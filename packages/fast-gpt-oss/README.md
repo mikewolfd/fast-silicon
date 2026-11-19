@@ -24,30 +24,32 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 
 ## Parity & Benchmarks (`mlx-community/gpt-oss-20b-MXFP4-Q4`, M4 Pro `48 GB`)
 
-### Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`)
+### 1. Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`)
 
-Verified in the unified monorepo runner (`scripts/benchmark_monorepo.py --packages fast-gpt-oss`; suite Metal Peak `15.901 GB`, OS Footprint `21.709 GB` via `RUSAGE_INFO_V4`):
+Suite Metal Peak **`15.901 GB`**, OS Footprint **`21.709 GB`** (`RUSAGE_INFO_V4`; recorded with `6` background quiescence warnings):
 
-| Engine / Batch | Valid | Prefill (`s`) | Decode (`s`) | Decode tok/s | Docs/s | Peak Mem | Speedup |
-|---|---|---:|---:|---:|---:|---:|---|
-| `b1_seq` (`8` docs) | `8/8` | — | `17.27` wall | 74.9 | 0.464 | **10.70 GB** | `1.18x` vs `stock-mlx_lm B=1` (`63.5 tok/s`) |
-| `batched_B8` | `8/8` | 2.03 | 6.96 | 162.1 | 0.888 | 11.46 GB | `1.39x` vs `stock-mlx_lm B=8` (`116.3 tok/s`) |
-| `batched_B64` | `64/64` | 15.532 | 22.625 | 410.0 | 1.636 | 12.63 GB | `3.53x` vs `stock-mlx_lm B=8` |
-| **`batched_B128`** | **`128/128`** | 34.024 | 33.182 | **555.5** | **1.874** | 14.81 GB | **`7.42x`** vs `B=1` (`4.04x` docs/s); **`4.78x`** vs `stock-mlx_lm B=8` |
-| `stock-mlx_lm` (`B=8`, Public) | — | — | — | 116.3 | 0.871 | `11.384 GB` Metal (`12.139 GB` OS) | Public baseline (`B=1`: `63.5 tok/s`, `load=3.985 s`) |
+| Engine / Mode | Batch (Docs) | Valid | Prefill | Decode / Wall | Decode tok/s | Docs/s | Peak Mem | vs Stock `B=8` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `b1_seq` | `1` (`8`) | `8/8` | — | `17.27 s` *(wall)* | `74.9` | `0.464` | **10.70 GB** | `0.64x` | **`1.18x`** vs `stock-mlx_lm B=1` (`63.5 tok/s`) |
+| `batched_B8` | `8` (`8`) | `8/8` | `2.030 s` | `6.960 s` | `162.1` | `0.888` | `11.46 GB` | `1.39x` | Same batch size as `stock-mlx_lm B=8` |
+| `batched_B64` | `64` (`64`) | `64/64` | `15.532 s` | `22.625 s` | `410.0` | `1.636` | `12.63 GB` | `3.53x` | Hydragen v2 + Hybrid MoE |
+| **`batched_B128`** | `128` (`128`) | **`128/128`** | `34.024 s` | `33.182 s` | **555.5** | **1.874** | `14.81 GB` | **`4.78x`** | **`7.42x`** vs `b1_seq`; `4.04x` `docs/s` |
+| `stock-mlx_lm` (Public) | `8` | — | — | — | `116.3` | `0.871` | `11.384 GB` | `1.00x` | `12.139 GB` OS (`load=3.985 s`) |
+| `stock-mlx_lm` (Public) | `1` | — | — | — | `63.5` | — | — | `0.55x` | Single-stream baseline |
 
-Monorepo `verify` (`elapsed=29.706 s`): `b1_valid=4/4` (`71.3 dec tok/s`, `0.367 docs/s`), `b8_valid=8/8` (`104.9 dec tok/s`, `0.582 docs/s`), `prefix16_token_matches=4`, `key_field_matches=4`. Note: run manifest recorded `6` background quiescence warnings.
+Monorepo `verify` (`29.706 s`): `b1_valid=4/4` (`71.3 dec tok/s`, `0.367 docs/s`), `b8_valid=8/8` (`104.9 dec tok/s`, `0.582 docs/s`), `prefix16_token_matches=4`, `key_field_matches=4`.
 
-### Standalone Long-Prefix Suite (`gpt-oss bench --batches 8,64,128`)
+### 2. Standalone Long-Prefix Suite (`gpt-oss bench --batches 8,64,128`)
 
-`max_tokens=512`, structured JSON fixtures, `L_sys=1,275`, `vocab_out=131,072`, back-to-back sustained run:
+`max_tokens=512`, structured JSON fixtures, `L_sys=1,275`, `vocab_out=131,072`:
 
-| Batch / Mode | Docs Valid | Decode tok/s | Throughput (docs/s) | Peak MLX Mem | Notes |
+| Batch / Mode | Docs Valid | Decode tok/s | Docs/s | Peak MLX Mem | Notes |
 |---|---:|---:|---:|---:|---|
-| `B=1` sequential | `8/8` | 71.4 | 0.200 | **11.46 GB** | Cool single-stream `forward_b1`: **`97.4 tok/s`** (`0.289 docs/s`) |
-| `B=8` batched | `8/8` | 116.8 | 0.295 | 12.63 GB | `verify`: `8/8` valid, `4/4` `key_field_matches` |
-| `B=64` batched | `64/64` | 363.9 | 0.603 | 14.46 GB | Hydragen v2 + Zero-Sync Hybrid MoE |
-| **`B=128` batched** | **`128/128`** | **462.8** | **0.710** | **16.56 GB** | **Peak sustained throughput (`+6.5x` decode over `B=1`)** |
+| `B=1` cool async (`forward_b1`) | — | **`97.4`** | `0.289` | — | Isolated uncontended `B=1` |
+| `B=1` sequential (sustained) | `8/8` | `71.4` | `0.200` | **11.46 GB** | Sustained back-to-back |
+| `B=8` batched | `8/8` | `116.8` | `0.295` | `12.63 GB` | `4/4` `key_field_matches` |
+| `B=64` batched | `64/64` | `363.9` | `0.603` | `14.46 GB` | Hydragen v2 + Hybrid MoE |
+| **`B=128` batched** | **`128/128`** | **462.8** | **0.710** | `16.56 GB` | **`+6.5x`** decode over sustained `B=1` |
 
 ## What keeps it fast
 

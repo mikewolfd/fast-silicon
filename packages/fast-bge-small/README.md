@@ -43,37 +43,53 @@ vecs = eng.encode_texts(["passage one...", "passage two..."], mode="hetero")    
 | `Hetero` (`GPU + ANE`) vs `F16` | `0.999984` | Two-ended bucket routing |
 | `Single-query B=1 S=24 ANE` vs `GPU` | `0.999986` | `build/bge-ane-cli`: `0.502 ms` (`tokens=16`, `iters=30`) |
 
-## Speed (`bge-small bench`, `n = 4,000` docs, M4 Pro `48 GB`)
+## Speed (`bge-small bench`, M4 Pro `48 GB`)
 
-Single-query `B=1 S=24` (`ANE` vs `GPU`):
-- Synthetic: `ANE_B1_S24` median **`0.493 ms`** (min `0.475 ms`) vs `GPU_B1_S24` median `1.937 ms` (min `1.843 ms`).
-- Document OCR: `ANE_B1_S24` median **`0.560 ms`** (min `0.485 ms`) vs `GPU_B1_S24` median `4.067 ms` (min `2.227 ms`).
+### 1. Standalone (`bge-small bench --n 4000`)
 
-Corpus throughput:
+#### Single-Query Latency (`B=1`, `S=24`)
 
-| Workload | Mode | Elapsed (s) | Throughput (tok/s) | Split (`gpu_docs / ane_docs`, tokens) |
+| Workload | Backend | Median | Min | Notes |
 |---|---|---:|---:|---|
-| Synthetic (`993,944` toks) | `gpu` | 7.185 | 138,335 | 4,000 / 0 (`993,944` / `0`) |
-| Synthetic (`993,944` toks) | `ane` | 16.772 | 59,261 | 0 / 4,000 (`0` / `993,944`) |
-| Synthetic (`993,944` toks) | `hetero` | **5.250** | **189,338** | 1,504 / 2,496 (`577,600` / `416,344`) |
-| Document OCR (`981,829` toks) | `gpu` | 8.249 | 119,028 | 4,000 / 0 (`981,829` / `0`) |
-| Document OCR (`981,829` toks) | `ane` | 16.272 | 60,339 | 0 / 4,000 (`0` / `981,829`) |
-| Document OCR (`981,829` toks) | `hetero` | **4.566** | **215,022** | 1,856 / 2,144 (`632,487` / `349,342`) |
+| Synthetic | `bge-ane-cli` (zero-Python) | **`0.502 ms`** | — | `tokens=16`, `iters=30` |
+| Synthetic | `ane` (`ANE_B1_S24`) | **`0.493 ms`** | `0.475 ms` | **`3.93x`** faster than GPU |
+| Synthetic | `gpu` (`GPU_B1_S24`) | `1.937 ms` | `1.843 ms` | Metal 4 MPP |
+| Document OCR | `ane` (`ANE_B1_S24`) | **`0.560 ms`** | `0.485 ms` | **`7.26x`** faster than GPU |
+| Document OCR | `gpu` (`GPU_B1_S24`) | `4.067 ms` | `2.227 ms` | Metal 4 MPP |
 
-### Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`, M4 Pro `48 GB`)
+#### Corpus Throughput (`n = 4,000` docs)
 
-Verified in the unified monorepo runner (`scripts/benchmark_monorepo.py --packages fast-bge-small`, `n=1,000` docs / `249,303` tokens, Metal Peak `1.173 GB`, OS Footprint `4.813 GB` via `RUSAGE_INFO_V4`):
+| Workload (Tokens) | Mode | Elapsed | Throughput | GPU Docs (`Tokens`) | ANE Docs (`Tokens`) |
+|---|---|---:|---:|---:|---:|
+| Synthetic (`993,944`) | **`hetero`** | **5.250 s** | **189,338 tok/s** | `1,504` (`577,600`) | `2,496` (`416,344`) |
+| Synthetic (`993,944`) | `gpu` | `7.185 s` | `138,335 tok/s` | `4,000` (`993,944`) | `0` (`0`) |
+| Synthetic (`993,944`) | `ane` | `16.772 s` | `59,261 tok/s` | `0` (`0`) | `4,000` (`993,944`) |
+| Document OCR (`981,829`) | **`hetero`** | **4.566 s** | **215,022 tok/s** | `1,856` (`632,487`) | `2,144` (`349,342`) |
+| Document OCR (`981,829`) | `gpu` | `8.249 s` | `119,028 tok/s` | `4,000` (`981,829`) | `0` (`0`) |
+| Document OCR (`981,829`) | `ane` | `16.272 s` | `60,339 tok/s` | `0` (`0`) | `4,000` (`981,829`) |
 
-| Workload / Mode | Latency (`B=1 S=24`) | Time (`s`) | Throughput | Notes / Split |
-|---|---:|---:|---:|---|
-| **`hetero` (Metal 4 + ANE)** | ANE **0.526 ms** (min `0.467`) | **1.203** | **207,264 tok/s** | `424` GPU / `576` ANE docs (**`1.52x`** `gpu`; **`2.50x`** vs `transformers-mps`) |
-| `gpu` (Metal 4 MPP) | GPU `2.015 ms` (min `1.847`) | 1.828 | 136,416 tok/s | `1,000` GPU docs (`ANE B=1` is **`3.83x`** lower latency) |
-| `ane` (CoreML ANE) | ANE `0.526 ms` | 4.388 | 56,808 tok/s | `1,000` ANE docs |
-| `transformers-mps-float16` (Public) | `8.446 ms` | — | `82,883.2 tok/s` (`332.46 docs/s`) | OS Footprint `3.520 GB` (`load=1.314 s`) |
+### 2. Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`, `n = 1,000` / `249,303` toks)
+
+Captured alongside `6` background quiescence warnings (`RUSAGE_INFO_V4` OS footprint):
+
+#### Single-Query Latency (`B=1`, `S=24`)
+
+| Engine / Runtime | Mode | Median | Min | Speedup vs Public MPS |
+|---|---|---:|---:|---:|
+| **`fast-bge-small`** | **`ane`** | **0.526 ms** | `0.467 ms` | **`16.06x`** (`3.83x` vs GPU) |
+| `fast-bge-small` | `gpu` | `2.015 ms` | `1.847 ms` | `4.19x` |
+| `transformers-mps-float16` (Public) | PyTorch MPS | `8.446 ms` | — | `1.00x` (Baseline) |
+
+#### Corpus Throughput (`n = 1,000` docs, `249,303` toks)
+
+| Engine / Runtime | Mode | Elapsed | Throughput | Doc Split (`GPU / ANE`) | Token Split (`GPU / ANE`) | Metal Peak | OS Footprint | vs Public MPS | Notes |
+|---|---|---:|---:|---|---|---:|---:|---:|---|
+| **`fast-bge-small`** | **`hetero`** | **1.203 s** | **207,264 tok/s** | `424 / 576` | `158,312 / 90,991` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | **`2.50x`** | **`1.52x`** vs `gpu` |
+| `fast-bge-small` | `gpu` | `1.828 s` | `136,416 tok/s` | `1,000 / 0` | `249,303 / 0` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | `1.65x` | Metal-only baseline |
+| `fast-bge-small` | `ane` | `4.388 s` | `56,808 tok/s` | `0 / 1,000` | `0 / 249,303` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | `0.69x` | ANE-only baseline |
+| `transformers-mps-float16` (Public) | PyTorch MPS | — | `82,883.2 tok/s` | — | — | `0.071 GB` | `3.520 GB` | `1.00x` | `332.46 docs/s`; `load=1.314 s` |
 
 Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `Hetero_vs_F16` `min=0.999984`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999986`.
-
-*Note: Monorepo capture ran alongside light background system activity (`6` quiescence warnings recorded in the run manifest).*
 
 ## What keeps it fast
 

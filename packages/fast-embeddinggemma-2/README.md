@@ -36,35 +36,54 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 | `Hetero` vs `F16` reference | `0.999705` | Dynamic `GPU + ANE + CPU-SME` split |
 | `Single-query B=1 S=24 ANE` vs `GPU` | `0.999890` | `emb2_pk_s32_w8.mlmodelc` (`emb2-ane-cli`: `1.8713 ms`) |
 
-## Speed (`embeddinggemma-2 bench`, `n = 2,000` docs, M4 Pro `48 GB`)
+## Speed (`embeddinggemma-2 bench`, M4 Pro `48 GB`)
 
-Single-query latency: `ANE_B1_S32` median `2.095 ms` (min `1.899 ms` synth) / `2.066 ms` (min `1.868 ms` OCR) vs `GPU_B1_S64` median `9.026 ms` / `8.895 ms`.
+### 1. Standalone (`embeddinggemma-2 bench --n 2000`)
 
-| Workload | Mode | Elapsed (s) | Tok/s | Doc/s | Split (`gpu / ane / cpu` docs & toks) |
-|---|---|---:|---:|---:|---|
-| Synthetic (`551,889` toks) | `gpu` | 33.376 | 16,535 | 59.9 | 2,000 / 0 / 0 (`551,889` / 0 / 0) |
-| Synthetic (`551,889` toks) | `ane` | 27.406 | 20,138 | 73.0 | 0 / 2,000 / 0 (0 / `551,889` / 0) |
-| Synthetic (`551,889` toks) | **`hetero2` (`GPU+ANE`)** | **14.952** | **36,911** | **133.8** | 910 / 1,090 / 0 (`256,316` / `295,573` / 0) |
-| Synthetic (`551,889` toks) | `hetero` (`GPU+ANE+CPU`) | 17.639 | 31,288 | 113.4 | 1,032 / 715 / 253 (`286,755` / `197,377` / `67,757`) |
-| Document OCR (`559,737` toks) | `gpu` | 47.257 | 11,844 | 42.3 | 2,000 / 0 / 0 (`559,737` / 0 / 0) |
-| Document OCR (`559,737` toks) | `ane` | 27.136 | 20,627 | 73.7 | 64 / 1,936 / 0 (`37,609` / `522,128` / 0) |
-| Document OCR (`559,737` toks) | **`hetero2` (`GPU+ANE`)** | **17.186** | **32,569** | **116.4** | 730 / 1,270 / 0 (`212,621` / `347,116` / 0) |
-| Document OCR (`559,737` toks) | `hetero` (`GPU+ANE+CPU`) | 19.523 | 28,671 | 102.4 | 957 / 805 / 238 (`271,748` / `222,921` / `65,068`) |
+#### Single-Query Latency (`B=1`)
 
-### Monorepo Showcase & Parity (`benchmark_monorepo.py`, M4 Pro `48 GB`)
+| Workload | Backend / Tool | Seq | Median | Min |
+|---|---|---:|---:|---:|
+| Synthetic | `emb2-ane-cli` (zero-Python) | `32` | **`1.871 ms`** | — |
+| Synthetic | `ane` (`ANE_B1_S32`) | `32` | **`2.095 ms`** | `1.899 ms` |
+| Synthetic | `gpu` (`GPU_B1_S64`) | `64` | `9.026 ms` | — |
+| Document OCR | `ane` (`ANE_B1_S32`) | `32` | **`2.066 ms`** | `1.868 ms` |
+| Document OCR | `gpu` (`GPU_B1_S64`) | `64` | `8.895 ms` | — |
 
-Verified in the unified monorepo runner (`scripts/benchmark_monorepo.py --packages fast-embeddinggemma-2`, `n=2,000` docs / `551,889` tokens, Metal Peak `2.224 GB`, OS Footprint `10.820 GB` via `RUSAGE_INFO_V4`):
+#### Corpus Throughput (`n = 2,000` docs)
 
-| Workload / Mode | Latency (`B=1`) | Time (`s`) | Throughput | Docs/s | Doc Split (`GPU / ANE / CPU`) |
-|---|---|---:|---:|---:|---|
-| **`hetero2` (`GPU+ANE`)** | ANE (`S=32`) **2.188 ms** (min `1.943`) | **17.363** | **31,786 tok/s** | **115.2** | `591 / 1,409 / 0` (**`1.85x`** `gpu`) |
-| `hetero` (`GPU+ANE+CPU`) | — | 17.621 | 31,319 tok/s | 113.5 | `650 / 1,322 / 28` |
-| `ane` (16-core ANE) | ANE (`S=32`) `2.188 ms` | 27.149 | 20,328 tok/s | 73.7 | `0 / 2,000 / 0` (**`4.36x`** lower `B=1` vs GPU) |
-| `gpu` (Metal 4 MPP) | GPU (`S=64`) `9.540 ms` (min `9.089`) | 32.129 | 17,177 tok/s | 62.2 | `2,000 / 0 / 0` |
+| Workload (Tokens) | Mode | Elapsed | Tok/s | Docs/s | Doc Split (`GPU / ANE / CPU`) | Token Split (`GPU / ANE / CPU`) |
+|---|---|---:|---:|---:|---|---|
+| Synthetic (`551,889`) | **`hetero2` (`GPU+ANE`)** | **14.952 s** | **36,911** | **133.8** | `910 / 1,090 / 0` | `256,316 / 295,573 / 0` |
+| Synthetic (`551,889`) | `hetero` (`GPU+ANE+CPU`) | `17.639 s` | `31,288` | `113.4` | `1,032 / 715 / 253` | `286,755 / 197,377 / 67,757` |
+| Synthetic (`551,889`) | `ane` | `27.406 s` | `20,138` | `73.0` | `0 / 2,000 / 0` | `0 / 551,889 / 0` |
+| Synthetic (`551,889`) | `gpu` | `33.376 s` | `16,535` | `59.9` | `2,000 / 0 / 0` | `551,889 / 0 / 0` |
+| Document OCR (`559,737`) | **`hetero2` (`GPU+ANE`)** | **17.186 s** | **32,569** | **116.4** | `730 / 1,270 / 0` | `212,621 / 347,116 / 0` |
+| Document OCR (`559,737`) | `hetero` (`GPU+ANE+CPU`) | `19.523 s` | `28,671` | `102.4` | `957 / 805 / 238` | `271,748 / 222,921 / 65,068` |
+| Document OCR (`559,737`) | `ane` | `27.136 s` | `20,627` | `73.7` | `64 / 1,936 / 0` | `37,609 / 522,128 / 0` |
+| Document OCR (`559,737`) | `gpu` | `47.257 s` | `11,844` | `42.3` | `2,000 / 0 / 0` | `559,737 / 0 / 0` |
 
-Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `GPU_vs_BF16` `min=0.999894`, `Hetero_vs_F16` `min=0.999724`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999887`. Public `transformers-mps` comparison was skipped in this environment because installed `transformers` lacked `embedding_gemma2` support.
+### 2. Monorepo Showcase & Parity (`benchmark_monorepo.py`, `n = 2,000` / `551,889` toks)
 
-*Note: Standalone & monorepo runs were captured on Apple M4 Pro (`48 GB`) alongside light background sessions (`6` quiescence warnings recorded in the monorepo run manifest).*
+Captured alongside `6` background quiescence warnings (`Metal Peak: 2.224 GB`, `OS Footprint: 10.820 GB` via `RUSAGE_INFO_V4`; public `transformers-mps` skipped because installed `transformers` lacked `embedding_gemma2` support):
+
+#### Single-Query Latency (`B=1`)
+
+| Mode | Seq | Median | Min | Speedup vs GPU |
+|---|---:|---:|---:|---:|
+| **`ane`** | `32` | **2.188 ms** | `1.943 ms` | **`4.36x`** |
+| `gpu` | `64` | `9.540 ms` | `9.089 ms` | `1.00x` |
+
+#### Corpus Throughput (`n = 2,000` docs, `551,889` toks)
+
+| Mode | Elapsed | Tok/s | Docs/s | Doc Split (`GPU / ANE / CPU`) | Token Split (`GPU / ANE / CPU`) | Speedup vs GPU |
+|---|---:|---:|---:|---|---|---:|
+| **`hetero2` (`GPU+ANE`)** | **17.363 s** | **31,786** | **115.2** | `591 / 1,409 / 0` | `208,158 / 343,731 / 0` | **`1.85x`** |
+| `hetero` (`GPU+ANE+CPU`) | `17.621 s` | `31,319` | `113.5` | `650 / 1,322 / 28` | `232,550 / 311,494 / 7,845` | `1.82x` |
+| `ane` (16-core ANE) | `27.149 s` | `20,328` | `73.7` | `0 / 2,000 / 0` | `0 / 551,889 / 0` | `1.18x` |
+| `gpu` (Metal 4 MPP) | `32.129 s` | `17,177` | `62.2` | `2,000 / 0 / 0` | `551,889 / 0 / 0` | `1.00x` |
+
+Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `GPU_vs_BF16` `min=0.999894`, `Hetero_vs_F16` `min=0.999724`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999887`.
 
 ## What keeps it fast
 

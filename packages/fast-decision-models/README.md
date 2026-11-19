@@ -37,26 +37,27 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:
 
 ## Parity & Benchmarks (`decision-models verify` / `bench`, M4 Pro `48 GB`)
 
-### Monorepo Showcase, `bf16` Ablation & Public Baseline (`benchmark_monorepo.py`, `n=64`)
+### 1. Monorepo Showcase, `bf16` Ablation & Public Baseline (`benchmark_monorepo.py`, `n=64`)
 
-Verified in the unified monorepo runner (`scripts/benchmark_monorepo.py --packages fast-decision-models`; `w8`+`laya` suite Metal Peak `1.748 GB`, OS Footprint `3.166 GB` via `RUSAGE_INFO_V4`):
+Default suite (`kev_08b w8 B=8` + `laya_ane`) Metal Peak **`1.748 GB`**, OS Footprint **`3.166 GB`** (`RUSAGE_INFO_V4`; `verify` recorded `6` quiescence warnings):
 
-| Engine / Baseline | Batch / Precision | Throughput | Latency | Time (`s`) | Footprint / vs Public |
-|---|---|---:|---:|---:|---|
-| **`kev_08b` (`w8 B=8`, Default)** | `w8`, `B=8` (`n=64`) | **50.95 q/s** | **19.63 ms/q** | 1.2562 | OS `3.166 GB` (**`5.27x`** vs `transformers-mps`, **`-2.13 GB`**; `1.86x` vs `bf16 B=1`) |
-| `laya_ane` (`Laya-Typed-421M`) | `W8A16` ANE (`n=64`) | **40.53 q/s** | **24.67 ms/q** | 1.5789 | Plans `[1585,0,0]` (`s256` & `s512`); **`4.19x`** vs `transformers-mps B=8` |
-| `kev_08b` (`bf16 B=8`, Internal) | `bf16`, `B=8` (`n=64`) | 51.65 q/s | 19.36 ms/q | 1.2390 | OS `3.718 GB` (`w8 B=8` is `0.99x` speed with **`-0.553 GB`** footprint) |
-| `kev_08b` (`bf16 B=1`, Internal) | `bf16`, `B=1` (`n=24`) | 27.42 q/s | 36.48 ms/q | 0.8754 | OS `2.086 GB` |
-| `transformers-mps-bf16` (Public) | `bf16`, `B=8` (`B=1`: `2.98 q/s`) | 9.67 q/s | 103.38 ms/q | — | OS `5.295 GB`, Metal `1.505 GB` (`load=11.554 s`) |
+| Engine / Baseline | Precision | Batch | Questions | Elapsed | Throughput | Latency | Metal Peak | OS Footprint | vs MPS `B=8` | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`kev_08b` (Default)** | `W8` (`g64`) | `8` | `64` | `1.2562 s` | **50.95 q/s** | **19.63 ms/q** | `1.748 GB` *(suite)* | **3.166 GB** *(suite)* | **`5.27x`** | **`-2.13 GB`** OS vs MPS; **`-0.553 GB`** vs `bf16 B=8` |
+| `laya_ane` (`Laya-Typed-421M`) | `W8A16` ANE | `P=4` | `64` | `1.5789 s` | **40.53 q/s** | **24.67 ms/q** | `1.748 GB` *(suite)* | **3.166 GB** *(suite)* | **`4.19x`** | `[1585,0,0]` ANE/GPU/CPU ops |
+| `kev_08b` (Internal baseline) | `BF16` | `8` | `64` | `1.2390 s` | `51.65 q/s` | `19.36 ms/q` | `2.439 GB` | `3.718 GB` | `5.34x` | `w8 B=8` runs at `0.99x` speed with lower memory |
+| `kev_08b` (Internal baseline) | `BF16` | `1` | `24` | `0.8754 s` | `27.42 q/s` | `36.48 ms/q` | `1.642 GB` | `2.086 GB` | `2.84x` | `w8 B=8` is **`1.86x`** faster |
+| `transformers-mps-bf16` (Public) | `BF16` | `8` | — | — | `9.67 q/s` | `103.38 ms/q` | `1.505 GB` | `5.295 GB` | `1.00x` | Public MPS (`load=11.554 s`) |
+| `transformers-mps-bf16` (Public) | `BF16` | `1` | — | — | `2.98 q/s` | — | — | — | `0.31x` | Public single-stream baseline |
 
-Monorepo `verify` (`6` host quiescence warnings): `laya-ane` `[1585, 0, 0]` (`s256` & `s512`, `probs=[0.7107, 0.2738, 0.3558]`) and `kev-0.8b (w8)` `B=1 vs B=3` `max_diff=0.005613` (`probs=[0.8747, 0.1441, 0.1485]`).
+Monorepo `verify`: `laya-ane` `[1585, 0, 0]` (`s256` & `s512`, `probs=[0.7107, 0.2738, 0.3558]`) and `kev-0.8b (w8)` `B=1 vs B=3` `max_diff=0.005613` (`probs=[0.8747, 0.1441, 0.1485]`).
 
-### Standalone Quick Bench (`decision-models bench`, `n=24`, `batch_docs=8`)
+### 2. Standalone Quick Bench (`decision-models bench`, `n=24`, `batch_docs=8`)
 
-| Backend | Plan / Parity | Throughput | Latency | Time (`n=24`) |
+| Backend | Compute Plan / Parity | Elapsed | Throughput | Latency |
 |---|---|---:|---:|---:|
-| `laya-ane` (`Laya-Typed-421M W8A16`) | `[1585, 0, 0]` (`s256` & `s512`); probs `[0.9326, 0.0119, 0.0998]` | **41.72 q/s** | **23.97 ms/q** | `0.5753 s` |
-| `kev-08b` (`Kev-0.8B r15 w8 g64`) | `B=1` vs `B=3` `max_diff=0.005613`; probs `[0.8747, 0.1441, 0.1485]` | **59.68 q/s** | **16.76 ms/q** | `0.4022 s` |
+| `kev-08b` (`Kev-0.8B r15 w8 g64`) | `B=1 vs B=3` `max_diff=0.005613`; probs `[0.8747, 0.1441, 0.1485]` | `0.4022 s` | **59.68 q/s** | **16.76 ms/q** |
+| `laya-ane` (`Laya-Typed-421M W8A16`) | `[1585, 0, 0]` (`s256` & `s512`); probs `[0.9326, 0.0119, 0.0998]` | `0.5753 s` | **41.72 q/s** | **23.97 ms/q** |
 
 ## What keeps it fast
 

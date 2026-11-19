@@ -74,14 +74,15 @@ embeddinggemma-2 parquet \
 
 ## Sibling Engines (`48 GB` M4 Pro `Mac16,8`)
 
-| Engine | Model | Execution Path | Verified M4 Pro Result (`monorepo_bench` + Standalone) |
-|---|---|---|---|
-| [`fast-bge-small`](../fast-bge-small) | `BAAI/bge-small-en-v1.5` (`33M`) | Metal 4 MPP + 16-core ANE (`hetero`) | **`207,264 tok/s`** `hetero` (`0.526 ms` ANE `B=1`, **`2.50x`** vs `transformers-mps-float16`, `1.173 GB` Metal / `4.813 GB` OS); standalone up to **`215,022 tok/s`** OCR / `0.493 ms` |
-| [`fast-embeddinggemma-2`](../fast-embeddinggemma-2) | `google/embeddinggemma-2` (`300M`) | Metal 4 MPP + 16-core ANE + SME (`hetero2`) | **`31,786 tok/s`** `hetero2` (`115.2 doc/s`, `2.188 ms` ANE `B=1` = **`4.36x`** GPU, `2.224 GB` Metal / `10.820 GB` OS); standalone up to **`36,911 tok/s`** synth / `1.871 ms` |
-| [`fast-pplx`](../fast-pplx) | `pplx-embed-v2-context-0.6b` (`0.6B`) | Metal MLX GDN+SDPA + Staged ANE (`hetero2`) | **`15,244.9 tok/s`** `hetero2` (`B=8 S=256`, **`5.50x`** vs `torch-mps` / **`10.06x`** vs `torch-cpu`, `4.46 ms` ANE `B=1`, `S=4K` `2.5` vs `12.5 GB`; `1.621 GB` Metal / `2.591 GB` OS, `16/16` parity) |
-| [`fast-gemma4`](../fast-gemma4) | `google/gemma-4-E2B-it` (`~2B` act.) | Rolling `B_slots=128` (`kv_i8`) + Early14 ANE ring | **`8.92 docs/s`** Concurrent ANE+GPU `2xB=128` (`1,192 dec tok/s`, **`2.54x`** vs `stock-mlx_vlm B=64`, `-3.50 GB` peak, `6.718 GB` Metal / `18.314 GB` OS); standalone **`671.1–704.8` e2e out tok/s** (`6.88 GB`) |
-| [`fast-gpt-oss`](../fast-gpt-oss) | `openai/gpt-oss-20b` (`MXFP4` MoE) | Unified Hot-MPP + Cold-QMV + Hydragen v2 | **`555.5 dec tok/s`** (`1.874 docs/s` @ `B=128`, **`4.78x`** vs `stock-mlx_lm B=8`, `14.81 GB` peak / `15.901 GB` suite Metal / `21.709 GB` OS); `B=1` `74.9`–`97.4 tok/s` |
-| [`fast-decision-models`](../fast-decision-models) | `Laya-Typed-421M` + `Kev-0.8B` | Pure ANE `[1585,0,0]` (`P=4`) & `W8` MLX | `kev_08b` **`50.95 q/s`** (**`5.27x`** vs `transformers-mps-bf16`, `-2.13 GB` OS footprint) & `laya_ane` **`40.53 q/s`** (**`4.19x`**, `1.748 GB` Metal / `3.166 GB` OS); standalone **`59.68`** / **`41.72 q/s`** |
+| Engine | Model | Execution Path | Monorepo Throughput | Monorepo Latency / Alt | vs Public Baseline | Suite Metal / OS | Standalone Peak |
+|---|---|---|---:|---:|---|---|---|
+| [`fast-bge-small`](../fast-bge-small) | `BAAI/bge-small-en-v1.5` (`33M`) | Metal 4 MPP + 16-core ANE (`hetero`) | **207,264 tok/s** | `0.526 ms` (`B=1` ANE) | **`2.50x`** vs `transformers-mps-float16` | `1.173 / 4.813 GB` | **215,022 tok/s** OCR (`0.493 ms` `B=1`) |
+| [`fast-embeddinggemma-2`](../fast-embeddinggemma-2) | `google/embeddinggemma-2` (`300M`) | Metal 4 MPP + ANE + SME (`hetero2`) | **31,786 tok/s** | `2.188 ms` (`B=1` ANE) | *skipped* (`transformers` lacks arch) | `2.224 / 10.820 GB` | **36,911 tok/s** synth (`1.871 ms` `B=1`) |
+| [`fast-pplx`](../fast-pplx) | `pplx-embed-v2-context-0.6b` (`0.6B`) | Metal GDN+SDPA + Staged ANE (`hetero2`) | **15,244.9 tok/s** (`S=256`) | `4.46 ms` (`query_b1` ANE) | **`5.50x`** vs `torch-mps`, **`10.06x`** vs `torch-cpu` | `1.621 / 2.591 GB` | **32K** context in `2.690 GB` OS (`16/16` parity) |
+| [`fast-gemma4`](../fast-gemma4) | `google/gemma-4-E2B-it` (`~2B` act.) | Rolling `B_slots=128` (`kv_i8`) + ANE ring | **8.92 docs/s** (`2xB=128`) | `1,192 dec tok/s` | **`2.54x`** vs `stock-mlx_vlm B=64` (`-3.50 GB`) | `6.718 / 18.314 GB` | **671.1–704.8** e2e out tok/s (`6.88 GB`) |
+| [`fast-gpt-oss`](../fast-gpt-oss) | `openai/gpt-oss-20b` (`MXFP4` MoE) | Unified Hot-MPP + Cold-QMV + Hydragen v2 | **555.5 dec tok/s** (`B=128`) | `1.874 docs/s` | **`4.78x`** vs `stock-mlx_lm B=8` | `15.901 / 21.709 GB` | **462.8** dec tok/s (`L=1,275`), `97.4` `B=1` |
+| [`fast-decision-models`](../fast-decision-models) | `Kev-0.8B r15` (`W8` `g64`, `B=8`) | `W8` Metal MLX left-padded judge | **50.95 q/s** | `19.63 ms/q` | **`5.27x`** vs `transformers-mps B=8` | `1.748 / 3.166 GB` | **59.68 q/s** (`16.76 ms/q`, `n=24`) |
+| [`fast-decision-models`](../fast-decision-models) | `Laya-Typed-421M` (`W8A16`, `P=4`) | Pure ANE `[1585,0,0]` (`IOSurface` + NEON) | **40.53 q/s** | `24.67 ms/q` | **`4.19x`** vs `transformers-mps B=8` | `1.748 / 3.166 GB` | **41.72 q/s** (`23.97 ms/q`, `n=24`) |
 
 ## Agent Plugin & Tests
 
