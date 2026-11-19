@@ -1,7 +1,8 @@
 # fast-embeddinggemma-2
 
-Hardware-limit inference engine for **google/embeddinggemma-2** (`300M`, `768`-d, `2048`-context, Matryoshka `128..768`) executing across Apple Silicon M4 Pro's **20-core Metal 4 GPU**, **16-core Neural Engine (`W8A16`)**, and **14-core ARMv9 CPU-SME**.
-Zero runtime `transformers` or `torch` dependencies, with a standalone C++/CoreML CLI (`build/emb2-ane-cli`) for zero-Python ANE inference.
+**2,048-context Matryoshka embeddings at 31K–37K tok/s and ~2 ms latency on Apple Silicon, with no PyTorch runtime required.**
+
+`fast-embeddinggemma-2` executes `google/embeddinggemma-2` (`300M`, `128..768`-d MRL) across Apple M4 Pro's Metal GPU and 16-core Neural Engine — cutting single-query latency to **1.87–2.19 ms** (**4.36x** faster than GPU-only) and reaching **31,786 tok/s** (**36,911 tok/s** standalone) at **0.999997** GPU / **0.999705** hetero cosine parity. Ships with a Python API, chunked OCR-aware Parquet ingestion, an OpenAI `/v1/embeddings` server (`"dimensions"` support), and the zero-Python `emb2-ane-cli`.
 
 ## Quick start
 

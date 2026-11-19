@@ -1,7 +1,8 @@
 # fast-decision-models
 
-Apple Silicon hardware-limit runners for typed-question decision models (**`noul`**, **`choice`**, **`score`**) targeting **Laya-Typed-421M (`W8A16`)** on the 16-core Apple Neural Engine and **Kev-0.8B r15 (`W8`/`BF16`)** on the 20-core Metal GPU.
-`import fast_decision_models` stays pure Python stdlib while lazy backends drive zero-GPU-contention CoreML ANE (`P=4` `IOSurface`) or left-padded batched MLX execution.
+**Fast local document classification, scoring, and validation on Apple Silicon — 4.2x–5.3x faster and 2.1 GB smaller than PyTorch MPS.**
+
+`fast-decision-models` runs typed binary (`noul`), multi-choice (`choice`), and scalar (`score`) judges for **Kev-0.8B** on Metal (**50.95 queries/s**, `19.63 ms/q`) and **Laya-Typed-421M** purely on the 16-core Apple Neural Engine (**40.53–41.72 queries/s** with `0` GPU ops, keeping your GPU completely free for LLM or embedding work). Importing the package is pure Python stdlib with zero runtime PyTorch dependency, backed by CLI (`score`) and Python APIs.
 
 ## Quick start
 

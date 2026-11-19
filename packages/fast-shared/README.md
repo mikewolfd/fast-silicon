@@ -1,7 +1,8 @@
 # fast-shared
 
-Shared Apple Silicon runtime, Metal 4 / CoreML / Accelerate primitives, benchmark hygiene utilities, and the M4/M5+ optimization plugin powering [`fast-silicon`](../fast-silicon).
-Every engine package (`fast-bge-small`, `fast-embeddinggemma-2`, `fast-pplx`, `fast-gemma4`, `fast-gpt-oss`, `fast-decision-models`) reuses this layer rather than duplicating Metal kernel builders, tokenizers, HTTP/SSE routers, or Parquet pipelines.
+**The Apple Silicon runtime, Metal 4 / CoreML primitives, and benchmark discipline toolkit powering [`fast-silicon`](https://github.com/mikewolfd/fast-silicon).**
+
+`fast-shared` gives local ML engines one reusable foundation instead of re-implementing custom kernels, tokenizers, OpenAI HTTP/SSE servers, resumable Parquet pipelines, or memory-mapped weight loaders (`MappedEmbedding`). It also ships practical guardrails any MLX/CoreML developer can adopt today: `RUSAGE_INFO_V4` OS unified-memory footprint tracking (`fast-bench-check`), static `FP32`-upcast and mask bug detection (`fast-ir-guard`), host hardware/quiescence checks, and an installable Apple Silicon optimization skill plugin for Claude Code / Codex.
 
 ## Quick start
 

@@ -1,7 +1,8 @@
 # fast-gpt-oss
 
-Hardware-limit Apple Silicon (**M4 Pro**, Metal 4 `MPP::matmul2d` + SIMD) batched inference engine for **`openai/gpt-oss-20b`** (`mlx-community/gpt-oss-20b-MXFP4-Q4`).
-Combines Hydragen v2 shared-prefix attention, circular SWA-128 decode, zero-sync GPU tile-binned Hybrid Hot-MPP / Cold-QMV MXFP4 MoE, asymmetric `131,072` output vocab pruning, and constrained `llguidance` JSON extraction.
+**Serve `openai/gpt-oss-20b` across 128 parallel documents on one Mac at 555.5 tok/s — 4.78x faster than `mlx_lm` (`B=8`) with 100% schema-valid JSON.**
+
+`fast-gpt-oss` eliminates redundant shared-prompt KV cache copies and pairs Metal 4 GPU kernels with hybrid quantized MoE routing so a **20.9B MXFP4** model runs at **14.81 GB** peak (`B=128`, **1.874 docs/s**) or **10.70 GB** single-stream (**74.9–97.4 tok/s**), keeping all `201K` input prompt tokens intact with zero misses. Ready out of the box with OpenAI-compatible SSE serving (`serve`), Parquet/JSONL batch extraction (`parquet` / `extract`), and CLI generation.
 
 ## Quick start
 

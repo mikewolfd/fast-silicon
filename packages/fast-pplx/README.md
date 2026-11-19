@@ -1,7 +1,8 @@
 # fast-pplx
 
-Hardware-limit Apple Silicon inference engine for **`perplexity-ai/pplx-embed-v2-context-0.6b`** — a 12-layer hybrid Qwen3.5 (`GatedDeltaNet` + bidirectional full self-attention) contextual embedding model supporting **32K context**, **Matryoshka truncation (`128..1024`)**, **`float32`/`float16`/`int8`** outputs, and concurrent **Metal GPU + 16-core ANE (`hetero2`)** execution.
-Includes a pure-Rust `tokenizers` wrapper (zero runtime `torch`/`transformers`), a custom CoreML/ObjC++ ANE async pipeline, `MappedEmbedding` memmap gather (`~1.02 GB` off GPU RAM), a streamed `S > 2048` 32K GPU path, a two-knob contextual Parquet pipeline (`--context-tokens` / `--chunk-tokens`), and an OpenAI HTTP server.
+**32K-context `pplx-embed-v2-context-0.6b` embeddings in 2.69 GB of unified memory — 1.71x–2.42x faster than `pplx-context-mlx` and 6.3x smaller than PyTorch MPS.**
+
+`fast-pplx` preserves exact upstream tokenization, late-chunking context (`[Q]`/`[D]`/`<|chunk_sep|>`), and Matryoshka dimensions (`128..1024`, `float32`/`float16`/`int8`), while scheduling short chunks (`<=512` tok) onto the Apple Neural Engine and streaming long documents on Metal GPU. That delivers **3.93 ms** single queries (**2.28x** vs `pplx-context-mlx-f16`, **11.95x** vs `torch-mps`), **15,384 tok/s** at `S=256` (**1.71x**), and **13,935 tok/s** (**2.42x**) on mixed batches — with zero `torch`/`transformers` runtime dependencies and built-in Python, OpenAI `/v1/embeddings`, contextual Parquet CLI, and `pplx-ane-cli` interfaces.
 
 ## Quick start
 

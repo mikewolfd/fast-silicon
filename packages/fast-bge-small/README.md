@@ -1,7 +1,8 @@
 # fast-bge-small
 
-Hardware-limit inference engine for **BAAI/bge-small-en-v1.5** (`33M`, `384`-d) on Apple Silicon **M4 Pro** combining 20-core Metal 4 `MPP::matmul2d` GPU kernels and 16-core Apple Neural Engine (`CoreML` / `IOSurface`) concurrent execution.
-No `transformers`, `torch`, or Python runtime overhead is required for inference, with a standalone C++/CoreML binary (`build/bge-ane-cli`) for zero-Python single-query ANE execution.
+**Sub-millisecond text embeddings and 207K tok/s corpus indexing on a Mac — with zero `torch` or `transformers` runtime dependencies.**
+
+`fast-bge-small` runs `BAAI/bge-small-en-v1.5` (`33M`, `384`-d) by routing short queries onto the 16-core Apple Neural Engine (**0.49–0.53 ms** `B=1`) and splitting bulk workloads concurrently across Metal GPU and ANE (**207,264 tok/s**, **2.50x** faster than PyTorch MPS) while matching float16 reference cosine similarity to **0.999998**. Use it from Python, an OpenAI-compatible `/v1/embeddings` server, a resumable OCR-aware Parquet CLI, or the standalone zero-Python `bge-ane-cli` binary.
 
 ## Quick start
 

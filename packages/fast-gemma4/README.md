@@ -1,7 +1,8 @@
 # fast-gemma4
 
-Hardware-limit batch structured JSON extraction and inference engine for **Gemma-4 E2B** (`lmstudio-community/gemma-4-E2B-it-MLX-4bit` / `google/gemma-4-E2B-it`) on Apple Silicon M4 Pro (**20-core Metal 4 GPU + 16-core ANE**).
-Combines a continuous length-sorted rolling slot scheduler (`B_slots=128`), INT8 KV compression (`kv_i8`), Metal 4 `MPP::matmul2d` BF16 kernels, lossless `150,786` vocab pruning, `llguidance` causal slice jumping, and an optional async Linear-W8 ANE prefix ring.
+**Guaranteed schema-valid JSON extraction with Gemma-4 E2B — 2.54x faster than stock `mlx_vlm` at 6.3–6.9 GB instead of 34 GB OOM.**
+
+Built for high-volume local structured extraction on Apple Silicon, `fast-gemma4` combines continuous batching (`B_slots=128`), `int8` KV cache compression, lossless output vocab pruning, speculative decoding, and an optional Neural Engine prefill ring to process **8.92 documents/s** (`1,192` decode `tok/s`). Run it from Python, extract directly from resumable PDF/Parquet shards (`--max-pages`, `--ocr-pages-only`) or JSONL, or serve an OpenAI-compatible SSE endpoint.
 
 ## Quick start
 

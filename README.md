@@ -1,12 +1,11 @@
 # fast-silicon
 
-Hardware-limit Apple Silicon ML inference and embedding workspace (`uv` monorepo) combining Metal 4 `MPP::matmul2d`, 16-core Apple Neural Engine (`CoreML` / `IOSurface` zero-copy), and CPU SME/AMX pipelines.
-Includes a monorepo-wide benchmark & OS footprint runner ([`scripts/benchmark_monorepo.py`](scripts/benchmark_monorepo.py)) measuring MLX active peak alongside macOS `RUSAGE_INFO_V4` unified-memory footprint across all packages.
+**Run local embeddings, guaranteed-valid JSON extraction, and 20B MoE models on Apple Silicon up to 2.5x–5.3x faster — and at a fraction of the memory.**
 
-> [!WARNING]
-> **Tested Hardware Baseline Only (`Mac16,8` — `48 GB` Apple M4 Pro)**
->
-> Everything in this workspace was built and verified **only** on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` RAM, `14` CPU `[10P + 4E]`, `20` GPU cores, `16` ANE `h16g` cores, macOS 26.6 / Metal 4). Running on other Apple Silicon chips or RAM sizes is **untested** and emits a startup check warning (`FAST_SILICON_NO_HW_WARN=1` to mute after reading).
+`fast-silicon` is a `uv` workspace of focused inference engines, CLI tools, OpenAI-compatible HTTP servers, and resumable Parquet pipelines built on Apple MLX, CoreML (16-core Neural Engine), and Metal 4. By scheduling work across GPU and ANE without heavy PyTorch runtime bloat, the suite embeds at **207K tok/s** (`<0.53 ms` single query), holds **32K**-context embeddings in **2.69 GB** (`1.71x–2.42x` vs `pplx-context-mlx-f16`), extracts strict JSON with **Gemma-4 E2B** (`2.54x` vs `mlx_vlm`), and serves **GPT-OSS-20B** at **555.5 tok/s** across `128` parallel documents (`4.78x` vs `mlx_lm`). It also ships a unified monorepo benchmark and `RUSAGE_INFO_V4` memory-footprint harness ([`scripts/benchmark_monorepo.py`](scripts/benchmark_monorepo.py)).
+
+> [!NOTE]
+> **Tested Hardware Baseline (`Mac16,8` — `48 GB` Apple M4 Pro):** Built and verified on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` unified RAM, `14` CPU `[10P + 4E]`, `20` GPU, `16` ANE `h16g` cores, macOS 26.6 / Metal 4). Other Apple Silicon chips and memory sizes are untested and emit a non-fatal startup note (`FAST_SILICON_NO_HW_WARN=1` to mute).
 
 ## Quick start
 
@@ -28,15 +27,15 @@ make test-cpu                # Run offline CPU + fault-injection + native parity
 
 ## Workspace Packages (`48 GB` M4 Pro `Mac16,8`)
 
-| Package | Model | Engine Summary |
+| Package | Model | Best For / Capabilities |
 |---|---|---|
-| [`packages/fast-shared`](packages/fast-shared) | Runtime, kernels & tooling | Metal 4 `MPP` (`FP16`/`BF16`), CoreML/Accelerate headers, `MappedEmbedding`, `fast-ir-guard`, `RUSAGE_INFO_V4` footprint (`fast-bench-check`), Parquet & HTTP SSE, Agent plugin |
-| [`packages/fast-bge-small`](packages/fast-bge-small) | `BAAI/bge-small-en-v1.5` (`33M`) | Metal 4 MPP + 16-core ANE (`hetero`) + standalone zero-Python `bge-ane-cli` |
-| [`packages/fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | `google/embeddinggemma-2` (`300M`) | Metal 4 MPP + 16-core ANE (`W8A16`) + CPU SME (`hetero2`/`hetero`) + standalone `emb2-ane-cli` |
-| [`packages/fast-pplx`](packages/fast-pplx) | `pplx-embed-v2-context-0.6b` (`0.6B`) | `Qwen3.5` hybrid GDN + SDPA up to `32K`, `hetero2` ANE (`w8a16`), `MappedEmbedding`, MRL `128..1024`, `--context-tokens` Parquet + `benchmark.py` |
-| [`packages/fast-gemma4`](packages/fast-gemma4) | `google/gemma-4-E2B-it` (`~2B` act.) | Rolling `B_slots=128` (`kv_i8`) + Early14 Linear-W8 ANE ring (`1,326` ops) + `llguidance` + `forward_ff_jump_slot` + `PromptLookup` |
-| [`packages/fast-gpt-oss`](packages/fast-gpt-oss) | `openai/gpt-oss-20b` (`20.9B` `MXFP4` MoE) | Unified Hot-MPP + Cold-QMV MoE, Hydragen v2 + SWA-128, `131K` pruned `lm_head`, `llguidance` |
-| [`packages/fast-decision-models`](packages/fast-decision-models) | `Laya-Typed-421M` + `Kev-0.8B` | Pure ANE (`[1585,0,0]`, `P=4` `IOSurface` + NEON) & `W8` MLX left-padded judge (stdlib `zipfile` `head.pt`) |
+| [`packages/fast-shared`](packages/fast-shared) | Shared runtime & toolkit | Reusable Metal 4/CoreML/Accelerate kernels, `MappedEmbedding`, `RUSAGE_INFO_V4` memory tooling (`fast-bench-check`), `fast-ir-guard`, Parquet & HTTP SSE, Agent plugin |
+| [`packages/fast-bge-small`](packages/fast-bge-small) | `BAAI/bge-small-en-v1.5` (`33M`) | Sub-ms (`0.53 ms`) search queries & `207K tok/s` batch indexing (ANE+GPU `hetero`, OpenAI HTTP, Parquet, zero-Python `bge-ane-cli`) |
+| [`packages/fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | `google/embeddinggemma-2` (`300M`) | `2048`-context MRL (`128..768`-d) retrieval & OCR chunking (`31.8K–36.9K tok/s`, OpenAI HTTP, Parquet, `emb2-ane-cli`) |
+| [`packages/fast-pplx`](packages/fast-pplx) | `pplx-embed-v2-context-0.6b` (`0.6B`) | `32K` late-chunking contextual embeddings in `2.69 GB` OS (`15.4K tok/s`, `1.71x–2.42x` vs `pplx-context-mlx`, MRL `128..1024`, `--context-tokens` Parquet) |
+| [`packages/fast-gemma4`](packages/fast-gemma4) | `google/gemma-4-E2B-it` (`~2B` act.) | Guaranteed schema-valid batch JSON extraction (`8.92 docs/s` at `6.26 GB` Metal, `int8` KV cache, PDF/Parquet CLI, SSE server) |
+| [`packages/fast-gpt-oss`](packages/fast-gpt-oss) | `openai/gpt-oss-20b` (`20.9B` `MXFP4` MoE) | High-concurrency 20B structured generation (`555.5 tok/s` at `B=128`, shared-prefix KV reuse, OpenAI SSE server, Parquet CLI) |
+| [`packages/fast-decision-models`](packages/fast-decision-models) | `Laya-Typed-421M` + `Kev-0.8B` | Fast local binary, multi-choice, & scalar document scoring (`50.95 q/s` Metal or `40.53 q/s` pure ANE with `0` GPU ops) |
 
 ## Live Monorepo Showcase (`scripts/benchmark_monorepo.py`)
 
