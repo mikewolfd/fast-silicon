@@ -190,19 +190,35 @@ class BaseFastTokenizer:
         while pos < n:
             end = min(n, pos + eff_max_body)
             c0 = 0 if pos == 0 else offsets[pos][0]
-            while end > pos:
-                if end < n and offsets[end - 1][1] > offsets[end][0]:
-                    end -= 1
-                    continue
-                # Include whitespace ignored by the tokenizer, and never split
-                # a Unicode character with multiple tokens sharing an offset.
-                c1 = len(text) if end == n else max(offsets[end - 1][1], offsets[end][0])
-                ids = self._tok.encode(eff_prefix + text[c0:c1], add_special_tokens=True).ids
-                if len(ids) <= max_chunk_tokens:
-                    break
+            # Step back off mid-character overlapping token boundaries first.
+            while end > pos and end < n and offsets[end - 1][1] > offsets[end][0]:
                 end -= 1
-            else:
+            if end <= pos:
                 raise ValueError("A source character or token span cannot fit max_chunk_tokens with its prefix")
+
+            c1 = len(text) if end == n else max(offsets[end - 1][1], offsets[end][0])
+            ids = self._tok.encode(eff_prefix + text[c0:c1], add_special_tokens=True).ids
+            if len(ids) > max_chunk_tokens:
+                # Binary-search over valid character-boundary end positions in [pos + 1, end - 1].
+                valid_ends = [
+                    e for e in range(pos + 1, end) if e == n or offsets[e - 1][1] <= offsets[e][0]
+                ]
+                best: tuple[int, int, list[int]] | None = None
+                lo = 0
+                hi = len(valid_ends) - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    cand_end = valid_ends[mid]
+                    cand_c1 = len(text) if cand_end == n else max(offsets[cand_end - 1][1], offsets[cand_end][0])
+                    cand_ids = self._tok.encode(eff_prefix + text[c0:cand_c1], add_special_tokens=True).ids
+                    if len(cand_ids) <= max_chunk_tokens:
+                        best = (cand_end, cand_c1, cand_ids)
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                if best is None:
+                    raise ValueError("A source character or token span cannot fit max_chunk_tokens with its prefix")
+                end, c1, ids = best
 
             chunks.append((self._finalize_ids(ids, max_chunk_tokens), c0, c1))
             if end >= n:

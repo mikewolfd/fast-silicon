@@ -1348,3 +1348,267 @@ def test_top128_tail_mass_bounds_exact_and_fallback_cpu(tmp_path: Path) -> None:
     assert st_counters["full_vocab_logit_copies"] == 1
     assert _enum_matcher().validate_tokens([t_st])
 
+
+def test_dead_kernels_removed_and_norm_bf16_coercion_cpu(tmp_path: Path) -> None:
+    """Verify dead Metal kernels were removed and RMSNorm weights are coerced to `bfloat16`."""
+    import mlx.core as mx
+
+    sources = render_kernel_sources(KernelSpec())
+    for dead_name in (
+        "aff_q4_qmv_f16",
+        "aff_q4_qmv_resid_bf16",
+        "moe_b1_gu_swiglu",
+        "moe_b1_dn_resid_bf16",
+    ):
+        assert dead_name not in sources, f"Dead kernel {dead_name} still compiled"
+    assert "unpack4_scaled" not in sources["moe_batch_gu_unified"]["header"]
+    assert "e8m0_to_float" in sources["moe_batch_gu_unified"]["header"]
+
+    # Build a synthetic checkpoint with float32 norm weights and verify FastGptOssModel coerces them to bfloat16!
+    mdir = _build_synthetic_mxfp4_model_dir(tmp_path / "ckpt_f32ln", tmp_path / "tok_f32ln")
+    sf_path = mdir / "model.safetensors"
+    raw = mx.load(str(sf_path))
+    raw["model.norm.weight"] = raw["model.norm.weight"].astype(mx.float32)
+    raw["model.layers.0.input_layernorm.weight"] = raw["model.layers.0.input_layernorm.weight"].astype(mx.float32)
+    raw["model.layers.0.post_attention_layernorm.weight"] = raw["model.layers.0.post_attention_layernorm.weight"].astype(mx.float16)
+    mx.save_safetensors(str(sf_path), raw)
+
+    m = FastGptOssModel(mdir, vocab_out=None, compile_kernels=False)
+    assert m.final_norm.dtype == mx.bfloat16
+    assert m.layers[0]["in_ln"].dtype == mx.bfloat16
+    assert m.layers[0]["pa_ln"].dtype == mx.bfloat16
+
+    # Verify vocab_out pruning warns cleanly if tokenizer.json & vocab_remap_npz are absent,
+    # and loads from cached vocab_remap_npz even when tokenizer.json is absent!
+    import warnings
+
+    (mdir / "tokenizer.json").unlink()
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        m_warn = FastGptOssModel(mdir, vocab_out=128, compile_kernels=False)
+    assert m_warn.vocab_n == m_warn.full_vocab_size
+    assert any(issubclass(w.category, UserWarning) and "vocab pruning" in str(w.message) for w in rec)
+
+    remap_npz = tmp_path / "remap_128.npz"
+    np.savez(remap_npz, kept_old_ids=np.arange(128, dtype=np.int32))
+    m_npz = FastGptOssModel(mdir, vocab_out=128, vocab_remap_npz=remap_npz, compile_kernels=False)
+    assert m_npz.vocab_n == 128
+
+
+def test_memory_clamp_wave_sorting_wired_restore_and_paths_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify <=24 GiB wave clamping, length-sorted waves, wired-limit restore, and `paths.py` artifacts lookup."""
+    from collections import OrderedDict
+    import warnings
+    from fast_gpt_oss.engine import FastGptOssEngine, recommended_max_wave_batch
+    import fast_gpt_oss.paths as gpt_paths
+
+    # 1. Unified memory clamping
+    assert recommended_max_wave_batch(16 << 30) == 8
+    assert recommended_max_wave_batch(24 << 30) == 16
+    assert recommended_max_wave_batch(48 << 30) == 64
+
+    assert select_gpt_oss_plan("auto", 64, None, memory_bytes=16 << 30) == ("batched", 8)
+    assert select_gpt_oss_plan("auto", 64, None, memory_bytes=24 << 30) == ("batched", 16)
+    assert select_gpt_oss_plan("auto", 64, None, memory_bytes=48 << 30) == ("batched", 64)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        assert select_gpt_oss_plan("batched", 64, 32, memory_bytes=16 << 30) == ("batched", 8)
+    assert any(issubclass(w.category, UserWarning) and "Clamping wave batch_size" in str(w.message) for w in rec)
+
+    # 2. `paths.py` checks `artifacts/` instead of stopping on `pyproject.toml`
+    fake_pkg = tmp_path / "monorepo" / "packages" / "fast-gpt-oss"
+    fake_file = fake_pkg / "src" / "fast_gpt_oss" / "paths.py"
+    fake_file.parent.mkdir(parents=True)
+    fake_file.write_text("", encoding="utf-8")
+    (fake_pkg / "pyproject.toml").write_text("", encoding="utf-8")
+    monkeypatch.delenv("FAST_GPT_OSS_HOME", raising=False)
+    monkeypatch.setattr(gpt_paths, "__file__", str(fake_file))
+    assert gpt_paths.resolve_paths().home == (Path("~/.cache") / "fast-gpt-oss").expanduser().resolve()
+    (fake_pkg / "artifacts").mkdir()
+    assert gpt_paths.resolve_paths().home == fake_pkg.resolve()
+
+    # 3. Length-sorted multi-wave slicing preserves exact original input order & clears cache between waves
+    tok_path = _write_synthetic_o200k_tokenizer(tmp_path)
+    tok = FastGptOssTokenizer(tok_path)
+    seen_wave_lens: list[list[int]] = []
+
+    class _SortingSpyEng(FastGptOssEngine):
+        def _run_batched_wave(self, prompt_ids_wave, **_kwargs):
+            seen_wave_lens.append([len(p) for p in prompt_ids_wave])
+            return {
+                "out_ids": [tok.encode(f"len={len(p)}") for p in prompt_ids_wave],
+                "ff_skipped": [0] * len(prompt_ids_wave),
+                "mask_hits": [0] * len(prompt_ids_wave),
+                "finished": [True] * len(prompt_ids_wave),
+                "lcp": 0,
+                "prefix_sec": 0.0,
+                "prefix_hit": False,
+                "prefill_sec": 0.0,
+                "decode_sec": 0.01,
+                "steps": 1,
+                "compactions": 0,
+            }
+
+    eng = _SortingSpyEng.__new__(_SortingSpyEng)
+    eng.tokenizer = tok
+    eng.model = SimpleNamespace(vocab_n=tok.vocab_size, new_to_old=np.arange(tok.vocab_size, dtype=np.int32))
+    eng.default_mode = "batched"
+    eng.default_reasoning_effort = "skip"
+    eng.min_prefix_cache_tokens = 1
+    eng._max_prefix_cache = 8
+    eng._max_grammar_cache = 8
+    eng._prefix_cache = OrderedDict()
+    eng._grammar_cache = OrderedDict()
+    eng._lock = threading.RLock()
+    eng._dummy_pad_id = 0
+    eng._host_memory_bytes = 48 << 30
+    eng._prev_wired_limit = None
+    eng._wired_limit_restored = True
+
+    prompts = ["hi", "hello world alpha beta hello world", "a", "hello world beta alpha hello world"]
+    res = eng.generate_batch(prompts, mode="batched", batch_size=2, use_chat_template=False)
+    assert len(seen_wave_lens) == 2
+    assert max(seen_wave_lens[0]) <= min(seen_wave_lens[1]), f"Waves not sorted by length: {seen_wave_lens}"
+    # Verify original order restored in `res.items`!
+    for i, item in enumerate(res.items):
+        assert item.text == f"len={item.prompt_tokens}"
+    assert res.items[0].prompt_tokens < res.items[1].prompt_tokens
+    assert res.items[2].prompt_tokens < res.items[3].prompt_tokens
+
+    # 4. Wired limit restore in `close()`
+    import mlx.core as mx
+
+    wired_calls: list[int] = []
+    orig_set_wired = getattr(mx, "set_wired_limit", None)
+    if callable(orig_set_wired):
+        monkeypatch.setattr(mx, "set_wired_limit", lambda lim: wired_calls.append(lim) or 0)
+        eng._prev_wired_limit = 123456789
+        eng._wired_limit_restored = False
+        eng.close()
+        assert wired_calls == [123456789]
+        # Second close is idempotent
+        eng.close()
+        assert wired_calls == [123456789]
+
+
+def test_hot_mpp_extreme_e8m0_scale_chunked_moe_and_swa8q1kv_gpu(tmp_path: Path) -> None:
+    """Verify Hot-MPP has zero NaN/inf at E8M0=141 (6*2^14=98304 > FP16 max) & E8M0=100, chunked >256 MoE, and 8Q:1KV SWA."""
+    import mlx.core as mx
+
+    mdir = _build_synthetic_mxfp4_model_dir(tmp_path / "ckpt_hot", tmp_path / "tok_hot")
+    m = FastGptOssModel(mdir, vocab_out=None, compile_kernels=True)
+
+    # 1. Hot-MPP vs Cold-QMV vs gather_qmm at extreme E8M0=141 (previously half4 -> inf -> NaN with 0.0!)
+    #    and E8M0=100 (previously half4 underflow -> 0.0!).
+    ld = dict(m.layers[0])
+    E, D_ff, H = m.num_local_experts, m.d_ff, m.H
+    ng_h = H // 32
+    ng_d = D_ff // 32
+
+    # Pack E2M1 nibble 0x7 (+6.0) on block 0 with E8M0=141 (scale=2^14=16384 -> 6*2^14=98304 > 65504!)
+    # and E8M0=100 (scale=2^-27 -> previously flushed to 0.0 in half4!) on block 1.
+    gu_w = mx.full((E, 2 * D_ff, ng_h * 4), 0xF7F7F7F7, dtype=mx.uint32)
+    dn_w = mx.full((E, H, ng_d * 4), 0xF7F7F7F7, dtype=mx.uint32)
+    gu_w_np = np.full((E, 2 * D_ff, ng_h * 4), 0xF7F7F7F7, dtype=np.uint32)
+    gu_w_np[0, :, :4] = 0x77777777  # +6.0 across block 0 -> exact non-zero product with E8M0=141!
+    dn_w_np = np.full((E, H, ng_d * 4), 0xF7F7F7F7, dtype=np.uint32)
+    dn_w_np[0, :, :4] = 0x11111111  # +0.5 across block 0
+    gu_s_np = np.full((E, 2 * D_ff, ng_h), 120, dtype=np.uint8)
+    gu_s_np[0, :, 0] = 141
+    gu_s_np[0, :, 1] = 100
+    dn_s_np = np.full((E, H, ng_d), 120, dtype=np.uint8)
+    dn_s_np[0, :, 0] = 132
+    dn_s_np[0, :, 1] = 100
+    ld["gu_w"] = mx.array(gu_w_np, dtype=mx.uint32)
+    ld["gu_s"] = mx.array(gu_s_np, dtype=mx.uint8)
+    ld["dn_w"] = mx.array(dn_w_np, dtype=mx.uint32)
+    ld["dn_s"] = mx.array(dn_s_np, dtype=mx.uint8)
+
+    # 20 tokens all routing slot 0 to expert 0 (20 > 8 -> Hot-MPP with 12 zero-padded rows!) and slot 1..3 to cold experts
+    b_ext = 20
+    rng = np.random.default_rng(55)
+    pn_np = (rng.standard_normal((b_ext, H)) * 1e-4).astype(np.float16)
+    # Explicitly put exact 0.0f in half of block 0 (would trigger inf*0.0 -> NaN under old half4 unpack4_scaled!)
+    # and positive values in the other half so Hot-MPP produces non-trivial finite outputs!
+    pn_np[:, :16] = 0.0
+    pn_np[:, 16:32] = np.float16(1e-4)
+    pn_ext = mx.array(pn_np, dtype=mx.float16)
+    h_ext = mx.zeros((b_ext, H), dtype=mx.bfloat16)
+
+    inds_np = np.zeros((b_ext, 4), dtype=np.int32)
+    inds_np[:, 0] = 0
+    for i in range(b_ext):
+        inds_np[i, 1] = 1 + (i % 5)
+        inds_np[i, 2] = 6 + (i % 5)
+        inds_np[i, 3] = 11 + (i % 5)
+    inds_ext = mx.array(inds_np, dtype=mx.int32)
+    scores_ext = mx.full((b_ext, 4), 0.25, dtype=mx.float32)
+
+    h_mpp = m._moe_tile_mpp_chunk(pn_ext, h_ext, inds_ext, scores_ext, ld)
+    # Use float32 input for exact reference (avoids MLX float16 gather_qmm's own FP16 dequant overflow at E8M0=141!)
+    h_ref = m._moe_gather_qmm_nax(pn_ext.astype(mx.float32), h_ext, inds_ext, scores_ext, ld)
+    # Also run B=1 (Cold-QMV only!) for token 0 to verify Hot-MPP == Cold-QMV directly!
+    h_cold0 = m._moe_tile_mpp_chunk(pn_ext[:1], h_ext[:1], inds_ext[:1], scores_ext[:1], ld)
+    mx.eval(h_mpp, h_ref, h_cold0)
+
+    mpp_f32 = np.asarray(h_mpp.astype(mx.float32))
+    ref_f32 = np.asarray(h_ref.astype(mx.float32))
+    cold0_f32 = np.asarray(h_cold0.astype(mx.float32))
+    assert np.all(np.isfinite(mpp_f32)), "Hot-MPP produced NaN/inf at E8M0=141!"
+    assert np.all(np.isfinite(cold0_f32)), "Cold-QMV produced NaN/inf at E8M0=141!"
+    assert float(np.max(np.abs(mpp_f32))) > 1.0, "Expected non-trivial signal from E8M0=141 block"
+    np.testing.assert_allclose(mpp_f32[0], cold0_f32[0], rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(mpp_f32, ref_f32, rtol=3e-2, atol=3e-2)
+
+    # 2. Chunked tile-table MPP for n_tok > 256 (e.g. n_tok=280) vs gather_qmm reference!
+    ld0 = m.layers[0]
+    n_big = 280
+    h_big = (mx.random.normal((n_big, H)) * 2.0).astype(mx.bfloat16)
+    pn_big = m.rms_f16(h_big, ld0["pa_ln"])
+    rl_big = m._linear(
+        pn_big, ld0["r_w"], ld0["r_s"], ld0["r_b"], is_quant=True, bits=ld0["r_bits"], group_size=ld0["r_gs"], bias=ld0["r_bias"]
+    )
+    inds_big, scores_big = m._route_c(rl_big)
+    h_chunked = m._moe_forward(pn_big, h_big, inds_big, scores_big, ld0)
+    h_big_ref = m._moe_gather_qmm_nax(pn_big, h_big, inds_big, scores_big, ld0)
+    mx.eval(h_chunked, h_big_ref)
+    assert float(mx.max(mx.abs(h_chunked.astype(mx.float32) - h_big_ref.astype(mx.float32)))) < 0.08
+
+    # 3. 8Q:1KV packed `swa128_prefill_mma` on non-multiple-of-8 L_q=37 with Offset=11, Window=16 vs exact float32 ref!
+    l_q, off_swa, win_swa = 37, 11, 16
+    l_kv = off_swa + l_q
+    q_t = (mx.random.normal((1, m.n_q, l_q, m.hd)) * 0.3).astype(mx.float16)
+    k_t = (mx.random.normal((1, m.n_kv, l_kv, m.hd)) * 0.3).astype(mx.float16)
+    v_t = (mx.random.normal((1, m.n_kv, l_kv, m.hd)) * 0.3).astype(mx.float16)
+    sinks_t = ld0["sinks_f32"]
+    p_arr = mx.array([l_q, l_kv, off_swa, win_swa, m.scale_u32], dtype=mx.uint32)
+    att_got = m.kernels["swa128_prefill_mma"](
+        inputs=[q_t, k_t, v_t, sinks_t, p_arr],
+        grid=(((l_q + 7) // 8) * 256, m.n_kv, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, m.n_q, l_q, m.hd)],
+        output_dtypes=[mx.float16],
+    )[0]
+    mx.eval(att_got)
+
+    q_np = np.asarray(q_t.astype(mx.float32))[0]
+    k_np = np.asarray(k_t.astype(mx.float32))[0]
+    v_np = np.asarray(v_t.astype(mx.float32))[0]
+    sinks_np = np.asarray(sinks_t, dtype=np.float32)
+    ref_att = np.zeros_like(q_np)
+    for hq in range(m.n_q):
+        hkv = hq // 8
+        sc = (q_np[hq] @ k_np[hkv].T) * m.scale  # [l_q, l_kv]
+        q_abs = np.arange(l_q)[:, None] + off_swa
+        k_abs = np.arange(l_kv)[None, :]
+        valid = (q_abs >= k_abs) & ((q_abs - k_abs) < win_swa)
+        sc = np.where(valid, sc, -1e30)
+        sink_col = np.full((l_q, 1), sinks_np[hq], dtype=np.float32)
+        sc_ext = np.concatenate([sc, sink_col], axis=-1)
+        m_max = sc_ext.max(axis=-1, keepdims=True)
+        ex = np.exp(sc_ext - m_max)
+        probs = ex[:, :-1] / ex.sum(axis=-1, keepdims=True)
+        ref_att[hq] = probs @ v_np[hkv]
+    got_np = np.asarray(att_got.astype(mx.float32))[0]
+    assert float(np.max(np.abs(got_np - ref_att))) < 5e-3
+

@@ -558,3 +558,182 @@ def test_real_staged_ane_vs_gpu_parity_and_hetero2_speed() -> None:
             vecs_h2 = eng.encode_documents(mixed, mode="hetero2", normalize=True)
             assert vecs_h2.shape == (len(mixed), 1024)
             assert np.all(np.isfinite(vecs_h2))
+
+
+def test_build_ane_eps_clamp_prescaling_and_outlier_gdn_fp16_preservation() -> None:
+    bam = _load_script_module("fast_pplx_build_ane_models_remediation", _BUILD_ANE_PATH)
+
+    # 1. FP16 eps floor >= 2^-14 (never subnormal 1e-6 / 1.2e-7)
+    fp16_min = float(np.finfo(np.float16).tiny)
+    assert np.isclose(bam.FP16_MIN_NORMAL, fp16_min, rtol=1e-9)
+    for raw_eps in (0.0, 1.2e-7, 1e-6, 1e-5, 6.0e-5):
+        clamped = bam.clamp_fp16_eps(raw_eps)
+        assert clamped >= fp16_min
+        assert np.float16(clamped) >= np.float16(fp16_min)
+        assert np.float16(clamped) > np.float16(0.0)
+    assert bam.clamp_fp16_eps(0.016384) == pytest.approx(0.016384)
+
+    # 2. Extended 1/64 prescaling across l5..l11 + final_norm (no 1/8 overflow risk on l6..l8)
+    for name in ("l5_in_ln", "l6_post_ln", "l7_in_ln", "l8_post_ln", "l9_in_ln", "l11_post_ln", "final_norm"):
+        assert bam.resolve_rmsnorm_prescale(name) == pytest.approx(1.0 / 64.0)
+    for name in ("l0_in_ln", "l4_post_ln"):
+        assert bam.resolve_rmsnorm_prescale(name) == pytest.approx(1.0)
+    # Calibrated override respected
+    assert bam.resolve_rmsnorm_prescale("l3_in_ln", calib_stats={"norms": {"l3_in_ln": {"absmax": 3000.0}}}) == pytest.approx(1.0 / 64.0)
+
+    # 3. High-outlier + sensitive GDN projections excluded from global INT8 quantization
+    cfg = PplxConfig()
+    preserved = bam.select_fp16_preserved_ops(0, 12, cfg.layer_types, preserve_gdn_fp16=True)
+    for expected in (
+        "l5_mlp_dn", "l7_mlp_dn", "l8_mlp_dn", "l9_mlp_dn", "l10_mlp_dn", "l11_mlp_dn",
+        "l0_qkvzba", "l0_conv1d", "l0_out_proj", "l8_out_proj", "l10_out_proj",
+    ):
+        assert expected in preserved
+    assert "l1_qkvgate" not in preserved
+    assert "l1_mlp_gu" not in preserved
+
+    # Mocked coremltools.optimize.coreml config builder verifies op_name_configs disables INT8 on excluded ops
+    class _FakeCTO:
+        class OpLinearQuantizerConfig:
+            def __init__(self, **kw):
+                self.kw = kw
+
+        class OptimizationConfig:
+            def __init__(self, *, op_type_configs, op_name_configs):
+                self.op_type_configs = op_type_configs
+                self.op_name_configs = op_name_configs
+
+    q_cfg = bam.build_weight_quant_config(preserved, cto_module=_FakeCTO)
+    assert q_cfg.op_type_configs["conv"].kw["dtype"] == "int8"
+    assert q_cfg.op_name_configs["l8_mlp_dn"] is None
+    assert q_cfg.op_name_configs["l0_qkvzba"] is None
+    assert "l1_mlp_gu" not in q_cfg.op_name_configs
+
+    # 4. Core AI macOS 27.0+ status helper
+    st_off = bam.check_coreai_backend_status(macos_version="26.6", use_os_coreai=False)
+    assert st_off["eligible"] is False
+    st_old = bam.check_coreai_backend_status(macos_version="26.6", use_os_coreai=True)
+    assert st_old["eligible"] is False and "27.0+" in st_old["reason"]
+
+
+def test_build_ane_coreml_mil_emits_normal_fp16_eps_when_coremltools_installed() -> None:
+    pytest.importorskip("coremltools")
+    bam = _load_script_module("fast_pplx_build_ane_models_ct", _BUILD_ANE_PATH)
+    assert bam.FP16_MIN_NORMAL >= 6.1e-5
+
+
+def test_native_ane_cli_zip_bit3_and_alignment_and_error_propagation(tmp_path: Path) -> None:
+    import io
+    import subprocess
+    import zipfile
+    import zlib
+    from fast_pplx.engine import _coreml_last_error, _load_coreml_lib
+
+    paths = resolve_paths()
+    if not (paths.ane_cli.is_file() and paths.coreml_dylib.is_file()):
+        pytest.skip("Native binaries not built yet")
+
+    # 1. Misaligned seq_len % chunk_size != 0 must fail cleanly with clear stderr message
+    proc_align = subprocess.run(
+        [
+            str(paths.ane_cli),
+            "--stage", str(tmp_path / "missing.mlmodelc"),
+            "--seq-len", "100",
+            "--chunk-size", "32",
+            "--weights-npz", str(tmp_path / "w.npz"),
+            "--embed-safetensors", str(tmp_path / "e.safetensors"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_align.returncode != 0
+    assert "divisible by chunk_size" in proc_align.stderr
+
+    # 2. Construct a valid bit-3 (data descriptor, local comp_sz=0, uncomp_sz=0) .npz archive
+    #    and a synthetic F16 safetensors file with `model.embed_tokens.weight` key.
+    #    Running pplx-ane-cli with a nonexistent stage proves BOTH bit-3 ZIP parsing AND
+    #    broadened safetensors key mmap succeeded (it reaches stage load error, not ZIP/embed error).
+    hidden = 16
+    vocab = 8
+    embed_f16 = np.ones((vocab, hidden), dtype=np.float16)
+    raw_emb = embed_f16.tobytes()
+    hdr_dict = {
+        "model.embed_tokens.weight": {
+            "dtype": "F16",
+            "shape": [vocab, hidden],
+            "data_offsets": [0, len(raw_emb)],
+        }
+    }
+    hdr_b = json.dumps(hdr_dict, separators=(",", ":")).encode("utf-8")
+    hdr_b += b" " * ((-len(hdr_b)) % 8)
+    sf_path = tmp_path / "embed.safetensors"
+    with sf_path.open("wb") as fh:
+        fh.write(struct.pack("<Q", len(hdr_b)))
+        fh.write(hdr_b)
+        fh.write(raw_emb)
+
+    # Create bit-3 data-descriptor ZIP containing contextual_projection.weight.npy (deflated)
+    proj = np.eye(hidden, dtype=np.float32)
+    npy_buf = io.BytesIO()
+    np.save(npy_buf, proj)
+    npy_bytes = npy_buf.getvalue()
+    crc = zlib.crc32(npy_bytes) & 0xFFFFFFFF
+    comp_obj = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
+    comp_bytes = comp_obj.compress(npy_bytes) + comp_obj.flush()
+    fname = b"contextual_projection.weight.npy"
+
+    # Local header with bit 3 set (flags=0x0008) and zeroed crc/comp_sz/uncomp_sz
+    local_hdr = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50, 20, 0x0008, 8, 0, 0, 0, 0, 0, len(fname), 0,
+    ) + fname
+    data_desc = struct.pack("<IIII", 0x08074B50, crc, len(comp_bytes), len(npy_bytes))
+    cd_offset = len(local_hdr) + len(comp_bytes) + len(data_desc)
+    cd_hdr = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50, 20, 20, 0x0008, 8, 0, 0, crc, len(comp_bytes), len(npy_bytes),
+        len(fname), 0, 0, 0, 0, 0, 0,
+    ) + fname
+    eocd = struct.pack(
+        "<IHHHHIIH",
+        0x06054B50, 0, 0, 1, 1, len(cd_hdr), cd_offset, 0,
+    )
+    npz_bit3 = tmp_path / "bit3_weights.npz"
+    npz_bit3.write_bytes(local_hdr + comp_bytes + data_desc + cd_hdr + eocd)
+    # Sanity check Python zipfile reads our synthetic archive cleanly
+    with zipfile.ZipFile(npz_bit3, "r") as zf:
+        assert "contextual_projection.weight.npy" in zf.namelist()
+
+    proc_zip = subprocess.run(
+        [
+            str(paths.ane_cli),
+            "--stage", str(tmp_path / "does_not_exist.mlmodelc"),
+            "--seq-len", "64",
+            "--chunk-size", "32",
+            "--weights-npz", str(npz_bit3),
+            "--embed-safetensors", str(sf_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_zip.returncode != 0
+    assert "Failed to mmap" not in proc_zip.stderr
+    assert "Failed to read contextual_projection" not in proc_zip.stderr
+    assert "Failed to load CoreML ANE stage pipeline" in proc_zip.stderr
+
+    # 3. Verify pplx_coreml_runner propagates NSError via pplx_ane_last_error and returns <0 on bad plan
+    lib = _load_coreml_lib(paths.coreml_dylib)
+    buf = ctypes.create_string_buffer(512)
+    rc = lib.pplx_ane_inspect_plan(str(tmp_path / "missing.mlmodelc").encode("utf-8"), 0, buf, 512)
+    assert rc < 0
+    parsed = json.loads(buf.value.decode("utf-8"))
+    assert "error" in parsed and parsed["error"]
+    assert _coreml_last_error(lib) != ""
+
+    bad_arr = (ctypes.c_char_p * 1)(str(tmp_path / "missing.mlmodelc").encode("utf-8"))
+    handle = lib.pplx_ane_load_stages(bad_arr, 1, 64, 1024, 32, 32, 2, 0)
+    assert not handle
+    err_txt = _coreml_last_error(lib)
+    assert "MLComputePlan" in err_txt or "failed" in err_txt.lower()

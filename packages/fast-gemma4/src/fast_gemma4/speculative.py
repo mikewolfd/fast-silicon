@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 from typing import Any, Sequence
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -20,9 +21,11 @@ from .ane_pipeline import (
     AsyncHybridPrefillRing,
     SlotCacheMetalBinding,
     is_ane_resident_bundle,
+    is_w8_bundle_calibrated,
+    validate_slot_kv_scales_finite,
 )
 from .grammar import GrammarHelper, sample_unconstrained
-from .model import FastGemma4Model
+from .model import FastGemma4Model, safe_argmax_with_nan_guard
 
 
 def build_ngram_table(
@@ -160,6 +163,7 @@ def _resolve_or_build_ane_ring(
     *,
     use_ane_ring: bool | str,
     ane_ring: Any | None,
+    ane_ring_variant: str = "fp16",
 ) -> AsyncHybridPrefillRing | None:
     want_ane, require_ane = _parse_use_ane_ring(use_ane_ring)
     if not want_ane:
@@ -186,6 +190,9 @@ def _resolve_or_build_ane_ring(
     if ane_ring is not None:
         return ane_ring
 
+    if not require_ane and 0.0 < _host_ram_gib() < 32.0:
+        return None
+
     paths = getattr(model, "paths", None)
     model_dir = getattr(model, "model_dir", None)
     if paths is None or not paths.lib_ane_prefix.exists():
@@ -193,23 +200,37 @@ def _resolve_or_build_ane_ring(
             raise RuntimeError("libgemma4_ane_prefix.dylib is unavailable for use_ane_ring=True.")
         return None
 
-    w8_bundle = paths.resolve_ane_bundle("w8", model_dir=model_dir, local_files_only=True)
-    if not is_ane_resident_bundle(paths.lib_ane_prefix, w8_bundle):
+    exit_layer = getattr(model, "first_kv_shared", 15) - 1
+    try:
+        bundle = paths.resolve_ane_bundle(
+            ane_ring_variant, model_dir=model_dir, local_files_only=True, exit_layer=exit_layer
+        )
+    except TypeError:
+        bundle = paths.resolve_ane_bundle(ane_ring_variant, model_dir=model_dir, local_files_only=True)
+    if not is_ane_resident_bundle(paths.lib_ane_prefix, bundle):
         if require_ane:
             raise RuntimeError(
-                f"No valid linear-int8 ANE bundle (`0` CPU runtime ops) found for model_dir={model_dir} (checked {w8_bundle})."
+                f"No valid {ane_ring_variant} ANE bundle (`0` CPU runtime ops) found for model_dir={model_dir} (checked {bundle})."
             )
         return None
-    assert w8_bundle is not None
+    assert bundle is not None
 
-    cached_runner: AnePrefixRunner | None = getattr(model, "_auto_ane_w8_runner", None)
-    cached_bundle: str | None = getattr(model, "_auto_ane_w8_bundle", None)
-    if cached_runner is None or cached_bundle != str(w8_bundle):
+    if ane_ring_variant == "w8" and not is_w8_bundle_calibrated(bundle):
+        warnings.warn(
+            f"ANE ring bundle {bundle.name} is Linear-W8 without a domain-corpus/QAT calibration manifest; "
+            "consider ane_ring_variant='fp16' or calibrating with `--awq-mse --calib-file ...`.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    cached_runner: AnePrefixRunner | None = getattr(model, "_auto_ane_runner", None)
+    cached_bundle: str | None = getattr(model, "_auto_ane_bundle", None)
+    if cached_runner is None or cached_bundle != str(bundle):
         if cached_runner is not None:
             cached_runner.close()
-        cached_runner = AnePrefixRunner(paths.lib_ane_prefix, w8_bundle, pipe_depth=4, out_ring_slots=96)
-        model._auto_ane_w8_runner = cached_runner
-        model._auto_ane_w8_bundle = str(w8_bundle)
+        cached_runner = AnePrefixRunner(paths.lib_ane_prefix, bundle, pipe_depth=4, out_ring_slots=96)
+        model._auto_ane_runner = cached_runner
+        model._auto_ane_bundle = str(bundle)
 
     tables = getattr(model, "_auto_cpu_ane_tables", None)
     if tables is None:
@@ -347,16 +368,22 @@ def run_decode_batch(
             last_x = cache.get("_last_x_in")
             if temperature > 0.0:
                 lg_np = np.array(logits_2d.astype(mx.float32))
+                nan_rows = [active[r] for r in row_indices if bool(np.isnan(lg_np[r]).any())]
+                if nan_rows:
+                    raise FloatingPointError(f"NaN logits detected in run_decode_batch for rows {nan_rows}")
                 am_np = np.argmax(lg_np, axis=-1).tolist()
                 for r in row_indices:
                     xr = last_x[r, -1] if last_x is not None else None
                     consume_sampled(active[r], lg_np[r], am_np[r], x_row_mx=xr)
                 return
 
-            am_mx = mx.argmax(logits_2d, axis=-1)
+            am_mx = safe_argmax_with_nan_guard(logits_2d, axis=-1)
             mx.eval(am_mx)
             am_list = am_mx.tolist()
             del am_mx
+            bad_rows = [active[r] for r in row_indices if int(am_list[r]) < 0]
+            if bad_rows:
+                raise FloatingPointError(f"NaN logits detected in run_decode_batch for rows {bad_rows}")
             if grammar is None:
                 for r in row_indices:
                     consume_sampled(active[r], None, am_list[r])
@@ -626,9 +653,12 @@ def run_decode_prompt_lookup(
         return True
 
     if init_lg is not None:
-        am_mx0 = mx.argmax(init_lg[:, 0, :], axis=-1)
+        am_mx0 = safe_argmax_with_nan_guard(init_lg[:, 0, :], axis=-1)
         mx.eval(am_mx0)
         am_list0 = am_mx0.tolist()
+        bad0 = [active[r] for r in range(len(active)) if int(am_list0[r]) < 0]
+        if bad0:
+            raise FloatingPointError(f"NaN logits detected in run_decode_prompt_lookup init_lg for rows {bad0}")
         last_x0 = cache.get("_last_x_in")
         if grammar is None:
             for r, b in enumerate(active):
@@ -712,9 +742,11 @@ def run_decode_prompt_lookup(
             )
         else:
             lg_step = model.forward_step_ragged(batch_mx, cache, off_cur, apply_softcap=True)
-        am_mx = mx.argmax(lg_step, axis=-1)
+        am_mx = safe_argmax_with_nan_guard(lg_step, axis=-1)
         mx.eval(am_mx)
         am_list = am_mx.tolist()
+        if np.any(np.asarray(am_list, dtype=np.int32) < 0):
+            raise FloatingPointError("NaN logits detected in run_decode_prompt_lookup verification step")
         verify_steps += 1
         last_x_step = cache.get("_last_x_in")
 
@@ -864,6 +896,7 @@ def run_decode_rolling(
     ane_ring: Any | None = None,
     ane_cohort_size: int = 16,
     enable_ff_jump: bool = True,
+    ane_ring_variant: str = "fp16",
 ) -> dict[str, Any]:
     """
     Continuous length-sorted slot-refill rolling GPU (+ optional Async Hybrid ANE+GPU) scheduler:
@@ -917,6 +950,7 @@ def run_decode_rolling(
             "used_ane_ring": False,
             "ane_cohorts": 0,
             "ane_busy_sec": 0.0,
+            "ane_nan_fallbacks": 0,
             "gpu_boot_cohorts": 0,
         }
 
@@ -948,6 +982,7 @@ def run_decode_rolling(
             "used_ane_ring": False,
             "ane_cohorts": 0,
             "ane_busy_sec": 0.0,
+            "ane_nan_fallbacks": 0,
             "gpu_boot_cohorts": 0,
         }
 
@@ -956,13 +991,15 @@ def run_decode_rolling(
     eff_group_size = min(group_size, 8 if B_slots <= 32 else 16)
     max_suf = max(len(s) for s in suf_list)
     eff_doc_cap_full = max(int(doc_cap_full), max_suf + max_tokens + 64, 128)
-    cache = model.make_slot_cache(
-        prefix_kv,
-        batch_size=B_slots,
-        doc_cap_full=eff_doc_cap_full,
-        swa_ring_cap=swa_ring_cap,
-        kv_i8=kv_i8,
-    )
+    slot_cache_kwargs: dict[str, Any] = {
+        "batch_size": B_slots,
+        "doc_cap_full": eff_doc_cap_full,
+        "swa_ring_cap": swa_ring_cap,
+        "kv_i8": kv_i8,
+    }
+    if int(max_ff_drain) > 16:
+        slot_cache_kwargs["drain_slack"] = int(max_ff_drain)
+    cache = model.make_slot_cache(prefix_kv, **slot_cache_kwargs)
 
     active_ane_ring = _resolve_or_build_ane_ring(
         model,
@@ -971,6 +1008,7 @@ def run_decode_rolling(
         suf_list,
         use_ane_ring=use_ane_ring,
         ane_ring=ane_ring,
+        ane_ring_variant=ane_ring_variant,
     )
 
     doc_order = (
@@ -1010,6 +1048,7 @@ def run_decode_rolling(
     decode_sec = 0.0
     ane_cohorts = 0
     ane_busy_sec = 0.0
+    ane_nan_fallbacks = 0
     gpu_boot_cohorts = 0
 
     stop_event = threading.Event()
@@ -1157,11 +1196,11 @@ def run_decode_rolling(
         decode_sec += time.perf_counter() - td0
 
     def _admit_ane_cohort(item: dict[str, Any], target_slots: list[int]) -> None:
-        nonlocal prefill_sec, decode_sec, llm_steps, ane_cohorts, ane_busy_sec
+        nonlocal prefill_sec, decode_sec, llm_steps, ane_cohorts, ane_busy_sec, ane_nan_fallbacks
         tp0 = time.perf_counter()
         doc_indices = item["doc_ids"]
         sub_sufs = item["sufs"]
-        covered = item["covered"]
+        covered = list(item["covered"])
         K = len(doc_indices)
         assert active_ane_ring is not None
         model._eval_doc_layers(cache["layers"], bool(cache.get("kv_i8", True)))
@@ -1170,6 +1209,17 @@ def run_decode_rolling(
             active_ane_ring.scatter_cohort_to_slot_cache(live_binding, item, target_slots)
         ane_cohorts += 1
         ane_busy_sec += float(item.get("ane_sec", 0.0))
+
+        # Validate scattered KV_i8 scales (or BF16 KV) for Inf/NaN; if poisoned, recompute cohort cleanly on GPU!
+        if not validate_slot_kv_scales_finite(cache, target_slots):
+            warnings.warn(
+                "Non-finite (Inf/NaN) ANE KV or KV_i8 scale detected after ring scatter; "
+                "falling back to GPU BF16 prefill for this cohort.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            ane_nan_fallbacks += 1
+            covered = [0] * K
 
         l_sys_i = int(cache["l_sys"])
         # Finish on the GPU whatever suffix the ANE chunks did not cover.
@@ -1251,7 +1301,7 @@ def run_decode_rolling(
             if (can_ff_jump and n_ff <= 4 and max_ff_drain > 0)
             else max_ff_drain
         )
-        eff_drain = min(eff_drain, ff_pad_cap)
+        eff_drain = min(eff_drain, int(cache.get("drain_slack", 16)), ff_pad_cap)
         max_k = 1
         k_lens = [0] * n_ff
         max_priv_start = 0
@@ -1522,6 +1572,7 @@ def run_decode_rolling(
             "used_ane_ring": active_ane_ring is not None,
             "ane_cohorts": ane_cohorts,
             "ane_busy_sec": ane_busy_sec,
+            "ane_nan_fallbacks": ane_nan_fallbacks,
             "gpu_boot_cohorts": gpu_boot_cohorts,
         }
     finally:

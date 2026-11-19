@@ -6,12 +6,18 @@ import ctypes
 import json
 from pathlib import Path
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
+import warnings
 
 from ._common import softmax_2, softmax_vec
 from .paths import ensure_laya_dylib, resolve_laya_dir
 
 _QTYPES = {"choice": 0, "score": 1, "noul": 2}
+
+# Compute unit mode constants aligned 1:1 with `fast_shared::ComputeMode` & `laya_ane_runner.h`.
+COMPUTE_MODE_CPU_AND_ANE = 0
+COMPUTE_MODE_CPU_ONLY = 1
+COMPUTE_MODE_ALL = 2
 
 
 class LayaAneBackend:
@@ -23,7 +29,7 @@ class LayaAneBackend:
         dylib_path: Path | str | None = None,
         *,
         pipe_depth: int = 4,
-        compute_mode: int = 1,
+        compute_mode: int = COMPUTE_MODE_CPU_AND_ANE,
     ) -> None:
         import numpy as np
         from tokenizers import Tokenizer
@@ -84,6 +90,10 @@ class LayaAneBackend:
             ctypes.c_int,
         ]
         self._lib.laya_ane_exec_batch.restype = ctypes.c_double
+        self._has_last_error = hasattr(self._lib, "laya_ane_last_error")
+        if self._has_last_error:
+            self._lib.laya_ane_last_error.argtypes = [ctypes.c_void_p]
+            self._lib.laya_ane_last_error.restype = ctypes.c_char_p
         self._lib.laya_ane_free.argtypes = [ctypes.c_void_p]
 
         self._mc_s256 = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
@@ -153,8 +163,22 @@ class LayaAneBackend:
             return float(self.temperature_by_options.get(f"{prefix}:6-10", default_t))
         return float(self.temperature_by_options.get(f"{prefix}:11+", 1.0))
 
-    def encode_item(self, state: Any, qdef: Mapping[str, Any], *, max_len: int | None = None) -> dict[str, Any]:
-        """Encode one typed question (`noul`, `choice`, `score`) + state into token ids & option markers."""
+    def encode_item(
+        self,
+        state: Any,
+        qdef: Mapping[str, Any],
+        *,
+        max_len: int | None = None,
+        on_truncate: Literal["warn", "error", "ignore"] = "warn",
+    ) -> dict[str, Any]:
+        """Encode one typed question (`noul`, `choice`, `score`) + state into token ids & option markers.
+
+        `Laya-Typed-421M` ANE buckets are fixed at `S <= 512` (`self.max_len`). When the encoded
+        question + state exceeds `eff_max`, `on_truncate` controls behavior (`"warn"` emits a
+        `UserWarning`, `"error"` raises `ValueError`, `"ignore"` truncates silently).
+        """
+        if on_truncate not in ("warn", "error", "ignore"):
+            raise ValueError(f"Unsupported on_truncate={on_truncate!r}; expected 'warn', 'error', or 'ignore'.")
         eff_max = min(self.max_len, int(max_len)) if max_len is not None else self.max_len
         eff_head = min(self.head_max_len, 128) if eff_max <= 256 else self.head_max_len
         t = str(qdef["type"])
@@ -174,17 +198,26 @@ class LayaAneBackend:
             ]
         ins_raw = qdef["instructions"] if isinstance(qdef["instructions"], str) else json.dumps(qdef["instructions"])
         ins = str(ins_raw).replace(self.mask_tok, " ")
-        head_ids = self._encode_ids(f"{t} question: {ins}")
+        head_ids_raw = self._encode_ids(f"{t} question: {ins}")
         opt_cap = 32 if eff_max <= 256 else 48
         opt_ids: list[list[int]] = []
+        truncated_parts: list[str] = []
         for opt_s in opts:
-            opt_ids.append([self.mask_id] + self._encode_ids(" " + opt_s.replace(self.mask_tok, " "))[:opt_cap])
+            raw_opt = self._encode_ids(" " + opt_s.replace(self.mask_tok, " "))
+            if len(raw_opt) > opt_cap:
+                truncated_parts.append(f"option({len(raw_opt)}>{opt_cap})")
+            opt_ids.append([self.mask_id] + raw_opt[:opt_cap])
         opt_budget = eff_head - sum(len(o) for o in opt_ids)
         if opt_budget < 16:
             per = max(4, (eff_head - 16) // max(1, len(opt_ids)))
+            if any(len(o) > per for o in opt_ids):
+                truncated_parts.append(f"options_budget(per={per})")
             opt_ids = [o[:per] for o in opt_ids]
             opt_budget = eff_head - sum(len(o) for o in opt_ids)
-        head_ids = head_ids[: max(8, opt_budget)]
+        head_lim = max(8, opt_budget)
+        if len(head_ids_raw) > head_lim:
+            truncated_parts.append(f"instructions({len(head_ids_raw)}>{head_lim})")
+        head_ids = head_ids_raw[:head_lim]
         ids = [self.cls_id] + head_ids + [self.sep_id]
         markers: list[int] = []
         for o in opt_ids:
@@ -193,9 +226,30 @@ class LayaAneBackend:
         ids.append(self.sep_id)
         room = max(0, eff_max - len(ids) - 1)
         state_str = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
-        st_ids = self._encode_ids(state_str.replace(self.mask_tok, " "))[:room]
+        st_ids_raw = self._encode_ids(state_str.replace(self.mask_tok, " "))
+        if len(st_ids_raw) > room:
+            truncated_parts.append(f"state({len(st_ids_raw)}>{room})")
+        st_ids = st_ids_raw[:room]
+        total_untruncated = len(ids) + len(st_ids_raw) + 1
         ids = (ids + st_ids + [self.sep_id])[:eff_max]
-        return {"ids": ids, "markers": markers, "qtype": _QTYPES[t], "k": len(opts)}
+        truncated = bool(truncated_parts) or (total_untruncated > eff_max)
+        if truncated and on_truncate != "ignore":
+            msg = (
+                f"LayaAneBackend.encode_item truncated input to eff_max={eff_max} tokens "
+                f"(untruncated_total={total_untruncated}, details={', '.join(truncated_parts) or 'max_len'}). "
+                f"Pass on_truncate='ignore' to silence or use Kev08bMlxBackend for >512 tokens."
+            )
+            if on_truncate == "error":
+                raise ValueError(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
+        return {
+            "ids": ids,
+            "markers": markers,
+            "qtype": _QTYPES[t],
+            "k": len(opts),
+            "truncated": truncated,
+            "original_state_tokens": len(st_ids_raw),
+        }
 
     def _exec_bucket(self, bucket_items: list[dict[str, Any]], S: int, handle: Any) -> Any:
         np = self._np
@@ -210,7 +264,7 @@ class LayaAneBackend:
             qt_np[i] = it["qtype"]
         out_pos = np.empty((N, S), dtype=np.float32)
         with self._exec_lock:
-            self._lib.laya_ane_exec_batch(
+            dt = self._lib.laya_ane_exec_batch(
                 handle,
                 N,
                 ids_np.ctypes.data,
@@ -219,6 +273,15 @@ class LayaAneBackend:
                 out_pos.ctypes.data,
                 1 if N > 1 else 0,
             )
+            if dt < 0.0:
+                err_msg = ""
+                if self._has_last_error:
+                    raw = self._lib.laya_ane_last_error(handle)
+                    if raw:
+                        err_msg = raw.decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Laya ANE CoreML prediction failed (bucket S={S}, N={N}): {err_msg or 'unknown error'}"
+                )
         return out_pos
 
     def _score_buckets(
@@ -294,4 +357,9 @@ class LayaAneBackend:
             self._h512 = None
 
 
-__all__ = ["LayaAneBackend"]
+__all__ = [
+    "COMPUTE_MODE_ALL",
+    "COMPUTE_MODE_CPU_AND_ANE",
+    "COMPUTE_MODE_CPU_ONLY",
+    "LayaAneBackend",
+]

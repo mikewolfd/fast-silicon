@@ -258,22 +258,12 @@ def forward_bad(self, x, off_cur):
 
 def test_clean_pass_on_fast_repos() -> None:
     fast_shared_src = REPO_ROOT / "src" / "fast_shared"
+    fast_shared_tests = REPO_ROOT / "tests"
     assert fast_shared_src.exists(), f"Missing {fast_shared_src}"
-    rep_shared = check_mlx_paths([fast_shared_src])
-    # All production inference modules (`metal_mpp*.py`, `server.py`, `pipeline_llm.py`, etc.)
-    # must pass cleanly; only `roofline.py`'s `measure_dram_bw` microbenchmark deliberately allocates
-    # `device float4*` / `mx.float32` probes.
-    non_probe_findings = [
-        f
-        for f in rep_shared.findings
-        if not (Path(f.file).name == "roofline.py" and f.symbol == "<module>.measure_dram_bw")
-    ]
-    assert non_probe_findings == [], "Unexpected guard findings in fast-shared:\n" + "\n".join(
-        f.format() for f in non_probe_findings
+    rep_shared = check_mlx_paths([fast_shared_src, fast_shared_tests], flag_bool_sdpa_as_error=True)
+    assert rep_shared.findings == [], "Unexpected guard findings in fast-shared:\n" + "\n".join(
+        f.format() for f in rep_shared.findings
     )
-    probe_rules = {f.rule_id for f in rep_shared.findings}
-    assert "METAL_FP32_OUTPUT_PTR" in probe_rules
-    assert "MLX_METAL_FP32_OUTPUT" in probe_rules
 
     sibling_targets = (
         ("fast-gemma4", WORK_ROOT / "fast-gemma4" / "src" / "fast_gemma4", "bfloat16"),
@@ -291,6 +281,84 @@ def test_clean_pass_on_fast_repos() -> None:
         assert rep.ok, f"Unexpected guard errors in {label}:\n" + "\n".join(
             f.format() for f in rep.errors
         )
+
+
+def test_detects_new_metal4_quantize_transpose_and_loop_sync_rules() -> None:
+    src = """
+import mlx.core as mx
+import numpy as np
+
+_TENSOR_BAD_HDR = mx.fast.metal_kernel(
+    name="bad_hdr",
+    input_names=["A"],
+    output_names=["C"],
+    header="#include <metal_stdlib>",
+    source="auto tC = tensor<device float, dextents<int32_t, 2>>(C, dextents<int32_t, 2>(64, 64));",
+)
+
+_CONST_BF16 = mx.fast.metal_kernel(
+    name="const_bf16_in_fp16",
+    input_names=["A"],
+    output_names=["C"],
+    source="const device bfloat* ap = (const device bfloat*)A; device half* cp = (device half*)C; cp[0] = half(ap[0]);",
+)
+
+def bad_all(w_in, lhs_idx, rhs_idx):
+    w_bf = mx.ones((64, 64), dtype=mx.bfloat16)
+    x_fp = mx.ones((4, 64), dtype=mx.float16)
+    wq, sc, bi = mx.quantize(w_bf, group_size=64, bits=4)
+    y_qmm = mx.quantized_matmul(x_fp, wq, sc, bi, transpose=True, group_size=64, bits=4)
+
+    x_bf = mx.ones((4, 64), dtype=mx.bfloat16)
+    bi_fp = mx.ones((64, 1), dtype=mx.float16)
+    y_bi = mx.quantized_matmul(x_bf, wq, sc, bi_fp, transpose=True, group_size=64, bits=4)
+
+    y_unsorted = mx.gather_qmm(x_bf, wq, sc, bi, lhs_indices=lhs_idx, rhs_indices=rhs_idx)
+
+    wt = x_fp.T
+    z0 = mx.zeros(())
+    out_nc = _CONST_BF16(
+        inputs=[wt, z0],
+        output_shapes=[(4, 64)],
+        output_dtypes=[mx.float16],
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+    )[0]
+
+    q = mx.ones((1, 4, 8, 64), dtype=mx.float16)
+    k = mx.ones((1, 4, 8, 64), dtype=mx.float16)
+    v = mx.ones((1, 4, 8, 64), dtype=mx.float16)
+    m_bf = mx.zeros((1, 1, 8, 8), dtype=mx.bfloat16)
+    sdpa_bad = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=m_bf)
+
+    while True:
+        mx.eval(x_bf)
+        _ = x_bf.item()
+        break
+
+    return y_qmm, y_bi, y_unsorted, out_nc, sdpa_bad
+"""
+    rep = check_mlx_source(src)
+    err_ids = {f.rule_id for f in rep.errors}
+    warn_ids = {f.rule_id for f in rep.warnings}
+    assert "METAL_TENSOR_MISSING_HEADER" in err_ids
+    assert "METAL_FP32_OUTPUT_PTR" in err_ids
+    assert "METAL_BF16_PTR_IN_FP16_KERNEL" in err_ids
+    assert "MLX_IMPLICIT_FP32_SCALE_UPCAST" in err_ids
+    assert "MLX_METAL_NONCONTIGUOUS_INPUT" in err_ids
+    assert "MLX_METAL_0D_SCALAR" in err_ids
+    assert "MLX_SDPA_DTYPE_MISMATCH" in err_ids
+    assert "MLX_GATHER_QMM_UNSORTED_INDICES" in warn_ids
+    assert "MLX_SYNC_EVAL_IN_WHILE_LOOP" in warn_ids
+    assert "MLX_IMPLICIT_HOST_SYNC_IN_LOOP" in warn_ids
+
+    # CoreML AST check flags mb.matmul on non-test files
+    cm_src = "def build(mb, x, w):\n    return mb.matmul(x=x, y=w)\n"
+    rep_cm = check_mlx_source(cm_src, filename="builder.py", check_coreml_ast=True)
+    assert any(f.rule_id == "COREML_PY_MATMUL_ANE" for f in rep_cm.warnings)
+
+    # CLI --coreml flag cleanly executes on a clean file
+    assert ir_dtype_guard.main(["--coreml", str(REPO_ROOT / "src" / "fast_shared" / "paths.py")]) == 0
 
 
 def test_coreml_mil_guard_detects_fp32_casts_and_passes_clean_fp16() -> None:

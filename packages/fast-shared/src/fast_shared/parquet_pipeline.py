@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from dataclasses import dataclass
 import glob
+import json
 import os
+from pathlib import Path
 import queue
 import threading
 import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -16,9 +18,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from .embeddings import accepts_kwarg, resolve_embedding_dim, truncate_and_normalize
+from .bench import clear_mlx_arena, wired_limit
+from .embeddings import accepts_kwarg, resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
 
 DEFAULT_TEXT_COLUMNS = ("body", "page_text", "text", "content")
+_MANIFEST_FILENAME = ".embed_manifest.json"
 
 
 @dataclass
@@ -280,6 +284,106 @@ def _prepare_batch_rows(
     return meta_table, expanded_tok_lists
 
 
+def _enter_mlx_limits(
+    stack: ExitStack,
+    *,
+    mlx_cache_limit_mb: int | None,
+    use_wired_limit: bool,
+) -> None:
+    if mlx_cache_limit_mb is not None:
+        prev_limit: int | None = None
+        try:
+            import mlx.core as mx
+
+            set_limit = getattr(mx, "set_cache_limit", None)
+            if callable(set_limit):
+                prev = set_limit(max(0, int(mlx_cache_limit_mb)) * 1024 * 1024)
+                if isinstance(prev, int):
+                    prev_limit = prev
+        except Exception:
+            set_mlx_cache_limit(int(mlx_cache_limit_mb))
+        if prev_limit is not None:
+            def _restore(val: int = prev_limit) -> None:
+                try:
+                    import mlx.core as mx
+
+                    set_limit = getattr(mx, "set_cache_limit", None)
+                    if callable(set_limit):
+                        set_limit(val)
+                except Exception:
+                    pass
+
+            stack.callback(_restore)
+    if use_wired_limit:
+        stack.enter_context(wired_limit())
+
+
+def _load_manifest(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_manifest(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _shard_matches_expected(
+    shard_path: Path,
+    *,
+    expected_rows: int,
+    expected_meta_cols: list[str],
+    expected_dim: int,
+    expected_dtype: str,
+    manifest: dict[str, Any],
+    run_config: dict[str, Any],
+) -> bool:
+    if not shard_path.is_file():
+        return False
+    # If a manifest exists and records a conflicting run configuration, do not blindly resume.
+    if manifest and isinstance(manifest.get("config"), dict) and manifest["config"] != run_config:
+        return False
+    manifest_shards = manifest.get("shards") if isinstance(manifest.get("shards"), dict) else {}
+    if manifest_shards and shard_path.name in manifest_shards:
+        entry = manifest_shards[shard_path.name]
+        if (
+            not isinstance(entry, dict)
+            or entry.get("num_rows") != expected_rows
+            or entry.get("dim") != expected_dim
+            or entry.get("dtype") != expected_dtype
+        ):
+            return False
+    try:
+        pf = pq.ParquetFile(shard_path)
+        if pf.metadata.num_rows != expected_rows:
+            return False
+        sch = pf.schema_arrow
+        if "vector" not in sch.names:
+            return False
+        vec_type = sch.field("vector").type
+        exp_val_type = pa.float16() if expected_dtype == "float16" else pa.float32()
+        if not pa.types.is_fixed_size_list(vec_type):
+            return False
+        if vec_type.list_size != expected_dim or vec_type.value_type != exp_val_type:
+            return False
+        actual_meta_cols = [n for n in sch.names if n != "vector"]
+        if actual_meta_cols != expected_meta_cols:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def embed_parquet(
     engine: Any,
     input_path: str | Path,
@@ -312,6 +416,8 @@ def embed_parquet(
     resume: bool = False,
     limit: int | None = None,
     progress_every: int = 1,
+    mlx_cache_limit_mb: int | None = 512,
+    use_wired_limit: bool = False,
 ) -> ParquetEmbedSummary:
     """Prepare source batches, encode capped chunk batches, and write Parquet.
 
@@ -353,6 +459,38 @@ def embed_parquet(
         out_p.parent.mkdir(parents=True, exist_ok=True)
     else:
         out_p.mkdir(parents=True, exist_ok=True)
+
+    run_config: dict[str, Any] = {
+        "dim": dim,
+        "dtype": dtype,
+        "text_col": eff_text_col,
+        "keep_cols": keep_cols,
+        "drop_text_col": drop_text_col,
+        "shard_rows": shard_rows,
+        "filter_ocr": filter_ocr,
+        "ocr_pages_only": ocr_pages_only,
+        "per_ocr_page": per_ocr_page,
+        "chunk": chunk,
+        "max_body_tokens": max_body_tokens,
+        "overlap": overlap,
+        "max_encode_length": max_encode_length,
+        "max_chunk_tokens": max_chunk_tokens,
+        "skip_empty": skip_empty,
+        "include_chunk_text": include_chunk_text,
+        "prefix": prefix,
+        "prompt_name": prompt_name,
+        "add_query_prefix": add_query_prefix,
+        "add_document_prefix": add_document_prefix,
+        "input_files": [[f.name, f.stat().st_size] for f in files],
+    }
+    manifest_path = out_p / _MANIFEST_FILENAME
+    manifest = _load_manifest(manifest_path) if (not single_file_mode and resume) else {}
+    manifest_shards: dict[str, Any] = (
+        dict(manifest.get("shards", {}))
+        if (manifest.get("config") == run_config and isinstance(manifest.get("shards"), dict))
+        else {}
+    )
+    manifest_lock = threading.Lock()
 
     if keep_cols is not None:
         needed = list(dict.fromkeys([*keep_cols, eff_text_col]))
@@ -404,12 +542,12 @@ def embed_parquet(
 
     t0 = time.perf_counter()
     prod_thread = threading.Thread(target=producer, daemon=True)
-    prod_thread.start()
 
     single_writer: pq.ParquetWriter | None = None
     tmp_single_path = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
     shard_idx = 0
-    pending_meta: pa.Table | None = None
+    pending_meta_parts: list[pa.Table] = []
+    pending_meta_rows = 0
     pending_toks: list[list[int]] = []
 
     rows_emitted = 0
@@ -439,12 +577,20 @@ def embed_parquet(
                         single_writer = pq.ParquetWriter(tmp_single_path, out_tbl.schema, compression=compression)
                     single_writer.write_table(out_tbl)
                 else:
-                    _, m_slice, vecs, shard_path, tmp_shard = w_item
+                    _, m_slice, vecs, shard_path, tmp_shard, n_shard_toks = w_item
                     vec_arr = _make_vector_array(vecs, dim=dim, dtype=dtype)
                     out_tbl = m_slice.append_column("vector", vec_arr)
                     try:
                         pq.write_table(out_tbl, tmp_shard, compression=compression)
                         os.replace(tmp_shard, shard_path)
+                        with manifest_lock:
+                            manifest_shards[shard_path.name] = {
+                                "num_rows": out_tbl.num_rows,
+                                "tokens": int(n_shard_toks),
+                                "dim": dim,
+                                "dtype": dtype,
+                            }
+                            _save_manifest(manifest_path, {"config": run_config, "shards": manifest_shards})
                     except BaseException:
                         tmp_shard.unlink(missing_ok=True)
                         raise
@@ -459,7 +605,6 @@ def embed_parquet(
                     single_writer = None
 
     writer_thread = threading.Thread(target=_writer_worker, daemon=True)
-    writer_thread.start()
 
     def _enqueue_write(job: tuple | None) -> None:
         while True:
@@ -473,104 +618,137 @@ def embed_parquet(
 
     def encode_rows(tok_lists: list[list[int]]) -> np.ndarray:
         if len(tok_lists) <= encode_batch_rows:
-            return truncate_and_normalize(engine.encode_corpus(tok_lists, **corpus_kw), dim)
+            out_vecs = truncate_and_normalize(engine.encode_corpus(tok_lists, **corpus_kw), dim)
+            clear_mlx_arena(256)
+            return out_vecs
         vecs = np.empty((len(tok_lists), dim), dtype=np.float32)
         for start in range(0, len(tok_lists), encode_batch_rows):
             end = min(start + encode_batch_rows, len(tok_lists))
             vecs[start:end] = truncate_and_normalize(engine.encode_corpus(tok_lists[start:end], **corpus_kw), dim)
+            clear_mlx_arena(256)
         return vecs
 
     def write_shard_slice(meta_slice: pa.Table, tok_slice: list[list[int]]) -> None:
-        nonlocal shard_idx
+        nonlocal shard_idx, rows_emitted, total_tokens
         shard_path = out_p / f"part-{shard_idx:05d}.parquet"
         tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
         shard_idx += 1
-        if resume and shard_path.exists():
-            try:
-                if pq.ParquetFile(shard_path).metadata.num_rows == len(tok_slice):
-                    return
-            except Exception:
-                pass
+        if resume and _shard_matches_expected(
+            shard_path,
+            expected_rows=len(tok_slice),
+            expected_meta_cols=list(meta_slice.schema.names),
+            expected_dim=dim,
+            expected_dtype=dtype,
+            manifest=manifest,
+            run_config=run_config,
+        ):
+            return
+        n_shard_toks = sum(len(x) for x in tok_slice)
         vecs = encode_rows(tok_slice)
-        _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard))
+        rows_emitted += len(tok_slice)
+        total_tokens += n_shard_toks
+        _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard, n_shard_toks))
 
     def drain_shards(final: bool = False) -> None:
-        nonlocal pending_meta, pending_toks
-        while pending_meta is not None and len(pending_toks) >= shard_rows:
-            slice_meta = pending_meta.slice(0, shard_rows)
-            slice_toks = pending_toks[:shard_rows]
-            rem = len(pending_toks) - shard_rows
-            pending_meta = pending_meta.slice(shard_rows, rem) if rem > 0 else None
-            pending_toks = pending_toks[shard_rows:]
+        nonlocal pending_meta_parts, pending_meta_rows, pending_toks
+        if not pending_meta_parts:
+            return
+        if not final and pending_meta_rows < shard_rows:
+            return
+        combined = (
+            pending_meta_parts[0]
+            if len(pending_meta_parts) == 1
+            else pa.concat_tables(pending_meta_parts, promote_options="default")
+        )
+        pending_meta_parts = []
+        offset = 0
+        total_avail = len(pending_toks)
+        while (total_avail - offset) >= shard_rows:
+            slice_meta = combined.slice(offset, shard_rows)
+            slice_toks = pending_toks[offset : offset + shard_rows]
+            offset += shard_rows
             write_shard_slice(slice_meta, slice_toks)
-        if final and pending_meta is not None and len(pending_toks) > 0:
-            write_shard_slice(pending_meta, pending_toks)
-            pending_meta = None
+        rem = total_avail - offset
+        if final and rem > 0:
+            write_shard_slice(combined.slice(offset, rem), pending_toks[offset:])
+            pending_meta_rows = 0
+            pending_toks = []
+        elif rem > 0:
+            pending_meta_parts = [combined.slice(offset, rem)]
+            pending_meta_rows = rem
+            pending_toks = pending_toks[offset:]
+        else:
+            pending_meta_rows = 0
             pending_toks = []
 
-    try:
-        while True:
+    with ExitStack() as stack:
+        _enter_mlx_limits(
+            stack,
+            mlx_cache_limit_mb=mlx_cache_limit_mb,
+            use_wired_limit=use_wired_limit,
+        )
+        prod_thread.start()
+        writer_thread.start()
+        try:
+            while True:
+                if writer_err:
+                    raise writer_err[0]
+                item = prep_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+
+                _, meta_tbl, tok_lists = item
+                batch_num += 1
+
+                if single_file_mode:
+                    vecs = encode_rows(tok_lists)
+                    rows_emitted += len(tok_lists)
+                    total_tokens += sum(len(x) for x in tok_lists)
+                    _enqueue_write(("single", meta_tbl, vecs))
+                else:
+                    pending_meta_parts.append(meta_tbl)
+                    pending_meta_rows += meta_tbl.num_rows
+                    pending_toks.extend(tok_lists)
+                    drain_shards(final=False)
+
+                if progress_every > 0 and (batch_num % progress_every == 0):
+                    dt = time.perf_counter() - t0
+                    print(
+                        f"[parquet batch {batch_num}] rows={rows_emitted:,} toks={total_tokens:,} "
+                        f"elapsed={dt:.2f}s ({total_tokens/max(dt, 1e-9):,.0f} tok/s)",
+                        flush=True,
+                    )
+
+            if not single_file_mode:
+                drain_shards(final=True)
+
+            _enqueue_write(None)
+            writer_thread.join()
             if writer_err:
                 raise writer_err[0]
-            item = prep_queue.get()
-            if item is None:
-                break
-            if isinstance(item, BaseException):
-                raise item
-
-            _, meta_tbl, tok_lists = item
-            n_items = len(tok_lists)
-            n_toks = sum(len(x) for x in tok_lists)
-            total_tokens += n_toks
-            rows_emitted += n_items
-            batch_num += 1
 
             if single_file_mode:
-                vecs = encode_rows(tok_lists)
-                _enqueue_write(("single", meta_tbl, vecs))
-            else:
-                if pending_meta is None:
-                    pending_meta = meta_tbl
+                if rows_emitted > 0 and tmp_single_path is not None and tmp_single_path.exists():
+                    os.replace(tmp_single_path, out_p)
                 else:
-                    pending_meta = pa.concat_tables([pending_meta, meta_tbl], promote_options="default")
-                pending_toks.extend(tok_lists)
-                drain_shards(final=False)
-
-            if progress_every > 0 and (batch_num % progress_every == 0):
-                dt = time.perf_counter() - t0
-                print(
-                    f"[parquet batch {batch_num}] rows={rows_emitted:,} toks={total_tokens:,} "
-                    f"elapsed={dt:.2f}s ({total_tokens/dt:,.0f} tok/s)",
-                    flush=True,
-                )
-
-        if not single_file_mode:
-            drain_shards(final=True)
-
-        _enqueue_write(None)
-        writer_thread.join()
-        if writer_err:
-            raise writer_err[0]
-
-        if single_file_mode:
-            if rows_emitted > 0 and tmp_single_path is not None and tmp_single_path.exists():
-                os.replace(tmp_single_path, out_p)
-            else:
-                empty_schema = pa.schema(
-                    [f for f in first_schema if f.name != eff_text_col or not drop_text_col]
-                    + [pa.field("vector", pa.list_(pa.float16() if dtype == "float16" else pa.float32(), dim))]
-                )
-                pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_p, compression=compression)
-    finally:
-        writer_stop.set()
-        try:
-            write_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        writer_thread.join(timeout=2.0)
-        if tmp_single_path is not None and tmp_single_path.exists():
-            tmp_single_path.unlink(missing_ok=True)
-        prod_thread.join(timeout=2.0)
+                    empty_schema = pa.schema(
+                        [f for f in first_schema if f.name != eff_text_col or not drop_text_col]
+                        + [pa.field("vector", pa.list_(pa.float16() if dtype == "float16" else pa.float32(), dim))]
+                    )
+                    pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_p, compression=compression)
+        finally:
+            writer_stop.set()
+            try:
+                write_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            writer_thread.join(timeout=2.0)
+            if tmp_single_path is not None and tmp_single_path.exists():
+                tmp_single_path.unlink(missing_ok=True)
+            prod_thread.join(timeout=2.0)
+            clear_mlx_arena(256)
 
     elapsed = time.perf_counter() - t0
     return ParquetEmbedSummary(

@@ -77,7 +77,7 @@ Monorepo `verify` (`29.706 s`): `b1_valid=4/4` (`71.3 dec tok/s`, `0.367 docs/s`
 
 ## Scope & Not-tested
 
-- Verified on **Apple M4 Pro (`Mac16,8`, `48 GB` unified memory)**. Fits alongside `16.56 GB` peak MLX allocation at `B=128`; larger batches or smaller `16–24 GB` Macs are **untested**.
+- Verified on **Apple M4 Pro (`Mac16,8`, `48 GB` unified memory)**. Fits alongside `16.56 GB` peak MLX allocation at `B=128`; on `16–24 GB` hosts (`M4`/`M5`), `select_gpt_oss_plan` automatically clamps default wave batch sizes (`<= 8` on `16 GB`, `<= 16` on `24 GB`) and bounds wired memory to preserve OS headroom.
 - **Not tested:** Training/LoRA fine-tuning, CoreML ANE offload (weights fit Metal MoE/QMV bandwidth directly), or multi-node execution.
 
 ## Author & License

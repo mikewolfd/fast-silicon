@@ -48,6 +48,80 @@ CURATED_TOP_LEVEL = {
     "sources_and_scope",
 }
 
+_OS_VERSION_COLUMNS: tuple[str, ...] = (
+    "min_macos",
+    "macos_requirement",
+    "macos_api_floor",
+    "minimum_macos",
+    "storage_api_since",
+    "arithmetic_operands_since",
+    "scale_plane_since",
+    "macOS / runtime requirement",
+    "Minimum macOS",
+    "Minimum macOS for API",
+    "macOS / API floor",
+    "Earliest tagged declaration found",
+    "macOS and build",
+)
+
+_SIX_CHIP_COLUMNS: tuple[str, ...] = (
+    "M4",
+    "M4 Pro",
+    "M4 Max",
+    "M5",
+    "M5 Pro",
+    "M5 Max",
+)
+
+_HOST_CAPTURE_COLUMN_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("m4_pro_26_6", "base_m5_26_2", "base_m5_27_2_1", "m5_26_2"),
+    ("m4_pro_runtime_26_6", "base_m5_runtime_26_2", "base_m5_runtime_27_2_1"),
+    ("m4_pro_48gb_26_6", "base_m5_24gb_26_2", "base_m5_24gb_27_2_1"),
+    ("M4 Pro • 26.6", "Base M5 • 26.2", "Base M5 • 27.2.1"),
+    ("m4_pro_apple9", "m5_apple10"),
+    ("m4_pro_0_32_4", "m5_0_32_4"),
+    ("m4_pro_26_6_storage", "base_m5_26_2_storage", "base_m5_27_2_1_storage"),
+    ("m4_pro_gate_26_6", "m5_gate_26_2", "m5_gate_27_2_1"),
+    ("m4_pro_clang", "m5_clang"),
+    ("m4_pro_clang_target", "m5_clang_target"),
+)
+
+# Match macOS version numbers (10.x..15.x or 26.x..99.x, including "27", "27.x", "27.2+", "27.2.1")
+# while ignoring MSL 4.0/4.1, Metal 4, MLX 0.32.4, and GPU generation >=17.
+_NON_OS_PREFIX_RE = re.compile(
+    r"\b(?:MSL|Metal|MLX|Xcode|LLVM|Clang|iOS|iPadOS|tvOS|visionOS|watchOS|generation)\s*[≥>=]*\s*\d+(?:\.\d+)*",
+    re.I,
+)
+_OS_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])(1[0-5]|2[6-9]|[3-9]\d)(?:\.(\d+)(?:\.(\d+))?|\.[xX])?(?:\+)?(?![A-Za-z0-9_.])"
+)
+
+
+def parse_os_tuple(ver_str: str) -> tuple[int, int, int]:
+    """Parse a user-supplied macOS version floor like '26.2', '27', '27.0', '27.2.1'."""
+    cleaned = str(ver_str).strip().rstrip("+")
+    m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?$", cleaned)
+    if not m:
+        raise ValueError(f"Invalid --min-os version string {ver_str!r}; expected e.g. '26.2', '27', '27.0', '27.2.1'")
+    return (int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0))
+
+
+def extract_os_versions(text: str) -> list[tuple[int, int, int]]:
+    """Extract all macOS semantic version tuples from an OS-requirement field string."""
+    if not text:
+        return []
+    scrubbed = _NON_OS_PREFIX_RE.sub(" ", text)
+    out: list[tuple[int, int, int]] = []
+    for m in _OS_TOKEN_RE.finditer(scrubbed):
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) is not None else 0
+        patch = int(m.group(3)) if m.group(3) is not None else 0
+        # Guard against bogus large standalone numbers like 100000 or random two-digit counts
+        if major >= 40 and m.group(2) is None:
+            continue
+        out.append((major, minor, patch))
+    return out
+
 
 def load_curated() -> dict[str, Any]:
     """Load the normalized curated matrix JSON payload."""
@@ -83,49 +157,67 @@ def all_table_names() -> list[str]:
     return sorted(CURATED_SIX_CHIP) + sorted(CURATED_TOP_LEVEL) + ["encoder_timings"] + sorted(CATALOG_MAP)
 
 
+def _row_has_chip_diff(row: dict[str, Any]) -> bool:
+    """Return True if a row shows any difference across all 6 M4/M5 chips or host OS captures."""
+    # 1. Six-chip matrix rows: compare across ALL 6 chips (M4, M4 Pro, M4 Max, M5, M5 Pro, M5 Max)
+    six_vals = [
+        str(row[col]).strip()
+        for col in _SIX_CHIP_COLUMNS
+        if col in row and row[col] not in ("", "—", None)
+    ]
+    if len(six_vals) >= 2:
+        return len(set(six_vals)) > 1
+
+    # 2. Explicit comparison annotations (instruction_differences, a64_encodings, live_metal, etc.)
+    cmp_vals = [
+        str(row[k]).strip().lower()
+        for k in ("comparison_27_2_1", "comparison_26_2", "comparison_first_capture", "comparison")
+        if k in row and row[k] not in ("", "—", None)
+    ]
+
+    # 3. Host/capture column groups (captures M4 Pro vs M5 AND 26.2 vs 27.2.1 OS evolution)
+    group_saw_values = False
+    for group in _HOST_CAPTURE_COLUMN_GROUPS:
+        vals = [
+            str(row[k]).strip()
+            for k in group
+            if k in row and row[k] not in ("", "—", None)
+        ]
+        if len(vals) >= 2:
+            group_saw_values = True
+            if len(set(vals)) > 1:
+                return True
+
+    if cmp_vals:
+        joined = " ".join(cmp_vals)
+        if any(tag in joined for tag in ("same", "both", "identical", "neither")):
+            return False
+        return True
+
+    return not group_saw_values
+
+
 def matches_filters(
     row: dict[str, Any],
     search_re: re.Pattern[str] | None,
     min_os: str | None,
     diff_only: bool,
 ) -> bool:
-    """Apply optional regex search, OS floor filter, and difference-only filter."""
+    """Apply optional regex search, semantic OS floor (`>=`) filter, and 6-chip difference filter."""
     blob = " | ".join(f"{k}={v}" for k, v in row.items() if v not in ("", "—", None))
     if search_re and not search_re.search(blob):
         return False
     if min_os:
-        os_fields = " ".join(
-            str(row.get(k, ""))
-            for k in (
-                "min_macos",
-                "macos_requirement",
-                "macos_api_floor",
-                "minimum_macos",
-                "storage_api_since",
-                "macOS / runtime requirement",
-                "Minimum macOS",
-                "Minimum macOS for API",
-                "macOS / API floor",
-                "Earliest tagged declaration found",
-            )
-        )
-        if min_os not in os_fields:
+        target_ver = parse_os_tuple(min_os)
+        os_versions: list[tuple[int, int, int]] = []
+        for k in _OS_VERSION_COLUMNS:
+            val = row.get(k)
+            if val not in ("", "—", None):
+                os_versions.extend(extract_os_versions(str(val)))
+        if not any(v >= target_ver for v in os_versions):
             return False
     if diff_only:
-        cmp_vals = " ".join(
-            str(row.get(k, ""))
-            for k in (
-                "comparison_26_2",
-                "comparison_27_2_1",
-                "comparison_first_capture",
-                "comparison",
-            )
-        ).lower()
-        if any(tag in cmp_vals for tag in ("same", "both", "identical")):
-            return False
-        m4p = row.get("m4_pro_26_6") or row.get("M4 Pro") or row.get("m4_pro_runtime_26_6")
-        m5 = row.get("base_m5_27_2_1") or row.get("M5") or row.get("base_m5_runtime_27_2_1")
-        if m4p is not None and m5 is not None and m4p == m5 and not cmp_vals:
+        if not _row_has_chip_diff(row):
             return False
     return True
 
@@ -184,11 +276,18 @@ def main(argv: list[str] | None = None) -> int:
         choices=("m4", "m4_pro", "m4_max", "m5", "m5_pro", "m5_max"),
         help="Focus JSON output fields on a specific Apple Silicon SKU.",
     )
-    parser.add_argument("--min-os", help="Filter rows matching a macOS floor string (e.g. 26.4, 27.0, 27.2).")
-    parser.add_argument("--diff-only", action="store_true", help="Show records highlighting M4 vs M5 or 26.2 vs 27.2.1 deltas.")
+    parser.add_argument("--min-os", help="Filter rows requiring macOS >= VERSION (e.g. 26.2, 26.4, 27.0, 27.2).")
+    parser.add_argument("--diff-only", action="store_true", help="Show records highlighting differences across all 6 M4/M5 chips or 26.2 vs 27.2.1.")
     parser.add_argument("--limit", type=int, default=25, help="Maximum matching rows to display (default: 25, 0 = unlimited).")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output.")
     args = parser.parse_args(argv)
+
+    if args.min_os:
+        try:
+            parse_os_tuple(args.min_os)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
     curated = load_curated()
     if args.stats:

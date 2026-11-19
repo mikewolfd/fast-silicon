@@ -2,7 +2,7 @@ UV ?= uv
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 NATIVE_PACKAGES := packages/fast-bge-small packages/fast-embeddinggemma-2 packages/fast-gemma4 packages/fast-decision-models packages/fast-pplx
 
-.PHONY: uv-sync hw-check native clean guard test-cpu test-hw sync sync-check leak-check
+.PHONY: uv-sync hw-check native clean guard test-cpu test-hw sync sync-check sync-clean-check leak-check
 
 uv-sync:
 	$(UV) sync --extra dev
@@ -24,12 +24,15 @@ clean:
 FAST_IR_GUARD ?= $(shell if [ -x .venv/bin/fast-ir-guard ]; then echo .venv/bin/fast-ir-guard; else echo fast-ir-guard; fi)
 
 guard:
-	$(FAST_IR_GUARD) --strict-bool-mask \
+	$(FAST_IR_GUARD) --strict-bool-mask --coreml \
+		packages/fast-shared/src packages/fast-shared/tests \
+		packages/fast-shared/skills/apple-silicon-ml-optimizer/scripts \
+		packages/fast-bge-small/src packages/fast-bge-small/tests \
 		packages/fast-embeddinggemma-2/src packages/fast-embeddinggemma-2/tests \
-		packages/fast-gpt-oss/src packages/fast-gpt-oss/tests \
 		packages/fast-gemma4/src packages/fast-gemma4/tests \
-		packages/fast-decision-models/src packages/fast-decision-models/tests \
-		packages/fast-pplx/src packages/fast-pplx/tests
+		packages/fast-gpt-oss/src packages/fast-gpt-oss/tests \
+		packages/fast-pplx/src packages/fast-pplx/tests \
+		packages/fast-decision-models/src packages/fast-decision-models/tests
 	$(PYTHON) -m pytest -q packages/fast-shared/tests/test_ir_dtype_guard_cpu.py -k test_clean_pass_on_fast_repos
 
 test-cpu: hw-check
@@ -62,6 +65,9 @@ sync:
 
 sync-check:
 	$(PYTHON) scripts/sync_from_siblings.py --check
+
+sync-clean-check:
+	$(PYTHON) scripts/sync_from_siblings.py --check --require-clean
 
 leak-check:
 	@! rg -n -i "/users/|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \

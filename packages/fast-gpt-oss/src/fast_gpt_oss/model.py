@@ -19,14 +19,50 @@ from __future__ import annotations
 import glob
 import json
 import math
+import os
+import platform
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import warnings
 
 import numpy as np
 
 from .kernels import KernelSpec, build_kernels
 from .tokenizer import FULL_VOCAB_SIZE, O200kVocabRemapper
+
+
+def _parse_ver_tuple(ver_str: str) -> tuple[int, ...]:
+    out: list[int] = []
+    for tok in str(ver_str).split("."):
+        m = re.match(r"(\d+)", tok)
+        if not m:
+            break
+        out.append(int(m.group(1)))
+    return tuple(out)
+
+
+def _detect_m5_nax_moe(mx: Any) -> bool:
+    """Return True on Apple10 (M5+) + macOS >= 26.2 + MLX >= 0.31.2 with NAX MoE/segmented_mm support."""
+    if os.environ.get("MLX_METAL_NO_NAX") == "1":
+        return False
+    if not hasattr(mx, "segmented_mm"):
+        return False
+    try:
+        dev = mx.device_info()
+    except Exception:
+        return False
+    dev_name = str(dev.get("device_name", "")).lower()
+    arch = str(dev.get("architecture", "")).lower()
+    is_m5 = ("m5" in dev_name) or ("apple10" in arch) or ("g17" in arch)
+    if not is_m5:
+        return False
+    mac_ver = _parse_ver_tuple(platform.mac_ver()[0])
+    if mac_ver and mac_ver < (26, 2):
+        return False
+    mlx_ver = _parse_ver_tuple(getattr(mx, "__version__", "0.0.0"))
+    return mlx_ver >= (0, 31, 2)
 
 
 def _f32_to_u32(val: float) -> int:
@@ -152,7 +188,7 @@ class GptOssConfig:
             layer_types=tuple(raw.get("layer_types") or default_types),
         )
 
-    def to_kernel_spec(self) -> KernelSpec:
+    def to_kernel_spec(self, *, moe_hot_threshold: int = 8) -> KernelSpec:
         return KernelSpec(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
@@ -163,6 +199,7 @@ class GptOssConfig:
             sliding_window=self.sliding_window,
             swiglu_limit=self.swiglu_limit,
             swiglu_alpha=self.swiglu_alpha,
+            moe_hot_threshold=int(moe_hot_threshold),
         )
 
 
@@ -223,6 +260,7 @@ def pack_gpt_oss_layer_tensors(
     *,
     f16_dtype: Any = np.float16,
     f32_dtype: Any = np.float32,
+    bf16_dtype: Any | None = None,
 ) -> dict[str, Any]:
     """Pack QKV projections and Expert Gate+Up projections for a single layer.
 
@@ -311,10 +349,16 @@ def pack_gpt_oss_layer_tensors(
         dtype=f16_dtype,
     )
 
+    in_ln_w = weights[p + "input_layernorm.weight"]
+    pa_ln_w = weights[p + "post_attention_layernorm.weight"]
+    if bf16_dtype is not None:
+        in_ln_w = _as_dtype(in_ln_w, bf16_dtype)
+        pa_ln_w = _as_dtype(pa_ln_w, bf16_dtype)
+
     return {
         "is_full": (layer_type == "full_attention"),
-        "in_ln": weights[p + "input_layernorm.weight"],
-        "pa_ln": weights[p + "post_attention_layernorm.weight"],
+        "in_ln": in_ln_w,
+        "pa_ln": pa_ln_w,
         "sinks_f32": _as_dtype(weights[p + "self_attn.sinks"], f32_dtype),
         "sinks_f16": _as_dtype(weights[p + "self_attn.sinks"], f16_dtype),
         "qkv_w": qkv_w,
@@ -471,7 +515,7 @@ class FastGptOssModel:
         )
         self.emb_s = emb_s_raw.astype(mx.float16) if self.emb_quant else None
         self.emb_b = w["model.embed_tokens.biases"].astype(mx.float16) if self.emb_quant else None
-        self.final_norm = w["model.norm.weight"]
+        self.final_norm = w["model.norm.weight"].astype(mx.bfloat16)
 
         lm_w = w["lm_head.weight"]
         lm_s_raw = w.get("lm_head.scales")
@@ -486,15 +530,34 @@ class FastGptOssModel:
         self.full_vocab_size = int(lm_w.shape[0])
         kept_ids: np.ndarray | None = None
         if vocab_out and 0 < int(vocab_out) < self.full_vocab_size:
+            target_v = int(vocab_out)
+            npz_p = Path(vocab_remap_npz) if vocab_remap_npz is not None else None
             tok_json = Path(tokenizer_json_path) if tokenizer_json_path else Path(self.model_dir) / "tokenizer.json"
-            if tok_json.exists():
+            if npz_p is not None and npz_p.is_file():
+                cached_kept = np.asarray(np.load(npz_p)["kept_old_ids"], dtype=np.int32)
+                if len(cached_kept) == target_v:
+                    kept_ids = cached_kept
+            if kept_ids is None and tok_json.exists():
                 remap = O200kVocabRemapper.load_or_build(
                     tok_json,
                     cache_npz_path=vocab_remap_npz,
-                    target_size=int(vocab_out),
+                    target_size=target_v,
                     full_vocab_size=self.full_vocab_size,
                 )
                 kept_ids = remap.kept_old_ids
+            elif kept_ids is None:
+                warnings.warn(
+                    f"Skipping lm_head vocab pruning to {target_v} (missing tokenizer.json={tok_json} "
+                    f"and matching vocab_remap_npz={vocab_remap_npz}); retaining full vocab={self.full_vocab_size}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if kept_ids is not None:
+                valid_mask = (kept_ids >= 0) & (kept_ids < self.full_vocab_size)
+                if not bool(np.all(valid_mask)):
+                    kept_ids = kept_ids[valid_mask]
+                if len(kept_ids) == 0:
+                    kept_ids = None
 
         self.lm_w, self.lm_s, self.lm_b, self.new_to_old, self.old_to_new = prune_lm_head_tensors(
             lm_w,
@@ -528,6 +591,7 @@ class FastGptOssModel:
                 self.q_dim,
                 f16_dtype=mx.float16,
                 f32_dtype=mx.float32,
+                bf16_dtype=mx.bfloat16,
             )
             self.layers.append(ld)
             to_eval.extend(v for v in ld.values() if isinstance(v, mx.array))
@@ -547,6 +611,9 @@ class FastGptOssModel:
 
         self._swiglu_c = _get_compiled_swiglu(self.config.swiglu_limit, self.config.swiglu_alpha)
         self._route_c = _get_compiled_route(self.num_experts_per_tok)
+        self._is_m5_nax_moe = _detect_m5_nax_moe(mx)
+        self._moe_hot_threshold = 12 if self._is_m5_nax_moe else 8
+        self._moe_tile_chunk_tokens = 256
         self._fast_all_quant = bool(
             self.emb_quant
             and self.lm_quant
@@ -559,7 +626,9 @@ class FastGptOssModel:
 
     def _ensure_kernels(self) -> dict[str, Any]:
         if self._kernels is None:
-            self._kernels = build_kernels(self.config.to_kernel_spec())
+            self._kernels = build_kernels(
+                self.config.to_kernel_spec(moe_hot_threshold=self._moe_hot_threshold)
+            )
         return self._kernels
 
     @property
@@ -618,6 +687,134 @@ class FastGptOssModel:
             output_dtypes=[mx.float16],
         )[0]
         return out.reshape(shape)
+
+    def _moe_tile_mpp_chunk(
+        self,
+        pn_2d: Any,
+        h_2d: Any,
+        inds_2d: Any,
+        scores_2d: Any,
+        ld: dict[str, Any],
+    ) -> Any:
+        """Single-launch Hybrid Hot-MPP + Cold-QMV MoE residual update with tight cold grid."""
+        import mlx.core as mx
+
+        n_tok = int(pn_2d.shape[0])
+        n_assign = n_tok * 4
+        hot_thresh = int(self._moe_hot_threshold)
+        max_hot = n_assign // (hot_thresh + 1)
+        max_cold = min(self.num_local_experts, n_assign)
+        grid_y = max(1, max_hot + max_cold)
+        hot_meta_len = max(1, max_hot) * 3
+        cold_meta_len = max(1, max_cold) * 3
+        ntok_arr = mx.array([n_tok], dtype=mx.uint32)
+
+        tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = self.kernels["moe_build_tiles"](
+            inputs=[inds_2d.astype(mx.uint32), scores_2d.astype(mx.float16), ntok_arr],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(n_assign,), (n_assign,), (n_assign,), (hot_meta_len,), (cold_meta_len,), (2,)],
+            output_dtypes=[mx.uint32, mx.uint32, mx.float16, mx.uint32, mx.uint32, mx.uint32],
+        )
+        mid = self.kernels["moe_batch_gu_unified"](
+            inputs=[pn_2d, tok_idx, ld["gu_w"], ld["gu_s"], ld["gu_bias"], hot_meta, cold_meta, meta_counts],
+            grid=((self.d_ff // 8) * 128, grid_y, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n_assign, self.d_ff)],
+            output_dtypes=[mx.float16],
+        )[0]
+        y_slots = self.kernels["moe_batch_dn_unified"](
+            inputs=[mid, slot_idx, rweights, ld["dn_w"], ld["dn_s"], ld["dn_bias"], hot_meta, cold_meta, meta_counts],
+            grid=((self.H // 16) * 128, grid_y, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n_tok, 4, self.H)],
+            output_dtypes=[mx.float16],
+        )[0]
+        return self.kernels["moe_reduce4_resid_bf16"](
+            inputs=[y_slots, h_2d],
+            grid=(self.H // 4, n_tok, 1),
+            threadgroup=(16, 1, 1),
+            output_shapes=[(n_tok, self.H)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+
+    def _moe_gather_qmm_nax(
+        self,
+        pn_2d: Any,
+        h_2d: Any,
+        inds_2d: Any,
+        scores_2d: Any,
+        ld: dict[str, Any],
+    ) -> Any:
+        """M5 NAX large-token sorted `gather_qmm` path (gated strictly to Apple10 + macOS>=26.2 + MLX>=0.31.2)."""
+        import mlx.core as mx
+
+        n_tok = int(pn_2d.shape[0])
+        fl = inds_2d.reshape(-1)
+        ord_i = mx.argsort(fl)
+        inv_i = mx.argsort(ord_i)
+        inds_e = fl[ord_i]
+        hx = pn_2d.reshape(-1, 1, self.H)[ord_i // 4]
+        gu = mx.gather_qmm(  # guard: allow-lhs-indices
+            hx,
+            ld["gu_w"],
+            ld["gu_s"],
+            rhs_indices=inds_e,
+            transpose=True,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+            sorted_indices=True,
+        )
+        act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), ld["gu_bias"][inds_e]).reshape(
+            *gu.shape[:-1], self.d_ff
+        )
+        y = mx.gather_qmm(  # guard: allow-lhs-indices
+            act,
+            ld["dn_w"],
+            ld["dn_s"],
+            rhs_indices=inds_e,
+            transpose=True,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+            sorted_indices=True,
+        )
+        y = (y.reshape(-1, self.H) + ld["dn_bias"][inds_e])[inv_i].reshape(n_tok, 4, self.H)
+        return h_2d + mx.sum(y * scores_2d[..., None].astype(mx.float32), axis=-2).astype(mx.bfloat16)
+
+    def _moe_forward(
+        self,
+        pn_2d: Any,
+        h_2d: Any,
+        inds_2d: Any,
+        scores_2d: Any,
+        ld: dict[str, Any],
+    ) -> Any:
+        """Unified multi-token MoE residual update: chunked tile-table MPP or gated M5 NAX path."""
+        import mlx.core as mx
+
+        n_tok = int(pn_2d.shape[0])
+        if self._is_m5_nax_moe and n_tok >= 512:
+            return self._moe_gather_qmm_nax(pn_2d, h_2d, inds_2d, scores_2d, ld)
+
+        chunk = int(self._moe_tile_chunk_tokens)
+        if n_tok <= chunk:
+            return self._moe_tile_mpp_chunk(pn_2d, h_2d, inds_2d, scores_2d, ld)
+
+        outs = []
+        for s0 in range(0, n_tok, chunk):
+            s1 = min(n_tok, s0 + chunk)
+            outs.append(
+                self._moe_tile_mpp_chunk(
+                    pn_2d[s0:s1],
+                    h_2d[s0:s1],
+                    inds_2d[s0:s1],
+                    scores_2d[s0:s1],
+                    ld,
+                )
+            )
+        return mx.concatenate(outs, axis=0)
 
     def _apply_rope(self, q: Any, k: Any, offset: int) -> tuple[Any, Any]:
         import mlx.core as mx
@@ -783,7 +980,7 @@ class FastGptOssModel:
                 )
                 inds, scores = self._route_c(rl[0])
                 exp_ids = inds[0].astype(mx.uint32)
-                gu = mx.gather_qmm(  # guard: allow-lhs-indices
+                gu = mx.gather_qmm(  # guard: allow-lhs-indices guard: allow-unsorted-qmm
                     pn.reshape(1, 1, 1, self.H),
                     ld["gu_w"],
                     ld["gu_s"],
@@ -798,7 +995,7 @@ class FastGptOssModel:
                     4, 1, 1, self.d_ff
                 )
                 dn = (
-                    mx.gather_qmm(
+                    mx.gather_qmm(  # guard: allow-unsorted-qmm
                         act,
                         ld["dn_w"],
                         ld["dn_s"],
@@ -877,10 +1074,13 @@ class FastGptOssModel:
                 kv_len = int(k_att.shape[2])
                 swa_offset = kv_len - l_seq
                 p_arr = mx.array([l_seq, kv_len, swa_offset, self.swa, self.scale_u32], dtype=mx.uint32)
+                q_c = mx.contiguous(q)
+                k_c = mx.contiguous(k_att)
+                v_c = mx.contiguous(v_att)
                 att = self.kernels["swa128_prefill_mma"](
-                    inputs=[q, k_att, v_att, ld["sinks_f32"], p_arr],
-                    grid=(((l_seq + 31) // 32) * 128, self.n_q, 1),
-                    threadgroup=(128, 1, 1),
+                    inputs=[q_c, k_c, v_c, ld["sinks_f32"], p_arr],
+                    grid=(((l_seq + 7) // 8) * 256, self.n_kv, 1),
+                    threadgroup=(256, 1, 1),
                     output_shapes=[(1, self.n_q, l_seq, self.hd)],
                     output_dtypes=[mx.float16],
                 )[0]
@@ -910,39 +1110,13 @@ class FastGptOssModel:
                 bias=ld["r_bias"],
             )
             inds, scores = self._route_c(rl)
-            fl = inds.reshape(-1)
-            ord_i = mx.argsort(fl)
-            inv_i = mx.argsort(ord_i)
-            inds_e = fl[ord_i]
-            hx = pn.reshape(-1, 1, self.H)[ord_i // 4]
-            gu = mx.gather_qmm(  # guard: allow-lhs-indices
-                hx,
-                ld["gu_w"],
-                ld["gu_s"],
-                rhs_indices=inds_e,
-                transpose=True,
-                group_size=32,
-                bits=4,
-                mode="mxfp4",
-                sorted_indices=True,
-            )
-            act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), ld["gu_bias"][inds_e]).reshape(
-                *gu.shape[:-1], self.d_ff
-            )
-            y = mx.gather_qmm(  # guard: allow-lhs-indices
-                act,
-                ld["dn_w"],
-                ld["dn_s"],
-                rhs_indices=inds_e,
-                transpose=True,
-                group_size=32,
-                bits=4,
-                mode="mxfp4",
-                sorted_indices=True,
-            )
-            y = (y.reshape(-1, self.H) + ld["dn_bias"][inds_e])[inv_i].reshape(1, l_seq, 4, self.H)
-            mlp_out = mx.sum(y * scores[..., None].astype(mx.float32), axis=-2).astype(mx.bfloat16)
-            h = h + mlp_out
+            h = self._moe_forward(
+                pn.reshape(l_seq, self.H),
+                h.reshape(l_seq, self.H),
+                inds.reshape(l_seq, 4),
+                scores.reshape(l_seq, 4),
+                ld,
+            ).reshape(1, l_seq, self.H)
 
         hf = self.rms_f16(h[:, -1:, :] if last_only else h, self.final_norm)
         return self._linear(
@@ -1157,10 +1331,13 @@ class FastGptOssModel:
                         ]
                         kv_len = int(k_att.shape[2])
                         p_arr = mx.array([ln, kv_len, swa_sys_len, self.swa, self.scale_u32], dtype=mx.uint32)
+                        q_c = mx.contiguous(q)
+                        k_c = mx.contiguous(k_att)
+                        v_c = mx.contiguous(v_att)
                         att_b = self.kernels["swa128_prefill_mma"](
-                            inputs=[q, k_att, v_att, ld["sinks_f32"], p_arr],
-                            grid=(((ln + 31) // 32) * 128, self.n_q, 1),
-                            threadgroup=(128, 1, 1),
+                            inputs=[q_c, k_c, v_c, ld["sinks_f32"], p_arr],
+                            grid=(((ln + 7) // 8) * 256, self.n_kv, 1),
+                            threadgroup=(256, 1, 1),
                             output_shapes=[(1, self.n_q, ln, self.hd)],
                             output_dtypes=[mx.float16],
                         )[0]
@@ -1191,39 +1368,7 @@ class FastGptOssModel:
                     bias=ld["r_bias"],
                 )
                 inds, scores = self._route_c(rl)
-                fl = inds.reshape(-1)
-                ord_i = mx.argsort(fl)
-                inv_i = mx.argsort(ord_i)
-                inds_e = fl[ord_i]
-                hx = pn.reshape(-1, 1, self.H)[ord_i // 4]
-                gu = mx.gather_qmm(  # guard: allow-lhs-indices
-                    hx,
-                    ld["gu_w"],
-                    ld["gu_s"],
-                    rhs_indices=inds_e,
-                    transpose=True,
-                    group_size=32,
-                    bits=4,
-                    mode="mxfp4",
-                    sorted_indices=True,
-                )
-                act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), ld["gu_bias"][inds_e]).reshape(
-                    *gu.shape[:-1], self.d_ff
-                )
-                y = mx.gather_qmm(  # guard: allow-lhs-indices
-                    act,
-                    ld["dn_w"],
-                    ld["dn_s"],
-                    rhs_indices=inds_e,
-                    transpose=True,
-                    group_size=32,
-                    bits=4,
-                    mode="mxfp4",
-                    sorted_indices=True,
-                )
-                y = (y.reshape(-1, self.H) + ld["dn_bias"][inds_e])[inv_i].reshape(total_tok, 4, self.H)
-                mlp_out = mx.sum(y * scores[..., None].astype(mx.float32), axis=-2).astype(mx.bfloat16)
-                h_all = h_all + mlp_out
+                h_all = self._moe_forward(pn, h_all, inds, scores, ld)
 
             end_indices = mx.array([offs[i + 1] - 1 for i in range(len(sub_lens))], dtype=mx.int32)
             hf = self.rms_f16(h_all[end_indices], self.final_norm)
@@ -1279,14 +1424,11 @@ class FastGptOssModel:
         suf_lens_arr = batch_cache["suf_lens_arr"]
         swa_init_lens_arr = batch_cache["swa_init_lens_arr"]
         rope_pos_arr = batch_cache["rope_pos_arr"]
-        ntok_arr = mx.array([b_sz], dtype=mx.uint32)
         p_hyd_p1 = mx.array([b_sz, l_sys, self.scale_u32], dtype=mx.uint32)
         p_hyd_p2 = mx.array([cap_full, suf_max, dec_cnt + 1, self.scale_u32, has_sys], dtype=mx.uint32)
         p_swa = mx.array([self.swa, end_mod, dec_cnt, self.scale_u32], dtype=mx.uint32)
 
         h = self.embed(tokens_1d)
-        n_assign = b_sz * 4
-        max_hot = max(1, (n_assign // 9) + 1)
         n_heads_tot = self.n_q + self.n_kv
         last_layer_idx = self.num_layers - 1
 
@@ -1372,69 +1514,7 @@ class FastGptOssModel:
                 bias=ld["r_bias"],
             )
             inds, scores = self._route_c(rl)
-
-            if b_sz <= 256:
-                tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = self.kernels["moe_build_tiles"](
-                    inputs=[inds.astype(mx.uint32), scores.astype(mx.float16), ntok_arr],
-                    grid=(32, 1, 1),
-                    threadgroup=(32, 1, 1),
-                    output_shapes=[(n_assign,), (n_assign,), (n_assign,), (max_hot * 3,), (32 * 3,), (2,)],
-                    output_dtypes=[mx.uint32, mx.uint32, mx.float16, mx.uint32, mx.uint32, mx.uint32],
-                )
-                mid = self.kernels["moe_batch_gu_unified"](
-                    inputs=[pn, tok_idx, ld["gu_w"], ld["gu_s"], ld["gu_bias"], hot_meta, cold_meta, meta_counts],
-                    grid=((self.d_ff // 8) * 128, max_hot + self.num_local_experts, 1),
-                    threadgroup=(128, 1, 1),
-                    output_shapes=[(n_assign, self.d_ff)],
-                    output_dtypes=[mx.float16],
-                )[0]
-                y_slots = self.kernels["moe_batch_dn_unified"](
-                    inputs=[mid, slot_idx, rweights, ld["dn_w"], ld["dn_s"], ld["dn_bias"], hot_meta, cold_meta, meta_counts],
-                    grid=((self.H // 16) * 128, max_hot + self.num_local_experts, 1),
-                    threadgroup=(128, 1, 1),
-                    output_shapes=[(b_sz, 4, self.H)],
-                    output_dtypes=[mx.float16],
-                )[0]
-                h = self.kernels["moe_reduce4_resid_bf16"](
-                    inputs=[y_slots, h],
-                    grid=(self.H // 4, b_sz, 1),
-                    threadgroup=(16, 1, 1),
-                    output_shapes=[(b_sz, self.H)],
-                    output_dtypes=[mx.bfloat16],
-                )[0]
-            else:
-                fl = inds.reshape(-1)
-                ord_i = mx.argsort(fl)
-                inv_i = mx.argsort(ord_i)
-                inds_e = fl[ord_i]
-                hx = pn.reshape(-1, 1, self.H)[ord_i // 4]
-                gu = mx.gather_qmm(  # guard: allow-lhs-indices
-                    hx,
-                    ld["gu_w"],
-                    ld["gu_s"],
-                    rhs_indices=inds_e,
-                    transpose=True,
-                    group_size=32,
-                    bits=4,
-                    mode="mxfp4",
-                    sorted_indices=True,
-                )
-                act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), ld["gu_bias"][inds_e]).reshape(
-                    *gu.shape[:-1], self.d_ff
-                )
-                y = mx.gather_qmm(  # guard: allow-lhs-indices
-                    act,
-                    ld["dn_w"],
-                    ld["dn_s"],
-                    rhs_indices=inds_e,
-                    transpose=True,
-                    group_size=32,
-                    bits=4,
-                    mode="mxfp4",
-                    sorted_indices=True,
-                )
-                y = (y.reshape(-1, self.H) + ld["dn_bias"][inds_e])[inv_i].reshape(b_sz, 4, self.H)
-                h = h + mx.sum(y * scores[..., None].astype(mx.float32), axis=-2).astype(mx.bfloat16)
+            h = self._moe_forward(pn, h, inds, scores, ld)
 
         batch_cache["dec_cnt"] = dec_cnt + 1
         batch_cache["swa_write"] = swa_write + 1

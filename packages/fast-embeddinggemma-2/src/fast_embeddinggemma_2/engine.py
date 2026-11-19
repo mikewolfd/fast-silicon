@@ -1,27 +1,33 @@
-"""Unified M4 Pro EmbeddingGemma-2 engine (Metal MPP GPU + 16-core ANE + CPU SME)."""
+"""Unified Apple Silicon EmbeddingGemma-2 engine (Metal GPU + 16-core ANE + opt-in CPU SME)."""
 
 from __future__ import annotations
 
-from collections import deque
 import ctypes
+import os
 from pathlib import Path
+import platform
+import subprocess
 import threading
 import time
-from typing import Sequence
+from typing import Any, Sequence
+import warnings
 
 import mlx.core as mx
 import numpy as np
-from fast_shared.embeddings import resolve_embedding_dim, truncate_and_normalize
+from fast_shared.bench import clear_mlx_arena
+from fast_shared.embeddings import resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
 
 from .gpu import (
     ANE_MS_COST,
     EMBED_DIM,
     GPU_B_OPTS,
+    HIDDEN_SIZE,
     MAX_SEQ_LEN,
     OVER_B_OPTS,
     FastEmbeddingGemma2GPU,
     build_over_chunks,
     fast_pack_cost_aware,
+    make_rope_tables_np,
 )
 from .paths import require_runtime_paths
 from .tokenizer import FastEmbeddingGemma2Tokenizer
@@ -38,10 +44,13 @@ _ANE_BUNDLES: tuple[tuple[int, str, int], ...] = (
     (512, "emb2_pk_s512_w8.mlmodelc", 4),
 )
 
+# Cap CPU-SME concurrent slots / BLAS workers to <= 2 (2 physical shared SME2 units on M4/M5).
+MAX_CPU_SME_THREADS: int = 2
+
 _CPU_BUNDLES: tuple[tuple[int, str, int], ...] = (
-    (256, "emb2_cpu_s256_mix_w8.mlmodelc", 4),
-    (384, "emb2_cpu_s384_mix_w8.mlmodelc", 4),
-    (512, "emb2_cpu_s512_mix_w8.mlmodelc", 4),
+    (256, "emb2_cpu_s256_mix_w8.mlmodelc", MAX_CPU_SME_THREADS),
+    (384, "emb2_cpu_s384_mix_w8.mlmodelc", MAX_CPU_SME_THREADS),
+    (512, "emb2_cpu_s512_mix_w8.mlmodelc", MAX_CPU_SME_THREADS),
 )
 
 _QUERY_CAPS: tuple[int, ...] = (32, 64, 128, 192, 256, 320, 384, 448, 512)
@@ -50,16 +59,109 @@ HETERO_CPU_MAX_SEC: float = 0.75
 HETERO_CPU_MAX_DOCS: int = 192
 HETERO_CPU_MAX_TOKS: int = 32768
 
+# Minimum workload size before opt-in 3-way hetero3 fires CPU-SME alongside GPU+ANE.
+HETERO3_CPU_MIN_DOCS: int = 256
+HETERO3_CPU_MIN_TOKS: int = 65536
+
+
+def _sysctl_str(key: str) -> str:
+    if platform.system() != "Darwin":
+        return ""
+    try:
+        return subprocess.check_output(["sysctl", "-n", key], text=True, stderr=subprocess.DEVNULL, timeout=2).strip()
+    except Exception:
+        return ""
+
+
+def _sysctl_int(key: str) -> int | None:
+    raw = _sysctl_str(key)
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def probe_cpu_topology() -> dict[str, Any]:
+    """Probe perflevel0/perflevel1 names and core counts without assuming E-cores exist.
+
+    Base M5 reports 4 Super + 6 Efficiency, whereas M5 Pro/Max report 6 Super + 12 Performance (zero E-cores).
+    """
+    p0_name = _sysctl_str("hw.perflevel0.name") or "Performance"
+    p0_cnt = _sysctl_int("hw.perflevel0.physicalcpu")
+    p1_name = _sysctl_str("hw.perflevel1.name") or ""
+    p1_cnt = _sysctl_int("hw.perflevel1.physicalcpu")
+    has_eff_cores = bool(p1_cnt and "eff" in p1_name.lower())
+    return {
+        "brand": _sysctl_str("machdep.cpu.brand_string") or platform.processor() or "unknown",
+        "perflevel0_name": p0_name,
+        "perflevel0_cores": p0_cnt,
+        "perflevel1_name": p1_name or None,
+        "perflevel1_cores": p1_cnt,
+        "has_efficiency_cores": has_eff_cores,
+        "max_cpu_sme_threads": MAX_CPU_SME_THREADS,
+    }
+
+
+def _apply_mlx_wired_limit() -> int | None:
+    set_wired = getattr(mx, "set_wired_limit", None)
+    dev_info_fn = getattr(mx, "device_info", None)
+    if not callable(set_wired) or not callable(dev_info_fn):
+        return None
+    try:
+        info = dev_info_fn()
+        rec = int(info.get("max_recommended_working_set_size", 0))
+        if rec > 0:
+            return int(set_wired(rec))
+    except Exception:
+        return None
+    return None
+
+
+def _restore_mlx_wired_limit(prev_limit: int | None) -> None:
+    if prev_limit is None:
+        return
+    set_wired = getattr(mx, "set_wired_limit", None)
+    if callable(set_wired):
+        try:
+            set_wired(int(prev_limit))
+        except Exception:
+            pass
+
+
+def _maybe_clear_mlx_arena(threshold_mib: int = 256) -> None:
+    get_cache = getattr(mx, "get_cache_memory", None)
+    if callable(get_cache):
+        try:
+            if int(get_cache()) > (threshold_mib << 20):
+                clear_mlx_arena(threshold_mib)
+        except Exception:
+            pass
+
 
 def _should_stop_hetero_cpu(elapsed_s: float, cpu_docs: int, cpu_toks: int, *, eff_mode: str) -> bool:
-    """Keep CPU-SME on short bursts only in `hetero` mode so sustained runs do not throttle ANE/GPU."""
-    if eff_mode != "hetero":
+    """Keep CPU-SME on short bursts only in hetero/hetero3 mode so sustained runs do not throttle ANE/GPU."""
+    if eff_mode not in ("hetero", "hetero3"):
         return False
     return (
         (elapsed_s >= HETERO_CPU_MAX_SEC)
         or (cpu_docs >= HETERO_CPU_MAX_DOCS)
         or (cpu_toks >= HETERO_CPU_MAX_TOKS)
     )
+
+
+def _allow_hetero3_cpu_worker(
+    n_docs: int,
+    total_toks: int,
+    *,
+    cpu_sme_available: bool,
+    llm_coexec: bool = False,
+) -> bool:
+    """Gate 3-way CPU-SME bursts away from small/medium batches and LLM co-execution."""
+    if not cpu_sme_available or llm_coexec:
+        return False
+    if os.environ.get("FAST_SILICON_LLM_COEXEC") == "1":
+        return False
+    return (n_docs >= HETERO3_CPU_MIN_DOCS) or (total_toks >= HETERO3_CPU_MIN_TOKS)
 
 
 def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
@@ -94,7 +196,30 @@ def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
     lib.emb2_pk_exec_queue.restype = ctypes.c_double
     lib.emb2_pk_free.argtypes = [ctypes.c_void_p]
     lib.emb2_pk_free.restype = None
+    if hasattr(lib, "emb2_inspect_plan"):
+        lib.emb2_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.emb2_inspect_plan.restype = None
+    if hasattr(lib, "emb2_get_plan_counts"):
+        lib.emb2_get_plan_counts.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.emb2_get_plan_counts.restype = ctypes.c_int
+    if hasattr(lib, "emb2_last_error"):
+        lib.emb2_last_error.argtypes = []
+        lib.emb2_last_error.restype = ctypes.c_char_p
     return lib
+
+
+def _coreml_err_detail(lib: ctypes.CDLL | None) -> str:
+    if lib is not None and hasattr(lib, "emb2_last_error"):
+        raw = lib.emb2_last_error()
+        if raw:
+            return raw.decode("utf-8", errors="replace")
+    return ""
 
 
 def _load_io_lib(dylib_path: Path) -> ctypes.CDLL:
@@ -178,7 +303,7 @@ MRL_DIMENSIONS: tuple[int, ...] = (128, 256, 512, 768)
 
 
 class FastEmbeddingGemma2:
-    """Heterogeneous M4 Pro EmbeddingGemma-2 engine (GPU MPP + ANE W8 + CPU-SME mix-W8)."""
+    """Heterogeneous Apple Silicon EmbeddingGemma-2 engine (GPU + ANE W8 + opt-in CPU-SME mix-W8)."""
 
     dim: int = EMBED_DIM
     max_dim: int = EMBED_DIM
@@ -192,21 +317,34 @@ class FastEmbeddingGemma2:
         self,
         *,
         home: str | Path | None = None,
-        default_mode: str = "hetero2",
+        default_mode: str = "hetero",
         warmup: bool = True,
         enable_ane: bool = True,
-        enable_cpu_sme: bool = True,
+        enable_cpu_sme: bool = False,
         dimensions: int | None = None,
+        verify_ane_plan: bool = True,
+        mlx_cache_limit_mb: int | None = 512,
+        set_wired_limit: bool = True,
+        llm_coexec: bool = False,
     ) -> None:
         self.dim = resolve_embedding_dim(dimensions, max_dim=EMBED_DIM)
         self.paths = require_runtime_paths(home, require_ane=False)
         self.tokenizer = FastEmbeddingGemma2Tokenizer(self.paths.tokenizer_json)
-        self.gpu = FastEmbeddingGemma2GPU(self.paths.weights_npz)
+        self._gpu: FastEmbeddingGemma2GPU | None = None
+        self._gpu_init_lock = threading.Lock()
+        self._mlx_cache_limit_mb = mlx_cache_limit_mb
+        self._set_wired_limit = set_wired_limit
+        self._prev_wired_limit: int | None = None
+        self._memory_hygiene_applied = False
+        self.llm_coexec = bool(llm_coexec)
+        self.cpu_topology = probe_cpu_topology()
 
         self._coreml: ctypes.CDLL | None = None
         self._io: ctypes.CDLL | None = None
         self.ane_handles: dict[int, int] = {}
         self.cpu_handles: dict[int, int] = {}
+        self._ane_bundle_paths: dict[int, Path] = {}
+        self.ane_plan_stats: dict[int, dict[str, int]] = {}
         self._handle_locks: dict[tuple[str, int], threading.Lock] = {}
         self.ane_available = False
         self.cpu_sme_available = False
@@ -227,45 +365,109 @@ class FastEmbeddingGemma2:
         self._corpus_lock = threading.Lock()
         self.last_stats: dict[str, int] | None = None
 
+        eff_enable_cpu = bool(enable_cpu_sme) or (default_mode in ("cpu", "hetero3"))
+        if eff_enable_cpu:
+            # Cap Accelerate BLAS concurrency to <= 2 SME2 units if caller did not set a lower cap.
+            cur_blas = os.environ.get("VECLIB_MAXIMUM_THREADS")
+            if not cur_blas or (cur_blas.isdigit() and int(cur_blas) > MAX_CPU_SME_THREADS):
+                os.environ["VECLIB_MAXIMUM_THREADS"] = str(MAX_CPU_SME_THREADS)
+
+        # Skip eager Metal GPU weight/kernel initialization when default_mode is pure ANE or pure CPU.
+        if default_mode not in ("ane", "cpu"):
+            _ = self.gpu
+
         if (
-            (enable_ane or enable_cpu_sme)
+            (enable_ane or eff_enable_cpu)
             and self.paths.coreml_dylib.exists()
             and self.paths.io_dylib.exists()
             and self.paths.ane_models_dir.exists()
         ):
-            self._init_coreml(enable_ane=enable_ane, enable_cpu_sme=enable_cpu_sme)
+            self._init_coreml(
+                enable_ane=enable_ane,
+                enable_cpu_sme=eff_enable_cpu,
+                verify_plan=verify_ane_plan,
+            )
 
         self.default_mode = self._resolve_mode(default_mode)
+        if self.default_mode not in ("ane", "cpu") and self._gpu is None:
+            _ = self.gpu
+
         if warmup:
             self.warmup()
+
+    def _ensure_memory_hygiene(self) -> None:
+        if self._memory_hygiene_applied:
+            return
+        self._memory_hygiene_applied = True
+        if self._mlx_cache_limit_mb is not None:
+            set_mlx_cache_limit(self._mlx_cache_limit_mb)
+        if self._set_wired_limit:
+            self._prev_wired_limit = _apply_mlx_wired_limit()
+
+    @property
+    def gpu(self) -> FastEmbeddingGemma2GPU:
+        if self._gpu is None:
+            with self._gpu_init_lock:
+                if self._gpu is None:
+                    self._ensure_memory_hygiene()
+                    self._gpu = FastEmbeddingGemma2GPU(self.paths.weights_npz)
+        return self._gpu
+
+    @gpu.setter
+    def gpu(self, value: Any) -> None:
+        self._gpu = value
 
     def _resolve_dim(self, dimensions: int | None) -> int:
         return resolve_embedding_dim(dimensions, max_dim=EMBED_DIM, default_dim=self.dim)
 
     def _resolve_mode(self, mode: str) -> str:
-        if mode == "hetero":
+        # Canonical mode naming aligned with fast-bge-small:
+        #   "hetero" (and backward-compat alias "hetero2") -> 2-way GPU + ANE
+        #   "hetero3" -> explicit opt-in 3-way GPU + ANE + CPU-SME (gated on batch size / no LLM coexec)
+        if mode in ("hetero", "hetero2"):
+            return "hetero" if self.ane_available else "gpu"
+        if mode == "hetero3":
             if self.ane_available and self.cpu_sme_available:
-                return "hetero"
+                return "hetero3"
             if self.ane_available:
-                return "hetero2"
-            if self.cpu_sme_available:
                 return "hetero"
+            if self.cpu_sme_available:
+                return "hetero3"
             return "gpu"
-        if mode == "hetero2":
-            return "hetero2" if self.ane_available else "gpu"
         if mode == "ane" and not self.ane_available:
             raise RuntimeError(
                 f"ANE requested but CoreML runner dylibs or .mlmodelc bundles are missing under {self.paths.home}"
             )
         if mode == "cpu" and not self.cpu_sme_available:
             raise RuntimeError(
-                f"CPU-SME requested but CoreML runner dylibs or cpu .mlmodelc bundles are missing under {self.paths.home}"
+                f"CPU-SME requested but CoreML runner dylibs, cpu .mlmodelc bundles, or enable_cpu_sme=True are missing under {self.paths.home}"
             )
-        if mode not in ("gpu", "ane", "cpu", "hetero", "hetero2"):
+        if mode not in ("gpu", "ane", "cpu", "hetero", "hetero2", "hetero3"):
             raise ValueError(f"Unsupported mode: {mode!r}")
         return mode
 
-    def _init_coreml(self, *, enable_ane: bool, enable_cpu_sme: bool) -> None:
+    def _load_coreml_host_tables(self) -> None:
+        if self._gpu is not None:
+            self._emb_scaled_np = np.ascontiguousarray(np.array(self._gpu.embed_scaled))
+            self._emb_proj_T32_np = np.ascontiguousarray(np.array(self._gpu.emb_proj_wT32))
+            self._c256_np = np.ascontiguousarray(np.array(self._gpu.c256))
+            self._s256_np = np.ascontiguousarray(np.array(self._gpu.s256))
+            self._c512_np = np.ascontiguousarray(np.array(self._gpu.c512))
+            self._s512_np = np.ascontiguousarray(np.array(self._gpu.s512))
+            return
+
+        # Pure-NumPy table loading so mode="ane"/"cpu" never initializes Metal GPU weights.
+        with np.load(self.paths.weights_npz) as raw:
+            emb_f16 = raw["embed_tokens"].astype(np.float16)
+            self._emb_scaled_np = np.ascontiguousarray(
+                (emb_f16.astype(np.float32) * np.float32(HIDDEN_SIZE ** 0.5)).astype(np.float16)
+            )
+            proj_raw = raw["emb_proj"]
+            proj_2d = proj_raw[:, :, 0, 0] if proj_raw.ndim == 4 else proj_raw
+            self._emb_proj_T32_np = np.ascontiguousarray(proj_2d.astype(np.float32).T)
+        self._c256_np, self._s256_np, self._c512_np, self._s512_np = make_rope_tables_np(MAX_SEQ_LEN)
+
+    def _init_coreml(self, *, enable_ane: bool, enable_cpu_sme: bool, verify_plan: bool = True) -> None:
         coreml = _load_coreml_lib(self.paths.coreml_dylib)
         io_lib = _load_io_lib(self.paths.io_dylib)
 
@@ -277,6 +479,7 @@ class FastEmbeddingGemma2:
                 h = coreml.emb2_pk_load_units(str(p).encode("utf-8"), seq_len, pd, 0)
                 if h:
                     self.ane_handles[seq_len] = h
+                    self._ane_bundle_paths[seq_len] = p
                     self._handle_locks[("ane", seq_len)] = threading.Lock()
 
         if enable_cpu_sme:
@@ -284,7 +487,7 @@ class FastEmbeddingGemma2:
                 p = self.paths.ane_models_dir / fname
                 if not p.exists():
                     continue
-                h = coreml.emb2_pk_load_units(str(p).encode("utf-8"), seq_len, pd, 1)
+                h = coreml.emb2_pk_load_units(str(p).encode("utf-8"), seq_len, min(pd, MAX_CPU_SME_THREADS), 1)
                 if h:
                     self.cpu_handles[seq_len] = h
                     self._handle_locks[("cpu", seq_len)] = threading.Lock()
@@ -292,29 +495,75 @@ class FastEmbeddingGemma2:
         if self.ane_handles or self.cpu_handles:
             self._coreml = coreml
             self._io = io_lib
-            self._emb_scaled_np = np.ascontiguousarray(np.array(self.gpu.embed_scaled))
-            self._emb_proj_T32_np = np.ascontiguousarray(np.array(self.gpu.emb_proj_wT32))
-            self._c256_np = np.ascontiguousarray(np.array(self.gpu.c256))
-            self._s256_np = np.ascontiguousarray(np.array(self.gpu.s256))
-            self._c512_np = np.ascontiguousarray(np.array(self.gpu.c512))
-            self._s512_np = np.ascontiguousarray(np.array(self.gpu.s512))
+            self._load_coreml_host_tables()
             self._query_scratch = CoreMLScratch(1, 512)
             self._ane_scratch = CoreMLScratch(32, 512)
             self._ane_scratch_b = CoreMLScratch(32, 512)
-            self._cpu_scratch = CoreMLScratch(24, 512)
+            self._cpu_scratch = CoreMLScratch(24, 512) if self.cpu_handles else None
             self.ane_available = bool(self.ane_handles)
             self.cpu_sme_available = bool(self.cpu_handles)
+            if verify_plan and self.ane_available:
+                self.inspect_ane_plans(warn_on_cpu_fallback=True)
+
+    def inspect_ane_plans(self, *, warn_on_cpu_fallback: bool = True) -> dict[int, dict[str, int]]:
+        """Inspect MLComputePlan placement for loaded ANE bundles; warn if cpu_ops > 0 or ane_ops == 0."""
+        plans: dict[int, dict[str, int]] = {}
+        if not self.ane_available or self._coreml is None or not hasattr(self._coreml, "emb2_get_plan_counts"):
+            return plans
+        for seq_len in sorted(self._ane_bundle_paths):
+            model_path = self._ane_bundle_paths[seq_len]
+            ane_c = ctypes.c_int(0)
+            gpu_c = ctypes.c_int(0)
+            cpu_c = ctypes.c_int(0)
+            rc = self._coreml.emb2_get_plan_counts(
+                str(model_path).encode("utf-8"),
+                0,
+                ctypes.byref(ane_c),
+                ctypes.byref(gpu_c),
+                ctypes.byref(cpu_c),
+            )
+            if rc != 0:
+                if warn_on_cpu_fallback:
+                    warnings.warn(
+                        f"MLComputePlan inspection failed for {model_path.name} (rc={rc}: {_coreml_err_detail(self._coreml)})",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                continue
+            entry = {"ane_ops": int(ane_c.value), "gpu_ops": int(gpu_c.value), "cpu_ops": int(cpu_c.value)}
+            plans[seq_len] = entry
+            if warn_on_cpu_fallback and (entry["ane_ops"] == 0 or entry["cpu_ops"] > 0):
+                warnings.warn(
+                    f"CoreML ANE plan for {model_path.name} has ANE={entry['ane_ops']} GPU={entry['gpu_ops']} "
+                    f"CPU={entry['cpu_ops']} (expected ane_ops > 0 and cpu_ops == 0).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        self.ane_plan_stats = plans
+        return plans
 
     def close(self) -> None:
-        if self._coreml is not None:
-            for h in self.ane_handles.values():
-                self._coreml.emb2_pk_free(h)
-            for h in self.cpu_handles.values():
-                self._coreml.emb2_pk_free(h)
+        coreml = getattr(self, "_coreml", None)
+        if coreml is not None:
+            for h in getattr(self, "ane_handles", {}).values():
+                coreml.emb2_pk_free(h)
+            for h in getattr(self, "cpu_handles", {}).values():
+                coreml.emb2_pk_free(h)
             self.ane_handles.clear()
             self.cpu_handles.clear()
         self.ane_available = False
         self.cpu_sme_available = False
+        prev = getattr(self, "_prev_wired_limit", None)
+        self._prev_wired_limit = None
+        _restore_mlx_wired_limit(prev)
+        if getattr(self, "_gpu", None) is not None:
+            _maybe_clear_mlx_arena(256)
+
+    def __enter__(self) -> "FastEmbeddingGemma2":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
     def __del__(self) -> None:
         try:
@@ -425,7 +674,7 @@ class FastEmbeddingGemma2:
         lock = self._handle_locks[(kind, S)]
         N, tot_docs, real_toks, doc_idxs = self._prep_coreml_lanes(S, lanes, scratch)
         with lock:
-            self._coreml.emb2_pk_exec_queue(
+            ms = self._coreml.emb2_pk_exec_queue(
                 handle,
                 N,
                 scratch.h_all.ctypes.data,
@@ -436,6 +685,9 @@ class FastEmbeddingGemma2:
                 scratch.sf_all.ctypes.data,
                 scratch.out_all.ctypes.data,
             )
+            if ms < 0.0:
+                detail = _coreml_err_detail(self._coreml)
+                raise RuntimeError(f"emb2_pk_exec_queue(kind={kind}, S={S}) failed: {detail}")
         self._finish_coreml_lanes(S, tot_docs, scratch, out_dest, doc_idxs, eff_dim)
         return real_toks, N * S
 
@@ -449,20 +701,24 @@ class FastEmbeddingGemma2:
             self.encode_query([2, 3250, 236787, 7293, 1109, 1816, 236787, 1], prefer_ane=True)
         if self.default_mode == "ane" and self.ane_available:
             return
+        if self.default_mode == "cpu" and self.cpu_sme_available:
+            return
         with self._gpu_lock:
             self.gpu.encode_single([2, 3250, 236787, 7293, 1109, 1816, 236787, 1])
             if prewarm_gpu_shapes:
-                warm_arrs: list[mx.array] = []
+                # Serialize shape warmup sequentially per (L_lane, B) with arena hygiene between
+                # buckets so 23 packed graphs do not accumulate intermediates in a single spike.
                 for L_l, b_tup in GPU_B_OPTS.items():
                     for B in b_tup:
                         _, _, _, o = self.gpu.exec_packed(L_l, [[(0, [2, 1])]] * B)
-                        warm_arrs.append(o)
+                        mx.eval(o)
+                    _maybe_clear_mlx_arena(256)
                 if prewarm_over_shapes:
                     for ml, b_tup in OVER_B_OPTS.items():
                         for B in b_tup:
                             _, _, _, o = self.gpu.exec_over(ml, [(0, [2, 1])] * B)
-                            warm_arrs.append(o)
-                mx.eval(*warm_arrs)
+                            mx.eval(o)
+                        _maybe_clear_mlx_arena(256)
                 mx.synchronize()
 
     def encode_query(
@@ -471,6 +727,7 @@ class FastEmbeddingGemma2:
         prefer_ane: bool = True,
         *,
         dimensions: int | None = None,
+        strict_ane: bool = False,
     ) -> np.ndarray:
         """Low-latency single-query encoder returning a `(dim,)` L2-normalized float32 vector."""
         eff_dim = self._resolve_dim(dimensions)
@@ -486,6 +743,12 @@ class FastEmbeddingGemma2:
                     out = np.empty((1, eff_dim), dtype=np.float32)
                     self._exec_coreml_lanes("ane", cap, [[(0, arr)]], self._query_scratch, out, eff_dim=eff_dim)
                     return out[0]
+
+        if strict_ane:
+            raise ValueError(
+                f"Strict ANE mode cannot encode query of length {sl} (max ANE length is {self.ane_query_max_len}); "
+                "use mode='hetero'/'gpu' or truncate to <=512 tokens."
+            )
 
         with self._gpu_lock:
             if isinstance(self.gpu, FastEmbeddingGemma2GPU):
@@ -510,6 +773,7 @@ class FastEmbeddingGemma2:
         eff_dim = self._resolve_dim(dimensions)
         eff_mode = self._resolve_mode(mode or self.default_mode)
         prefer_ane = eff_mode != "gpu"
+        strict_ane = eff_mode == "ane"
         ml = MAX_SEQ_LEN if max_length is None else min(MAX_SEQ_LEN, int(max_length))
 
         if isinstance(texts, str):
@@ -521,7 +785,7 @@ class FastEmbeddingGemma2:
                 add_document_prefix=add_document_prefix,
                 max_length=ml,
             )
-            return self.encode_query(ids, prefer_ane=prefer_ane, dimensions=eff_dim)
+            return self.encode_query(ids, prefer_ane=prefer_ane, dimensions=eff_dim, strict_ane=strict_ane)
 
         items = list(texts)
         if not items:
@@ -537,8 +801,11 @@ class FastEmbeddingGemma2:
         )
         if is_query or len(tok_lists) == 1:
             if len(tok_lists) == 1:
-                return self.encode_query(tok_lists[0], prefer_ane=prefer_ane, dimensions=eff_dim)[None, :]
-            return np.stack([self.encode_query(ids, prefer_ane=prefer_ane, dimensions=eff_dim) for ids in tok_lists], axis=0)
+                return self.encode_query(tok_lists[0], prefer_ane=prefer_ane, dimensions=eff_dim, strict_ane=strict_ane)[None, :]
+            return np.stack(
+                [self.encode_query(ids, prefer_ane=prefer_ane, dimensions=eff_dim, strict_ane=strict_ane) for ids in tok_lists],
+                axis=0,
+            )
 
         return self.encode_corpus(tok_lists, mode=eff_mode, dimensions=eff_dim)
 
@@ -548,8 +815,13 @@ class FastEmbeddingGemma2:
         *,
         mode: str | None = None,
         dimensions: int | None = None,
+        allow_gpu_overflow: bool = False,
     ) -> np.ndarray:
-        """Batch-embed pre-tokenized sequences `[N]` into `[N, dim]` float32 L2-normalized vectors."""
+        """Batch-embed pre-tokenized sequences `[N]` into `[N, dim]` float32 L2-normalized vectors.
+
+        When `mode="ane"` or `mode="cpu"`, sequences exceeding `512` tokens raise `ValueError`
+        unless `allow_gpu_overflow=True` is explicitly set (preventing silent GPU execution).
+        """
         eff_dim = self._resolve_dim(dimensions)
         n = len(token_lists)
         if n == 0:
@@ -563,29 +835,49 @@ class FastEmbeddingGemma2:
             for i, t in enumerate(token_lists)
         ]
 
-        if len(seqs) == 1 and eff_mode in ("gpu", "hetero", "hetero2"):
+        if len(seqs) == 1 and eff_mode in ("gpu", "hetero", "hetero2", "hetero3"):
             v = self.encode_query(seqs[0][1], prefer_ane=(eff_mode != "gpu"), dimensions=eff_dim)
+            on_ane = eff_mode != "gpu" and self.ane_available and len(seqs[0][1]) <= self.ane_query_max_len
             self.last_stats = {
-                "gpu_toks": 0 if (eff_mode != "gpu" and self.ane_available and len(seqs[0][1]) <= self.ane_query_max_len) else len(seqs[0][1]),
-                "ane_toks": len(seqs[0][1]) if (eff_mode != "gpu" and self.ane_available and len(seqs[0][1]) <= self.ane_query_max_len) else 0,
+                "gpu_toks": 0 if on_ane else len(seqs[0][1]),
+                "ane_toks": len(seqs[0][1]) if on_ane else 0,
                 "cpu_toks": 0,
-                "gpu_docs": 0 if (eff_mode != "gpu" and self.ane_available and len(seqs[0][1]) <= self.ane_query_max_len) else 1,
-                "ane_docs": 1 if (eff_mode != "gpu" and self.ane_available and len(seqs[0][1]) <= self.ane_query_max_len) else 0,
+                "gpu_docs": 0 if on_ane else 1,
+                "ane_docs": 1 if on_ane else 0,
                 "cpu_docs": 0,
             }
             return v[None, :]
 
         outs = np.empty((n, eff_dim), dtype=np.float32)
+        total_toks = sum(len(t) for _, t in seqs)
 
         with self._corpus_lock:
             by_b, over = fast_pack_cost_aware(seqs, ANE_MS_COST)
             over_q = build_over_chunks(over)
+            if len(over_q) > 0 and eff_mode in ("ane", "cpu") and not allow_gpu_overflow:
+                raise ValueError(
+                    f"mode={eff_mode!r} received {len(over)} sequence(s) longer than 512 tokens; "
+                    "ANE/CPU CoreML bundles cap at 512 tokens. Use mode='hetero'/'gpu', truncate to <=512, "
+                    "or pass allow_gpu_overflow=True to explicitly route >512 overflow onto GPU."
+                )
+
             qlock = threading.Lock()
-            use_ane = eff_mode in ("hetero", "hetero2", "ane") and self.ane_available
-            use_cpu = eff_mode in ("hetero", "cpu") and self.cpu_sme_available
-            use_gpu = eff_mode in ("hetero", "hetero2", "gpu") or (len(over_q) > 0)
+            use_ane = eff_mode in ("hetero", "hetero2", "hetero3", "ane") and self.ane_available
+            if eff_mode == "cpu":
+                use_cpu = self.cpu_sme_available
+            elif eff_mode == "hetero3":
+                use_cpu = _allow_hetero3_cpu_worker(
+                    n,
+                    total_toks,
+                    cpu_sme_available=self.cpu_sme_available,
+                    llm_coexec=getattr(self, "llm_coexec", False),
+                )
+            else:
+                use_cpu = False
+            use_gpu = eff_mode in ("hetero", "hetero2", "hetero3", "gpu") or (len(over_q) > 0)
 
             stats = {"gpu": 0, "ane": 0, "cpu": 0, "gpu_docs": 0, "ane_docs": 0, "cpu_docs": 0}
+            errors: list[BaseException] = []
 
             def pop_lanes(L_l: int, count: int) -> list:
                 q = by_b[L_l]
@@ -596,49 +888,53 @@ class FastEmbeddingGemma2:
                 return sum(len(q) for q in by_b.values())
 
             def gpu_worker() -> None:
-                prev_o: mx.array | None = None
-                prev_idxs: list[int] | None = None
-                gpu_only_mode = (eff_mode == "gpu") or (not use_ane and not use_cpu)
-                gpu_pref = sorted(by_b.keys()) if gpu_only_mode else (448, 320, 192, 512, 384, 256, 128)
-                with self._gpu_lock:
-                    while True:
-                        job = None
-                        with qlock:
-                            if over_q:
-                                ml, chk = over_q.popleft()
-                                job = ("over", ml, chk)
-                            elif eff_mode in ("hetero", "hetero2", "gpu"):
-                                for L_l in gpu_pref:
-                                    q_b = by_b.get(L_l)
-                                    n_av = len(q_b) if q_b is not None else 0
-                                    if n_av == 0:
-                                        continue
-                                    opts = GPU_B_OPTS[L_l]
-                                    cand_opts = opts if (gpu_only_mode or not use_ane) else opts[:-1]
-                                    chosen = 0
-                                    for opt in cand_opts:
-                                        if opt <= n_av:
-                                            chosen = opt
+                try:
+                    prev_o: mx.array | None = None
+                    prev_idxs: list[int] | None = None
+                    gpu_only_mode = (eff_mode == "gpu") or (not use_ane and not use_cpu)
+                    gpu_pref = sorted(by_b.keys()) if gpu_only_mode else (448, 320, 192, 512, 384, 256, 128)
+                    with self._gpu_lock:
+                        while not errors:
+                            job = None
+                            with qlock:
+                                if over_q:
+                                    ml, chk = over_q.popleft()
+                                    job = ("over", ml, chk)
+                                elif eff_mode in ("hetero", "hetero2", "hetero3", "gpu"):
+                                    for L_l in gpu_pref:
+                                        q_b = by_b.get(L_l)
+                                        n_av = len(q_b) if q_b is not None else 0
+                                        if n_av == 0:
+                                            continue
+                                        opts = GPU_B_OPTS[L_l]
+                                        cand_opts = opts if (gpu_only_mode or not use_ane) else opts[:-1]
+                                        chosen = 0
+                                        for opt in cand_opts:
+                                            if opt <= n_av:
+                                                chosen = opt
+                                                break
+                                        if chosen > 0:
+                                            job = ("packed", L_l, pop_lanes(L_l, chosen))
                                             break
-                                    if chosen > 0:
-                                        job = ("packed", L_l, pop_lanes(L_l, chosen))
-                                        break
-                        if job is None:
-                            break
-                        kind, param, chk = job
-                        if kind == "over":
-                            rt, _, di, cur_o = self.gpu.exec_over(param, chk, dimensions=eff_dim)
-                        else:
-                            rt, _, di, cur_o = self.gpu.exec_packed(param, chk, dimensions=eff_dim)
-                        mx.async_eval(cur_o)
+                            if job is None:
+                                break
+                            kind, param, chk = job
+                            if kind == "over":
+                                rt, _, di, cur_o = self.gpu.exec_over(param, chk, dimensions=eff_dim)
+                            else:
+                                rt, _, di, cur_o = self.gpu.exec_packed(param, chk, dimensions=eff_dim)
+                            mx.async_eval(cur_o)
+                            if prev_o is not None and prev_idxs is not None:
+                                outs[prev_idxs] = np.asarray(prev_o, dtype=np.float32)
+                            prev_o, prev_idxs = cur_o, di
+                            stats["gpu"] += rt
+                            stats["gpu_docs"] += len(di)
                         if prev_o is not None and prev_idxs is not None:
                             outs[prev_idxs] = np.asarray(prev_o, dtype=np.float32)
-                        prev_o, prev_idxs = cur_o, di
-                        stats["gpu"] += rt
-                        stats["gpu_docs"] += len(di)
-                    if prev_o is not None and prev_idxs is not None:
-                        outs[prev_idxs] = np.asarray(prev_o, dtype=np.float32)
-                    mx.synchronize()
+                        mx.synchronize()
+                        _maybe_clear_mlx_arena(256)
+                except BaseException as exc:
+                    errors.append(exc)
 
             def ane_worker() -> None:
                 assert self._ane_scratch is not None and self._ane_scratch_b is not None
@@ -678,7 +974,7 @@ class FastEmbeddingGemma2:
                     return None
 
                 try:
-                    while True:
+                    while not errors:
                         job = pop_ane_job()
                         if job is None:
                             break
@@ -692,9 +988,13 @@ class FastEmbeddingGemma2:
                         if prev is not None:
                             p_lock, p_flight, p_S, p_tot_docs, p_doc_idxs, p_rt, p_sc = prev
                             try:
-                                self._coreml.emb2_pk_wait_queue(p_flight)
+                                wait_ms = self._coreml.emb2_pk_wait_queue(p_flight)
                             finally:
                                 p_lock.release()
+                            if wait_ms < 0.0:
+                                raise RuntimeError(
+                                    f"emb2_pk_wait_queue(ane, S={p_S}) failed: {_coreml_err_detail(self._coreml)}"
+                                )
 
                         c_lock = self._handle_locks[("ane", S_exec)]
                         c_handle = self.ane_handles[S_exec]
@@ -711,6 +1011,10 @@ class FastEmbeddingGemma2:
                                 cur_sc.sf_all.ctypes.data,
                                 cur_sc.out_all.ctypes.data,
                             )
+                            if not c_flight:
+                                raise RuntimeError(
+                                    f"emb2_pk_submit_queue(ane, S={S_exec}) returned null: {_coreml_err_detail(self._coreml)}"
+                                )
                         except BaseException:
                             c_lock.release()
                             raise
@@ -725,12 +1029,18 @@ class FastEmbeddingGemma2:
                         p_lock, p_flight, p_S, p_tot_docs, p_doc_idxs, p_rt, p_sc = inflight
                         inflight = None
                         try:
-                            self._coreml.emb2_pk_wait_queue(p_flight)
+                            wait_ms = self._coreml.emb2_pk_wait_queue(p_flight)
                         finally:
                             p_lock.release()
+                        if wait_ms < 0.0:
+                            raise RuntimeError(
+                                f"emb2_pk_wait_queue(ane, S={p_S}) failed: {_coreml_err_detail(self._coreml)}"
+                            )
                         self._finish_coreml_lanes(p_S, p_tot_docs, p_sc, outs, p_doc_idxs, eff_dim)
                         stats["ane"] += p_rt
                         stats["ane_docs"] += p_tot_docs
+                except BaseException as exc:
+                    errors.append(exc)
                 finally:
                     if inflight is not None:
                         p_lock, p_flight, *_ = inflight
@@ -740,57 +1050,61 @@ class FastEmbeddingGemma2:
                             p_lock.release()
 
             def cpu_worker() -> None:
-                assert self._cpu_scratch is not None
-                cpu_pref_hi = [(256, 16), (384, 12), (512, 8)]
-                cpu_pref_lo = [(256, 8), (384, 6), (512, 4)]
-                cpu_fallback = [(128, 256), (192, 256), (320, 384), (448, 512), (256, 256), (384, 384), (512, 512)]
-                cpu_t0 = time.perf_counter()
-                while True:
-                    if use_gpu and use_ane and _should_stop_hetero_cpu(
-                        time.perf_counter() - cpu_t0, stats["cpu_docs"], stats["cpu"], eff_mode=eff_mode
-                    ):
-                        break
-                    job = None
-                    with qlock:
-                        rem_sh = total_shared_rem()
-                        cpu_pref = cpu_pref_hi if rem_sh > 64 else cpu_pref_lo
-                        for S, batch_n in cpu_pref:
-                            if S not in self.cpu_handles:
-                                continue
-                            n_av = len(by_b.get(S, ()))
-                            if n_av > 0:
-                                if eff_mode == "cpu":
-                                    n_take = min(batch_n, n_av)
-                                elif rem_sh <= 20:
-                                    n_take = max(4, min(batch_n, (n_av + 2) // 3)) if n_av > 4 else n_av
-                                else:
-                                    n_take = min(batch_n, n_av)
-                                job = (S, pop_lanes(S, n_take))
-                                break
-                        if job is None and (eff_mode == "cpu" or not use_ane):
-                            for src_b, s_tgt in cpu_fallback:
-                                if s_tgt not in self.cpu_handles:
+                try:
+                    assert self._cpu_scratch is not None
+                    cpu_pref_hi = [(256, 16), (384, 12), (512, 8)]
+                    cpu_pref_lo = [(256, 8), (384, 6), (512, 4)]
+                    cpu_fallback = [(128, 256), (192, 256), (320, 384), (448, 512), (256, 256), (384, 384), (512, 512)]
+                    cpu_t0 = time.perf_counter()
+                    while not errors:
+                        # Bound CPU-SME whenever co-executing with GPU (with or without ANE).
+                        if use_gpu and _should_stop_hetero_cpu(
+                            time.perf_counter() - cpu_t0, stats["cpu_docs"], stats["cpu"], eff_mode=eff_mode
+                        ):
+                            break
+                        job = None
+                        with qlock:
+                            rem_sh = total_shared_rem()
+                            cpu_pref = cpu_pref_hi if rem_sh > 64 else cpu_pref_lo
+                            for S, batch_n in cpu_pref:
+                                if S not in self.cpu_handles:
                                     continue
-                                n_av = len(by_b.get(src_b, ()))
+                                n_av = len(by_b.get(S, ()))
                                 if n_av > 0:
-                                    n_take = min(8, n_av) if eff_mode == "cpu" else min(4, max(1, (n_av + 1) // 2))
-                                    job = (s_tgt, pop_lanes(src_b, n_take))
+                                    if eff_mode == "cpu":
+                                        n_take = min(batch_n, n_av)
+                                    elif rem_sh <= 20:
+                                        n_take = max(4, min(batch_n, (n_av + 2) // 3)) if n_av > 4 else n_av
+                                    else:
+                                        n_take = min(batch_n, n_av)
+                                    job = (S, pop_lanes(S, n_take))
                                     break
-                        elif job is None:
-                            for src_b, s_tgt in ((192, 256), (320, 384), (448, 512)):
-                                if s_tgt not in self.cpu_handles:
-                                    continue
-                                n_av = len(by_b.get(src_b, ()))
-                                if n_av > 0:
-                                    n_take = min(4, max(1, (n_av + 1) // 2))
-                                    job = (s_tgt, pop_lanes(src_b, n_take))
-                                    break
-                    if job is None:
-                        break
-                    S, chk = job
-                    rt, _ = self._exec_coreml_lanes("cpu", S, chk, self._cpu_scratch, outs, eff_dim=eff_dim)
-                    stats["cpu"] += rt
-                    stats["cpu_docs"] += sum(len(ln) for ln in chk)
+                            if job is None and (eff_mode == "cpu" or not use_ane):
+                                for src_b, s_tgt in cpu_fallback:
+                                    if s_tgt not in self.cpu_handles:
+                                        continue
+                                    n_av = len(by_b.get(src_b, ()))
+                                    if n_av > 0:
+                                        n_take = min(8, n_av) if eff_mode == "cpu" else min(4, max(1, (n_av + 1) // 2))
+                                        job = (s_tgt, pop_lanes(src_b, n_take))
+                                        break
+                            elif job is None:
+                                for src_b, s_tgt in ((192, 256), (320, 384), (448, 512)):
+                                    if s_tgt not in self.cpu_handles:
+                                        continue
+                                    n_av = len(by_b.get(src_b, ()))
+                                    if n_av > 0:
+                                        n_take = min(4, max(1, (n_av + 1) // 2))
+                                        job = (s_tgt, pop_lanes(src_b, n_take))
+                                        break
+                        if job is None:
+                            break
+                        S, chk = job
+                        rt, _ = self._exec_coreml_lanes("cpu", S, chk, self._cpu_scratch, outs, eff_dim=eff_dim)
+                        stats["cpu"] += rt
+                        stats["cpu_docs"] += sum(len(ln) for ln in chk)
+                except BaseException as exc:
+                    errors.append(exc)
 
             threads: list[threading.Thread] = []
             if use_gpu:
@@ -803,6 +1117,8 @@ class FastEmbeddingGemma2:
                 th.start()
             for th in threads:
                 th.join()
+            if errors:
+                raise errors[0]
 
             self.last_stats = {
                 "gpu_toks": stats["gpu"],

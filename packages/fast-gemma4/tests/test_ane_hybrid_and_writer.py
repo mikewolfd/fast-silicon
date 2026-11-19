@@ -26,7 +26,6 @@ from fast_gemma4.ane_pipeline import (
 )
 from fast_gemma4.grammar import GrammarHelper
 from fast_gemma4.kernels import (
-    fused_gemma4_res_rms_bf16,
     fused_norm_add_norm,
     fused_ple_geglu_indexed,
     fused_res_rms_norm,
@@ -225,16 +224,21 @@ def test_linear_w8_bundle_compute_plan_and_kv_fidelity(paths: Gemma4Paths, engin
     finally:
         runner.close()
 
-    gpu_ks = np.stack([np.array(c_gpu["layers"][l]["k"][:, :256, :].astype(mx.float32)) for l in model.swa_layers], axis=1)
-    gpu_vs = np.stack([np.array(c_gpu["layers"][l]["v"][:, :256, :].astype(mx.float32)) for l in model.swa_layers], axis=1)
-    gpu_kf = np.stack([np.array(c_gpu["layers"][l]["k"][:, :256, :].astype(mx.float32)) for l in model.full_layers], axis=1)
-    gpu_vf = np.stack([np.array(c_gpu["layers"][l]["v"][:, :256, :].astype(mx.float32)) for l in model.full_layers], axis=1)
+    gpu_ks = np.stack([np.array(c_gpu["layers"][l]["k"][:, :256, 0, :].astype(mx.float32)) for l in model.swa_layers], axis=1)
+    gpu_vs = np.stack([np.array(c_gpu["layers"][l]["v"][:, :256, 0, :].astype(mx.float32)) for l in model.swa_layers], axis=1)
+    gpu_kf = np.stack([np.array(c_gpu["layers"][l]["k"][:, :256, 0, :].astype(mx.float32)) for l in model.full_layers], axis=1)
+    gpu_vf = np.stack([np.array(c_gpu["layers"][l]["v"][:, :256, 0, :].astype(mx.float32)) for l in model.full_layers], axis=1)
 
-    cos_ks = float(np.mean([_cosine(gpu_ks[b, :, :vl], ok_s[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
-    cos_vs = float(np.mean([_cosine(gpu_vs[b, :, :vl], ov_s[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
-    cos_kf = float(np.mean([_cosine(gpu_kf[b, :, :vl], ok_f[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
-    cos_vf = float(np.mean([_cosine(gpu_vf[b, :, :vl], ov_f[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
-    cos_l14k = float(np.mean([_cosine(gpu_kf[b, 2, :vl], ok_f[ri, 2, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
+    ok_s_4d = ok_s[:, :, 0, :, :] if ok_s.ndim == 5 else ok_s
+    ov_s_4d = ov_s[:, :, 0, :, :] if ov_s.ndim == 5 else ov_s
+    ok_f_4d = ok_f[:, :, 0, :, :] if ok_f.ndim == 5 else ok_f
+    ov_f_4d = ov_f[:, :, 0, :, :] if ov_f.ndim == 5 else ov_f
+
+    cos_ks = float(np.mean([_cosine(gpu_ks[b, :, :vl], ok_s_4d[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
+    cos_vs = float(np.mean([_cosine(gpu_vs[b, :, :vl], ov_s_4d[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
+    cos_kf = float(np.mean([_cosine(gpu_kf[b, :, :vl], ok_f_4d[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
+    cos_vf = float(np.mean([_cosine(gpu_vf[b, :, :vl], ov_f_4d[ri, :, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
+    cos_l14k = float(np.mean([_cosine(gpu_kf[b, 2, :vl], ok_f_4d[ri, 2, :vl]) for ri, (b, vl) in enumerate(zip(act0, vlen0))]))
     assert cos_ks >= 0.9983
     assert cos_vs >= 0.9983
     assert cos_kf >= 0.9983
@@ -281,12 +285,16 @@ def test_zero_copy_iosurface_to_metal_kv_i8_scatter_bridge(paths: Gemma4Paths, e
         ane_ref = worker.run_wave_cpu_ane(sufs_2)
         for ch_k, (act, vlen, ks_c, vs_c, kf_c, vf_c) in ane_ref["chunks"].items():
             c0 = ch_k * 256
+            ks_4d = ks_c[:, :, 0, :, :] if ks_c.ndim == 5 else ks_c
+            vs_4d = vs_c[:, :, 0, :, :] if vs_c.ndim == 5 else vs_c
+            kf_4d = kf_c[:, :, 0, :, :] if kf_c.ndim == 5 else kf_c
+            vf_4d = vf_c[:, :, 0, :, :] if vf_c.ndim == 5 else vf_c
             for ri, b in enumerate(act):
                 vl = vlen[ri]
-                kq_s, ksc_s = _ref_quant_i8_f16(ks_c[ri, :, :vl, :])
-                vq_s, vsc_s = _ref_quant_i8_f16(vs_c[ri, :, :vl, :])
-                kq_f, ksc_f = _ref_quant_i8_f16(kf_c[ri, :, :vl, :])
-                vq_f, vsc_f = _ref_quant_i8_f16(vf_c[ri, :, :vl, :])
+                kq_s, ksc_s = _ref_quant_i8_f16(ks_4d[ri, :, :vl, :])
+                vq_s, vsc_s = _ref_quant_i8_f16(vs_4d[ri, :, :vl, :])
+                kq_f, ksc_f = _ref_quant_i8_f16(kf_4d[ri, :, :vl, :])
+                vq_f, vsc_f = _ref_quant_i8_f16(vf_4d[ri, :, :vl, :])
                 slots = np.arange(c0, c0 + vl) & 511
                 for j, sl in enumerate(slots):
                     ref_swa_k[b, :, int(sl), :] = kq_s[:, j, :]
@@ -298,7 +306,7 @@ def test_zero_copy_iosurface_to_metal_kv_i8_scatter_bridge(paths: Gemma4Paths, e
                 ref_full_v[b, :, c0 : c0 + vl, :] = vq_f
                 ref_full_vs[b, :, c0 : c0 + vl] = vsc_f
 
-        ring = AsyncHybridPrefillRing(model, runner, pkv, w_emb, w_pli14)
+        ring = AsyncHybridPrefillRing(model, runner, pkv, w_emb, w_pli14, min_chunk_tokens=32)
         with SlotCacheMetalBinding(runner, model, c_zc) as binding:
             item = ring.prefill_cohort_into_ring([0, 1], sufs_2, pipe_depth=4)
             dt = ring.scatter_cohort_to_slot_cache(binding, item, [0, 1])
@@ -307,15 +315,15 @@ def test_zero_copy_iosurface_to_metal_kv_i8_scatter_bridge(paths: Gemma4Paths, e
         runner.close()
 
     for si, li in enumerate(model.swa_layers):
-        assert np.array_equal(ref_swa_k[:, si], np.array(c_zc["layers"][li]["k"]))
-        assert np.array_equal(ref_swa_v[:, si], np.array(c_zc["layers"][li]["v"]))
-        assert np.array_equal(ref_swa_ks[:, si], np.array(c_zc["layers"][li]["k_s"]))
-        assert np.array_equal(ref_swa_vs[:, si], np.array(c_zc["layers"][li]["v_s"]))
+        assert np.array_equal(ref_swa_k[:, si], np.array(c_zc["layers"][li]["k"])[:, :, 0, :])
+        assert np.array_equal(ref_swa_v[:, si], np.array(c_zc["layers"][li]["v"])[:, :, 0, :])
+        assert np.array_equal(ref_swa_ks[:, si], np.array(c_zc["layers"][li]["k_s"])[:, :, 0])
+        assert np.array_equal(ref_swa_vs[:, si], np.array(c_zc["layers"][li]["v_s"])[:, :, 0])
     for fi, li in enumerate(model.full_layers):
-        assert np.array_equal(ref_full_k[:, fi], np.array(c_zc["layers"][li]["k"]))
-        assert np.array_equal(ref_full_v[:, fi], np.array(c_zc["layers"][li]["v"]))
-        assert np.array_equal(ref_full_ks[:, fi], np.array(c_zc["layers"][li]["k_s"]))
-        assert np.array_equal(ref_full_vs[:, fi], np.array(c_zc["layers"][li]["v_s"]))
+        assert np.array_equal(ref_full_k[:, fi], np.array(c_zc["layers"][li]["k"])[:, :, 0, :])
+        assert np.array_equal(ref_full_v[:, fi], np.array(c_zc["layers"][li]["v"])[:, :, 0, :])
+        assert np.array_equal(ref_full_ks[:, fi], np.array(c_zc["layers"][li]["k_s"])[:, :, 0])
+        assert np.array_equal(ref_full_vs[:, fi], np.array(c_zc["layers"][li]["v_s"])[:, :, 0])
 
 
 def test_async_hybrid_prefill_ring_rolling_and_long_tail(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:
@@ -419,16 +427,15 @@ def test_writer_nan_argmax_empty_batch_and_full_vocab_fallback(engine: FastGemma
     w_1536 = mx.ones((1536,), dtype=mx.bfloat16)
     h0, p0 = fused_norm_add_norm(z_1536, z_1536, w_1536, w_1536, 1e-6, None)
     r0 = fused_res_rms_norm(z_1536, z_1536, w_1536, 1e-6)
-    v0_a, v0_b = fused_gemma4_res_rms_bf16(z_1536, z_1536, w_1536, w_1536)
     g0 = fused_ple_geglu_indexed(
         mx.zeros((0, 1, 256), dtype=mx.bfloat16),
         mx.zeros((0, 1, 14, 256), dtype=mx.bfloat16),
         mx.array([0], dtype=mx.int32),
     )
-    mx.eval(h0, p0, r0, v0_a, v0_b, g0)
-    assert h0.shape == (0, 1536) and v0_a.shape == (0, 1536) and g0.shape == (0, 1, 256)
+    mx.eval(h0, p0, r0, g0)
+    assert h0.shape == (0, 1536) and r0.shape == (0, 1536) and g0.shape == (0, 1, 256)
 
-    # Verify E4B D=2560 support in fused_norm_add_norm and fused_gemma4_res_rms_bf16 (including 3D B=1, L=6)
+    # Verify E4B D=2560 support in fused_norm_add_norm and fused_res_rms_norm (including 3D B=1, L=6)
     rng = np.random.default_rng(99)
     h3 = mx.array(rng.standard_normal((1, 6, 2560)), dtype=mx.bfloat16)
     x3 = mx.array(rng.standard_normal((1, 6, 2560)), dtype=mx.bfloat16)
@@ -436,12 +443,14 @@ def test_writer_nan_argmax_empty_batch_and_full_vocab_fallback(engine: FastGemma
     wn = mx.array(rng.uniform(0.5, 1.5, size=(2560,)), dtype=mx.bfloat16)
     sc = mx.array([0.85], dtype=mx.bfloat16)
     ra, na = fused_norm_add_norm(h3, x3, wp, wn, 1e-6, sc)
-    rb, nb = fused_gemma4_res_rms_bf16(h3, x3, wp, wn, eps=1e-6, scalar=sc, emit_res=True)
-    nb_only = fused_gemma4_res_rms_bf16(h3, x3, wp, wn, eps=1e-6, scalar=sc, emit_res=False)
-    mx.eval(ra, na, rb, nb, nb_only)
-    assert _cosine(np.array(ra.astype(mx.float32)), np.array(rb.astype(mx.float32))) >= 0.99999
-    assert _cosine(np.array(na.astype(mx.float32)), np.array(nb.astype(mx.float32))) >= 0.99999
-    assert np.array_equal(np.array(nb.astype(mx.float32)), np.array(nb_only.astype(mx.float32)))
+    res_ref = (h3 + mx.fast.rms_norm(x3, wp, 1e-6)) * sc
+    na_ref = mx.fast.rms_norm(res_ref, wn, 1e-6)
+    rr = fused_res_rms_norm(h3, x3, wp, 1e-6)
+    rr_ref = h3 + mx.fast.rms_norm(x3, wp, 1e-6)
+    mx.eval(ra, na, res_ref, na_ref, rr, rr_ref)
+    assert _cosine(np.array(ra.astype(mx.float32)), np.array(res_ref.astype(mx.float32))) >= 0.9999
+    assert _cosine(np.array(na.astype(mx.float32)), np.array(na_ref.astype(mx.float32))) >= 0.9999
+    assert _cosine(np.array(rr.astype(mx.float32)), np.array(rr_ref.astype(mx.float32))) >= 0.9999
 
     # 3. Full-vocab (`262,144`) fallback hygiene when schema requires tokens outside pruned `150,786` head
     model = engine.model

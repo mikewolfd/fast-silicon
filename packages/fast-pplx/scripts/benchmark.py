@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Reproducible M4 Pro benchmark & evaluation harness for `fast-pplx`.
+"""Reproducible Apple Silicon benchmark & evaluation harness for `fast-pplx`.
 
-Captures speed, Metal active peak vs macOS OS unified-memory footprint (`RUSAGE_INFO_V4`),
-16-case PyTorch CPU reference parity, streamed 32K context scaling, contextual window
-retrieval sensitivity, and exact bit-identity regression checks — all serialized cleanly
-under `/tmp/m4_gpu_validation.lock` with system quiescence checks.
+Captures speed (symmetric E2E + forward-only breakdown, interleaved ABBA thermal-drift
+cancellation, `clear_mlx_arena(256)`, and `wired_limit_scope`), Metal active peak vs macOS
+OS unified-memory footprint (`RUSAGE_INFO_V4`), 16-case PyTorch CPU reference parity across
+`gpu`, `gpu-bf16`, `ane`, and `hetero2` plus `S=4096` streamed parity, streamed 32K context
+scaling, contextual window retrieval sensitivity, and exact bit-identity regression checks —
+all serialized cleanly under `/tmp/m4_gpu_validation.lock` with system quiescence checks and
+explicit `MLX_ENABLE_TF32` telemetry.
 """
 
 from __future__ import annotations
@@ -21,6 +24,10 @@ import subprocess
 import sys
 import time
 from typing import Any, Iterator, Sequence
+
+# Default MLX_ENABLE_TF32=0 before importing MLX so FP32 paths remain exact IEEE FP32
+# across M4 (Apple9) and M5 (Apple10 NAX) unless explicitly overridden.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 import numpy as np
 
@@ -149,6 +156,24 @@ def _footprint_snapshot() -> dict[str, float | int]:
     return get_unified_memory_footprint()
 
 
+def _clear_arena(threshold_mib: int = 256) -> None:
+    try:
+        from fast_shared.bench import clear_mlx_arena
+
+        clear_mlx_arena(threshold_mib)
+    except Exception:
+        pass
+
+
+def _collect_telemetry() -> dict[str, Any]:
+    try:
+        from fast_pplx.gpu import get_mlx_runtime_telemetry
+
+        return get_mlx_runtime_telemetry()
+    except Exception:
+        return {"mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "0")}
+
+
 def _mlx_peak_gb() -> float:
     try:
         import mlx.core as mx
@@ -167,6 +192,17 @@ def _reset_mlx_peak() -> None:
         mx.reset_peak_memory()
     except Exception:
         pass
+
+
+@contextmanager
+def _wired_limit_ctx() -> Iterator[int | None]:
+    try:
+        from fast_pplx.gpu import wired_limit_scope
+
+        with wired_limit_scope() as prev:
+            yield prev
+    except Exception:
+        yield None
 
 
 @contextmanager
@@ -203,7 +239,7 @@ def _preflight_quiescence(*, allow_contended: bool) -> list[str]:
             print(f"  {line}", file=sys.stderr)
         if not allow_contended:
             raise RuntimeError(
-                "System not quiescent for reliable M4 Pro benchmarking; re-run when clear or pass --allow-contended."
+                "System not quiescent for reliable Apple Silicon benchmarking; re-run when clear or pass --allow-contended."
             )
     return warnings
 
@@ -580,7 +616,7 @@ def _median_timed(fn: Any, *, warmup: int, repeats: int) -> tuple[float, Any]:
 
 
 def _resolve_speed_mode_spec(mode: str, args: argparse.Namespace) -> tuple[str, str, bool]:
-    """Map benchmark speed variant (`gpu`, `gpu-f16`, `gpu-bf16`, `gpu-no-mmap`, `ane`, `hetero2`) -> `(engine_mode, dtype, mapped)`."""
+    """Map benchmark variant (`gpu`, `gpu-f16`, `gpu-bf16`, `gpu-no-mmap`, `ane`, `hetero`, `hetero2`) -> `(engine_mode, dtype, mapped)`."""
     if mode == "gpu-no-mmap":
         return "gpu", args.dtype, False
     if mode == "gpu-bf16":
@@ -588,6 +624,78 @@ def _resolve_speed_mode_spec(mode: str, args: argparse.Namespace) -> tuple[str, 
     if mode == "gpu-f16":
         return "gpu", "float16", not args.no_mapped_embedding
     return mode, args.dtype, not args.no_mapped_embedding
+
+
+def run_abba_speed_pair(
+    args: argparse.Namespace,
+    mode_a: str,
+    mode_b: str,
+    *,
+    rounds: int = 2,
+) -> dict[str, Any]:
+    """Compare two internal `fast-pplx` modes using `fast_shared.bench.interleaved_abba`."""
+    from fast_pplx.engine import FastPplx
+    from fast_shared.bench import interleaved_abba
+
+    ready, model_dir = _resolve_engine_model_dir(args.model_dir, args.home)
+    if not ready:
+        return {"status": "skipped", "reason": "no local weights found"}
+
+    spec_a = _resolve_speed_mode_spec(mode_a, args)
+    spec_b = _resolve_speed_mode_spec(mode_b, args)
+    doc_lengths = _parse_int_csv(args.doc_lengths)
+    probe_len = 512 if 512 in doc_lengths else doc_lengths[0]
+    b_doc = args.doc_batch if probe_len <= 1024 else max(1, min(args.doc_batch, 4))
+    docs = [_build_synthetic_text(probe_len, i) for i in range(b_doc)]
+    timing_scope = getattr(args, "timing_scope", "e2e")
+
+    with _wired_limit_ctx():
+        with FastPplx(
+            home=args.home,
+            model_dir=model_dir,
+            mode=spec_a[0],
+            dtype=spec_a[1],
+            use_mapped_embedding=spec_a[2],
+            local_files_only=True,
+        ) as eng_a, FastPplx(
+            home=args.home,
+            model_dir=model_dir,
+            mode=spec_b[0],
+            dtype=spec_b[1],
+            use_mapped_embedding=spec_b[2],
+            local_files_only=True,
+        ) as eng_b:
+            toks_a = [eng_a.tokenizer.encode_document(d, max_length=probe_len) for d in docs]
+            toks_b = [eng_b.tokenizer.encode_document(d, max_length=probe_len) for d in docs]
+            total_toks = sum(len(t) for t in toks_a)
+
+            def _run_a() -> dict[str, Any]:
+                t0 = time.perf_counter()
+                if timing_scope == "e2e":
+                    _ = eng_a.encode_documents(docs, batch_size=b_doc, max_length=probe_len, dimensions=args.dimensions, mode=spec_a[0])
+                else:
+                    _ = eng_a.encode_tokens(toks_a, batch_size=b_doc, dimensions=args.dimensions, mode=spec_a[0])
+                dt = time.perf_counter() - t0
+                return {"wall_sec": round(dt, 4), "tok_s": round(total_toks / max(dt, 1e-9), 1)}
+
+            def _run_b() -> dict[str, Any]:
+                t0 = time.perf_counter()
+                if timing_scope == "e2e":
+                    _ = eng_b.encode_documents(docs, batch_size=b_doc, max_length=probe_len, dimensions=args.dimensions, mode=spec_b[0])
+                else:
+                    _ = eng_b.encode_tokens(toks_b, batch_size=b_doc, dimensions=args.dimensions, mode=spec_b[0])
+                dt = time.perf_counter() - t0
+                return {"wall_sec": round(dt, 4), "tok_s": round(total_toks / max(dt, 1e-9), 1)}
+
+            abba = interleaved_abba(_run_a, _run_b, warmup=(args.warmup > 0), rounds=rounds)
+            return {
+                "status": "ok",
+                "mode_a": mode_a,
+                "mode_b": mode_b,
+                "workload": f"doc_s{probe_len}",
+                "timing_scope": timing_scope,
+                **abba,
+            }
 
 
 _TORCH_CPU_SNIPPET = r"""
@@ -686,6 +794,7 @@ for wid, label, fn, s_len, b_n in workloads:
                 "workload": wid,
                 "label": label,
                 "mode": "torch-cpu",
+                "timing_scope": "e2e",
                 "status": "ok",
                 "tok_s": tok_s,
                 "latency_ms": (dt * 1000.0) / max(b_n, 1),
@@ -704,6 +813,7 @@ import ctypes, json, os, platform, resource, statistics, sys, types, time
 import numpy as np
 
 cfg = json.loads(sys.argv[1])
+os.environ.setdefault("MLX_ENABLE_TF32", str(cfg.get("mlx_enable_tf32", "0")))
 if cfg.get("repo_path"):
     sys.path.insert(0, cfg["repo_path"])
 
@@ -775,13 +885,14 @@ rows.append({
     "workload": "query_b1",
     "label": f"{mode_lbl} query B=1 (S={q1_toks})",
     "mode": mode_lbl,
+    "timing_scope": "e2e",
     "status": "ok",
     "tok_s": q1_toks / max(dt_q1, 1e-9),
     "latency_ms": dt_q1 * 1000.0,
     "peak_active_gb": round(float(mx.get_peak_memory()) / 1e9, 4),
     "peak_footprint_gb": fp_gb,
     "rss_gb": rss_gb,
-    "notes": f"load={load_s:.2f}s",
+    "notes": f"load={load_s:.2f}s,tf32={os.environ.get('MLX_ENABLE_TF32', '0')}",
 })
 
 q_batch = [[f"Query {i}: summarize coastal pressure anomaly trends."] for i in range(32)]
@@ -793,6 +904,7 @@ rows.append({
     "workload": "query_b32",
     "label": f"{mode_lbl} query B=32",
     "mode": mode_lbl,
+    "timing_scope": "e2e",
     "status": "ok",
     "tok_s": qb_toks / max(dt_qb, 1e-9),
     "latency_ms": (dt_qb * 1000.0) / 32.0,
@@ -814,6 +926,7 @@ for s_len in cfg["doc_lengths"]:
         "workload": f"doc_s{s_len}",
         "label": f"{mode_lbl} doc B={b_doc} S={s_len}",
         "mode": mode_lbl,
+        "timing_scope": "e2e",
         "status": "ok",
         "tok_s": total_toks / max(dt_d, 1e-9),
         "latency_ms": (dt_d * 1000.0) / b_doc,
@@ -833,6 +946,7 @@ rows.append({
     "workload": "mixed_short_long",
     "label": f"{mode_lbl} mixed (24x~128 + 4x2048)",
     "mode": mode_lbl,
+    "timing_scope": "e2e",
     "status": "ok",
     "tok_s": m_toks / max(dt_m, 1e-9),
     "latency_ms": dt_m * 1000.0,
@@ -842,7 +956,7 @@ rows.append({
     "notes": "public mlx GPU",
 })
 
-print(json.dumps({"mode": mode_lbl, "status": "ok", "load_s": round(load_s, 3), "rows": rows}))
+print(json.dumps({"mode": mode_lbl, "status": "ok", "load_s": round(load_s, 3), "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "0"), "rows": rows}))
 """
 
 
@@ -904,13 +1018,13 @@ with torch.inference_mode():
     q1_toks = int(model.prepare_inputs([q1], "query")["input_ids"].shape[1])
     dt_q1 = median_t(lambda: model.encode_queries([q1], batch_size=1), cfg["warmup"], cfg["repeats"])
     fp_gb, rss_gb = footprint_gb()
-    rows.append({"workload": "query_b1", "label": f"torch-mps query B=1 (S={q1_toks})", "mode": "torch-mps", "status": "ok", "tok_s": q1_toks / max(dt_q1, 1e-9), "latency_ms": dt_q1 * 1000.0, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"load={load_s:.2f}s"})
+    rows.append({"workload": "query_b1", "label": f"torch-mps query B=1 (S={q1_toks})", "mode": "torch-mps", "timing_scope": "e2e", "status": "ok", "tok_s": q1_toks / max(dt_q1, 1e-9), "latency_ms": dt_q1 * 1000.0, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"load={load_s:.2f}s"})
 
     qb = [f"Query {i}: summarize coastal pressure anomaly trends." for i in range(32)]
     qb_toks = int(model.prepare_inputs([[x] for x in qb], "query")["input_ids"].shape[1]) * 32
     dt_qb = median_t(lambda: model.encode_queries([[x] for x in qb], batch_size=32), cfg["warmup"], cfg["repeats"])
     fp_gb, rss_gb = footprint_gb()
-    rows.append({"workload": "query_b32", "label": "torch-mps query B=32", "mode": "torch-mps", "status": "ok", "tok_s": qb_toks / max(dt_qb, 1e-9), "latency_ms": (dt_qb * 1000.0) / 32.0, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"q/s={32.0 / max(dt_qb, 1e-9):.1f}"})
+    rows.append({"workload": "query_b32", "label": "torch-mps query B=32", "mode": "torch-mps", "timing_scope": "e2e", "status": "ok", "tok_s": qb_toks / max(dt_qb, 1e-9), "latency_ms": (dt_qb * 1000.0) / 32.0, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"q/s={32.0 / max(dt_qb, 1e-9):.1f}"})
 
     for s_len in cfg["doc_lengths"]:
         b_doc = cfg["doc_batch"] if s_len <= 1024 else max(1, min(cfg["doc_batch"], 4))
@@ -918,7 +1032,7 @@ with torch.inference_mode():
         toks = int(model.prepare_inputs(docs, "document")["attention_mask"].sum().item())
         dt_d = median_t(lambda d=docs, b=b_doc: model.encode(d, batch_size=b), cfg["warmup"], cfg["repeats"])
         fp_gb, rss_gb = footprint_gb()
-        rows.append({"workload": f"doc_s{s_len}", "label": f"torch-mps doc B={b_doc} S={s_len}", "mode": "torch-mps", "status": "ok", "tok_s": toks / max(dt_d, 1e-9), "latency_ms": (dt_d * 1000.0) / b_doc, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"docs/s={b_doc / max(dt_d, 1e-9):.2f}"})
+        rows.append({"workload": f"doc_s{s_len}", "label": f"torch-mps doc B={b_doc} S={s_len}", "mode": "torch-mps", "timing_scope": "e2e", "status": "ok", "tok_s": toks / max(dt_d, 1e-9), "latency_ms": (dt_d * 1000.0) / b_doc, "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4), "peak_footprint_gb": fp_gb, "rss_gb": rss_gb, "notes": f"docs/s={b_doc / max(dt_d, 1e-9):.2f}"})
 
 print(json.dumps({"mode": "torch-mps", "status": "ok", "load_s": round(load_s, 3), "rows": rows}))
 """
@@ -932,6 +1046,7 @@ def _run_pplx_context_mlx_baseline(args: argparse.Namespace, *, dtype: str) -> d
         "repo_path": str(Path(repo_path).expanduser().resolve()) if repo_path else None,
         "dtype": dtype,
         "label_mode": label,
+        "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "0"),
         "doc_lengths": _parse_int_csv(args.doc_lengths),
         "doc_batch": args.doc_batch,
         "warmup": args.warmup,
@@ -1003,6 +1118,7 @@ def _run_speed_single_mode(args: argparse.Namespace, mode: str) -> dict[str, Any
 
     engine_mode, eff_dtype, eff_mapped = _resolve_speed_mode_spec(mode, args)
     doc_lengths = _parse_int_csv(args.doc_lengths)
+    timing_scope = getattr(args, "timing_scope", "e2e")
     if engine_mode in ("ane", "hetero", "hetero2"):
         ane_ok, ane_note = _check_ane_ready(args.home)
         if not ane_ok:
@@ -1014,147 +1130,205 @@ def _run_speed_single_mode(args: argparse.Namespace, mode: str) -> dict[str, Any
 
     rows: list[dict[str, Any]] = []
     t_load0 = time.perf_counter()
-    with FastPplx(
-        home=args.home,
-        model_dir=model_dir,
-        mode=engine_mode,
-        dtype=eff_dtype,
-        use_mapped_embedding=eff_mapped,
-        local_files_only=True,
-    ) as eng:
-        load_s = time.perf_counter() - t_load0
-        q_short = ["What drives oceanic thermohaline heat transport across hemispheres?"]
-        q_batch = [f"Query {i}: summarize coastal pressure anomaly trends." for i in range(32)]
+    with _wired_limit_ctx():
+        with FastPplx(
+            home=args.home,
+            model_dir=model_dir,
+            mode=engine_mode,
+            dtype=eff_dtype,
+            use_mapped_embedding=eff_mapped,
+            local_files_only=True,
+        ) as eng:
+            load_s = time.perf_counter() - t_load0
+            q_short = ["What drives oceanic thermohaline heat transport across hemispheres?"]
+            q_batch = [f"Query {i}: summarize coastal pressure anomaly trends." for i in range(32)]
 
-        # 1. B=1 Query
-        _reset_mlx_peak()
-        q1_toks = len(eng.tokenizer.encode_query(q_short[0]))
-        med_q1, _ = _median_timed(
-            lambda: eng.encode_queries(q_short, batch_size=1, dimensions=args.dimensions, mode=engine_mode),
-            warmup=args.warmup,
-            repeats=args.repeats,
-        )
-        fp = _footprint_snapshot()
-        rows.append(
-            {
-                "workload": "query_b1",
-                "label": f"{mode} query B=1 (S={q1_toks})",
-                "mode": mode,
-                "status": "ok",
-                "tok_s": q1_toks / max(med_q1, 1e-9),
-                "latency_ms": med_q1 * 1000.0,
-                "peak_active_gb": _mlx_peak_gb(),
-                "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
-                "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
-                "notes": f"load={load_s:.2f}s",
-            }
-        )
+            def _measure_pair(
+                *,
+                total_toks: int,
+                denom_items: int,
+                fn_e2e: Any,
+                fn_fwd: Any,
+                tok_fn: Any,
+            ) -> tuple[float, float, float, float]:
+                t_tok0 = time.perf_counter()
+                _ = tok_fn()
+                tok_ms = (time.perf_counter() - t_tok0) * 1000.0
+                _reset_mlx_peak()
+                med_e2e, _ = _median_timed(fn_e2e, warmup=args.warmup, repeats=args.repeats)
+                med_fwd, _ = _median_timed(fn_fwd, warmup=max(0, args.warmup), repeats=args.repeats)
+                primary_dt = med_e2e if timing_scope == "e2e" else med_fwd
+                return primary_dt, med_e2e, med_fwd, tok_ms
 
-        # 2. B=32 Queries
-        _reset_mlx_peak()
-        qb_toks = sum(len(eng.tokenizer.encode_query(t)) for t in q_batch)
-        med_qb, _ = _median_timed(
-            lambda: eng.encode_queries(q_batch, batch_size=32, dimensions=args.dimensions, mode=engine_mode),
-            warmup=args.warmup,
-            repeats=args.repeats,
-        )
-        fp = _footprint_snapshot()
-        rows.append(
-            {
-                "workload": "query_b32",
-                "label": f"{mode} query B=32 (~{qb_toks // 32} tok/q)",
-                "mode": mode,
-                "status": "ok",
-                "tok_s": qb_toks / max(med_qb, 1e-9),
-                "latency_ms": (med_qb * 1000.0) / 32.0,
-                "peak_active_gb": _mlx_peak_gb(),
-                "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
-                "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
-                "notes": f"q/s={32.0 / max(med_qb, 1e-9):.1f}",
-            }
-        )
+            # 1. B=1 Query (symmetric E2E + forward breakdown)
+            q1_ids = [eng.tokenizer.encode_query(q_short[0])]
+            q1_toks = len(q1_ids[0])
+            dt_q1, e2e_q1, fwd_q1, tok_q1_ms = _measure_pair(
+                total_toks=q1_toks,
+                denom_items=1,
+                fn_e2e=lambda: eng.encode_queries(q_short, batch_size=1, dimensions=args.dimensions, mode=engine_mode),
+                fn_fwd=lambda: eng.encode_tokens(q1_ids, batch_size=1, dimensions=args.dimensions, mode=engine_mode),
+                tok_fn=lambda: [eng.tokenizer.encode_query(q_short[0])],
+            )
+            fp = _footprint_snapshot()
+            rows.append(
+                {
+                    "workload": "query_b1",
+                    "label": f"{mode} query B=1 (S={q1_toks})",
+                    "mode": mode,
+                    "timing_scope": timing_scope,
+                    "status": "ok",
+                    "tok_s": q1_toks / max(dt_q1, 1e-9),
+                    "e2e_tok_s": round(q1_toks / max(e2e_q1, 1e-9), 1),
+                    "forward_tok_s": round(q1_toks / max(fwd_q1, 1e-9), 1),
+                    "tokenize_ms": round(tok_q1_ms, 3),
+                    "latency_ms": dt_q1 * 1000.0,
+                    "peak_active_gb": _mlx_peak_gb(),
+                    "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
+                    "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+                    "notes": f"load={load_s:.2f}s,scope={timing_scope}",
+                }
+            )
+            _clear_arena(256)
 
-        # 3. Document length sweep (skip >512 for strict `ane` mode)
-        max_ane = eng.ane_query_max_len if engine_mode == "ane" else 32768
-        for s_len in doc_lengths:
-            if s_len > max_ane:
+            # 2. B=32 Queries
+            qb_ids = [eng.tokenizer.encode_query(t) for t in q_batch]
+            qb_toks = sum(len(row) for row in qb_ids)
+            dt_qb, e2e_qb, fwd_qb, tok_qb_ms = _measure_pair(
+                total_toks=qb_toks,
+                denom_items=32,
+                fn_e2e=lambda: eng.encode_queries(q_batch, batch_size=32, dimensions=args.dimensions, mode=engine_mode),
+                fn_fwd=lambda: eng.encode_tokens(qb_ids, batch_size=32, dimensions=args.dimensions, mode=engine_mode),
+                tok_fn=lambda: [eng.tokenizer.encode_query(t) for t in q_batch],
+            )
+            fp = _footprint_snapshot()
+            rows.append(
+                {
+                    "workload": "query_b32",
+                    "label": f"{mode} query B=32 (~{qb_toks // 32} tok/q)",
+                    "mode": mode,
+                    "timing_scope": timing_scope,
+                    "status": "ok",
+                    "tok_s": qb_toks / max(dt_qb, 1e-9),
+                    "e2e_tok_s": round(qb_toks / max(e2e_qb, 1e-9), 1),
+                    "forward_tok_s": round(qb_toks / max(fwd_qb, 1e-9), 1),
+                    "tokenize_ms": round(tok_qb_ms, 3),
+                    "latency_ms": (dt_qb * 1000.0) / 32.0,
+                    "peak_active_gb": _mlx_peak_gb(),
+                    "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
+                    "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+                    "notes": f"q/s={32.0 / max(dt_qb, 1e-9):.1f}",
+                }
+            )
+            _clear_arena(256)
+
+            # 3. Document length sweep (skip >512 for strict `ane` mode)
+            max_ane = eng.ane_query_max_len if engine_mode == "ane" else 32768
+            for s_len in doc_lengths:
+                if s_len > max_ane:
+                    rows.append(
+                        {
+                            "workload": f"doc_s{s_len}",
+                            "label": f"{mode} doc S={s_len}",
+                            "mode": mode,
+                            "timing_scope": timing_scope,
+                            "status": "skipped",
+                            "reason": f"exceeds ANE bucket cap {max_ane}",
+                        }
+                    )
+                    continue
+                b_doc = args.doc_batch if s_len <= 1024 else max(1, min(args.doc_batch, 4))
+                docs = [_build_synthetic_text(s_len, i) for i in range(b_doc)]
+                tok_lists = [eng.tokenizer.encode_document(d, max_length=s_len) for d in docs]
+                total_toks = sum(len(t) for t in tok_lists)
+                dt_d, e2e_d, fwd_d, tok_d_ms = _measure_pair(
+                    total_toks=total_toks,
+                    denom_items=b_doc,
+                    fn_e2e=lambda d=docs, b=b_doc, sl=s_len: eng.encode_documents(
+                        d, batch_size=b, max_length=sl, dimensions=args.dimensions, mode=engine_mode
+                    ),
+                    fn_fwd=lambda tl=tok_lists, b=b_doc: eng.encode_tokens(
+                        tl, batch_size=b, dimensions=args.dimensions, mode=engine_mode
+                    ),
+                    tok_fn=lambda d=docs, sl=s_len: [eng.tokenizer.encode_document(x, max_length=sl) for x in d],
+                )
+                fp = _footprint_snapshot()
                 rows.append(
                     {
                         "workload": f"doc_s{s_len}",
-                        "label": f"{mode} doc S={s_len}",
+                        "label": f"{mode} doc B={b_doc} S={s_len}",
                         "mode": mode,
-                        "status": "skipped",
-                        "reason": f"exceeds ANE bucket cap {max_ane}",
+                        "timing_scope": timing_scope,
+                        "status": "ok",
+                        "tok_s": total_toks / max(dt_d, 1e-9),
+                        "e2e_tok_s": round(total_toks / max(e2e_d, 1e-9), 1),
+                        "forward_tok_s": round(total_toks / max(fwd_d, 1e-9), 1),
+                        "tokenize_ms": round(tok_d_ms, 3),
+                        "latency_ms": (dt_d * 1000.0) / b_doc,
+                        "peak_active_gb": _mlx_peak_gb(),
+                        "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
+                        "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+                        "notes": f"docs/s={b_doc / max(dt_d, 1e-9):.2f}",
                     }
                 )
-                continue
-            b_doc = args.doc_batch if s_len <= 1024 else max(1, min(args.doc_batch, 4))
-            docs = [_build_synthetic_text(s_len, i) for i in range(b_doc)]
-            tok_lists = [eng.tokenizer.encode_document(d, max_length=s_len) for d in docs]
-            total_toks = sum(len(t) for t in tok_lists)
-            _reset_mlx_peak()
-            med_d, _ = _median_timed(
-                lambda: eng.encode_tokens(tok_lists, batch_size=b_doc, dimensions=args.dimensions, mode=engine_mode),
-                warmup=args.warmup,
-                repeats=args.repeats,
-            )
-            fp = _footprint_snapshot()
-            rows.append(
-                {
-                    "workload": f"doc_s{s_len}",
-                    "label": f"{mode} doc B={b_doc} S={s_len}",
-                    "mode": mode,
-                    "status": "ok",
-                    "tok_s": total_toks / max(med_d, 1e-9),
-                    "latency_ms": (med_d * 1000.0) / b_doc,
-                    "peak_active_gb": _mlx_peak_gb(),
-                    "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
-                    "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
-                    "notes": f"docs/s={b_doc / max(med_d, 1e-9):.2f}",
-                }
-            )
+                _clear_arena(256)
 
-        # 4. Mixed short+long workload highlighting hetero2 concurrent scheduling
-        if engine_mode in ("gpu", "hetero2"):
-            mixed_toks = [eng.tokenizer.encode_document(_build_synthetic_text(128, i), max_length=256) for i in range(24)]
-            mixed_toks.extend(
-                eng.tokenizer.encode_document(_build_synthetic_text(2048, 100 + i), max_length=2048) for i in range(4)
-            )
-            m_total = sum(len(t) for t in mixed_toks)
-            _reset_mlx_peak()
-            med_m, _ = _median_timed(
-                lambda: eng.encode_tokens(mixed_toks, batch_size=8, dimensions=args.dimensions, mode=engine_mode),
-                warmup=args.warmup,
-                repeats=args.repeats,
-            )
-            fp = _footprint_snapshot()
-            st = dict(eng.last_stats)
-            rows.append(
-                {
-                    "workload": "mixed_short_long",
-                    "label": f"{mode} mixed (24x~128 + 4x2048)",
-                    "mode": mode,
-                    "status": "ok",
-                    "tok_s": m_total / max(med_m, 1e-9),
-                    "latency_ms": med_m * 1000.0,
-                    "peak_active_gb": _mlx_peak_gb(),
-                    "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
-                    "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
-                    "notes": f"ane={st.get('ane_items', 0)},gpu={st.get('gpu_items', 0)}",
-                }
-            )
+            # 4. Mixed short+long workload highlighting hetero / hetero2 concurrent scheduling
+            if engine_mode in ("gpu", "hetero", "hetero2"):
+                mixed_docs = [_build_synthetic_text(128, i) for i in range(24)] + [
+                    _build_synthetic_text(2048, 100 + i) for i in range(4)
+                ]
+                mixed_toks = [eng.tokenizer.encode_document(d, max_length=256) for d in mixed_docs[:24]] + [
+                    eng.tokenizer.encode_document(d, max_length=2048) for d in mixed_docs[24:]
+                ]
+                m_total = sum(len(t) for t in mixed_toks)
+                dt_m, e2e_m, fwd_m, tok_m_ms = _measure_pair(
+                    total_toks=m_total,
+                    denom_items=1,
+                    fn_e2e=lambda: eng.encode_documents(
+                        mixed_docs, batch_size=8, max_length=2048, dimensions=args.dimensions, mode=engine_mode
+                    ),
+                    fn_fwd=lambda: eng.encode_tokens(
+                        mixed_toks, batch_size=8, dimensions=args.dimensions, mode=engine_mode
+                    ),
+                    tok_fn=lambda: [eng.tokenizer.encode_document(d, max_length=2048) for d in mixed_docs],
+                )
+                fp = _footprint_snapshot()
+                st = dict(eng.last_stats)
+                rows.append(
+                    {
+                        "workload": "mixed_short_long",
+                        "label": f"{mode} mixed (24x~128 + 4x2048)",
+                        "mode": mode,
+                        "timing_scope": timing_scope,
+                        "status": "ok",
+                        "tok_s": m_total / max(dt_m, 1e-9),
+                        "e2e_tok_s": round(m_total / max(e2e_m, 1e-9), 1),
+                        "forward_tok_s": round(m_total / max(fwd_m, 1e-9), 1),
+                        "tokenize_ms": round(tok_m_ms, 3),
+                        "latency_ms": dt_m * 1000.0,
+                        "peak_active_gb": _mlx_peak_gb(),
+                        "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
+                        "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+                        "notes": f"ane={st.get('ane_items', 0)},gpu={st.get('gpu_items', 0)}",
+                    }
+                )
+                _clear_arena(256)
 
     return {"mode": mode, "status": "ok", "load_s": round(load_s, 3), "rows": rows}
 
 
 def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
     modes = _parse_str_csv(args.modes)
+    timing_scope = getattr(args, "timing_scope", "e2e")
     plan = {
         "suite": "speed",
         "modes": modes,
         "dtype": args.dtype,
+        "timing_scope": timing_scope,
         "doc_lengths": _parse_int_csv(args.doc_lengths),
         "isolate": bool(args.isolate),
+        "telemetry": _collect_telemetry(),
         "quiescence_warnings": _sys_quiescence(),
         "ane_status": _check_ane_ready(args.home),
         "model_dir": str(_resolve_model_dir(args.model_dir, args.home)),
@@ -1165,6 +1339,7 @@ def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
     _preflight_quiescence(allow_contended=args.allow_contended)
     all_rows: list[dict[str, Any]] = []
     mode_results: list[dict[str, Any]] = []
+    abba_report: dict[str, Any] | None = None
     with _hw_lock():
         for mode in modes:
             if args.isolate:
@@ -1176,6 +1351,8 @@ def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
                     mode,
                     "--dtype",
                     args.dtype,
+                    "--timing-scope",
+                    timing_scope,
                     "--doc-lengths",
                     args.doc_lengths,
                     "--doc-batch",
@@ -1186,10 +1363,13 @@ def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
                     str(args.repeats),
                     "--torch-threads",
                     getattr(args, "torch_threads", "1,2,4,6"),
-                    "--allow-contended",
                     "--no-isolate",
                     "--json-only",
                 ]
+                if args.allow_contended:
+                    child_cmd.append("--allow-contended")
+                if getattr(args, "enable_tf32", False):
+                    child_cmd.append("--enable-tf32")
                 if getattr(args, "torch_python", None):
                     child_cmd.extend(["--torch-python", str(args.torch_python)])
                 if getattr(args, "pplx_mlx_path", None):
@@ -1214,13 +1394,62 @@ def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
                 elif res["status"] != "ok":
                     all_rows.append({"label": f"{mode}", **res})
 
+        abba_pair = getattr(args, "abba_pair", None)
+        if abba_pair:
+            pair = _parse_str_csv(abba_pair)
+            if len(pair) == 2:
+                abba_report = run_abba_speed_pair(args, pair[0], pair[1], rounds=max(2, args.repeats))
+        elif getattr(args, "abba", False) and not args.isolate:
+            internal = [m for m in modes if m in ("gpu", "gpu-f16", "gpu-bf16", "gpu-no-mmap", "ane", "hetero", "hetero2")]
+            if len(internal) >= 2:
+                abba_report = run_abba_speed_pair(args, internal[0], internal[1], rounds=max(2, args.repeats))
+
     annotated = annotate_speed_comparisons(all_rows)
-    return {
+    out: dict[str, Any] = {
         "suite": "speed",
+        "timing_scope": timing_scope,
+        "telemetry": plan["telemetry"],
         "quiescence_warnings": plan["quiescence_warnings"],
         "mode_results": mode_results,
         "rows": annotated,
         "markdown": format_speed_markdown(annotated),
+    }
+    if abba_report is not None:
+        out["abba"] = abba_report
+    return out
+
+
+def _eval_s4096_streamed_parity(eng: Any) -> dict[str, Any]:
+    """Compare streamed (S > 2048) vs whole forward pass at S=4096 on the live GPU engine."""
+    import fast_pplx.gpu as pplx_gpu_mod
+
+    text = _build_synthetic_text(4200, seed_idx=4096)
+    toks = eng.tokenizer.encode_document(text, max_length=4096)
+    assert len(toks) == 4096 or len(toks) > 2048
+
+    orig_thresh = pplx_gpu_mod._STREAMED_SEQ_THRESHOLD
+    try:
+        pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = 10_000
+        whole_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu")
+        whole_i = eng.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False, mode="gpu")
+
+        pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = 2048
+        stream_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu")
+        stream_i = eng.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False, mode="gpu")
+    finally:
+        pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = orig_thresh
+        _clear_arena(256)
+
+    vp = compute_vector_parity(stream_p, whole_p)
+    ip = compute_int8_parity(stream_i, whole_i)
+    return {
+        "seq_len": len(toks),
+        "proj_max_abs_err": round(float(vp["max_abs_err"]), 6),
+        "proj_min_cos": round(float(vp["min_cos"]), 6),
+        "int8_max_abs_err": int(ip["max_abs_err"]),
+        "int8_exact_fraction": round(float(ip["exact_fraction"]), 4),
+        "int8_min_cos": round(float(ip["min_cos"]), 6),
+        "passed": bool(vp["min_cos"] >= 0.9999 and int(ip["max_abs_err"]) <= 1),
     }
 
 
@@ -1232,6 +1461,8 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
         "suite": "parity",
         "modes": modes,
         "dtype": args.dtype,
+        "include_s4096": bool(getattr(args, "include_s4096", True)),
+        "telemetry": _collect_telemetry(),
         "cases_file": str(cases_path),
         "reference_file": str(ref_path),
         "quiescence_warnings": _sys_quiescence(),
@@ -1245,14 +1476,15 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
     ref = np.load(ref_path)
     ready, model_dir = _resolve_engine_model_dir(args.model_dir, args.home)
     if not ready:
-        return {"suite": "parity", "status": "skipped", "reason": "no local HF snapshot cached"}
+        return {"suite": "parity", "status": "skipped", "reason": "no local HF snapshot cached", "telemetry": plan["telemetry"]}
 
     from fast_pplx.engine import FastPplx
 
     reports: list[dict[str, Any]] = []
-    with _hw_lock():
+    with _hw_lock(), _wired_limit_ctx():
         for mode in modes:
-            if mode in ("ane", "hetero2"):
+            engine_mode, eff_dtype, eff_mapped = _resolve_speed_mode_spec(mode, args)
+            if engine_mode in ("ane", "hetero", "hetero2"):
                 ok_ane, reason = _check_ane_ready(args.home)
                 if not ok_ane:
                     reports.append({"mode": mode, "status": "skipped", "reason": reason})
@@ -1261,9 +1493,10 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
             with FastPplx(
                 home=args.home,
                 model_dir=model_dir,
-                mode=mode,
-                dtype=args.dtype,
-                use_mapped_embedding=not args.no_mapped_embedding,
+                mode=engine_mode,
+                dtype=eff_dtype,
+                use_mapped_embedding=eff_mapped,
+                deterministic=(engine_mode == "gpu"),
                 local_files_only=True,
             ) as eng:
                 proj_errs: list[float] = []
@@ -1277,7 +1510,7 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
                 for case in cases:
                     cid = case["id"]
                     docs = case["documents"]
-                    if mode == "ane":
+                    if engine_mode == "ane":
                         if case["task"] == "query":
                             lens = [len(eng.tokenizer.encode_query(row[0])) for row in docs]
                         else:
@@ -1288,8 +1521,8 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
 
                     if case["task"] == "query":
                         flat_q = [row[0] for row in docs]
-                        got_p = eng.encode_queries(flat_q, output_dtype="float32", normalize=False, mode=mode)
-                        got_i = eng.encode_queries(flat_q, output_dtype="int8", normalize=False, mode=mode)
+                        got_p = eng.encode_queries(flat_q, output_dtype="float32", normalize=False, mode=engine_mode)
+                        got_i = eng.encode_queries(flat_q, output_dtype="int8", normalize=False, mode=engine_mode)
                         exp_p = ref[f"{cid}/projected"].reshape(-1, 1024)
                         exp_i = np.concatenate([ref[f"{cid}/encoded/{k}"] for k in range(len(flat_q))], axis=0)
                         vp = compute_vector_parity(got_p, exp_p)
@@ -1301,8 +1534,8 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
                         i8_cos.append(float(ip["min_cos"]))
                         evaluated += 1
                     else:
-                        got_p_list = eng.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, mode=mode)
-                        got_i_list = eng.encode_contextual_chunks(docs, output_dtype="int8", normalize=False, mode=mode)
+                        got_p_list = eng.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, mode=engine_mode)
+                        got_i_list = eng.encode_contextual_chunks(docs, output_dtype="int8", normalize=False, mode=engine_mode)
                         exp_p_all = ref[f"{cid}/projected"]
                         for di, doc in enumerate(docs):
                             if not doc:
@@ -1323,21 +1556,29 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
                             i8_cos.append(float(ip["min_cos"]))
                         evaluated += 1
 
-                reports.append(
-                    {
-                        "mode": mode,
-                        "status": "ok",
-                        "cases_evaluated": evaluated,
-                        "cases_skipped_ane_cap": skipped_len,
-                        "proj_max_abs_err": round(max(proj_errs) if proj_errs else 0.0, 6),
-                        "proj_min_cos": round(min(proj_cos) if proj_cos else 1.0, 6),
-                        "int8_max_abs_err": max(i8_errs) if i8_errs else 0,
-                        "int8_exact_fraction": round(sum(i8_exact) / max(len(i8_exact), 1), 4),
-                        "int8_min_cos": round(min(i8_cos) if i8_cos else 1.0, 6),
-                    }
-                )
+                min_proj_cos = round(min(proj_cos) if proj_cos else 1.0, 6)
+                is_det_gpu = engine_mode == "gpu"
+                rep: dict[str, Any] = {
+                    "mode": mode,
+                    "dtype": eff_dtype,
+                    "parity_tier": "deterministic_gpu" if is_det_gpu else "ane_drift_tolerant",
+                    "status": "ok",
+                    "cases_evaluated": evaluated,
+                    "cases_skipped_ane_cap": skipped_len,
+                    "proj_max_abs_err": round(max(proj_errs) if proj_errs else 0.0, 6),
+                    "proj_min_cos": min_proj_cos,
+                    "int8_max_abs_err": max(i8_errs) if i8_errs else 0,
+                    "int8_exact_fraction": round(sum(i8_exact) / max(len(i8_exact), 1), 4),
+                    "int8_min_cos": round(min(i8_cos) if i8_cos else 1.0, 6),
+                    "within_strict_parity": bool(min_proj_cos >= 0.9998),
+                    "ane_drift_warning": bool((not is_det_gpu) and min_proj_cos < 0.9998),
+                }
+                if is_det_gpu and getattr(args, "include_s4096", True):
+                    rep["s4096_streamed_parity"] = _eval_s4096_streamed_parity(eng)
+                reports.append(rep)
+                _clear_arena(256)
 
-    return {"suite": "parity", "reports": reports}
+    return {"suite": "parity", "telemetry": plan["telemetry"], "reports": reports}
 
 
 def _run_context_limit_worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -1348,33 +1589,36 @@ def _run_context_limit_worker(args: argparse.Namespace) -> dict[str, Any]:
         return {"target_tokens": args.single_length, "status": "skipped", "reason": "missing weights"}
 
     target = int(args.single_length)
-    with FastPplx(
-        home=args.home,
-        model_dir=model_dir,
-        mode=args.mode,
-        dtype=args.dtype,
-        use_mapped_embedding=not args.no_mapped_embedding,
-        local_files_only=True,
-    ) as eng:
-        raw_text = _build_synthetic_text(target + 256, 7)
-        toks = eng.tokenizer.encode_document(raw_text, max_length=target)
-        _ = eng.encode_tokens([toks[: min(128, len(toks))]], batch_size=1, mode=args.mode)
-        _reset_mlx_peak()
-        t0 = time.perf_counter()
-        vecs = eng.encode_tokens([toks], batch_size=1, dimensions=args.dimensions, mode=args.mode)
-        dt = time.perf_counter() - t0
-        fp = _footprint_snapshot()
-        return {
-            "target_tokens": target,
-            "actual_tokens": len(toks),
-            "elapsed_s": round(dt, 4),
-            "tok_s": round(len(toks) / max(dt, 1e-9), 1),
-            "peak_active_gb": _mlx_peak_gb(),
-            "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
-            "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
-            "finite": bool(np.all(np.isfinite(vecs))),
-            "status": "ok" if np.all(np.isfinite(vecs)) else "non_finite",
-        }
+    with _wired_limit_ctx():
+        with FastPplx(
+            home=args.home,
+            model_dir=model_dir,
+            mode=args.mode,
+            dtype=args.dtype,
+            use_mapped_embedding=not args.no_mapped_embedding,
+            local_files_only=True,
+        ) as eng:
+            raw_text = _build_synthetic_text(target + 256, 7)
+            toks = eng.tokenizer.encode_document(raw_text, max_length=target)
+            _ = eng.encode_tokens([toks[: min(128, len(toks))]], batch_size=1, mode=args.mode)
+            _clear_arena(256)
+            _reset_mlx_peak()
+            t0 = time.perf_counter()
+            vecs = eng.encode_tokens([toks], batch_size=1, dimensions=args.dimensions, mode=args.mode)
+            dt = time.perf_counter() - t0
+            fp = _footprint_snapshot()
+            _clear_arena(256)
+            return {
+                "target_tokens": target,
+                "actual_tokens": len(toks),
+                "elapsed_s": round(dt, 4),
+                "tok_s": round(len(toks) / max(dt, 1e-9), 1),
+                "peak_active_gb": _mlx_peak_gb(),
+                "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
+                "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+                "finite": bool(np.all(np.isfinite(vecs))),
+                "status": "ok" if np.all(np.isfinite(vecs)) else "non_finite",
+            }
 
 
 def cmd_context_limit(args: argparse.Namespace) -> dict[str, Any]:
@@ -1387,6 +1631,7 @@ def cmd_context_limit(args: argparse.Namespace) -> dict[str, Any]:
         "mode": args.mode,
         "dtype": args.dtype,
         "lengths": lengths,
+        "telemetry": _collect_telemetry(),
         "quiescence_warnings": _sys_quiescence(),
     }
     if args.dry_run:
@@ -1406,9 +1651,12 @@ def cmd_context_limit(args: argparse.Namespace) -> dict[str, Any]:
                 args.mode,
                 "--dtype",
                 args.dtype,
-                "--allow-contended",
                 "--json-only",
             ]
+            if args.allow_contended:
+                cmd.append("--allow-contended")
+            if getattr(args, "enable_tf32", False):
+                cmd.append("--enable-tf32")
             if args.home:
                 cmd.extend(["--home", str(args.home)])
             if args.model_dir:
@@ -1424,7 +1672,12 @@ def cmd_context_limit(args: argparse.Namespace) -> dict[str, Any]:
                 rows.append({"target_tokens": length, "status": "error", "reason": str(exc)})
                 break
     annotated_cl = annotate_context_limit_comparisons(rows)
-    return {"suite": "context-limit", "rows": annotated_cl, "markdown": format_context_limit_markdown(annotated_cl)}
+    return {
+        "suite": "context-limit",
+        "telemetry": plan["telemetry"],
+        "rows": annotated_cl,
+        "markdown": format_context_limit_markdown(annotated_cl),
+    }
 
 
 def build_synthetic_context_corpus(filler_repeats: int = 8) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -1448,6 +1701,7 @@ def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
         "dtype": args.dtype,
         "context_budgets": budgets,
         "filler_repeats": args.filler_repeats,
+        "telemetry": _collect_telemetry(),
         "quiescence_warnings": _sys_quiescence(),
     }
     if args.dry_run:
@@ -1456,13 +1710,13 @@ def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
     _preflight_quiescence(allow_contended=args.allow_contended)
     ready, model_dir = _resolve_engine_model_dir(args.model_dir, args.home)
     if not ready:
-        return {"suite": "context-windows", "status": "skipped", "reason": "missing weights"}
+        return {"suite": "context-windows", "status": "skipped", "reason": "missing weights", "telemetry": plan["telemetry"]}
 
     from fast_pplx.engine import FastPplx
 
     docs, queries = build_synthetic_context_corpus(filler_repeats=args.filler_repeats)
     rows: list[dict[str, Any]] = []
-    with _hw_lock():
+    with _hw_lock(), _wired_limit_ctx():
         with FastPplx(
             home=args.home,
             model_dir=model_dir,
@@ -1495,6 +1749,7 @@ def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
                     **score_retrieval_metrics(q_vecs, iso_vecs, iso_doc_ids, q_ids),
                 }
             )
+            _clear_arena(256)
 
             # Sweep contextual window token budgets
             for budget in budgets:
@@ -1521,9 +1776,15 @@ def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
                         **score_retrieval_metrics(q_vecs, c_vecs, chunk_doc_ids, q_ids),
                     }
                 )
+                _clear_arena(256)
 
     annotated_cw = annotate_context_window_comparisons(rows)
-    return {"suite": "context-windows", "rows": annotated_cw, "markdown": format_context_windows_markdown(annotated_cw)}
+    return {
+        "suite": "context-windows",
+        "telemetry": plan["telemetry"],
+        "rows": annotated_cw,
+        "markdown": format_context_windows_markdown(annotated_cw),
+    }
 
 
 def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
@@ -1537,6 +1798,7 @@ def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
             "suite": "bit-identity",
             "action": "dump",
             "mode": args.mode,
+            "telemetry": _collect_telemetry(),
             "out_dir": str(args.out_dir),
         }
 
@@ -1549,13 +1811,14 @@ def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
     from fast_pplx.engine import FastPplx
 
     vectors: dict[str, np.ndarray] = {}
-    with _hw_lock():
+    with _hw_lock(), _wired_limit_ctx():
         with FastPplx(
             home=args.home,
             model_dir=model_dir,
             mode=args.mode,
             dtype=args.dtype,
             use_mapped_embedding=not args.no_mapped_embedding,
+            deterministic=(args.mode == "gpu"),
             local_files_only=True,
         ) as eng:
             for case in cases:
@@ -1571,27 +1834,33 @@ def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     for di, mat in enumerate(mats):
                         vectors[f"{cid}/doc_{di}"] = mat
-    manifest = dump_bit_identity(vectors, {"mode": args.mode, "dtype": args.dtype}, Path(args.out_dir))
-    return {"suite": "bit-identity", "action": "dump", "manifest": str(manifest), "n_tensors": len(vectors)}
+    telemetry = _collect_telemetry()
+    manifest = dump_bit_identity(vectors, {"mode": args.mode, "dtype": args.dtype, "telemetry": telemetry}, Path(args.out_dir))
+    return {"suite": "bit-identity", "action": "dump", "telemetry": telemetry, "manifest": str(manifest), "n_tensors": len(vectors)}
 
 
 def cmd_all(args: argparse.Namespace) -> dict[str, Any]:
     plan = {
         "suite": "all",
         "modes": _parse_str_csv(args.modes),
+        "parity_modes": _parse_str_csv(getattr(args, "parity_modes", "gpu,gpu-bf16,ane,hetero2")),
         "doc_lengths": _parse_int_csv(args.doc_lengths),
         "context_limits": _parse_int_csv(args.lengths),
         "context_budgets": _parse_int_csv(args.context_budgets),
+        "telemetry": _collect_telemetry(),
         "quiescence_warnings": _sys_quiescence(),
         "ane_status": _check_ane_ready(args.home),
     }
     if args.dry_run:
         return {"dry_run": True, **plan}
 
+    parity_args = argparse.Namespace(**vars(args))
+    parity_args.modes = getattr(args, "parity_modes", "gpu,gpu-bf16,ane,hetero2")
     return {
         "suite": "all",
+        "telemetry": plan["telemetry"],
         "speed": cmd_speed(args),
-        "parity": cmd_parity(args),
+        "parity": cmd_parity(parity_args),
         "context_limit": cmd_context_limit(args),
         "context_windows": cmd_context_windows(args),
     }
@@ -1603,6 +1872,7 @@ def _add_shared_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     p.add_argument("--dimensions", type=int, default=None, help="Optional Matryoshka output width")
     p.add_argument("--no-mapped-embedding", action="store_true", help="Put embed_tokens on GPU instead of mmap")
+    p.add_argument("--enable-tf32", action="store_true", help="Opt into MLX_ENABLE_TF32=1 (default: 0 for IEEE FP32 exactness)")
     p.add_argument("--allow-contended", action="store_true", help="Proceed even if quiescence check sees contenders")
     p.add_argument("--dry-run", action="store_true", help="Print plan and asset readiness without GPU/ANE work")
     p.add_argument("--json-out", default=None, help="Write full JSON output to this path")
@@ -1612,7 +1882,7 @@ def _add_shared_flags(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fast-pplx-bench",
-        description="M4 Pro benchmark, parity, 32K footprint, contextual window, and bit-identity harness for fast-pplx.",
+        description="Apple Silicon benchmark, parity, 32K footprint, contextual window, and bit-identity harness for fast-pplx.",
     )
     sub = parser.add_subparsers(dest="suite", required=True)
 
@@ -1623,18 +1893,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="gpu-no-mmap,gpu-bf16,gpu,hetero2,pplx-context-mlx-f16,torch-mps,torch-cpu",
         help="Comma-separated modes & public baselines",
     )
+    p_speed.add_argument("--timing-scope", choices=("e2e", "forward"), default="e2e", help="Symmetric primary timing scope (default: e2e)")
     p_speed.add_argument("--doc-lengths", default="256,512,2048,4096", help="Comma-separated doc lengths")
     p_speed.add_argument("--doc-batch", type=int, default=8)
     p_speed.add_argument("--warmup", type=int, default=1)
     p_speed.add_argument("--repeats", type=int, default=3)
     p_speed.add_argument("--isolate", action=argparse.BooleanOptionalAction, default=True)
+    p_speed.add_argument("--abba", action=argparse.BooleanOptionalAction, default=True, help="Run interleaved ABBA pairing when --no-isolate")
+    p_speed.add_argument("--abba-pair", default=None, help="Optional comma-separated pair (e.g. gpu,hetero2) for interleaved ABBA run")
     p_speed.add_argument("--torch-python", default=None, help="Optional Python binary with torch/transformers installed")
     p_speed.add_argument("--pplx-mlx-path", default=None, help="Optional checkout path for public pplx-context-mlx")
     p_speed.add_argument("--torch-threads", default="1,2,4,6", help="Thread counts swept for torch-cpu baseline")
 
-    p_parity = sub.add_parser("parity", help="Verify all 16 reference cases across modes against reference.npz")
+    p_parity = sub.add_parser("parity", help="Verify all 16 reference cases + S=4096 streamed parity across modes")
     _add_shared_flags(p_parity)
-    p_parity.add_argument("--modes", default="gpu,ane,hetero2")
+    p_parity.add_argument("--modes", default="gpu,gpu-bf16,ane,hetero2")
+    p_parity.add_argument("--include-s4096", action=argparse.BooleanOptionalAction, default=True)
 
     p_clim = sub.add_parser("context-limit", help="Sweep 512..32K sequence lengths in isolated subprocesses")
     _add_shared_flags(p_clim)
@@ -1645,14 +1919,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_cwin = sub.add_parser("context-windows", help="Probe MRR/nDCG@5 & tok/s across contextual window budgets vs isolated")
     _add_shared_flags(p_cwin)
-    p_cwin.add_argument("--mode", choices=("auto", "gpu", "hetero2"), default="gpu")
+    p_cwin.add_argument("--mode", choices=("auto", "gpu", "hetero", "hetero2"), default="gpu")
     p_cwin.add_argument("--context-budgets", default="512,1024,2048,4096")
     p_cwin.add_argument("--filler-repeats", type=int, default=8)
 
     p_bit = sub.add_parser("bit-identity", help="Dump or compare exact float32 projected arrays across commits")
     _add_shared_flags(p_bit)
     p_bit.add_argument("action", choices=("dump", "compare"))
-    p_bit.add_argument("--mode", choices=("gpu", "ane", "hetero2"), default="gpu")
+    p_bit.add_argument("--mode", choices=("gpu", "ane", "hetero", "hetero2"), default="gpu")
     p_bit.add_argument("--out-dir", default="artifacts/bit_identity")
     p_bit.add_argument("--baseline-dir", default=None)
     p_bit.add_argument("--candidate-dir", default=None)
@@ -1660,12 +1934,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_all = sub.add_parser("all", help="Run speed + parity + context-limit + context-windows suites")
     _add_shared_flags(p_all)
     p_all.add_argument("--modes", default="gpu-no-mmap,gpu-bf16,gpu,hetero2,pplx-context-mlx-f16,torch-mps,torch-cpu")
+    p_all.add_argument("--parity-modes", default="gpu,gpu-bf16,ane,hetero2")
+    p_all.add_argument("--timing-scope", choices=("e2e", "forward"), default="e2e")
     p_all.add_argument("--mode", choices=("gpu", "hetero2"), default="gpu")
     p_all.add_argument("--doc-lengths", default="256,512,2048,4096")
     p_all.add_argument("--doc-batch", type=int, default=8)
     p_all.add_argument("--warmup", type=int, default=1)
     p_all.add_argument("--repeats", type=int, default=3)
     p_all.add_argument("--isolate", action=argparse.BooleanOptionalAction, default=True)
+    p_all.add_argument("--abba", action=argparse.BooleanOptionalAction, default=True)
+    p_all.add_argument("--abba-pair", default=None)
+    p_all.add_argument("--include-s4096", action=argparse.BooleanOptionalAction, default=True)
     p_all.add_argument("--torch-python", default=None)
     p_all.add_argument("--pplx-mlx-path", default=None)
     p_all.add_argument("--torch-threads", default="1,2,4,6")
@@ -1681,6 +1960,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "enable_tf32", False):
+        os.environ["MLX_ENABLE_TF32"] = "1"
+    else:
+        os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
     if args.suite == "bit-identity" and args.action == "compare":
         if not args.baseline_dir or not args.candidate_dir:
             parser.error("`bit-identity compare` requires --baseline-dir and --candidate-dir")

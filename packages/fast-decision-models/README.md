@@ -64,7 +64,7 @@ Monorepo `verify`: `laya-ane` `[1585, 0, 0]` (`s256` & `s512`, `probs=[0.7107, 0
 
 | Model / Engine | Optimization | Source |
 |---|---|---|
-| **Laya-Typed-421M ANE** | Piecewise Scale-Invariant Residual Re-Centering (`1 -> 1/32 -> 1/256 -> 1/1024`), Accelerate/NEON LUT + `8x8` transpose, `P=4` async CoreML ring | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
+| **Laya-Typed-421M ANE** | Piecewise Scale-Invariant Residual Re-Centering (`1 -> 1/32 -> 1/256 -> 1/1024`) w/ compensated FP16 LayerNorm, scalar FP16 LUT + NEON `8x8` transpose into `IOSurface`-backed `CVPixelBuffer`s, `P=4` async CoreML ring | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
 | **Kev-0.8B Metal MLX** | Lossless `W8 (g64)` + `BF16` merged weights, `@mx.compile` forward, left-padded `B=8` batching, `_GDN_PACKED_BTREE_SRC`, stdlib ZIP `head.pt` loader | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py) |
 
 ## CLI, Setup & Verification

@@ -149,6 +149,13 @@ class _FakeArray:
         rhs = other.data if isinstance(other, _FakeArray) else other
         return _FakeArray(self.data & rhs, dtype=self._dtype)
 
+    def __or__(self, other: Any) -> "_FakeArray":
+        rhs = other.data if isinstance(other, _FakeArray) else other
+        return _FakeArray(self.data | rhs, dtype=self._dtype)
+
+    def __invert__(self) -> "_FakeArray":
+        return _FakeArray(~self.data, dtype=self._dtype)
+
     def __ge__(self, other: Any) -> "_FakeArray":
         rhs = other.data if isinstance(other, _FakeArray) else other
         return _FakeArray(self.data >= rhs, dtype="bool")
@@ -238,6 +245,22 @@ class _FakeMx:
 
     def argmax(self, x: _FakeArray, axis: int = -1) -> _FakeArray:
         return _FakeArray(np.argmax(x.data, axis=axis).astype(np.int32), dtype=self.int32)
+
+    def where(self, cond: Any, x: Any, y: Any) -> _FakeArray:
+        c = cond.data if isinstance(cond, _FakeArray) else np.asarray(cond)
+        xv = x.data if isinstance(x, _FakeArray) else x
+        yv = y.data if isinstance(y, _FakeArray) else y
+        dt = x.dtype if isinstance(x, _FakeArray) else (y.dtype if isinstance(y, _FakeArray) else self.float32)
+        return _FakeArray(np.where(c, xv, yv), dtype=dt)
+
+    def isnan(self, x: _FakeArray) -> _FakeArray:
+        return _FakeArray(np.isnan(x.data), dtype="bool")
+
+    def any(self, x: _FakeArray, axis: int | None = None) -> _FakeArray:
+        return _FakeArray(np.asarray(np.any(x.data, axis=axis)), dtype="bool")
+
+    def abs(self, x: _FakeArray) -> _FakeArray:
+        return _FakeArray(np.abs(x.data), dtype=x.dtype)
 
     def eval(self, *args: Any) -> None:
         self.events.append(("eval", len(args)))
@@ -405,6 +428,8 @@ def test_mlp_dispatch_16_to_64_and_64x64_prefill_cpu() -> None:
     }
 
     with (
+        patch.object(fg4_model, "_supports_mpp_bf16", return_value=True),
+        patch.object(fg4_model, "_detect_gpu_family", return_value="apple9"),
         patch.object(fg4_model, "mpp_fused_geglu_bf16", side_effect=_model_v4),
         patch.object(fg4_model, "mpp_linear_bf16", side_effect=_model_mpp_lin),
         patch.object(fg4_model, "fused_geglu_split", side_effect=_fake_fused_geglu_split),
@@ -416,9 +441,9 @@ def test_mlp_dispatch_16_to_64_and_64x64_prefill_cpu() -> None:
             (24, True, "hybrid_32_mlx_dn"),
             (32, True, "hybrid_32_mlx_dn"),
             (64, True, "hybrid_32_mlx_dn"),
-            (65, True, "mpp_32x32"),
-            (256, True, "mpp_32x32"),
-            (511, True, "mpp_32x32"),
+            (65, True, "all_mlx"),
+            (256, True, "all_mlx"),
+            (511, True, "all_mlx"),
             (512, True, "all_mlx"),
             (1024, True, "all_mlx"),
             (2047, True, "all_mlx"),
@@ -439,16 +464,13 @@ def test_mlp_dispatch_16_to_64_and_64x64_prefill_cpu() -> None:
             elif expect == "hybrid_32_mlx_dn":
                 assert v4_geglu_calls == [M] and down_mlx_calls == [M]
                 assert not gu_mlx_calls and not model_mpp_lin_calls
-            elif expect == "mpp_32x32":
-                assert v4_geglu_calls == [M] and model_mpp_lin_calls == [(M, 32, 32)]
-                assert not gu_mlx_calls and not down_mlx_calls
             elif expect == "mpp_64x64":
                 assert v4_geglu_calls == [M] and model_mpp_lin_calls == [(M, 64, 64)]
                 assert not gu_mlx_calls and not down_mlx_calls
 
 
 def test_prefill_allow_mpp_gate_and_skip_s0_self_dequant_cpu() -> None:
-    """Verify Deliverable #3 (`_run_mlp` single-owner `M < 512 or M >= 2048`) & #4 (skip `s0==0` i8 self-dequant + SWA pre-scatter gather)."""
+    """Verify Deliverable #3 (`_run_mlp` single-owner `16<=M<=64` / `M>=2048`) & #4 (skip `s0==0` i8 self-dequant + SWA pre-scatter gather)."""
     src = (REPO_ROOT / "src" / "fast_gemma4" / "model.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     # Single owner: zero duplicated call-site `allow_mpp=` expressions in model.py!
@@ -458,7 +480,7 @@ def test_prefill_allow_mpp_gate_and_skip_s0_self_dequant_cpu() -> None:
             allow_mpp_calls.append(node.lineno)
     assert allow_mpp_calls == [], f"Unexpected duplicated allow_mpp kwargs at lines {allow_mpp_calls}"
     run_mlp_src = inspect.getsource(FastGemma4Model._run_mlp)
-    assert "M < 512 or M >= 2048" in run_mlp_src
+    assert "16 <= M <= 64" in run_mlp_src and "M >= prefill_min_m" in run_mlp_src
 
     # Verify `_prefill_early14_slot_group` runtime behavior on s0==0 and s0>0 (with swa_ring_cap=512 wrap)
     fake_mx = _FakeMx()
@@ -537,7 +559,7 @@ def test_prefill_allow_mpp_gate_and_skip_s0_self_dequant_cpu() -> None:
         pli = _FakeArray(np.zeros((B, L, 2, 4), dtype=np.float32), dtype=fake_mx.bfloat16)
         return h, pli
 
-    def _fake_qkv_nr(qkv: _FakeArray, wqn: Any, wkn: Any, inv: Any, off_meta: _FakeArray, eps: float):
+    def _fake_qkv_nr(qkv: _FakeArray, wqn: Any, wkn: Any, inv: Any, off_meta: _FakeArray, eps: float, **_kw: Any):
         Bg, lc, _ = qkv.shape
         off_val = int(off_meta.data[0])
         pos_ids = (off_val + np.arange(lc, dtype=np.float32))[None, :, None]
@@ -546,7 +568,7 @@ def test_prefill_allow_mpp_gate_and_skip_s0_self_dequant_cpu() -> None:
         v = _FakeArray(np.broadcast_to(pos_ids + 10000.0, (Bg, lc, 8)).copy(), dtype=fake_mx.bfloat16)
         return q, k, v
 
-    def _fake_kv_only(kv: _FakeArray, wkn: Any, inv: Any, off_bg: _FakeArray, eps: float):
+    def _fake_kv_only(kv: _FakeArray, wkn: Any, inv: Any, off_bg: _FakeArray, eps: float, **_kw: Any):
         Bg, lc, _ = kv.shape
         k = _FakeArray(np.zeros((Bg, lc, 8), dtype=np.float32), dtype=fake_mx.bfloat16)
         v = _FakeArray(np.zeros((Bg, lc, 8), dtype=np.float32), dtype=fake_mx.bfloat16)
@@ -579,7 +601,7 @@ def test_prefill_allow_mpp_gate_and_skip_s0_self_dequant_cpu() -> None:
 
     def _fake_run_mlp(mlp_in: _FakeArray, ld: dict[str, Any], allow_mpp: bool = True) -> _FakeArray:
         m_val = mlp_in.size // mlp_in.shape[-1]
-        allow_mpp_log.append((m_val, bool(allow_mpp and (m_val < 512 or m_val >= 2048))))
+        allow_mpp_log.append((m_val, bool(allow_mpp and (16 <= m_val <= 64 or m_val >= 2048))))
         return _FakeArray(np.zeros(mlp_in.shape, dtype=np.float32), dtype=mlp_in.dtype)
 
     fake_mx.fast.scaled_dot_product_attention = _fake_sdpa  # type: ignore[method-assign]
@@ -1431,13 +1453,21 @@ def test_ane_ring_variant_selects_the_ring_bundle_cpu() -> None:
     with patch.object(fg4_engine, "AnePrefixRunner", _Runner), patch.object(
         fg4_engine, "is_ane_resident_bundle", lambda lib, bundle: True
     ):
-        for variant, expect in ((None, "w8"), ("w8", "w8"), ("fp16", "fp16")):
+        for variant, expect in ((None, "fp16"), ("w8", "w8"), ("fp16", "fp16")):
             eng = _engine(variant)
             assert eng.ane_ring_bundle is None
-            runner = eng._resolve_ane_ring_runner(require=True)
+            if expect == "w8":
+                with pytest.warns(UserWarning, match="Linear-W8"):
+                    runner = eng._resolve_ane_ring_runner(require=True)
+            else:
+                runner = eng._resolve_ane_ring_runner(require=True)
             assert runner.bundle.name == f"early14_{expect}.mlmodelc"  # type: ignore[union-attr]
             assert eng.ane_ring_bundle == runner.bundle  # type: ignore[union-attr]
-            assert eng._resolve_ane_ring_runner(require=False) is runner
+            if expect == "w8":
+                with pytest.warns(UserWarning, match="Linear-W8"):
+                    assert eng._resolve_ane_ring_runner(require=False) is runner
+            else:
+                assert eng._resolve_ane_ring_runner(require=False) is runner
 
     # A bundle that is missing or not fully on the ANE: `auto` falls back to GPU only and says so through
     # `ane_ring_bundle`; an explicit ring request fails loudly and names the variant.
@@ -1534,10 +1564,11 @@ def test_ane_ring_chunk_count_and_previous_chunk_bookkeeping_cpu() -> None:
             self.scattered = (list(ring_ids), list(doc_slots), list(offs), list(vlens))
             return 0.0
 
-    def _ring(out_ring_size: int) -> AsyncHybridPrefillRing:
+    def _ring(out_ring_size: int, *, min_chunk_tokens: int = 1) -> AsyncHybridPrefillRing:
         ring = AsyncHybridPrefillRing.__new__(AsyncHybridPrefillRing)
         ring.runner = _Runner(out_ring_size)  # type: ignore[assignment]
         ring.lcp, ring.n_chunks = lcp, n_chunks
+        ring.min_chunk_tokens = min_chunk_tokens
         ring.geoms = {k: make_chunk_geom(lcp + k * ANE_CHUNK_S) for k in range(n_chunks)}
         ring.w_emb = np.zeros((8, 4), dtype=np.float16)
         ring.w_pli14 = np.zeros((8, 6), dtype=np.float16)
@@ -1552,7 +1583,16 @@ def test_ane_ring_chunk_count_and_previous_chunk_bookkeeping_cpu() -> None:
     sufs = [[1 + (i % 7)] * n for i, n in enumerate(lens)]
     doc_chunks = [1, 2, 3, 6, 7, 7]
 
-    ring = _ring(96)
+    # Default min_chunk_tokens=64 spills short tails (<64 toks: 59, 43, 19) cleanly to GPU instead of wasting S=256 buckets!
+    ring_default = _ring(96, min_chunk_tokens=AsyncHybridPrefillRing.min_chunk_tokens)
+    assert AsyncHybridPrefillRing.min_chunk_tokens == 64
+    item_def = ring_default.prefill_cohort_into_ring(list(range(len(lens))), sufs)
+    assert item_def["covered"] == [0, 256, 768, 1280, 1792, 1792]
+    ring_default.scatter_cohort_to_slot_cache(object(), item_def, [10, 11, 12, 13, 14, 15])  # type: ignore[arg-type]
+    assert ring_default._free_ring_q.qsize() == 96
+
+    # With min_chunk_tokens=1, verify exact partial-chunk previous-chunk bookkeeping across all 7 chunks:
+    ring = _ring(96, min_chunk_tokens=1)
     item = ring.prefill_cohort_into_ring(list(range(len(lens))), sufs)
     assert item["covered"] == [59, 299, 768, 1299, 1792, 1792]
     calls = ring.runner.calls  # type: ignore[attr-defined]
@@ -1581,7 +1621,7 @@ def test_ane_ring_chunk_count_and_previous_chunk_bookkeeping_cpu() -> None:
 
     # A cohort that cannot fit the ring fails at once and leaks no slot: waiting would never return, because only
     # scattering this same cohort frees slots.
-    small = _ring(20)
+    small = _ring(20, min_chunk_tokens=1)
     with pytest.raises(ValueError, match="26 ring slots"):
         small.prefill_cohort_into_ring(list(range(len(lens))), sufs)
     assert small._free_ring_q.qsize() == 20 and small.runner.calls == []  # type: ignore[attr-defined]

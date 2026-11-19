@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import json
 from pathlib import Path
 import queue
 import threading
 import time
 from typing import Any, Sequence
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -19,6 +21,7 @@ ANE_CHUNK_S = 256
 ANE_P_SWA = 512
 ANE_P_FULL = 1920
 ANE_MAX_CHUNKS = 3  # `AnePrefixWorker` only: `gemma4_px_run_batch` stitches at most two earlier chunks
+ANE_RING_MIN_CHUNK_TOKENS = 64  # Spill <64-token tails to GPU to avoid wasting full S=256 ANE slots
 
 
 def ane_ring_chunk_count(lcp: int, S: int = ANE_CHUNK_S, P_full: int = ANE_P_FULL) -> int:
@@ -35,16 +38,21 @@ def make_chunk_geom(
     S: int = ANE_CHUNK_S,
     P_swa: int = ANE_P_SWA,
     P_full: int = ANE_P_FULL,
+    *,
+    hd_swa: int = 256,
+    hd_full: int = 512,
+    window_size: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build CoreML ANE FP16 RoPE tables and causal/SWA masks for chunk starting at global offset `off`."""
     pos = np.arange(off, off + S, dtype=np.float32)[:, None]
-    inv_swa = 1.0 / (10000.0 ** (np.arange(0, 256, 2, dtype=np.float32) / 256.0))
+    inv_swa = 1.0 / (10000.0 ** (np.arange(0, hd_swa, 2, dtype=np.float32) / float(hd_swa)))
     ang_swa = np.concatenate([pos * inv_swa[None, :], pos * inv_swa[None, :]], axis=-1)
     cos_swa = np.ascontiguousarray(np.cos(ang_swa), dtype=np.float16)
     sin_swa = np.ascontiguousarray(np.sin(ang_swa), dtype=np.float16)
 
-    inv_full_part = 1.0 / (1000000.0 ** (np.arange(0, 128, 2, dtype=np.float32) / 512.0))
-    inv_full = np.concatenate([inv_full_part, np.zeros(256 - 64, dtype=np.float32)])
+    rotary_full = max(2, hd_full // 4)
+    inv_full_part = 1.0 / (1000000.0 ** (np.arange(0, rotary_full, 2, dtype=np.float32) / float(hd_full)))
+    inv_full = np.concatenate([inv_full_part, np.zeros((hd_full // 2) - len(inv_full_part), dtype=np.float32)])
     ang_full = np.concatenate([pos * inv_full[None, :], pos * inv_full[None, :]], axis=-1)
     cos_full = np.ascontiguousarray(np.cos(ang_full), dtype=np.float16)
     sin_full = np.ascontiguousarray(np.sin(ang_full), dtype=np.float16)
@@ -53,7 +61,7 @@ def make_chunk_geom(
     k_past_pos_swa = (off - P_swa + np.arange(P_swa))[None, :]
     k_new_pos = (off + np.arange(S))[None, :]
     k_all_swa = np.concatenate([k_past_pos_swa, k_new_pos], axis=1)
-    vis_swa = (k_all_swa >= 0) & (k_all_swa <= q_pos) & ((q_pos - k_all_swa) < 512)
+    vis_swa = (k_all_swa >= 0) & (k_all_swa <= q_pos) & ((q_pos - k_all_swa) < window_size)
     mask_swa = np.ascontiguousarray(np.where(vis_swa, 0.0, -10000.0), dtype=np.float16)
 
     past_idx = np.arange(P_full)[None, :]
@@ -62,6 +70,128 @@ def make_chunk_geom(
     vis_full = np.concatenate([np.broadcast_to(vis_full_past, (S, P_full)), vis_full_new], axis=1)
     mask_full = np.ascontiguousarray(np.where(vis_full, 0.0, -10000.0), dtype=np.float16)
     return cos_swa, sin_swa, cos_full, sin_full, mask_swa, mask_full
+
+
+def validate_ane_kv_finite(*arrays: np.ndarray, max_abs: float = 65504.0) -> bool:
+    """Return True iff every ANE FP16/BF16 KV array contains only finite values within `[-max_abs, max_abs]`."""
+    for arr in arrays:
+        if arr is None or arr.size == 0:
+            continue
+        if not bool(np.all(np.isfinite(arr))):
+            return False
+        if float(np.max(np.abs(arr))) > max_abs:
+            return False
+    return True
+
+
+def validate_slot_kv_scales_finite(
+    cache: dict[str, Any],
+    target_slots: Sequence[int],
+    *,
+    max_scale: float = 65504.0,
+) -> bool:
+    """Validate that scattered `KV_i8` scales (or BF16 KV tensors) at `target_slots` contain no `NaN`/`Inf`."""
+    slots = [int(s) for s in target_slots]
+    if not slots:
+        return True
+    layers = cache.get("layers", ())
+    if not layers:
+        return True
+
+    use_i8 = bool(cache.get("kv_i8", False))
+    mx_flags: list[mx.array] = []
+    slot_mx: mx.array | None = None
+
+    for cl in layers:
+        if use_i8 and "k_s" in cl and "v_s" in cl:
+            ks_raw, vs_raw = cl["k_s"], cl["v_s"]
+        elif "k" in cl and "v" in cl:
+            ks_raw, vs_raw = cl["k"], cl["v"]
+        else:
+            continue
+
+        if isinstance(ks_raw, np.ndarray) or isinstance(vs_raw, np.ndarray):
+            ks_sub = np.asarray(ks_raw)[slots]
+            vs_sub = np.asarray(vs_raw)[slots]
+            if not (np.all(np.isfinite(ks_sub)) and np.all(np.isfinite(vs_sub))):
+                return False
+            if ks_sub.size and float(np.max(np.abs(ks_sub))) > max_scale:
+                return False
+            if vs_sub.size and float(np.max(np.abs(vs_sub))) > max_scale:
+                return False
+            if use_i8 and "k_s" in cl:
+                if ks_sub.size and float(np.min(ks_sub)) < 0.0:
+                    return False
+                if vs_sub.size and float(np.min(vs_sub)) < 0.0:
+                    return False
+        else:
+            if slot_mx is None:
+                slot_mx = mx.array(slots, dtype=mx.int32)
+            ks_sub = ks_raw[slot_mx]
+            vs_sub = vs_raw[slot_mx]
+            flag = (
+                mx.any(mx.isnan(ks_sub))
+                | mx.any(mx.isnan(vs_sub))
+                | mx.any(mx.abs(ks_sub) > max_scale)
+                | mx.any(mx.abs(vs_sub) > max_scale)
+            )
+            if use_i8 and "k_s" in cl:
+                flag = flag | mx.any(ks_sub < 0.0) | mx.any(vs_sub < 0.0)
+            mx_flags.append(flag)
+
+    if not mx_flags:
+        return True
+    any_bad = mx_flags[0]
+    for f in mx_flags[1:]:
+        any_bad = any_bad | f
+    mx.eval(any_bad)
+    return not bool(any_bad.item())
+
+
+def is_w8_bundle_calibrated(mlmodelc_path: str | Path | None) -> bool:
+    """Return True iff `ane_calibration_manifest.json` certifies the W8 bundle as domain-calibrated or QAT-validated."""
+    if mlmodelc_path is None:
+        return False
+    mp = Path(mlmodelc_path)
+    for manifest_p in (mp.parent / "ane_calibration_manifest.json", mp / "ane_calibration_manifest.json"):
+        if not manifest_p.is_file():
+            continue
+        try:
+            data = json.loads(manifest_p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        bundles = data.get("bundles", {})
+        entry = bundles.get(mp.name) if isinstance(bundles, dict) else None
+        if not isinstance(entry, dict):
+            entry = data if data.get("bundle_name") == mp.name else None
+        if not isinstance(entry, dict):
+            continue
+        if bool(entry.get("qat_validated", False)):
+            return True
+        src = str(entry.get("calibration_source", "")).strip().lower()
+        docs = int(entry.get("calibration_docs", 0))
+        if bool(entry.get("awq_mse", False)) and src in ("corpus", "domain_corpus", "file", "fixtures") and docs >= 8:
+            return True
+    return False
+
+
+def _stack_sys_kv_fp16(
+    prefix_kv: dict[str, Any],
+    key: str,
+    layer_indices: Sequence[int],
+) -> np.ndarray:
+    """Stack prefix KV tensors into contiguous FP16 `(n_layers, n_kv, l_sys, hd)`."""
+    mats: list[np.ndarray] = []
+    for l_idx in layer_indices:
+        arr = np.asarray(prefix_kv[key][l_idx].astype(mx.float16), dtype=np.float16)
+        if arr.ndim == 2:
+            arr = arr[None, :, :]  # legacy (l_sys, hd) -> (1, l_sys, hd)
+        elif arr.ndim == 3:
+            arr = np.transpose(arr, (1, 0, 2))  # (l_sys, n_kv, hd) -> (n_kv, l_sys, hd)
+        else:
+            raise ValueError(f"Expected 2D or 3D prefix_kv[{key!r}][{l_idx}], got shape {arr.shape}")
+        mats.append(arr)
+    return np.ascontiguousarray(np.stack(mats, axis=0), dtype=np.float16)
 
 
 def _mx_uma_ptr_and_nbytes(arr: mx.array) -> tuple[int, int]:
@@ -537,12 +667,15 @@ def can_use_ane_prefix(lcp: int, max_suf_len: int) -> bool:
 
 
 class AsyncHybridPrefillRing:
-    """Zero-copy background ANE EarlyExit14 producer + IOSurface -> Metal KV_i8 scatter ring.
+    """Zero-copy background ANE EarlyExit14/Early23 producer + IOSurface -> Metal KV_i8 scatter ring.
 
     Keeps CPU SME2 strictly parked for standard suffixes (`S_suffix <= 1,200`), streaming
     `pipe_depth=4` ANE chunks directly into unlocked `CVPixelBuffer`/`IOSurface` ring slots
     and scattering them into freed MLX `KV_i8` rolling slots via 2 Metal dispatches (`0` CPU copies).
+    Short suffix tails `< min_chunk_tokens` (default `64`) spill cleanly to GPU BF16 prefill.
     """
+
+    min_chunk_tokens: int = ANE_RING_MIN_CHUNK_TOKENS
 
     def __init__(
         self,
@@ -551,29 +684,32 @@ class AsyncHybridPrefillRing:
         prefix_kv: dict[str, Any],
         w_emb: np.ndarray,
         w_pli14: np.ndarray,
+        *,
+        min_chunk_tokens: int = ANE_RING_MIN_CHUNK_TOKENS,
+        secondary_runner: AnePrefixRunner | None = None,
+        secondary_chunk_s: int | None = None,
     ) -> None:
         self.model = model
         self.runner = runner
         self.w_emb = w_emb
         self.w_pli14 = w_pli14
+        self.min_chunk_tokens = max(1, int(min_chunk_tokens))
+        self.secondary_runner = secondary_runner
+        self.secondary_chunk_s = int(secondary_chunk_s) if secondary_chunk_s else None
+        self.n_kv = int(getattr(model, "n_kv_heads", 1))
+        self.hd_swa = int(getattr(model, "swa_head_dim", 256))
+        self.hd_full = int(getattr(model, "full_head_dim", 512))
+        self.window_size = int(getattr(model, "window_size", 512))
         self.lcp = int(prefix_kv["l_sys"])
         if self.lcp > ANE_P_FULL - ANE_CHUNK_S:
             raise ValueError(f"Prefix length {self.lcp} exceeds CoreML P_FULL={ANE_P_FULL}")
 
-        self.sys_ks = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["k_sys"][l].astype(mx.float16)) for l in model.swa_layers], axis=0)
-        )
-        self.sys_vs = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["v_sys"][l].astype(mx.float16)) for l in model.swa_layers], axis=0)
-        )
+        self.sys_ks = _stack_sys_kv_fp16(prefix_kv, "k_sys", model.swa_layers)
+        self.sys_vs = _stack_sys_kv_fp16(prefix_kv, "v_sys", model.swa_layers)
         n_fp = len(model.full_layers) - 1
-        if self.lcp > 0:
-            self.sys_kf: np.ndarray | None = np.ascontiguousarray(
-                np.stack([np.array(prefix_kv["k_sys"][l].astype(mx.float16)) for l in model.full_layers[:n_fp]], axis=0)
-            )
-            self.sys_vf: np.ndarray | None = np.ascontiguousarray(
-                np.stack([np.array(prefix_kv["v_sys"][l].astype(mx.float16)) for l in model.full_layers[:n_fp]], axis=0)
-            )
+        if self.lcp > 0 and n_fp > 0:
+            self.sys_kf: np.ndarray | None = _stack_sys_kv_fp16(prefix_kv, "k_sys", model.full_layers[:n_fp])
+            self.sys_vf: np.ndarray | None = _stack_sys_kv_fp16(prefix_kv, "v_sys", model.full_layers[:n_fp])
         else:
             self.sys_kf = None
             self.sys_vf = None
@@ -585,7 +721,15 @@ class AsyncHybridPrefillRing:
 
         self.n_chunks = ane_ring_chunk_count(self.lcp)
         self.geoms: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {
-            k: make_chunk_geom(self.lcp + k * ANE_CHUNK_S, ANE_CHUNK_S, ANE_P_SWA, ANE_P_FULL)
+            k: make_chunk_geom(
+                self.lcp + k * ANE_CHUNK_S,
+                ANE_CHUNK_S,
+                ANE_P_SWA,
+                ANE_P_FULL,
+                hd_swa=self.hd_swa,
+                hd_full=self.hd_full,
+                window_size=self.window_size,
+            )
             for k in range(self.n_chunks)
         }
 
@@ -594,13 +738,19 @@ class AsyncHybridPrefillRing:
         for r_id in range(self.runner.out_ring_size):
             self._free_ring_q.put(r_id)
 
+    @property
+    def bucket_sizes(self) -> tuple[int, ...]:
+        if self.secondary_runner is not None and self.secondary_chunk_s:
+            return (ANE_CHUNK_S, self.secondary_chunk_s)
+        return (ANE_CHUNK_S,)
+
     def _tail_swa(self, arr: np.ndarray, n_take: int) -> np.ndarray:
-        n_swa = arr.shape[0]
+        n_swa, n_kv, _, hd = arr.shape
         if self.lcp >= n_take:
-            return np.ascontiguousarray(arr[:, -n_take:, :], dtype=np.float16)
-        out = np.zeros((n_swa, n_take, 256), dtype=np.float16)
+            return np.ascontiguousarray(arr[:, :, -n_take:, :], dtype=np.float16)
+        out = np.zeros((n_swa, n_kv, n_take, hd), dtype=np.float16)
         if self.lcp > 0:
-            out[:, n_take - self.lcp :, :] = arr
+            out[:, :, n_take - self.lcp :, :] = arr
         return out
 
     def acquire_ring_slots(self, count: int, stop_event: threading.Event | None = None) -> list[int]:
@@ -635,13 +785,21 @@ class AsyncHybridPrefillRing:
         """Run up to `n_chunks` ANE chunks per doc directly into unlocked IOSurface ring slots.
 
         A doc keeps one ring slot per chunk until the cohort is scattered: later chunks read the earlier ones as
-        their past, so a cohort of `B` docs can hold `B * n_chunks` slots at once.
+        their past, so a cohort of `B` docs can hold `B * n_chunks` slots at once. Trailing tails shorter than
+        `min_chunk_tokens` (default 64) are spilled cleanly to GPU BF16 prefill instead of wasting a 256-tok bucket.
         """
         B = len(doc_ids)
         covered = [0] * B
         chunk_records: list[tuple[int, list[int], list[int], list[int]]] = []
         ring_by_chunk: list[dict[int, int]] = []  # chunk -> doc row -> ring slot
-        need = sum(min(self.n_chunks, -(-(len(s) - 1) // ANE_CHUNK_S)) for s in sufs)
+        min_tok = max(1, int(getattr(self, "min_chunk_tokens", ANE_RING_MIN_CHUNK_TOKENS)))
+        chunk_keys = sorted(self.geoms.keys())
+        need = 0
+        for k in chunk_keys:
+            c_off = k * ANE_CHUNK_S
+            if self.lcp + c_off > ANE_P_FULL:
+                break
+            need += sum(1 for s in sufs if (len(s) - 1 - c_off) >= min_tok)
         if need > self.runner.out_ring_size:
             # Slots are only freed by scattering this cohort, so waiting for more would never return.
             raise ValueError(
@@ -651,13 +809,12 @@ class AsyncHybridPrefillRing:
         allocated_all: list[int] = []
 
         try:
-            for k in sorted(self.geoms.keys()):
+            for k in chunk_keys:
                 c_off = k * ANE_CHUNK_S
                 if self.lcp + c_off > ANE_P_FULL:
                     break
-                # Because ANE chunk attention is strictly causal and `bridge_scatter` clips at `valid_len`,
-                # partial chunks (`1..256` tokens) execute on idle ANE with exact causal KV and 0 GPU stall!
-                act_ris = [ri for ri in range(B) if (len(sufs[ri]) - 1 - c_off) > 0]
+                # Gate partial chunks at `min_chunk_tokens` (default 64); shorter tails spill to GPU BF16 prefill.
+                act_ris = [ri for ri in range(B) if (len(sufs[ri]) - 1 - c_off) >= min_tok]
                 if not act_ris:
                     break
 
@@ -764,67 +921,85 @@ class AnePrefixWorker:
         prefix_kv: dict[str, Any],
         w_emb: np.ndarray,
         w_pli14: np.ndarray,
+        *,
+        min_chunk_tokens: int = 32,
     ) -> None:
         self.model = model
         self.runner = runner
         self.w_emb = w_emb
         self.w_pli14 = w_pli14
+        self.min_chunk_tokens = max(1, int(min_chunk_tokens))
+        self.n_swa = len(model.swa_layers)
+        self.n_full = len(model.full_layers)
+        self.n_full_past = max(0, self.n_full - 1)
+        self.n_kv = int(getattr(model, "n_kv_heads", 1))
+        self.hd_swa = int(getattr(model, "swa_head_dim", 256))
+        self.hd_full = int(getattr(model, "full_head_dim", 512))
+        self.window_size = int(getattr(model, "window_size", 512))
         self.lcp = int(prefix_kv["l_sys"])
         if self.lcp > ANE_P_FULL - ANE_CHUNK_S:
             raise ValueError(f"Prefix length {self.lcp} exceeds CoreML P_FULL={ANE_P_FULL}")
 
-        self.sys_ks = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["k_sys"][l].astype(mx.float16)) for l in model.swa_layers], axis=0)
-        )
-        self.sys_vs = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["v_sys"][l].astype(mx.float16)) for l in model.swa_layers], axis=0)
-        )
-        self.sys_kf = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["k_sys"][l].astype(mx.float16)) for l in model.full_layers[:2]], axis=0)
-        )
-        self.sys_vf = np.ascontiguousarray(
-            np.stack([np.array(prefix_kv["v_sys"][l].astype(mx.float16)) for l in model.full_layers[:2]], axis=0)
-        )
+        self.sys_ks = _stack_sys_kv_fp16(prefix_kv, "k_sys", model.swa_layers)
+        self.sys_vs = _stack_sys_kv_fp16(prefix_kv, "v_sys", model.swa_layers)
+        self.sys_kf = _stack_sys_kv_fp16(prefix_kv, "k_sys", model.full_layers[: self.n_full_past])
+        self.sys_vf = _stack_sys_kv_fp16(prefix_kv, "v_sys", model.full_layers[: self.n_full_past])
 
         self.geoms = {}
         for k in range(ANE_MAX_CHUNKS):
             off = self.lcp + k * ANE_CHUNK_S
             if off <= ANE_P_FULL:
-                self.geoms[k] = make_chunk_geom(off, ANE_CHUNK_S, ANE_P_SWA, ANE_P_FULL)
+                self.geoms[k] = make_chunk_geom(
+                    off,
+                    ANE_CHUNK_S,
+                    ANE_P_SWA,
+                    ANE_P_FULL,
+                    hd_swa=self.hd_swa,
+                    hd_full=self.hd_full,
+                    window_size=self.window_size,
+                )
 
     def _sys_swa_tail512(self, k_arr: np.ndarray, n_take: int) -> np.ndarray:
         """Return rightmost `n_take` slots of `sys_ks/sys_vs`, zero-left-padded if `lcp < n_take`."""
+        n_swa, n_kv, _, hd = k_arr.shape
         if self.lcp >= n_take:
-            return np.ascontiguousarray(k_arr[:, -n_take:, :], dtype=np.float16)
-        out = np.zeros((12, n_take, 256), dtype=np.float16)
+            return np.ascontiguousarray(k_arr[:, :, -n_take:, :], dtype=np.float16)
+        out = np.zeros((n_swa, n_kv, n_take, hd), dtype=np.float16)
         if self.lcp > 0:
-            out[:, n_take - self.lcp :, :] = k_arr
+            out[:, :, n_take - self.lcp :, :] = k_arr
         return out
 
     def run_wave_cpu_ane(self, suf_ids_list: Sequence[Sequence[int]]) -> dict[str, Any]:
-        """Run pure CPU embed lookup + CoreML ANE Early14 prefill for a wave of documents."""
+        """Run pure CPU embed lookup + CoreML ANE Early14/Early23 prefill for a wave of documents."""
         t0 = time.perf_counter()
         B = len(suf_ids_list)
         lcp = self.lcp
+        n_swa = self.n_swa
+        n_full = self.n_full
+        n_fp = self.n_full_past
+        n_kv = self.n_kv
+        hd_s = self.hd_swa
+        hd_f = self.hd_full
 
         chunks_out: dict[int, tuple[list[int], list[int], np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         covered = [0] * B
-        ane_ks_prev = np.empty((B, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-        ane_vs_prev = np.empty((B, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-        ane_kf_prev = np.empty((B, 2, ANE_CHUNK_S, 512), dtype=np.float16)
-        ane_vf_prev = np.empty((B, 2, ANE_CHUNK_S, 512), dtype=np.float16)
-        ane_ks_prev1 = np.empty((B, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-        ane_vs_prev1 = np.empty((B, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-        ane_kf_prev1 = np.empty((B, 2, ANE_CHUNK_S, 512), dtype=np.float16)
-        ane_vf_prev1 = np.empty((B, 2, ANE_CHUNK_S, 512), dtype=np.float16)
+        ane_ks_prev = np.empty((B, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+        ane_vs_prev = np.empty((B, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+        ane_kf_prev = np.empty((B, n_fp, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
+        ane_vf_prev = np.empty((B, n_fp, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
+        ane_ks_prev1 = np.empty((B, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+        ane_vs_prev1 = np.empty((B, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+        ane_kf_prev1 = np.empty((B, n_fp, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
+        ane_vf_prev1 = np.empty((B, n_fp, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
 
         t_emb = 0.0
         t_ane = 0.0
+        non_finite_detected = False
         for k in sorted(self.geoms.keys()):
             c0 = k * ANE_CHUNK_S
             if lcp + c0 > ANE_P_FULL:
                 break
-            act = [b for b in range(B) if (len(suf_ids_list[b]) - 1 - c0) >= 32]
+            act = [b for b in range(B) if (len(suf_ids_list[b]) - 1 - c0) >= self.min_chunk_tokens]
             if not act:
                 break
             n_act = len(act)
@@ -844,51 +1019,51 @@ class AnePrefixWorker:
             if k == 0:
                 kp_s = self._sys_swa_tail512(self.sys_ks, ANE_P_SWA)
                 vp_s = self._sys_swa_tail512(self.sys_vs, ANE_P_SWA)
-                kp_f = np.zeros((2, ANE_P_FULL, 512), dtype=np.float16)
-                vp_f = np.zeros((2, ANE_P_FULL, 512), dtype=np.float16)
+                kp_f = np.zeros((n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
+                vp_f = np.zeros((n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
                 if lcp > 0:
-                    kp_f[:, :lcp, :] = self.sys_kf
-                    vp_f[:, :lcp, :] = self.sys_vf
+                    kp_f[:, :, :lcp, :] = self.sys_kf
+                    vp_f[:, :, :lcp, :] = self.sys_vf
                 shared_past = True
             elif k == 1:
-                kp_s = np.empty((n_act, 12, ANE_P_SWA, 256), dtype=np.float16)
-                vp_s = np.empty((n_act, 12, ANE_P_SWA, 256), dtype=np.float16)
-                kp_f = np.zeros((n_act, 2, ANE_P_FULL, 512), dtype=np.float16)
-                vp_f = np.zeros((n_act, 2, ANE_P_FULL, 512), dtype=np.float16)
-                kp_s[:, :, :ANE_CHUNK_S, :] = self._sys_swa_tail512(self.sys_ks, ANE_CHUNK_S)
-                vp_s[:, :, :ANE_CHUNK_S, :] = self._sys_swa_tail512(self.sys_vs, ANE_CHUNK_S)
+                kp_s = np.empty((n_act, n_swa, n_kv, ANE_P_SWA, hd_s), dtype=np.float16)
+                vp_s = np.empty((n_act, n_swa, n_kv, ANE_P_SWA, hd_s), dtype=np.float16)
+                kp_f = np.zeros((n_act, n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
+                vp_f = np.zeros((n_act, n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
+                kp_s[:, :, :, :ANE_CHUNK_S, :] = self._sys_swa_tail512(self.sys_ks, ANE_CHUNK_S)
+                vp_s[:, :, :, :ANE_CHUNK_S, :] = self._sys_swa_tail512(self.sys_vs, ANE_CHUNK_S)
                 if lcp > 0:
-                    kp_f[:, :, :lcp, :] = self.sys_kf
-                    vp_f[:, :, :lcp, :] = self.sys_vf
+                    kp_f[:, :, :, :lcp, :] = self.sys_kf
+                    vp_f[:, :, :, :lcp, :] = self.sys_vf
                 act_idx = np.asarray(act, dtype=np.int32)
-                kp_s[:, :, ANE_CHUNK_S:, :] = ane_ks_prev[act_idx]
-                vp_s[:, :, ANE_CHUNK_S:, :] = ane_vs_prev[act_idx]
-                kp_f[:, :, lcp : lcp + ANE_CHUNK_S, :] = ane_kf_prev[act_idx]
-                vp_f[:, :, lcp : lcp + ANE_CHUNK_S, :] = ane_vf_prev[act_idx]
+                kp_s[:, :, :, ANE_CHUNK_S:, :] = ane_ks_prev[act_idx]
+                vp_s[:, :, :, ANE_CHUNK_S:, :] = ane_vs_prev[act_idx]
+                kp_f[:, :, :, lcp : lcp + ANE_CHUNK_S, :] = ane_kf_prev[act_idx]
+                vp_f[:, :, :, lcp : lcp + ANE_CHUNK_S, :] = ane_vf_prev[act_idx]
                 shared_past = False
             else:
-                kp_s = np.empty((n_act, 12, ANE_P_SWA, 256), dtype=np.float16)
-                vp_s = np.empty((n_act, 12, ANE_P_SWA, 256), dtype=np.float16)
-                kp_f = np.zeros((n_act, 2, ANE_P_FULL, 512), dtype=np.float16)
-                vp_f = np.zeros((n_act, 2, ANE_P_FULL, 512), dtype=np.float16)
+                kp_s = np.empty((n_act, n_swa, n_kv, ANE_P_SWA, hd_s), dtype=np.float16)
+                vp_s = np.empty((n_act, n_swa, n_kv, ANE_P_SWA, hd_s), dtype=np.float16)
+                kp_f = np.zeros((n_act, n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
+                vp_f = np.zeros((n_act, n_fp, n_kv, ANE_P_FULL, hd_f), dtype=np.float16)
                 act_idx = np.asarray(act, dtype=np.int32)
-                kp_s[:, :, :ANE_CHUNK_S, :] = ane_ks_prev[act_idx]
-                kp_s[:, :, ANE_CHUNK_S:, :] = ane_ks_prev1[act_idx]
-                vp_s[:, :, :ANE_CHUNK_S, :] = ane_vs_prev[act_idx]
-                vp_s[:, :, ANE_CHUNK_S:, :] = ane_vs_prev1[act_idx]
+                kp_s[:, :, :, :ANE_CHUNK_S, :] = ane_ks_prev[act_idx]
+                kp_s[:, :, :, ANE_CHUNK_S:, :] = ane_ks_prev1[act_idx]
+                vp_s[:, :, :, :ANE_CHUNK_S, :] = ane_vs_prev[act_idx]
+                vp_s[:, :, :, ANE_CHUNK_S:, :] = ane_vs_prev1[act_idx]
                 if lcp > 0:
-                    kp_f[:, :, :lcp, :] = self.sys_kf
-                    vp_f[:, :, :lcp, :] = self.sys_vf
-                kp_f[:, :, lcp : lcp + ANE_CHUNK_S, :] = ane_kf_prev[act_idx]
-                vp_f[:, :, lcp : lcp + ANE_CHUNK_S, :] = ane_vf_prev[act_idx]
-                kp_f[:, :, lcp + ANE_CHUNK_S : lcp + 2 * ANE_CHUNK_S, :] = ane_kf_prev1[act_idx]
-                vp_f[:, :, lcp + ANE_CHUNK_S : lcp + 2 * ANE_CHUNK_S, :] = ane_vf_prev1[act_idx]
+                    kp_f[:, :, :, :lcp, :] = self.sys_kf
+                    vp_f[:, :, :, :lcp, :] = self.sys_vf
+                kp_f[:, :, :, lcp : lcp + ANE_CHUNK_S, :] = ane_kf_prev[act_idx]
+                vp_f[:, :, :, lcp : lcp + ANE_CHUNK_S, :] = ane_vf_prev[act_idx]
+                kp_f[:, :, :, lcp + ANE_CHUNK_S : lcp + 2 * ANE_CHUNK_S, :] = ane_kf_prev1[act_idx]
+                vp_f[:, :, :, lcp + ANE_CHUNK_S : lcp + 2 * ANE_CHUNK_S, :] = ane_vf_prev1[act_idx]
                 shared_past = False
 
-            ok_s = np.empty((n_act, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-            ov_s = np.empty((n_act, 12, ANE_CHUNK_S, 256), dtype=np.float16)
-            ok_f = np.empty((n_act, 3, ANE_CHUNK_S, 512), dtype=np.float16)
-            ov_f = np.empty((n_act, 3, ANE_CHUNK_S, 512), dtype=np.float16)
+            ok_s = np.empty((n_act, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+            ov_s = np.empty((n_act, n_swa, n_kv, ANE_CHUNK_S, hd_s), dtype=np.float16)
+            ok_f = np.empty((n_act, n_full, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
+            ov_f = np.empty((n_act, n_full, n_kv, ANE_CHUNK_S, hd_f), dtype=np.float16)
 
             dt = self.runner.run_batch(
                 n_act,
@@ -914,17 +1089,28 @@ class AnePrefixWorker:
             )
             t_ane += dt
 
+            if not validate_ane_kv_finite(ok_s, ov_s, ok_f, ov_f):
+                warnings.warn(
+                    f"Non-finite (Inf/NaN) ANE FP16 KV detected at chunk {k}; falling back to GPU BF16 prefill.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                non_finite_detected = True
+                chunks_out.clear()
+                covered = [0] * B
+                break
+
             act_idx = np.asarray(act, dtype=np.int32)
             if k == 0:
                 ane_ks_prev[act_idx] = ok_s
                 ane_vs_prev[act_idx] = ov_s
-                ane_kf_prev[act_idx] = ok_f[:, :2]
-                ane_vf_prev[act_idx] = ov_f[:, :2]
+                ane_kf_prev[act_idx] = ok_f[:, :n_fp]
+                ane_vf_prev[act_idx] = ov_f[:, :n_fp]
             elif k == 1:
                 ane_ks_prev1[act_idx] = ok_s
                 ane_vs_prev1[act_idx] = ov_s
-                ane_kf_prev1[act_idx] = ok_f[:, :2]
-                ane_vf_prev1[act_idx] = ov_f[:, :2]
+                ane_kf_prev1[act_idx] = ok_f[:, :n_fp]
+                ane_vf_prev1[act_idx] = ov_f[:, :n_fp]
 
             chunks_out[k] = (act, vlen, ok_s, ov_s, ok_f, ov_f)
             for ri, b in enumerate(act):
@@ -933,6 +1119,7 @@ class AnePrefixWorker:
         return {
             "chunks": chunks_out,
             "covered": covered,
+            "non_finite_detected": non_finite_detected,
             "worker_sec": time.perf_counter() - t0,
             "ane_sec": t_ane,
             "emb_sec": t_emb,
@@ -946,27 +1133,45 @@ def ingest_ane_finish_tail_and_last(
     ane_res: dict[str, Any],
     lcp: int,
 ) -> tuple[mx.array, mx.array, float, float, float]:
-    """Ingest ANE chunk KVs into GPU cache, finish any short tail via EarlyExit14, and run batched LastTok."""
+    """Ingest ANE chunk KVs into GPU cache, finish any short tail via EarlyExit14/23, and run batched LastTok.
+
+    Automatically detects non-finite (`Inf`/`NaN`) ANE outputs and falls back cleanly to GPU BF16 prefill.
+    """
     t0 = time.perf_counter()
     B = len(suf_ids_list)
     chunks = ane_res["chunks"]
-    covered = ane_res["covered"]
+    covered = list(ane_res["covered"])
+    non_finite = bool(ane_res.get("non_finite_detected", False))
 
-    for k, (act, vlen, ok_s, ov_s, ok_f, ov_f) in chunks.items():
-        c0 = k * ANE_CHUNK_S
-        if all(v == ANE_CHUNK_S for v in vlen):
-            model.ingest_ane_chunk_kv(cache, act, c0, ok_s, ov_s, ok_f, ov_f, valid_len=ANE_CHUNK_S, eval_cache=False)
-        else:
-            by_vl: dict[int, list[tuple[int, int]]] = collections.defaultdict(list)
-            for ri, b in enumerate(act):
-                by_vl[vlen[ri]].append((ri, b))
-            for vl, pairs in by_vl.items():
-                ris = np.asarray([p[0] for p in pairs], dtype=np.int32)
-                bs = [p[1] for p in pairs]
-                model.ingest_ane_chunk_kv(
-                    cache, bs, c0, ok_s[ris], ov_s[ris], ok_f[ris], ov_f[ris], valid_len=vl, eval_cache=False
+    if not non_finite:
+        for _, (_, _, ok_s, ov_s, ok_f, ov_f) in chunks.items():
+            if not validate_ane_kv_finite(ok_s, ov_s, ok_f, ov_f):
+                warnings.warn(
+                    "Non-finite (Inf/NaN) ANE KV chunk detected during ingestion; falling back to GPU BF16 prefill.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-    mx.eval(*[(c["k"], c["v"]) for c in cache["layers"]])
+                non_finite = True
+                break
+
+    if non_finite:
+        covered = [0] * B
+    else:
+        for k, (act, vlen, ok_s, ov_s, ok_f, ov_f) in chunks.items():
+            c0 = k * ANE_CHUNK_S
+            if all(v == ANE_CHUNK_S for v in vlen):
+                model.ingest_ane_chunk_kv(cache, act, c0, ok_s, ov_s, ok_f, ov_f, valid_len=ANE_CHUNK_S, eval_cache=False)
+            else:
+                by_vl: dict[int, list[tuple[int, int]]] = collections.defaultdict(list)
+                for ri, b in enumerate(act):
+                    by_vl[vlen[ri]].append((ri, b))
+                for vl, pairs in by_vl.items():
+                    ris = np.asarray([p[0] for p in pairs], dtype=np.int32)
+                    bs = [p[1] for p in pairs]
+                    model.ingest_ane_chunk_kv(
+                        cache, bs, c0, ok_s[ris], ov_s[ris], ok_f[ris], ov_f[ris], valid_len=vl, eval_cache=False
+                    )
+        mx.eval(*[(c["k"], c["v"]) for c in cache["layers"]])
     t_ing = time.perf_counter() - t0
 
     t_tail0 = time.perf_counter()

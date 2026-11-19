@@ -43,14 +43,22 @@ def test_ref_64_parity_all_modes(engine: FastEmbeddingGemma2) -> None:
     assert float(np.min(np.sum(v_het * v_f16, axis=1))) >= 0.9995
 
     if engine.ane_available:
-        v_ane = engine.encode_corpus(sub_lists, mode="ane")
-        assert float(np.min(np.sum(v_ane * v_gpu, axis=1))) >= 0.9995
+        # Doc #63 has 744 tokens (>512), so strict mode='ane' refuses silent GPU overflow unless opted in
+        with pytest.raises(ValueError, match="longer than 512"):
+            engine.encode_corpus(sub_lists, mode="ane")
+        le512 = [i for i, s in enumerate(sub_lists) if len(s) <= 512]
+        v_ane = engine.encode_corpus([sub_lists[i] for i in le512], mode="ane")
+        assert engine.last_stats is not None and engine.last_stats["gpu_docs"] == 0
+        assert float(np.min(np.sum(v_ane * v_gpu[le512], axis=1))) >= 0.9995
+        v_ane_ov = engine.encode_corpus(sub_lists, mode="ane", allow_gpu_overflow=True)
+        assert float(np.min(np.sum(v_ane_ov * v_gpu, axis=1))) >= 0.9995
         v_h2 = engine.encode_corpus(sub_lists, mode="hetero2")
         assert float(np.min(np.sum(v_h2 * v_gpu, axis=1))) >= 0.9995
 
     if engine.cpu_sme_available:
-        v_cpu = engine.encode_corpus(sub_lists, mode="cpu")
-        assert float(np.min(np.sum(v_cpu * v_gpu, axis=1))) >= 0.9995
+        le512 = [i for i, s in enumerate(sub_lists) if len(s) <= 512]
+        v_cpu = engine.encode_corpus([sub_lists[i] for i in le512], mode="cpu")
+        assert float(np.min(np.sum(v_cpu * v_gpu[le512], axis=1))) >= 0.9995
 
 
 def test_query_buckets_parity_and_edge_cases(engine: FastEmbeddingGemma2) -> None:
@@ -634,4 +642,222 @@ def test_warmup_skips_gpu_on_ane_default_and_over_by_default() -> None:
     finally:
         mx.eval = orig_eval
         mx.synchronize = orig_sync
+
+
+def test_plain_matmul_and_force_fused_sdpa_gate() -> None:
+    """Findings #2 & #4: Plain projections use mx.matmul(x, w.T); force_fused strictly M5+SWA+D256+384/512."""
+    import ast
+    import mlx.core as mx
+    from fast_embeddinggemma_2 import gpu as emb2_gpu
+
+    src = Path(emb2_gpu.__file__).read_text(encoding="utf-8")
+    assert not hasattr(emb2_gpu, "_MPP_64")
+    assert not hasattr(emb2_gpu, "_MPP_128")
+    assert not hasattr(emb2_gpu, "_mpp_matmul")
+    assert 'epilogue="none"' not in src
+    assert "_MPP_GEGLU_64" in src and "_MPP_PG_64" in src
+    tree = ast.parse(src, filename=str(emb2_gpu.__file__))
+    trunk_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_forward_trunk")
+    trunk_src = ast.get_source_segment(src, trunk_fn) or ""
+    assert "mx.matmul(" in trunk_src and "_mpp_matmul(" not in trunk_src
+
+    # Apple10 (M5) + SWA + D256 + S in (384, 512) + FP16 + macOS >= 26.2 -> True
+    for seq_l in (384, 512):
+        assert emb2_gpu.should_force_fused_sdpa(
+            is_apple10=True, is_swa=True, hd=256, seq_l=seq_l, dtype=mx.float16,
+            sdpa_supports_force_fused=True, macos_version=(26, 2),
+        )
+    # NEVER on Apple9 (M4 Pro), NEVER on D512, NEVER on other seq_l, NEVER on macOS < 26.2
+    assert not emb2_gpu.should_force_fused_sdpa(is_apple10=False, is_swa=True, hd=256, seq_l=512)
+    assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=False, hd=512, seq_l=512)
+    assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=True, hd=512, seq_l=512)
+    for bad_s in (64, 128, 192, 256, 320, 448, 640, 1024, 2048):
+        assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=True, hd=256, seq_l=bad_s)
+    assert not emb2_gpu.should_force_fused_sdpa(
+        is_apple10=True, is_swa=True, hd=256, seq_l=512, macos_version=(26, 1)
+    )
+    assert not emb2_gpu.should_force_fused_sdpa(
+        is_apple10=True, is_swa=True, hd=256, seq_l=512, sdpa_supports_force_fused=False
+    )
+
+    assert emb2_gpu.should_use_fused_mpp(m_tot=128, metal4=True, macos_version=(26, 0), dtype=mx.float16)
+    assert not emb2_gpu.should_use_fused_mpp(m_tot=128, metal4=True, macos_version=(26, 0), dtype=mx.bfloat16)
+    assert emb2_gpu.should_use_fused_mpp(m_tot=128, metal4=True, macos_version=(26, 1), dtype=mx.bfloat16)
+    assert not emb2_gpu.should_use_fused_mpp(m_tot=32, metal4=True, macos_version=(26, 6), dtype=mx.float16)
+    assert not emb2_gpu.should_use_fused_mpp(m_tot=128, metal4=False, macos_version=(26, 6), dtype=mx.float16)
+
+
+def test_seg_mean_pool_f32_direct_and_over_compiled_f32_precision(engine: FastEmbeddingGemma2) -> None:
+    """Finding #5: Direct FP32 segment mean-pool (no half4 truncation) and FP32 sum in _over_compiled."""
+    import mlx.core as mx
+    from fast_embeddinggemma_2 import gpu as emb2_gpu
+
+    src = Path(emb2_gpu.__file__).read_text(encoding="utf-8")
+    assert "*(device float4*)outp = acc / float(n_pos);" in src
+    assert "ho.astype(mx.float32)" in src
+    assert "msk_mx.astype(mx.float16)" not in src
+
+    # Test high-precision mean where half4 truncation would introduce ~5e-4 error
+    ho_np = np.full((3, 512), 1.0, dtype=np.float16)
+    ho_np[1, :] = np.float16(1.0009765625)  # 1 + 2^-10
+    ho_np[2, :] = np.float16(1.0)
+    pooled = emb2_gpu.mean_pool_segments(mx.array(ho_np), [0], [3])
+    mx.eval(pooled)
+    pooled_np = np.array(pooled)
+    assert pooled_np.dtype == np.float32
+    expected = ho_np.astype(np.float32).mean(axis=0, keepdims=True)
+    # Direct float4 output matches FP32 reference to ~1e-6 (would fail at ~2e-4 if truncated through half4)
+    assert np.allclose(pooled_np, expected, atol=1e-6, rtol=1e-6)
+
+    # Exercise 2048-token _over_compiled path cleanly
+    rng = np.random.default_rng(2048)
+    long_tok = [engine.tokenizer.bos_id] + rng.integers(100, 30000, size=2046).tolist() + [engine.tokenizer.eos_id]
+    v_2048 = engine.encode_corpus([long_tok], mode="gpu")
+    assert v_2048.shape == (1, 768) and np.all(np.isfinite(v_2048))
+    assert np.allclose(np.linalg.norm(v_2048, axis=1), 1.0, atol=1e-4)
+
+
+def test_coreml_error_propagation_and_mlcomputeplan(engine: FastEmbeddingGemma2) -> None:
+    """Findings #6 & #12: NSError propagation and MLComputePlan zero-CPU verification."""
+    if not engine.ane_available or engine._coreml is None:
+        pytest.skip("ANE unavailable")
+
+    plans = engine.inspect_ane_plans(warn_on_cpu_fallback=False)
+    assert len(plans) == len(engine.ane_handles)
+    for seq_len, counts in plans.items():
+        assert counts["ane_ops"] > 0, f"Expected ane_ops > 0 for S={seq_len}, got {counts}"
+        assert counts["cpu_ops"] == 0, f"Unexpected CPU fallback for S={seq_len}: {counts}"
+
+    # Loading nonexistent model must return NULL and record non-empty error string
+    bad_h = engine._coreml.emb2_pk_load_units(b"/nonexistent/emb2_missing.mlmodelc", 64, 1, 0)
+    assert not bad_h
+    assert len(engine._coreml.emb2_last_error().decode("utf-8")) > 0
+    assert engine._coreml.emb2_pk_wait_queue(None) < 0.0
+
+
+def test_cpu_sme_opt_in_bounds_topology_and_explicit_cpu_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding #8: CPU-SME is opt-in, bounded on small/medium batches & LLM co-exec, and topology-aware."""
+    from fast_embeddinggemma_2.engine import (
+        HETERO3_CPU_MIN_DOCS,
+        HETERO3_CPU_MIN_TOKS,
+        MAX_CPU_SME_THREADS,
+        _CPU_BUNDLES,
+        _allow_hetero3_cpu_worker,
+        _should_stop_hetero_cpu,
+        probe_cpu_topology,
+    )
+
+    assert MAX_CPU_SME_THREADS == 2
+    assert all(pd <= 2 for _, _, pd in _CPU_BUNDLES)
+    assert _should_stop_hetero_cpu(1.0, 10, 1000, eff_mode="hetero3")
+    assert not _should_stop_hetero_cpu(0.1, 10, 1000, eff_mode="hetero3")
+
+    monkeypatch.delenv("FAST_SILICON_LLM_COEXEC", raising=False)
+    assert not _allow_hetero3_cpu_worker(64, 8192, cpu_sme_available=True)
+    assert _allow_hetero3_cpu_worker(HETERO3_CPU_MIN_DOCS, 8192, cpu_sme_available=True)
+    assert _allow_hetero3_cpu_worker(32, HETERO3_CPU_MIN_TOKS, cpu_sme_available=True)
+    assert not _allow_hetero3_cpu_worker(1000, 200000, cpu_sme_available=True, llm_coexec=True)
+    monkeypatch.setenv("FAST_SILICON_LLM_COEXEC", "1")
+    assert not _allow_hetero3_cpu_worker(1000, 200000, cpu_sme_available=True)
+    monkeypatch.delenv("FAST_SILICON_LLM_COEXEC", raising=False)
+
+    topo = probe_cpu_topology()
+    assert topo["max_cpu_sme_threads"] == 2
+    assert isinstance(topo["has_efficiency_cores"], bool)
+    assert topo["perflevel0_name"]
+
+    # Explicit opt-in CPU-SME engine loads CPU bundles and passes parity on <=512 docs
+    paths = resolve_paths()
+    if paths.coreml_dylib.exists() and (paths.ane_models_dir / "emb2_cpu_s256_mix_w8.mlmodelc").exists():
+        with FastEmbeddingGemma2(warmup=False, enable_ane=False, enable_cpu_sme=True, default_mode="cpu") as cpu_eng:
+            assert cpu_eng.cpu_sme_available is True
+            assert cpu_eng._gpu is None
+            ref = np.load(FIXTURE_64)
+            lens = ref["lens"]
+            sub_4 = [ref["ids"][i, : int(lens[i])].tolist() for i in range(4)]
+            v_cpu = cpu_eng.encode_corpus(sub_4, mode="cpu")
+            assert v_cpu.shape == (4, 768) and np.all(np.isfinite(v_cpu))
+            assert float(np.min(np.sum(v_cpu * ref["v_f16"][:4], axis=1))) >= 0.9990
+            assert cpu_eng._gpu is None
+
+
+def test_ane_lazy_gpu_strict_query_and_wired_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding #7: ANE default_mode skips GPU init/warmup; strict ANE rejects >512; close() restores wired limit."""
+    import mlx.core as mx
+    from fast_embeddinggemma_2.engine import _apply_mlx_wired_limit, _restore_mlx_wired_limit
+
+    wired_calls: list[int] = []
+    monkeypatch.setattr(mx, "set_wired_limit", lambda val: (wired_calls.append(int(val)) or 54321))
+    prev = _apply_mlx_wired_limit()
+    assert prev == 54321 and len(wired_calls) == 1 and wired_calls[0] > 0
+    _restore_mlx_wired_limit(prev)
+    assert wired_calls[-1] == 54321
+
+    paths = resolve_paths()
+    if paths.coreml_dylib.exists() and paths.io_dylib.exists() and paths.ane_models_dir.exists():
+        with FastEmbeddingGemma2(default_mode="ane", warmup=True, verify_ane_plan=False) as ane_eng:
+            assert ane_eng._gpu is None
+            v = ane_eng.encode_texts("pure neural engine query", mode="ane")
+            assert v.shape == (768,) and np.all(np.isfinite(v))
+            assert ane_eng._gpu is None
+            # Strict mode="ane" refuses >512-token single text instead of silently invoking GPU
+            long_text = " ".join(["engineering telemetry"] * 400)
+            with pytest.raises(ValueError, match="Strict ANE mode"):
+                ane_eng.encode_texts(long_text, mode="ane")
+            assert ane_eng._gpu is None
+
+
+def test_paths_resolve_home_requires_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Monorepo checkouts with pyproject.toml + native/ but no artifacts/ must fall through."""
+    from fast_embeddinggemma_2.paths import resolve_home
+
+    monkeypatch.delenv("FAST_EMBEDDINGGEMMA2_HOME", raising=False)
+    monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
+
+    fake_pkg = tmp_path / "fast-silicon" / "packages" / "fast-embeddinggemma-2"
+    anchor = fake_pkg / "src" / "fast_embeddinggemma_2" / "paths.py"
+    anchor.parent.mkdir(parents=True)
+    anchor.write_text("# stub\n", encoding="utf-8")
+    (fake_pkg / "pyproject.toml").write_text("[project]\nname='fast-embeddinggemma-2'\n", encoding="utf-8")
+    (fake_pkg / "native").mkdir()
+
+    assert resolve_home(anchor_file=anchor) == (Path("~/.cache") / "fast-embeddinggemma-2").expanduser().resolve()
+
+    ar = tmp_path / "shared_artifacts"
+    (ar / "fast-embeddinggemma-2" / "artifacts").mkdir(parents=True)
+    monkeypatch.setenv("FAST_ARTIFACTS_ROOT", str(ar))
+    assert resolve_home(anchor_file=anchor) == (ar / "fast-embeddinggemma-2").resolve()
+
+    (fake_pkg / "artifacts").mkdir()
+    assert resolve_home(anchor_file=anchor) == fake_pkg.resolve()
+
+
+def test_cli_alignment_rank_metrics_and_outlier_replay(engine: FastEmbeddingGemma2) -> None:
+    """Findings #9 & #14: Aligned CLI modes/flags, rank verification, and hetero outlier replay."""
+    from fast_embeddinggemma_2.cli import _rank_metrics, _replay_hetero_outliers, build_parser
+
+    assert engine.default_mode == "hetero"
+    assert engine.cpu_sme_available is False
+
+    parser = build_parser()
+    ns_embed = parser.parse_args(["embed", "hello"])
+    assert ns_embed.mode == "hetero"
+    ns_h3 = parser.parse_args(["embed", "--mode", "hetero3", "hello"])
+    assert ns_h3.mode == "hetero3"
+    ns_bench = parser.parse_args(["bench", "--runs", "2", "--check-ps", "--document-prefix"])
+    assert ns_bench.runs == 2 and ns_bench.check_ps is True and ns_bench.document_prefix is True
+    ns_verify = parser.parse_args(["verify", "--strict"])
+    assert ns_verify.strict is True
+
+    ref = np.load(FIXTURE_64)
+    lens = ref["lens"]
+    sub_lists = [ref["ids"][i, : int(lens[i])].tolist() for i in range(len(lens))]
+    v_gpu = engine.encode_corpus(sub_lists, mode="gpu")
+    v_het = engine.encode_corpus(sub_lists, mode="hetero")
+    rm = _rank_metrics(v_gpu, ref["v_f16"], top_k=5)
+    assert rm["top1_match"] == 1.0 and rm["topk_overlap"] >= 0.95 and rm["spearman_mean"] >= 0.999
+
+    rep = _replay_hetero_outliers(engine, sub_lists, v_het, v_gpu)
+    assert rep["replay_fixed_gpu_min_cos"] >= 0.9998
+    assert len(rep["outlier_idxs"]) == 8
 

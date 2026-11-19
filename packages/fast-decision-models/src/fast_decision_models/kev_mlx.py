@@ -5,7 +5,9 @@ from __future__ import annotations
 from functools import partial
 import json
 import math
+import os
 from pathlib import Path
+import platform
 import re
 from typing import Any, Literal, Mapping, Sequence
 
@@ -13,8 +15,12 @@ from ._common import softmax_vec
 from .paths import resolve_kev_dir
 
 _KEV_SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
+_KEV_CACHE_LIMIT_BYTES = 512 << 20
+_KEV_CLEAR_CACHE_THRESHOLD_BYTES = 256 << 20
 
 # Metal kernel source for Qwen3.5 `GatedDeltaNet` (`Dk=128`, `Dv % 8 == 0` packed butterfly).
+# Reads prefix `state_in` indirectly via `owner_idx[b_idx]` (zero `N_br`-way FP32 GDN state cloning!)
+# and skips allocating/writing `acc_f32` during branch scoring when `WriteState == false`.
 # Uses `acc_f32` output name for the FP32 recurrent state accumulator per `fast-ir-guard` contract.
 _GDN_PACKED_BTREE_SRC = r"""
     constexpr int lanes_per_row = 4;
@@ -38,8 +44,9 @@ _GDN_PACKED_BTREE_SRC = r"""
     auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
     y += (b_idx * T * Hv + hv_idx) * Dv;
 
-    auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-    auto o_state = acc_f32 + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+    auto src_b = static_cast<uint>(owner_idx[b_idx]);
+    auto src_n = src_b * Hv + hv_idx;
+    auto i_state = state_in + (src_n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
 
     float state[values_per_lane];
     for (int i = 0; i < values_per_lane; ++i) {
@@ -97,8 +104,11 @@ _GDN_PACKED_BTREE_SRC = r"""
         beta_ += Hv;
     }
 
-    for (int i = 0; i < values_per_lane; ++i) {
-        o_state[i] = static_cast<StT>(state[i]);
+    if constexpr (WriteState) {
+        auto o_state = acc_f32 + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+        for (int i = 0; i < values_per_lane; ++i) {
+            o_state[i] = static_cast<StT>(state[i]);
+        }
     }
 """
 
@@ -121,11 +131,67 @@ def _kev_render(v: Any, indent: int = 0) -> str:
     return str(v)
 
 
+def _parse_ver_tuple(ver_str: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for tok in str(ver_str).split("."):
+        m = re.match(r"(\d+)", tok)
+        if not m:
+            break
+        parts.append(int(m.group(1)))
+    return tuple(parts)
+
+
+def _detect_apple10_d256_force_fused(mx: Any) -> bool:
+    """Return True only on Apple10 (M5+) + macOS >= 26.2 + MLX >= 0.32.2 supporting `force_fused` D256 SDPA."""
+    if os.environ.get("MLX_METAL_NO_NAX") == "1":
+        return False
+    try:
+        dev = mx.device_info()
+    except Exception:
+        return False
+    dev_name = str(dev.get("device_name", "")).lower()
+    arch = str(dev.get("architecture", "")).lower()
+    is_m5 = ("m5" in dev_name) or ("apple10" in arch) or ("g17" in arch)
+    if not is_m5:
+        return False
+    mac_ver = _parse_ver_tuple(platform.mac_ver()[0])
+    if mac_ver and mac_ver < (26, 2):
+        return False
+    mlx_ver = _parse_ver_tuple(getattr(mx, "__version__", "0.0.0"))
+    if mlx_ver < (0, 32, 2):
+        return False
+    doc = getattr(mx.fast.scaled_dot_product_attention, "__doc__", "") or ""
+    return "force_fused" in doc
+
+
+def _build_state_attn_mask(mx: Any, pad_lens: Sequence[int], s_max: int, act_dtype: Any) -> Any:
+    """Vectorized additive `(B, 1, s_max, s_max)` causal left-pad mask directly in `act_dtype` (zero bool SDPA mask)."""
+    if all(pl == 0 for pl in pad_lens):
+        return "causal"
+    pl = mx.array(list(pad_lens), dtype=mx.int32)[:, None, None, None]
+    q_pos = mx.arange(s_max, dtype=mx.int32)[None, None, :, None]
+    k_pos = mx.arange(s_max, dtype=mx.int32)[None, None, None, :]
+    allow = (q_pos >= pl) & (k_pos >= pl) & (k_pos <= q_pos)
+    return mx.where(allow, mx.array(0.0, dtype=act_dtype), mx.array(-1e9, dtype=act_dtype))
+
+
+def _build_branch_attn_mask(mx: Any, owner_pads: Sequence[int], s_max: int, max_br: int, act_dtype: Any) -> Any:
+    """Vectorized additive `(N_br, 1, max_br, s_max + max_br)` branch mask directly in `act_dtype`."""
+    if all(pl == 0 for pl in owner_pads):
+        return "causal"
+    pl = mx.array(list(owner_pads), dtype=mx.int32)[:, None, None, None]
+    q_pos = mx.arange(max_br, dtype=mx.int32)[None, None, :, None] + s_max
+    k_pos = mx.arange(s_max + max_br, dtype=mx.int32)[None, None, None, :]
+    allow = (k_pos >= pl) & (k_pos <= q_pos)
+    return mx.where(allow, mx.array(0.0, dtype=act_dtype), mx.array(-1e9, dtype=act_dtype))
+
+
 def _build_qwen35_backbone(
     text_cfg: Mapping[str, Any],
     weights: dict[str, Any],
     *,
     quant_cfg: Mapping[str, Any] | None = None,
+    use_d256_force_fused: bool | None = None,
 ) -> Any:
     """Build self-contained MLX `Qwen3_5TextModel` (`W8` quantized or `BF16`, batched left-pad ready)."""
     import mlx.core as mx
@@ -133,7 +199,7 @@ def _build_qwen35_backbone(
 
     gdn_packed_kernel = mx.fast.metal_kernel(
         name="kev_gated_delta_step_packed_btree",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        input_names=["q", "k", "v", "g", "beta", "state_in", "owner_idx", "T"],
         output_names=["y", "acc_f32"],
         source=_GDN_PACKED_BTREE_SRC,
     )
@@ -178,15 +244,25 @@ def _build_qwen35_backbone(
         [1.0 / (rope_theta ** (float(i) / float(rot_dims))) for i in range(0, rot_dims, 2)],
         dtype=mx.float32,
     )
+    allow_d256_force_fused = (
+        _detect_apple10_d256_force_fused(mx) if use_d256_force_fused is None else bool(use_d256_force_fused)
+    )
 
-    def _apply_partial_rope(x: Any, pos_2d: Any) -> Any:
+    @partial(mx.compile, shapeless=True)
+    def _precompute_partial_rope_trig(pos_2d: Any) -> tuple[Any, Any]:
         angles = (pos_2d.astype(mx.float32)[:, None, :, None]) * inv_freq[None, None, None, :]
-        cos_a = mx.cos(angles).astype(x.dtype)
-        sin_a = mx.sin(angles).astype(x.dtype)
+        return mx.cos(angles).astype(mx.bfloat16), mx.sin(angles).astype(mx.bfloat16)
+
+    @partial(mx.compile, shapeless=True)
+    def _fused_rot_pair(x0: Any, x1: Any, cos_a: Any, sin_a: Any) -> tuple[Any, Any]:
+        c = cos_a.astype(x0.dtype)
+        s = sin_a.astype(x0.dtype)
+        return x0 * c - x1 * s, x1 * c + x0 * s
+
+    def _apply_partial_rope_trig(x: Any, cos_a: Any, sin_a: Any) -> Any:
         x_rot, x_pass = mx.split(x, [rot_dims], axis=-1)
         x0, x1 = mx.split(x_rot, [half_rot], axis=-1)
-        y0 = x0 * cos_a - x1 * sin_a
-        y1 = x1 * cos_a + x0 * sin_a
+        y0, y1 = _fused_rot_pair(x0, x1, cos_a, sin_a)
         return mx.concatenate([y0, y1, x_pass], axis=-1)
 
     class _DeltaCache:
@@ -205,15 +281,40 @@ def _build_qwen35_backbone(
             self.values = values
             self.offset = offset
 
-        def update_and_fetch(self, k_new: Any, v_new: Any) -> tuple[Any, Any]:
+        def update_and_fetch(
+            self,
+            k_new: Any,
+            v_new: Any,
+            *,
+            owner_idx: Any | None = None,
+            owner_is_identity: bool = False,
+            write_state: bool = True,
+        ) -> tuple[Any, Any]:
             if self.keys is None:
-                self.keys = k_new
-                self.values = v_new
+                if write_state:
+                    self.keys = k_new
+                    self.values = v_new
+                    self.offset += int(k_new.shape[2])
+                return k_new, v_new
+
+            if owner_idx is None or owner_is_identity:
+                k_pre = self.keys
+                v_pre = self.values
+            elif int(self.keys.shape[0]) == 1:
+                b_cur = int(k_new.shape[0])
+                k_pre = mx.broadcast_to(self.keys, (b_cur, *self.keys.shape[1:]))
+                v_pre = mx.broadcast_to(self.values, (b_cur, *self.values.shape[1:]))
             else:
-                self.keys = mx.concatenate([self.keys, k_new], axis=2)
-                self.values = mx.concatenate([self.values, v_new], axis=2)
-            self.offset += int(k_new.shape[2])
-            return self.keys, self.values
+                k_pre = mx.take(self.keys, owner_idx, axis=0)
+                v_pre = mx.take(self.values, owner_idx, axis=0)
+
+            k_cat = mx.concatenate([k_pre, k_new], axis=2)
+            v_cat = mx.concatenate([v_pre, v_new], axis=2)
+            if write_state:
+                self.keys = k_cat
+                self.values = v_cat
+                self.offset += int(k_new.shape[2])
+            return k_cat, v_cat
 
         def select_rows(self, row_indices: Any) -> "_FullAttnCache":
             ks = mx.take(self.keys, row_indices, axis=0) if self.keys is not None else None
@@ -255,7 +356,16 @@ def _build_qwen35_backbone(
             self._inv_scale = head_k_dim**-0.5
             self._rms_eps = 1e-6 * (self._inv_scale**2)
 
-        def __call__(self, x: Any, cache: _DeltaCache, valid_token_scale: Any | None = None) -> Any:
+        def __call__(
+            self,
+            x: Any,
+            cache: _DeltaCache,
+            valid_token_scale: Any | None = None,
+            *,
+            owner_idx: Any | None = None,
+            owner_is_identity: bool = False,
+            write_state: bool = True,
+        ) -> Any:
             B, S, _ = x.shape
             qkv = self.in_proj_qkv(x)
             if valid_token_scale is not None:
@@ -264,13 +374,18 @@ def _build_qwen35_backbone(
             b = self.in_proj_b(x)
             a = self.in_proj_a(x)
 
-            conv_state = (
-                cache.conv_state
-                if cache.conv_state is not None
-                else mx.zeros((B, conv_k - 1, self.conv_dim), dtype=x.dtype)
-            )
+            if cache.conv_state is None:
+                conv_state = mx.zeros((B, conv_k - 1, self.conv_dim), dtype=x.dtype)
+            elif owner_idx is None or owner_is_identity:
+                conv_state = cache.conv_state
+            elif int(cache.conv_state.shape[0]) == 1:
+                conv_state = mx.broadcast_to(cache.conv_state, (B, *cache.conv_state.shape[1:]))
+            else:
+                conv_state = mx.take(cache.conv_state, owner_idx, axis=0)
+
             conv_in = mx.concatenate([conv_state, qkv], axis=1)
-            cache.conv_state = mx.contiguous(conv_in[:, -(conv_k - 1) :, :])
+            if write_state:
+                cache.conv_state = mx.contiguous(conv_in[:, -(conv_k - 1) :, :])
             conv_out = nn.silu(self.conv1d(conv_in))
 
             q_raw, k_raw, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -288,14 +403,16 @@ def _build_qwen35_backbone(
                 # Zeroing beta on left-pad slots keeps initial rec_state == 0.0 bit-identical to unpadded B=1.
                 beta = beta * valid_token_scale
             g = _fused_compute_g(self.A_log, a, self.dt_bias)
-            rec_state = (
-                cache.rec_state
-                if cache.rec_state is not None
-                else mx.zeros((B, num_v_heads, head_v_dim, head_k_dim), dtype=mx.float32)
-            )
+            if cache.rec_state is not None:
+                rec_state = cache.rec_state
+                eff_owner = owner_idx if owner_idx is not None else mx.arange(B, dtype=mx.int32)
+            else:
+                rec_state = mx.zeros((B, num_v_heads, head_v_dim, head_k_dim), dtype=mx.float32)
+                eff_owner = mx.arange(B, dtype=mx.int32)
             T = int(k.shape[1])
+            state_out_shape = (B, num_v_heads, head_v_dim, head_k_dim) if write_state else (1,)
             y, new_state = gdn_packed_kernel(
-                inputs=[q, k, v, g, beta, rec_state, T],
+                inputs=[q, k, v, g, beta, rec_state, eff_owner, T],
                 template=[
                     ("InT", q.dtype),
                     ("StT", mx.float32),
@@ -303,13 +420,15 @@ def _build_qwen35_backbone(
                     ("Dv", head_v_dim),
                     ("Hk", num_k_heads),
                     ("Hv", num_v_heads),
+                    ("WriteState", bool(write_state)),
                 ],
                 grid=(32, head_v_dim // 8, B * num_v_heads),
                 threadgroup=(32, 2, 1),
-                output_shapes=[(B, T, num_v_heads, head_v_dim), rec_state.shape],
+                output_shapes=[(B, T, num_v_heads, head_v_dim), state_out_shape],
                 output_dtypes=[q.dtype, mx.float32],
             )
-            cache.rec_state = new_state
+            if write_state:
+                cache.rec_state = new_state
             out = self.norm(y, z)
             return self.out_proj(out.reshape(B, S, -1))
 
@@ -330,7 +449,11 @@ def _build_qwen35_backbone(
             x: Any,
             cache: _FullAttnCache,
             attn_mask: Any = "causal",
-            pos_2d: Any | None = None,
+            rope_trig: tuple[Any, Any] | None = None,
+            *,
+            owner_idx: Any | None = None,
+            owner_is_identity: bool = False,
+            write_state: bool = True,
         ) -> Any:
             B, L, _ = x.shape
             qp = self.q_proj(x)
@@ -341,23 +464,49 @@ def _build_qwen35_backbone(
             queries = self.q_norm(queries).transpose(0, 2, 1, 3)
             keys = self.k_norm(keys).transpose(0, 2, 1, 3)
 
-            if pos_2d is not None:
-                queries = _apply_partial_rope(queries, pos_2d)
-                keys = _apply_partial_rope(keys, pos_2d)
+            if rope_trig is not None:
+                cos_a, sin_a = rope_trig
+                queries = _apply_partial_rope_trig(queries, cos_a, sin_a)
+                keys = _apply_partial_rope_trig(keys, cos_a, sin_a)
             else:
                 off = cache.offset
                 queries = self.rope(queries, offset=off)
                 keys = self.rope(keys, offset=off)
-            keys, values = cache.update_and_fetch(keys, values)
-
-            eff_mask = (None if L == 1 else "causal") if attn_mask == "causal" else attn_mask
-            out = mx.fast.scaled_dot_product_attention(
-                queries,
+            keys, values = cache.update_and_fetch(
                 keys,
                 values,
-                scale=self.scale,
-                mask=eff_mask,
+                owner_idx=owner_idx,
+                owner_is_identity=owner_is_identity,
+                write_state=write_state,
             )
+
+            eff_mask = (None if L == 1 else "causal") if attn_mask == "causal" else attn_mask
+            if allow_d256_force_fused and head_dim == 256 and 256 <= L < 1024:
+                try:
+                    out = mx.fast.scaled_dot_product_attention(
+                        queries,
+                        keys,
+                        values,
+                        scale=self.scale,
+                        mask=eff_mask,
+                        force_fused=True,
+                    )
+                except Exception:
+                    out = mx.fast.scaled_dot_product_attention(
+                        queries,
+                        keys,
+                        values,
+                        scale=self.scale,
+                        mask=eff_mask,
+                    )
+            else:
+                out = mx.fast.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask=eff_mask,
+                )
             out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
             return self.o_proj(out * mx.sigmoid(gate))
 
@@ -390,12 +539,30 @@ def _build_qwen35_backbone(
             *,
             valid_token_scale: Any | None = None,
             attn_mask: Any = "causal",
-            pos_2d: Any | None = None,
+            rope_trig: tuple[Any, Any] | None = None,
+            owner_idx: Any | None = None,
+            owner_is_identity: bool = False,
+            write_state: bool = True,
         ) -> Any:
             if self.is_linear:
-                h = x + self.linear_attn(self.input_layernorm(x), cache, valid_token_scale=valid_token_scale)
+                h = x + self.linear_attn(
+                    self.input_layernorm(x),
+                    cache,
+                    valid_token_scale=valid_token_scale,
+                    owner_idx=owner_idx,
+                    owner_is_identity=owner_is_identity,
+                    write_state=write_state,
+                )
             else:
-                h = x + self.self_attn(self.input_layernorm(x), cache, attn_mask=attn_mask, pos_2d=pos_2d)
+                h = x + self.self_attn(
+                    self.input_layernorm(x),
+                    cache,
+                    attn_mask=attn_mask,
+                    rope_trig=rope_trig,
+                    owner_idx=owner_idx,
+                    owner_is_identity=owner_is_identity,
+                    write_state=write_state,
+                )
             return h + self.mlp(self.post_attention_layernorm(h))
 
     class _Qwen35Backbone(nn.Module):
@@ -404,6 +571,7 @@ def _build_qwen35_backbone(
             self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
             self.layers = [_DecoderBlock(i) for i in range(num_layers)]
             self.norm = nn.RMSNorm(hidden_size, eps=rms_eps)
+            self.use_d256_force_fused = allow_d256_force_fused
 
         def make_cache(self) -> list[Any]:
             return [_DeltaCache() if blk.is_linear else _FullAttnCache() for blk in self.layers]
@@ -420,15 +588,22 @@ def _build_qwen35_backbone(
             valid_token_scale: Any | None = None,
             attn_mask: Any = "causal",
             pos_2d: Any | None = None,
+            owner_idx: Any | None = None,
+            owner_is_identity: bool = False,
+            write_state: bool = True,
         ) -> Any:
             h = self.embed_tokens(input_ids)
+            rope_trig = _precompute_partial_rope_trig(pos_2d) if pos_2d is not None else None
             for idx in range(len(self.layers)):
                 h = self.layers[idx](
                     h,
                     cache[idx],
                     valid_token_scale=valid_token_scale,
                     attn_mask=attn_mask,
-                    pos_2d=pos_2d,
+                    rope_trig=rope_trig,
+                    owner_idx=owner_idx,
+                    owner_is_identity=owner_is_identity,
+                    write_state=write_state,
                 )
             return self.norm(h)
 
@@ -457,6 +632,7 @@ class Kev08bMlxBackend:
         batch_docs: int = 8,
         max_state: int = 1024,
         max_branch: int = 2048,
+        max_branch_batch: int | None = None,
     ) -> None:
         import mlx.core as mx
         import numpy as np
@@ -468,6 +644,10 @@ class Kev08bMlxBackend:
         self.batch_docs = max(1, int(batch_docs))
         self.max_state = int(max_state)
         self.max_branch = int(max_branch)
+        self.mlx_enable_tf32 = os.environ.get("MLX_ENABLE_TF32", "1")
+        self._prev_cache_limit: int | None = None
+        self._prev_wired_limit: int | None = None
+        self._limits_restored = False
 
         w8_sf = self.kev_dir / "model_w8.safetensors"
         w8_meta = self.kev_dir / "kev_meta_w8.json"
@@ -494,17 +674,64 @@ class Kev08bMlxBackend:
         self.tok.no_truncation()
         self.tok.no_padding()
 
-        mx.set_cache_limit(1 << 30)
-        weights = mx.load(str(sf_p))
-        self.q_w = np.asarray(weights["pointer_head.q_weight"].astype(mx.float32))
-        self.q_b = np.asarray(weights["pointer_head.q_bias"].astype(mx.float32))
-        self.k_w = np.asarray(weights["pointer_head.k_weight"].astype(mx.float32))
-        self.k_b = np.asarray(weights["pointer_head.k_bias"].astype(mx.float32))
-        self.ptr_scale = 1.0 / math.sqrt(float(self.q_w.shape[0]))
+        host_mem_bytes = 0
+        try:
+            dev_info = mx.device_info()
+            host_mem_bytes = int(dev_info.get("memory_size", 0))
+            max_rec = int(dev_info.get("max_recommended_working_set_size", 0))
+            set_wired = getattr(mx, "set_wired_limit", None)
+            if callable(set_wired) and max_rec > 0:
+                wired_target = min(max_rec, int(host_mem_bytes * 0.72)) if 0 < host_mem_bytes <= (24 << 30) else max_rec
+                self._prev_wired_limit = int(set_wired(wired_target))
+        except Exception:
+            self._prev_wired_limit = None
 
-        self.backbone = _build_qwen35_backbone(meta["text_config"], weights, quant_cfg=self.quantization)
-        del weights
-        mx.clear_cache()
+        set_cache = getattr(mx, "set_cache_limit", None)
+        if callable(set_cache):
+            try:
+                self._prev_cache_limit = int(set_cache(_KEV_CACHE_LIMIT_BYTES))
+            except Exception:
+                self._prev_cache_limit = None
+
+        default_max_br = 16 if (0 < host_mem_bytes <= (24 << 30)) else 32
+        self.max_branch_batch = max(1, int(max_branch_batch or default_max_br))
+
+        try:
+            weights = mx.load(str(sf_p))
+            self.q_w = np.asarray(weights["pointer_head.q_weight"].astype(mx.float32))
+            self.q_b = np.asarray(weights["pointer_head.q_bias"].astype(mx.float32))
+            self.k_w = np.asarray(weights["pointer_head.k_weight"].astype(mx.float32))
+            self.k_b = np.asarray(weights["pointer_head.k_bias"].astype(mx.float32))
+            self.ptr_scale = 1.0 / math.sqrt(float(self.q_w.shape[0]))
+
+            self.backbone = _build_qwen35_backbone(meta["text_config"], weights, quant_cfg=self.quantization)
+            del weights
+            mx.clear_cache()
+        except Exception:
+            self._restore_mlx_limits()
+            raise
+
+    def _restore_mlx_limits(self) -> None:
+        if getattr(self, "_limits_restored", True):
+            return
+        self._limits_restored = True
+        mx = self._mx
+        if self._prev_wired_limit is not None:
+            set_wired = getattr(mx, "set_wired_limit", None)
+            if callable(set_wired):
+                try:
+                    set_wired(self._prev_wired_limit)
+                except Exception:
+                    pass
+            self._prev_wired_limit = None
+        if self._prev_cache_limit is not None:
+            set_cache = getattr(mx, "set_cache_limit", None)
+            if callable(set_cache):
+                try:
+                    set_cache(self._prev_cache_limit)
+                except Exception:
+                    pass
+            self._prev_cache_limit = None
 
     def __enter__(self) -> "Kev08bMlxBackend":
         return self
@@ -571,6 +798,16 @@ class Kev08bMlxBackend:
         probs = softmax_vec(raw_z, temp)
         return probs, raw_z
 
+    def _maybe_clear_wave_cache(self) -> None:
+        mx = self._mx
+        get_cache_mem = getattr(mx, "get_cache_memory", None)
+        if callable(get_cache_mem):
+            try:
+                if int(get_cache_mem()) > _KEV_CLEAR_CACHE_THRESHOLD_BYTES:
+                    mx.clear_cache()
+            except Exception:
+                pass
+
     def _run_batched_pointer(
         self,
         items: Sequence[tuple[Any, Sequence[Mapping[str, Any]]]],
@@ -578,12 +815,13 @@ class Kev08bMlxBackend:
         batch_docs: int | None = None,
         temperature: float | None = None,
     ) -> list[list[tuple[list[float], list[float]]]]:
-        """Batch `B` document states via left-padded hybrid prefill + parallel branch pass."""
+        """Batch `B` document states via left-padded hybrid prefill + zero-GDN-clone branch pass."""
         if not items:
             return []
         mx = self._mx
         np = self._np
         eff_b = max(1, int(batch_docs or self.batch_docs))
+        br_chunk_lim = max(eff_b, self.max_branch_batch)
 
         encoded_all = [self.encode_questions(st, qs) for st, qs in items]
         order = sorted(range(len(items)), key=lambda idx: len(encoded_all[idx][0]))
@@ -600,54 +838,71 @@ class Kev08bMlxBackend:
                     out_by_orig[orig_0] = []
                     continue
                 cache = self.backbone.make_cache()
-                h_st = self.backbone(mx.array([state_ids], dtype=mx.int32), cache)
+                h_st = self.backbone(mx.array([state_ids], dtype=mx.int32), cache, write_state=True)
                 mx.eval(h_st)
 
-                br_cache = (
-                    cache
-                    if len(rows) == 1
-                    else self.backbone.select_cache_rows(cache, mx.zeros((len(rows),), dtype=mx.int32))
-                )
-                max_l = max(len(r["ids"]) for r in rows)
-                ids_mx = mx.array(
-                    [r["ids"] + [self.pad_id] * (max_l - len(r["ids"])) for r in rows],
-                    dtype=mx.int32,
-                )
-                h_mx = self.backbone(ids_mx, br_cache)
-                mx.eval(h_mx)
-                h_np = np.asarray(h_mx.astype(mx.float32))
-                out_by_orig[orig_0] = [
-                    self._pointer_logits_and_probs(h_np[ri], r["decide"], r["opts"], temperature=temperature)
-                    for ri, r in enumerate(rows)
-                ]
+                doc_outs: list[tuple[list[float], list[float]]] = []
+                for c0 in range(0, len(rows), br_chunk_lim):
+                    sub_rows = rows[c0 : c0 + br_chunk_lim]
+                    n_sub = len(sub_rows)
+                    max_l = max(len(r["ids"]) for r in sub_rows)
+                    ids_mx = mx.array(
+                        [r["ids"] + [self.pad_id] * (max_l - len(r["ids"])) for r in sub_rows],
+                        dtype=mx.int32,
+                    )
+                    owner_mx = mx.zeros((n_sub,), dtype=mx.int32)
+                    h_mx = self.backbone(
+                        ids_mx,
+                        cache,
+                        owner_idx=owner_mx,
+                        owner_is_identity=(n_sub == 1),
+                        write_state=False,
+                    )
+                    mx.eval(h_mx)
+                    h_np = np.asarray(h_mx.astype(mx.float32))
+                    for ri, r in enumerate(sub_rows):
+                        doc_outs.append(
+                            self._pointer_logits_and_probs(h_np[ri], r["decide"], r["opts"], temperature=temperature)
+                        )
+                out_by_orig[orig_0] = doc_outs
+                del cache, h_st
+                self._maybe_clear_wave_cache()
                 continue
 
             state_lists = [encoded_all[idx][0] for idx in wave_orig]
             s_lens = [len(s) for s in state_lists]
             s_max = max(s_lens)
             pad_lens = [s_max - ln for ln in s_lens]
+            all_unpadded = all(pl == 0 for pl in pad_lens)
 
             st_np = np.full((B, s_max), self.pad_id, dtype=np.int32)
-            valid_np = np.zeros((B, s_max, 1), dtype=np.float32)
-            pos_st_np = np.zeros((B, s_max), dtype=np.int32)
-            mask_st_np = np.full((B, 1, s_max, s_max), -1e9, dtype=np.float32)
-
             for b_i in range(B):
                 pl = pad_lens[b_i]
-                ln = s_lens[b_i]
                 st_np[b_i, pl:] = state_lists[b_i]
-                valid_np[b_i, pl:, 0] = 1.0
-                pos_st_np[b_i, pl:] = np.arange(ln, dtype=np.int32)
-                for q_t in range(pl, s_max):
-                    mask_st_np[b_i, 0, q_t, pl : q_t + 1] = 0.0
+
+            if all_unpadded:
+                valid_scale_mx = None
+                pos_st_mx = None
+                mask_st_mx: Any = "causal"
+            else:
+                pl_mx = mx.array(pad_lens, dtype=mx.int32)[:, None]
+                seq_pos = mx.arange(s_max, dtype=mx.int32)[None, :]
+                valid_scale_mx = mx.where(
+                    seq_pos >= pl_mx,
+                    mx.array(1.0, dtype=mx.bfloat16),
+                    mx.array(0.0, dtype=mx.bfloat16),
+                )[:, :, None]
+                pos_st_mx = mx.maximum(seq_pos - pl_mx, 0)
+                mask_st_mx = _build_state_attn_mask(mx, pad_lens, s_max, mx.bfloat16)
 
             cache = self.backbone.make_cache()
             h_st = self.backbone(
                 mx.array(st_np, dtype=mx.int32),
                 cache,
-                valid_token_scale=mx.array(valid_np).astype(mx.bfloat16),
-                attn_mask=mx.array(mask_st_np).astype(mx.bfloat16),
-                pos_2d=mx.array(pos_st_np, dtype=mx.int32),
+                valid_token_scale=valid_scale_mx,
+                attn_mask=mask_st_mx,
+                pos_2d=pos_st_mx,
+                write_state=True,
             )
             mx.eval(h_st)
 
@@ -662,42 +917,61 @@ class Kev08bMlxBackend:
                 doc_slices.append((st_idx, len(flat_rows)))
 
             if not flat_rows:
+                del cache, h_st
+                self._maybe_clear_wave_cache()
                 continue
 
             N_br = len(flat_rows)
-            max_br = max(len(r["ids"]) for r in flat_rows)
-            br_np = np.full((N_br, max_br), self.pad_id, dtype=np.int32)
-            pos_br_np = np.zeros((N_br, max_br), dtype=np.int32)
-            mask_br_np = np.full((N_br, 1, max_br, s_max + max_br), -1e9, dtype=np.float32)
+            flat_outs: list[tuple[list[float], list[float]]] = []
+            for c0 in range(0, N_br, br_chunk_lim):
+                c1 = min(N_br, c0 + br_chunk_lim)
+                sub_rows = flat_rows[c0:c1]
+                sub_owner = owner_b[c0:c1]
+                n_sub = len(sub_rows)
+                max_br = max(len(r["ids"]) for r in sub_rows)
+                br_np = np.full((n_sub, max_br), self.pad_id, dtype=np.int32)
+                for r_i, r in enumerate(sub_rows):
+                    bl = len(r["ids"])
+                    br_np[r_i, :bl] = r["ids"]
 
-            for r_i, r in enumerate(flat_rows):
-                b_i = owner_b[r_i]
-                pl = pad_lens[b_i]
-                sl = s_lens[b_i]
-                bl = len(r["ids"])
-                br_np[r_i, :bl] = r["ids"]
-                pos_br_np[r_i] = sl + np.arange(max_br, dtype=np.int32)
-                for q_t in range(max_br):
-                    mask_br_np[r_i, 0, q_t, pl : s_max + q_t + 1] = 0.0
+                sub_pads = [pad_lens[b_i] for b_i in sub_owner]
+                sub_slens = [s_lens[b_i] for b_i in sub_owner]
+                sub_unpadded = all(pl == 0 for pl in sub_pads)
+                if sub_unpadded:
+                    pos_br_mx = None
+                    mask_br_mx: Any = "causal"
+                else:
+                    pos_br_mx = (
+                        mx.array(sub_slens, dtype=mx.int32)[:, None]
+                        + mx.arange(max_br, dtype=mx.int32)[None, :]
+                    )
+                    mask_br_mx = _build_branch_attn_mask(mx, sub_pads, s_max, max_br, mx.bfloat16)
 
-            br_cache = self.backbone.select_cache_rows(cache, mx.array(owner_b, dtype=mx.int32))
-            h_br = self.backbone(
-                mx.array(br_np, dtype=mx.int32),
-                br_cache,
-                valid_token_scale=None,
-                attn_mask=mx.array(mask_br_np).astype(mx.bfloat16),
-                pos_2d=mx.array(pos_br_np, dtype=mx.int32),
-            )
-            mx.eval(h_br)
-            h_br_np = np.asarray(h_br.astype(mx.float32))
+                owner_is_identity = (n_sub == B) and (sub_owner == list(range(B)))
+                owner_mx = mx.array(sub_owner, dtype=mx.int32)
+                h_br = self.backbone(
+                    mx.array(br_np, dtype=mx.int32),
+                    cache,
+                    valid_token_scale=None,
+                    attn_mask=mask_br_mx,
+                    pos_2d=pos_br_mx,
+                    owner_idx=owner_mx,
+                    owner_is_identity=owner_is_identity,
+                    write_state=False,
+                )
+                mx.eval(h_br)
+                h_br_np = np.asarray(h_br.astype(mx.float32))
+                for ri, r in enumerate(sub_rows):
+                    flat_outs.append(
+                        self._pointer_logits_and_probs(h_br_np[ri], r["decide"], r["opts"], temperature=temperature)
+                    )
 
-            flat_outs = [
-                self._pointer_logits_and_probs(h_br_np[ri], r["decide"], r["opts"], temperature=temperature)
-                for ri, r in enumerate(flat_rows)
-            ]
             for b_i, orig_i in enumerate(wave_orig):
                 lo, hi = doc_slices[b_i]
                 out_by_orig[orig_i] = flat_outs[lo:hi]
+
+            del cache, h_st
+            self._maybe_clear_wave_cache()
 
         return out_by_orig
 
@@ -729,9 +1003,15 @@ class Kev08bMlxBackend:
         ]
 
     def close(self) -> None:
-        """Release model weights and clear the MLX buffer cache."""
+        """Release model weights, restore MLX memory/cache limits, and clear the MLX buffer cache."""
         self.backbone = None
+        self._restore_mlx_limits()
         self._mx.clear_cache()
 
 
-__all__ = ["Kev08bMlxBackend"]
+__all__ = [
+    "Kev08bMlxBackend",
+    "_build_branch_attn_mask",
+    "_build_state_attn_mask",
+    "_detect_apple10_d256_force_fused",
+]

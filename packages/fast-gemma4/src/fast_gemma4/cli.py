@@ -20,11 +20,13 @@ from .server import FastGemma4Server
 
 
 def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
+    ane_var = getattr(args, "ane_variant", "fp16")
     return FastGemma4Engine(
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
         default_mode=getattr(args, "mode", "auto"),
-        ane_variant=getattr(args, "ane_variant", "fp16"),
+        ane_variant=ane_var,
+        ane_ring_variant=ane_var,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
         mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
         kv_i8=not getattr(args, "no_kv_i8", False),
@@ -315,6 +317,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         model_dir=getattr(args, "model_dir", None),
         default_mode="auto",
         ane_variant=args.ane_variant,
+        ane_ring_variant=args.ane_variant,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
         mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
         kv_i8=not getattr(args, "no_kv_i8", False),
@@ -391,7 +394,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                 mode="hetero",
                 speculative=False,
                 batch_size=b_wave,
-                use_ane_ring=("auto" if getattr(args, "ane_variant", "fp16") == "w8" else False),
+                use_ane_ring="auto",
             )
             print(
                 f"[Concurrent ANE+GPU {args.waves}xB={b_wave}] JSON={res_het.stats['valid_json_count']}/{n_tot} "
@@ -413,7 +416,7 @@ def _add_model_args(subparser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gemma4", description="Apple Silicon M4 Pro fast-gemma4 CLI")
+    p = argparse.ArgumentParser(prog="gemma4", description="Apple Silicon (M4 / M5+) fast-gemma4 CLI (E2B / E4B)")
     p.add_argument("--home", default=None, help="Override FAST_GEMMA4_HOME directory")
     sub = p.add_subparsers(dest="cmd", required=True)
 

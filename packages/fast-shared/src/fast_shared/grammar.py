@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -115,7 +116,9 @@ def sample_unconstrained(
     rng: np.random.Generator | None = None,
 ) -> int:
     if temperature <= 0.0:
-        return int(new_to_old[argmax_idx])
+        if 0 <= argmax_idx < len(new_to_old):
+            return int(new_to_old[argmax_idx])
+        return int(new_to_old[int(np.argmax(logits_1d))])
     return _sample_from_logits(logits_1d, new_to_old, temperature=temperature, top_p=top_p, rng=rng)
 
 
@@ -130,7 +133,7 @@ def _import_llguidance():
 
 
 class GrammarHelper:
-    """Fast pruned-vocab `llguidance` matcher with zero-allocation bitmask mapping."""
+    """Thread-safe pruned-vocab `llguidance` matcher with zero-allocation bitmask mapping."""
 
     def __init__(
         self,
@@ -164,6 +167,7 @@ class GrammarHelper:
         self.k_word = self.new_to_old >> 5
         self.k_bit = self.new_to_old & 31
         n_words = (int(self.ltok.vocab_size) + 31) // 32
+        self._mask_lock = threading.Lock()
         self._mask_buf = np.empty(n_words, dtype=np.uint32)
         self._mask_ptr = int(self._mask_buf.ctypes.data)
         self._mask_nbytes = int(self._mask_buf.nbytes)
@@ -187,19 +191,33 @@ class GrammarHelper:
         fallback_to_full_vocab: bool = False,
         full_logits_1d: np.ndarray | Callable[[], np.ndarray] | None = None,
     ) -> tuple[int, bool]:
+        vocab_sz = int(self.ltok.vocab_size)
         if temperature <= 0.0:
-            orig_id = int(self.new_to_old[argmax_idx])
-            if matcher.validate_tokens([orig_id]):
-                return orig_id, False
-        matcher.unsafe_compute_mask_ptr(self._mask_ptr, self._mask_nbytes)
-        allowed = ((self._mask_buf[self.k_word] >> self.k_bit) & 1) != 0
-        if not np.any(allowed):
-            if fallback_to_full_vocab:
-                vocab_sz = int(self.ltok.vocab_size)
+            if 0 <= argmax_idx < len(self.new_to_old):
+                orig_id = int(self.new_to_old[argmax_idx])
+                if matcher.validate_tokens([orig_id]):
+                    return orig_id, False
+            elif fallback_to_full_vocab and 0 <= argmax_idx < vocab_sz:
+                if matcher.validate_tokens([int(argmax_idx)]):
+                    return int(argmax_idx), False
+
+        # Protect shared `_mask_buf` across concurrent threads; copy bit slices before releasing lock.
+        with self._mask_lock:
+            matcher.unsafe_compute_mask_ptr(self._mask_ptr, self._mask_nbytes)
+            allowed = ((self._mask_buf[self.k_word] >> self.k_bit) & 1) != 0
+            any_allowed = bool(np.any(allowed))
+            valid_ids: np.ndarray | None = None
+            argmax_full_allowed: bool | None = None
+            if not any_allowed and fallback_to_full_vocab:
                 bit_shifts = np.arange(32, dtype=np.uint32)
                 valid_mask = ((self._mask_buf[:, None] >> bit_shifts) & 1).ravel()[:vocab_sz] != 0
                 valid_ids = np.flatnonzero(valid_mask).astype(np.int32)
-                if len(valid_ids) > 0:
+            elif any_allowed and not (0 <= argmax_idx < len(allowed)) and 0 <= argmax_idx < vocab_sz:
+                argmax_full_allowed = bool((self._mask_buf[argmax_idx >> 5] >> (argmax_idx & 31)) & 1)
+
+        if not any_allowed:
+            if fallback_to_full_vocab:
+                if valid_ids is not None and len(valid_ids) > 0:
                     full_arr: np.ndarray | None = None
                     if full_logits_1d is not None:
                         full_arr = np.asarray(
@@ -234,8 +252,8 @@ class GrammarHelper:
                         "requires `full_logits_1d` (or unpruned `logits_1d`) to score full-vocab candidates."
                     )
             return self.eos_token_id, True
+
         logits_arr = logits_1d() if callable(logits_1d) else logits_1d
-        vocab_sz = int(self.ltok.vocab_size)
         pruned_logits = (
             logits_arr[self.new_to_old]
             if len(logits_arr) >= vocab_sz and len(self.new_to_old) < len(logits_arr)
@@ -243,17 +261,17 @@ class GrammarHelper:
         )
         if 0 <= argmax_idx < len(allowed):
             was_masked = not bool(allowed[argmax_idx])
-        elif len(logits_arr) >= vocab_sz and 0 <= argmax_idx < vocab_sz:
-            was_masked = not bool((self._mask_buf[argmax_idx >> 5] >> (argmax_idx & 31)) & 1)
+        elif len(logits_arr) >= vocab_sz and argmax_full_allowed is not None:
+            was_masked = not argmax_full_allowed
         else:
             was_masked = not bool(allowed[int(np.argmax(pruned_logits))])
         masked = np.where(allowed, pruned_logits, -1e9)
         if temperature <= 0.0:
             best_j = int(np.argmax(masked))
-            return int(self.new_to_old[best_j]), True
+            return int(self.new_to_old[best_j]), bool(was_masked)
         return (
             _sample_from_logits(masked, self.new_to_old, temperature=temperature, top_p=top_p, rng=rng),
-            was_masked,
+            bool(was_masked),
         )
 
     def validate_token_sequence(self, full_ids: Sequence[int]) -> bool:

@@ -1,10 +1,28 @@
+# Native C++/ObjC++ build for fast-pplx (Accelerate/NEON + CoreML staged ANE runner).
+#
+# Deployment & architecture notes:
+# - Default `-mcpu=apple-m4` is safe across M4 (Apple9) and M5+ (Apple10+) Macs.
+# - Never pass blind `-mcpu=apple-m5`: Apple Clang 21 enables `+specres2` even though
+#   `FEAT_SPECRES`/`FEAT_SPECRES2` report 0 at runtime (guarded below with `+nospecres2`).
+# - For MLX source builds targeting M5 NAX, set `CMAKE_OSX_DEPLOYMENT_TARGET>=26.2`
+#   to prevent compiling `MLX_METAL_NO_NAX`.
+# - Optional macOS 27.0+ Core AI builds should gate explicitly on `USE_OS_COREAI=1`
+#   and `MACOSX_MIN_VERSION>=27.0`.
+
 CXX := clang++
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -Wno-unused-parameter -fPIC -DACCELERATE_NEW_LAPACK
+PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
+MACOSX_MIN_VERSION ?= 15.0
+TARGET_ARCH ?= arm64
+TARGET_CPU ?= apple-m4
+CPU_FLAGS := $(if $(filter apple-m5,$(TARGET_CPU)),-mcpu=apple-m5+nospecres2,$(if $(TARGET_CPU),-mcpu=$(TARGET_CPU),))
+
+CXXFLAGS := -std=c++17 -O3 -arch $(TARGET_ARCH) -mmacosx-version-min=$(MACOSX_MIN_VERSION) $(CPU_FLAGS) \
+  -Wall -Wextra -Wno-unused-parameter -fPIC -DACCELERATE_NEW_LAPACK
 SHARED_INC := $(shell \
   if [ -d ../fast-shared/src/fast_shared/include ]; then \
     echo ../fast-shared/src/fast_shared/include; \
   else \
-    .venv/bin/python -c "import fast_shared, pathlib; print(pathlib.Path(fast_shared.__file__).resolve().parent / 'include')" 2>/dev/null || \
+    $(PYTHON) -c "import fast_shared, pathlib; print(pathlib.Path(fast_shared.__file__).resolve().parent / 'include')" 2>/dev/null || \
     python3 -c "import fast_shared, pathlib; print(pathlib.Path(fast_shared.__file__).resolve().parent / 'include')"; \
   fi)
 OBJCXX_FLAGS := -ObjC++ -fobjc-arc -I$(SHARED_INC)

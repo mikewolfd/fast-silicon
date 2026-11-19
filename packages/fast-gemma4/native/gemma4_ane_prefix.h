@@ -36,6 +36,18 @@ int gemma4_px_is_zero_copy(void* handle);
 // Returns the number of allocated output IOSurface ring slots on handle.
 int gemma4_px_out_ring_size(void* handle);
 
+// Query runtime tensor dimensions inferred from the loaded CoreML .mlmodelc bundle (supports E2B and E4B).
+// Returns 0 on success, -1 on NULL handle. Any out_* pointer may be NULL.
+int gemma4_px_get_dims(
+    void* handle,
+    int* out_H,
+    int* out_C_pli,
+    int* out_n_swa,
+    int* out_n_full_past,
+    int* out_n_full_out,
+    int* out_n_kv
+);
+
 // Free handle and associated CoreML / IOSurface / Metal resources.
 void gemma4_px_free(void* handle);
 

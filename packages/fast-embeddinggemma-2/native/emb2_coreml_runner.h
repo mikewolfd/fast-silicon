@@ -8,6 +8,18 @@ extern "C" {
 // Inspect MLComputePlan placement (ANE / GPU / CPU op counts) via stdout.
 void emb2_inspect_plan(const char* mlmodelc_path, int compute_mode);
 
+// Query MLComputePlan op counts programmatically. Returns 0 on success, < 0 on error.
+int emb2_get_plan_counts(
+    const char* mlmodelc_path,
+    int compute_mode,
+    int* out_ane_ops,
+    int* out_gpu_ops,
+    int* out_cpu_ops
+);
+
+// Retrieve last recorded CoreML error description (empty string if none).
+const char* emb2_last_error(void);
+
 // Load a packed CoreML bundle for sequence length S with pipe_depth async prediction slots.
 // compute_mode: 0 = CPUAndNeuralEngine (ANE), 1 = CPUOnly (AMX/SME), 2 = All.
 void* emb2_pk_load_units(const char* mlmodelc_path, int S, int pipe_depth, int compute_mode);

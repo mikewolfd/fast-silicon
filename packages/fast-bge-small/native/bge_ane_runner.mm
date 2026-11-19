@@ -3,11 +3,14 @@
 #include <Accelerate/Accelerate.h>
 #include <arm_neon.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "bge_ane_runner.h"
@@ -19,6 +22,54 @@ static int g_vocab_size = 0;
 static int g_max_pos = 0;
 static std::vector<uint16_t> g_wt0;
 static std::vector<uint16_t> g_pos;
+static std::mutex g_err_mu;
+static std::string g_last_err;
+
+static void record_ane_error(const char* ctx, NSError* err, const char* fallback_msg = nullptr) {
+    std::string msg = ctx ? std::string(ctx) : std::string("bge_ane");
+    msg += ": ";
+    if (err != nil) {
+        const char* desc = err.localizedDescription ? err.localizedDescription.UTF8String : "unknown NSError";
+        msg += desc ? desc : "unknown NSError";
+    } else if (fallback_msg) {
+        msg += fallback_msg;
+    } else {
+        msg += "CoreML prediction returned nil";
+    }
+    fprintf(stderr, "[bge_ane_runner] %s\n", msg.c_str());
+    std::lock_guard<std::mutex> lk(g_err_mu);
+    g_last_err = std::move(msg);
+}
+
+static void clear_ane_error() {
+    std::lock_guard<std::mutex> lk(g_err_mu);
+    g_last_err.clear();
+}
+
+static inline uint16_t fp16_bits(float v) {
+    float16_t h = static_cast<float16_t>(v);
+    uint16_t bits = 0;
+    memcpy(&bits, &h, sizeof(bits));
+    return bits;
+}
+
+// Fill a non-constant finite embedding + valid first-position attention mask (0.0h at pos 0,
+// -10000.0h elsewhere) so LayerNorm never sees var==0 and softmax never sees an all-masked row.
+static void fill_valid_dummy_doc_fp16(int S, uint16_t* __restrict__ dst_emb, uint16_t* __restrict__ dst_mask) {
+    const uint16_t pos_half = fp16_bits(0.5f);
+    const uint16_t neg_half = fp16_bits(-0.5f);
+    for (int c = 0; c < 384; ++c) {
+        const uint16_t val = (c & 1) ? neg_half : pos_half;
+        uint16_t* row = dst_emb + static_cast<size_t>(c) * S;
+        std::fill_n(row, S, val);
+    }
+    const uint16_t mask_zero = 0x0000;
+    const uint16_t mask_pad = fp16_bits(-10000.0f);
+    if (S > 0) {
+        dst_mask[0] = mask_zero;
+        for (int s = 1; s < S; ++s) dst_mask[s] = mask_pad;
+    }
+}
 
 struct ANEBucket {
     MLModel* model;
@@ -120,11 +171,10 @@ static inline void fill_emb_doc_fp16(
     }
 
     const uint16_t mask_zero = 0x0000;
-    float16_t m_neg = static_cast<float16_t>(-10000.0f);
-    uint16_t mask_pad;
-    memcpy(&mask_pad, &m_neg, 2);
-    for (int s = 0; s < sl; ++s) dst_mask[s] = mask_zero;
-    for (int s = sl; s < S; ++s) dst_mask[s] = mask_pad;
+    const uint16_t mask_pad = fp16_bits(-10000.0f);
+    int active = (sl > 0) ? sl : 1;
+    for (int s = 0; s < active && s < S; ++s) dst_mask[s] = mask_zero;
+    for (int s = active; s < S; ++s) dst_mask[s] = mask_pad;
 }
 
 static inline void l2_normalize_row(const float* src, float* dst) {
@@ -162,6 +212,11 @@ static MLComputeUnits resolve_compute_units(int compute_mode) {
     return MLComputeUnitsAll;
 }
 
+extern "C" const char* bge_ane_last_error(void) {
+    std::lock_guard<std::mutex> lk(g_err_mu);
+    return g_last_err.c_str();
+}
+
 extern "C" int bge_ane_init_tables(const uint16_t* wt0_fp16, int vocab_size, const uint16_t* pos_fp16, int max_pos) {
     if (!wt0_fp16 || !pos_fp16 || vocab_size <= 0 || max_pos <= 0) return -1;
     g_vocab_size = vocab_size;
@@ -171,16 +226,29 @@ extern "C" int bge_ane_init_tables(const uint16_t* wt0_fp16, int vocab_size, con
     return 0;
 }
 
-extern "C" void bge_ane_inspect_plan(const char* mlmodelc_path, int compute_mode) {
+extern "C" int bge_ane_get_plan_counts(
+    const char* mlmodelc_path,
+    int compute_mode,
+    int* out_ane_ops,
+    int* out_gpu_ops,
+    int* out_cpu_ops
+) {
     @autoreleasepool {
+        if (!mlmodelc_path) {
+            record_ane_error("bge_ane_get_plan_counts", nil, "null mlmodelc_path");
+            return -1;
+        }
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:mlmodelc_path]];
         MLModelConfiguration* cfg = [MLModelConfiguration new];
         cfg.computeUnits = resolve_compute_units(compute_mode);
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         __block int ane_ops = 0, gpu_ops = 0, cpu_ops = 0;
+        __block int status = 0;
         [MLComputePlan loadContentsOfURL:url configuration:cfg completionHandler:^(MLComputePlan* plan, NSError* err) {
-            (void)err;
-            if (plan && plan.modelStructure.program) {
+            if (err != nil || !plan) {
+                record_ane_error("MLComputePlan", err, "plan load returned nil");
+                status = -2;
+            } else if (plan.modelStructure.program) {
                 auto* fn = plan.modelStructure.program.functions[@"main"];
                 for (MLModelStructureProgramOperation* op in fn.block.operations) {
                     MLComputePlanDeviceUsage* u = [plan computeDeviceUsageForMLProgramOperation:op];
@@ -193,22 +261,37 @@ extern "C" void bge_ane_inspect_plan(const char* mlmodelc_path, int compute_mode
             dispatch_semaphore_signal(sem);
         }];
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        if (out_ane_ops) *out_ane_ops = ane_ops;
+        if (out_gpu_ops) *out_gpu_ops = gpu_ops;
+        if (out_cpu_ops) *out_cpu_ops = cpu_ops;
+        return status;
+    }
+}
+
+extern "C" void bge_ane_inspect_plan(const char* mlmodelc_path, int compute_mode) {
+    int ane_ops = 0, gpu_ops = 0, cpu_ops = 0;
+    int rc = bge_ane_get_plan_counts(mlmodelc_path, compute_mode, &ane_ops, &gpu_ops, &cpu_ops);
+    if (rc == 0) {
         printf("[ANE Plan mode=%d] %s -> ANE=%d GPU=%d CPU=%d\n", compute_mode, mlmodelc_path, ane_ops, gpu_ops, cpu_ops);
+    } else {
+        fprintf(stderr, "[ANE Plan mode=%d] %s -> FAILED (rc=%d): %s\n", compute_mode, mlmodelc_path, rc, bge_ane_last_error());
     }
 }
 
 extern "C" int bge_ane_load_bucket(const char* mlmodelc_path, int B, int S, int n_slots, int compute_mode) {
     @autoreleasepool {
         if (!mlmodelc_path || B <= 0 || S <= 0 || (S % 8) != 0 || S > 512 || n_slots <= 0) {
+            record_ane_error("bge_ane_load_bucket", nil, "invalid bucket parameters");
             return -3;
         }
+        clear_ane_error();
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:mlmodelc_path]];
         MLModelConfiguration* cfg = [MLModelConfiguration new];
         cfg.computeUnits = resolve_compute_units(compute_mode);
         NSError* err = nil;
         MLModel* model = [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
         if (!model || err) {
-            fprintf(stderr, "Failed to load %s: %s\n", mlmodelc_path, err ? err.localizedDescription.UTF8String : "null");
+            record_ane_error("bge_ane_load_bucket(load)", err, mlmodelc_path);
             return -1;
         }
         ANEBucket* bk = new ANEBucket();
@@ -219,11 +302,31 @@ extern "C" int bge_ane_load_bucket(const char* mlmodelc_path, int B, int S, int 
         for (int i = 0; i < n_slots; ++i) {
             NSError* e = nil;
             MLMultiArray* emb = [[MLMultiArray alloc] initWithShape:@[@(B), @384, @1, @(S)] dataType:MLMultiArrayDataTypeFloat16 error:&e];
+            if (!emb || e) {
+                record_ane_error("bge_ane_load_bucket(alloc emb)", e);
+                delete bk;
+                return -4;
+            }
             MLMultiArray* msk = [[MLMultiArray alloc] initWithShape:@[@(B), @1, @1, @(S)] dataType:MLMultiArrayDataTypeFloat16 error:&e];
+            if (!msk || e) {
+                record_ane_error("bge_ane_load_bucket(alloc mask)", e);
+                delete bk;
+                return -4;
+            }
             MLFeatureDescription* outDesc = model.modelDescription.outputDescriptionsByName[@"cls_emb"];
             MLMultiArray* outCls = [[MLMultiArray alloc] initWithShape:@[@(B), @384] dataType:outDesc.multiArrayConstraint.dataType error:&e];
+            if (!outCls || e) {
+                record_ane_error("bge_ane_load_bucket(alloc out)", e);
+                delete bk;
+                return -4;
+            }
             MLDictionaryFeatureProvider* fp = [[MLDictionaryFeatureProvider alloc]
                 initWithDictionary:@{@"emb_sum": emb, @"ext_mask": msk} error:&e];
+            if (!fp || e) {
+                record_ane_error("bge_ane_load_bucket(feature provider)", e);
+                delete bk;
+                return -4;
+            }
             MLPredictionOptions* opt = [MLPredictionOptions new];
             opt.outputBackings = @{@"cls_emb": outCls};
             bk->in_emb.push_back(emb);
@@ -232,12 +335,31 @@ extern "C" int bge_ane_load_bucket(const char* mlmodelc_path, int B, int S, int 
             bk->feats.push_back(fp);
             bk->opts.push_back(opt);
         }
-        // Zero-initialize warmup inputs
-        memset(bk->in_emb[0].dataPointer, 0, static_cast<size_t>(B) * 384 * S * sizeof(uint16_t));
-        memset(bk->in_mask[0].dataPointer, 0, static_cast<size_t>(B) * S * sizeof(uint16_t));
-        [model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
-        if (err) {
-            fprintf(stderr, "Warmup error %s: %s\n", mlmodelc_path, err.localizedDescription.UTF8String);
+        // Initialize warmup inputs with valid finite embeddings and a valid attention mask
+        // (never all-zero emb/mask which hits LayerNorm variance==0 on FP16 ANE graphs).
+        uint16_t* w_emb = static_cast<uint16_t*>(bk->in_emb[0].dataPointer);
+        uint16_t* w_msk = static_cast<uint16_t*>(bk->in_mask[0].dataPointer);
+        const size_t doc_emb_elems = static_cast<size_t>(384) * S;
+        const int32_t kWarmToks[2] = {101, 102};
+        for (int b = 0; b < B; ++b) {
+            if (!g_wt0.empty() && !g_pos.empty()) {
+                fill_emb_doc_fp16(
+                    g_wt0.data(), g_vocab_size, g_pos.data(), g_max_pos,
+                    kWarmToks, std::min(2, S), S,
+                    w_emb + static_cast<size_t>(b) * doc_emb_elems,
+                    w_msk + static_cast<size_t>(b) * S
+                );
+            } else {
+                fill_valid_dummy_doc_fp16(
+                    S,
+                    w_emb + static_cast<size_t>(b) * doc_emb_elems,
+                    w_msk + static_cast<size_t>(b) * S
+                );
+            }
+        }
+        id<MLFeatureProvider> warm_out = [model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
+        if (!warm_out || err) {
+            record_ane_error("bge_ane_load_bucket(warmup)", err, mlmodelc_path);
             delete bk;
             return -2;
         }
@@ -254,6 +376,10 @@ extern "C" double bge_ane_query(int bucket_id, const int32_t* tok_ids, int len, 
         }
         if (g_wt0.empty() || g_pos.empty()) return -2.0;
         ANEBucket* bk = g_buckets[bucket_id];
+        if (bk->B != 1) {
+            record_ane_error("bge_ane_query", nil, "requires B=1 bucket");
+            return -4.0;
+        }
         int S = bk->S;
         int sl = std::clamp(len, 0, S);
         double t0 = now_sec();
@@ -262,7 +388,11 @@ extern "C" double bge_ane_query(int bucket_id, const int32_t* tok_ids, int len, 
             uint16_t* msk_ptr = static_cast<uint16_t*>(bk->in_mask[0].dataPointer);
             fill_emb_doc_fp16(g_wt0.data(), g_vocab_size, g_pos.data(), g_max_pos, tok_ids, sl, S, emb_ptr, msk_ptr);
             NSError* err = nil;
-            [bk->model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
+            id<MLFeatureProvider> res = [bk->model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
+            if (!res || err) {
+                record_ane_error("bge_ane_query", err);
+                return -3.0;
+            }
             if (bk->out_cls[0].dataType == MLMultiArrayDataTypeFloat32) {
                 l2_normalize_row(static_cast<const float*>(bk->out_cls[0].dataPointer), out_vec384);
             } else {
@@ -298,24 +428,46 @@ extern "C" double bge_ane_encode_bucket(
         int n_batches = (n_docs + B - 1) / B;
         int depth = std::min(pipe_depth, bk->n_slots);
         size_t doc_emb_elems = static_cast<size_t>(384) * S;
+        static const int32_t kDummyToks[2] = {101, 102};
 
         double t0 = now_sec();
         auto fill_slot = [&](int slot, int d_start, int d_end) {
             uint16_t* emb_ptr = static_cast<uint16_t*>(bk->in_emb[slot].dataPointer);
             uint16_t* msk_ptr = static_cast<uint16_t*>(bk->in_mask[slot].dataPointer);
+            const bool has_valid_row0 = (d_start < d_end) && (offsets[d_start + 1] > offsets[d_start]);
             for (int j = 0; j < B; ++j) {
                 int d = d_start + j;
                 if (d < d_end) {
                     int s0 = offsets[d], s1 = offsets[d + 1];
+                    int sl = std::min(s1 - s0, S);
+                    if (sl > 0) {
+                        fill_emb_doc_fp16(
+                            g_wt0.data(), g_vocab_size, g_pos.data(), g_max_pos,
+                            flat_toks + s0, sl, S,
+                            emb_ptr + static_cast<size_t>(j) * doc_emb_elems,
+                            msk_ptr + static_cast<size_t>(j) * S
+                        );
+                    } else {
+                        fill_emb_doc_fp16(
+                            g_wt0.data(), g_vocab_size, g_pos.data(), g_max_pos,
+                            kDummyToks, std::min(2, S), S,
+                            emb_ptr + static_cast<size_t>(j) * doc_emb_elems,
+                            msk_ptr + static_cast<size_t>(j) * S
+                        );
+                    }
+                } else if (has_valid_row0) {
+                    // Unused trailing slot in B=8 batch: copy valid row 0 embeddings & valid mask
+                    // instead of all-zero emb/mask so ANE FP16 LayerNorm/softmax never produces NaNs.
+                    // Trailing outputs are ignored by write_cls_outputs(count = d_end - d_start).
+                    memcpy(emb_ptr + static_cast<size_t>(j) * doc_emb_elems, emb_ptr, doc_emb_elems * sizeof(uint16_t));
+                    memcpy(msk_ptr + static_cast<size_t>(j) * S, msk_ptr, static_cast<size_t>(S) * sizeof(uint16_t));
+                } else {
                     fill_emb_doc_fp16(
                         g_wt0.data(), g_vocab_size, g_pos.data(), g_max_pos,
-                        flat_toks + s0, std::min(s1 - s0, S), S,
+                        kDummyToks, std::min(2, S), S,
                         emb_ptr + static_cast<size_t>(j) * doc_emb_elems,
                         msk_ptr + static_cast<size_t>(j) * S
                     );
-                } else {
-                    memset(emb_ptr + static_cast<size_t>(j) * doc_emb_elems, 0, doc_emb_elems * sizeof(uint16_t));
-                    memset(msk_ptr + static_cast<size_t>(j) * S, 0, S * sizeof(uint16_t));
                 }
             }
         };
@@ -326,17 +478,28 @@ extern "C" double bge_ane_encode_bucket(
                 int d_end = std::min(n_docs, d_start + B);
                 fill_slot(0, d_start, d_end);
                 NSError* err = nil;
-                [bk->model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
+                id<MLFeatureProvider> res = [bk->model predictionFromFeatures:bk->feats[0] options:bk->opts[0] error:&err];
+                if (!res || err) {
+                    record_ane_error("bge_ane_encode_bucket(sync)", err);
+                    return -3.0;
+                }
                 write_cls_outputs(bk->out_cls[0], d_start, d_end - d_start, doc_orig_idx, out_vecs);
             }
         } else {
             std::vector<dispatch_semaphore_t> sems(depth);
             for (int i = 0; i < depth; ++i) sems[i] = dispatch_semaphore_create(1);
             dispatch_group_t grp = dispatch_group_create();
+            std::atomic<int> err_flag{0};
+            std::atomic<int>* err_flag_ptr = &err_flag;
 
             for (int bi = 0; bi < n_batches; ++bi) {
+                if (err_flag.load(std::memory_order_acquire) != 0) break;
                 int s = bi % depth;
                 dispatch_semaphore_wait(sems[s], DISPATCH_TIME_FOREVER);
+                if (err_flag.load(std::memory_order_acquire) != 0) {
+                    dispatch_semaphore_signal(sems[s]);
+                    break;
+                }
 
                 int d_start = bi * B;
                 int d_end = std::min(n_docs, d_start + B);
@@ -348,14 +511,22 @@ extern "C" double bge_ane_encode_bucket(
                 [bk->model predictionFromFeatures:bk->feats[s]
                                            options:bk->opts[s]
                                  completionHandler:^(id<MLFeatureProvider> out, NSError* err) {
-                    (void)out;
-                    (void)err;
-                    write_cls_outputs(out_arr, d_start, d_end - d_start, doc_orig_idx, out_vecs);
+                    if (!out || err != nil) {
+                        int expected = 0;
+                        if (err_flag_ptr->compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                            record_ane_error("bge_ane_encode_bucket(async)", err);
+                        }
+                    } else if (err_flag_ptr->load(std::memory_order_acquire) == 0) {
+                        write_cls_outputs(out_arr, d_start, d_end - d_start, doc_orig_idx, out_vecs);
+                    }
                     dispatch_semaphore_signal(sem);
                     dispatch_group_leave(grp);
                 }];
             }
             dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+            if (err_flag.load(std::memory_order_acquire) != 0) {
+                return -3.0;
+            }
         }
         return now_sec() - t0;
     }

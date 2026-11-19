@@ -24,6 +24,11 @@ inline float u16_to_f32(uint16_t bits) {
     return static_cast<float>(h);
 }
 
+// Reusable per-thread scratch buffers avoid heap allocations on every bucket.
+thread_local std::vector<uint16_t> tl_gathered_f16;
+thread_local std::vector<float> tl_pooled_f32;
+thread_local std::vector<float> tl_tok_norm_f32;
+
 // Fast NEON 8x8 FP16 matrix transpose from row-major src[seq_len, hidden_dim]
 // into channel-major dst[hidden_dim, seq_len]. Mirrors emb2_fast_io NEON kernel.
 void neon_transpose_seq_hidden_f16(
@@ -156,13 +161,21 @@ void pplx_pack_bucket_f16(
         !out_tok_valid_u16 || !out_gdn_carry_u16) {
         return;
     }
+    if (vocab_size <= 0 || hidden_dim <= 0 || seq_len <= 0 || chunk_size <= 0 ||
+        rope_half <= 0 || max_pos <= 0 || (seq_len % chunk_size) != 0) {
+        return;
+    }
 
     const uint16_t one_u16 = f32_to_u16(1.0f);
     const uint16_t zero_u16 = 0;
     const uint16_t mask_neg_u16 = f32_to_u16(-10000.0f);
 
-    // 1. Gather row-major [S, H] embeddings (zeroing padded slots) then transpose to [H, S].
-    std::vector<uint16_t> gathered(static_cast<size_t>(seq_len) * hidden_dim, 0);
+    // 1. Gather row-major [S, H] embeddings into reusable thread-local scratch then transpose to [H, S].
+    const size_t total_elems = static_cast<size_t>(seq_len) * static_cast<size_t>(hidden_dim);
+    if (tl_gathered_f16.size() < total_elems) {
+        tl_gathered_f16.resize(total_elems);
+    }
+    uint16_t* gathered = tl_gathered_f16.data();
     const size_t row_bytes = static_cast<size_t>(hidden_dim) * sizeof(uint16_t);
     const size_t rope_bytes = static_cast<size_t>(rope_half) * sizeof(uint16_t);
 
@@ -170,14 +183,17 @@ void pplx_pack_bucket_f16(
         const int32_t did = doc_ids[s];
         const bool is_valid = (did >= 0);
         out_tok_valid_u16[s] = is_valid ? one_u16 : zero_u16;
+        uint16_t* dst_row = gathered + static_cast<size_t>(s) * hidden_dim;
 
         if (is_valid) {
             const int32_t tid = token_ids[s];
             if (tid >= 0 && tid < vocab_size) {
                 std::memcpy(
-                    gathered.data() + static_cast<size_t>(s) * hidden_dim,
+                    dst_row,
                     embed_table_u16 + static_cast<size_t>(tid) * hidden_dim,
                     row_bytes);
+            } else {
+                std::memset(dst_row, 0, row_bytes);
             }
             const int32_t pid = std::max(0, std::min(pos_ids[s], max_pos - 1));
             std::memcpy(
@@ -189,15 +205,18 @@ void pplx_pack_bucket_f16(
                 rope_sin_u16 + static_cast<size_t>(pid) * rope_half,
                 rope_bytes);
         } else {
+            std::memset(dst_row, 0, row_bytes);
             // Identity RoPE at pad positions (cos=1, sin=0) avoids garbage values.
+            uint16_t* cos_row = out_cos32_u16 + static_cast<size_t>(s) * rope_half;
+            uint16_t* sin_row = out_sin32_u16 + static_cast<size_t>(s) * rope_half;
             for (int k = 0; k < rope_half; ++k) {
-                out_cos32_u16[static_cast<size_t>(s) * rope_half + k] = one_u16;
-                out_sin32_u16[static_cast<size_t>(s) * rope_half + k] = zero_u16;
+                cos_row[k] = one_u16;
+                sin_row[k] = zero_u16;
             }
         }
     }
 
-    neon_transpose_seq_hidden_f16(gathered.data(), out_h_u16, seq_len, hidden_dim);
+    neon_transpose_seq_hidden_f16(gathered, out_h_u16, seq_len, hidden_dim);
 
     // 2. Block-diagonal bidirectional attention bias [S, S]:
     //    same non-negative doc_id -> 0.0; pad query -> pad keys are 0.0 (avoids NaN softmax).
@@ -217,7 +236,7 @@ void pplx_pack_bucket_f16(
 
     // 3. Inter-chunk carry flags for GatedDeltaNet:
     //    Carry state into chunk c only if c>0 continues the exact same document across the boundary.
-    const int n_chunks = seq_len / std::max(1, chunk_size);
+    const int n_chunks = seq_len / chunk_size;
     for (int c = 0; c < n_chunks; ++c) {
         if (c == 0) {
             out_gdn_carry_u16[c] = zero_u16;
@@ -243,22 +262,28 @@ void pplx_pool_and_project_f32(
     int apply_tanh_int8,
     int apply_l2_norm,
     float* out_f32) {
-    if (!h_out_u16 || !span_starts || !span_ends || !contextual_proj_f32 || !out_f32 || n_spans <= 0) {
+    if (!h_out_u16 || !span_starts || !span_ends || !contextual_proj_f32 || !out_f32 ||
+        n_spans <= 0 || hidden_dim <= 0 || seq_len <= 0 || proj_rows <= 0 || out_dim <= 0) {
         return;
     }
     const int eff_dim = std::min(out_dim, proj_rows);
-    std::vector<float> pooled(static_cast<size_t>(n_spans) * hidden_dim, 0.0f);
+    const size_t pooled_elems = static_cast<size_t>(n_spans) * static_cast<size_t>(hidden_dim);
+    if (tl_pooled_f32.size() < pooled_elems) {
+        tl_pooled_f32.resize(pooled_elems);
+    }
+    float* pooled = tl_pooled_f32.data();
 
     if (final_norm_f32 == nullptr) {
         // Fast path: ANE stage already ran final RMSNorm; sum contiguous slice [start, end) per channel.
         for (int k = 0; k < n_spans; ++k) {
+            float* dst = pooled + static_cast<size_t>(k) * hidden_dim;
             const int s0 = std::max(0, span_starts[k]);
             const int s1 = std::min(seq_len, span_ends[k]);
             if (s1 <= s0) {
+                std::memset(dst, 0, static_cast<size_t>(hidden_dim) * sizeof(float));
                 continue;
             }
             const float inv_len = 1.0f / static_cast<float>(s1 - s0);
-            float* dst = pooled.data() + static_cast<size_t>(k) * hidden_dim;
             for (int c = 0; c < hidden_dim; ++c) {
                 const uint16_t* ch = h_out_u16 + static_cast<size_t>(c) * seq_len;
                 float32x4_t acc = vdupq_n_f32(0.0f);
@@ -277,15 +302,19 @@ void pplx_pool_and_project_f32(
         }
     } else {
         // Optional path: apply final RMSNorm across channels per token before span pooling.
-        std::vector<float> tok_buf(static_cast<size_t>(hidden_dim));
+        if (tl_tok_norm_f32.size() < static_cast<size_t>(hidden_dim)) {
+            tl_tok_norm_f32.resize(static_cast<size_t>(hidden_dim));
+        }
+        float* tok_buf = tl_tok_norm_f32.data();
         for (int k = 0; k < n_spans; ++k) {
+            float* dst = pooled + static_cast<size_t>(k) * hidden_dim;
+            std::memset(dst, 0, static_cast<size_t>(hidden_dim) * sizeof(float));
             const int s0 = std::max(0, span_starts[k]);
             const int s1 = std::min(seq_len, span_ends[k]);
             if (s1 <= s0) {
                 continue;
             }
             const float inv_len = 1.0f / static_cast<float>(s1 - s0);
-            float* dst = pooled.data() + static_cast<size_t>(k) * hidden_dim;
             for (int s = s0; s < s1; ++s) {
                 double sq = 0.0;
                 for (int c = 0; c < hidden_dim; ++c) {
@@ -313,7 +342,7 @@ void pplx_pool_and_project_f32(
         eff_dim,
         hidden_dim,
         1.0f,
-        pooled.data(),
+        pooled,
         hidden_dim,
         contextual_proj_f32,
         hidden_dim,

@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Shared Apple Silicon MLX/Metal-MPP/CoreML utilities and M4/M5 optimization plugin for fast-bge-small, fast-embeddinggemma-2, fast-gemma4, fast-gpt-oss, and fast-decision-models"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "mlx>=0.30.0",
+    "mlx>=0.32.4",
     "numpy>=1.26.0",
     "tokenizers>=0.20.0",
     "pyarrow>=18.0.0",

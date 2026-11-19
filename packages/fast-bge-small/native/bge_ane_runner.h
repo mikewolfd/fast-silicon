@@ -7,6 +7,14 @@ extern "C" {
 
 int bge_ane_init_tables(const uint16_t* wt0_fp16, int vocab_size, const uint16_t* pos_fp16, int max_pos);
 void bge_ane_inspect_plan(const char* mlmodelc_path, int compute_mode);
+int bge_ane_get_plan_counts(
+    const char* mlmodelc_path,
+    int compute_mode,
+    int* out_ane_ops,
+    int* out_gpu_ops,
+    int* out_cpu_ops
+);
+const char* bge_ane_last_error(void);
 int bge_ane_load_bucket(const char* mlmodelc_path, int B, int S, int n_slots, int compute_mode);
 double bge_ane_query(int bucket_id, const int32_t* tok_ids, int len, float* out_vec384, int iters);
 double bge_ane_encode_bucket(

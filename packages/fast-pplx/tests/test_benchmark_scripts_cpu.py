@@ -276,3 +276,23 @@ def test_monorepo_benchmark_dry_run_and_parsers(capsys: pytest.CaptureFixture[st
     cw_src = inspect.getsource(pplx_bench.cmd_context_windows)
     assert "group_chunks_by_context_windows" in cw_src
     assert "_pack_contextual_windows" not in cw_src
+
+    # Verify telemetry, gpu-bf16 + S=4096 parity defaults, symmetric timing scope, and no forced --allow-contended
+    rc_par = pplx_bench.main(["parity", "--dry-run"])
+    assert rc_par == 0
+    par_payload = json.loads(capsys.readouterr().out)
+    assert "gpu-bf16" in par_payload["modes"]
+    assert par_payload["include_s4096"] is True
+    assert "mlx_enable_tf32" in par_payload["telemetry"]
+
+    rc_spd = pplx_bench.main(["speed", "--dry-run", "--modes", "gpu,hetero2"])
+    assert rc_spd == 0
+    spd_payload = json.loads(capsys.readouterr().out)
+    assert spd_payload["timing_scope"] == "e2e"
+    assert "mlx_enable_tf32" in spd_payload["telemetry"]
+
+    spd_src = inspect.getsource(pplx_bench.cmd_speed)
+    clim_src = inspect.getsource(pplx_bench.cmd_context_limit)
+    assert "if args.allow_contended:" in spd_src
+    assert "if args.allow_contended:" in clim_src
+    assert "interleaved_abba" in inspect.getsource(pplx_bench.run_abba_speed_pair)

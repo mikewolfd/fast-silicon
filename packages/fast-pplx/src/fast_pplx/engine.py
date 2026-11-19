@@ -16,7 +16,7 @@ import numpy as np
 from fast_shared.embeddings import resolve_embedding_dim, truncate_and_normalize
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
-from .gpu import FastPplxGPU, _find_local_hf_snapshot
+from .gpu import FastPplxGPU, _find_local_hf_snapshot, get_mlx_runtime_telemetry
 from .paths import RepoPaths, resolve_paths
 from .tokenizer import ContextualTokenizer
 
@@ -28,6 +28,18 @@ DEFAULT_ROPE_HALF = 32
 DEFAULT_PIPE_DEPTH = 4
 DEFAULT_ANE_MAX_SEQ_LEN = 512
 _VALID_MODES: tuple[str, ...] = ("auto", "gpu", "ane", "hetero", "hetero2")
+
+
+class _PplxSlotBuffers(ctypes.Structure):
+    _fields_ = [
+        ("slot_idx", ctypes.c_int),
+        ("in_h", ctypes.c_void_p),
+        ("in_bias", ctypes.c_void_p),
+        ("in_cos32", ctypes.c_void_p),
+        ("in_sin32", ctypes.c_void_p),
+        ("in_tok_valid", ctypes.c_void_p),
+        ("in_gdn_carry", ctypes.c_void_p),
+    ]
 
 
 @dataclass(frozen=True)
@@ -47,6 +59,17 @@ class PackedBucket:
     targets: list[PackedSpanTarget]
     n_docs: int
     used_tokens: int
+
+
+@dataclass
+class _BucketStagingSlot:
+    h_in_u16: np.ndarray
+    bias_u16: np.ndarray
+    c32_u16: np.ndarray
+    s32_u16: np.ndarray
+    tvalid_u16: np.ndarray
+    carry_u16: np.ndarray
+    h_out_u16: np.ndarray
 
 
 def pack_ane_buckets(
@@ -253,7 +276,48 @@ def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
 
     lib.pplx_ane_free.argtypes = [ctypes.c_void_p]
     lib.pplx_ane_free.restype = None
+
+    if hasattr(lib, "pplx_ane_last_error"):
+        lib.pplx_ane_last_error.argtypes = []
+        lib.pplx_ane_last_error.restype = ctypes.c_char_p
+
+    if all(
+        hasattr(lib, fn)
+        for fn in (
+            "pplx_ane_acquire_slot",
+            "pplx_ane_submit_slot",
+            "pplx_ane_wait_slot",
+            "pplx_ane_release_slot",
+        )
+    ):
+        lib.pplx_ane_acquire_slot.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PplxSlotBuffers)]
+        lib.pplx_ane_acquire_slot.restype = ctypes.c_int
+
+        lib.pplx_ane_submit_slot.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.pplx_ane_submit_slot.restype = ctypes.c_void_p
+
+        lib.pplx_ane_wait_slot.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.pplx_ane_wait_slot.restype = ctypes.c_double
+
+        lib.pplx_ane_release_slot.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.pplx_ane_release_slot.restype = None
+
     return lib
+
+
+def _coreml_last_error(lib: ctypes.CDLL) -> str:
+    fn = getattr(lib, "pplx_ane_last_error", None)
+    if fn is None:
+        return ""
+    try:
+        raw = fn()
+        return raw.decode("utf-8", errors="replace") if raw else ""
+    except Exception:
+        return ""
 
 
 def _discover_ane_stage_paths(ane_dir: Path) -> dict[int, list[Path]]:
@@ -311,7 +375,12 @@ def _load_f16_memmap_from_safetensors(sf_path: Path) -> tuple[np.ndarray, int, i
 
 
 class _ANERunnerBackend:
-    """Thread-safe double/quad-buffered C++ + CoreML ANE backend using staged .mlmodelc bundles."""
+    """Thread-safe double/quad-buffered C++ + CoreML ANE backend using staged .mlmodelc bundles.
+
+    Eliminates per-bucket NumPy allocations and MLMultiArray copies by packing directly into
+    dense ring-slot MLMultiArray pointers when supported, with preallocated per-bucket
+    staging pools as fallback.
+    """
 
     def __init__(
         self,
@@ -330,6 +399,16 @@ class _ANERunnerBackend:
         self.embed_mm = embed_f16_mm
         self.vocab_size, self.hidden_dim = int(embed_f16_mm.shape[0]), int(embed_f16_mm.shape[1])
         self.contextual_proj_f32 = np.ascontiguousarray(contextual_proj_f32, dtype=np.float32)
+        self._run_lock = threading.Lock()
+        self._supports_zero_copy_slots = all(
+            hasattr(self.coreml_lib, fn)
+            for fn in (
+                "pplx_ane_acquire_slot",
+                "pplx_ane_submit_slot",
+                "pplx_ane_wait_slot",
+                "pplx_ane_release_slot",
+            )
+        )
 
         stage_map = _discover_ane_stage_paths(paths.ane_models_dir)
         if not stage_map:
@@ -352,7 +431,9 @@ class _ANERunnerBackend:
                     compute_units,
                 )
                 if not handle:
-                    raise RuntimeError(f"Failed loading ANE pipeline for S={cap} ({stage_paths})")
+                    detail = _coreml_last_error(self.coreml_lib)
+                    suffix = f": {detail}" if detail else ""
+                    raise RuntimeError(f"Failed loading ANE pipeline for S={cap} ({stage_paths}){suffix}")
                 self.runners[cap] = int(handle)
         except Exception:
             self.close()
@@ -360,6 +441,24 @@ class _ANERunnerBackend:
 
         self.caps: tuple[int, ...] = tuple(sorted(self.runners))
         self.max_cap: int = self.caps[-1]
+
+        # Preallocate reusable fallback staging rings (one per cap, pipe_depth slots) to eliminate per-bucket np.empty.
+        self._staging_rings: dict[int, list[_BucketStagingSlot]] = {}
+        for cap in self.caps:
+            n_chunks = max(1, cap // DEFAULT_CHUNK_SIZE)
+            self._staging_rings[cap] = [
+                _BucketStagingSlot(
+                    h_in_u16=np.empty((self.hidden_dim, cap), dtype=np.uint16),
+                    bias_u16=np.empty((cap, cap), dtype=np.uint16),
+                    c32_u16=np.empty((cap, DEFAULT_ROPE_HALF), dtype=np.uint16),
+                    s32_u16=np.empty((cap, DEFAULT_ROPE_HALF), dtype=np.uint16),
+                    tvalid_u16=np.empty((cap,), dtype=np.uint16),
+                    carry_u16=np.empty((n_chunks,), dtype=np.uint16),
+                    h_out_u16=np.empty((self.hidden_dim, cap), dtype=np.uint16),
+                )
+                for _ in range(self.pipe_depth)
+            ]
+        self._ring_cursors: dict[int, int] = {cap: 0 for cap in self.caps}
 
         self.rope_cos_u16 = np.empty((self.max_cap, DEFAULT_ROPE_HALF), dtype=np.uint16)
         self.rope_sin_u16 = np.empty((self.max_cap, DEFAULT_ROPE_HALF), dtype=np.uint16)
@@ -370,6 +469,45 @@ class _ANERunnerBackend:
             DEFAULT_ROPE_HALF,
             float(config.rope_theta),
         )
+
+    def _next_staging_slot(self, seq_len: int) -> _BucketStagingSlot:
+        ring = self._staging_rings[seq_len]
+        idx = self._ring_cursors[seq_len]
+        self._ring_cursors[seq_len] = (idx + 1) % len(ring)
+        return ring[idx]
+
+    def _pool_from_h_ptr(
+        self,
+        bkt: PackedBucket,
+        h_out_ptr: int,
+        *,
+        out_dim: int,
+        apply_tanh_int8: bool,
+        apply_l2_norm: bool,
+    ) -> np.ndarray:
+        live_targets = [t for t in bkt.targets if t.end > t.start]
+        if not live_targets:
+            return np.zeros((0, out_dim), dtype=np.float32)
+        starts = np.fromiter((t.start for t in live_targets), dtype=np.int32, count=len(live_targets))
+        ends = np.fromiter((t.end for t in live_targets), dtype=np.int32, count=len(live_targets))
+        out_f32 = np.zeros((len(live_targets), out_dim), dtype=np.float32)
+        # Final stage already executed final RMSNorm -> pass final_norm_f32=None (0)
+        self.io_lib.pplx_pool_and_project_f32(
+            h_out_ptr,
+            self.hidden_dim,
+            bkt.seq_len,
+            len(live_targets),
+            starts.ctypes.data,
+            ends.ctypes.data,
+            None,
+            int(self.contextual_proj_f32.ctypes.data),
+            int(self.contextual_proj_f32.shape[0]),
+            out_dim,
+            1 if apply_tanh_int8 else 0,
+            1 if apply_l2_norm else 0,
+            out_f32.ctypes.data,
+        )
+        return out_f32
 
     def run_buckets(
         self,
@@ -383,111 +521,170 @@ class _ANERunnerBackend:
         if not buckets:
             return []
 
-        embed_ptr = int(self.embed_mm.ctypes.data)
-        cos_ptr = int(self.rope_cos_u16.ctypes.data)
-        sin_ptr = int(self.rope_sin_u16.ctypes.data)
-        proj_ptr = int(self.contextual_proj_f32.ctypes.data)
-        proj_rows = int(self.contextual_proj_f32.shape[0])
+        with self._run_lock:
+            embed_ptr = int(self.embed_mm.ctypes.data)
+            cos_ptr = int(self.rope_cos_u16.ctypes.data)
+            sin_ptr = int(self.rope_sin_u16.ctypes.data)
 
-        # Maintain an async inflight window up to pipe_depth overlapping CPU prep + ANE exec.
-        inflight: deque[tuple[PackedBucket, np.ndarray, int]] = deque()
-        completed: list[tuple[PackedBucket, np.ndarray]] = []
+            # Inflight queue entries: (is_zero_copy, runner_handle, bkt, slot_idx_or_staging_h_out, job_ptr)
+            inflight: deque[tuple[bool, int, PackedBucket, Any, int]] = deque()
+            completed: list[tuple[PackedBucket, np.ndarray]] = []
 
-        def _drain_one() -> None:
-            bkt, h_out_u16, job = inflight.popleft()
-            dt = self.coreml_lib.pplx_ane_wait(ctypes.c_void_p(job))
-            if dt < 0.0:
-                raise RuntimeError(f"ANE prediction failed for bucket S={bkt.seq_len}")
-            live_targets = [t for t in bkt.targets if t.end > t.start]
-            if not live_targets:
-                completed.append((bkt, np.zeros((0, out_dim), dtype=np.float32)))
-                return
-            starts = np.array([t.start for t in live_targets], dtype=np.int32)
-            ends = np.array([t.end for t in live_targets], dtype=np.int32)
-            out_f32 = np.zeros((len(live_targets), out_dim), dtype=np.float32)
-            # Final stage already executed final RMSNorm -> pass final_norm_f32=None (0)
-            self.io_lib.pplx_pool_and_project_f32(
-                h_out_u16.ctypes.data,
-                self.hidden_dim,
-                bkt.seq_len,
-                len(live_targets),
-                starts.ctypes.data,
-                ends.ctypes.data,
-                None,
-                proj_ptr,
-                proj_rows,
-                out_dim,
-                1 if apply_tanh_int8 else 0,
-                1 if apply_l2_norm else 0,
-                out_f32.ctypes.data,
-            )
-            completed.append((bkt, out_f32))
+            def _drain_one() -> None:
+                is_zc, runner_handle, bkt, aux, job = inflight.popleft()
+                if is_zc:
+                    out_ptr = ctypes.c_void_p(0)
+                    slot_out = ctypes.c_int(int(aux))
+                    dt = self.coreml_lib.pplx_ane_wait_slot(
+                        ctypes.c_void_p(job),
+                        ctypes.byref(out_ptr),
+                        ctypes.byref(slot_out),
+                    )
+                    try:
+                        if dt < 0.0 or not out_ptr.value:
+                            detail = _coreml_last_error(self.coreml_lib)
+                            suffix = f": {detail}" if detail else ""
+                            raise RuntimeError(f"ANE prediction failed for bucket S={bkt.seq_len}{suffix}")
+                        out_f32 = self._pool_from_h_ptr(
+                            bkt,
+                            int(out_ptr.value),
+                            out_dim=out_dim,
+                            apply_tanh_int8=apply_tanh_int8,
+                            apply_l2_norm=apply_l2_norm,
+                        )
+                    finally:
+                        self.coreml_lib.pplx_ane_release_slot(ctypes.c_void_p(runner_handle), int(slot_out.value))
+                    completed.append((bkt, out_f32))
+                else:
+                    h_out_u16: np.ndarray = aux
+                    dt = self.coreml_lib.pplx_ane_wait(ctypes.c_void_p(job))
+                    if dt < 0.0:
+                        detail = _coreml_last_error(self.coreml_lib)
+                        suffix = f": {detail}" if detail else ""
+                        raise RuntimeError(f"ANE prediction failed for bucket S={bkt.seq_len}{suffix}")
+                    out_f32 = self._pool_from_h_ptr(
+                        bkt,
+                        int(h_out_u16.ctypes.data),
+                        out_dim=out_dim,
+                        apply_tanh_int8=apply_tanh_int8,
+                        apply_l2_norm=apply_l2_norm,
+                    )
+                    completed.append((bkt, out_f32))
 
-        try:
-            for bkt in buckets:
-                if len(inflight) >= self.pipe_depth:
+            try:
+                for bkt in buckets:
+                    if len(inflight) >= self.pipe_depth:
+                        _drain_one()
+
+                    seq_len = bkt.seq_len
+                    if seq_len not in self.runners:
+                        raise KeyError(f"No ANE runner loaded for bucket S={seq_len} (have {self.caps})")
+                    runner_handle = self.runners[seq_len]
+
+                    submitted_zc = False
+                    if self._supports_zero_copy_slots:
+                        slot_bufs = _PplxSlotBuffers()
+                        slot_idx = int(
+                            self.coreml_lib.pplx_ane_acquire_slot(
+                                ctypes.c_void_p(runner_handle), ctypes.byref(slot_bufs)
+                            )
+                        )
+                        if slot_idx >= 0:
+                            try:
+                                self.io_lib.pplx_pack_bucket_f16(
+                                    embed_ptr,
+                                    self.vocab_size,
+                                    self.hidden_dim,
+                                    seq_len,
+                                    DEFAULT_CHUNK_SIZE,
+                                    DEFAULT_ROPE_HALF,
+                                    bkt.token_ids.ctypes.data,
+                                    bkt.doc_ids.ctypes.data,
+                                    bkt.pos_ids.ctypes.data,
+                                    cos_ptr,
+                                    sin_ptr,
+                                    self.max_cap,
+                                    slot_bufs.in_h,
+                                    slot_bufs.in_bias,
+                                    slot_bufs.in_cos32,
+                                    slot_bufs.in_sin32,
+                                    slot_bufs.in_tok_valid,
+                                    slot_bufs.in_gdn_carry,
+                                )
+                                job = self.coreml_lib.pplx_ane_submit_slot(
+                                    ctypes.c_void_p(runner_handle),
+                                    slot_idx,
+                                )
+                                if not job:
+                                    detail = _coreml_last_error(self.coreml_lib)
+                                    suffix = f": {detail}" if detail else ""
+                                    raise RuntimeError(f"pplx_ane_submit_slot returned NULL for S={seq_len}{suffix}")
+                            except BaseException:
+                                self.coreml_lib.pplx_ane_release_slot(ctypes.c_void_p(runner_handle), slot_idx)
+                                raise
+                            inflight.append((True, runner_handle, bkt, slot_idx, int(job)))
+                            submitted_zc = True
+
+                    if not submitted_zc:
+                        slot = self._next_staging_slot(seq_len)
+                        self.io_lib.pplx_pack_bucket_f16(
+                            embed_ptr,
+                            self.vocab_size,
+                            self.hidden_dim,
+                            seq_len,
+                            DEFAULT_CHUNK_SIZE,
+                            DEFAULT_ROPE_HALF,
+                            bkt.token_ids.ctypes.data,
+                            bkt.doc_ids.ctypes.data,
+                            bkt.pos_ids.ctypes.data,
+                            cos_ptr,
+                            sin_ptr,
+                            self.max_cap,
+                            slot.h_in_u16.ctypes.data,
+                            slot.bias_u16.ctypes.data,
+                            slot.c32_u16.ctypes.data,
+                            slot.s32_u16.ctypes.data,
+                            slot.tvalid_u16.ctypes.data,
+                            slot.carry_u16.ctypes.data,
+                        )
+                        job = self.coreml_lib.pplx_ane_submit(
+                            ctypes.c_void_p(runner_handle),
+                            slot.h_in_u16.ctypes.data,
+                            slot.bias_u16.ctypes.data,
+                            slot.c32_u16.ctypes.data,
+                            slot.s32_u16.ctypes.data,
+                            slot.tvalid_u16.ctypes.data,
+                            slot.carry_u16.ctypes.data,
+                            slot.h_out_u16.ctypes.data,
+                        )
+                        if not job:
+                            detail = _coreml_last_error(self.coreml_lib)
+                            suffix = f": {detail}" if detail else ""
+                            raise RuntimeError(f"pplx_ane_submit returned NULL for S={seq_len}{suffix}")
+                        inflight.append((False, runner_handle, bkt, slot.h_out_u16, int(job)))
+
+                while inflight:
                     _drain_one()
+            except Exception:
+                while inflight:
+                    is_zc, runner_handle, _, aux, job = inflight.popleft()
+                    try:
+                        if is_zc:
+                            out_ptr = ctypes.c_void_p(0)
+                            slot_out = ctypes.c_int(int(aux))
+                            self.coreml_lib.pplx_ane_wait_slot(
+                                ctypes.c_void_p(job),
+                                ctypes.byref(out_ptr),
+                                ctypes.byref(slot_out),
+                            )
+                            self.coreml_lib.pplx_ane_release_slot(ctypes.c_void_p(runner_handle), int(slot_out.value))
+                        else:
+                            self.coreml_lib.pplx_ane_wait(ctypes.c_void_p(job))
+                    except Exception:
+                        pass
+                raise
 
-                seq_len = bkt.seq_len
-                if seq_len not in self.runners:
-                    raise KeyError(f"No ANE runner loaded for bucket S={seq_len} (have {self.caps})")
-
-                # Staging buffers (copied immediately inside pplx_ane_submit before it returns).
-                h_in_u16 = np.empty((self.hidden_dim, seq_len), dtype=np.uint16)
-                bias_u16 = np.empty((seq_len, seq_len), dtype=np.uint16)
-                c32_u16 = np.empty((seq_len, DEFAULT_ROPE_HALF), dtype=np.uint16)
-                s32_u16 = np.empty((seq_len, DEFAULT_ROPE_HALF), dtype=np.uint16)
-                tvalid_u16 = np.empty((seq_len,), dtype=np.uint16)
-                carry_u16 = np.empty((seq_len // DEFAULT_CHUNK_SIZE,), dtype=np.uint16)
-                h_out_u16 = np.empty((self.hidden_dim, seq_len), dtype=np.uint16)
-
-                self.io_lib.pplx_pack_bucket_f16(
-                    embed_ptr,
-                    self.vocab_size,
-                    self.hidden_dim,
-                    seq_len,
-                    DEFAULT_CHUNK_SIZE,
-                    DEFAULT_ROPE_HALF,
-                    bkt.token_ids.ctypes.data,
-                    bkt.doc_ids.ctypes.data,
-                    bkt.pos_ids.ctypes.data,
-                    cos_ptr,
-                    sin_ptr,
-                    self.max_cap,
-                    h_in_u16.ctypes.data,
-                    bias_u16.ctypes.data,
-                    c32_u16.ctypes.data,
-                    s32_u16.ctypes.data,
-                    tvalid_u16.ctypes.data,
-                    carry_u16.ctypes.data,
-                )
-
-                job = self.coreml_lib.pplx_ane_submit(
-                    ctypes.c_void_p(self.runners[seq_len]),
-                    h_in_u16.ctypes.data,
-                    bias_u16.ctypes.data,
-                    c32_u16.ctypes.data,
-                    s32_u16.ctypes.data,
-                    tvalid_u16.ctypes.data,
-                    carry_u16.ctypes.data,
-                    h_out_u16.ctypes.data,
-                )
-                if not job:
-                    raise RuntimeError(f"pplx_ane_submit returned NULL for S={seq_len}")
-                inflight.append((bkt, h_out_u16, int(job)))
-
-            while inflight:
-                _drain_one()
-        except Exception:
-            while inflight:
-                _, _, job = inflight.popleft()
-                try:
-                    self.coreml_lib.pplx_ane_wait(ctypes.c_void_p(job))
-                except Exception:
-                    pass
-            raise
-
-        return completed
+            return completed
 
     def close(self) -> None:
         runners = getattr(self, "runners", None)
@@ -507,7 +704,15 @@ class _ANERunnerBackend:
 
 
 class FastPplx:
-    """Unified M4 Pro `pplx-embed-v2-context-0.6b` engine (Metal MLX GPU + 16-core ANE `hetero2`)."""
+    """Unified Apple Silicon `pplx-embed-v2-context-0.6b` engine (Metal MLX GPU + 16-core ANE).
+
+    Routing modes:
+      - ``gpu``: deterministic high-precision Metal MLX GPU (recommended for exact reproducibility / verify).
+      - ``ane``: static short-bucket (``<= 512``) pure-ANE CoreML pipeline (ANE quantization drift tolerance).
+      - ``hetero``: deterministic static split (``<= max_ane_cap`` -> ANE, ``> max_ane_cap`` -> GPU; no stealing).
+      - ``hetero2``: dynamic work-stealing ANE + GPU (maximum mixed throughput; non-deterministic stealing).
+      - ``auto``: selects ``hetero2`` when ANE stages are available (or ``gpu`` when ``deterministic=True``).
+    """
 
     model_name: str = DEFAULT_MODEL_NAME
     max_dim: int = MAX_EMBED_DIM
@@ -526,6 +731,7 @@ class FastPplx:
         cache_limit_mb: int = 512,
         local_files_only: bool = True,
         enable_ane: bool = True,
+        deterministic: bool = False,
         dimensions: int | None = None,
         pipe_depth: int = DEFAULT_PIPE_DEPTH,
         compute_units: int = 0,
@@ -539,7 +745,12 @@ class FastPplx:
         self.paths: RepoPaths = resolve_paths(home)
         self.dtype_name = dtype
         self.pipe_depth = int(pipe_depth)
-        self.last_stats: dict[str, Any] = {}
+        self.deterministic = bool(deterministic)
+        self._local_stats = threading.local()
+        self._stats_lock = threading.Lock()
+        self._latest_stats: dict[str, Any] = {}
+        self._gpu_lock = threading.Lock()
+        self.runtime_telemetry: dict[str, Any] = get_mlx_runtime_telemetry()
 
         # 1. GPU / MLX backend (always loaded unless explicitly testing ANE-only with mock)
         self.gpu: Any = _gpu_backend
@@ -570,7 +781,12 @@ class FastPplx:
         # 2. Optional ANE staged runner
         self.ane: Any = _ane_backend
         self._ane_init_error: str | None = None
-        want_ane = enable_ane and mode in ("auto", "ane", "hetero", "hetero2")
+        want_ane = enable_ane and (not self.deterministic or mode in ("ane", "hetero")) and mode in (
+            "auto",
+            "ane",
+            "hetero",
+            "hetero2",
+        )
         if want_ane and self.ane is None:
             self.ane = self._try_init_ane(pipe_depth=self.pipe_depth, compute_units=compute_units)
             if self.ane is None and mode == "ane":
@@ -589,13 +805,40 @@ class FastPplx:
             else DEFAULT_ANE_MAX_SEQ_LEN
         )
         if mode == "auto":
-            self.default_mode = "hetero2" if self.ane_available else "gpu"
+            if self.deterministic:
+                self.default_mode = "gpu"
+            else:
+                self.default_mode = "hetero2" if self.ane_available else "gpu"
         elif mode == "ane":
             self.default_mode = "ane"
-        elif mode in ("hetero", "hetero2"):
-            self.default_mode = mode if self.ane_available else "gpu"
+        elif mode == "hetero2":
+            if self.deterministic:
+                self.default_mode = "gpu" if self.gpu is not None else "hetero"
+            else:
+                self.default_mode = "hetero2" if self.ane_available else "gpu"
+        elif mode == "hetero":
+            self.default_mode = "hetero" if self.ane_available else "gpu"
         else:
             self.default_mode = "gpu"
+
+    @property
+    def last_stats(self) -> dict[str, Any]:
+        """Thread-safe snapshot of the calling thread's most recent dispatch stats."""
+        local_val = getattr(self._local_stats, "value", None)
+        if local_val is not None:
+            return dict(local_val)
+        with self._stats_lock:
+            return dict(self._latest_stats)
+
+    @last_stats.setter
+    def last_stats(self, value: dict[str, Any]) -> None:
+        snap = dict(value)
+        self._local_stats.value = snap
+        with self._stats_lock:
+            self._latest_stats = snap
+
+    def _set_call_stats(self, stats: dict[str, Any]) -> None:
+        self.last_stats = stats
 
     def _load_config(self, model_dir: str | Path | None) -> PplxConfig:
         for cand in (
@@ -677,7 +920,11 @@ class FastPplx:
         if eff not in _VALID_MODES:
             raise ValueError(f"Unsupported mode {eff!r}; choose from {_VALID_MODES}")
         if eff == "auto":
+            if self.deterministic:
+                return "gpu" if self.gpu is not None else "ane"
             return "hetero2" if self.ane_available else "gpu"
+        if eff == "hetero2" and self.deterministic and self.gpu is not None:
+            return "gpu"
         if eff in ("hetero", "hetero2") and not self.ane_available:
             if self.gpu is not None:
                 return "gpu"
@@ -721,31 +968,42 @@ class FastPplx:
         t0 = time.perf_counter()
         n_items = len(items)
         if n_items == 0:
+            self._set_call_stats(
+                {"mode": eff_mode, "ane_items": 0, "gpu_items": 0, "deterministic": eff_mode in ("gpu", "ane", "hetero"), "elapsed_s": 0.0}
+            )
             return [] if contextual_docs is not None else self._format_empty(0, target_dim, output_dtype)
 
         ane_caps = tuple(getattr(self.ane, "caps", ())) if self.ane is not None else ()
         max_ane_cap = ane_caps[-1] if ane_caps else 0
 
         if eff_mode == "gpu":
-            self.last_stats = {"mode": "gpu", "ane_items": 0, "gpu_items": n_items}
-            if contextual_docs is not None:
-                res = self.gpu.encode_contextual_chunks(
-                    contextual_docs,
-                    batch_size=batch_size,
-                    max_length=self.max_seq_len,
-                    dimensions=target_dim,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
-            else:
-                res = self.gpu.encode_tokens(
-                    [it[1] for it in items],
-                    batch_size=batch_size,
-                    dimensions=target_dim,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
-            self.last_stats["elapsed_s"] = round(time.perf_counter() - t0, 4)
+            with self._gpu_lock:
+                if contextual_docs is not None:
+                    res = self.gpu.encode_contextual_chunks(
+                        contextual_docs,
+                        batch_size=batch_size,
+                        max_length=self.max_seq_len,
+                        dimensions=target_dim,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+                else:
+                    res = self.gpu.encode_tokens(
+                        [it[1] for it in items],
+                        batch_size=batch_size,
+                        dimensions=target_dim,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+            self._set_call_stats(
+                {
+                    "mode": "gpu",
+                    "ane_items": 0,
+                    "gpu_items": n_items,
+                    "deterministic": True,
+                    "elapsed_s": round(time.perf_counter() - t0, 4),
+                }
+            )
             return res
 
         # Partition short vs >max_ane_cap items.
@@ -790,29 +1048,30 @@ class FastPplx:
             if not sub_items:
                 return
             idxs = [it[0] for it in sub_items]
-            if contextual_docs is not None:
-                sub_docs = [contextual_docs[i] for i in idxs]
-                vecs_list = self.gpu.encode_contextual_chunks(
-                    sub_docs,
-                    batch_size=batch_size,
-                    max_length=self.max_seq_len,
-                    dimensions=target_dim,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
-                for orig_i, v_mat in zip(idxs, vecs_list, strict=True):
-                    ctx_out[orig_i] = v_mat
-            else:
-                toks = [it[1] for it in sub_items]
-                vecs = self.gpu.encode_tokens(
-                    toks,
-                    batch_size=batch_size,
-                    dimensions=target_dim,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
-                for pos, orig_i in enumerate(idxs):
-                    flat_out[orig_i] = vecs[pos]
+            with self._gpu_lock:
+                if contextual_docs is not None:
+                    sub_docs = [contextual_docs[i] for i in idxs]
+                    vecs_list = self.gpu.encode_contextual_chunks(
+                        sub_docs,
+                        batch_size=batch_size,
+                        max_length=self.max_seq_len,
+                        dimensions=target_dim,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+                    for orig_i, v_mat in zip(idxs, vecs_list, strict=True):
+                        ctx_out[orig_i] = v_mat
+                else:
+                    toks = [it[1] for it in sub_items]
+                    vecs = self.gpu.encode_tokens(
+                        toks,
+                        batch_size=batch_size,
+                        dimensions=target_dim,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+                    for pos, orig_i in enumerate(idxs):
+                        flat_out[orig_i] = vecs[pos]
 
         if eff_mode == "ane" or self.gpu is None:
             buckets = pack_ane_buckets(short_items, supported_caps=ane_caps)
@@ -823,23 +1082,26 @@ class FastPplx:
                 apply_l2_norm=apply_l2,
             )
             _store_ane_results(done)
-            self.last_stats = {
-                "mode": eff_mode,
-                "ane_items": len(short_items),
-                "ane_buckets": len(buckets),
-                "gpu_items": 0,
-                "elapsed_s": round(time.perf_counter() - t0, 4),
-            }
+            self._set_call_stats(
+                {
+                    "mode": eff_mode,
+                    "ane_items": len(short_items),
+                    "ane_buckets": len(buckets),
+                    "gpu_items": 0,
+                    "deterministic": True,
+                    "elapsed_s": round(time.perf_counter() - t0, 4),
+                }
+            )
             return ctx_out if contextual_docs is not None else flat_out
 
-        # Concurrent hetero / hetero2 scheduler:
-        # - ANE drains packed buckets from head of short_dq via async pipe_depth ring.
-        # - GPU processes all >max_ane_cap items first, then steals batches from tail of short_dq
-        #   whenever enough short items remain to amortize a Metal launch.
+        # Concurrent hetero (deterministic static split) vs hetero2 (dynamic work-stealing):
+        # - `hetero`: ANE owns all short <= max_ane_cap items deterministically; GPU owns > max_ane_cap items.
+        # - `hetero2`: ANE drains from head of short_dq while GPU finishes long items and steals from tail of short_dq.
+        allow_stealing = eff_mode == "hetero2"
         short_dq = deque(sorted(short_items, key=lambda it: len(it[1])))
         mu = threading.Lock()
         errors: list[BaseException] = []
-        counts = {"ane_items": 0, "ane_buckets": 0, "gpu_items": 0}
+        counts = {"ane_items": 0, "ane_buckets": 0, "gpu_items": 0, "gpu_stolen_items": 0}
         steal_min_chunk = max(4, min(batch_size, 16))
         ane_chunk_take = max(8, self.pipe_depth * 2)
 
@@ -870,10 +1132,10 @@ class FastPplx:
                     _run_gpu_subset(long_items)
                     with mu:
                         counts["gpu_items"] += len(long_items)
-                if eff_mode in ("hetero", "hetero2"):
+                if allow_stealing:
                     while True:
                         with mu:
-                            # Leave at least 2 small items if almost done so ANE finishes quickly cleanly.
+                            # Leave at least a few small items if almost done so ANE finishes cleanly.
                             if len(short_dq) < steal_min_chunk:
                                 break
                             take_n = min(batch_size, max(1, len(short_dq) // 2))
@@ -881,6 +1143,7 @@ class FastPplx:
                         _run_gpu_subset(stolen)
                         with mu:
                             counts["gpu_items"] += len(stolen)
+                            counts["gpu_stolen_items"] += len(stolen)
             except BaseException as exc:
                 errors.append(exc)
 
@@ -893,11 +1156,14 @@ class FastPplx:
         if errors:
             raise errors[0]
 
-        self.last_stats = {
-            "mode": eff_mode,
-            **counts,
-            "elapsed_s": round(time.perf_counter() - t0, 4),
-        }
+        self._set_call_stats(
+            {
+                "mode": eff_mode,
+                **counts,
+                "deterministic": not allow_stealing,
+                "elapsed_s": round(time.perf_counter() - t0, 4),
+            }
+        )
         return ctx_out if contextual_docs is not None else flat_out
 
     def encode_tokens(

@@ -12,10 +12,12 @@ import shutil
 import time
 from pathlib import Path
 
-import coremltools as ct
-from coremltools.converters.mil import Builder as mb
-from coremltools.converters.mil.mil import types
 import numpy as np
+
+# Smallest positive normal IEEE-754 binary16 value: 2^-14 ~= 6.103515625e-5.
+# Clamping LayerNorm epsilon to >= MIN_FP16_LAYERNORM_EPS prevents np.float16(1e-12)
+# from underflowing to exact 0.0 in FP16 CoreML/ANE graphs (rsqrt(var + 0.0) -> Inf/NaN).
+MIN_FP16_LAYERNORM_EPS: float = float(np.finfo(np.float16).tiny)
 
 # Production zero-GPU-contention bucket suite matching Native/Python engine routing.
 PRODUCTION_BUCKETS = [
@@ -30,14 +32,39 @@ PRODUCTION_BUCKETS = [
     (1, 512),
 ]
 
+# Optional single-query S=256 bucket eliminating the 193..256 -> 320 query padding gap.
+OPTIONAL_QUERY_BUCKETS = [
+    (1, 256),
+]
+
+
+def safe_fp16_layernorm_epsilon(eps: float = 1e-12) -> np.float16:
+    """Return an FP16-representable positive normal LayerNorm epsilon (>= 2^-14)."""
+    clamped = max(float(eps), MIN_FP16_LAYERNORM_EPS)
+    val = np.float16(clamped)
+    if not np.isfinite(val) or float(val) < MIN_FP16_LAYERNORM_EPS:
+        val = np.float16(MIN_FP16_LAYERNORM_EPS)
+    return val
+
 
 def repo_root() -> Path:
     return Path(os.environ.get("FAST_BGE_SMALL_HOME") or Path(__file__).resolve().parent.parent)
 
 
-def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len: int):
+def build_bert_ane_mil(
+    weights: dict[str, np.ndarray],
+    batch_size: int,
+    seq_len: int,
+    *,
+    layer_norm_eps: float = 1e-12,
+):
     """Build channel-first [B, 384, 1, S] BGE-small body with Layer-11 [CLS] slice."""
+    import coremltools as ct
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+
     scale_val = np.float16(1.0 / np.sqrt(32.0))
+    ln_eps = safe_fp16_layernorm_epsilon(layer_norm_eps)
 
     @mb.program(
         input_specs=[
@@ -49,7 +76,7 @@ def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len:
     def bge_body(emb_sum, ext_mask):
         emb_ln_w = mb.const(val=weights["embeddings.LayerNorm.weight"].astype(np.float16), name="emb_ln_w")
         emb_ln_b = mb.const(val=weights["embeddings.LayerNorm.bias"].astype(np.float16), name="emb_ln_b")
-        h = mb.layer_norm(x=emb_sum, axes=[1], gamma=emb_ln_w, beta=emb_ln_b, epsilon=np.float16(1e-12))
+        h = mb.layer_norm(x=emb_sum, axes=[1], gamma=emb_ln_w, beta=emb_ln_b, epsilon=ln_eps)
 
         for l in range(11):
             p = f"encoder.layer.{l}."
@@ -84,7 +111,7 @@ def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len:
             h = mb.add(x=ao, y=h)
             ln1w = mb.const(val=weights[p + "attention.output.LayerNorm.weight"].astype(np.float16), name=f"l{l}_ln1w")
             ln1b = mb.const(val=weights[p + "attention.output.LayerNorm.bias"].astype(np.float16), name=f"l{l}_ln1b")
-            h = mb.layer_norm(x=h, axes=[1], gamma=ln1w, beta=ln1b, epsilon=np.float16(1e-12))
+            h = mb.layer_norm(x=h, axes=[1], gamma=ln1w, beta=ln1b, epsilon=ln_eps)
 
             wup = weights[p + "intermediate.dense.weight"][:, :, None, None].astype(np.float16)
             bup = weights[p + "intermediate.dense.bias"].astype(np.float16)
@@ -96,7 +123,7 @@ def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len:
             h = mb.add(x=dn, y=h)
             ln2w = mb.const(val=weights[p + "output.LayerNorm.weight"].astype(np.float16), name=f"l{l}_ln2w")
             ln2b = mb.const(val=weights[p + "output.LayerNorm.bias"].astype(np.float16), name=f"l{l}_ln2b")
-            h = mb.layer_norm(x=h, axes=[1], gamma=ln2w, beta=ln2b, epsilon=np.float16(1e-12))
+            h = mb.layer_norm(x=h, axes=[1], gamma=ln2w, beta=ln2b, epsilon=ln_eps)
 
         p = "encoder.layer.11."
         h_cls = mb.slice_by_index(x=h, begin=[0, 0, 0, 0], end=[batch_size, 384, 1, 1])
@@ -135,7 +162,7 @@ def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len:
             axes=[1],
             gamma=mb.const(val=weights[p + "attention.output.LayerNorm.weight"].astype(np.float16), name="l11_ln1w"),
             beta=mb.const(val=weights[p + "attention.output.LayerNorm.bias"].astype(np.float16), name="l11_ln1b"),
-            epsilon=np.float16(1e-12),
+            epsilon=ln_eps,
         )
         wup11 = weights[p + "intermediate.dense.weight"][:, :, None, None].astype(np.float16)
         bup11 = weights[p + "intermediate.dense.bias"].astype(np.float16)
@@ -150,21 +177,30 @@ def build_bert_ane_mil(weights: dict[str, np.ndarray], batch_size: int, seq_len:
             axes=[1],
             gamma=mb.const(val=weights[p + "output.LayerNorm.weight"].astype(np.float16), name="l11_ln2w"),
             beta=mb.const(val=weights[p + "output.LayerNorm.bias"].astype(np.float16), name="l11_ln2b"),
-            epsilon=np.float16(1e-12),
+            epsilon=ln_eps,
         )
         return mb.squeeze(x=hc, axes=[2, 3], name="cls_emb")
 
     return bge_body
 
 
-def compile_bucket(weights: dict[str, np.ndarray], ane_dir: Path, batch_size: int, seq_len: int) -> Path:
+def compile_bucket(
+    weights: dict[str, np.ndarray],
+    ane_dir: Path,
+    batch_size: int,
+    seq_len: int,
+    *,
+    layer_norm_eps: float = 1e-12,
+) -> Path:
+    import coremltools as ct
+
     tag = f"bge_b{batch_size}_s{seq_len}_fp16"
     out_mlmodelc = ane_dir / f"{tag}.mlmodelc"
     if out_mlmodelc.exists():
         shutil.rmtree(out_mlmodelc)
 
     t0 = time.perf_counter()
-    prog = build_bert_ane_mil(weights, batch_size, seq_len)
+    prog = build_bert_ane_mil(weights, batch_size, seq_len, layer_norm_eps=layer_norm_eps)
     mlmodel = ct.convert(
         prog,
         minimum_deployment_target=ct.target.macOS15,
@@ -180,6 +216,11 @@ def compile_bucket(weights: dict[str, np.ndarray], ane_dir: Path, batch_size: in
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile CoreML .mlmodelc ANE buckets.")
     parser.add_argument("--home", type=Path, default=repo_root())
+    parser.add_argument(
+        "--include-s256-query",
+        action="store_true",
+        help="Also build optional bge_b1_s256_fp16.mlmodelc single-query bucket (fills 193..256 gap).",
+    )
     args = parser.parse_args()
 
     home = args.home.resolve()
@@ -191,7 +232,11 @@ def main() -> None:
     ane_dir.mkdir(parents=True, exist_ok=True)
     weights = dict(np.load(npz_path))
 
-    for b, s in PRODUCTION_BUCKETS:
+    buckets = list(PRODUCTION_BUCKETS)
+    if args.include_s256_query:
+        buckets.extend(OPTIONAL_QUERY_BUCKETS)
+
+    for b, s in buckets:
         compile_bucket(weights, ane_dir, b, s)
 
 

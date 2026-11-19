@@ -123,6 +123,41 @@ def test_kev08b_choice_and_score_distributions() -> None:
     assert probs_choice[1] == max(probs_choice), f"Expected 'storage', got {probs_choice}"
 
 
+def test_kev08b_multi_branch_shared_prefix_parity_and_limit_restore() -> None:
+    """Verify multi-branch zero-GDN-clone scoring matches single-question B=1 and restores MLX limits."""
+    import mlx.core as mx
+
+    kev_dir = resolve_kev_dir()
+    if not (kev_dir / "model_w8.safetensors").exists() and not (kev_dir / "model.safetensors").exists():
+        pytest.skip(f"Missing Kev-0.8B artifacts in {kev_dir}")
+
+    doc0 = _SAMPLE_CASES[0][0]
+    doc1 = _SAMPLE_CASES[1][0]
+    q0_list = [_SAMPLE_CASES[0][1], _SAMPLE_CASES[2][1], _SAMPLE_CASES[3][1]]
+    q1_list = [_SAMPLE_CASES[1][1], _SAMPLE_CASES[0][1]]
+
+    prev_cache_before = mx.set_cache_limit(mx.set_cache_limit(256 << 20))
+    mx.set_cache_limit(prev_cache_before)
+
+    with acquire_hw_lock("test_kev08b_multi_branch"):
+        kev = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=2, max_branch_batch=3)
+        try:
+            ref0 = [kev.score_multi_states([(doc0, [q])], batch_docs=1)[0][0][0] for q in q0_list]
+            ref1 = [kev.score_multi_states([(doc1, [q])], batch_docs=1)[0][0][0] for q in q1_list]
+            batched = kev.score_multi_states([(doc0, q0_list), (doc1, q1_list)], batch_docs=2)
+        finally:
+            kev.close()
+
+    cache_after = mx.set_cache_limit(prev_cache_before)
+    assert cache_after == prev_cache_before
+
+    assert len(batched) == 2 and len(batched[0]) == 3 and len(batched[1]) == 2
+    for idx, (r_probs, (b_probs, _)) in enumerate(zip(ref0, batched[0])):
+        assert max(abs(a - b) for a, b in zip(r_probs, b_probs)) < 1.5e-2, f"doc0 q[{idx}] drift: {r_probs} vs {b_probs}"
+    for idx, (r_probs, (b_probs, _)) in enumerate(zip(ref1, batched[1])):
+        assert max(abs(a - b) for a, b in zip(r_probs, b_probs)) < 1.5e-2, f"doc1 q[{idx}] drift: {r_probs} vs {b_probs}"
+
+
 def test_laya_ane_compute_plan_and_batch_parity() -> None:
     laya_dir = resolve_laya_dir()
     if not (laya_dir / "laya_typed_s512_w8.mlmodelc").exists():

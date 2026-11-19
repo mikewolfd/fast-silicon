@@ -11,9 +11,13 @@ try:
         check_system_quiescence,
         check_tensor_dtypes,
         clear_mlx_arena,
+        collect_env_telemetry,
         cos_sim,
+        get_unified_memory_footprint,
         interleaved_abba,
         main,
+        peak_footprint_gb,
+        wired_limit,
     )
 except ImportError:
     _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -23,18 +27,26 @@ except ImportError:
         check_system_quiescence,
         check_tensor_dtypes,
         clear_mlx_arena,
+        collect_env_telemetry,
         cos_sim,
+        get_unified_memory_footprint,
         interleaved_abba,
         main,
+        peak_footprint_gb,
+        wired_limit,
     )
 
 __all__ = [
     "check_system_quiescence",
     "check_tensor_dtypes",
     "clear_mlx_arena",
+    "collect_env_telemetry",
     "cos_sim",
+    "get_unified_memory_footprint",
     "interleaved_abba",
     "main",
+    "peak_footprint_gb",
+    "wired_limit",
 ]
 
 if __name__ == "__main__":

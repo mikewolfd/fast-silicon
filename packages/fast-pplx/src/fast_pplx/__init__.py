@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
-from .paths import RepoPaths, require_runtime_paths, resolve_paths
+from .paths import RepoPaths, require_runtime_paths, resolve_home, resolve_paths
 
 if TYPE_CHECKING:
     from .engine import FastPplx
@@ -43,5 +43,6 @@ __all__ = [
     "PplxConfig",
     "RepoPaths",
     "require_runtime_paths",
+    "resolve_home",
     "resolve_paths",
 ]

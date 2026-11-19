@@ -446,3 +446,312 @@ def test_streamed_gdn_sdpa_whole_in_proj_parity_cpu(monkeypatch: pytest.MonkeyPa
         assert np.allclose(np.array(whole, dtype=np.float32), np.array(streamed, dtype=np.float32), atol=2e-4, rtol=1e-4)
     finally:
         mx.set_default_device(prev_dev)
+
+
+def test_resolve_home_checks_artifacts_and_fallbacks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fast_pplx.paths import resolve_home
+
+    monkeypatch.delenv("FAST_PPLX_HOME", raising=False)
+    monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
+
+    # Fake monorepo layout: <tmp>/work/fast-silicon/packages/fast-pplx/src/fast_pplx/paths.py
+    pkg_dir = tmp_path / "work" / "fast-silicon" / "packages" / "fast-pplx"
+    anchor = pkg_dir / "src" / "fast_pplx" / "paths.py"
+    anchor.parent.mkdir(parents=True)
+    anchor.write_text("# stub\n", encoding="utf-8")
+    # Put pyproject.toml + native/ + build/ inside pkg_dir, WITHOUT artifacts/
+    (pkg_dir / "pyproject.toml").write_text("[project]\nname='fast-pplx'\n", encoding="utf-8")
+    (pkg_dir / "native").mkdir()
+    (pkg_dir / "build").mkdir()
+
+    # 1. Must NOT stop on native/ or pyproject.toml; falls back to ~/.cache/fast-pplx when nothing has artifacts/
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    assert resolve_home(_anchor_file=anchor) == (fake_home / ".cache" / "fast-pplx").resolve()
+
+    # 2. Populated ~/.cache/fast-pplx/artifacts resolves to cache dir while build_dir falls back to pkg_dir/build
+    (fake_home / ".cache" / "fast-pplx" / "artifacts").mkdir(parents=True)
+    p_cache = resolve_paths(_anchor_file=anchor)
+    assert p_cache.home == (fake_home / ".cache" / "fast-pplx").resolve()
+    assert p_cache.build_dir == (pkg_dir / "build").resolve()
+
+    # 3. Sibling checkout <tmp>/work/fast-pplx/artifacts beats ~/.cache
+    sib_dir = tmp_path / "work" / "fast-pplx"
+    (sib_dir / "artifacts").mkdir(parents=True)
+    assert resolve_home(_anchor_file=anchor) == sib_dir.resolve()
+
+    # 4. FAST_ARTIFACTS_ROOT/fast-pplx/artifacts beats sibling checkout
+    art_root = tmp_path / "shared_artifacts"
+    (art_root / "fast-pplx" / "artifacts").mkdir(parents=True)
+    monkeypatch.setenv("FAST_ARTIFACTS_ROOT", str(art_root))
+    assert resolve_home(_anchor_file=anchor) == (art_root / "fast-pplx").resolve()
+
+    # 5. Direct artifacts/ inside pkg_dir beats FAST_ARTIFACTS_ROOT
+    (pkg_dir / "artifacts").mkdir()
+    assert resolve_home(_anchor_file=anchor) == pkg_dir.resolve()
+
+
+def test_tf32_telemetry_chip_gated_attention_and_fp32_norms(tmp_path: Path) -> None:
+    import os
+    from fast_pplx.gpu import (
+        FastPplxGPU,
+        PplxAttention,
+        PplxRMSNorm,
+        _detect_gpu_family_info,
+        get_mlx_runtime_telemetry,
+        normalize_qk,
+    )
+
+    assert os.environ.get("MLX_ENABLE_TF32") == "0"
+    tel = get_mlx_runtime_telemetry()
+    assert tel["mlx_enable_tf32"] == "0"
+    assert "is_apple10" in tel and "sdpa_slice_len" in tel
+
+    # Apple9 (M4 Pro) -> 512; Apple10 (M5 26.2+) -> 1024; M5 pre-26.2 -> 512
+    m4 = _detect_gpu_family_info({"device_name": "Apple M4 Pro", "architecture": "applegpu_g16s"}, "26.6")
+    assert m4["is_apple10"] is False and m4["sdpa_slice_len"] == 512
+    m5 = _detect_gpu_family_info({"device_name": "Apple M5", "architecture": "applegpu_g17g"}, "26.2")
+    assert m5["is_apple10"] is True and m5["nax_sdpa_eligible"] is True and m5["sdpa_slice_len"] == 1024
+    m5_old = _detect_gpu_family_info({"device_name": "Apple M5", "architecture": "applegpu_g17g"}, "26.0")
+    assert m5_old["is_apple10"] is True and m5_old["nax_sdpa_eligible"] is False and m5_old["sdpa_slice_len"] == 512
+
+    cfg = PplxConfig(
+        hidden_size=64, num_hidden_layers=2, intermediate_size=128,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=32, rope_dim=8,
+        layer_types=("linear_attention", "full_attention"),
+    )
+    attn_m5 = PplxAttention(cfg, gpu_family=m5)
+    attn_m4 = PplxAttention(cfg, gpu_family=m4)
+    assert attn_m5.sdpa_slice_len == 1024
+    assert attn_m4.sdpa_slice_len == 512
+
+    # Bool mask must be rejected on PplxAttention fast path
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        x_small = mx.ones((1, 4, 64), dtype=mx.float16)
+        with pytest.raises(TypeError, match="SDPA mask"):
+            attn_m5(x_small, sdpa_mask=mx.ones((1, 1, 4, 4), dtype=mx.bool_))
+        # Causal string fast path works with zero array mask allocation
+        out_causal = attn_m5(x_small, sdpa_mask="causal")
+        mx.eval(out_causal)
+        assert out_causal.shape == (1, 4, 64)
+
+        # normalize_qk protects tiny FP16 inputs (where eps/128 < 2^-24) & large >256 inputs against overflow
+        q_large = mx.full((1, 2, 2, 128), 512.0, dtype=mx.float16)
+        k_tiny = mx.full((1, 2, 2, 128), 1e-4, dtype=mx.float16)
+        qn, kn = normalize_qk(q_large, k_tiny, inv_scale=128.0 ** -0.5, eps=1e-6)
+        mx.eval(qn, kn)
+        assert np.all(np.isfinite(np.array(qn, dtype=np.float32)))
+        assert np.all(np.isfinite(np.array(kn, dtype=np.float32)))
+        assert qn.dtype == mx.float16 and kn.dtype == mx.float16
+
+        # PplxRMSNorm protects deep FP16 residual outliers (>256) from x*x FP16 overflow
+        norm = PplxRMSNorm(16, eps=1e-6)
+        big_x = mx.full((1, 2, 16), 2048.0, dtype=mx.float16)
+        normed = norm(big_x)
+        mx.eval(normed)
+        assert np.all(np.isfinite(np.array(normed, dtype=np.float32)))
+        assert np.allclose(np.array(normed, dtype=np.float32), 1.0, atol=1e-2)
+
+        # _embed_inputs gathers MappedEmbedding as float16 even for bfloat16 (no CPU float32 upcast)
+        seen_dtypes: list[str] = []
+
+        class _SpyMapped:
+            def gather(self, ids, *, out_dtype="float16"):
+                seen_dtypes.append(str(out_dtype))
+                return np.ones((*ids.shape, 8), dtype=np.float16)
+
+        stub = object.__new__(FastPplxGPU)
+        stub._mapped_embed = _SpyMapped()
+        stub.dtype_name = "bfloat16"
+        stub.act_dtype = mx.bfloat16
+        emb = stub._embed_inputs(np.array([[1, 2]], dtype=np.int32))
+        mx.eval(emb)
+        assert seen_dtypes == ["float16"]
+        assert emb.dtype == mx.bfloat16
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_parquet_int8_streaming_sharded_resume_and_cli_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fast_pplx.parquet_pipeline import embed_contextual_parquet, embed_parquet
+
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+
+    in_pq = tmp_path / "docs.parquet"
+    doc_a = " ".join(["hello world chunk one two"] * 6)
+    doc_b = " ".join(["chunk two hello world one"] * 6)
+    pq.write_table(pa.table({"doc_id": ["a", "b", "empty"], "text": [doc_a, doc_b, "   "]}), in_pq)
+
+    encode_calls = {"ctx": 0, "flat": 0}
+
+    class _Int8Engine:
+        dim = 16
+        max_dim = 16
+        max_seq_len = 512
+        supports_dimensions = True
+        tokenizer = tok
+
+        def encode_contextual_chunks(self, docs, *, dimensions=None, output_dtype="float32", normalize=True, mode=None):
+            encode_calls["ctx"] += 1
+            d = dimensions or self.dim
+            dt = {"int8": np.int8, "float16": np.float16, "float32": np.float32}[output_dtype]
+            return [np.full((len(chunks), d), 42 if output_dtype == "int8" else 0.5, dtype=dt) for chunks in docs]
+
+        def encode_corpus(self, tok_lists, *, dimensions=None, output_dtype="float32", normalize=True, mode=None):
+            encode_calls["flat"] += 1
+            d = dimensions or self.dim
+            dt = {"int8": np.int8, "float16": np.float16, "float32": np.float32}[output_dtype]
+            return np.full((len(tok_lists), d), -17 if output_dtype == "int8" else 0.25, dtype=dt)
+
+        def close(self):
+            pass
+
+    eng = _Int8Engine()
+
+    # 1. Contextual single-file int8 output
+    out_ctx_file = tmp_path / "ctx_i8.parquet"
+    s1 = embed_contextual_parquet(
+        eng, in_pq, out_ctx_file, chunk_tokens=10, context_tokens=24, overlap=2,
+        dimensions=8, dtype="int8", skip_empty=True,
+    )
+    assert s1.rows_read == 3
+    assert s1.rows_emitted >= 4
+    tbl = pq.read_table(out_ctx_file)
+    assert tbl.schema.field("vector").type == pa.list_(pa.int8(), 8)
+    assert all(v == 42 for v in tbl["vector"][0].as_py())
+
+    # 2. Contextual sharded directory + --resume skips completed shards without re-encoding
+    out_shards = tmp_path / "ctx_shards"
+    encode_calls["ctx"] = 0
+    s2 = embed_contextual_parquet(
+        eng, in_pq, out_shards, chunk_tokens=10, context_tokens=24, overlap=2,
+        dimensions=8, dtype="int8", shard_rows=2, resume=False,
+    )
+    shards = sorted(out_shards.glob("part-*.parquet"))
+    assert len(shards) >= 2
+    first_calls = encode_calls["ctx"]
+    assert first_calls >= 2
+
+    encode_calls["ctx"] = 0
+    _ = embed_contextual_parquet(
+        eng, in_pq, out_shards, chunk_tokens=10, context_tokens=24, overlap=2,
+        dimensions=8, dtype="int8", shard_rows=2, resume=True,
+    )
+    assert encode_calls["ctx"] == 0  # Every existing shard matched row count and was skipped!
+
+    # 3. Non-contextual embed_parquet supports int8 streaming
+    out_flat_i8 = tmp_path / "flat_i8.parquet"
+    s3 = embed_parquet(eng, in_pq, out_flat_i8, text_col="text", dimensions=8, dtype="int8", skip_empty=True)
+    assert s3.rows_emitted == 2
+    flat_tbl = pq.read_table(out_flat_i8)
+    assert flat_tbl.schema.field("vector").type == pa.list_(pa.int8(), 8)
+    assert all(v == -17 for v in flat_tbl["vector"][0].as_py())
+
+    # 4. CLI forwards --resume, --shard-rows, --encode-batch-rows, --skip-empty, --query-prefix, --dtype int8
+    captured: dict[str, object] = {}
+
+    def _spy_ctx(*args, **kwargs):
+        captured.update(kwargs)
+        from fast_shared.parquet_pipeline import ParquetEmbedSummary
+
+        return ParquetEmbedSummary(1, 1, 1, 10, 0.01, tmp_path / "out")
+
+    monkeypatch.setattr("fast_pplx.cli.warn_if_untested_hardware", lambda *a, **k: False)
+    monkeypatch.setattr("fast_pplx.cli._make_engine", lambda a, **kw: eng)
+    monkeypatch.setattr("fast_pplx.cli.embed_contextual_parquet", _spy_ctx)
+
+    rc = cli_main([
+        "parquet", "--input", str(in_pq), "--output", str(tmp_path / "cli_out"),
+        "--context-tokens", "2048", "--chunk-tokens", "256", "--dtype", "int8",
+        "--resume", "--shard-rows", "128", "--encode-batch-rows", "64",
+        "--skip-empty", "--query-prefix",
+    ])
+    assert rc == 0
+    assert captured["resume"] is True
+    assert captured["shard_rows"] == 128
+    assert captured["encode_batch_rows"] == 64
+    assert captured["skip_empty"] is True
+    assert captured["add_query_prefix"] is True
+    assert captured["dtype"] == "int8"
+
+    # Verify new `verify` and upgraded `bench` CLI flags parse cleanly
+    p = build_parser()
+    assert p.parse_args(["verify", "--mode", "gpu", "--json"]).command == "verify"
+    b_ns = p.parse_args(["bench", "--mode", "all", "--runs", "2", "--timing-scope", "e2e"])
+    assert b_ns.mode == "all" and b_ns.runs == 2 and b_ns.timing_scope == "e2e"
+
+
+def test_thread_safe_last_stats_and_hetero_vs_hetero2_deterministic(tmp_path: Path) -> None:
+    import time as _time
+    from fast_pplx.engine import FastPplx
+
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+
+    class _MockGPU:
+        max_seq_len = 32768
+
+        def encode_tokens(self, token_lists, *, batch_size=16, dimensions=None, output_dtype="float32", normalize=True):
+            return np.ones((len(token_lists), dimensions or 16), dtype=np.float32)
+
+        def close(self):
+            pass
+
+    class _MockANE:
+        caps = (64, 128)
+        max_cap = 128
+
+        def run_buckets(self, buckets, *, out_dim, apply_tanh_int8, apply_l2_norm):
+            _time.sleep(0.005)
+            out = []
+            for bkt in buckets:
+                live = [t for t in bkt.targets if t.end > t.start]
+                out.append((bkt, np.ones((len(live), out_dim), dtype=np.float32) * 2.0))
+            return out
+
+        def close(self):
+            pass
+
+    # 1. `hetero` is deterministic static partition (zero stealing); `hetero2` steals
+    with FastPplx(home=tmp_path, mode="hetero", _gpu_backend=_MockGPU(), _ane_backend=_MockANE(), _tokenizer=tok) as eng:
+        items = [[4, 5, 6] for _ in range(20)] + [[7] * 200]
+        _ = eng.encode_tokens(items, dimensions=16, mode="hetero")
+        st_h = eng.last_stats
+        assert st_h["deterministic"] is True
+        assert st_h["gpu_stolen_items"] == 0
+        assert st_h["ane_items"] == 20 and st_h["gpu_items"] == 1
+
+        # 2. Thread-local last_stats isolation across concurrent threads
+        results_by_thread: dict[str, dict[str, object]] = {}
+
+        def _worker(tag: str, mode_name: str, n_items: int) -> None:
+            _ = eng.encode_tokens([[4, 5]] * n_items, dimensions=16, mode=mode_name)
+            _time.sleep(0.01)
+            results_by_thread[tag] = eng.last_stats
+
+        t1 = threading.Thread(target=_worker, args=("gpu_t", "gpu", 3))
+        t2 = threading.Thread(target=_worker, args=("ane_t", "ane", 5))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert results_by_thread["gpu_t"]["mode"] == "gpu"
+        assert results_by_thread["gpu_t"]["gpu_items"] == 3
+        assert results_by_thread["ane_t"]["mode"] == "ane"
+        assert results_by_thread["ane_t"]["ane_items"] == 5
+
+    # 3. deterministic=True routes auto / hetero2 strictly to deterministic gpu
+    with FastPplx(
+        home=tmp_path, mode="auto", deterministic=True,
+        _gpu_backend=_MockGPU(), _ane_backend=_MockANE(), _tokenizer=tok,
+    ) as eng_det:
+        assert eng_det.default_mode == "gpu"
+        _ = eng_det.encode_tokens([[4, 5, 6]], dimensions=16, mode="hetero2")
+        assert eng_det.last_stats["mode"] == "gpu"
+        assert eng_det.last_stats["deterministic"] is True

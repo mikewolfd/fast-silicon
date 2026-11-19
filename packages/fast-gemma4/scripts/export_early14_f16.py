@@ -19,7 +19,7 @@ def main() -> int:
     paths = resolve_paths(args.home)
     model = FastGemma4Model(paths=paths, model_dir=args.model_dir, mlp_dtype="bfloat16", use_mpp=False)
     copy_tokenizer_files(model.model_dir, paths.tokenizer_dir)
-    weights_out = paths.resolve_early14_weights_npz(args.model_dir)
+    weights_out = paths.resolve_early14_weights_npz(args.model_dir, exit_layer=model.first_kv_shared - 1)
     out = model.export_early14_f16(weights_out)
     print(f"Exported {out} ({out.stat().st_size / (1024**3):.2f} GiB)")
     return 0

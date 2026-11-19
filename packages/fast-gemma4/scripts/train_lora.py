@@ -100,8 +100,39 @@ def build_length_bucketed_batches(
     return batches
 
 
+def _host_ram_gib() -> float:
+    try:
+        return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024.0**3)
+    except Exception:
+        return 0.0
+
+
+def compute_safe_memory_limit_gb(
+    requested_gb: float | None,
+    host_ram_gib: float,
+    max_rec_ws_bytes: int | None = None,
+    *,
+    force: bool = False,
+) -> float:
+    """Compute a safe MLX memory limit in GiB so <=24 GiB hosts (Base M5) never wedge macOS wired memory."""
+    if max_rec_ws_bytes is not None and int(max_rec_ws_bytes) > 0:
+        rec_gb = (int(max_rec_ws_bytes) / float(1024**3)) * 0.92
+    elif host_ram_gib > 0.0:
+        rec_gb = host_ram_gib * 0.75
+    else:
+        rec_gb = 18.0
+    if host_ram_gib > 0.0:
+        rec_gb = min(rec_gb, max(4.0, host_ram_gib - 4.0))
+    safe_cap = round(max(4.0, rec_gb), 2)
+    if requested_gb is None:
+        return round(min(38.0, safe_cap), 2)
+    if force:
+        return float(requested_gb)
+    return round(min(float(requested_gb), safe_cap), 2)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Train a Gemma-4 E2B LoRA on token pairs, then fuse and pack BF16->8bit")
+    ap = argparse.ArgumentParser(description="Train a Gemma-4 E2B/E4B LoRA on token pairs, then fuse and pack BF16->8bit")
     ap.add_argument("--base-snap", type=Path, default=DEFAULT_BF16_BASE_DIR)
     ap.add_argument("--pairs", type=Path, default=None, help="JSON of tokenized train/valid pairs; required unless --fuse-only")
     ap.add_argument("--checkpoint-config", type=Path, action="append", default=[],
@@ -123,7 +154,13 @@ def main() -> int:
     ap.add_argument("--data-seed", type=int, default=20261117, help="batch-order seed; change it for a warm restart")
     ap.add_argument("--seed", type=int, default=20261117, help="LoRA init and dropout seed")
     ap.add_argument("--train-only", action="store_true", help="stop after training; skip fuse, pack and ANE")
-    ap.add_argument("--memory-limit-gb", type=float, default=38.0, help="hard MLX memory limit")
+    ap.add_argument(
+        "--memory-limit-gb",
+        type=float,
+        default=None,
+        help="hard MLX memory limit in GiB (auto-clamped to host RAM / recommended working set unless --force-memory-limit)",
+    )
+    ap.add_argument("--force-memory-limit", action="store_true", help="Bypass host RAM safety clamp on --memory-limit-gb")
     ap.add_argument("--vocab-out", type=int, default=162304)
     ap.add_argument("--lr", type=float, default=1.8e-4)
     ap.add_argument("--min-lr", type=float, default=1.8e-5)
@@ -132,6 +169,8 @@ def main() -> int:
     ap.add_argument("--smoke-steps", type=int, default=0, help="Run N steps only to measure step timing")
     ap.add_argument("--fuse-only", action="store_true", help="Skip training and fuse+pack existing adapters_best")
     ap.add_argument("--skip-ane", action="store_true", help="Skip Step 3 CoreML ANE compilation")
+    ap.add_argument("--ane-variant", choices=("fp16", "w8", "both"), default="fp16", help="ANE bundle variant for Step 3")
+    ap.add_argument("--calib-file", type=Path, default=None, help="Optional domain corpus for AWQ-MSE W8 calibration")
     ap.add_argument("--no-hw-lock", action="store_true", help="do not wait on the shared GPU lock (fuse/pack beside a paused run)")
     args = ap.parse_args()
     if args.pairs is None and not args.fuse_only:
@@ -146,9 +185,28 @@ def main() -> int:
     from mlx_lm.tuner.utils import linear_to_lora_layers, print_trainable_parameters
     from mlx_lm.utils import load_model
 
-    # GPU memory is wired and cannot be paged out, so an overrun takes the Mac down rather than slowing it.
-    mx.set_memory_limit(int(args.memory_limit_gb * 1024**3))
+    # GPU memory is wired and cannot be paged out, so clamp cleanly to host RAM & Metal recommended working set.
+    host_ram = _host_ram_gib()
+    dev_info_fn = getattr(mx, "device_info", None)
+    max_rec_ws = int(dev_info_fn().get("max_recommended_working_set_size", 0)) if callable(dev_info_fn) else 0
+    eff_mem_limit_gb = compute_safe_memory_limit_gb(
+        args.memory_limit_gb, host_ram, max_rec_ws or None, force=args.force_memory_limit
+    )
+    if args.memory_limit_gb is not None and eff_mem_limit_gb < float(args.memory_limit_gb):
+        print(
+            f"[memory-clamp] Clamped --memory-limit-gb from {args.memory_limit_gb:.2f} GiB -> "
+            f"{eff_mem_limit_gb:.2f} GiB for {host_ram:.1f} GiB host.",
+            flush=True,
+        )
+    mx.set_memory_limit(int(eff_mem_limit_gb * 1024**3))
     mx.set_cache_limit(512 * 1024 * 1024)
+    prev_wired_limit: int | None = None
+    set_wl = getattr(mx, "set_wired_limit", None)
+    if callable(set_wl) and max_rec_ws > 0:
+        try:
+            prev_wired_limit = int(set_wl(max_rec_ws))
+        except Exception:
+            prev_wired_limit = None
     mx.random.seed(args.seed)
     random.seed(args.seed)
 
@@ -267,7 +325,18 @@ def main() -> int:
             tot_toks += n_ans
         return tot_loss / max(tot_toks, 1)
 
-    with contextlib.nullcontext() if args.no_hw_lock else acquire_hw_lock("train_lora"):
+    @contextlib.contextmanager
+    def _restore_wired_limit() -> Iterator[None]:
+        try:
+            yield
+        finally:
+            if prev_wired_limit is not None and callable(set_wl):
+                try:
+                    set_wl(prev_wired_limit)
+                except Exception:
+                    pass
+
+    with _restore_wired_limit(), (contextlib.nullcontext() if args.no_hw_lock else acquire_hw_lock("train_lora")):
         t_start = time.perf_counter()
         print(f"1. Loading native BF16 Gemma-4 base from {args.base_snap}...", flush=True)
         model, _ = load_model(args.base_snap, strict=False)
@@ -569,27 +638,33 @@ def main() -> int:
                 shutil.rmtree(tmp_bf16_dir, ignore_errors=True)
 
     # -------------------------------------------------------------------------
-    # Step 3: Compile Checkpoint-Scoped Early14 Linear-W8 + AWQ-MSE ANE Bundle
+    # Step 3: Compile Checkpoint-Scoped Early14/Early23 ANE Bundle
     # -------------------------------------------------------------------------
-    if not args.skip_ane:
-        print("5. Compiling checkpoint-scoped Linear-W8 + AWQ-MSE Early14 ANE prefill bundle...", flush=True)
+    if args.skip_ane:
+        stale_local_ane = args.out_model_dir / "ane_models"
+        if stale_local_ane.exists():
+            shutil.rmtree(stale_local_ane, ignore_errors=True)
+            print(f"5. Removed stale local ANE directory {stale_local_ane} (--skip-ane).", flush=True)
+    else:
+        print(f"5. Compiling checkpoint-scoped {args.ane_variant} EarlyExit ANE prefill bundle...", flush=True)
         env_ane = dict(os.environ)
         env_ane["PYTHONPATH"] = str(REPO_ROOT / "src")
-        subprocess.check_call(
-            [
-                str(DEFAULT_FG4_PYTHON),
-                str(REPO_ROOT / "scripts" / "build_ane_models.py"),
-                "--home",
-                str(REPO_ROOT),
-                "--model-dir",
-                str(args.out_model_dir),
-                "--variant",
-                "w8",
-                "--awq-mse",
-                "--reexport",
-            ],
-            env=env_ane,
-        )
+        ane_cmd = [
+            str(DEFAULT_FG4_PYTHON),
+            str(REPO_ROOT / "scripts" / "build_ane_models.py"),
+            "--home",
+            str(REPO_ROOT),
+            "--model-dir",
+            str(args.out_model_dir),
+            "--variant",
+            args.ane_variant,
+            "--reexport",
+        ]
+        if args.ane_variant in ("w8", "both"):
+            ane_cmd.append("--awq-mse")
+            if args.calib_file is not None:
+                ane_cmd.extend(["--calib-file", str(args.calib_file)])
+        subprocess.check_call(ane_cmd, env=env_ane)
 
     print(f"ALL 3 STEPS COMPLETE in {(time.perf_counter() - t_start) / 60.0:.2f} min -> {args.out_model_dir}", flush=True)
     return 0

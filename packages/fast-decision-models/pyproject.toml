@@ -12,7 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "fast-shared",
     "huggingface-hub>=0.25",
-    "mlx>=0.25",
+    "mlx>=0.32.4",
     "numpy>=1.26",
     "tokenizers>=0.20",
 ]

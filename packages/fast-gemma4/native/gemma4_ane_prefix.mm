@@ -42,6 +42,7 @@ struct BridgeScatterParams {
     uint is_ring;
     uint src_row_f16;
     uint chunk_s;
+    uint n_kv;
 };
 
 template <uint D>
@@ -52,49 +53,65 @@ inline void quant_scatter_layer_tok(
     constant BridgeScatterParams& p,
     uint lane,
     uint tok,
-    uint l_idx)
+    uint lh_idx)
 {
     if (tok >= p.valid_len) return;
     constexpr uint NV = D / 128;
-    size_t src_row = (size_t)l_idx * (size_t)p.chunk_s + (size_t)tok;
+    const uint n_kv = max(1u, p.n_kv);
+    const uint l_idx = lh_idx / n_kv;
+    const uint kv_h = lh_idx % n_kv;
+    size_t src_row = (size_t)lh_idx * (size_t)p.chunk_s + (size_t)tok;
     const device half* kp = k_iso + src_row * (size_t)p.src_row_f16 + lane * 4u;
     const device half* vp = v_iso + src_row * (size_t)p.src_row_f16 + lane * 4u;
 
     float4 kv[NV], vv[NV];
     float kamax = 0.0f, vamax = 0.0f;
+    bool bad = false;
     #pragma unroll
     for (uint r = 0; r < NV; ++r) {
         kv[r] = float4(*(const device half4*)(kp + 128u * r));
         vv[r] = float4(*(const device half4*)(vp + 128u * r));
+        if (any(isnan(kv[r])) || any(isinf(kv[r])) || any(isnan(vv[r])) || any(isinf(vv[r]))) {
+            bad = true;
+        }
         float4 ka = abs(kv[r]);
         float4 va = abs(vv[r]);
         kamax = max(kamax, max(max(ka.x, ka.y), max(ka.z, ka.w)));
         vamax = max(vamax, max(max(va.x, va.y), max(va.z, va.w)));
     }
+    bad = simd_any(bad);
     kamax = simd_max(kamax);
     vamax = simd_max(vamax);
     float ks = max(kamax * (1.0f / 127.0f), 1e-6f);
     float vs = max(vamax * (1.0f / 127.0f), 1e-6f);
+    if (!isfinite(ks) || !isfinite(vs) || ks > 65504.0f || vs > 65504.0f) {
+        bad = true;
+    }
 
     uint pos = p.priv_off + tok;
     if (p.is_ring != 0u) {
         pos &= (p.cap - 1u);
     }
 
-    size_t st = (size_t)p.doc_slot * (size_t)p.cap + (size_t)pos;
+    size_t st_h = ((size_t)p.doc_slot * (size_t)p.cap + (size_t)pos) * (size_t)n_kv + (size_t)kv_h;
     LayerDestPtrs dst = dst_tbl[l_idx];
     if (lane == 0u) {
-        dst.ks[st] = (half)ks;
-        dst.vs[st] = (half)vs;
+        dst.ks[st_h] = bad ? (half)NAN : (half)ks;
+        dst.vs[st_h] = bad ? (half)NAN : (half)vs;
     }
-    device int8_t* kd = dst.k + st * (size_t)D + lane * 4u;
-    device int8_t* vd = dst.v + st * (size_t)D + lane * 4u;
+    device int8_t* kd = dst.k + st_h * (size_t)D + lane * 4u;
+    device int8_t* vd = dst.v + st_h * (size_t)D + lane * 4u;
     #pragma unroll
     for (uint r = 0; r < NV; ++r) {
-        float4 kq = clamp(rint(metal::precise::divide(kv[r], float4(ks))), -127.0f, 127.0f);
-        float4 vq = clamp(rint(metal::precise::divide(vv[r], float4(vs))), -127.0f, 127.0f);
-        *(device char4*)(kd + 128u * r) = char4((char)kq.x, (char)kq.y, (char)kq.z, (char)kq.w);
-        *(device char4*)(vd + 128u * r) = char4((char)vq.x, (char)vq.y, (char)vq.z, (char)vq.w);
+        if (bad) {
+            *(device char4*)(kd + 128u * r) = char4(0);
+            *(device char4*)(vd + 128u * r) = char4(0);
+        } else {
+            float4 kq = clamp(rint(metal::precise::divide(kv[r], float4(ks))), -127.0f, 127.0f);
+            float4 vq = clamp(rint(metal::precise::divide(vv[r], float4(vs))), -127.0f, 127.0f);
+            *(device char4*)(kd + 128u * r) = char4((char)kq.x, (char)kq.y, (char)kq.z, (char)kq.w);
+            *(device char4*)(vd + 128u * r) = char4((char)vq.x, (char)vq.y, (char)vq.z, (char)vq.w);
+        }
     }
 }
 
@@ -138,6 +155,7 @@ struct HostBridgeScatterParams {
     uint32_t is_ring;
     uint32_t src_row_f16;
     uint32_t chunk_s;
+    uint32_t n_kv;
 };
 
 // Unlocked CVPixelBuffer + IOSurface + MLMultiArray + zero-copy MTLBuffer wrapper.
@@ -663,6 +681,26 @@ int gemma4_px_out_ring_size(void* handle) {
     return static_cast<int>(static_cast<PxHandle*>(handle)->out_slots.size());
 }
 
+int gemma4_px_get_dims(
+    void* handle,
+    int* out_H,
+    int* out_C_pli,
+    int* out_n_swa,
+    int* out_n_full_past,
+    int* out_n_full_out,
+    int* out_n_kv
+) {
+    if (!handle) return -1;
+    const auto* h = static_cast<const PxHandle*>(handle);
+    if (out_H) *out_H = h->H_dim;
+    if (out_C_pli) *out_C_pli = h->C_pli;
+    if (out_n_swa) *out_n_swa = h->n_swa;
+    if (out_n_full_past) *out_n_full_past = h->n_full_past;
+    if (out_n_full_out) *out_n_full_out = h->n_full_out;
+    if (out_n_kv) *out_n_kv = h->n_kv;
+    return 0;
+}
+
 void gemma4_px_free(void* handle) {
     if (!handle) return;
     @autoreleasepool {
@@ -942,8 +980,16 @@ void* gemma4_px_bind_slot_cache_i8(
     const uint64_t* full_nbytes
 ) {
     @autoreleasepool {
+        if (B_slots <= 0 || swa_cap <= 0 || full_cap <= 0 || n_swa <= 0 || n_full <= 0) {
+            return nullptr;
+        }
+        // `quant_scatter_layer_tok` wraps ring positions with `pos &= (p.cap - 1u)`.
+        if ((swa_cap & (swa_cap - 1)) != 0) {
+            fprintf(stderr, "gemma4_px_bind_slot_cache_i8 error: swa_cap=%d must be a power of 2\n", swa_cap);
+            return nullptr;
+        }
         auto* h = static_cast<PxHandle*>(handle);
-        if (!h || !h->dev || B_slots <= 0 || swa_cap <= 0 || full_cap <= 0 || n_swa <= 0 || n_full <= 0) {
+        if (!h || !h->dev || !swa_ptrs || !swa_nbytes || !full_ptrs || !full_nbytes) {
             return nullptr;
         }
         auto* bind = new PxSlotCacheBind();
@@ -1043,6 +1089,7 @@ double gemma4_px_scatter_ring_kv_i8(
                 return -1.0;
             }
 
+            const uint32_t eff_n_kv = static_cast<uint32_t>(std::max(1, h->n_kv));
             HostBridgeScatterParams ps = {
                 static_cast<uint32_t>(d_slot),
                 static_cast<uint32_t>(p_off),
@@ -1051,13 +1098,14 @@ double gemma4_px_scatter_ring_kv_i8(
                 1u,
                 static_cast<uint32_t>(osl.ks.row_bytes / 2),
                 static_cast<uint32_t>(h->S),
+                eff_n_kv,
             };
             [enc setComputePipelineState:h->pso_swa];
             [enc setBuffer:osl.ks.mtl offset:0 atIndex:0];
             [enc setBuffer:osl.vs.mtl offset:0 atIndex:1];
             [enc setBuffer:bind->swa_tbl_buf offset:0 atIndex:2];
             [enc setBytes:&ps length:sizeof(ps) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(1, eff_vl, static_cast<NSUInteger>(bind->n_swa))
+            [enc dispatchThreadgroups:MTLSizeMake(1, eff_vl, static_cast<NSUInteger>(bind->n_swa) * eff_n_kv)
                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
             HostBridgeScatterParams pf = {
@@ -1068,13 +1116,14 @@ double gemma4_px_scatter_ring_kv_i8(
                 0u,
                 static_cast<uint32_t>(osl.kf.row_bytes / 2),
                 static_cast<uint32_t>(h->S),
+                eff_n_kv,
             };
             [enc setComputePipelineState:h->pso_full];
             [enc setBuffer:osl.kf.mtl offset:0 atIndex:0];
             [enc setBuffer:osl.vf.mtl offset:0 atIndex:1];
             [enc setBuffer:bind->full_tbl_buf offset:0 atIndex:2];
             [enc setBytes:&pf length:sizeof(pf) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(1, eff_vl, static_cast<NSUInteger>(bind->n_full))
+            [enc dispatchThreadgroups:MTLSizeMake(1, eff_vl, static_cast<NSUInteger>(bind->n_full) * eff_n_kv)
                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
 

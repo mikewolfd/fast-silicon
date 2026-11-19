@@ -346,11 +346,16 @@ int main(int argc, char** argv) {
         ids.data(), pos.data(), span_offsets.data(), spans_se.data(), neg_inf_u16,
         h_all.data(), b_all.data(), cs_all.data(), ss_all.data(), cf_all.data(), sf_all.data()
     );
-    emb2_pk_exec_queue(
+    const double exec_ms = emb2_pk_exec_queue(
         handle, iters,
         h_all.data(), b_all.data(), cs_all.data(), ss_all.data(), cf_all.data(), sf_all.data(),
         out_all.data()
     );
+    if (exec_ms < 0.0) {
+        fprintf(stderr, "emb2_pk_exec_queue failed: %s\n", emb2_last_error());
+        emb2_pk_free(handle);
+        return 1;
+    }
     emb2_pool_project_batch(
         chosen_s, out_all.data(), iters, doc_lane_se.data(),
         emb_proj_T.data(), scratch_pooled.data(), out_embs.data()

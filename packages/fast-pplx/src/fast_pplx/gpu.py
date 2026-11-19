@@ -3,28 +3,40 @@
 Combines:
 - Pure MLX/Metal 12-layer hybrid Qwen3.5 backbone (alternating GatedDeltaNet +
   bidirectional Full Attention, overriding config ``full_attention_interval=4`` to ``2``)
-- Zero-centered ``+1.0`` weight shifts computed in ``float32`` on ``RMSNorm`` layers
+- Zero-centered ``+1.0`` weight shifts kept in ``float32`` on ``RMSNorm`` layers
   (leaving ``GatedRMSNorm`` unshifted and multiplied in ``float32``)
+- FP32 ``normalize_qk`` and ``PplxRMSNorm`` protecting against FP16 subnormal flush and
+  deep residual overflow while preserving ``bfloat16`` precision
 - Fused ``qkv_proj`` (``q+gate, k, v``) and ``gate_up_proj`` projections
-- Fast ``mx.float16`` GatedDeltaNet path (``S <= 2048``) with zero per-layer ``mx.eval``
-- Long-context streamed path (``S > 2048``, up to ``32K``) carrying recurrent GDN + Conv1d
-  state across ``1024``-token slices and tile-aligned ``512``-token ``SDPA`` slices
-- ``MappedEmbedding`` safetensors memmap keeping ``embed_tokens`` out of Metal GPU RAM
+- Fast ``mx.float16`` / ``mx.bfloat16`` GatedDeltaNet path (``S <= 2048``) with zero per-layer ``mx.eval``
+- Long-context streamed path (``S > 2048``, up to ``32K``) carrying FP32 recurrent GDN + Conv1d
+  state across ``1024``-token slices with async pipelining (``mx.async_eval``) and chip-gated
+  ``SDPA`` slices (``1024`` on M5 ``Apple10`` NAX hosts, ``512`` on M4 ``Apple9``)
+- ``MappedEmbedding`` safetensors memmap gathered as ``float16`` keeping ``embed_tokens`` out of Metal GPU RAM
 - MIT-adapted ``gated_delta_update`` kernels from ``mlx-lm`` 0.32.2 (Copyright © 2025 Apple Inc.)
 """
 
 from __future__ import annotations
 
-import json
-import os
+from contextlib import contextmanager
 from functools import partial
+import inspect
+import os
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+import platform
+import re
+from typing import Any, Iterator, Mapping, Sequence
+
+# Default MLX_ENABLE_TF32=0 before importing mlx.core so FP32 projections and reference
+# paths stay exact IEEE FP32 across M4 (Apple9) and M5 (Apple10 NAX) unless explicitly overridden.
+_TF32_WAS_USER_SET = "MLX_ENABLE_TF32" in os.environ
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from fast_shared.bench import clear_mlx_arena
 from fast_shared.embeddings import (
     MappedEmbedding,
     resolve_embedding_dim,
@@ -40,8 +52,11 @@ from .tokenizer import ContextualTokenizer
 
 _STREAMED_SEQ_THRESHOLD = 2048
 _GDN_SLICE_LEN = 1024
-_SDPA_SLICE_LEN = 512
+_DEFAULT_SDPA_SLICE_LEN = 512
+_M5_SDPA_SLICE_LEN = 1024
+_SDPA_SLICE_LEN = _DEFAULT_SDPA_SLICE_LEN
 _SDPA_MIN_TAIL = _SDPA_SLICE_LEN
+_STREAMED_SYNC_STRIDE = 4
 
 _ZERO_CENTERED_NORM_SUFFIXES = (
     ".input_layernorm.weight",
@@ -57,6 +72,134 @@ _EMBED_TENSOR_CANDIDATES = (
 )
 
 _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
+_ARCH_GEN_RE = re.compile(r"g(\d+)", re.IGNORECASE)
+
+
+def _sdpa_supports_force_fused() -> bool:
+    try:
+        sig = inspect.signature(mx.fast.scaled_dot_product_attention)
+        return "force_fused" in sig.parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_SDPA_SUPPORTS_FORCE_FUSED = _sdpa_supports_force_fused()
+
+
+def _parse_macos_version(ver: str | None = None) -> tuple[int, int]:
+    raw = platform.mac_ver()[0] if ver is None else str(ver)
+    parts = [p for p in raw.strip().split(".") if p.isdigit()]
+    if not parts:
+        return (0, 0)
+    major = int(parts[0])
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    return (major, minor)
+
+
+def _get_mlx_device_info() -> dict[str, Any]:
+    dev_info_fn = getattr(mx, "device_info", None)
+    if callable(dev_info_fn):
+        try:
+            return dict(dev_info_fn())
+        except Exception:
+            pass
+    metal_mod = getattr(mx, "metal", None)
+    metal_info_fn = getattr(metal_mod, "device_info", None) if metal_mod is not None else None
+    if callable(metal_info_fn):
+        try:
+            return dict(metal_info_fn())
+        except Exception:
+            pass
+    return {}
+
+
+def _detect_gpu_family_info(
+    device_info: Mapping[str, Any] | None = None,
+    macos_version: str | None = None,
+) -> dict[str, Any]:
+    """Detect Apple9 (M4) vs Apple10+ (M5+ NAX) GPU family for SDPA dispatch."""
+    info = _get_mlx_device_info() if device_info is None else dict(device_info)
+    name = str(info.get("device_name", ""))
+    arch = str(info.get("architecture", ""))
+    name_low = name.lower()
+
+    gpu_gen = 0
+    match = _ARCH_GEN_RE.search(arch)
+    if match is not None:
+        gpu_gen = int(match.group(1))
+
+    is_apple10 = (
+        gpu_gen >= 17
+        or any(tok in name_low for tok in ("apple m5", "apple m6", "apple m7", "apple m8", "apple m9"))
+    )
+    os_ver_str = platform.mac_ver()[0] if macos_version is None else str(macos_version)
+    os_tuple = _parse_macos_version(os_ver_str)
+    nax_sdpa_eligible = bool(is_apple10 and os_tuple >= (26, 2))
+    sdpa_slice_len = _M5_SDPA_SLICE_LEN if nax_sdpa_eligible else _DEFAULT_SDPA_SLICE_LEN
+    return {
+        "device_name": name,
+        "architecture": arch,
+        "gpu_gen": gpu_gen,
+        "macos_version": os_ver_str,
+        "is_apple10": is_apple10,
+        "nax_sdpa_eligible": nax_sdpa_eligible,
+        "sdpa_slice_len": sdpa_slice_len,
+    }
+
+
+def get_mlx_runtime_telemetry() -> dict[str, Any]:
+    """Return active MLX precision, TF32, and Apple9/Apple10 dispatch telemetry."""
+    fam = _detect_gpu_family_info()
+    return {
+        "mlx_version": str(getattr(mx, "__version__", "unknown")),
+        "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "0"),
+        "mlx_enable_tf32_source": "env" if _TF32_WAS_USER_SET else "default_0",
+        "mlx_metal_no_nax": os.environ.get("MLX_METAL_NO_NAX", "0"),
+        "device_name": fam["device_name"],
+        "architecture": fam["architecture"],
+        "macos_version": fam["macos_version"],
+        "is_apple10": fam["is_apple10"],
+        "nax_sdpa_eligible": fam["nax_sdpa_eligible"],
+        "sdpa_slice_len": fam["sdpa_slice_len"],
+        "sdpa_supports_force_fused": _SDPA_SUPPORTS_FORCE_FUSED,
+    }
+
+
+def _apply_recommended_wired_limit() -> int | None:
+    """Safely raise MLX wired limit to `max_recommended_working_set_size`, returning prior limit."""
+    set_wl = getattr(mx, "set_wired_limit", None)
+    if not callable(set_wl) or not mx.metal.is_available():
+        return None
+    info = _get_mlx_device_info()
+    max_ws = int(info.get("max_recommended_working_set_size", 0) or 0)
+    if max_ws <= 0:
+        return None
+    try:
+        prev = set_wl(max_ws)
+        return int(prev) if prev is not None else 0
+    except Exception:
+        return None
+
+
+def _restore_wired_limit(prev_limit: int | None) -> None:
+    if prev_limit is None:
+        return
+    set_wl = getattr(mx, "set_wired_limit", None)
+    if callable(set_wl) and mx.metal.is_available():
+        try:
+            set_wl(int(prev_limit))
+        except Exception:
+            pass
+
+
+@contextmanager
+def wired_limit_scope() -> Iterator[int | None]:
+    """Context manager setting MLX wired limit safely and restoring the previous limit on exit."""
+    prev = _apply_recommended_wired_limit()
+    try:
+        yield prev
+    finally:
+        _restore_wired_limit(prev)
 
 
 def _open_mapped_embedding(path_or_dir: Path) -> MappedEmbedding | None:
@@ -89,12 +232,14 @@ def normalize_qk(
     inv_scale: float,
     eps: float = 1e-6,
 ) -> tuple[mx.array, mx.array]:
-    """L2-normalize q/k in ``q.dtype`` while folding ``head_dim**-0.5`` into ``q``."""
+    """L2-normalize q/k in ``float32`` to prevent FP16 subnormal ``rms_eps`` underflow and BF16 rounding."""
     rms_eps = eps * (inv_scale * inv_scale)
-    q_scale = mx.array(inv_scale * inv_scale, dtype=q.dtype)
-    k_scale = mx.array(inv_scale, dtype=k.dtype)
-    q_norm = q_scale * mx.fast.rms_norm(q, None, rms_eps)
-    k_norm = k_scale * mx.fast.rms_norm(k, None, rms_eps)
+    q_f32 = q.astype(mx.float32)
+    k_f32 = k.astype(mx.float32)
+    q_scale = mx.array(inv_scale * inv_scale, dtype=mx.float32)
+    k_scale = mx.array(inv_scale, dtype=mx.float32)
+    q_norm = (q_scale * mx.fast.rms_norm(q_f32, None, rms_eps)).astype(q.dtype)
+    k_norm = (k_scale * mx.fast.rms_norm(k_f32, None, rms_eps)).astype(k.dtype)
     return q_norm, k_norm
 
 
@@ -151,7 +296,7 @@ def _make_gated_delta_kernel(has_mask: bool = False):
             if (thread_index_in_simdgroup == 0) {{
               y[dv_idx] = static_cast<InT>(out);
             }}
-          }} else {{
+          }} else if (thread_index_in_simdgroup == 0) {{
             y[dv_idx] = static_cast<InT>(0);
           }}
           q_ += Hk * Dk;
@@ -184,8 +329,10 @@ def _make_gated_delta_packed_kernel():
     source = r"""
         constexpr int lanes_per_row = 4;
         constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        static_assert(Dk >= 16 && (Dk % (lanes_per_row * 4)) == 0, "Dk must be a positive multiple of 16");
         constexpr int values_per_lane = Dk / lanes_per_row;
         constexpr int partials_per_lane = values_per_lane / 4;
+        static_assert(partials_per_lane >= 1, "partials_per_lane must be >= 1");
 
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
@@ -218,8 +365,10 @@ def _make_gated_delta_packed_kernel():
           float gt = static_cast<float>(g_[hv_idx]);
 
           float part[partials_per_lane];
+          #pragma unroll
           for (int pb = 0; pb < partials_per_lane; ++pb) {
             float acc = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
               int e = pb * 4 + i;
               state[e] = state[e] * gt;
@@ -227,9 +376,14 @@ def _make_gated_delta_packed_kernel():
             }
             part[pb] = acc;
           }
-          float kv_mem =
-              ((part[0] + part[1]) + (part[2] + part[3])) +
-              ((part[4] + part[5]) + (part[6] + part[7]));
+          #pragma unroll
+          for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
+            #pragma unroll
+            for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
+              part[p] += part[p + stride];
+            }
+          }
+          float kv_mem = part[0];
           kv_mem += simd_shuffle_xor(kv_mem, 1);
           kv_mem += simd_shuffle_xor(kv_mem, 2);
 
@@ -237,8 +391,10 @@ def _make_gated_delta_packed_kernel():
               (static_cast<float>(v_[dv_idx]) - kv_mem) *
               static_cast<float>(beta_[hv_idx]);
 
+          #pragma unroll
           for (int pb = 0; pb < partials_per_lane; ++pb) {
             float acc = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
               int e = pb * 4 + i;
               state[e] = state[e] + static_cast<float>(k_[e]) * delta;
@@ -246,9 +402,14 @@ def _make_gated_delta_packed_kernel():
             }
             part[pb] = acc;
           }
-          float out =
-              ((part[0] + part[1]) + (part[2] + part[3])) +
-              ((part[4] + part[5]) + (part[6] + part[7]));
+          #pragma unroll
+          for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
+            #pragma unroll
+            for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
+              part[p] += part[p + stride];
+            }
+          }
+          float out = part[0];
           out += simd_shuffle_xor(out, 1);
           out += simd_shuffle_xor(out, 2);
           if (lane_in_row == 0) {
@@ -352,14 +513,17 @@ def gated_delta_update(
     mask: mx.array | None = None,
     *,
     use_kernel: bool = True,
+    state_fp32: bool = True,
 ) -> tuple[mx.array, mx.array]:
-    """Run GatedDeltaNet recurrence keeping ``q, k, v`` in their activation dtype."""
+    """Run GatedDeltaNet recurrence keeping ``q, k, v`` in activation dtype and ``state`` in FP32."""
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32 if state_fp32 else q.dtype)
+    elif state_fp32 and state.dtype != mx.float32:
+        state = state.astype(mx.float32)
 
     if (
         not use_kernel
@@ -378,7 +542,8 @@ def gated_delta_update(
     packed_eligible = (
         mask is None
         and g.ndim == 3
-        and Dk == 128
+        and Dk >= 32
+        and Dk % 32 == 0
         and Dv % 8 == 0
         and _GATED_DELTA_KERNEL_PACKED is not None
         and _ENABLE_GDN_PACKED
@@ -399,7 +564,8 @@ def gated_delta_update(
         grid = (32, Dv, B * Hv)
         threadgroup = (32, 4, 1)
 
-    out_y, out_state = kernel(
+    # Intentional FP32 recurrent state_out (StT) preserves accuracy across >2048 chunk handoffs while y stays InT.
+    out_y, out_state = kernel(  # guard: allow-fp32
         inputs=inputs,
         template=[
             ("InT", input_type),
@@ -423,13 +589,17 @@ def gated_delta_update(
 
 
 class PplxRMSNorm(nn.Module):
+    """RMSNorm evaluated in float32 to prevent FP16 residual overflow and BF16 weight rounding."""
+
     def __init__(self, dims: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.weight = mx.ones((dims,))
+        self.weight = mx.ones((dims,), dtype=mx.float32)
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
+        w_f32 = self.weight if self.weight.dtype == mx.float32 else self.weight.astype(mx.float32)
+        out_f32 = mx.fast.rms_norm(x.astype(mx.float32), w_f32, self.eps)
+        return out_f32.astype(x.dtype)
 
 
 class PplxGatedRMSNorm(nn.Module):
@@ -450,9 +620,14 @@ class PplxGatedRMSNorm(nn.Module):
 
 
 class PplxAttention(nn.Module):
-    """Bidirectional grouped-query attention with output gating and partial RoPE."""
+    """Bidirectional grouped-query attention with output gating, partial RoPE, and Apple9/Apple10 dispatch."""
 
-    def __init__(self, cfg: PplxConfig) -> None:
+    def __init__(
+        self,
+        cfg: PplxConfig,
+        *,
+        gpu_family: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
@@ -460,6 +635,12 @@ class PplxAttention(nn.Module):
         self.rope_dim = cfg.rope_dim
         self.rope_theta = float(cfg.rope_theta)
         self.scale = float(cfg.head_dim) ** -0.5
+
+        fam = _detect_gpu_family_info() if gpu_family is None else dict(gpu_family)
+        self.is_apple10 = bool(fam.get("is_apple10", False))
+        self.nax_sdpa_eligible = bool(fam.get("nax_sdpa_eligible", False))
+        self.sdpa_slice_len = int(fam.get("sdpa_slice_len", _DEFAULT_SDPA_SLICE_LEN))
+        self._supports_force_fused = _SDPA_SUPPORTS_FORCE_FUSED
 
         self.q_proj_dim = 2 * self.num_heads * self.head_dim
         self.kv_proj_dim = self.num_kv_heads * self.head_dim
@@ -470,10 +651,49 @@ class PplxAttention(nn.Module):
         self.q_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
+    def _run_sdpa(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        mask: mx.array | str | None,
+    ) -> mx.array:
+        if isinstance(mask, mx.array) and mask.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+            raise TypeError(
+                f"SDPA mask must be typed additive float (float16/bfloat16) or None/'causal', got {mask.dtype}"
+            )
+        # On M5 (Apple10) macOS 26.2+, MLX 0.32.3+ auto-selects fused D256 NAX at Q>=1024;
+        # for 384 <= Q < 1024 FP16 with additive mask, force_fused=True wins on M5 (never M4 Pro).
+        q_len = int(q.shape[2])
+        use_force_fused = (
+            self.nax_sdpa_eligible
+            and self._supports_force_fused
+            and self.head_dim == 256
+            and q.dtype == mx.float16
+            and isinstance(mask, mx.array)
+            and 384 <= q_len < _M5_SDPA_SLICE_LEN
+        )
+        if use_force_fused:
+            return mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                mask=mask,
+                force_fused=True,
+            )
+        return mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.scale,
+            mask=mask,
+        )
+
     def __call__(
         self,
         x: mx.array,
-        sdpa_mask: mx.array | None = None,
+        sdpa_mask: mx.array | str | None = None,
     ) -> mx.array:
         B, S, _ = x.shape
         qkv = self.qkv_proj(x)
@@ -507,26 +727,21 @@ class PplxAttention(nn.Module):
             offset=0,
         )
 
-        if S <= _STREAMED_SEQ_THRESHOLD:
-            attn_out = mx.fast.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale=self.scale,
-                mask=sdpa_mask,
-            )
+        if S <= _STREAMED_SEQ_THRESHOLD or sdpa_mask == "causal":
+            attn_out = self._run_sdpa(queries, keys, values, sdpa_mask)
         else:
-            slices = tile_aligned_slices(S, slice_len=_SDPA_SLICE_LEN, min_tail=_SDPA_MIN_TAIL)
+            # Honor module-level monkeypatches in unit tests while defaulting to 1024 on M5 Apple10 / 512 on M4.
+            slice_len = _SDPA_SLICE_LEN if _SDPA_SLICE_LEN != _DEFAULT_SDPA_SLICE_LEN else self.sdpa_slice_len
+            min_tail = _SDPA_MIN_TAIL if _SDPA_MIN_TAIL != _DEFAULT_SDPA_SLICE_LEN else slice_len
+            slices = tile_aligned_slices(S, slice_len=slice_len, min_tail=min_tail)
             parts: list[mx.array] = []
             for s0, s1 in slices:
-                part = mx.fast.scaled_dot_product_attention(
-                    queries[:, :, s0:s1, :],
-                    keys,
-                    values,
-                    scale=self.scale,
-                    mask=sdpa_mask,
-                )
-                mx.eval(part)  # guard: allow-eval
+                if isinstance(sdpa_mask, mx.array) and sdpa_mask.ndim == 4 and sdpa_mask.shape[2] == S:
+                    m_slice: mx.array | str | None = sdpa_mask[:, :, s0:s1, :]
+                else:
+                    m_slice = sdpa_mask
+                part = self._run_sdpa(queries[:, :, s0:s1, :], keys, values, m_slice)
+                mx.async_eval(part)
                 parts.append(part)
             attn_out = mx.concatenate(parts, axis=2)
 
@@ -536,7 +751,7 @@ class PplxAttention(nn.Module):
 
 
 class PplxGatedDeltaNet(nn.Module):
-    """Linear-attention GatedDeltaNet layer with causal Conv1d and state-carried streaming."""
+    """Linear-attention GatedDeltaNet layer with causal Conv1d and FP32 state-carried streaming."""
 
     def __init__(self, cfg: PplxConfig) -> None:
         super().__init__()
@@ -575,14 +790,18 @@ class PplxGatedDeltaNet(nn.Module):
         conv_state: mx.array,
         rec_state: mx.array,
         mask_slice: mx.array | None,
+        *,
+        keep_conv_state_fp32: bool = False,
     ) -> tuple[mx.array, mx.array, mx.array]:
         B, S_sub, _ = x_slice.shape
 
         mixed_qkv = self.in_proj_qkv(x_slice)
         z = self.in_proj_z(x_slice).reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
 
-        conv_in = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        new_conv_state = conv_in[:, -(self.conv_kernel_size - 1) :, :]
+        conv_prefix = conv_state if conv_state.dtype == mixed_qkv.dtype else conv_state.astype(mixed_qkv.dtype)
+        conv_in = mx.concatenate([conv_prefix, mixed_qkv], axis=1)
+        tail = conv_in[:, -(self.conv_kernel_size - 1) :, :]
+        new_conv_state = tail.astype(mx.float32) if keep_conv_state_fp32 else tail
         conv_out = nn.silu(self.conv1d(conv_in))
 
         q_flat, k_flat, v_flat = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -602,6 +821,7 @@ class PplxGatedDeltaNet(nn.Module):
             state=rec_state,
             mask=mask_slice,
             use_kernel=self.use_kernel,
+            state_fp32=True,
         )
         normed = self.norm(out, z).reshape(B, S_sub, self.value_dim)
         return self.out_proj(normed), new_conv_state, new_rec_state
@@ -619,13 +839,17 @@ class PplxGatedDeltaNet(nn.Module):
         # Narrow projections (N=16) depend on M-tile rounding, so evaluate once whole before slicing.
         a_all = self.in_proj_a(x)
         b_all = self.in_proj_b(x)
-        conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
-        rec_state = mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=x.dtype)
+        # Keep rec_state in FP32 so S > 2048 chunk handoffs never suffer FP16/BF16 state truncation.
+        rec_state = mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32)
         if S <= _STREAMED_SEQ_THRESHOLD:
-            out, _, _ = self._run_step(x, a_all, b_all, conv_state, rec_state, ssm_mask)
+            conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
+            out, _, _ = self._run_step(
+                x, a_all, b_all, conv_state, rec_state, ssm_mask, keep_conv_state_fp32=False
+            )
             return out
 
-        mx.eval(a_all, b_all)  # guard: allow-eval
+        conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=mx.float32)
+        mx.async_eval(a_all, b_all)
         outs: list[mx.array] = []
         for s0, s1 in tile_aligned_slices(S, slice_len=_GDN_SLICE_LEN, min_tail=_GDN_SLICE_LEN):
             mask_slice = None if ssm_mask is None else ssm_mask[:, s0:s1]
@@ -636,14 +860,15 @@ class PplxGatedDeltaNet(nn.Module):
                 conv_state,
                 rec_state,
                 mask_slice,
+                keep_conv_state_fp32=True,
             )
-            mx.eval(y_slice, conv_state, rec_state)  # guard: allow-eval
+            mx.async_eval(y_slice, conv_state, rec_state)
             outs.append(y_slice)
         return mx.concatenate(outs, axis=1)
 
 
 class PplxMLP(nn.Module):
-    """Fused Gate+Up SwiGLU MLP with sequence chunking above 2048 tokens."""
+    """Fused Gate+Up SwiGLU MLP with async-pipelined sequence chunking above 2048 tokens."""
 
     def __init__(self, cfg: PplxConfig) -> None:
         super().__init__()
@@ -663,13 +888,19 @@ class PplxMLP(nn.Module):
         outs: list[mx.array] = []
         for s0, s1 in tile_aligned_slices(S, slice_len=_GDN_SLICE_LEN, min_tail=_GDN_SLICE_LEN):
             part = self._run_slice(x[:, s0:s1, :])
-            mx.eval(part)  # guard: allow-eval
+            mx.async_eval(part)
             outs.append(part)
         return mx.concatenate(outs, axis=1)
 
 
 class PplxDecoderLayer(nn.Module):
-    def __init__(self, cfg: PplxConfig, is_linear: bool) -> None:
+    def __init__(
+        self,
+        cfg: PplxConfig,
+        is_linear: bool,
+        *,
+        gpu_family: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.is_linear = is_linear
         self.input_layernorm = PplxRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -678,14 +909,14 @@ class PplxDecoderLayer(nn.Module):
         if is_linear:
             self.linear_attn = PplxGatedDeltaNet(cfg)
         else:
-            self.self_attn = PplxAttention(cfg)
+            self.self_attn = PplxAttention(cfg, gpu_family=gpu_family)
 
     def __call__(
         self,
         h: mx.array,
         *,
         ssm_mask: mx.array | None = None,
-        sdpa_mask: mx.array | None = None,
+        sdpa_mask: mx.array | str | None = None,
     ) -> mx.array:
         x_in = self.input_layernorm(h)
         if self.is_linear:
@@ -697,12 +928,23 @@ class PplxDecoderLayer(nn.Module):
 
 
 class PplxModel(nn.Module):
-    def __init__(self, cfg: PplxConfig, *, has_embed_module: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: PplxConfig,
+        *,
+        has_embed_module: bool = True,
+        gpu_family: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.config = cfg
+        self.gpu_family = _detect_gpu_family_info() if gpu_family is None else dict(gpu_family)
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size) if has_embed_module else None
         self.layers = [
-            PplxDecoderLayer(cfg, is_linear=(cfg.layer_types[i] == "linear_attention"))
+            PplxDecoderLayer(
+                cfg,
+                is_linear=(cfg.layer_types[i] == "linear_attention"),
+                gpu_family=self.gpu_family,
+            )
             for i in range(cfg.num_hidden_layers)
         ]
         self.norm = PplxRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -713,7 +955,7 @@ class PplxModel(nn.Module):
         hidden: mx.array,
         *,
         ssm_mask: mx.array | None = None,
-        sdpa_mask: mx.array | None = None,
+        sdpa_mask: mx.array | str | None = None,
         return_trace: bool = False,
     ) -> mx.array | tuple[mx.array, list[mx.array]]:
         trace: list[mx.array] = []
@@ -721,10 +963,14 @@ class PplxModel(nn.Module):
             trace.append(hidden)
         h = hidden
         is_streamed = hidden.shape[1] > _STREAMED_SEQ_THRESHOLD
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             h = layer(h, ssm_mask=ssm_mask, sdpa_mask=sdpa_mask)
             if is_streamed:
-                mx.eval(h)  # guard: allow-eval
+                # Pipeline asynchronously per layer and only bound peak memory every 4 layers.
+                if (layer_idx + 1) % _STREAMED_SYNC_STRIDE == 0:
+                    mx.eval(h)  # guard: allow-eval
+                else:
+                    mx.async_eval(h)
             if return_trace:
                 trace.append(h)
         h = self.norm(h)
@@ -778,10 +1024,17 @@ def _canonicalize_weights(
         if "conv1d.weight" in key and val.ndim == 3 and val.shape[-1] != 1:
             val = val.moveaxis(2, 1)
 
-        if not norms_already_shifted and _is_zero_centered_norm_key(key):
+        is_zero_centered_norm = _is_zero_centered_norm_key(key)
+        if not norms_already_shifted and is_zero_centered_norm:
             val = val.astype(mx.float32) + 1.0
 
-        if key.endswith(".A_log") or key.endswith(".dt_bias") or key.endswith("linear_attn.norm.weight"):
+        # Keep zero-centered norm weights, GatedRMSNorm weights, and GDN decay params in FP32.
+        if (
+            is_zero_centered_norm
+            or key.endswith(".A_log")
+            or key.endswith(".dt_bias")
+            or key.endswith("linear_attn.norm.weight")
+        ):
             val = val.astype(mx.float32)
         else:
             val = val.astype(act_dtype)
@@ -858,12 +1111,18 @@ def _find_checkpoint_source(
 
 
 def _build_sdpa_mask(attention_mask: np.ndarray, *, dtype_name: str) -> mx.array:
-    neg = -65504.0 if dtype_name == "float16" else -1e9
-    valid_4d = attention_mask.astype(np.bool_)[:, None, None, :]
+    """Build a typed additive 4D SDPA mask (`0.0` valid, `-65504.0` for FP16, `-inf`/`-1e9` for BF16/FP32)."""
+    mask_bool = np.asarray(attention_mask, dtype=np.bool_)
+    valid_4d = mask_bool[:, None, None, :]
     if dtype_name == "float16":
-        arr = np.where(valid_4d, np.float16(0.0), np.float16(neg))
+        arr = np.where(valid_4d, np.float16(0.0), np.float16(-65504.0))
         return mx.array(arr, dtype=mx.float16)
-    arr = np.where(valid_4d, np.float32(0.0), np.float32(neg))
+    # Use -inf on rows that have at least one valid token, and finite -1e9 on all-pad rows to prevent NaN softmax.
+    row_has_valid = np.any(mask_bool, axis=1)[:, None, None, None]
+    neg_vals = np.where(row_has_valid, np.float32(-np.inf), np.float32(-1e9))
+    arr = np.where(valid_4d, np.float32(0.0), neg_vals)
+    if dtype_name == "float32":
+        return mx.array(arr, dtype=mx.float32)
     return mx.array(arr, dtype=mx.bfloat16)
 
 
@@ -897,109 +1156,121 @@ class FastPplxGPU:
         self.cache_limit_mb = int(cache_limit_mb)
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
+        self.runtime_telemetry = get_mlx_runtime_telemetry()
+
         set_mlx_cache_limit(self.cache_limit_mb)
+        self._prev_wired_limit: int | None = _apply_recommended_wired_limit()
 
-        kind, source_path, embed_st = _find_checkpoint_source(
-            self.paths,
-            model_dir=model_dir,
-            local_files_only=local_files_only,
-        )
+        try:
+            kind, source_path, embed_st = _find_checkpoint_source(
+                self.paths,
+                model_dir=model_dir,
+                local_files_only=local_files_only,
+            )
 
-        # Resolve config & tokenizer
-        cfg_candidates = [
-            self.paths.model_dir / "config.json",
-            self.paths.tokenizer_dir / "config.json",
-        ]
-        if kind == "dir":
-            cfg_candidates.insert(0, source_path / "config.json")
-        cfg_file = next((c for c in cfg_candidates if c.exists()), None)
-        self.config = PplxConfig.from_json(cfg_file) if cfg_file is not None else DEFAULT_PPLX_CONFIG
-
-        tok_candidates = [
-            source_path / "tokenizer.json" if kind == "dir" else self.paths.tokenizer_json,
-            self.paths.tokenizer_json,
-            self.paths.model_dir / "tokenizer.json",
-        ]
-        tok_file = next((c for c in tok_candidates if c.exists()), None)
-        if tok_file is None:
-            raise FileNotFoundError(f"Could not find tokenizer.json in {tok_candidates}")
-        self.tokenizer = ContextualTokenizer(tok_file, self.config, default_max_length=self.max_seq_len)
-
-        self.dim = self.config.embedding_dim
-        self.max_dim = self.config.embedding_dim
-        self.supports_dimensions = True
-        self.model_name = DEFAULT_MODEL_NAME
-
-        self._mapped_embed: MappedEmbedding | None = None
-        if self.use_mapped_embedding:
-            embed_candidates = [
-                p
-                for p in (
-                    embed_st,
-                    source_path if kind == "dir" else None,
-                    self.paths.embed_tokens_safetensors,
-                    self.paths.model_dir,
-                )
-                if p is not None
+            # Resolve config & tokenizer
+            cfg_candidates = [
+                self.paths.model_dir / "config.json",
+                self.paths.tokenizer_dir / "config.json",
             ]
-            for cand_path in embed_candidates:
-                self._mapped_embed = _open_mapped_embedding(cand_path)
-                if self._mapped_embed is not None:
-                    break
+            if kind == "dir":
+                cfg_candidates.insert(0, source_path / "config.json")
+            cfg_file = next((c for c in cfg_candidates if c.exists()), None)
+            self.config = PplxConfig.from_json(cfg_file) if cfg_file is not None else DEFAULT_PPLX_CONFIG
 
-        using_mapped = self._mapped_embed is not None
+            tok_candidates = [
+                source_path / "tokenizer.json" if kind == "dir" else self.paths.tokenizer_json,
+                self.paths.tokenizer_json,
+                self.paths.model_dir / "tokenizer.json",
+            ]
+            tok_file = next((c for c in tok_candidates if c.exists()), None)
+            if tok_file is None:
+                raise FileNotFoundError(f"Could not find tokenizer.json in {tok_candidates}")
+            self.tokenizer = ContextualTokenizer(tok_file, self.config, default_max_length=self.max_seq_len)
 
-        self.model = PplxModel(self.config, has_embed_module=(not using_mapped))
+            self.dim = self.config.embedding_dim
+            self.max_dim = self.config.embedding_dim
+            self.supports_dimensions = True
+            self.model_name = DEFAULT_MODEL_NAME
 
-        if kind == "dir":
-            raw_weights = _load_safetensors_dir(source_path)
-            norms_shifted = False
-        else:
-            raw_weights = dict(mx.load(str(source_path)))
-            flag = raw_weights.pop("__norms_shifted__", None)
-            norms_shifted = bool(int(flag.item())) if flag is not None else False
-            if not using_mapped and not any(
-                _strip_language_prefix(k) == "embed_tokens.weight" or k in _EMBED_TENSOR_CANDIDATES
-                for k in raw_weights
-            ):
-                embed_cand = next(
-                    (
-                        p
-                        for p in (
-                            embed_st,
-                            self.paths.embed_tokens_safetensors,
-                            self.paths.model_dir / "embed_tokens.safetensors",
-                        )
-                        if p is not None and p.is_file()
-                    ),
-                    None,
-                )
-                if embed_cand is not None:
-                    loaded_embed = mx.load(str(embed_cand))
-                    for cand in (*_EMBED_TENSOR_CANDIDATES, *loaded_embed.keys()):
-                        if cand in loaded_embed and (
-                            cand in _EMBED_TENSOR_CANDIDATES
-                            or _strip_language_prefix(cand) == "embed_tokens.weight"
-                        ):
-                            raw_weights["embed_tokens.weight"] = loaded_embed[cand]
-                            break
+            self._mapped_embed: MappedEmbedding | None = None
+            if self.use_mapped_embedding:
+                embed_candidates = [
+                    p
+                    for p in (
+                        embed_st,
+                        source_path if kind == "dir" else None,
+                        self.paths.embed_tokens_safetensors,
+                        self.paths.model_dir,
+                    )
+                    if p is not None
+                ]
+                for cand_path in embed_candidates:
+                    self._mapped_embed = _open_mapped_embedding(cand_path)
+                    if self._mapped_embed is not None:
+                        break
 
-        backbone_items, head_w = _canonicalize_weights(
-            raw_weights,
-            num_layers=self.config.num_hidden_layers,
-            act_dtype=self.act_dtype,
-            include_embed=(not using_mapped),
-            norms_already_shifted=norms_shifted,
-        )
-        all_items = [*backbone_items, ("contextual_projection.weight", head_w)]
-        self.model.load_weights(all_items, strict=True)
-        mx.eval(self.model.parameters())
+            using_mapped = self._mapped_embed is not None
+
+            self.model = PplxModel(
+                self.config,
+                has_embed_module=(not using_mapped),
+                gpu_family=_detect_gpu_family_info(),
+            )
+
+            if kind == "dir":
+                raw_weights = _load_safetensors_dir(source_path)
+                norms_shifted = False
+            else:
+                raw_weights = dict(mx.load(str(source_path)))
+                flag = raw_weights.pop("__norms_shifted__", None)
+                norms_shifted = bool(int(flag.item())) if flag is not None else False
+                if not using_mapped and not any(
+                    _strip_language_prefix(k) == "embed_tokens.weight" or k in _EMBED_TENSOR_CANDIDATES
+                    for k in raw_weights
+                ):
+                    embed_cand = next(
+                        (
+                            p
+                            for p in (
+                                embed_st,
+                                self.paths.embed_tokens_safetensors,
+                                self.paths.model_dir / "embed_tokens.safetensors",
+                            )
+                            if p is not None and p.is_file()
+                        ),
+                        None,
+                    )
+                    if embed_cand is not None:
+                        loaded_embed = mx.load(str(embed_cand))
+                        for cand in (*_EMBED_TENSOR_CANDIDATES, *loaded_embed.keys()):
+                            if cand in loaded_embed and (
+                                cand in _EMBED_TENSOR_CANDIDATES
+                                or _strip_language_prefix(cand) == "embed_tokens.weight"
+                            ):
+                                raw_weights["embed_tokens.weight"] = loaded_embed[cand]
+                                break
+
+            backbone_items, head_w = _canonicalize_weights(
+                raw_weights,
+                num_layers=self.config.num_hidden_layers,
+                act_dtype=self.act_dtype,
+                include_embed=(not using_mapped),
+                norms_already_shifted=norms_shifted,
+            )
+            all_items = [*backbone_items, ("contextual_projection.weight", head_w)]
+            self.model.load_weights(all_items, strict=True)
+            mx.eval(self.model.parameters())
+        except Exception:
+            self.close()
+            raise
 
     def _embed_inputs(self, input_ids: np.ndarray) -> mx.array:
         if self._mapped_embed is not None:
-            gather_dtype = "float16" if self.dtype_name == "float16" else "float32"
-            gathered = self._mapped_embed.gather(input_ids, out_dtype=gather_dtype)
-            return mx.array(gathered, dtype=self.act_dtype)
+            # Always gather as float16 (2 B/el) and cast FP16 -> BF16 on GPU in MLX when needed.
+            gathered = self._mapped_embed.gather(input_ids, out_dtype="float16")
+            arr = mx.array(gathered, dtype=mx.float16)
+            return arr if self.act_dtype == mx.float16 else arr.astype(self.act_dtype)
         assert self.model.embed_tokens is not None
         return self.model.embed_tokens(mx.array(input_ids, dtype=mx.int32))
 
@@ -1038,7 +1309,10 @@ class FastPplxGPU:
         pooled = mx.sum(hidden_f32 * mask_f32, axis=1) / denom
         projected = self.model.contextual_projection(pooled)
         mx.eval(projected)
-        return np.array(projected, dtype=np.float32, copy=False)
+        out = np.array(projected, dtype=np.float32, copy=False)
+        if hidden.shape[1] > _STREAMED_SEQ_THRESHOLD:
+            clear_mlx_arena(256)
+        return out
 
     def _project_span_pool(self, hidden: mx.array, chunk_token_spans: np.ndarray) -> np.ndarray:
         hidden_f32 = hidden.astype(mx.float32)
@@ -1056,7 +1330,10 @@ class FastPplxGPU:
         projected = self.model.contextual_projection(pooled)
         projected = mx.where(valid[..., None], projected, mx.array(0.0, dtype=mx.float32))
         mx.eval(projected)
-        return np.array(projected, dtype=np.float32, copy=False)
+        out = np.array(projected, dtype=np.float32, copy=False)
+        if hidden.shape[1] > _STREAMED_SEQ_THRESHOLD:
+            clear_mlx_arena(256)
+        return out
 
     def _format_output(
         self,
@@ -1115,6 +1392,7 @@ class FastPplxGPU:
             proj_batch = self._project_mean_pool(hidden, attention_mask)
             proj_all[idxs] = proj_batch
 
+        clear_mlx_arena(256)
         return self._format_output(
             proj_all,
             dimensions=dimensions,
@@ -1235,12 +1513,18 @@ class FastPplxGPU:
                     normalize=normalize,
                 )
 
+        clear_mlx_arena(256)
         return [r for r in results if r is not None]
 
     def close(self) -> None:
-        if self._mapped_embed is not None:
+        if getattr(self, "_mapped_embed", None) is not None:
             self._mapped_embed.close()
             self._mapped_embed = None
+        prev_wl = getattr(self, "_prev_wired_limit", None)
+        if prev_wl is not None:
+            self._prev_wired_limit = None
+            _restore_wired_limit(prev_wl)
+        clear_mlx_arena(256)
 
     def __enter__(self) -> FastPplxGPU:
         return self
@@ -1262,7 +1546,9 @@ __all__ = [
     "compute_g",
     "gated_delta_ops",
     "gated_delta_update",
+    "get_mlx_runtime_telemetry",
     "normalize_qk",
     "set_mlx_cache_limit",
     "tile_aligned_slices",
+    "wired_limit_scope",
 ]

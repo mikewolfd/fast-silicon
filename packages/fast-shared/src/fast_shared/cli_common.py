@@ -211,10 +211,11 @@ def run_serve_command(
     label: str,
 ) -> int:
     eng = make_engine(args)
-    srv = EmbeddingHTTPServer(eng, host=args.host, port=args.port)
+    mode = getattr(args, "mode", None)
+    srv = EmbeddingHTTPServer(eng, host=args.host, port=args.port, mode=mode)
     print(
         f"Serving {label} on http://{srv.host}:{srv.port} "
-        f"(dim={getattr(eng, 'dim', '?')}, ane={eng.ane_available}, mode={eng.default_mode})",
+        f"(dim={getattr(eng, 'dim', '?')}, ane={eng.ane_available}, mode={mode or eng.default_mode})",
         flush=True,
     )
     try:

@@ -1,9 +1,10 @@
 """Bare-Metal Metal 4 MPP & SIMD kernels for `openai/gpt-oss-20b` (`MXFP4` + Affine-Q4).
 
-Composes `fast_shared.metal_mpp.HEADER_MPP` with custom E2M1 subnormal unpacking
-and E8M0 scale folding (`(s + 14) << 23`), Hydragen v2 split-prefix SDPA, circular
-SWA-128 attention, Batched YaRN RoPE, Zero-Sync Metal 4 Hybrid MoE (`MPP::matmul2d`
-hot tiles + multi-column QMV cold tails), and fused `BF16` residual normalization.
+Composes `fast_shared.metal_mpp.HEADER_MPP` with exact E2M1 LUT unpacking and float32
+E8M0 per-block scaling (avoiding half4 threadgroup overflow/underflow), Hydragen v2
+split-prefix SDPA, 8Q:1KV packed SWA-128 prefill MMA, circular SWA-128 decode,
+Batched YaRN RoPE, Zero-Sync Metal 4 Hybrid MoE (`MPP::matmul2d` hot tiles +
+multi-column QMV cold tails), and fused `BF16` residual normalization.
 
 All `mx.fast.metal_kernel(...)` compilations happen lazily inside `build_kernels()`
 so importing this module on CPU or under unit tests executes zero GPU work.
@@ -17,30 +18,23 @@ from typing import Any
 from fast_shared.metal_mpp import HEADER_MPP
 
 _E2M1_HELPERS = r"""
-inline half2 e2m1_pair_subnormal(uint b) {
-  ushort2 bits = ushort2(b & 0xFu, (b >> 4) & 0xFu);
-  ushort2 hbits = ((bits & 7u) << 9) | ((bits & 8u) << 12);
-  return as_type<half2>(hbits);
+constant half kE2M1_LUT[16] = {
+  0.0h,  0.5h,  1.0h,  1.5h,  2.0h,  3.0h,  4.0h,  6.0h,
+ -0.0h, -0.5h, -1.0h, -1.5h, -2.0h, -3.0h, -4.0h, -6.0h
+};
+
+inline half4 unpack4_e2m1(uint packed16) {
+  return half4(
+    kE2M1_LUT[(packed16      ) & 0xFu],
+    kE2M1_LUT[(packed16 >>  4) & 0xFu],
+    kE2M1_LUT[(packed16 >>  8) & 0xFu],
+    kE2M1_LUT[(packed16 >> 12) & 0xFu]
+  );
 }
 
-inline half4 unpack4_e2m1_subnormal(uint packed16) {
-  return half4(e2m1_pair_subnormal(packed16 & 0xFFu),
-               e2m1_pair_subnormal((packed16 >> 8) & 0xFFu));
-}
-
-inline half4 unpack4_scaled(uint packed16, float f) {
-  return half4(float4(unpack4_e2m1_subnormal(packed16)) * f);
-}
-
-inline float dot8_affine_q4(uint w, float s, float b, const threadgroup half4* xp) {
-  float4 x0 = float4(xp[0]);
-  float4 x1 = float4(xp[1]);
-  float4 w0 = float4(float((w      ) & 0xFu), float((w >>  4) & 0xFu),
-                     float((w >>  8) & 0xFu), float((w >> 12) & 0xFu));
-  float4 w1 = float4(float((w >> 16) & 0xFu), float((w >> 20) & 0xFu),
-                     float((w >> 24) & 0xFu), float((w >> 28) & 0xFu));
-  return s * (dot(x0, w0) + dot(x1, w1)) +
-         b * (x0.x + x0.y + x0.z + x0.w + x1.x + x1.y + x1.z + x1.w);
+inline float e8m0_to_float(uchar s) {
+  // Exact IEEE-754 float32 for OCP MXFP4 E8M0 scale 2^(int(s) - 127) across s in [0..254].
+  return (s == 0u) ? as_type<float>(0x00400000u) : as_type<float>(uint(s) << 23);
 }
 """
 
@@ -68,6 +62,7 @@ class KernelSpec:
     sliding_window: int = 128
     swiglu_limit: float = 7.0
     swiglu_alpha: float = 1.702
+    moe_hot_threshold: int = 8
 
     def validate(self) -> None:
         if self.hidden_size % 64 != 0 or self.hidden_size <= 0:
@@ -86,6 +81,8 @@ class KernelSpec:
             raise ValueError(f"num_local_experts must be in 1..32, got {self.num_local_experts}")
         if self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+        if not (1 <= self.moe_hot_threshold <= 16):
+            raise ValueError(f"moe_hot_threshold must be in 1..16, got {self.moe_hot_threshold}")
 
 
 def render_kernel_sources(spec: KernelSpec) -> dict[str, dict[str, Any]]:
@@ -103,16 +100,12 @@ def render_kernel_sources(spec: KernelSpec) -> dict[str, dict[str, Any]]:
     NG_D = D_FF // 32
     D_FF_2 = D_FF * 2
     N_EXP = spec.num_local_experts
-    XS_MAX_K = max(4096, H, Q_DIM)
-    B1_XS_H = H
-    B1_XS_D = min(960, D_FF)
-    B1_XS_D_U4 = (4 * B1_XS_D) // 8
+    HOT_THRESH = spec.moe_hot_threshold
+    TG_HALF_ELEMS = max(3840, HOT_THRESH * 480)
     LIMIT = f"{float(spec.swiglu_limit):.6f}f"
     ALPHA = f"{float(spec.swiglu_alpha):.6f}f"
     HOT_X_GU = D_FF // 32
     HOT_X_DN = H // 64
-    H_U4 = H // 8
-    D_FF_U4 = D_FF // 8
 
     hdr = build_metal_header()
 
@@ -143,201 +136,6 @@ float inv = rsqrt(tot * (1.0f / {float(H):.1f}f) + Params[0]);
 device half* op = Out + (size_t)row * {H}u;
 for (uint i = tid; i < {H}u; i += 128u) {{
   op[i] = half(float(xp[i]) * inv * float(W[i]));
-}}
-""",
-        },
-        "aff_q4_qmv_f16": {
-            "input_names": ["X", "W", "S", "B", "Bias", "Dims"],
-            "output_names": ["Out"],
-            "header": hdr,
-            "source": f"""
-const uint N = Dims[0];
-const uint K = Dims[1];
-const uint flags = Dims[2];
-const uint col0 = threadgroup_position_in_grid.x * 8u + simdgroup_index_in_threadgroup * 2u;
-const uint tid = thread_index_in_threadgroup;
-const uint lane = thread_index_in_simdgroup;
-
-threadgroup half Xs[{XS_MAX_K}];
-const uint n_u4 = K >> 3;
-for (uint i = tid; i < n_u4; i += 128u) {{
-  *(threadgroup uint4*)(Xs + i * 8u) = *(const device uint4*)(X + i * 8u);
-}}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-const uint k_words = K >> 3;
-for (uint c = 0u; c < 2u; ++c) {{
-  uint col = col0 + c;
-  if (col >= N) return;
-  const device uint* wp = W + (size_t)col * k_words;
-  const device half* sp = S + (size_t)col * (K >> 6);
-  const device half* bp = B + (size_t)col * (K >> 6);
-  float acc = 0.0f;
-  for (uint i = lane; i < k_words; i += 32u) {{
-    uint g = i >> 3;
-    acc += dot8_affine_q4(wp[i], float(sp[g]), float(bp[g]), (const threadgroup half4*)(Xs + i * 8u));
-  }}
-  float tot = simd_sum(acc);
-  if (lane == 0u) {{
-    if (flags & 1u) tot += float(Bias[col]);
-    Out[col] = half(tot);
-  }}
-}}
-""",
-        },
-        "aff_q4_qmv_resid_bf16": {
-            "input_names": ["X", "W", "S", "B", "Bias", "Resid", "Dims"],
-            "output_names": ["Out"],
-            "header": hdr,
-            "source": f"""
-const uint N = Dims[0];
-const uint K = Dims[1];
-const uint col0 = threadgroup_position_in_grid.x * 8u + simdgroup_index_in_threadgroup * 2u;
-const uint tid = thread_index_in_threadgroup;
-const uint lane = thread_index_in_simdgroup;
-
-threadgroup half Xs[{XS_MAX_K}];
-const uint n_u4 = K >> 3;
-for (uint i = tid; i < n_u4; i += 128u) {{
-  *(threadgroup uint4*)(Xs + i * 8u) = *(const device uint4*)(X + i * 8u);
-}}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-const uint k_words = K >> 3;
-for (uint c = 0u; c < 2u; ++c) {{
-  uint col = col0 + c;
-  if (col >= N) return;
-  const device uint* wp = W + (size_t)col * k_words;
-  const device half* sp = S + (size_t)col * (K >> 6);
-  const device half* bp = B + (size_t)col * (K >> 6);
-  float acc = 0.0f;
-  for (uint i = lane; i < k_words; i += 32u) {{
-    uint g = i >> 3;
-    acc += dot8_affine_q4(wp[i], float(sp[g]), float(bp[g]), (const threadgroup half4*)(Xs + i * 8u));
-  }}
-  float tot = simd_sum(acc);
-  if (lane == 0u) {{
-    Out[col] = bfloat16_t(float(Resid[col]) + tot + float(Bias[col]));
-  }}
-}}
-""",
-        },
-        "moe_b1_gu_swiglu": {
-            "input_names": ["X", "ExpIds", "Wgu", "Sgu", "Bgu"],
-            "output_names": ["Mid"],
-            "header": hdr,
-            "source": f"""
-const uint k_slot = threadgroup_position_in_grid.y;
-const uint e = ExpIds[k_slot];
-const uint col = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
-const uint tid = thread_index_in_threadgroup;
-const uint lane = thread_index_in_simdgroup;
-
-threadgroup half Xs[{B1_XS_H}];
-for (uint i = tid; i < {H_U4}u; i += 128u) {{
-  *(threadgroup uint4*)(Xs + i * 8u) = *(const device uint4*)(X + i * 8u);
-}}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-if (col >= {D_FF}u) return;
-
-float acc_g = 0.0f, acc_u = 0.0f;
-if (lane < 30u) {{
-  const size_t base_g = ((size_t)e * {D_FF_2}u + col) * {NG_H}u;
-  const size_t base_u = ((size_t)e * {D_FF_2}u + {D_FF}u + col) * {NG_H}u;
-  const device uint4* Wgu4 = (const device uint4*)Wgu;
-  for (uint g0 = 0u; g0 < {NG_H}u; g0 += 30u) {{
-    uint g = g0 + lane;
-    if (g < {NG_H}u) {{
-      size_t wgi = base_g + g;
-      size_t wui = base_u + g;
-      uint4 wg = Wgu4[wgi];
-      uint4 wu = Wgu4[wui];
-      float fg = as_type<float>((uint(Sgu[wgi]) + 14u) << 23);
-      float fu = as_type<float>((uint(Sgu[wui]) + 14u) << 23);
-      const threadgroup half4* xp = (const threadgroup half4*)(Xs + g * 32u);
-      float dg = 0.0f, du = 0.0f;
-      #pragma unroll
-      for (int w = 0; w < 4; ++w) {{
-        uint vg = wg[w], vu = wu[w];
-        float4 x0 = float4(xp[w * 2 + 0]);
-        float4 x1 = float4(xp[w * 2 + 1]);
-        dg += dot(x0, float4(unpack4_e2m1_subnormal(vg & 0xFFFFu))) +
-              dot(x1, float4(unpack4_e2m1_subnormal(vg >> 16)));
-        du += dot(x0, float4(unpack4_e2m1_subnormal(vu & 0xFFFFu))) +
-              dot(x1, float4(unpack4_e2m1_subnormal(vu >> 16)));
-      }}
-      acc_g += dg * fg;
-      acc_u += du * fu;
-    }}
-  }}
-}}
-float gs = simd_sum(acc_g);
-float us = simd_sum(acc_u);
-if (lane == 0u) {{
-  float gv = min(gs + float(Bgu[(size_t)e * {D_FF_2}u + col]), {LIMIT});
-  float uv = clamp(us + float(Bgu[(size_t)e * {D_FF_2}u + {D_FF}u + col]), -{LIMIT}, {LIMIT});
-  Mid[(size_t)k_slot * {D_FF}u + col] = half((uv + 1.0f) * (gv / (1.0f + exp(-gv * {ALPHA}))));
-}}
-""",
-        },
-        "moe_b1_dn_resid_bf16": {
-            "input_names": ["Mid", "ExpIds", "RWeights", "Wd", "Sd", "Bd", "H"],
-            "output_names": ["HOut"],
-            "header": hdr,
-            "source": f"""
-const uint col = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
-const uint tid = thread_index_in_threadgroup;
-const uint lane = thread_index_in_simdgroup;
-if (col >= {H}u) return;
-
-threadgroup half Xs[4 * {B1_XS_D}];
-float acc_total = 0.0f;
-uint exps[4] = {{ExpIds[0], ExpIds[1], ExpIds[2], ExpIds[3]}};
-float rws[4] = {{float(RWeights[0]), float(RWeights[1]), float(RWeights[2]), float(RWeights[3])}};
-const device uint4* Wd4 = (const device uint4*)Wd;
-
-for (uint g0 = 0u; g0 < {NG_D}u; g0 += 30u) {{
-  uint k_off = g0 * 32u;
-  uint g_cnt = min(30u, {NG_D}u - g0);
-  uint k_chunk = g_cnt * 32u;
-  uint n_u4_ks = k_chunk >> 3;
-  uint n_u4_tot = 4u * n_u4_ks;
-  for (uint i = tid; i < n_u4_tot; i += 128u) {{
-    uint ks = i / n_u4_ks;
-    uint loc = (i % n_u4_ks) * 8u;
-    *(threadgroup uint4*)(Xs + ks * {B1_XS_D}u + loc) =
-        *(const device uint4*)(Mid + (size_t)ks * {D_FF}u + k_off + loc);
-  }}
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (lane < g_cnt) {{
-    uint g = g0 + lane;
-    #pragma unroll
-    for (uint ks = 0; ks < 4u; ++ks) {{
-      size_t wi = ((size_t)exps[ks] * {H}u + col) * {NG_D}u + g;
-      uint4 wd = Wd4[wi];
-      float fd = as_type<float>((uint(Sd[wi]) + 14u) << 23);
-      const threadgroup half4* xp = (const threadgroup half4*)(Xs + ks * {B1_XS_D}u + lane * 32u);
-      float d = 0.0f;
-      #pragma unroll
-      for (int w = 0; w < 4; ++w) {{
-        uint vd = wd[w];
-        d += dot(float4(xp[w * 2 + 0]), float4(unpack4_e2m1_subnormal(vd & 0xFFFFu))) +
-             dot(float4(xp[w * 2 + 1]), float4(unpack4_e2m1_subnormal(vd >> 16)));
-      }}
-      acc_total += d * (fd * rws[ks]);
-    }}
-  }}
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-}}
-
-float tot = simd_sum(acc_total);
-if (lane == 0u) {{
-  float bsum = float(Bd[(size_t)exps[0] * {H}u + col]) * rws[0] +
-               float(Bd[(size_t)exps[1] * {H}u + col]) * rws[1] +
-               float(Bd[(size_t)exps[2] * {H}u + col]) * rws[2] +
-               float(Bd[(size_t)exps[3] * {H}u + col]) * rws[3];
-  HOut[col] = bfloat16_t(float(H[col]) + tot + bsum);
 }}
 """,
         },
@@ -761,28 +559,29 @@ for (int dh = 0; dh < 2; ++dh) {{
             "output_names": ["Out"],
             "header": hdr,
             "source": f"""
+// 8Q:1KV GQA-packed SWA prefill MMA: 8 simdgroups (256 threads) share one Ks/Vs tile per hkv
+// across all 8 query heads (`hq = hkv * 8 + sg_id`) for `8` query tokens (`q_blk .. q_blk + 7`).
 const uint L_q    = Params[0];
 const uint L_kv   = Params[1];
 const uint Offset = Params[2];
 const uint Window = Params[3];
 const float Scale = as_type<float>(Params[4]);
 
-const uint q_blk = threadgroup_position_in_grid.x * 32u;
-const uint hq    = threadgroup_position_in_grid.y;
-const uint b     = threadgroup_position_in_grid.z;
-const uint hkv   = hq >> 3;
+const uint q_blk  = threadgroup_position_in_grid.x * 8u;
+const uint hkv    = threadgroup_position_in_grid.y;
+const uint b      = threadgroup_position_in_grid.z;
 const uint tid_tg = thread_index_in_threadgroup;
-const uint sg_id = simdgroup_index_in_threadgroup;
-const uint lane  = thread_index_in_simdgroup;
+const uint sg_id  = simdgroup_index_in_threadgroup;
+const uint lane   = thread_index_in_simdgroup;
+const uint hq     = hkv * 8u + sg_id;
 
 constexpr uint LD_KV = 72u;
 constexpr uint LD_S  = 40u;
 threadgroup half  Ks[32u * LD_KV];
 threadgroup half  Vs[32u * LD_KV];
-threadgroup float Sw[4u][8u * LD_S];
-threadgroup half  Pw[4u][8u * LD_S];
+threadgroup float Sw[8u][8u * LD_S];
+threadgroup half  Pw[8u][8u * LD_S];
 
-const uint q_warp = q_blk + sg_id * 8u;
 threadgroup half* Qs_all = (threadgroup half*)Sw;
 threadgroup half* Qw = Qs_all + sg_id * (8u * LD_KV);
 
@@ -790,7 +589,7 @@ const device half* q_ptr = Q + (((size_t)b * {N_Q}u + hq) * L_q) * 64u;
 for (uint i = lane; i < 64u; i += 32u) {{
   uint r = i >> 3;
   uint c = (i & 7u) << 3;
-  uint qi = q_warp + r;
+  uint qi = q_blk + r;
   if (qi < L_q) *(threadgroup uint4*)(Qw + r * LD_KV + c) = *(const device uint4*)(q_ptr + (size_t)qi * 64u + c);
   else *(threadgroup uint4*)(Qw + r * LD_KV + c) = uint4(0u);
 }}
@@ -810,27 +609,25 @@ float row_m[8], row_l[8];
 for (int r = 0; r < 8; ++r) {{ row_m[r] = -1e30f; row_l[r] = 0.0f; }}
 
 int min_q_abs = (int)(Offset + q_blk);
-int max_q_abs = (int)(Offset + min(L_q, q_blk + 32u) - 1u);
+int max_q_abs = (int)(Offset + min(L_q, q_blk + 8u) - 1u);
 int t_min = max(0, min_q_abs - (int)(Window - 1u));
 int t_max = min((int)L_kv - 1, max_q_abs);
 uint t_start = (uint)(t_min & ~31);
 uint t_end   = (uint)(t_max + 1);
 
 const size_t kv_base = ((size_t)b * {N_KV}u + hkv) * L_kv * 64u;
+const uint kv_r = tid_tg >> 3;
+const uint kv_c = (tid_tg & 7u) << 3;
 
 for (uint t0 = t_start; t0 < t_end; t0 += 32u) {{
   uint valid_t = min(32u, L_kv - t0);
-  for (uint idx = tid_tg; idx < 256u; idx += 128u) {{
-    uint r = idx >> 3;
-    uint c = (idx & 7u) << 3;
-    if (r < valid_t) {{
-      size_t off = kv_base + (size_t)(t0 + r) * 64u + c;
-      *(threadgroup uint4*)(Ks + r * LD_KV + c) = *(const device uint4*)(K + off);
-      *(threadgroup uint4*)(Vs + r * LD_KV + c) = *(const device uint4*)(V + off);
-    }} else {{
-      *(threadgroup uint4*)(Ks + r * LD_KV + c) = uint4(0u);
-      *(threadgroup uint4*)(Vs + r * LD_KV + c) = uint4(0u);
-    }}
+  if (kv_r < valid_t) {{
+    size_t off = kv_base + (size_t)(t0 + kv_r) * 64u + kv_c;
+    *(threadgroup uint4*)(Ks + kv_r * LD_KV + kv_c) = *(const device uint4*)(K + off);
+    *(threadgroup uint4*)(Vs + kv_r * LD_KV + kv_c) = *(const device uint4*)(V + off);
+  }} else {{
+    *(threadgroup uint4*)(Ks + kv_r * LD_KV + kv_c) = uint4(0u);
+    *(threadgroup uint4*)(Vs + kv_r * LD_KV + kv_c) = uint4(0u);
   }}
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -852,7 +649,7 @@ for (uint t0 = t_start; t0 < t_end; t0 += 32u) {{
   uint key_pos = t0 + lane;
   #pragma unroll
   for (int r = 0; r < 8; ++r) {{
-    uint qi = q_warp + (uint)r;
+    uint qi = q_blk + (uint)r;
     int q_abs = (int)(Offset + qi);
     int delta = q_abs - (int)key_pos;
     bool valid = (qi < L_q) && (lane < valid_t) && (delta >= 0) && (delta < (int)Window);
@@ -929,7 +726,7 @@ for (int half_idx = 0; half_idx < 2; ++half_idx) {{
   simdgroup_barrier(mem_flags::mem_threadgroup);
   #pragma unroll
   for (int r = 0; r < 8; ++r) {{
-    uint qi = q_warp + (uint)r;
+    uint qi = q_blk + (uint)r;
     if (qi < L_q) out_ptr[(size_t)qi * 64u + half_idx * 32u + lane] = half(sw[r * LD_S + lane] * sink_scale[r] * inv_l[r]);
   }}
   simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -978,7 +775,7 @@ if (lane == 0u) {{
     uint start = offs[e];
     uint tot   = cnts[e] - start;
     uint cur   = 0u;
-    while (tot - cur > 8u) {{
+    while (tot - cur > {HOT_THRESH}u) {{
       uint chunk = min(32u, tot - cur);
       HotMeta[nh * 3u + 0u] = e;
       HotMeta[nh * 3u + 1u] = start + cur;
@@ -1012,7 +809,9 @@ const uint tid_tg = thread_index_in_threadgroup;
 const uint sg_id  = simdgroup_index_in_threadgroup;
 const uint lane   = thread_index_in_simdgroup;
 
-threadgroup half TG[3840];
+threadgroup half TG[{TG_HALF_ELEMS}];
+threadgroup float fg_tg[32];
+threadgroup float fu_tg[32];
 
 if (ty < nh) {{
   if (threadgroup_position_in_grid.x >= {HOT_X_GU}u) return;
@@ -1022,10 +821,10 @@ if (ty < nh) {{
   const uint m_cnt   = HotMeta[ti + 2u];
   const uint col0    = threadgroup_position_in_grid.x * 32u;
 
-  constexpr auto descA = mpp::tensor_ops::matmul2d_descriptor(
+  constexpr auto descM = mpp::tensor_ops::matmul2d_descriptor(
       32, 32, 32, false, true, false,
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-  mpp::tensor_ops::matmul2d<descA, metal::execution_simdgroups<4>> mm;
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+  mpp::tensor_ops::matmul2d<descM, metal::execution_simdgroups<4>> mm;
 
   threadgroup half* Xs = TG;
   threadgroup half* Gs = TG + 1024u;
@@ -1037,6 +836,8 @@ if (ty < nh) {{
 
   auto cG = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tG), float>();
   auto cU = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tU), float>();
+  auto bG = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tG), float>();
+  auto bU = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tU), float>();
   #pragma unroll
   for (uint16_t i = 0; i < cG.get_capacity(); ++i) {{ cG[i] = 0.0f; cU[i] = 0.0f; }}
 
@@ -1061,16 +862,27 @@ if (ty < nh) {{
       size_t uidx  = gidx + (size_t){D_FF}u * {NG_H}u;
       uint vg = Wguu[gidx * 4u + w_idx];
       uint vu = Wguu[uidx * 4u + w_idx];
-      float fg = as_type<float>((uint(Sgu[gidx]) + 14u) << 23);
-      float fu = as_type<float>((uint(Sgu[uidx]) + 14u) << 23);
-      *(threadgroup half4*)(Gs + row_loc * 32u + w_idx * 8u)      = unpack4_scaled(vg & 0xFFFFu, fg);
-      *(threadgroup half4*)(Gs + row_loc * 32u + w_idx * 8u + 4u) = unpack4_scaled(vg >> 16, fg);
-      *(threadgroup half4*)(Us + row_loc * 32u + w_idx * 8u)      = unpack4_scaled(vu & 0xFFFFu, fu);
-      *(threadgroup half4*)(Us + row_loc * 32u + w_idx * 8u + 4u) = unpack4_scaled(vu >> 16, fu);
+      if (w_idx == 0u) {{
+        fg_tg[row_loc] = e8m0_to_float(Sgu[gidx]);
+        fu_tg[row_loc] = e8m0_to_float(Sgu[uidx]);
+      }}
+      // Stage unscaled exact E2M1 half values [-6, +6] in TG; apply E8M0 scale in float32 below.
+      *(threadgroup half4*)(Gs + row_loc * 32u + w_idx * 8u)      = unpack4_e2m1(vg & 0xFFFFu);
+      *(threadgroup half4*)(Gs + row_loc * 32u + w_idx * 8u + 4u) = unpack4_e2m1(vg >> 16);
+      *(threadgroup half4*)(Us + row_loc * 32u + w_idx * 8u)      = unpack4_e2m1(vu & 0xFFFFu);
+      *(threadgroup half4*)(Us + row_loc * 32u + w_idx * 8u + 4u) = unpack4_e2m1(vu >> 16);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    mm.run(tX, tG, cG);
-    mm.run(tX, tU, cU);
+    mm.run(tX, tG, bG);
+    mm.run(tX, tU, bU);
+    #pragma unroll
+    for (uint16_t i = 0; i < cG.get_capacity(); ++i) {{
+      if (cG.is_valid_element(i)) {{
+        uint c = uint(cG.get_multidimensional_index(i)[0]);
+        cG[i] += bG[i] * fg_tg[c];
+        cU[i] += bU[i] * fu_tg[c];
+      }}
+    }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }}
 
@@ -1096,11 +908,11 @@ if (ty < nh) {{
   const uint col0    = threadgroup_position_in_grid.x * 8u + sg_id * 2u;
 
   threadgroup half* Xs = TG;
-  float acc_g[2][8], acc_u[2][8];
+  float acc_g[2][{HOT_THRESH}], acc_u[2][{HOT_THRESH}];
   #pragma unroll
   for (int c = 0; c < 2; ++c) {{
     #pragma unroll
-    for (int r = 0; r < 8; ++r) {{ acc_g[c][r] = 0.0f; acc_u[c][r] = 0.0f; }}
+    for (int r = 0; r < {HOT_THRESH}; ++r) {{ acc_g[c][r] = 0.0f; acc_u[c][r] = 0.0f; }}
   }}
 
   const uint g_loc = lane >> 1;
@@ -1132,16 +944,16 @@ if (ty < nh) {{
           uint4 wu4 = Wgu4[uwi];
           uint2 wg2 = (h_loc == 0u) ? uint2(wg4.x, wg4.y) : uint2(wg4.z, wg4.w);
           uint2 wu2 = (h_loc == 0u) ? uint2(wu4.x, wu4.y) : uint2(wu4.z, wu4.w);
-          float fg = as_type<float>((uint(Sgu[gwi]) + 14u) << 23);
-          float fu = as_type<float>((uint(Sgu[uwi]) + 14u) << 23);
-          half4 wg_h0 = half4(e2m1_pair_subnormal(wg2.x & 0xFFu), e2m1_pair_subnormal((wg2.x >> 8) & 0xFFu));
-          half4 wg_h1 = half4(e2m1_pair_subnormal((wg2.x >> 16) & 0xFFu), e2m1_pair_subnormal((wg2.x >> 24) & 0xFFu));
-          half4 wg_h2 = half4(e2m1_pair_subnormal(wg2.y & 0xFFu), e2m1_pair_subnormal((wg2.y >> 8) & 0xFFu));
-          half4 wg_h3 = half4(e2m1_pair_subnormal((wg2.y >> 16) & 0xFFu), e2m1_pair_subnormal((wg2.y >> 24) & 0xFFu));
-          half4 wu_h0 = half4(e2m1_pair_subnormal(wu2.x & 0xFFu), e2m1_pair_subnormal((wu2.x >> 8) & 0xFFu));
-          half4 wu_h1 = half4(e2m1_pair_subnormal((wu2.x >> 16) & 0xFFu), e2m1_pair_subnormal((wu2.x >> 24) & 0xFFu));
-          half4 wu_h2 = half4(e2m1_pair_subnormal(wu2.y & 0xFFu), e2m1_pair_subnormal((wu2.y >> 8) & 0xFFu));
-          half4 wu_h3 = half4(e2m1_pair_subnormal((wu2.y >> 16) & 0xFFu), e2m1_pair_subnormal((wu2.y >> 24) & 0xFFu));
+          float fg = e8m0_to_float(Sgu[gwi]);
+          float fu = e8m0_to_float(Sgu[uwi]);
+          half4 wg_h0 = unpack4_e2m1(wg2.x & 0xFFFFu);
+          half4 wg_h1 = unpack4_e2m1(wg2.x >> 16);
+          half4 wg_h2 = unpack4_e2m1(wg2.y & 0xFFFFu);
+          half4 wg_h3 = unpack4_e2m1(wg2.y >> 16);
+          half4 wu_h0 = unpack4_e2m1(wu2.x & 0xFFFFu);
+          half4 wu_h1 = unpack4_e2m1(wu2.x >> 16);
+          half4 wu_h2 = unpack4_e2m1(wu2.y & 0xFFFFu);
+          half4 wu_h3 = unpack4_e2m1(wu2.y >> 16);
           for (uint r = 0u; r < m_cnt; ++r) {{
             const threadgroup half4* xp = (const threadgroup half4*)(Xs + r * 480u + k_loc);
             float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);
@@ -1188,7 +1000,8 @@ const uint tid_tg = thread_index_in_threadgroup;
 const uint sg_id  = simdgroup_index_in_threadgroup;
 const uint lane   = thread_index_in_simdgroup;
 
-threadgroup half TG[3840];
+threadgroup half TG[{TG_HALF_ELEMS}];
+threadgroup float fd_tg[64];
 
 if (ty < nh) {{
   if (threadgroup_position_in_grid.x >= {HOT_X_DN}u) return;
@@ -1200,7 +1013,7 @@ if (ty < nh) {{
 
   constexpr auto descD = mpp::tensor_ops::matmul2d_descriptor(
       32, 64, 32, false, true, false,
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
   mpp::tensor_ops::matmul2d<descD, metal::execution_simdgroups<4>> mm;
 
   threadgroup half* Xs = TG;
@@ -1210,6 +1023,7 @@ if (ty < nh) {{
   auto tW = metal::tensor<threadgroup half, metal::extents<int32_t, 32, 64>, metal::tensor_inline>(Ws, metal::extents<int32_t, 32, 64>());
 
   auto cD = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
+  auto bD = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
   #pragma unroll
   for (uint16_t i = 0; i < cD.get_capacity(); ++i) cD[i] = 0.0f;
 
@@ -1230,12 +1044,22 @@ if (ty < nh) {{
       uint n_idx   = col0 + row_loc;
       size_t gidx  = ((size_t)e * {H}u + n_idx) * {NG_D}u + g;
       uint vd = Wdu[gidx * 4u + w_idx];
-      float fd = as_type<float>((uint(Sd[gidx]) + 14u) << 23);
-      *(threadgroup half4*)(Ws + row_loc * 32u + w_idx * 8u)      = unpack4_scaled(vd & 0xFFFFu, fd);
-      *(threadgroup half4*)(Ws + row_loc * 32u + w_idx * 8u + 4u) = unpack4_scaled(vd >> 16, fd);
+      if (w_idx == 0u) {{
+        fd_tg[row_loc] = e8m0_to_float(Sd[gidx]);
+      }}
+      // Stage unscaled exact E2M1 half values [-6, +6] in TG; apply E8M0 scale in float32 below.
+      *(threadgroup half4*)(Ws + row_loc * 32u + w_idx * 8u)      = unpack4_e2m1(vd & 0xFFFFu);
+      *(threadgroup half4*)(Ws + row_loc * 32u + w_idx * 8u + 4u) = unpack4_e2m1(vd >> 16);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    mm.run(tX, tW, cD);
+    mm.run(tX, tW, bD);
+    #pragma unroll
+    for (uint16_t i = 0; i < cD.get_capacity(); ++i) {{
+      if (cD.is_valid_element(i)) {{
+        uint c = uint(cD.get_multidimensional_index(i)[0]);
+        cD[i] += bD[i] * fd_tg[c];
+      }}
+    }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }}
 
@@ -1261,11 +1085,11 @@ if (ty < nh) {{
   const uint col0    = threadgroup_position_in_grid.x * 16u + sg_id * 4u;
 
   threadgroup half* Xs = TG;
-  float acc[4][8];
+  float acc[4][{HOT_THRESH}];
   #pragma unroll
   for (int c = 0; c < 4; ++c) {{
     #pragma unroll
-    for (int r = 0; r < 8; ++r) acc[c][r] = 0.0f;
+    for (int r = 0; r < {HOT_THRESH}; ++r) acc[c][r] = 0.0f;
   }}
 
   const uint g_loc = lane >> 1;
@@ -1293,11 +1117,11 @@ if (ty < nh) {{
           size_t wi = ((size_t)e * {H}u + col) * {NG_D}u + g;
           uint4 wd4 = Wd4[wi];
           uint2 wd2 = (h_loc == 0u) ? uint2(wd4.x, wd4.y) : uint2(wd4.z, wd4.w);
-          float fd = as_type<float>((uint(Sd[wi]) + 14u) << 23);
-          half4 wd_h0 = half4(e2m1_pair_subnormal(wd2.x & 0xFFu), e2m1_pair_subnormal((wd2.x >> 8) & 0xFFu));
-          half4 wd_h1 = half4(e2m1_pair_subnormal((wd2.x >> 16) & 0xFFu), e2m1_pair_subnormal((wd2.x >> 24) & 0xFFu));
-          half4 wd_h2 = half4(e2m1_pair_subnormal(wd2.y & 0xFFu), e2m1_pair_subnormal((wd2.y >> 8) & 0xFFu));
-          half4 wd_h3 = half4(e2m1_pair_subnormal((wd2.y >> 16) & 0xFFu), e2m1_pair_subnormal((wd2.y >> 24) & 0xFFu));
+          float fd = e8m0_to_float(Sd[wi]);
+          half4 wd_h0 = unpack4_e2m1(wd2.x & 0xFFFFu);
+          half4 wd_h1 = unpack4_e2m1(wd2.x >> 16);
+          half4 wd_h2 = unpack4_e2m1(wd2.y & 0xFFFFu);
+          half4 wd_h3 = unpack4_e2m1(wd2.y >> 16);
           for (uint r = 0u; r < m_cnt; ++r) {{
             const threadgroup half4* xp = (const threadgroup half4*)(Xs + r * 480u + k_loc);
             float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);

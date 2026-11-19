@@ -15,7 +15,9 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import platform
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -25,8 +27,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LOCK_PATH = "/tmp/m4_gpu_validation.lock"
 
 # Child wrapper run inside an isolated fresh Python interpreter per package step.
-# Measures both MLX active peak and macOS RUSAGE_INFO_V4 OS physical footprint right
-# before process exit so parent sees exact hardware allocation per package.
+# Manages `mx.set_wired_limit` cleanly (saving and restoring prior limit in `finally`),
+# synchronizes MLX before reading wall time, and measures both MLX active peak and macOS
+# RUSAGE_INFO_V4 OS physical footprint right before process exit.
 _CHILD_HARNESS = r"""
 import json, os, runpy, sys, time
 from fast_shared.bench import get_unified_memory_footprint
@@ -35,6 +38,23 @@ mode = sys.argv[1]
 target = sys.argv[2]
 extra_args = json.loads(sys.argv[3])
 sys.argv = [target, *extra_args]
+
+use_wired = os.environ.get("FAST_SILICON_WIRED_LIMIT", "1") != "0"
+mx_mod = None
+prev_wired = None
+applied_wired = None
+try:
+    import mlx.core as mx
+    mx_mod = mx
+    if use_wired and hasattr(mx, "set_wired_limit"):
+        max_rec = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
+        if max_rec > 0:
+            prev_wired = int(mx.set_wired_limit(max_rec))
+            applied_wired = max_rec
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+except Exception:
+    mx_mod = None
 
 t0 = time.perf_counter()
 rc = 0
@@ -54,14 +74,29 @@ except SystemExit as exc:
 except Exception as exc:
     rc = 1
     exc_msg = f"{type(exc).__name__}: {exc}"
+finally:
+    if mx_mod is not None:
+        try:
+            if hasattr(mx_mod, "synchronize"):
+                mx_mod.synchronize()
+        except Exception:
+            pass
 
 elapsed_s = time.perf_counter() - t0
 fp = get_unified_memory_footprint()
-try:
-    import mlx.core as mx
-    mlx_peak_gb = round(float(mx.get_peak_memory()) / 1e9, 4)
-except Exception:
-    mlx_peak_gb = 0.0
+mlx_peak_gb = 0.0
+if mx_mod is not None:
+    try:
+        mlx_peak_gb = round(float(mx_mod.get_peak_memory()) / 1e9, 4)
+    except Exception:
+        mlx_peak_gb = 0.0
+    try:
+        if prev_wired is not None and hasattr(mx_mod, "set_wired_limit"):
+            mx_mod.set_wired_limit(prev_wired)
+        if hasattr(mx_mod, "clear_cache"):
+            mx_mod.clear_cache()
+    except Exception:
+        pass
 
 summary = {
     "rc": int(rc),
@@ -70,6 +105,7 @@ summary = {
     "peak_footprint_gb": round(float(fp["peak_footprint_gb"]), 4),
     "phys_footprint_gb": round(float(fp["phys_footprint_gb"]), 4),
     "rss_gb": round(float(fp["rss_bytes"]) / 1e9, 4),
+    "wired_limit_bytes": applied_wired,
     "error": exc_msg,
 }
 print("__MONOREPO_METRICS__=" + json.dumps(summary), flush=True)
@@ -119,10 +155,9 @@ DEFAULT_PACKAGE_SPECS: tuple[PackageSpec, ...] = (
             "--modes",
             "gpu-no-mmap,gpu-bf16,gpu,ane,hetero2,pplx-context-mlx-f16,torch-mps,torch-cpu",
             "--isolate",
-            "--allow-contended",
             "--json-only",
         ),
-        verify_args=("parity", "--modes", "gpu,ane,hetero2", "--allow-contended", "--json-only"),
+        verify_args=("parity", "--modes", "gpu,ane,hetero2", "--json-only"),
     ),
     PackageSpec(
         name="fast-gemma4",
@@ -130,10 +165,10 @@ DEFAULT_PACKAGE_SPECS: tuple[PackageSpec, ...] = (
         home_env_var="FAST_GEMMA4_HOME",
         runner_kind="module",
         runner_target="fast_gemma4.cli",
-        bench_args=("bench", "--batch-gpu", "128", "--batch-spec", "32", "--waves", "2", "--ane-variant", "w8"),
+        bench_args=("bench", "--batch-gpu", "128", "--batch-spec", "32", "--waves", "2", "--ane-variant", "fp16"),
         verify_args=("verify",),
         baseline_runs=(
-            ("no_kv_i8", ("bench", "--batch-gpu", "128", "--batch-spec", "1", "--waves", "1", "--skip-ane", "--no-kv-i8")),
+            ("no_kv_i8", ("bench", "--batch-gpu", "128", "--batch-spec", "32", "--waves", "2", "--skip-ane", "--no-kv-i8")),
         ),
     ),
     PackageSpec(
@@ -346,12 +381,78 @@ def classify_failure(clean_stdout: str, stderr: str, error_msg: str | None) -> s
     return "skipped" if any(tok in combined for tok in skip_tokens) else "failed"
 
 
+def _cmd_out_quiet(cmd: Sequence[str], *, timeout: float = 2.5) -> str:
+    try:
+        return subprocess.check_output(list(cmd), text=True, stderr=subprocess.DEVNULL, timeout=timeout).strip()
+    except Exception:
+        return ""
+
+
+def collect_environment_metadata(python_exe: str | None = None) -> dict[str, Any]:
+    """Capture host OS, Xcode SDK, chip/RAM, Python, MLX version, and NAX/TF32 env flags."""
+    is_darwin = platform.system() == "Darwin"
+    py = python_exe or sys.executable
+    mlx_ver = _cmd_out_quiet(
+        [py, "-c", "import mlx.core as mx; print(getattr(mx, '__version__', ''))"],
+        timeout=4.0,
+    )
+    mem_raw = _cmd_out_quiet(["sysctl", "-n", "hw.memsize"]) if is_darwin else ""
+    mem_gb = int(round(int(mem_raw) / (1024**3))) if mem_raw.isdigit() else 0
+    return {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "macos_version": _cmd_out_quiet(["sw_vers", "-productVersion"]) if is_darwin else None,
+        "macos_build": _cmd_out_quiet(["sw_vers", "-buildVersion"]) if is_darwin else None,
+        "xcode_sdk_version": _cmd_out_quiet(["xcrun", "--show-sdk-version"]) if is_darwin else None,
+        "xcode_sdk_build": _cmd_out_quiet(["xcrun", "--show-sdk-build-version"]) if is_darwin else None,
+        "chip": _cmd_out_quiet(["sysctl", "-n", "machdep.cpu.brand_string"]) if is_darwin else platform.processor(),
+        "hw_model": _cmd_out_quiet(["sysctl", "-n", "hw.model"]) if is_darwin else platform.machine(),
+        "mem_gb": mem_gb,
+        "python": py,
+        "python_version": platform.python_version(),
+        "mlx_version": mlx_ver or None,
+        "env_mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32"),
+        "env_mlx_metal_no_nax": os.environ.get("MLX_METAL_NO_NAX"),
+    }
+
+
+def _aggregate_repeated_steps(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize repeated ABBA/drift step dicts via median elapsed/peak plus A2/A1 thermal drift."""
+    if not runs:
+        return {}
+    if len(runs) == 1:
+        return dict(runs[0])
+    ok_runs = [r for r in runs if r.get("status") == "ok"]
+    pool = ok_runs if ok_runs else list(runs)
+    el_vals = [float(r.get("elapsed_s", 0.0)) for r in pool]
+    med_el = float(statistics.median(el_vals))
+    # Choose the representative run closest to median elapsed time so stdout/parsed_json stay coherent.
+    rep = dict(min(pool, key=lambda r: abs(float(r.get("elapsed_s", 0.0)) - med_el)))
+    rep["elapsed_s"] = round(med_el, 3)
+    rep["mlx_peak_gb"] = round(float(statistics.median([float(r.get("mlx_peak_gb", 0.0)) for r in pool])), 4)
+    rep["peak_footprint_gb"] = round(
+        float(statistics.median([float(r.get("peak_footprint_gb", 0.0)) for r in pool])), 4
+    )
+    rep["phys_footprint_gb"] = round(
+        float(statistics.median([float(r.get("phys_footprint_gb", 0.0)) for r in pool])), 4
+    )
+    rep["rss_gb"] = round(float(statistics.median([float(r.get("rss_gb", 0.0)) for r in pool])), 4)
+    rep["repeats"] = len(runs)
+    rep["elapsed_series_s"] = [round(float(r.get("elapsed_s", 0.0)), 3) for r in runs]
+    if len(pool) >= 2 and float(pool[0].get("elapsed_s", 0.0)) > 0:
+        rep["thermal_drift_last_over_first"] = round(
+            float(pool[-1]["elapsed_s"]) / float(pool[0]["elapsed_s"]), 4
+        )
+    return rep
+
+
 def _run_isolated_step(
     python_exe: str,
     spec: PackageSpec,
     step_args: Sequence[str],
     *,
     timeout_sec: int,
+    wired_limit: bool = True,
 ) -> dict[str, Any]:
     resolved_home = resolve_package_home(spec)
     cmd = [
@@ -364,6 +465,7 @@ def _run_isolated_step(
     ]
     env = dict(os.environ)
     env["M4_GPU_LOCK_HELD"] = "1"
+    env["FAST_SILICON_WIRED_LIMIT"] = "1" if wired_limit else "0"
     env.setdefault(spec.home_env_var, str(resolved_home))
     try:
         proc = subprocess.run(
@@ -703,6 +805,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-verify", action="store_true", help="Also run each package's verify command")
     parser.add_argument("--skip-extra-baselines", action="store_true", help="Skip secondary internal baseline runs")
     parser.add_argument("--skip-public-baselines", action="store_true", help="Skip external public Apple Silicon baseline runs")
+    parser.add_argument(
+        "--gemma4-ane-variant",
+        choices=("fp16", "w8"),
+        default="fp16",
+        help="ANE prefix bundle variant for fast-gemma4 (default: fp16; use w8 only for calibrated/QAT-validated bundles)",
+    )
+    parser.add_argument(
+        "--abba-rounds",
+        type=int,
+        default=2,
+        help="Interleaved ABBA rounds per primary/baseline pair (2 => A-B-B-A; 1 => single-shot; default: 2)",
+    )
+    parser.add_argument(
+        "--cooldown-sec",
+        type=float,
+        default=2.0,
+        help="Thermal cooldown seconds between isolated benchmark steps (default: 2.0)",
+    )
+    parser.add_argument(
+        "--no-wired-limit",
+        action="store_true",
+        help="Disable mx.set_wired_limit(max_recommended_working_set_size) inside child benchmark workers",
+    )
     parser.add_argument("--allow-contended", action="store_true", help="Run even if contention warnings appear")
     parser.add_argument("--dry-run", action="store_true", help="Print selected specs & quiescence status cleanly")
     parser.add_argument("--timeout-sec", type=int, default=300, help="Per-subprocess timeout seconds (default: 300)")
@@ -720,10 +845,25 @@ def _effective_bench_args(spec: PackageSpec, args: argparse.Namespace) -> list[s
             modes_idx = cmd_args.index("--modes") + 1
             if modes_idx < len(cmd_args):
                 cmd_args[modes_idx] = "gpu-no-mmap,gpu-bf16,gpu,ane,hetero2"
+        if getattr(args, "allow_contended", False) and "--allow-contended" not in cmd_args:
+            cmd_args.append("--allow-contended")
         if pub_py:
             cmd_args.extend(["--torch-python", str(pub_py)])
         if pplx_path:
             cmd_args.extend(["--pplx-mlx-path", str(pplx_path)])
+    elif spec.name == "fast-gemma4":
+        ane_var = str(getattr(args, "gemma4_ane_variant", "fp16"))
+        if "--ane-variant" in cmd_args:
+            var_idx = cmd_args.index("--ane-variant") + 1
+            if var_idx < len(cmd_args):
+                cmd_args[var_idx] = ane_var
+    return cmd_args
+
+
+def _effective_verify_args(spec: PackageSpec, args: argparse.Namespace) -> list[str]:
+    cmd_args = list(spec.verify_args)
+    if spec.name == "fast-pplx" and getattr(args, "allow_contended", False) and "--allow-contended" not in cmd_args:
+        cmd_args.append("--allow-contended")
     return cmd_args
 
 
@@ -737,6 +877,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     specs = select_specs(args.packages)
     quiescence = check_system_quiescence()
+    env_meta = collect_environment_metadata(args.python)
+    wired_limit = not bool(getattr(args, "no_wired_limit", False))
+    abba_rounds = max(1, int(getattr(args, "abba_rounds", 2)))
+    cooldown_sec = max(0.0, float(getattr(args, "cooldown_sec", 2.0)))
 
     if args.dry_run:
         plan = {
@@ -747,6 +891,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "include_verify": bool(args.include_verify),
             "include_extra_baselines": not bool(args.skip_extra_baselines),
             "include_public_baselines": not bool(args.skip_public_baselines),
+            "abba_rounds": abba_rounds,
+            "cooldown_sec": cooldown_sec,
+            "wired_limit": wired_limit,
+            "allow_contended": bool(args.allow_contended),
+            "environment": env_meta,
             "quiescence_warnings": quiescence,
             "packages": [
                 {
@@ -757,7 +906,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "baseline_runs": {}
                     if args.skip_extra_baselines
                     else {lbl: list(b_args) for lbl, b_args in s.baseline_runs},
-                    "verify_args": list(s.verify_args) if args.include_verify else [],
+                    "verify_args": _effective_verify_args(s, args) if args.include_verify else [],
                 }
                 for s in specs
             ],
@@ -772,26 +921,94 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Aborting: re-run when quiet or pass --allow-contended.", file=sys.stderr)
         return 2
 
+    def _cooldown() -> None:
+        if cooldown_sec > 0.0:
+            time.sleep(cooldown_sec)
+
     results: list[dict[str, Any]] = []
     total_specs = len(specs)
     with _hw_lock():
         for idx, spec in enumerate(specs, 1):
+            if idx > 1:
+                _cooldown()
             print(f"[{idx}/{total_specs}] Benchmarking {spec.name}...", file=sys.stderr, flush=True)
             resolved_home = resolve_package_home(spec)
-            bench_res = _run_isolated_step(
-                args.python, spec, _effective_bench_args(spec, args), timeout_sec=args.timeout_sec
-            )
-            baselines: dict[str, dict[str, Any]] = {}
-            if not args.skip_extra_baselines:
-                for lbl, b_args in spec.baseline_runs:
+            eff_bench = _effective_bench_args(spec, args)
+            extra_bl_list = [] if args.skip_extra_baselines else list(spec.baseline_runs)
+            primary_runs: list[dict[str, Any]] = []
+            baseline_run_lists: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl, _ in extra_bl_list}
+            abba_order: list[str] = []
+
+            if abba_rounds >= 2 and extra_bl_list:
+                # True interleaved A-B-B-A pairing between primary (A) and first baseline (B) to cancel thermal drift!
+                pair_lbl, pair_args = extra_bl_list[0]
+                schedule = ["A", "B", "B", "A"] * max(1, abba_rounds // 2)
+                if abba_rounds % 2 == 1:
+                    schedule.extend(["A", "B"])
+                abba_order = list(schedule)
+                for step_i, tag in enumerate(schedule):
+                    if step_i > 0:
+                        _cooldown()
+                    if tag == "A":
+                        primary_runs.append(
+                            _run_isolated_step(
+                                args.python, spec, eff_bench, timeout_sec=args.timeout_sec, wired_limit=wired_limit
+                            )
+                        )
+                    else:
+                        print(
+                            f"[{idx}/{total_specs}]   baseline '{pair_lbl}' ({tag}) for {spec.name}...",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        baseline_run_lists[pair_lbl].append(
+                            _run_isolated_step(
+                                args.python, spec, pair_args, timeout_sec=args.timeout_sec, wired_limit=wired_limit
+                            )
+                        )
+                for lbl, b_args in extra_bl_list[1:]:
+                    _cooldown()
                     print(
                         f"[{idx}/{total_specs}]   baseline '{lbl}' for {spec.name}...",
                         file=sys.stderr,
                         flush=True,
                     )
-                    baselines[lbl] = _run_isolated_step(args.python, spec, b_args, timeout_sec=args.timeout_sec)
+                    baseline_run_lists[lbl].append(
+                        _run_isolated_step(
+                            args.python, spec, b_args, timeout_sec=args.timeout_sec, wired_limit=wired_limit
+                        )
+                    )
+            else:
+                for rep_i in range(abba_rounds):
+                    if rep_i > 0:
+                        _cooldown()
+                    abba_order.append("A")
+                    primary_runs.append(
+                        _run_isolated_step(
+                            args.python, spec, eff_bench, timeout_sec=args.timeout_sec, wired_limit=wired_limit
+                        )
+                    )
+                for lbl, b_args in extra_bl_list:
+                    _cooldown()
+                    print(
+                        f"[{idx}/{total_specs}]   baseline '{lbl}' for {spec.name}...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    baseline_run_lists[lbl].append(
+                        _run_isolated_step(
+                            args.python, spec, b_args, timeout_sec=args.timeout_sec, wired_limit=wired_limit
+                        )
+                    )
+
+            bench_res = _aggregate_repeated_steps(primary_runs)
+            baselines: dict[str, dict[str, Any]] = {
+                lbl: _aggregate_repeated_steps(rlist) for lbl, rlist in baseline_run_lists.items() if rlist
+            }
+
             public_res: dict[str, Any] | None = None
             if not args.skip_public_baselines and spec.name != "fast-pplx":
+                _cooldown()
                 print(
                     f"[{idx}/{total_specs}]   public baseline for {spec.name}...",
                     file=sys.stderr,
@@ -802,10 +1019,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     resolved_home=resolved_home,
                     public_python=args.public_python,
                     timeout_sec=args.timeout_sec,
+                    wired_limit=wired_limit,
+                    cooldown_sec=min(cooldown_sec, 1.0),
                 )
             entry: dict[str, Any] = {
                 "package": spec.name,
                 "role": spec.role,
+                "abba_order": abba_order,
                 "bench": bench_res,
                 "baselines": baselines,
                 "baseline_comparison": extract_baseline_comparison(spec.name, bench_res, baselines),
@@ -813,19 +1033,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "public_comparison": extract_public_comparison(spec.name, bench_res, public_res),
             }
             if args.include_verify:
+                _cooldown()
                 print(
                     f"[{idx}/{total_specs}]   verify for {spec.name}...",
                     file=sys.stderr,
                     flush=True,
                 )
                 entry["verify"] = _run_isolated_step(
-                    args.python, spec, spec.verify_args, timeout_sec=args.timeout_sec
+                    args.python,
+                    spec,
+                    _effective_verify_args(spec, args),
+                    timeout_sec=args.timeout_sec,
+                    wired_limit=wired_limit,
                 )
             results.append(entry)
 
     md = format_monorepo_markdown(results)
     payload = {
         "timestamp_epoch": int(time.time()),
+        "abba_rounds": abba_rounds,
+        "cooldown_sec": cooldown_sec,
+        "wired_limit": wired_limit,
+        "environment": env_meta,
         "quiescence_warnings": quiescence,
         "results": results,
     }

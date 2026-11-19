@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fast-gemma4"
 version = "0.1.0"
-description = "Hardware-limit Apple Silicon (M4 Pro Metal 4 MPP GPU + 16-core ANE + llguidance + Prompt-Lookup Speculative) Gemma-4 E2B engine"
+description = "Hardware-limit Apple Silicon (M4/M5+ Metal 4 MPP GPU + 16-core ANE + llguidance + Prompt-Lookup Speculative) Gemma-4 E2B/E4B engine"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "fast-shared>=0.1.0",
-    "mlx>=0.30.0",
+    "mlx>=0.32.4",
     "numpy>=1.26.0",
     "tokenizers>=0.20.0",
     "pyarrow>=18.0.0",

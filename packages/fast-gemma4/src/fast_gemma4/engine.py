@@ -1,4 +1,4 @@
-"""High-throughput Gemma-4 E2B inference engine (Metal 4 MPP GPU + CoreML ANE + llguidance + PromptLookup)."""
+"""High-throughput Gemma-4 E2B/E4B inference engine (Metal 4 MPP GPU + CoreML ANE + llguidance + PromptLookup)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Sequence
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -24,11 +25,13 @@ from .ane_pipeline import (
     can_use_ane_prefix,
     ingest_ane_finish_tail_and_last,
     is_ane_resident_bundle,
+    is_w8_bundle_calibrated,
 )
 from .grammar import GrammarHelper
 from .model import FastGemma4Model
 from .paths import Gemma4Paths, resolve_paths
 from .speculative import (
+    _host_ram_gib,
     _parse_use_ane_ring,
     run_decode_batch,
     run_decode_prompt_lookup,
@@ -71,17 +74,20 @@ def select_execution_plan(
     max_suf: int,
     n_docs: int,
     batch_size: int | None,
+    *,
+    max_b_slots: int = 256,
 ) -> tuple[bool, int]:
-    """Choose `(use_ane, wave_bs)`: auto prefers V4 rolling GPU (`256` slots); explicit `hetero` enables ANE+GPU."""
+    """Choose `(use_ane, wave_bs)`: auto prefers V4 rolling GPU (`<=max_b_slots`); explicit `hetero` enables ANE+GPU."""
     eff_mode = mode.lower()
     ane_ok = ane_available and can_use_ane_prefix(lcp, max_suf)
     use_ane = bool(eff_mode == "hetero" and ane_ok)
+    cap_slots = max(1, int(max_b_slots))
     if batch_size is not None:
         wave_bs = int(batch_size)
     elif use_ane:
-        wave_bs = 64 if n_docs >= 128 else n_docs
+        wave_bs = min(64, cap_slots) if n_docs >= 128 else min(n_docs, cap_slots)
     else:
-        wave_bs = 256 if n_docs > 256 else n_docs
+        wave_bs = cap_slots if n_docs > cap_slots else n_docs
     return use_ane, wave_bs
 
 
@@ -100,7 +106,7 @@ def should_use_speculative(
 
 
 class FastGemma4Engine:
-    """Thread-safe hardware-limit Gemma-4 E2B engine for Apple Silicon M4 Pro."""
+    """Thread-safe hardware-limit Gemma-4 E2B/E4B engine for Apple Silicon (M4 / M5+)."""
 
     def __init__(
         self,
@@ -109,7 +115,7 @@ class FastGemma4Engine:
         model_dir: str | Path | None = None,
         default_mode: str = "auto",
         ane_variant: str = "fp16",
-        ane_ring_variant: str = "w8",
+        ane_ring_variant: str = "fp16",
         vocab_out: int | None = DEFAULT_KEPT_VOCAB_SIZE,
         lm_head_mode: str = "q4",
         mlp_dtype: str = "bfloat16",
@@ -118,7 +124,9 @@ class FastGemma4Engine:
         vec4_reduce: bool = True,
         mpp_m32_cutoff: int = 96,
         use_fused_softcap_argmax: bool = True,
-        max_prefix_cache: int = 8,
+        max_prefix_cache: int | None = None,
+        max_b_slots: int | None = None,
+        allow_ane_on_low_ram: bool = False,
         local_files_only: bool = True,
         warmup: bool = True,
         warmup_ane: bool = False,
@@ -129,6 +137,24 @@ class FastGemma4Engine:
             raise ValueError(f"Unsupported ane_variant={ane_variant!r}")
         if ane_ring_variant not in ("fp16", "w8"):
             raise ValueError(f"Unsupported ane_ring_variant={ane_ring_variant!r}")
+
+        self._host_ram_gib = _host_ram_gib()
+        self._is_low_ram = 0.0 < self._host_ram_gib < 32.0
+        self._allow_ane_on_low_ram = bool(allow_ane_on_low_ram)
+        self.default_max_b_slots = int(max_b_slots) if max_b_slots is not None else (128 if self._is_low_ram else 256)
+        eff_prefix_cache = (2 if self._is_low_ram else 8) if max_prefix_cache is None else int(max_prefix_cache)
+
+        # Pin Metal wired working set cleanly (restored in close()) to eliminate macOS swap/page-fault jitter.
+        self._prev_wired_limit: int | None = None
+        set_wl = getattr(mx, "set_wired_limit", None)
+        dev_info_fn = getattr(mx, "device_info", None)
+        if callable(set_wl) and callable(dev_info_fn):
+            try:
+                rec_ws = int(dev_info_fn().get("max_recommended_working_set_size", 0))
+                if rec_ws > 0:
+                    self._prev_wired_limit = int(set_wl(rec_ws))
+            except Exception:
+                self._prev_wired_limit = None
 
         self.paths: Gemma4Paths = resolve_paths(home)
         self.model = FastGemma4Model(
@@ -145,13 +171,17 @@ class FastGemma4Engine:
             use_fused_softcap_argmax=use_fused_softcap_argmax,
         )
         self.tokenizer = FastGemma4Tokenizer(self.model.tokenizer_json)
-        self.model_name = "google/gemma-4-E2B-it"
+        is_e4b = (
+            getattr(self.model, "hidden_size", 1536) >= 2560
+            or getattr(self.model, "num_layers", 35) >= 42
+            or getattr(self.model, "n_kv_heads", 1) >= 2
+        )
+        self.model_name = "google/gemma-4-E4B-it" if is_e4b else "google/gemma-4-E2B-it"
         self.default_mode = default_mode
         self.ane_variant = ane_variant
-        # Bundle the hybrid prefill ring runs. Separate from `ane_variant` (the hetero wave worker's bundle, default
-        # FP16) so the ring stays on Linear-W8 unless a caller asks for FP16 to isolate weight quantization.
+        # Default hybrid prefill ring to FP16 unless the caller opts into a domain-calibrated / QAT-validated W8 bundle.
         self.ane_ring_variant = ane_ring_variant
-        self.max_prefix_cache = max(1, int(max_prefix_cache))
+        self.max_prefix_cache = max(1, eff_prefix_cache)
 
         self._gpu_lock = threading.Lock()
         self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
@@ -166,39 +196,64 @@ class FastGemma4Engine:
         self._ane_rings: dict[tuple[int, ...], AsyncHybridPrefillRing] = {}
         self._local_files_only = bool(local_files_only)
 
-        eff_var = "w8" if ane_variant == "auto" else ane_variant
+        exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
+        eff_var = "fp16" if ane_variant == "auto" else ane_variant
         bundle = self.paths.resolve_ane_bundle(
-            eff_var, model_dir=self.model.model_dir, local_files_only=local_files_only
+            eff_var, model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
         )
         if bundle is None and eff_var != "fp16":
             bundle = self.paths.resolve_ane_bundle(
-                "fp16", model_dir=self.model.model_dir, local_files_only=local_files_only
+                "fp16", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
             )
         if bundle is None and eff_var != "w8":
             bundle = self.paths.resolve_ane_bundle(
-                "w8", model_dir=self.model.model_dir, local_files_only=local_files_only
+                "w8", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
             )
         self._ane_bundle = bundle
-        self.ane_available = bool(bundle is not None and self.paths.lib_ane_prefix.exists())
+        low_ram_ane_disabled = self._is_low_ram and not self._allow_ane_on_low_ram and default_mode != "hetero"
+        self.ane_available = bool(
+            (not low_ram_ane_disabled) and bundle is not None and self.paths.lib_ane_prefix.exists()
+        )
 
         if warmup:
             self.warmup(enable_ane=warmup_ane)
 
-    def close(self) -> None:
+    def release_ane_resources(self) -> None:
+        """Close native ANE runners and free the ~2.68 GiB host FP16 ANE embedding/PLE tables."""
         if getattr(self, "_ane_runner", None) is not None:
             self._ane_runner.close()  # type: ignore[union-attr]
             self._ane_runner = None
         if getattr(self, "_ane_ring_runner", None) is not None:
             self._ane_ring_runner.close()  # type: ignore[union-attr]
             self._ane_ring_runner = None
-        auto_r = getattr(self.model, "_auto_ane_w8_runner", None)
-        if auto_r is not None:
-            auto_r.close()
-            self.model._auto_ane_w8_runner = None  # type: ignore[attr-defined]
+        model = getattr(self, "model", None)
+        if model is not None:
+            for attr in ("_auto_ane_w8_runner", "_auto_ane_runner"):
+                auto_r = getattr(model, attr, None)
+                if auto_r is not None:
+                    auto_r.close()
+                    setattr(model, attr, None)
+            if getattr(model, "_auto_cpu_ane_tables", None) is not None:
+                model._auto_cpu_ane_tables = None  # type: ignore[attr-defined]
         if hasattr(self, "_ane_workers"):
             self._ane_workers.clear()
         if hasattr(self, "_ane_rings"):
             self._ane_rings.clear()
+        self._w_emb = None
+        self._w_pli14 = None
+        gc.collect()
+
+    def close(self) -> None:
+        self.release_ane_resources()
+        prev_wl = getattr(self, "_prev_wired_limit", None)
+        if prev_wl is not None:
+            set_wl = getattr(mx, "set_wired_limit", None)
+            if callable(set_wl):
+                try:
+                    set_wl(prev_wl)
+                except Exception:
+                    pass
+            self._prev_wired_limit = None
 
     def _ensure_ane_ready(self) -> tuple[AnePrefixRunner, np.ndarray, np.ndarray]:
         if not self.ane_available or self._ane_bundle is None:
@@ -280,15 +335,21 @@ class FastGemma4Engine:
 
     def _resolve_ane_ring_runner(self, *, require: bool) -> AnePrefixRunner | None:
         """Runner for the `ane_ring_variant` bundle, or None when that bundle is missing or not fully on the ANE."""
-        variant = getattr(self, "ane_ring_variant", "w8")
+        variant = getattr(self, "ane_ring_variant", "fp16")
         if not getattr(self, "_ane_ring_checked", False):
             paths = getattr(self, "paths", None)
             local_only = bool(getattr(self, "_local_files_only", True))
-            cand = (
-                paths.resolve_ane_bundle(variant, model_dir=self.model.model_dir, local_files_only=local_only)
-                if paths is not None
-                else None
-            )
+            exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
+            cand = None
+            if paths is not None:
+                try:
+                    cand = paths.resolve_ane_bundle(
+                        variant, model_dir=self.model.model_dir, local_files_only=local_only, exit_layer=exit_layer
+                    )
+                except TypeError:
+                    cand = paths.resolve_ane_bundle(
+                        variant, model_dir=self.model.model_dir, local_files_only=local_only
+                    )
             self._ane_ring_bundle = (
                 cand if (paths is not None and is_ane_resident_bundle(paths.lib_ane_prefix, cand)) else None
             )
@@ -299,6 +360,14 @@ class FastGemma4Engine:
                     f"No valid {variant} ANE ring bundle (`0` CPU runtime ops) available for {self.model.model_dir}."
                 )
             return None
+        if variant == "w8" and not is_w8_bundle_calibrated(self._ane_ring_bundle):
+            warnings.warn(
+                f"ANE ring bundle {self._ane_ring_bundle.name} is Linear-W8 without a domain-corpus/QAT "
+                "calibration manifest; use ane_ring_variant='fp16' or rebuild with `--awq-mse --calib-file ...` "
+                "to avoid repeat-loop regressions.",
+                UserWarning,
+                stacklevel=2,
+            )
         if getattr(self, "_ane_ring_runner", None) is None:
             self._ane_ring_runner = AnePrefixRunner(
                 self.paths.lib_ane_prefix, self._ane_ring_bundle, pipe_depth=4, out_ring_slots=96
@@ -316,6 +385,8 @@ class FastGemma4Engine:
     ) -> AsyncHybridPrefillRing | None:
         want_ane, require_ane = _parse_use_ane_ring(use_ane_ring)
         if not want_ane:
+            return None
+        if not require_ane and getattr(self, "_is_low_ram", False) and not getattr(self, "_allow_ane_on_low_ram", False):
             return None
         if not kv_i8:
             if require_ane:
@@ -432,12 +503,18 @@ class FastGemma4Engine:
         use_ane_ring: bool | str = False,
         ane_cohort_size: int = 16,
         enable_ff_jump: bool = True,
+        override_memory_cap: bool = False,
         **_compat_kwargs: Any,
     ) -> dict[str, Any]:
-        """Thread-safe GPU (+ optional Hybrid ANE Linear-W8) rolling decode entrypoint."""
+        """Thread-safe GPU (+ optional Hybrid ANE) rolling decode entrypoint."""
         with self._gpu_lock:
             pkv = self.get_prefix_kv(sys_ids)
             eff_kv_i8 = self.model.kv_i8 if kv_i8 is None else bool(kv_i8)
+            eff_b_slots = (
+                int(B_slots)
+                if override_memory_cap
+                else min(int(B_slots), int(getattr(self, "default_max_b_slots", 256)))
+            )
             ring = self._maybe_get_ane_ring(
                 sys_ids, pkv, suf_ids_list, use_ane_ring=use_ane_ring, kv_i8=eff_kv_i8
             )
@@ -448,7 +525,7 @@ class FastGemma4Engine:
                 pkv,
                 suf_ids_list,
                 max_tokens=max_tokens,
-                b_slots=B_slots,
+                b_slots=eff_b_slots,
                 refill_min=refill_min,
                 swa_ring_cap=swa_ring_cap,
                 group_size=group_size,
@@ -463,6 +540,7 @@ class FastGemma4Engine:
                 ane_ring=ring,
                 ane_cohort_size=ane_cohort_size,
                 enable_ff_jump=enable_ff_jump,
+                ane_ring_variant=getattr(self, "ane_ring_variant", "fp16"),
             )
 
     def generate_batch(
@@ -560,7 +638,13 @@ class FastGemma4Engine:
                 sys_ids, pkv, suf_all, use_ane_ring=use_ane_ring, kv_i8=bool(self.model.kv_i8)
             )
             use_ane, wave_bs = select_execution_plan(
-                eff_mode, self.ane_available, lcp, max_suf, n_docs, batch_size
+                eff_mode,
+                self.ane_available,
+                lcp,
+                max_suf,
+                n_docs,
+                batch_size,
+                max_b_slots=int(getattr(self, "default_max_b_slots", 256)),
             )
             if ring_for_batch is not None:
                 use_ane = False
@@ -735,6 +819,7 @@ class FastGemma4Engine:
                     ane_ring=ring_for_batch,
                     ane_cohort_size=ane_cohort_size,
                     enable_ff_jump=enable_ff_jump,
+                    ane_ring_variant=getattr(self, "ane_ring_variant", "fp16"),
                 )
                 all_gen_toks = roll_res["gen_toks"]
                 roll_valid_schemas = roll_res.get("valid_schemas")
@@ -752,6 +837,7 @@ class FastGemma4Engine:
                     "used_ane_ring": used_ane_ring_flag,
                     "ane_cohorts": int(roll_res.get("ane_cohorts", 0)),
                     "ane_busy_sec": float(roll_res.get("ane_busy_sec", 0.0)),
+                    "ane_nan_fallbacks": int(roll_res.get("ane_nan_fallbacks", 0)),
                     "gpu_boot_cohorts": int(roll_res.get("gpu_boot_cohorts", 0)),
                 }
                 if roll_res.get("used_speculative"):

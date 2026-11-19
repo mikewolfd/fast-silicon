@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import queue
+import threading
 import time
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .bench import clear_mlx_arena, wired_limit
+from .embeddings import set_mlx_cache_limit
 from .parquet_pipeline import (
     DEFAULT_TEXT_COLUMNS,
     resolve_input_files,
@@ -66,6 +71,40 @@ def resolve_llm_text_column(schema: pa.Schema, text_col: str | None) -> str:
         raise
 
 
+def _enter_mlx_limits(
+    stack: ExitStack,
+    *,
+    mlx_cache_limit_mb: int | None,
+    use_wired_limit: bool,
+) -> None:
+    if mlx_cache_limit_mb is not None:
+        prev_limit: int | None = None
+        try:
+            import mlx.core as mx
+
+            set_limit = getattr(mx, "set_cache_limit", None)
+            if callable(set_limit):
+                prev = set_limit(max(0, int(mlx_cache_limit_mb)) * 1024 * 1024)
+                if isinstance(prev, int):
+                    prev_limit = prev
+        except Exception:
+            set_mlx_cache_limit(int(mlx_cache_limit_mb))
+        if prev_limit is not None:
+            def _restore(val: int = prev_limit) -> None:
+                try:
+                    import mlx.core as mx
+
+                    set_limit = getattr(mx, "set_cache_limit", None)
+                    if callable(set_limit):
+                        set_limit(val)
+                except Exception:
+                    pass
+
+            stack.callback(_restore)
+    if use_wired_limit:
+        stack.enter_context(wired_limit())
+
+
 def extract_parquet(
     engine: Any,
     input_path: str | Path,
@@ -90,9 +129,11 @@ def extract_parquet(
     ocr_pages_only: bool = False,
     skip_empty: bool = True,
     resume: bool = False,
+    mlx_cache_limit_mb: int | None = 512,
+    use_wired_limit: bool = False,
     **extra_gen_kwargs: Any,
 ) -> ParquetExtractSummary:
-    """Stream-extract structured JSON from Parquet input(s) into a single file or sharded directory."""
+    """Stream-extract structured JSON from Parquet input(s) with overlapped reader/GPU/writer threads."""
     in_files = resolve_input_files(input_path)
     out = Path(output_path)
     sharded = out.suffix.lower() != ".parquet"
@@ -128,20 +169,6 @@ def extract_parquet(
                     status_by_id[key_val] = bool(ok_vs and ok_fr)
         done_ids = {k for k, ok in status_by_id.items() if ok}
 
-    writer: pq.ParquetWriter | None = None
-    tmp_dst: Path | None = None
-    final_dst: Path | None = None
-    shard_idx = next_shard_index(out) if sharded else 0
-    shard_acc = 0
-
-    docs_processed = 0
-    valid_json_tot = 0
-    valid_schema_tot = 0
-    prompt_toks_tot = 0
-    comp_toks_tot = 0
-    tot_dec_sec = 0.0
-    t0 = time.perf_counter()
-
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
     roll_kw = clean_extra.get("roll_slots")
     bs_kw = clean_extra.pop("batch_size", None)
@@ -154,99 +181,122 @@ def extract_parquet(
         else (bs_extra if bs_extra is not None else max(eff_batch_rows, roll_default))
     )
 
-    try:
-        for fpath in in_files:
-            pf = pq.ParquetFile(fpath)
-            schema = pf.schema_arrow
-            tcol = resolve_llm_text_column(schema, text_col)
-            avail = set(schema.names)
-            meta_cols = [c for c in keep_cols if c in avail] if keep_cols is not None else [
-                c for c in schema.names if not (drop_text_col and c == tcol)
-            ]
-            read_cols = list(dict.fromkeys(meta_cols + [tcol]))
-            for extra in ("is_ocr", "ocr_pages", "page_offsets"):
-                if extra in avail and extra not in read_cols:
-                    read_cols.append(extra)
+    prep_queue: queue.Queue[tuple[pa.Table, list[str]] | None | BaseException] = queue.Queue(maxsize=2)
+    write_queue: queue.Queue[pa.Table | None] = queue.Queue(maxsize=2)
+    reader_stop = threading.Event()
+    writer_abort = threading.Event()
+    writer_err: list[BaseException] = []
 
-            for rb in pf.iter_batches(batch_size=eff_batch_rows, columns=read_cols):
-                if filter_ocr:
-                    mask_flags = [True] * rb.num_rows
-                    has_iso = "is_ocr" in rb.schema.names
-                    has_op = "ocr_pages" in rb.schema.names
-                    iso_list = rb.column("is_ocr").to_pylist() if has_iso else None
-                    op_list = rb.column("ocr_pages").to_pylist() if has_op else None
-                    for i in range(rb.num_rows):
-                        v_iso = bool(iso_list[i]) if iso_list is not None and iso_list[i] is not None else False
-                        v_op = len(op_list[i]) > 0 if op_list is not None and op_list[i] is not None else False
-                        if has_iso or has_op:
-                            mask_flags[i] = v_iso or v_op
-                    rb = rb.filter(pa.array(mask_flags, type=pa.bool_()))
-                    if rb.num_rows == 0:
-                        continue
+    def _put_prep(item: tuple[pa.Table, list[str]] | None | BaseException) -> bool:
+        while not reader_stop.is_set():
+            try:
+                prep_queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
 
-                if done_ids:
-                    kcol = resume_key_col if (resume_key_col and resume_key_col in rb.schema.names) else (
-                        "id" if "id" in rb.schema.names else ("body_sha" if "body_sha" in rb.schema.names else None)
-                    )
-                    if kcol is not None:
-                        ids_col = rb.column(kcol).to_pylist()
-                        keep_flags = [x not in done_ids for x in ids_col]
-                        rb = rb.filter(pa.array(keep_flags, type=pa.bool_()))
+    def _reader_worker() -> None:
+        try:
+            for fpath in in_files:
+                if reader_stop.is_set():
+                    return
+                pf = pq.ParquetFile(fpath)
+                schema = pf.schema_arrow
+                tcol = resolve_llm_text_column(schema, text_col)
+                avail = set(schema.names)
+                meta_cols = [c for c in keep_cols if c in avail] if keep_cols is not None else [
+                    c for c in schema.names if not (drop_text_col and c == tcol)
+                ]
+                meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
+                read_cols = list(dict.fromkeys(meta_cols + [tcol]))
+                for extra in ("is_ocr", "ocr_pages", "page_offsets"):
+                    if extra in avail and extra not in read_cols:
+                        read_cols.append(extra)
+
+                for rb in pf.iter_batches(batch_size=eff_batch_rows, columns=read_cols):
+                    if reader_stop.is_set():
+                        return
+                    if filter_ocr:
+                        mask_flags = [True] * rb.num_rows
+                        has_iso = "is_ocr" in rb.schema.names
+                        has_op = "ocr_pages" in rb.schema.names
+                        iso_list = rb.column("is_ocr").to_pylist() if has_iso else None
+                        op_list = rb.column("ocr_pages").to_pylist() if has_op else None
+                        for i in range(rb.num_rows):
+                            v_iso = bool(iso_list[i]) if iso_list is not None and iso_list[i] is not None else False
+                            v_op = len(op_list[i]) > 0 if op_list is not None and op_list[i] is not None else False
+                            if has_iso or has_op:
+                                mask_flags[i] = v_iso or v_op
+                        rb = rb.filter(pa.array(mask_flags, type=pa.bool_()))
                         if rb.num_rows == 0:
                             continue
 
-                texts_raw = rb.column(tcol).to_pylist()
-                offsets_col = rb.column("page_offsets").to_pylist() if "page_offsets" in rb.schema.names else None
-                ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in rb.schema.names else None
+                    if done_ids:
+                        kcol = resume_key_col if (resume_key_col and resume_key_col in rb.schema.names) else (
+                            "id" if "id" in rb.schema.names else ("body_sha" if "body_sha" in rb.schema.names else None)
+                        )
+                        if kcol is not None:
+                            ids_col = rb.column(kcol).to_pylist()
+                            keep_flags = [x not in done_ids for x in ids_col]
+                            rb = rb.filter(pa.array(keep_flags, type=pa.bool_()))
+                            if rb.num_rows == 0:
+                                continue
 
-                kept_indices: list[int] = []
-                prompts: list[str] = []
-                for i in range(rb.num_rows):
-                    t = texts_raw[i] if isinstance(texts_raw[i], str) else ""
-                    if ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
-                        t = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
-                    elif max_pages > 0 and offsets_col is not None:
-                        t = slice_first_pages_utf8(t, offsets_col[i], max_pages)
-                    if max_chars > 0 and len(t) > max_chars:
-                        t = t[:max_chars]
-                    if skip_empty and not t.strip():
+                    texts_raw = rb.column(tcol).to_pylist()
+                    offsets_col = rb.column("page_offsets").to_pylist() if "page_offsets" in rb.schema.names else None
+                    ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in rb.schema.names else None
+
+                    kept_indices: list[int] = []
+                    prompts: list[str] = []
+                    for i in range(rb.num_rows):
+                        t = texts_raw[i] if isinstance(texts_raw[i], str) else ""
+                        if ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
+                            t = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
+                        elif max_pages > 0 and offsets_col is not None:
+                            t = slice_first_pages_utf8(t, offsets_col[i], max_pages)
+                        if max_chars > 0 and len(t) > max_chars:
+                            t = t[:max_chars]
+                        if skip_empty and not t.strip():
+                            continue
+                        kept_indices.append(i)
+                        prompts.append(t)
+
+                    if not prompts:
                         continue
-                    kept_indices.append(i)
-                    prompts.append(t)
 
-                if not prompts:
+                    meta_tbl = pa.Table.from_batches([rb.take(kept_indices)]).select(meta_only_cols)
+                    if not _put_prep((meta_tbl, prompts)):
+                        return
+        except BaseException as exc:
+            try:
+                prep_queue.put(exc, timeout=1.0)
+            except queue.Full:
+                pass
+        finally:
+            try:
+                prep_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass
+
+    shard_idx = next_shard_index(out) if sharded else 0
+
+    def _writer_worker() -> None:
+        nonlocal shard_idx
+        writer: pq.ParquetWriter | None = None
+        tmp_dst: Path | None = None
+        final_dst: Path | None = None
+        shard_acc = 0
+        try:
+            while True:
+                if writer_abort.is_set():
+                    break
+                try:
+                    out_table = write_queue.get(timeout=0.05)
+                except queue.Empty:
                     continue
-
-                gen_kw: dict[str, Any] = {
-                    "system_prompt": system_prompt,
-                    "json_schema": json_schema,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "whitespace_flexible": whitespace_flexible,
-                    "batch_size": min(len(prompts), eff_gpu_batch_size),
-                    **clean_extra,
-                }
-                if mode is not None:
-                    gen_kw["mode"] = mode
-                if speculative is not None:
-                    gen_kw["speculative"] = speculative
-
-                res = engine.generate_batch(prompts, **gen_kw)
-
-                meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
-                out_table = pa.Table.from_batches([rb.take(kept_indices)]).select(meta_only_cols)
-                out_table = (
-                    out_table.append_column("response_text", pa.array([it.text for it in res.items], type=pa.string()))
-                    .append_column("valid_json", pa.array([it.valid_json for it in res.items], type=pa.bool_()))
-                    .append_column("valid_schema", pa.array([it.valid_schema for it in res.items], type=pa.bool_()))
-                    .append_column(
-                        "finish_reason",
-                        pa.array([str(getattr(it, "finish_reason", "stop")) for it in res.items], type=pa.string()),
-                    )
-                    .append_column("prompt_tokens", pa.array([it.prompt_tokens for it in res.items], type=pa.int32()))
-                    .append_column("completion_tokens", pa.array([it.completion_tokens for it in res.items], type=pa.int32()))
-                )
-
+                if out_table is None:
+                    break
                 if writer is None:
                     final_dst = (out / f"part-{shard_idx:05d}.parquet") if sharded else out
                     tmp_dst = final_dst.with_name(f".{final_dst.name}.tmp.{os.getpid()}")
@@ -264,29 +314,130 @@ def extract_parquet(
                     final_dst = None
                     shard_idx += 1
 
+            if writer is not None:
+                if writer_abort.is_set():
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    writer = None
+                    if tmp_dst is not None:
+                        tmp_dst.unlink(missing_ok=True)
+                else:
+                    writer.close()
+                    writer = None
+                    assert tmp_dst is not None and final_dst is not None
+                    os.replace(tmp_dst, final_dst)
+                    tmp_dst = None
+                    final_dst = None
+        except BaseException as exc:
+            writer_err.append(exc)
+            writer_abort.set()
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                writer = None
+            if tmp_dst is not None:
+                tmp_dst.unlink(missing_ok=True)
+
+    def _enqueue_write(tbl: pa.Table | None) -> None:
+        while True:
+            if writer_err:
+                raise writer_err[0]
+            try:
+                write_queue.put(tbl, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    docs_processed = 0
+    valid_json_tot = 0
+    valid_schema_tot = 0
+    prompt_toks_tot = 0
+    comp_toks_tot = 0
+    tot_dec_sec = 0.0
+    t0 = time.perf_counter()
+
+    reader_thread = threading.Thread(target=_reader_worker, daemon=True)
+    writer_thread = threading.Thread(target=_writer_worker, daemon=True)
+
+    with ExitStack() as stack:
+        _enter_mlx_limits(
+            stack,
+            mlx_cache_limit_mb=mlx_cache_limit_mb,
+            use_wired_limit=use_wired_limit,
+        )
+        reader_thread.start()
+        writer_thread.start()
+        try:
+            while True:
+                if writer_err:
+                    raise writer_err[0]
+                item = prep_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+
+                meta_tbl, prompts = item
+                gen_kw: dict[str, Any] = {
+                    "system_prompt": system_prompt,
+                    "json_schema": json_schema,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "whitespace_flexible": whitespace_flexible,
+                    "batch_size": min(len(prompts), eff_gpu_batch_size),
+                    **clean_extra,
+                }
+                if mode is not None:
+                    gen_kw["mode"] = mode
+                if speculative is not None:
+                    gen_kw["speculative"] = speculative
+
+                res = engine.generate_batch(prompts, **gen_kw)
+                clear_mlx_arena(256)
+
+                out_table = (
+                    meta_tbl.append_column("response_text", pa.array([it.text for it in res.items], type=pa.string()))
+                    .append_column("valid_json", pa.array([it.valid_json for it in res.items], type=pa.bool_()))
+                    .append_column("valid_schema", pa.array([it.valid_schema for it in res.items], type=pa.bool_()))
+                    .append_column(
+                        "finish_reason",
+                        pa.array([str(getattr(it, "finish_reason", "stop")) for it in res.items], type=pa.string()),
+                    )
+                    .append_column("prompt_tokens", pa.array([it.prompt_tokens for it in res.items], type=pa.int32()))
+                    .append_column("completion_tokens", pa.array([it.completion_tokens for it in res.items], type=pa.int32()))
+                )
+                _enqueue_write(out_table)
+
                 docs_processed += len(res.items)
                 valid_json_tot += int(res.stats.get("valid_json_count", 0))
                 valid_schema_tot += int(res.stats.get("valid_schema_count", 0))
                 prompt_toks_tot += int(res.stats.get("prompt_tokens", 0))
                 comp_toks_tot += int(res.stats.get("completion_tokens", 0))
                 tot_dec_sec += float(res.stats.get("decode_sec", 0.0))
-        if writer is not None:
-            writer.close()
-            writer = None
-            assert tmp_dst is not None and final_dst is not None
-            os.replace(tmp_dst, final_dst)
-            tmp_dst = None
-            final_dst = None
-    except BaseException:
-        if writer is not None:
+
+            _enqueue_write(None)
+            writer_thread.join()
+            if writer_err:
+                raise writer_err[0]
+        except BaseException:
+            reader_stop.set()
+            writer_abort.set()
             try:
-                writer.close()
-            except Exception:
+                write_queue.put_nowait(None)
+            except queue.Full:
                 pass
-            writer = None
-        if tmp_dst is not None:
-            tmp_dst.unlink(missing_ok=True)
-        raise
+            writer_thread.join(timeout=5.0)
+            reader_thread.join(timeout=2.0)
+            raise
+        finally:
+            reader_stop.set()
+            reader_thread.join(timeout=2.0)
+            writer_thread.join(timeout=2.0)
+            clear_mlx_arena(256)
 
     elapsed = max(time.perf_counter() - t0, 1e-9)
     return ParquetExtractSummary(
@@ -319,6 +470,8 @@ def extract_jsonl(
     whitespace_flexible: bool = False,
     response_text_key: str = "output_text",
     response_json_key: str = "parsed",
+    mlx_cache_limit_mb: int | None = 512,
+    use_wired_limit: bool = False,
     **extra_gen_kwargs: Any,
 ) -> dict[str, Any]:
     """Batch-extract structured JSON from a JSON or JSONL file into JSONL."""
@@ -356,7 +509,15 @@ def extract_jsonl(
     if speculative is not None:
         gen_kw["speculative"] = speculative
 
-    res = engine.generate_batch(prompts, **gen_kw)
+    with ExitStack() as stack:
+        _enter_mlx_limits(
+            stack,
+            mlx_cache_limit_mb=mlx_cache_limit_mb,
+            use_wired_limit=use_wired_limit,
+        )
+        res = engine.generate_batch(prompts, **gen_kw)
+        clear_mlx_arena(256)
+
     tmp_out = out_p.with_name(f".{out_p.name}.tmp.{os.getpid()}")
     try:
         with tmp_out.open("w", encoding="utf-8") as fp:

@@ -1,4 +1,4 @@
-"""Custom Metal & Metal 4 MPP BF16 kernels for `fast-gemma4`."""
+"""Custom Metal & Metal 4 MPP BF16 kernels for `fast-gemma4` (parameterized for E2B & E4B)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from fast_shared.metal_mpp_bf16 import (
     mpp_linear_bf16,
 )
 
+MAX_KV_SPLITS = 32
+
 __all__ = [
+    "MAX_KV_SPLITS",
     "dequant_kv_pair_i8_bf16",
     "fused_geglu_split",
-    "fused_gemma4_res_rms_bf16",
     "fused_kv_only_norm_rope_ragged",
     "fused_norm_add_norm",
     "fused_ple_geglu_indexed",
@@ -40,20 +42,19 @@ __all__ = [
 _EPS_F32_CACHE: dict[float, mx.array] = {}
 _POST_PRE_KERNELS: dict[tuple[mx.Dtype, int, bool, float], object] = {}
 _RES_RMS_KERNELS: dict[tuple[mx.Dtype, int, float], object] = {}
-_VEC4_RES_RMS_KERNELS: dict[tuple[int, int, bool, bool, bool, float], object] = {}
-_QKV_NORM_ROPE_KERNELS: dict[tuple[mx.Dtype, int, float], object] = {}
-_RAGGED_QKV_KERNELS: dict[int, object] = {}
-_RAGGED_Q_KERNELS: dict[int, object] = {}
-_RAGGED_KV_ONLY_KERNELS: dict[int, object] = {}
+_QKV_NORM_ROPE_KERNELS: dict[tuple[mx.Dtype, int, int, int, float], object] = {}
+_RAGGED_QKV_KERNELS: dict[tuple[int, int, int], object] = {}
+_RAGGED_Q_KERNELS: dict[tuple[int, int], object] = {}
+_RAGGED_KV_ONLY_KERNELS: dict[tuple[int, int], object] = {}
 _PLE_GEGLU_IDX_KERNELS: dict[int, tuple[object, int]] = {}
 _SOFTCAP_ARGMAX_KERNELS: dict[tuple[int, int, float], object] = {}
 _QKV_I8_KERNELS: dict[int, object] = {}
-_DEQ_KV_PAIR_KERNELS: dict[int, object] = {}
-_GATHER_DEQ_KV_PAIR_KERNELS: dict[int, object] = {}
-_PREFIX_RAGGED_SDPA_KERNELS: dict[int, tuple[object, int]] = {}
-_PREFIX_SLOT_KERNELS: dict[tuple[int, bool], tuple[object, int]] = {}
-_VEC4_REDUCE_KERNELS: dict[int, tuple[object, int]] = {}
-_PREFIX_RAGGED_REDUCE_KERNEL = None
+_DEQ_KV_PAIR_KERNELS: dict[tuple[int, int], object] = {}
+_GATHER_DEQ_KV_PAIR_KERNELS: dict[tuple[int, int], object] = {}
+_PREFIX_RAGGED_SDPA_KERNELS: dict[tuple[int, int, int, bool], tuple[object, int]] = {}
+_PREFIX_SLOT_KERNELS: dict[tuple[int, int, int, bool, bool], tuple[object, int]] = {}
+_VEC4_REDUCE_KERNELS: dict[tuple[int, int], tuple[object, int]] = {}
+_PREFIX_RAGGED_REDUCE_KERNELS: dict[int, object] = {}
 
 
 def _get_eps_f32(eps: float = 1e-6) -> mx.array:
@@ -63,6 +64,13 @@ def _get_eps_f32(eps: float = 1e-6) -> mx.array:
         mx.eval(arr)
         _EPS_F32_CACHE[eps] = arr
     return arr
+
+
+def _validate_n_splits(n_splits: int) -> int:
+    ns = int(n_splits)
+    if ns < 1 or ns > MAX_KV_SPLITS:
+        raise ValueError(f"n_splits must be in [1, {MAX_KV_SPLITS}], got {ns}")
+    return ns
 
 
 def fused_norm_add_norm(
@@ -162,190 +170,6 @@ def fused_norm_add_norm(
     )
 
 
-def fused_gemma4_res_rms_bf16(
-    h: mx.array,
-    sub: mx.array,
-    w_post: mx.array,
-    w_next: mx.array | None = None,
-    *,
-    eps: float = 1e-6,
-    scalar: mx.array | None = None,
-    emit_res: bool = True,
-) -> mx.array | tuple[mx.array, mx.array]:
-    """Zero-barrier SIMD-warp-per-row vectorized `bfloat4` fused Residual + RMSNorm (`m_rows == 0` safe).
-
-    Computes `Y_res = (H + rms_norm(Sub, W_post, eps)) [* Scalar]` and optional
-    `Y_norm = rms_norm(Y_res, W_next, eps)` entirely in registers using 1 SIMD group (32 lanes)
-    per row (`0` `threadgroup_barrier`s, `bfloat4` coalesced loads/stores).
-    """
-    if h.ndim < 1 or int(h.shape[-1]) % 128 != 0:
-        raise ValueError(f"Expected last dim divisible by 128, got shape {h.shape}")
-    D = int(h.shape[-1])
-    if sub.shape != h.shape:
-        raise ValueError(f"Expected sub shape {h.shape}, got {sub.shape}")
-    if w_post.shape != (D,):
-        raise ValueError(f"Expected w_post shape ({D},), got {w_post.shape}")
-    if w_next is not None and w_next.shape != (D,):
-        raise ValueError(f"Expected w_next shape ({D},), got {w_next.shape}")
-    if w_next is None and not emit_res:
-        raise ValueError("emit_res=False requires w_next to be provided")
-    if h.dtype != mx.bfloat16 or sub.dtype != mx.bfloat16 or w_post.dtype != mx.bfloat16:
-        raise TypeError(f"Expected bfloat16 inputs, got h={h.dtype}, sub={sub.dtype}, w_post={w_post.dtype}")
-    if w_next is not None and w_next.dtype != mx.bfloat16:
-        raise TypeError(f"Expected bfloat16 w_next, got {w_next.dtype}")
-
-    orig_shape = tuple(int(d) for d in h.shape)
-    m_rows = int(h.size) // D
-    if m_rows == 0:
-        empty = mx.zeros(orig_shape, dtype=mx.bfloat16)
-        if w_next is None or not emit_res:
-            return empty
-        return empty, mx.zeros(orig_shape, dtype=mx.bfloat16)
-
-    sc_1d: mx.array | None = None
-    if scalar is not None:
-        if scalar.dtype != mx.bfloat16:
-            raise TypeError(f"Expected bfloat16 scalar, got {scalar.dtype}")
-        sc_1d = scalar.reshape((1,)) if scalar.ndim == 0 else scalar
-        if sc_1d.ndim != 1 or int(sc_1d.size) != 1:
-            raise ValueError(f"Expected 1D scalar shape (1,), got {sc_1d.shape}")
-
-    warps = 1 if m_rows <= 4 else 8
-    has_sc = sc_1d is not None
-    has_next = w_next is not None
-    key = (D, warps, has_sc, has_next, bool(emit_res), float(eps))
-    kern = _VEC4_RES_RMS_KERNELS.get(key)
-    if kern is None:
-        nv = D // 128
-        inv_d = 1.0 / float(D)
-        in_names = ["H", "Sub", "W_post"]
-        if has_sc:
-            in_names.append("Scalar")
-        if has_next:
-            in_names.append("W_next")
-        out_names: list[str] = []
-        if emit_res:
-            out_names.append("Y_res")
-        if has_next:
-            out_names.append("Y_norm")
-
-        sc_decl = "float sc = (float)Scalar[0];" if has_sc else ""
-        sc_mul = " * sc" if has_sc else ""
-        write_res = (
-            """
-            device bfloat* yrp = Y_res + base;
-            #pragma unroll
-            for (uint k = 0; k < NV; ++k) {
-                float4 rv = r_vec[k];
-                *(device bfloat4*)(yrp + 128u * k) = bfloat4((bfloat)rv.x, (bfloat)rv.y, (bfloat)rv.z, (bfloat)rv.w);
-            }
-            """
-            if emit_res
-            else ""
-        )
-        next_block = (
-            f"""
-            float sq2 = 0.0f;
-            #pragma unroll
-            for (uint k = 0; k < NV; ++k) {{
-                sq2 += dot(r_vec[k], r_vec[k]);
-            }}
-            float inv2 = rsqrt(simd_sum(sq2) * {inv_d:.9e}f + {eps:.8e}f);
-            const device bfloat* wnp = W_next + lane * 4u;
-            device bfloat* ynp = Y_norm + base;
-            #pragma unroll
-            for (uint k = 0; k < NV; ++k) {{
-                bfloat4 wn4 = *(const device bfloat4*)(wnp + 128u * k);
-                float4 wf = float4((float)wn4[0], (float)wn4[1], (float)wn4[2], (float)wn4[3]);
-                float4 yn = r_vec[k] * inv2 * wf;
-                *(device bfloat4*)(ynp + 128u * k) = bfloat4((bfloat)yn.x, (bfloat)yn.y, (bfloat)yn.z, (bfloat)yn.w);
-            }}
-            """
-            if has_next
-            else ""
-        )
-        row_expr = (
-            "uint row = threadgroup_position_in_grid.x;"
-            if warps == 1
-            else f"uint row = threadgroup_position_in_grid.x * {warps}u + (thread_position_in_threadgroup.x >> 5);"
-        )
-        src = f"""
-            constexpr uint D = {D};
-            constexpr uint NV = {nv};
-            uint lane = thread_position_in_threadgroup.x & 31u;
-            {row_expr}
-            if (row >= (uint)H_shape[0]) return;
-            size_t base = (size_t)row * D + lane * 4u;
-            const device bfloat* sp = Sub + base;
-            float4 s_vec[NV];
-            float sq1 = 0.0f;
-            #pragma unroll
-            for (uint k = 0; k < NV; ++k) {{
-                bfloat4 sv = *(const device bfloat4*)(sp + 128u * k);
-                float4 sf = float4((float)sv[0], (float)sv[1], (float)sv[2], (float)sv[3]);
-                s_vec[k] = sf;
-                sq1 += dot(sf, sf);
-            }}
-            float inv1 = rsqrt(simd_sum(sq1) * {inv_d:.9e}f + {eps:.8e}f);
-            {sc_decl}
-            const device bfloat* hp = H + base;
-            const device bfloat* wpp = W_post + lane * 4u;
-            float4 r_vec[NV];
-            #pragma unroll
-            for (uint k = 0; k < NV; ++k) {{
-                bfloat4 hv = *(const device bfloat4*)(hp + 128u * k);
-                bfloat4 wp4 = *(const device bfloat4*)(wpp + 128u * k);
-                float4 hf = float4((float)hv[0], (float)hv[1], (float)hv[2], (float)hv[3]);
-                float4 wf = float4((float)wp4[0], (float)wp4[1], (float)wp4[2], (float)wp4[3]);
-                r_vec[k] = (hf + s_vec[k] * inv1 * wf){sc_mul};
-            }}
-            {write_res}
-            {next_block}
-        """
-        kern = mx.fast.metal_kernel(
-            name=f"g4_vec4_res_rms_d{D}_w{warps}_{'sc' if has_sc else 'ns'}_{'nx' if has_next else 'add'}_{'er' if emit_res else 'nr'}",
-            input_names=in_names,
-            output_names=out_names,
-            source=src,
-        )
-        _VEC4_RES_RMS_KERNELS[key] = kern
-
-    h2d = mx.contiguous(h)
-    sub2d = mx.contiguous(sub)
-    if h2d.ndim != 2:
-        h2d = h2d.reshape(m_rows, D)
-        sub2d = sub2d.reshape(m_rows, D)
-    inputs: list[mx.array] = [h2d, sub2d, w_post]
-    if sc_1d is not None:
-        inputs.append(sc_1d)
-    if w_next is not None:
-        inputs.append(w_next)
-
-    tg_x = warps * 32
-    grid_x = ((m_rows + warps - 1) // warps) * tg_x
-    if emit_res and has_next:
-        y_res, y_norm = kern(
-            inputs=inputs,
-            grid=(grid_x, 1, 1),
-            threadgroup=(tg_x, 1, 1),
-            output_shapes=[(m_rows, D), (m_rows, D)],
-            output_dtypes=[mx.bfloat16, mx.bfloat16],
-        )
-        if len(orig_shape) != 2:
-            y_res = y_res.reshape(orig_shape)
-            y_norm = y_norm.reshape(orig_shape)
-        return y_res, y_norm
-
-    y_single = kern(
-        inputs=inputs,
-        grid=(grid_x, 1, 1),
-        threadgroup=(tg_x, 1, 1),
-        output_shapes=[(m_rows, D)],
-        output_dtypes=[mx.bfloat16],
-    )[0]
-    return y_single if len(orig_shape) == 2 else y_single.reshape(orig_shape)
-
-
 def fused_qkv_packed_norm_rope(
     qkv_raw: mx.array,
     w_qn: mx.array,
@@ -353,44 +177,59 @@ def fused_qkv_packed_norm_rope(
     inv_freq: mx.array,
     offset: mx.array | int,
     eps: float = 1e-6,
+    *,
+    n_q: int = 8,
+    n_kv: int | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Fused Q/K/V RMSNorm + Proportional RoPE on packed [B, L_q, 10*D] prefill buffer."""
+    """Fused Q/K/V RMSNorm + Proportional RoPE on packed `[B, L_q, (n_q + 2*n_kv)*D]` buffer."""
     B, L_q, total_d = qkv_raw.shape
-    D = w_qn.shape[0]
-    if total_d != 10 * D:
-        raise ValueError(f"Expected 10*D={10*D}, got {total_d}")
+    D = int(w_qn.shape[0])
+    n_q_i = int(n_q)
+    if n_kv is None:
+        rem = int(total_d) - n_q_i * D
+        if rem <= 0 or rem % (2 * D) != 0:
+            raise ValueError(f"Cannot infer n_kv from total_d={total_d}, n_q={n_q_i}, D={D}")
+        n_kv_i = rem // (2 * D)
+    else:
+        n_kv_i = int(n_kv)
+    n_tot = n_q_i + 2 * n_kv_i
+    if int(total_d) != n_tot * D:
+        raise ValueError(f"Expected (n_q + 2*n_kv)*D={n_tot * D}, got {total_d}")
     dt = qkv_raw.dtype
-    key = (dt, D, eps)
+    key = (dt, D, n_q_i, n_kv_i, eps)
     tpt = D // 2
-    nsg = tpt // 32
+    nsg = max(1, tpt // 32)
     kern = _QKV_NORM_ROPE_KERNELS.get(key)
     if kern is None:
         kern = mx.fast.metal_kernel(
-            name=f"g4_fused_qkv_packed_norm_rope_D{D}",
+            name=f"g4_fused_qkv_packed_norm_rope_D{D}_q{n_q_i}_kv{n_kv_i}",
             input_names=["qkv_raw", "w_qn", "w_kn", "inv_freq", "off_lq"],
             output_names=["q_out", "k_out", "v_out"],
             source=f"""
                 constexpr uint D = {D};
                 constexpr uint HD = D >> 1;
                 constexpr uint NSG = {nsg};
+                constexpr uint N_Q = {n_q_i};
+                constexpr uint N_KV = {n_kv_i};
+                constexpr uint N_TOT = {n_tot};
                 uint slot = threadgroup_position_in_grid.x;
                 uint b_l = threadgroup_position_in_grid.y;
                 uint tid = thread_index_in_threadgroup;
                 uint sid = tid >> 5;
                 uint lid = tid & 31;
 
-                const device T* src = qkv_raw + (b_l * 10 + slot) * D;
+                const device T* src = qkv_raw + ((size_t)b_l * N_TOT + slot) * D;
                 device T* dst;
                 const device T* wn = nullptr;
                 bool do_rope = true;
-                if (slot < 8) {{
-                    dst = q_out + (b_l * 8 + slot) * D;
+                if (slot < N_Q) {{
+                    dst = q_out + ((size_t)b_l * N_Q + slot) * D;
                     wn = w_qn;
-                }} else if (slot == 8) {{
-                    dst = k_out + b_l * D;
+                }} else if (slot < N_Q + N_KV) {{
+                    dst = k_out + ((size_t)b_l * N_KV + (slot - N_Q)) * D;
                     wn = w_kn;
                 }} else {{
-                    dst = v_out + b_l * D;
+                    dst = v_out + ((size_t)b_l * N_KV + (slot - N_Q - N_KV)) * D;
                     do_rope = false;
                 }}
 
@@ -441,20 +280,29 @@ def fused_qkv_packed_norm_rope(
     return kern(
         inputs=[qkv_raw, w_qn, w_kn, inv_freq, off_arr],
         template=[("T", dt)],
-        grid=(10 * tpt, B * L_q, 1),
+        grid=(n_tot * tpt, B * L_q, 1),
         threadgroup=(tpt, 1, 1),
-        output_shapes=[(B, L_q, 8, D), (B, L_q, D), (B, L_q, D)],
+        output_shapes=[(B, L_q, n_q_i, D), (B, L_q, n_kv_i, D), (B, L_q, n_kv_i, D)],
         output_dtypes=[dt, dt, dt],
     )
 
 
-def _get_ragged_qkv_kernel(head_dim: int):
-    kern = _RAGGED_QKV_KERNELS.get(head_dim)
+def _get_ragged_qkv_kernel(head_dim: int, n_q: int, n_kv: int):
+    key = (head_dim, n_q, n_kv)
+    kern = _RAGGED_QKV_KERNELS.get(key)
     if kern is None:
         half_d = head_dim // 2
+        n_tot = n_q + 2 * n_kv
+        tpt = min(256, head_dim)
+        nsg = max(1, tpt // 32)
         src = f"""
     constexpr int D = {head_dim};
     constexpr int HALF_D = {half_d};
+    constexpr int TPT = {tpt};
+    constexpr int NSG = {nsg};
+    constexpr int N_Q = {n_q};
+    constexpr int N_KV = {n_kv};
+    constexpr int N_TOT = {n_tot};
     int L_q = (int)qkv_shape[1];
     int row = (int)threadgroup_position_in_grid.y;
     int h = (int)threadgroup_position_in_grid.x;
@@ -464,43 +312,44 @@ def _get_ragged_qkv_kernel(head_dim: int):
     int simd_lane = tid & 31;
     int simd_id = tid >> 5;
 
-    threadgroup float tg_w[8];
+    threadgroup float tg_w[NSG];
     threadgroup float tg_y[D];
 
-    const device bfloat* in_ptr = qkv + (size_t)row * (10 * D) + h * D;
+    const device bfloat* in_ptr = qkv + ((size_t)row * N_TOT + h) * D;
     float x0 = (float)in_ptr[tid];
-    float x1 = (D > 256) ? (float)in_ptr[tid + 256] : 0.0f;
-    float ss = x0 * x0 + ((D > 256) ? (x1 * x1) : 0.0f);
+    float x1 = (D > TPT) ? (float)in_ptr[tid + TPT] : 0.0f;
+    float ss = x0 * x0 + ((D > TPT) ? (x1 * x1) : 0.0f);
     float ws = simd_sum(ss);
     if (simd_lane == 0) tg_w[simd_id] = ws;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_id == 0) {{
-        float t = (tid < 8) ? tg_w[tid] : 0.0f;
+        float t = (tid < NSG) ? tg_w[tid] : 0.0f;
         float tot = simd_sum(t);
         if (tid == 0) tg_w[0] = rsqrt(tot / (float)D + eps[0]);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv_rms = tg_w[0];
 
-    if (h == 9) {{
-        device bfloat* v_dst = v_out + (size_t)row * D;
+    if (h >= N_Q + N_KV) {{
+        int vh = h - (N_Q + N_KV);
+        device bfloat* v_dst = v_out + ((size_t)row * N_KV + vh) * D;
         v_dst[tid] = (bfloat)(x0 * inv_rms);
-        if (D > 256) v_dst[tid + 256] = (bfloat)(x1 * inv_rms);
+        if (D > TPT) v_dst[tid + TPT] = (bfloat)(x1 * inv_rms);
         return;
     }}
 
-    const device bfloat* nw = (h < 8) ? wq : wk;
+    const device bfloat* nw = (h < N_Q) ? wq : wk;
     tg_y[tid] = x0 * inv_rms * (float)nw[tid];
-    if (D > 256) tg_y[tid + 256] = x1 * inv_rms * (float)nw[tid + 256];
+    if (D > TPT) tg_y[tid + TPT] = x1 * inv_rms * (float)nw[tid + TPT];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid < HALF_D) {{
         float y0 = tg_y[tid];
         float y1 = tg_y[tid + HALF_D];
         float freq = inv_freq[tid];
-        device bfloat* dst = (h < 8)
-            ? (q_out + ((size_t)row * 8 + h) * D)
-            : (k_out + (size_t)row * D);
+        device bfloat* dst = (h < N_Q)
+            ? (q_out + ((size_t)row * N_Q + h) * D)
+            : (k_out + ((size_t)row * N_KV + (h - N_Q)) * D);
         if (freq != 0.0f) {{
             float pos = (float)(off_b[b] + l);
             float a = pos * freq;
@@ -515,22 +364,28 @@ def _get_ragged_qkv_kernel(head_dim: int):
     }}
         """
         kern = mx.fast.metal_kernel(
-            name=f"g4_fused_qkv_ragged_d{head_dim}",
+            name=f"g4_fused_qkv_ragged_d{head_dim}_q{n_q}_kv{n_kv}",
             input_names=["qkv", "wq", "wk", "inv_freq", "off_b", "eps"],
             output_names=["q_out", "k_out", "v_out"],
             source=src,
         )
-        _RAGGED_QKV_KERNELS[head_dim] = kern
-    return kern
+        _RAGGED_QKV_KERNELS[key] = (kern, tpt)
+    return _RAGGED_QKV_KERNELS[key]
 
 
-def _get_ragged_q_kernel(head_dim: int):
-    kern = _RAGGED_Q_KERNELS.get(head_dim)
-    if kern is None:
+def _get_ragged_q_kernel(head_dim: int, n_q: int):
+    key = (head_dim, n_q)
+    entry = _RAGGED_Q_KERNELS.get(key)
+    if entry is None:
         half_d = head_dim // 2
+        tpt = min(256, head_dim)
+        nsg = max(1, tpt // 32)
         src = f"""
     constexpr int D = {head_dim};
     constexpr int HALF_D = {half_d};
+    constexpr int TPT = {tpt};
+    constexpr int NSG = {nsg};
+    constexpr int N_Q = {n_q};
     int L_q = (int)q_in_shape[1];
     int row = (int)threadgroup_position_in_grid.y;
     int h = (int)threadgroup_position_in_grid.x;
@@ -540,18 +395,18 @@ def _get_ragged_q_kernel(head_dim: int):
     int simd_lane = tid & 31;
     int simd_id = tid >> 5;
 
-    threadgroup float tg_w[8];
+    threadgroup float tg_w[NSG];
     threadgroup float tg_y[D];
 
-    const device bfloat* in_ptr = q_in + ((size_t)row * 8 + h) * D;
+    const device bfloat* in_ptr = q_in + ((size_t)row * N_Q + h) * D;
     float x0 = (float)in_ptr[tid];
-    float x1 = (D > 256) ? (float)in_ptr[tid + 256] : 0.0f;
-    float ss = x0 * x0 + ((D > 256) ? (x1 * x1) : 0.0f);
+    float x1 = (D > TPT) ? (float)in_ptr[tid + TPT] : 0.0f;
+    float ss = x0 * x0 + ((D > TPT) ? (x1 * x1) : 0.0f);
     float ws = simd_sum(ss);
     if (simd_lane == 0) tg_w[simd_id] = ws;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_id == 0) {{
-        float t = (tid < 8) ? tg_w[tid] : 0.0f;
+        float t = (tid < NSG) ? tg_w[tid] : 0.0f;
         float tot = simd_sum(t);
         if (tid == 0) tg_w[0] = rsqrt(tot / (float)D + eps[0]);
     }}
@@ -559,14 +414,14 @@ def _get_ragged_q_kernel(head_dim: int):
     float inv_rms = tg_w[0];
 
     tg_y[tid] = x0 * inv_rms * (float)wq[tid];
-    if (D > 256) tg_y[tid + 256] = x1 * inv_rms * (float)wq[tid + 256];
+    if (D > TPT) tg_y[tid + TPT] = x1 * inv_rms * (float)wq[tid + TPT];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid < HALF_D) {{
         float y0 = tg_y[tid];
         float y1 = tg_y[tid + HALF_D];
         float freq = inv_freq[tid];
-        device bfloat* dst = q_out + ((size_t)row * 8 + h) * D;
+        device bfloat* dst = q_out + ((size_t)row * N_Q + h) * D;
         if (freq != 0.0f) {{
             float pos = (float)(off_b[b] + l);
             float a = pos * freq;
@@ -581,13 +436,14 @@ def _get_ragged_q_kernel(head_dim: int):
     }}
         """
         kern = mx.fast.metal_kernel(
-            name=f"g4_fused_q_ragged_d{head_dim}",
+            name=f"g4_fused_q_ragged_d{head_dim}_q{n_q}",
             input_names=["q_in", "wq", "inv_freq", "off_b", "eps"],
             output_names=["q_out"],
             source=src,
         )
-        _RAGGED_Q_KERNELS[head_dim] = kern
-    return kern
+        entry = (kern, tpt)
+        _RAGGED_Q_KERNELS[key] = entry
+    return entry
 
 
 def fused_qkv_packed_norm_rope_ragged(
@@ -597,17 +453,31 @@ def fused_qkv_packed_norm_rope_ragged(
     inv_freq: mx.array,
     off_b: mx.array,
     eps: float = 1e-6,
+    *,
+    n_q: int = 8,
+    n_kv: int | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    B, L_q, ten_d = qkv.shape
-    D = ten_d // 10
-    kern = _get_ragged_qkv_kernel(D)
+    B, L_q, total_d = qkv.shape
+    D = int(wq.shape[0])
+    n_q_i = int(n_q)
+    if n_kv is None:
+        rem = int(total_d) - n_q_i * D
+        if rem <= 0 or rem % (2 * D) != 0:
+            raise ValueError(f"Cannot infer n_kv from total_d={total_d}, n_q={n_q_i}, D={D}")
+        n_kv_i = rem // (2 * D)
+    else:
+        n_kv_i = int(n_kv)
+    n_tot = n_q_i + 2 * n_kv_i
+    if int(total_d) != n_tot * D:
+        raise ValueError(f"Expected (n_q + 2*n_kv)*D={n_tot * D}, got {total_d}")
+    kern, tpt = _get_ragged_qkv_kernel(D, n_q_i, n_kv_i)
     eps_arr = _get_eps_f32(eps)
     q, k, v = kern(
         inputs=[qkv, wq, wk, inv_freq, off_b, eps_arr],
-        output_shapes=[(B, L_q, 8, D), (B, L_q, D), (B, L_q, D)],
+        output_shapes=[(B, L_q, n_q_i, D), (B, L_q, n_kv_i, D), (B, L_q, n_kv_i, D)],
         output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16],
-        grid=(10 * 256, B * L_q, 1),
-        threadgroup=(256, 1, 1),
+        grid=(n_tot * tpt, B * L_q, 1),
+        threadgroup=(tpt, 1, 1),
     )
     return q, k, v
 
@@ -618,27 +488,38 @@ def fused_q_norm_rope_ragged(
     inv_freq: mx.array,
     off_b: mx.array,
     eps: float = 1e-6,
+    *,
+    n_q: int | None = None,
 ) -> mx.array:
-    B, L_q, eight_d = q_in.shape
-    D = eight_d // 8
-    kern = _get_ragged_q_kernel(D)
+    B, L_q, total_d = q_in.shape
+    D = int(wq.shape[0])
+    n_q_i = int(n_q) if n_q is not None else int(total_d) // D
+    if n_q_i * D != int(total_d):
+        raise ValueError(f"Expected n_q*D={n_q_i * D}, got {total_d}")
+    kern, tpt = _get_ragged_q_kernel(D, n_q_i)
     eps_arr = _get_eps_f32(eps)
     return kern(
         inputs=[q_in, wq, inv_freq, off_b, eps_arr],
-        output_shapes=[(B, L_q, 8, D)],
+        output_shapes=[(B, L_q, n_q_i, D)],
         output_dtypes=[mx.bfloat16],
-        grid=(8 * 256, B * L_q, 1),
-        threadgroup=(256, 1, 1),
+        grid=(n_q_i * tpt, B * L_q, 1),
+        threadgroup=(tpt, 1, 1),
     )[0]
 
 
-def _get_ragged_kv_only_kernel(head_dim: int):
-    k = _RAGGED_KV_ONLY_KERNELS.get(head_dim)
-    if k is None:
+def _get_ragged_kv_only_kernel(head_dim: int, n_kv: int):
+    key = (head_dim, n_kv)
+    entry = _RAGGED_KV_ONLY_KERNELS.get(key)
+    if entry is None:
         half_d = head_dim // 2
+        tpt = min(256, head_dim)
+        nsg = max(1, tpt // 32)
         src = f"""
     constexpr int D = {head_dim};
     constexpr int HALF_D = {half_d};
+    constexpr int TPT = {tpt};
+    constexpr int NSG = {nsg};
+    constexpr int N_KV = {n_kv};
     int L_q = (int)kv_shape[1];
     int row = (int)threadgroup_position_in_grid.y;
     int h = (int)threadgroup_position_in_grid.x;
@@ -648,40 +529,41 @@ def _get_ragged_kv_only_kernel(head_dim: int):
     int simd_lane = tid & 31;
     int simd_id = tid >> 5;
 
-    threadgroup float tg_w[8];
+    threadgroup float tg_w[NSG];
     threadgroup float tg_y[D];
 
-    const device bfloat* in_ptr = kv + (size_t)row * (2 * D) + h * D;
+    const device bfloat* in_ptr = kv + ((size_t)row * (2 * N_KV) + h) * D;
     float x0 = (float)in_ptr[tid];
-    float x1 = (D > 256) ? (float)in_ptr[tid + 256] : 0.0f;
-    float ss = x0 * x0 + ((D > 256) ? (x1 * x1) : 0.0f);
+    float x1 = (D > TPT) ? (float)in_ptr[tid + TPT] : 0.0f;
+    float ss = x0 * x0 + ((D > TPT) ? (x1 * x1) : 0.0f);
     float ws = simd_sum(ss);
     if (simd_lane == 0) tg_w[simd_id] = ws;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_id == 0) {{
-        float t = (tid < 8) ? tg_w[tid] : 0.0f;
+        float t = (tid < NSG) ? tg_w[tid] : 0.0f;
         float tot = simd_sum(t);
         if (tid == 0) tg_w[0] = rsqrt(tot / (float)D + eps[0]);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv_rms = tg_w[0];
 
-    if (h == 1) {{
-        device bfloat* v_dst = v_out + (size_t)row * D;
+    if (h >= N_KV) {{
+        int vh = h - N_KV;
+        device bfloat* v_dst = v_out + ((size_t)row * N_KV + vh) * D;
         v_dst[tid] = (bfloat)(x0 * inv_rms);
-        if (D > 256) v_dst[tid + 256] = (bfloat)(x1 * inv_rms);
+        if (D > TPT) v_dst[tid + TPT] = (bfloat)(x1 * inv_rms);
         return;
     }}
 
     tg_y[tid] = x0 * inv_rms * (float)wk[tid];
-    if (D > 256) tg_y[tid + 256] = x1 * inv_rms * (float)wk[tid + 256];
+    if (D > TPT) tg_y[tid + TPT] = x1 * inv_rms * (float)wk[tid + TPT];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid < HALF_D) {{
         float y0 = tg_y[tid];
         float y1 = tg_y[tid + HALF_D];
         float freq = inv_freq[tid];
-        device bfloat* dst = k_out + (size_t)row * D;
+        device bfloat* dst = k_out + ((size_t)row * N_KV + h) * D;
         if (freq != 0.0f) {{
             float pos = (float)(off_b[b] + l);
             float a = pos * freq;
@@ -696,13 +578,14 @@ def _get_ragged_kv_only_kernel(head_dim: int):
     }}
         """
         k = mx.fast.metal_kernel(
-            name=f"g4_fused_kv_only_ragged_d{head_dim}",
+            name=f"g4_fused_kv_only_ragged_d{head_dim}_kv{n_kv}",
             input_names=["kv", "wk", "inv_freq", "off_b", "eps"],
             output_names=["k_out", "v_out"],
             source=src,
         )
-        _RAGGED_KV_ONLY_KERNELS[head_dim] = k
-    return k
+        entry = (k, tpt)
+        _RAGGED_KV_ONLY_KERNELS[key] = entry
+    return entry
 
 
 def fused_kv_only_norm_rope_ragged(
@@ -711,18 +594,23 @@ def fused_kv_only_norm_rope_ragged(
     inv_freq: mx.array,
     off_b: mx.array,
     eps: float = 1e-6,
+    *,
+    n_kv: int | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Fused K RMSNorm+RoPE and V RMSNorm on [B, L_q, 2*D] -> (k_rot, v_norm) [B, L_q, D]."""
-    B, L_q, two_d = kv.shape
-    D = two_d // 2
-    kern = _get_ragged_kv_only_kernel(D)
+    """Fused K RMSNorm+RoPE and V RMSNorm on `[B, L_q, 2*n_kv*D]` -> `(k_rot, v_norm)` `[B, L_q, n_kv, D]`."""
+    B, L_q, total_d = kv.shape
+    D = int(wk.shape[0])
+    n_kv_i = int(n_kv) if n_kv is not None else int(total_d) // (2 * D)
+    if 2 * n_kv_i * D != int(total_d):
+        raise ValueError(f"Expected 2*n_kv*D={2 * n_kv_i * D}, got {total_d}")
+    kern, tpt = _get_ragged_kv_only_kernel(D, n_kv_i)
     eps_arr = _get_eps_f32(eps)
     k, v = kern(
         inputs=[kv, wk, inv_freq, off_b, eps_arr],
-        output_shapes=[(B, L_q, D), (B, L_q, D)],
+        output_shapes=[(B, L_q, n_kv_i, D), (B, L_q, n_kv_i, D)],
         output_dtypes=[mx.bfloat16, mx.bfloat16],
-        grid=(2 * 256, B * L_q, 1),
-        threadgroup=(256, 1, 1),
+        grid=(2 * n_kv_i * tpt, B * L_q, 1),
+        threadgroup=(tpt, 1, 1),
     )
     return k, v
 
@@ -793,7 +681,7 @@ def fused_res_rms_norm(res: mx.array, x: mx.array, w: mx.array, eps: float = 1e-
 
 
 def fused_ple_geglu_indexed(gate: mx.array, pli: mx.array, layer_idx_mx: mx.array) -> mx.array:
-    """Zero-slice Metal kernel for `gelu_approx(gate) * pli[:, :, layer_idx, :]`."""
+    """Zero-slice Metal kernel for `gelu_approx(gate) * pli[:, :, layer_idx, :]` with contiguity guards."""
     ple_d = int(gate.shape[-1])
     if ple_d % 4 != 0:
         raise ValueError(f"Expected ple_dim divisible by 4, got {ple_d}")
@@ -829,10 +717,13 @@ def fused_ple_geglu_indexed(gate: mx.array, pli: mx.array, layer_idx_mx: mx.arra
     rows = int(gate.size) // ple_d
     if rows == 0:
         return mx.zeros(gate.shape, dtype=gate.dtype)
+    gate_c = mx.contiguous(gate)
+    pli_c = mx.contiguous(pli)
+    lidx_c = mx.contiguous(layer_idx_mx)
     return kern(
-        inputs=[gate, pli, layer_idx_mx],
-        output_shapes=[gate.shape],
-        output_dtypes=[gate.dtype],
+        inputs=[gate_c, pli_c, lidx_c],
+        output_shapes=[gate_c.shape],
+        output_dtypes=[gate_c.dtype],
         grid=(tg, rows, 1),
         threadgroup=(tg, 1, 1),
     )[0]
@@ -956,16 +847,22 @@ def scatter_kv_ragged(
     l_sys: int,
     doc_ring_cap: int = 0,
 ) -> tuple[mx.array, mx.array]:
-    """Write newly computed K,V [B, L_q, D] into per-doc buffer [B, T_cap, D]."""
-    B, L_q, _ = k_new.shape
-    T_cap = k_doc.shape[1]
+    """Write newly computed K,V `[B, L_q, n_kv, D]` (or `[B, L_q, D]`) into `[B, T_cap, n_kv, D]` (or `[B, T_cap, D]`)."""
+    B, L_q = int(k_new.shape[0]), int(k_new.shape[1])
+    T_cap = int(k_doc.shape[1])
     b_idx = mx.arange(B, dtype=mx.int32)
     is_pow2 = (T_cap & (T_cap - 1)) == 0
+    if k_doc.ndim == 4 and k_new.ndim == 3:
+        k_new = k_new.reshape(B, L_q, 1, int(k_new.shape[2]))
+        v_new = v_new.reshape(B, L_q, 1, int(v_new.shape[2]))
+    elif k_doc.ndim == 3 and k_new.ndim == 4:
+        k_new = k_new.reshape(B, L_q, int(k_new.shape[3]))
+        v_new = v_new.reshape(B, L_q, int(v_new.shape[3]))
     if L_q == 1:
         priv = off_b - l_sys
         slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
-        k_doc[b_idx, slot] = k_new[:, 0, :]
-        v_doc[b_idx, slot] = v_new[:, 0, :]
+        k_doc[b_idx, slot] = k_new[:, 0]
+        v_doc[b_idx, slot] = v_new[:, 0]
     else:
         priv = off_b[:, None] + mx.arange(L_q, dtype=mx.int32)[None, :] - l_sys
         slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
@@ -974,100 +871,131 @@ def scatter_kv_ragged(
     return k_doc, v_doc
 
 
-def _get_prefix_ragged_part_kernel(head_dim: int):
-    k = _PREFIX_RAGGED_SDPA_KERNELS.get(head_dim)
-    if k is None:
-        dv = head_dim // 128
-        if head_dim == 256:
-            src = f"""
-    constexpr int D = {head_dim};
-    constexpr int DV = {dv};
-    int L_q = (int)q_shape[1];
-    int L_sys = meta[0];
-    int T_cap = meta[1];
-    int win = meta[2];
-    int ring = meta[3];
-    int n_splits = meta[4];
-    int ring_mask = meta[5];
+def _build_gqa_sdpa_source(
+    *,
+    head_dim: int,
+    n_q: int,
+    n_kv: int,
+    use_slot_idx: bool,
+    kv_i8: bool,
+    single_pass: bool,
+) -> tuple[str, int]:
+    """Generate parameterized GQA/MQA Metal SDPA source for `D in {256, 512}`, arbitrary `n_q % n_kv == 0`."""
+    if n_q <= 0 or n_kv <= 0 or (n_q % n_kv) != 0:
+        raise ValueError(f"Expected n_q ({n_q}) divisible by n_kv ({n_kv})")
+    if head_dim % 128 != 0:
+        raise ValueError(f"Expected head_dim divisible by 128, got {head_dim}")
+    dv = head_dim // 128
+    gqa = n_q // n_kv
+    if head_dim == 256 and (gqa % 4 == 0):
+        qh_per_sg = 4
+    elif gqa % 2 == 0:
+        qh_per_sg = 2
+    else:
+        qh_per_sg = 1
+    tg_y = n_q // qh_per_sg
 
-    int row = (int)threadgroup_position_in_grid.y;
+    slot_expr = "int slot_row = slot_idx[b];" if use_slot_idx else "int slot_row = b;"
+    if single_pass:
+        split_bounds = """
+    int s0 = t_lo;
+    int s1 = t_hi;
+        """
+    else:
+        split_bounds = """
     int split_id = (int)threadgroup_position_in_grid.z;
-    int b = row / L_q;
-    int l_q = row % L_q;
-    int lane = (int)thread_position_in_threadgroup.x;
-    int sg = (int)thread_position_in_threadgroup.y;
-
-    int q_pos = off_b[b] + l_q;
-    int t_hi = q_pos + 1;
-    int t_lo = (win > 0 && q_pos - win + 1 > 0) ? (q_pos - win + 1) : 0;
     int tot = t_hi - t_lo;
     int chunk = (tot + n_splits - 1) / n_splits;
     int s0 = t_lo + split_id * chunk;
     int s1 = min(t_hi, s0 + chunk);
+        """
 
-    int h0 = sg * 4;
-    float4 q0[DV], q1[DV], q2[DV], q3[DV];
-    float4 acc0[DV], acc1[DV], acc2[DV], acc3[DV];
-    const device bfloat* qb = q + (size_t)row * 8 * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        bfloat4 v0 = *(const device bfloat4*)(qb + (h0 + 0) * D + 128 * r);
-        bfloat4 v1 = *(const device bfloat4*)(qb + (h0 + 1) * D + 128 * r);
-        bfloat4 v2 = *(const device bfloat4*)(qb + (h0 + 2) * D + 128 * r);
-        bfloat4 v3 = *(const device bfloat4*)(qb + (h0 + 3) * D + 128 * r);
-        q0[r] = float4((float)v0[0], (float)v0[1], (float)v0[2], (float)v0[3]);
-        q1[r] = float4((float)v1[0], (float)v1[1], (float)v1[2], (float)v1[3]);
-        q2[r] = float4((float)v2[0], (float)v2[1], (float)v2[2], (float)v2[3]);
-        q3[r] = float4((float)v3[0], (float)v3[1], (float)v3[2], (float)v3[3]);
-        acc0[r] = float4(0.0f); acc1[r] = float4(0.0f); acc2[r] = float4(0.0f); acc3[r] = float4(0.0f);
-    }}
-    float m0 = -1e38f, m1 = -1e38f, m2 = -1e38f, m3 = -1e38f;
-    float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+    q_decls = ", ".join(f"q{k}[DV]" for k in range(qh_per_sg))
+    acc_decls = ", ".join(f"acc{k}[DV]" for k in range(qh_per_sg))
+    m_decls = ", ".join(f"m{k} = -1e38f" for k in range(qh_per_sg))
+    l_decls = ", ".join(f"l{k} = 0.0f" for k in range(qh_per_sg))
 
-    int sys_end = min(s1, L_sys);
-    if (s0 < sys_end) {{
-        const device bfloat* ks_base = k_sys + lane * 4;
-        const device bfloat* vs_base = v_sys + lane * 4;
-        for (int t = s0; t < sys_end; ++t) {{
-            size_t off = (size_t)t * D;
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            float4 vv_r[DV];
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(ks_base + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vs_base + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr; p2 += q2[r] * kr; p3 += q3[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float d2 = simd_sum(p2.x + p2.y + p2.z + p2.w);
-            float d3 = simd_sum(p3.x + p3.y + p3.z + p3.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1), nm2 = max(d2, m2), nm3 = max(d3, m3);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            float a2 = metal::fast::exp(m2 - nm2), b2 = metal::fast::exp(d2 - nm2);
-            float a3 = metal::fast::exp(m3 - nm3), b3 = metal::fast::exp(d3 - nm3);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1; l2 = l2 * a2 + b2; l3 = l3 * a3 + b3;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r]; acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-                acc2[r] = acc2[r] * a2 + b2 * vv_r[r]; acc3[r] = acc3[r] * a3 + b3 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-        }}
-    }}
+    load_q_lines = []
+    for k in range(qh_per_sg):
+        load_q_lines.append(
+            f"        bfloat4 v{k} = *(const device bfloat4*)(qb + (h0 + {k}) * D + 128 * r);\n"
+            f"        q{k}[r] = float4((float)v{k}[0], (float)v{k}[1], (float)v{k}[2], (float)v{k}[3]);\n"
+            f"        acc{k}[r] = float4(0.0f);"
+        )
+    load_q_code = "\n".join(load_q_lines)
 
+    p_init = ", ".join(f"p{k} = 0" for k in range(qh_per_sg))
+    p_acc = " ".join(f"p{k} += q{k}[r] * kr;" for k in range(qh_per_sg))
+
+    def _softmax_update(scale_k: bool, scale_v: bool) -> str:
+        k_mul = " * ksc" if scale_k else ""
+        lines = [f"            float d{k} = simd_sum(p{k}.x + p{k}.y + p{k}.z + p{k}.w){k_mul};" for k in range(qh_per_sg)]
+        lines.append("            " + " ".join(f"float nm{k} = max(d{k}, m{k});" for k in range(qh_per_sg)))
+        lines.append(
+            "            "
+            + " ".join(
+                f"float a{k} = metal::fast::exp(m{k} - nm{k}), b{k} = metal::fast::exp(d{k} - nm{k});"
+                for k in range(qh_per_sg)
+            )
+        )
+        lines.append("            " + " ".join(f"l{k} = l{k} * a{k} + b{k};" for k in range(qh_per_sg)))
+        if scale_v:
+            lines.append("            " + " ".join(f"float bv{k} = b{k} * vsc;" for k in range(qh_per_sg)))
+            val_coeff = "bv"
+        else:
+            val_coeff = "b"
+        lines.append("            #pragma unroll")
+        lines.append("            for (int r = 0; r < DV; ++r) {")
+        lines.append(
+            "                "
+            + " ".join(f"acc{k}[r] = acc{k}[r] * a{k} + {val_coeff}{k} * vv_r[r];" for k in range(qh_per_sg))
+        )
+        lines.append("            }")
+        lines.append("            " + " ".join(f"m{k} = nm{k};" for k in range(qh_per_sg)))
+        return "\n".join(lines)
+
+    sys_update = _softmax_update(scale_k=False, scale_v=False)
+    if kv_i8:
+        doc_update = _softmax_update(scale_k=True, scale_v=True)
+        doc_block = f"""
     int doc_lo = max(s0, L_sys);
     if (doc_lo < s1) {{
-        const device bfloat* kd_b = k_doc + (size_t)b * T_cap * D + lane * 4;
-        const device bfloat* vd_b = v_doc + (size_t)b * T_cap * D + lane * 4;
+        const device int8_t* kd_b = k_doc + ((size_t)slot_row * T_cap * N_KV + kv_h) * D + lane * 4;
+        const device int8_t* vd_b = v_doc + ((size_t)slot_row * T_cap * N_KV + kv_h) * D + lane * 4;
+        const device half* ks_d = k_s_doc + (size_t)slot_row * T_cap * N_KV + kv_h;
+        const device half* vs_d = v_s_doc + (size_t)slot_row * T_cap * N_KV + kv_h;
         for (int t = doc_lo; t < s1; ++t) {{
             int priv = t - L_sys;
             int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+            size_t off = (size_t)slot * (N_KV * D);
+            float ksc = (float)ks_d[(size_t)slot * N_KV];
+            float vsc = (float)vs_d[(size_t)slot * N_KV];
+            float4 {p_init};
+            float4 vv_r[DV];
+            #pragma unroll
+            for (int r = 0; r < DV; ++r) {{
+                vec<int8_t, 4> kv = *(const device vec<int8_t, 4>*)(kd_b + off + 128 * r);
+                vec<int8_t, 4> vv = *(const device vec<int8_t, 4>*)(vd_b + off + 128 * r);
+                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
+                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
+                {p_acc}
+            }}
+{doc_update}
+        }}
+    }}
+        """
+    else:
+        doc_update = _softmax_update(scale_k=False, scale_v=False)
+        doc_block = f"""
+    int doc_lo = max(s0, L_sys);
+    if (doc_lo < s1) {{
+        const device bfloat* kd_b = k_doc + ((size_t)slot_row * T_cap * N_KV + kv_h) * D + lane * 4;
+        const device bfloat* vd_b = v_doc + ((size_t)slot_row * T_cap * N_KV + kv_h) * D + lane * 4;
+        for (int t = doc_lo; t < s1; ++t) {{
+            int priv = t - L_sys;
+            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
+            size_t off = (size_t)slot * (N_KV * D);
+            float4 {p_init};
             float4 vv_r[DV];
             #pragma unroll
             for (int r = 0; r < DV; ++r) {{
@@ -1075,51 +1003,54 @@ def _get_prefix_ragged_part_kernel(head_dim: int):
                 bfloat4 vv = *(const device bfloat4*)(vd_b + off + 128 * r);
                 float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
                 vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr; p2 += q2[r] * kr; p3 += q3[r] * kr;
+                {p_acc}
             }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float d2 = simd_sum(p2.x + p2.y + p2.z + p2.w);
-            float d3 = simd_sum(p3.x + p3.y + p3.z + p3.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1), nm2 = max(d2, m2), nm3 = max(d3, m3);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            float a2 = metal::fast::exp(m2 - nm2), b2 = metal::fast::exp(d2 - nm2);
-            float a3 = metal::fast::exp(m3 - nm3), b3 = metal::fast::exp(d3 - nm3);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1; l2 = l2 * a2 + b2; l3 = l3 * a3 + b3;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r]; acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-                acc2[r] = acc2[r] * a2 + b2 * vv_r[r]; acc3[r] = acc3[r] * a3 + b3 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+{doc_update}
         }}
     }}
+        """
 
-    size_t pb = ((size_t)row * n_splits + split_id) * 8 + h0;
-    float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f, il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-    float il2 = (l2 > 0.0f) ? (1.0f / l2) : 0.0f, il3 = (l3 > 0.0f) ? (1.0f / l3) : 0.0f;
+    il_lines = " ".join(f"float il{k} = (l{k} > 0.0f) ? (1.0f / l{k}) : 0.0f;" for k in range(qh_per_sg))
+    store_o_lines = "\n".join(
+        f"        float4 vo{k} = acc{k}[r] * il{k};\n"
+        f"        *(device bfloat4*)(od + {k} * D + 128 * r) = bfloat4((bfloat)vo{k}.x, (bfloat)vo{k}.y, (bfloat)vo{k}.z, (bfloat)vo{k}.w);"
+        for k in range(qh_per_sg)
+    )
+
+    if single_pass:
+        epilogue = f"""
+    size_t pb = (size_t)row * N_Q + h0;
+    {il_lines}
+    device bfloat* od = out + pb * D + lane * 4;
+    #pragma unroll
+    for (int r = 0; r < DV; ++r) {{
+{store_o_lines}
+    }}
+        """
+    else:
+        ml_lines = "\n".join(
+            f"        ml_part[(pb + {k}) * 2] = m{k}; ml_part[(pb + {k}) * 2 + 1] = l{k};" for k in range(qh_per_sg)
+        )
+        epilogue = f"""
+    size_t pb = ((size_t)row * n_splits + split_id) * N_Q + h0;
+    {il_lines}
     device bfloat* od = o_part + pb * D + lane * 4;
     #pragma unroll
     for (int r = 0; r < DV; ++r) {{
-        float4 vo0 = acc0[r] * il0, vo1 = acc1[r] * il1, vo2 = acc2[r] * il2, vo3 = acc3[r] * il3;
-        *(device bfloat4*)(od + 0 * D + 128 * r) = bfloat4((bfloat)vo0.x, (bfloat)vo0.y, (bfloat)vo0.z, (bfloat)vo0.w);
-        *(device bfloat4*)(od + 1 * D + 128 * r) = bfloat4((bfloat)vo1.x, (bfloat)vo1.y, (bfloat)vo1.z, (bfloat)vo1.w);
-        *(device bfloat4*)(od + 2 * D + 128 * r) = bfloat4((bfloat)vo2.x, (bfloat)vo2.y, (bfloat)vo2.z, (bfloat)vo2.w);
-        *(device bfloat4*)(od + 3 * D + 128 * r) = bfloat4((bfloat)vo3.x, (bfloat)vo3.y, (bfloat)vo3.z, (bfloat)vo3.w);
+{store_o_lines}
     }}
     if (lane == 0) {{
-        ml_part[(pb + 0) * 2] = m0; ml_part[(pb + 0) * 2 + 1] = l0;
-        ml_part[(pb + 1) * 2] = m1; ml_part[(pb + 1) * 2 + 1] = l1;
-        ml_part[(pb + 2) * 2] = m2; ml_part[(pb + 2) * 2 + 1] = l2;
-        ml_part[(pb + 3) * 2] = m3; ml_part[(pb + 3) * 2 + 1] = l3;
+{ml_lines}
     }}
-            """
-            tg_y = 2
-        else:
-            src = f"""
+        """
+
+    src = f"""
     constexpr int D = {head_dim};
     constexpr int DV = {dv};
+    constexpr int N_Q = {n_q};
+    constexpr int N_KV = {n_kv};
+    constexpr int GQA = {gqa};
+    constexpr int QH_PER_SG = {qh_per_sg};
     int L_q = (int)q_shape[1];
     int L_sys = meta[0];
     int T_cap = meta[1];
@@ -1129,151 +1060,105 @@ def _get_prefix_ragged_part_kernel(head_dim: int):
     int ring_mask = meta[5];
 
     int row = (int)threadgroup_position_in_grid.y;
-    int split_id = (int)threadgroup_position_in_grid.z;
     int b = row / L_q;
     int l_q = row % L_q;
+    {slot_expr}
     int lane = (int)thread_position_in_threadgroup.x;
     int sg = (int)thread_position_in_threadgroup.y;
 
     int q_pos = off_b[b] + l_q;
     int t_hi = q_pos + 1;
     int t_lo = (win > 0 && q_pos - win + 1 > 0) ? (q_pos - win + 1) : 0;
-    int tot = t_hi - t_lo;
-    int chunk = (tot + n_splits - 1) / n_splits;
-    int s0 = t_lo + split_id * chunk;
-    int s1 = min(t_hi, s0 + chunk);
+{split_bounds}
 
-    int h0 = sg * 2;
-    int h1 = h0 + 1;
-    float4 q0[DV], q1[DV], acc0[DV], acc1[DV];
-    const device bfloat* qp0 = q + ((size_t)row * 8 + h0) * D + lane * 4;
-    const device bfloat* qp1 = q + ((size_t)row * 8 + h1) * D + lane * 4;
+    int h0 = sg * QH_PER_SG;
+    int kv_h = h0 / GQA;
+    float4 {q_decls};
+    float4 {acc_decls};
+    const device bfloat* qb = q + (size_t)row * N_Q * D + lane * 4;
     #pragma unroll
     for (int r = 0; r < DV; ++r) {{
-        bfloat4 v0 = *(const device bfloat4*)(qp0 + 128 * r);
-        bfloat4 v1 = *(const device bfloat4*)(qp1 + 128 * r);
-        q0[r] = float4((float)v0[0], (float)v0[1], (float)v0[2], (float)v0[3]);
-        q1[r] = float4((float)v1[0], (float)v1[1], (float)v1[2], (float)v1[3]);
-        acc0[r] = float4(0.0f);
-        acc1[r] = float4(0.0f);
+{load_q_code}
     }}
-    float m0 = -1e38f, l0 = 0.0f;
-    float m1 = -1e38f, l1 = 0.0f;
+    float {m_decls};
+    float {l_decls};
 
     int sys_end = min(s1, L_sys);
     if (s0 < sys_end) {{
-        const device bfloat* ks_base = k_sys + lane * 4;
-        const device bfloat* vs_base = v_sys + lane * 4;
+        const device bfloat* ks_base = k_sys + (size_t)kv_h * D + lane * 4;
+        const device bfloat* vs_base = v_sys + (size_t)kv_h * D + lane * 4;
         for (int t = s0; t < sys_end; ++t) {{
-            size_t off = (size_t)t * D;
+            size_t off = (size_t)t * (N_KV * D);
+            float4 {p_init};
             float4 vv_r[DV];
-            float4 p0 = 0, p1 = 0;
             #pragma unroll
             for (int r = 0; r < DV; ++r) {{
                 bfloat4 kv = *(const device bfloat4*)(ks_base + off + 128 * r);
                 bfloat4 vv = *(const device bfloat4*)(vs_base + off + 128 * r);
                 float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
                 vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr;
+                {p_acc}
             }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r];
-                acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1;
+{sys_update}
         }}
     }}
 
-    int doc_lo = max(s0, L_sys);
-    if (doc_lo < s1) {{
-        const device bfloat* kd_b = k_doc + (size_t)b * T_cap * D + lane * 4;
-        const device bfloat* vd_b = v_doc + (size_t)b * T_cap * D + lane * 4;
-        for (int t = doc_lo; t < s1; ++t) {{
-            int priv = t - L_sys;
-            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float4 vv_r[DV];
-            float4 p0 = 0, p1 = 0;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(kd_b + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vd_b + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r];
-                acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1;
-        }}
-    }}
+{doc_block}
 
-    size_t ph0 = ((size_t)row * n_splits + split_id) * 8 + h0;
-    size_t ph1 = ph0 + 1;
-    float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f, il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-    device bfloat* od0 = o_part + ph0 * D + lane * 4;
-    device bfloat* od1 = o_part + ph1 * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        float4 vo0 = acc0[r] * il0, vo1 = acc1[r] * il1;
-        *(device bfloat4*)(od0 + 128 * r) = bfloat4((bfloat)vo0.x, (bfloat)vo0.y, (bfloat)vo0.z, (bfloat)vo0.w);
-        *(device bfloat4*)(od1 + 128 * r) = bfloat4((bfloat)vo1.x, (bfloat)vo1.y, (bfloat)vo1.z, (bfloat)vo1.w);
-    }}
-    if (lane == 0) {{
-        ml_part[ph0 * 2] = m0; ml_part[ph0 * 2 + 1] = l0;
-        ml_part[ph1 * 2] = m1; ml_part[ph1 * 2 + 1] = l1;
-    }}
-            """
-            tg_y = 4
+{epilogue}
+    """
+    return src, tg_y
+
+
+def _get_prefix_ragged_part_kernel(head_dim: int, n_q: int, n_kv: int, single_pass: bool):
+    key = (head_dim, n_q, n_kv, single_pass)
+    k = _PREFIX_RAGGED_SDPA_KERNELS.get(key)
+    if k is None:
+        src, tg_y = _build_gqa_sdpa_source(
+            head_dim=head_dim,
+            n_q=n_q,
+            n_kv=n_kv,
+            use_slot_idx=False,
+            kv_i8=False,
+            single_pass=single_pass,
+        )
+        out_names = ["out"] if single_pass else ["o_part", "ml_part"]
+        mode_tag = "sp" if single_pass else "part"
         kern = mx.fast.metal_kernel(
-            name=f"g4_mqa8_prefix_part_mh_d{head_dim}",
+            name=f"g4_gqa_prefix_{mode_tag}_d{head_dim}_q{n_q}_kv{n_kv}",
             input_names=["q", "k_sys", "v_sys", "k_doc", "v_doc", "off_b", "meta"],
-            output_names=["o_part", "ml_part"],
+            output_names=out_names,
             source=src,
         )
         k = (kern, tg_y)
-        _PREFIX_RAGGED_SDPA_KERNELS[head_dim] = k
+        _PREFIX_RAGGED_SDPA_KERNELS[key] = k
     return k
 
 
-def _get_slot_reduce_kernel_vec4(head_dim: int):
-    k = _VEC4_REDUCE_KERNELS.get(head_dim)
+def _get_slot_reduce_kernel_vec4(head_dim: int, n_q: int):
+    key = (head_dim, n_q)
+    k = _VEC4_REDUCE_KERNELS.get(key)
     if k is None:
         tg = head_dim // 4
         src = f"""
     constexpr int D = {head_dim};
+    constexpr int N_Q = {n_q};
     int n_splits = (int)o_part_shape[1];
     int row_h = (int)threadgroup_position_in_grid.y;
-    int row = row_h >> 3;
-    int h = row_h & 7;
+    int row = row_h / N_Q;
+    int h = row_h % N_Q;
     int tid = (int)thread_position_in_threadgroup.x;
 
     float g_m = -1e38f;
     for (int s = 0; s < n_splits; ++s) {{
-        size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+        size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
         float m_s = ml_part[idx * 2 + 0];
         if (ml_part[idx * 2 + 1] > 0.0f && m_s > g_m) g_m = m_s;
     }}
     float g_l = 0.0f;
-    float weights[32];
+    float weights[{MAX_KV_SPLITS}];
     for (int s = 0; s < n_splits; ++s) {{
-        size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+        size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
         float l_s = ml_part[idx * 2 + 1];
         float w = (l_s > 0.0f) ? (l_s * metal::fast::exp(ml_part[idx * 2 + 0] - g_m)) : 0.0f;
         weights[s] = w;
@@ -1283,7 +1168,7 @@ def _get_slot_reduce_kernel_vec4(head_dim: int):
     int d4 = tid * 4;
     float4 acc = float4(0.0f);
     for (int s = 0; s < n_splits; ++s) {{
-        size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+        size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
         bfloat4 pv = *(const device bfloat4*)(o_part + idx * D + d4);
         acc += weights[s] * float4((float)pv[0], (float)pv[1], (float)pv[2], (float)pv[3]);
     }}
@@ -1291,79 +1176,92 @@ def _get_slot_reduce_kernel_vec4(head_dim: int):
     *(device bfloat4*)(out + (size_t)row_h * D + d4) = bfloat4((bfloat)res.x, (bfloat)res.y, (bfloat)res.z, (bfloat)res.w);
         """
         kern = mx.fast.metal_kernel(
-            name=f"g4_mqa8_prefix_reduce_vec4_d{head_dim}",
+            name=f"g4_gqa_prefix_reduce_vec4_d{head_dim}_q{n_q}",
             input_names=["o_part", "ml_part"],
             output_names=["out"],
             source=src,
         )
         k = (kern, tg)
-        _VEC4_REDUCE_KERNELS[head_dim] = k
+        _VEC4_REDUCE_KERNELS[key] = k
     return k
 
 
-def _get_prefix_ragged_reduce_kernel():
-    global _PREFIX_RAGGED_REDUCE_KERNEL
-    if _PREFIX_RAGGED_REDUCE_KERNEL is None:
-        src = """
+def _get_prefix_ragged_reduce_kernel(n_q: int):
+    kern = _PREFIX_RAGGED_REDUCE_KERNELS.get(n_q)
+    if kern is None:
+        src = f"""
+    constexpr int N_Q = {n_q};
     int D = (int)o_part_shape[3];
     int n_splits = (int)o_part_shape[1];
     int row_h = (int)threadgroup_position_in_grid.y;
-    int row = row_h / 8;
-    int h = row_h % 8;
+    int row = row_h / N_Q;
+    int h = row_h % N_Q;
     int tid = (int)thread_position_in_threadgroup.x;
 
     float g_m = -1e38f;
-    for (int s = 0; s < n_splits; ++s) {
-        size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+    for (int s = 0; s < n_splits; ++s) {{
+        size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
         float m_s = ml_part[idx * 2 + 0];
         if (ml_part[idx * 2 + 1] > 0.0f && m_s > g_m) g_m = m_s;
-    }
+    }}
     float g_l = 0.0f;
-    float weights[32];
-    for (int s = 0; s < n_splits; ++s) {
-        size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+    float weights[{MAX_KV_SPLITS}];
+    for (int s = 0; s < n_splits; ++s) {{
+        size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
         float l_s = ml_part[idx * 2 + 1];
         float w = (l_s > 0.0f) ? (l_s * metal::fast::exp(ml_part[idx * 2 + 0] - g_m)) : 0.0f;
         weights[s] = w;
         g_l += w;
-    }
+    }}
     float inv_gl = (g_l > 0.0f) ? (1.0f / g_l) : 0.0f;
     device bfloat* dst = out + (size_t)row_h * D;
-    for (int d = tid; d < D; d += 256) {
+    for (int d = tid; d < D; d += 256) {{
         float acc = 0.0f;
-        for (int s = 0; s < n_splits; ++s) {
-            size_t idx = ((size_t)row * n_splits + s) * 8 + h;
+        for (int s = 0; s < n_splits; ++s) {{
+            size_t idx = ((size_t)row * n_splits + s) * N_Q + h;
             acc += weights[s] * (float)o_part[idx * D + d];
-        }
+        }}
         dst[d] = (bfloat)(acc * inv_gl);
-    }
+    }}
         """
-        _PREFIX_RAGGED_REDUCE_KERNEL = mx.fast.metal_kernel(
-            name="g4_mqa8_prefix_reduce_bf16",
+        kern = mx.fast.metal_kernel(
+            name=f"g4_gqa_prefix_reduce_bf16_q{n_q}",
             input_names=["o_part", "ml_part"],
             output_names=["out"],
             source=src,
         )
-    return _PREFIX_RAGGED_REDUCE_KERNEL
+        _PREFIX_RAGGED_REDUCE_KERNELS[n_q] = kern
+    return kern
 
 
-def _reduce_split_kv(o_part: mx.array, ml_part: mx.array, B: int, L_q: int, D: int, vec4_reduce: bool) -> mx.array:
+def _reduce_split_kv(
+    o_part: mx.array,
+    ml_part: mx.array,
+    B: int,
+    L_q: int,
+    D: int,
+    vec4_reduce: bool,
+    n_q: int = 8,
+) -> mx.array:
+    n_splits = _validate_n_splits(int(o_part.shape[1]))
+    if n_splits == 1:
+        return o_part.reshape(B, L_q, n_q * D)
     rows = B * L_q
     if vec4_reduce:
-        red_k, red_tg = _get_slot_reduce_kernel_vec4(D)
+        red_k, red_tg = _get_slot_reduce_kernel_vec4(D, n_q)
         return red_k(
             inputs=[o_part, ml_part],
-            output_shapes=[(B, L_q, 8 * D)],
+            output_shapes=[(B, L_q, n_q * D)],
             output_dtypes=[mx.bfloat16],
-            grid=(red_tg, rows * 8, 1),
+            grid=(red_tg, rows * n_q, 1),
             threadgroup=(red_tg, 1, 1),
         )[0]
-    red_k = _get_prefix_ragged_reduce_kernel()
+    red_k = _get_prefix_ragged_reduce_kernel(n_q)
     return red_k(
         inputs=[o_part, ml_part],
-        output_shapes=[(B, L_q, 8 * D)],
+        output_shapes=[(B, L_q, n_q * D)],
         output_dtypes=[mx.bfloat16],
-        grid=(256, rows * 8, 1),
+        grid=(256, rows * n_q, 1),
         threadgroup=(256, 1, 1),
     )[0]
 
@@ -1381,28 +1279,42 @@ def mqa8_sdpa_prefix_ragged(
     meta: mx.array | None = None,
     vec4_reduce: bool = True,
 ) -> mx.array:
-    """MQA-8 SDPA over shared `KV_sys [L_sys, D]` + ragged per-doc `KV_doc [B, T_cap, D]`."""
-    B, L_q, _, D = q.shape
-    L_sys = k_sys.shape[0]
-    T_cap = k_doc.shape[1]
+    """GQA/MQA SDPA over shared `KV_sys [L_sys, n_kv, D]` + ragged per-doc `KV_doc [B, T_cap, n_kv, D]`."""
+    B, L_q, n_q, D = (int(x) for x in q.shape)
+    L_sys = int(k_sys.shape[0])
+    T_cap = int(k_doc.shape[1])
+    n_kv = int(k_doc.shape[2]) if k_doc.ndim == 4 else 1
     ring = 1 if doc_ring_cap > 0 else 0
     ring_mask = (T_cap - 1) if (ring and (T_cap & (T_cap - 1)) == 0) else -1
     if n_splits <= 0:
-        if window_size > 0 and window_size <= 512:
-            n_splits = 2 if (B * L_q >= 96) else 4
+        rows = B * L_q
+        if rows >= 128:
+            n_splits = 1
+        elif window_size > 0 and window_size <= 512:
+            n_splits = 2 if rows >= 96 else 4
         else:
-            n_splits = 4 if (B * L_q >= 96) else 8
+            n_splits = 4 if rows >= 96 else 8
+    n_splits = _validate_n_splits(n_splits)
     if meta is None:
         meta = mx.array([L_sys, T_cap, window_size, ring, n_splits, ring_mask], dtype=mx.int32)
-    part_k, tg_y = _get_prefix_ragged_part_kernel(D)
+    single_pass = n_splits == 1
+    part_k, tg_y = _get_prefix_ragged_part_kernel(D, n_q, n_kv, single_pass=single_pass)
+    if single_pass:
+        return part_k(
+            inputs=[q, k_sys, v_sys, k_doc, v_doc, off_b, meta],
+            output_shapes=[(B, L_q, n_q * D)],
+            output_dtypes=[mx.bfloat16],
+            grid=(32, B * L_q * tg_y, 1),
+            threadgroup=(32, tg_y, 1),
+        )[0]
     o_part, ml_part = part_k(
         inputs=[q, k_sys, v_sys, k_doc, v_doc, off_b, meta],
-        output_shapes=[(B * L_q, n_splits, 8, D), (B * L_q, n_splits, 8, 2)],
+        output_shapes=[(B * L_q, n_splits, n_q, D), (B * L_q, n_splits, n_q, 2)],
         output_dtypes=[mx.bfloat16, mx.float32],
         grid=(32, B * L_q * tg_y, n_splits),
         threadgroup=(32, tg_y, 1),
     )
-    return _reduce_split_kv(o_part, ml_part, B, L_q, D, vec4_reduce=vec4_reduce)
+    return _reduce_split_kv(o_part, ml_part, B, L_q, D, vec4_reduce=vec4_reduce, n_q=n_q)
 
 
 def _get_quantize_kv_pair_kernel(head_dim: int):
@@ -1463,8 +1375,8 @@ def _get_quantize_kv_pair_kernel(head_dim: int):
 
 def quantize_kv_pair_i8(k_new: mx.array, v_new: mx.array):
     """Quantize K, V `[..., D]` bfloat16 -> `(k_q int8, k_s fp16, v_q int8, v_s fp16)`."""
-    D = k_new.shape[-1]
-    rows = k_new.size // D
+    D = int(k_new.shape[-1])
+    rows = int(k_new.size) // D
     kern = _get_quantize_kv_pair_kernel(D)
     s_shape = k_new.shape[:-1]
     return kern(
@@ -1477,40 +1389,53 @@ def quantize_kv_pair_i8(k_new: mx.array, v_new: mx.array):
 
 
 def dequant_kv_pair_i8_bf16(kq: mx.array, ks: mx.array, vq: mx.array, vs: mx.array):
-    """Fused zero-temp dequantize of contiguous `(kq, ks, vq, vs)` -> `(kd, vd)` shaped `(Bg, 1, Lc, D)` bfloat16."""
-    Bg, Lc, D = kq.shape
+    """Fused zero-temp dequantize of contiguous `(kq, ks, vq, vs)` -> `(kd, vd)` shaped `(Bg, n_kv, Lc, D)` bfloat16."""
+    if kq.ndim == 4:
+        Bg, Lc, n_kv, D = (int(x) for x in kq.shape)
+    else:
+        Bg, Lc, D = (int(x) for x in kq.shape)
+        n_kv = 1
     tg = D // 4
-    kern = _DEQ_KV_PAIR_KERNELS.get(D)
+    key = (D, n_kv)
+    kern = _DEQ_KV_PAIR_KERNELS.get(key)
     if kern is None:
         src = f"""
     constexpr uint D = {D};
+    constexpr uint N_KV = {n_kv};
+    uint Lc = (uint)kq_shape[1];
     uint row = threadgroup_position_in_grid.y;
     uint tid = thread_position_in_threadgroup.x;
-    size_t base = (size_t)row * D + tid * 4;
-    float sk = (float)ks[row];
-    float sv = (float)vs[row];
-    char4 kv = *((const device char4*)(kq + base));
-    char4 vv = *((const device char4*)(vq + base));
-    *((device bfloat4*)(kd + base)) = bfloat4(
+    uint b = row / (N_KV * Lc);
+    uint rem = row - b * (N_KV * Lc);
+    uint h = rem / Lc;
+    uint t = rem - h * Lc;
+    size_t src_idx = ((size_t)b * Lc + t) * N_KV + h;
+    size_t src_base = src_idx * D + tid * 4;
+    size_t dst_base = (size_t)row * D + tid * 4;
+    float sk = (float)ks[src_idx];
+    float sv = (float)vs[src_idx];
+    char4 kv = *((const device char4*)(kq + src_base));
+    char4 vv = *((const device char4*)(vq + src_base));
+    *((device bfloat4*)(kd + dst_base)) = bfloat4(
         (bfloat)((float)kv[0] * sk), (bfloat)((float)kv[1] * sk),
         (bfloat)((float)kv[2] * sk), (bfloat)((float)kv[3] * sk)
     );
-    *((device bfloat4*)(vd + base)) = bfloat4(
+    *((device bfloat4*)(vd + dst_base)) = bfloat4(
         (bfloat)((float)vv[0] * sv), (bfloat)((float)vv[1] * sv),
         (bfloat)((float)vv[2] * sv), (bfloat)((float)vv[3] * sv)
     );
         """
         kern = mx.fast.metal_kernel(
-            name=f"g4_dequant_kv_pair_i8_d{D}",
+            name=f"g4_dequant_kv_pair_i8_d{D}_kv{n_kv}",
             input_names=["kq", "ks", "vq", "vs"],
             output_names=["kd", "vd"],
             source=src,
         )
-        _DEQ_KV_PAIR_KERNELS[D] = kern
-    rows = Bg * Lc
+        _DEQ_KV_PAIR_KERNELS[key] = kern
+    rows = Bg * n_kv * Lc
     return kern(
         inputs=[kq, ks, vq, vs],
-        output_shapes=[(Bg, 1, Lc, D), (Bg, 1, Lc, D)],
+        output_shapes=[(Bg, n_kv, Lc, D), (Bg, n_kv, Lc, D)],
         output_dtypes=[mx.bfloat16, mx.bfloat16],
         grid=(tg, rows, 1),
         threadgroup=(tg, 1, 1),
@@ -1525,24 +1450,31 @@ def gather_dequant_kv_pair_i8_bf16(
     b_idx: mx.array,
     p_slots: mx.array,
 ):
-    """Fused 2D slot+pos gather + int8->bfloat16 dequantize -> `(kd, vd)` `(Bg, 1, L_kv, D)`."""
-    D = int(k_c.shape[2])
+    """Fused 2D slot+pos gather + int8->bfloat16 dequantize -> `(kd, vd)` `(Bg, n_kv, L_kv, D)`."""
+    if k_c.ndim == 4:
+        n_kv, D = int(k_c.shape[2]), int(k_c.shape[3])
+    else:
+        n_kv, D = 1, int(k_c.shape[2])
     Bg = int(b_idx.shape[0])
     L_kv = int(p_slots.shape[0])
     tg = D // 4
-    kern = _GATHER_DEQ_KV_PAIR_KERNELS.get(D)
+    key = (D, n_kv)
+    kern = _GATHER_DEQ_KV_PAIR_KERNELS.get(key)
     if kern is None:
         src = f"""
     constexpr uint D = {D};
+    constexpr uint N_KV = {n_kv};
     int T_cap = (int)k_c_shape[1];
     int L_kv = (int)p_slots_shape[0];
     uint row = threadgroup_position_in_grid.y;
     uint tid = thread_position_in_threadgroup.x;
-    int b = (int)(row / (uint)L_kv);
-    int t = (int)(row - (uint)(b * L_kv));
+    uint b = row / (N_KV * (uint)L_kv);
+    uint rem = row - b * (N_KV * (uint)L_kv);
+    uint h = rem / (uint)L_kv;
+    uint t = rem - h * (uint)L_kv;
     int slot = b_idx[b];
     int pos = p_slots[t];
-    size_t st_idx = (size_t)slot * T_cap + (size_t)pos;
+    size_t st_idx = ((size_t)slot * (size_t)T_cap + (size_t)pos) * N_KV + (size_t)h;
     size_t src_base = st_idx * D + tid * 4;
     size_t dst_base = (size_t)row * D + tid * 4;
     float sk = (float)ks_c[st_idx];
@@ -1559,16 +1491,16 @@ def gather_dequant_kv_pair_i8_bf16(
     );
         """
         kern = mx.fast.metal_kernel(
-            name=f"g4_gather_dequant_kv_pair_i8_d{D}",
+            name=f"g4_gather_dequant_kv_pair_i8_d{D}_kv{n_kv}",
             input_names=["k_c", "ks_c", "v_c", "vs_c", "b_idx", "p_slots"],
             output_names=["kd", "vd"],
             source=src,
         )
-        _GATHER_DEQ_KV_PAIR_KERNELS[D] = kern
-    rows = Bg * L_kv
+        _GATHER_DEQ_KV_PAIR_KERNELS[key] = kern
+    rows = Bg * n_kv * L_kv
     return kern(
         inputs=[k_c, ks_c, v_c, vs_c, b_idx, p_slots],
-        output_shapes=[(Bg, 1, L_kv, D), (Bg, 1, L_kv, D)],
+        output_shapes=[(Bg, n_kv, L_kv, D), (Bg, n_kv, L_kv, D)],
         output_dtypes=[mx.bfloat16, mx.bfloat16],
         grid=(tg, rows, 1),
         threadgroup=(tg, 1, 1),
@@ -1583,8 +1515,25 @@ def scatter_kv_slot_precomputed(
     slot_idx: mx.array,
     pos_slot: mx.array,
 ) -> None:
-    """Zero-overhead BF16 KV scatter using precomputed `slot_idx` and `pos_slot`."""
-    B, L_q, D = k_new.shape
+    """Zero-overhead BF16 KV scatter using precomputed `slot_idx` and `pos_slot` (`[B, Cap, n_kv, D]` or 3D)."""
+    B, L_q = int(k_new.shape[0]), int(k_new.shape[1])
+    if k_doc.ndim == 4:
+        n_kv, D = int(k_doc.shape[2]), int(k_doc.shape[3])
+        if k_new.ndim == 3:
+            k_new = k_new.reshape(B, L_q, n_kv, D)
+            v_new = v_new.reshape(B, L_q, n_kv, D)
+        if L_q == 1:
+            k_doc[slot_idx, pos_slot] = k_new.reshape(B, n_kv, D)
+            v_doc[slot_idx, pos_slot] = v_new.reshape(B, n_kv, D)
+        else:
+            s_idx = slot_idx[:, None] if slot_idx.ndim == 1 else slot_idx
+            k_doc[s_idx, pos_slot] = k_new
+            v_doc[s_idx, pos_slot] = v_new
+        return
+    D = int(k_doc.shape[2])
+    if k_new.ndim == 4:
+        k_new = k_new.reshape(B, L_q, D)
+        v_new = v_new.reshape(B, L_q, D)
     if L_q == 1:
         k_doc[slot_idx, pos_slot] = k_new.reshape(B, D)
         v_doc[slot_idx, pos_slot] = v_new.reshape(B, D)
@@ -1604,8 +1553,30 @@ def scatter_kv_i8_slot_precomputed(
     slot_idx: mx.array,
     pos_slot: mx.array,
 ) -> None:
-    """Zero-overhead INT8 KV quantize + scatter using precomputed `slot_idx` and `pos_slot`."""
-    B, L_q, D = k_new.shape
+    """Zero-overhead INT8 KV quantize + scatter using precomputed `slot_idx` and `pos_slot` (`[B, Cap, n_kv, D]` or 3D)."""
+    B, L_q = int(k_new.shape[0]), int(k_new.shape[1])
+    if k_q_doc.ndim == 4:
+        n_kv, D = int(k_q_doc.shape[2]), int(k_q_doc.shape[3])
+        if k_new.ndim == 3:
+            k_new = k_new.reshape(B, L_q, n_kv, D)
+            v_new = v_new.reshape(B, L_q, n_kv, D)
+        kq, ks, vq, vs = quantize_kv_pair_i8(k_new, v_new)
+        if L_q == 1:
+            k_q_doc[slot_idx, pos_slot] = kq.reshape(B, n_kv, D)
+            k_s_doc[slot_idx, pos_slot] = ks.reshape(B, n_kv)
+            v_q_doc[slot_idx, pos_slot] = vq.reshape(B, n_kv, D)
+            v_s_doc[slot_idx, pos_slot] = vs.reshape(B, n_kv)
+        else:
+            s_idx = slot_idx[:, None] if slot_idx.ndim == 1 else slot_idx
+            k_q_doc[s_idx, pos_slot] = kq
+            k_s_doc[s_idx, pos_slot] = ks
+            v_q_doc[s_idx, pos_slot] = vq
+            v_s_doc[s_idx, pos_slot] = vs
+        return
+    D = int(k_q_doc.shape[2])
+    if k_new.ndim == 4:
+        k_new = k_new.reshape(B, L_q, D)
+        v_new = v_new.reshape(B, L_q, D)
     kq, ks, vq, vs = quantize_kv_pair_i8(k_new, v_new)
     if L_q == 1:
         k_q_doc[slot_idx, pos_slot] = kq.reshape(B, D)
@@ -1630,20 +1601,17 @@ def scatter_kv_ragged_slot(
     doc_ring_cap: int = 0,
     slot_idx: mx.array | None = None,
 ) -> None:
-    B, L_q, D = k_new.shape
-    T_cap = k_doc.shape[1]
+    B, L_q = int(k_new.shape[0]), int(k_new.shape[1])
+    T_cap = int(k_doc.shape[1])
     b_idx = mx.arange(B, dtype=mx.int32) if slot_idx is None else slot_idx
     is_pow2 = (T_cap & (T_cap - 1)) == 0
     if L_q == 1:
         priv = off_b - l_sys
-        slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
-        k_doc[b_idx, slot] = k_new.reshape(B, D)
-        v_doc[b_idx, slot] = v_new.reshape(B, D)
+        pos = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
     else:
         priv = off_b[:, None] + mx.arange(L_q, dtype=mx.int32)[None, :] - l_sys
-        slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
-        k_doc[b_idx[:, None], slot] = k_new
-        v_doc[b_idx[:, None], slot] = v_new
+        pos = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
+    scatter_kv_slot_precomputed(k_doc, v_doc, k_new, v_new, b_idx, pos)
 
 
 def scatter_kv_ragged_i8_slot(
@@ -1658,401 +1626,44 @@ def scatter_kv_ragged_i8_slot(
     doc_ring_cap: int = 0,
     slot_idx: mx.array | None = None,
 ) -> None:
-    B, L_q, D = k_new.shape
-    T_cap = k_q_doc.shape[1]
-    kq, ks, vq, vs = quantize_kv_pair_i8(k_new, v_new)
+    B, L_q = int(k_new.shape[0]), int(k_new.shape[1])
+    T_cap = int(k_q_doc.shape[1])
     b_idx = mx.arange(B, dtype=mx.int32) if slot_idx is None else slot_idx
     is_pow2 = (T_cap & (T_cap - 1)) == 0
     if L_q == 1:
         priv = off_b - l_sys
-        slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
-        k_q_doc[b_idx, slot] = kq.reshape(B, D)
-        k_s_doc[b_idx, slot] = ks.reshape(B)
-        v_q_doc[b_idx, slot] = vq.reshape(B, D)
-        v_s_doc[b_idx, slot] = vs.reshape(B)
+        pos = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
     else:
         priv = off_b[:, None] + mx.arange(L_q, dtype=mx.int32)[None, :] - l_sys
-        slot = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
-        k_q_doc[b_idx[:, None], slot] = kq
-        k_s_doc[b_idx[:, None], slot] = ks
-        v_q_doc[b_idx[:, None], slot] = vq
-        v_s_doc[b_idx[:, None], slot] = vs
+        pos = (priv & (T_cap - 1)) if (doc_ring_cap > 0 and is_pow2) else (priv % T_cap if doc_ring_cap > 0 else priv)
+    scatter_kv_i8_slot_precomputed(k_q_doc, k_s_doc, v_q_doc, v_s_doc, k_new, v_new, b_idx, pos)
 
 
-def _get_prefix_slot_part_kernel(head_dim: int, kv_i8: bool):
-    key = (head_dim, kv_i8)
+def _get_prefix_slot_part_kernel(head_dim: int, n_q: int, n_kv: int, kv_i8: bool, single_pass: bool):
+    key = (head_dim, n_q, n_kv, kv_i8, single_pass)
     k = _PREFIX_SLOT_KERNELS.get(key)
     if k is not None:
         return k
 
-    dv = head_dim // 128
-    if head_dim == 256:
-        if kv_i8:
-            doc_block = f"""
-    int doc_lo = max(s0, L_sys);
-    if (doc_lo < s1) {{
-        const device int8_t* kd_b = k_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device int8_t* vd_b = v_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device half* ks_d = k_s_doc + (size_t)slot_row * T_cap;
-        const device half* vs_d = v_s_doc + (size_t)slot_row * T_cap;
-        for (int t = doc_lo; t < s1; ++t) {{
-            int priv = t - L_sys;
-            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float ksc = (float)ks_d[slot];
-            float vsc = (float)vs_d[slot];
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            float4 vv_r[DV];
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                vec<int8_t, 4> kv = *(const device vec<int8_t, 4>*)(kd_b + off + 128 * r);
-                vec<int8_t, 4> vv = *(const device vec<int8_t, 4>*)(vd_b + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr; p2 += q2[r] * kr; p3 += q3[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w) * ksc;
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w) * ksc;
-            float d2 = simd_sum(p2.x + p2.y + p2.z + p2.w) * ksc;
-            float d3 = simd_sum(p3.x + p3.y + p3.z + p3.w) * ksc;
-            float nm0 = max(d0, m0), nm1 = max(d1, m1), nm2 = max(d2, m2), nm3 = max(d3, m3);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            float a2 = metal::fast::exp(m2 - nm2), b2 = metal::fast::exp(d2 - nm2);
-            float a3 = metal::fast::exp(m3 - nm3), b3 = metal::fast::exp(d3 - nm3);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1; l2 = l2 * a2 + b2; l3 = l3 * a3 + b3;
-            float bv0 = b0 * vsc, bv1 = b1 * vsc, bv2 = b2 * vsc, bv3 = b3 * vsc;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + bv0 * vv_r[r]; acc1[r] = acc1[r] * a1 + bv1 * vv_r[r];
-                acc2[r] = acc2[r] * a2 + bv2 * vv_r[r]; acc3[r] = acc3[r] * a3 + bv3 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-        }}
-    }}
-            """
-        else:
-            doc_block = f"""
-    int doc_lo = max(s0, L_sys);
-    if (doc_lo < s1) {{
-        const device bfloat* kd_b = k_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device bfloat* vd_b = v_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        for (int t = doc_lo; t < s1; ++t) {{
-            int priv = t - L_sys;
-            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            float4 vv_r[DV];
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(kd_b + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vd_b + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr; p2 += q2[r] * kr; p3 += q3[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float d2 = simd_sum(p2.x + p2.y + p2.z + p2.w);
-            float d3 = simd_sum(p3.x + p3.y + p3.z + p3.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1), nm2 = max(d2, m2), nm3 = max(d3, m3);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            float a2 = metal::fast::exp(m2 - nm2), b2 = metal::fast::exp(d2 - nm2);
-            float a3 = metal::fast::exp(m3 - nm3), b3 = metal::fast::exp(d3 - nm3);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1; l2 = l2 * a2 + b2; l3 = l3 * a3 + b3;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r]; acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-                acc2[r] = acc2[r] * a2 + b2 * vv_r[r]; acc3[r] = acc3[r] * a3 + b3 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-        }}
-    }}
-            """
-        src = f"""
-    constexpr int D = {head_dim};
-    constexpr int DV = {dv};
-    int L_q = (int)q_shape[1];
-    int L_sys = meta[0];
-    int T_cap = meta[1];
-    int win = meta[2];
-    int ring = meta[3];
-    int n_splits = meta[4];
-    int ring_mask = meta[5];
-
-    int row = (int)threadgroup_position_in_grid.y;
-    int split_id = (int)threadgroup_position_in_grid.z;
-    int b = row / L_q;
-    int l_q = row % L_q;
-    int slot_row = slot_idx[b];
-    int lane = (int)thread_position_in_threadgroup.x;
-    int sg = (int)thread_position_in_threadgroup.y;
-
-    int q_pos = off_b[b] + l_q;
-    int t_hi = q_pos + 1;
-    int t_lo = (win > 0 && q_pos - win + 1 > 0) ? (q_pos - win + 1) : 0;
-    int tot = t_hi - t_lo;
-    int chunk = (tot + n_splits - 1) / n_splits;
-    int s0 = t_lo + split_id * chunk;
-    int s1 = min(t_hi, s0 + chunk);
-
-    int h0 = sg * 4;
-    float4 q0[DV], q1[DV], q2[DV], q3[DV];
-    float4 acc0[DV], acc1[DV], acc2[DV], acc3[DV];
-    const device bfloat* qb = q + (size_t)row * 8 * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        bfloat4 v0 = *(const device bfloat4*)(qb + (h0 + 0) * D + 128 * r);
-        bfloat4 v1 = *(const device bfloat4*)(qb + (h0 + 1) * D + 128 * r);
-        bfloat4 v2 = *(const device bfloat4*)(qb + (h0 + 2) * D + 128 * r);
-        bfloat4 v3 = *(const device bfloat4*)(qb + (h0 + 3) * D + 128 * r);
-        q0[r] = float4((float)v0[0], (float)v0[1], (float)v0[2], (float)v0[3]);
-        q1[r] = float4((float)v1[0], (float)v1[1], (float)v1[2], (float)v1[3]);
-        q2[r] = float4((float)v2[0], (float)v2[1], (float)v2[2], (float)v2[3]);
-        q3[r] = float4((float)v3[0], (float)v3[1], (float)v3[2], (float)v3[3]);
-        acc0[r] = float4(0.0f); acc1[r] = float4(0.0f); acc2[r] = float4(0.0f); acc3[r] = float4(0.0f);
-    }}
-    float m0 = -1e38f, m1 = -1e38f, m2 = -1e38f, m3 = -1e38f;
-    float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
-
-    int sys_end = min(s1, L_sys);
-    if (s0 < sys_end) {{
-        const device bfloat* ks_base = k_sys + lane * 4;
-        const device bfloat* vs_base = v_sys + lane * 4;
-        for (int t = s0; t < sys_end; ++t) {{
-            size_t off = (size_t)t * D;
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            float4 vv_r[DV];
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(ks_base + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vs_base + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr; p2 += q2[r] * kr; p3 += q3[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float d2 = simd_sum(p2.x + p2.y + p2.z + p2.w);
-            float d3 = simd_sum(p3.x + p3.y + p3.z + p3.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1), nm2 = max(d2, m2), nm3 = max(d3, m3);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            float a2 = metal::fast::exp(m2 - nm2), b2 = metal::fast::exp(d2 - nm2);
-            float a3 = metal::fast::exp(m3 - nm3), b3 = metal::fast::exp(d3 - nm3);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1; l2 = l2 * a2 + b2; l3 = l3 * a3 + b3;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r]; acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-                acc2[r] = acc2[r] * a2 + b2 * vv_r[r]; acc3[r] = acc3[r] * a3 + b3 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-        }}
-    }}
-
-    {doc_block}
-
-    size_t pb = ((size_t)row * n_splits + split_id) * 8 + h0;
-    float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f, il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-    float il2 = (l2 > 0.0f) ? (1.0f / l2) : 0.0f, il3 = (l3 > 0.0f) ? (1.0f / l3) : 0.0f;
-    device bfloat* od = o_part + pb * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        float4 vo0 = acc0[r] * il0, vo1 = acc1[r] * il1, vo2 = acc2[r] * il2, vo3 = acc3[r] * il3;
-        *(device bfloat4*)(od + 0 * D + 128 * r) = bfloat4((bfloat)vo0.x, (bfloat)vo0.y, (bfloat)vo0.z, (bfloat)vo0.w);
-        *(device bfloat4*)(od + 1 * D + 128 * r) = bfloat4((bfloat)vo1.x, (bfloat)vo1.y, (bfloat)vo1.z, (bfloat)vo1.w);
-        *(device bfloat4*)(od + 2 * D + 128 * r) = bfloat4((bfloat)vo2.x, (bfloat)vo2.y, (bfloat)vo2.z, (bfloat)vo2.w);
-        *(device bfloat4*)(od + 3 * D + 128 * r) = bfloat4((bfloat)vo3.x, (bfloat)vo3.y, (bfloat)vo3.z, (bfloat)vo3.w);
-    }}
-    if (lane == 0) {{
-        ml_part[(pb + 0) * 2] = m0; ml_part[(pb + 0) * 2 + 1] = l0;
-        ml_part[(pb + 1) * 2] = m1; ml_part[(pb + 1) * 2 + 1] = l1;
-        ml_part[(pb + 2) * 2] = m2; ml_part[(pb + 2) * 2 + 1] = l2;
-        ml_part[(pb + 3) * 2] = m3; ml_part[(pb + 3) * 2 + 1] = l3;
-    }}
-        """
-        tg_y = 2
-    else:
-        if kv_i8:
-            doc_block = f"""
-    int doc_lo = max(s0, L_sys);
-    if (doc_lo < s1) {{
-        const device int8_t* kd_b = k_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device int8_t* vd_b = v_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device half* ks_d = k_s_doc + (size_t)slot_row * T_cap;
-        const device half* vs_d = v_s_doc + (size_t)slot_row * T_cap;
-        for (int t = doc_lo; t < s1; ++t) {{
-            int priv = t - L_sys;
-            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float ksc = (float)ks_d[slot];
-            float vsc = (float)vs_d[slot];
-            float4 vv_r[DV];
-            float4 p0 = 0, p1 = 0;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                vec<int8_t, 4> kv = *(const device vec<int8_t, 4>*)(kd_b + off + 128 * r);
-                vec<int8_t, 4> vv = *(const device vec<int8_t, 4>*)(vd_b + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w) * ksc;
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w) * ksc;
-            float nm0 = max(d0, m0), nm1 = max(d1, m1);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1;
-            float bv0 = b0 * vsc, bv1 = b1 * vsc;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + bv0 * vv_r[r];
-                acc1[r] = acc1[r] * a1 + bv1 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1;
-        }}
-    }}
-            """
-        else:
-            doc_block = f"""
-    int doc_lo = max(s0, L_sys);
-    if (doc_lo < s1) {{
-        const device bfloat* kd_b = k_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        const device bfloat* vd_b = v_doc + (size_t)slot_row * T_cap * D + lane * 4;
-        for (int t = doc_lo; t < s1; ++t) {{
-            int priv = t - L_sys;
-            int slot = (ring_mask >= 0) ? (priv & ring_mask) : (ring ? (priv % T_cap) : priv);
-            size_t off = (size_t)slot * D;
-            float4 vv_r[DV];
-            float4 p0 = 0, p1 = 0;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(kd_b + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vd_b + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r];
-                acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1;
-        }}
-    }}
-            """
-        src = f"""
-    constexpr int D = {head_dim};
-    constexpr int DV = {dv};
-    int L_q = (int)q_shape[1];
-    int L_sys = meta[0];
-    int T_cap = meta[1];
-    int win = meta[2];
-    int ring = meta[3];
-    int n_splits = meta[4];
-    int ring_mask = meta[5];
-
-    int row = (int)threadgroup_position_in_grid.y;
-    int split_id = (int)threadgroup_position_in_grid.z;
-    int b = row / L_q;
-    int l_q = row % L_q;
-    int slot_row = slot_idx[b];
-    int lane = (int)thread_position_in_threadgroup.x;
-    int sg = (int)thread_position_in_threadgroup.y;
-
-    int q_pos = off_b[b] + l_q;
-    int t_hi = q_pos + 1;
-    int t_lo = (win > 0 && q_pos - win + 1 > 0) ? (q_pos - win + 1) : 0;
-    int tot = t_hi - t_lo;
-    int chunk = (tot + n_splits - 1) / n_splits;
-    int s0 = t_lo + split_id * chunk;
-    int s1 = min(t_hi, s0 + chunk);
-
-    int h0 = sg * 2;
-    int h1 = h0 + 1;
-    float4 q0[DV], q1[DV], acc0[DV], acc1[DV];
-    const device bfloat* qp0 = q + ((size_t)row * 8 + h0) * D + lane * 4;
-    const device bfloat* qp1 = q + ((size_t)row * 8 + h1) * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        bfloat4 v0 = *(const device bfloat4*)(qp0 + 128 * r);
-        bfloat4 v1 = *(const device bfloat4*)(qp1 + 128 * r);
-        q0[r] = float4((float)v0[0], (float)v0[1], (float)v0[2], (float)v0[3]);
-        q1[r] = float4((float)v1[0], (float)v1[1], (float)v1[2], (float)v1[3]);
-        acc0[r] = float4(0.0f);
-        acc1[r] = float4(0.0f);
-    }}
-    float m0 = -1e38f, l0 = 0.0f;
-    float m1 = -1e38f, l1 = 0.0f;
-
-    int sys_end = min(s1, L_sys);
-    if (s0 < sys_end) {{
-        const device bfloat* ks_base = k_sys + lane * 4;
-        const device bfloat* vs_base = v_sys + lane * 4;
-        for (int t = s0; t < sys_end; ++t) {{
-            size_t off = (size_t)t * D;
-            float4 vv_r[DV];
-            float4 p0 = 0, p1 = 0;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                bfloat4 kv = *(const device bfloat4*)(ks_base + off + 128 * r);
-                bfloat4 vv = *(const device bfloat4*)(vs_base + off + 128 * r);
-                float4 kr = float4((float)kv[0], (float)kv[1], (float)kv[2], (float)kv[3]);
-                vv_r[r] = float4((float)vv[0], (float)vv[1], (float)vv[2], (float)vv[3]);
-                p0 += q0[r] * kr; p1 += q1[r] * kr;
-            }}
-            float d0 = simd_sum(p0.x + p0.y + p0.z + p0.w);
-            float d1 = simd_sum(p1.x + p1.y + p1.z + p1.w);
-            float nm0 = max(d0, m0), nm1 = max(d1, m1);
-            float a0 = metal::fast::exp(m0 - nm0), b0 = metal::fast::exp(d0 - nm0);
-            float a1 = metal::fast::exp(m1 - nm1), b1 = metal::fast::exp(d1 - nm1);
-            l0 = l0 * a0 + b0; l1 = l1 * a1 + b1;
-            #pragma unroll
-            for (int r = 0; r < DV; ++r) {{
-                acc0[r] = acc0[r] * a0 + b0 * vv_r[r];
-                acc1[r] = acc1[r] * a1 + b1 * vv_r[r];
-            }}
-            m0 = nm0; m1 = nm1;
-        }}
-    }}
-
-    {doc_block}
-
-    size_t ph0 = ((size_t)row * n_splits + split_id) * 8 + h0;
-    size_t ph1 = ph0 + 1;
-    float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f, il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-    device bfloat* od0 = o_part + ph0 * D + lane * 4;
-    device bfloat* od1 = o_part + ph1 * D + lane * 4;
-    #pragma unroll
-    for (int r = 0; r < DV; ++r) {{
-        float4 vo0 = acc0[r] * il0, vo1 = acc1[r] * il1;
-        *(device bfloat4*)(od0 + 128 * r) = bfloat4((bfloat)vo0.x, (bfloat)vo0.y, (bfloat)vo0.z, (bfloat)vo0.w);
-        *(device bfloat4*)(od1 + 128 * r) = bfloat4((bfloat)vo1.x, (bfloat)vo1.y, (bfloat)vo1.z, (bfloat)vo1.w);
-    }}
-    if (lane == 0) {{
-        ml_part[ph0 * 2] = m0; ml_part[ph0 * 2 + 1] = l0;
-        ml_part[ph1 * 2] = m1; ml_part[ph1 * 2 + 1] = l1;
-    }}
-        """
-        tg_y = 4
-
+    src, tg_y = _build_gqa_sdpa_source(
+        head_dim=head_dim,
+        n_q=n_q,
+        n_kv=n_kv,
+        use_slot_idx=True,
+        kv_i8=kv_i8,
+        single_pass=single_pass,
+    )
     in_names = ["q", "k_sys", "v_sys", "k_doc", "v_doc"]
     if kv_i8:
         in_names += ["k_s_doc", "v_s_doc"]
     in_names += ["off_b", "slot_idx", "meta"]
+    out_names = ["out"] if single_pass else ["o_part", "ml_part"]
+    mode_tag = "sp" if single_pass else "part"
 
     kern = mx.fast.metal_kernel(
-        name=f"g4_mqa8_prefix_slot_{'i8' if kv_i8 else 'bf16'}_d{head_dim}",
+        name=f"g4_gqa_prefix_slot_{'i8' if kv_i8 else 'bf16'}_{mode_tag}_d{head_dim}_q{n_q}_kv{n_kv}",
         input_names=in_names,
-        output_names=["o_part", "ml_part"],
+        output_names=out_names,
         source=src,
     )
     k = (kern, tg_y)
@@ -2074,21 +1685,33 @@ def mqa8_sdpa_prefix_ragged_slot(
     v_s_doc: mx.array | None = None,
     vec4_reduce: bool = True,
 ) -> mx.array:
-    """Slot-indexed MQA-8 SDPA over `KV_sys` + `KV_doc` (BF16 or INT8) with optional `bfloat4` combine."""
-    B, L_q, _, D = q.shape
+    """Slot-indexed GQA/MQA SDPA over `KV_sys` + `KV_doc` (BF16 or INT8) with `n_splits==1` single-pass fast path."""
+    B, L_q, n_q, D = (int(x) for x in q.shape)
+    n_splits = _validate_n_splits(n_splits)
+    n_kv = int(k_doc.shape[2]) if k_doc.ndim == 4 else 1
     rows = B * L_q
     kv_i8 = k_s_doc is not None
-    part_k, tg_y = _get_prefix_slot_part_kernel(D, kv_i8=kv_i8)
+    single_pass = n_splits == 1
+    part_k, tg_y = _get_prefix_slot_part_kernel(D, n_q, n_kv, kv_i8=kv_i8, single_pass=single_pass)
     inputs = [q, k_sys, v_sys, k_doc, v_doc]
     if kv_i8:
         inputs += [k_s_doc, v_s_doc]
     inputs += [off_b, slot_idx, meta]
 
+    if single_pass:
+        return part_k(
+            inputs=inputs,
+            output_shapes=[(B, L_q, n_q * D)],
+            output_dtypes=[mx.bfloat16],
+            grid=(32, rows * tg_y, 1),
+            threadgroup=(32, tg_y, 1),
+        )[0]
+
     o_part, ml_part = part_k(
         inputs=inputs,
-        output_shapes=[(rows, n_splits, 8, D), (rows, n_splits, 8, 2)],
+        output_shapes=[(rows, n_splits, n_q, D), (rows, n_splits, n_q, 2)],
         output_dtypes=[mx.bfloat16, mx.float32],
         grid=(32, rows * tg_y, n_splits),
         threadgroup=(32, tg_y, 1),
     )
-    return _reduce_split_kv(o_part, ml_part, B, L_q, D, vec4_reduce=vec4_reduce)
+    return _reduce_split_kv(o_part, ml_part, B, L_q, D, vec4_reduce=vec4_reduce, n_q=n_q)

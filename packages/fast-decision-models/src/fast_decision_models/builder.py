@@ -26,6 +26,106 @@ from .paths import (
 
 KEV_SPECIAL_TOKENS = ["<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>"]
 
+# Smallest normal IEEE-754 binary16 value (2^-14 = 6.103515625e-5, exact in FP16).
+# Clamping LayerNorm eps_u >= FP16_MIN_NORMAL prevents subnormal flush-to-zero on ANE.
+FP16_MIN_NORMAL = float(np.ldexp(1.0, -14))
+
+
+def _laya_layer_res_scale(li: int) -> float:
+    """Cumulative residual branch scale factor entering ModernBERT encoder layer `li`."""
+    if li <= 4:
+        return 1.0
+    if li <= 13:
+        return 1.0 / 32.0
+    if li <= 18:
+        return 1.0 / 256.0
+    return 1.0 / 1024.0
+
+
+def _laya_ln_gain_and_eps(
+    cum_r: float,
+    *,
+    base_inv_scale: float = 0.25,
+    s_eff_floor: float = 1.0 / 256.0,
+    max_ln_gain: float = 16.0,
+    eps: float = 1e-5,
+) -> tuple[np.float16, np.float16]:
+    """Compute scale-invariant FP16 LayerNorm `(ln_gain, eps_u)` compensating for `cum_r`.
+
+    Avoids double attenuation (`1/32..1/1024` residual scaling stacked with `0.25` LN down-scaling)
+    that previously pushed late-layer variances to the `2^-24` FP16 subnormal floor and inflated
+    effective `eps` to `10.0`. Keeps `u = xc * ln_gain` safe against ModernBERT `33,024` outliers
+    (`u^2 <= 16,641 < 65,504` up to `|x_orig| <= 65,504`) and clamps `eps_u >= 2^-14` (normal FP16).
+    """
+    r = float(cum_r)
+    if r <= 0.0:
+        raise ValueError(f"cum_r must be positive, got {cum_r}")
+    if r >= 1.0:
+        ln_gain_f = float(base_inv_scale)
+    else:
+        # Never attenuate an already-scaled residual below 1.0; up-scale 1/1024 -> 4.0 (s_eff = 1/256).
+        ln_gain_f = max(1.0, min(float(max_ln_gain), float(s_eff_floor) / r))
+    s_eff = r * ln_gain_f
+    eps_u_f = max(float(eps) * (s_eff * s_eff), FP16_MIN_NORMAL)
+    return np.float16(ln_gain_f), np.float16(eps_u_f)
+
+
+def _laya_layernorm_ch_np(
+    x: np.ndarray,
+    gamma_1d: np.ndarray,
+    beta_1d: np.ndarray | None = None,
+    *,
+    cum_r: float = 1.0,
+    base_inv_scale: float = 0.25,
+    eps: float = 1e-5,
+    flush_subnormals: bool = False,
+) -> np.ndarray:
+    """Pure-NumPy FP16 simulation of `_layernorm_ch` (`[1, H, 1, S]`) for PyTorch-free parity tests."""
+
+    def _f16(arr: np.ndarray) -> np.ndarray:
+        out = np.asarray(arr, dtype=np.float16)
+        if flush_subnormals:
+            out = np.where(np.abs(out) < np.float16(FP16_MIN_NORMAL), np.float16(0.0), out)
+        return out
+
+    ln_gain, eps_u = _laya_ln_gain_and_eps(cum_r, base_inv_scale=base_inv_scale, eps=eps)
+    x16 = _f16(x)
+    # ANE reduce_mean accumulates in higher precision and stores FP16 output (unlike naive sequential FP16 sum).
+    mean = _f16(np.mean(x16.astype(np.float32), axis=1, keepdims=True))
+    xc = _f16(x16 - mean)
+    u = xc if float(ln_gain) == 1.0 else _f16(xc * ln_gain)
+    sq = _f16(u * u)
+    var_u = _f16(np.mean(sq.astype(np.float32), axis=1, keepdims=True))
+    ae = _f16(var_u + eps_u)
+    rsq = _f16(1.0 / np.sqrt(ae.astype(np.float32)))
+    gam4 = _f16(gamma_1d).reshape(1, -1, 1, 1)
+    if beta_1d is None:
+        xn = _f16(u * rsq)
+        return _f16(xn * gam4)
+    ug = _f16(u * gam4)
+    xn = _f16(ug * rsq)
+    bet4 = _f16(beta_1d).reshape(1, -1, 1, 1)
+    return _f16(xn + bet4)
+
+
+def _build_laya_quant_config(cto: Any, *, weight_threshold: int = 2048) -> Any:
+    """Build CoreML weight-only INT8 config scoped strictly to `conv` linear projections.
+
+    Keeps RoPE `cos`/`sin` tables (`mul`), SWA `-10000.0` bias masks (`add`), and LayerNorm
+    constants exact `FP16` by leaving `global_config=None`.
+    """
+    return cto.OptimizationConfig(
+        global_config=None,
+        op_type_configs={
+            "conv": cto.OpLinearQuantizerConfig(
+                mode="linear_symmetric",
+                dtype="int8",
+                granularity="per_channel",
+                weight_threshold=int(weight_threshold),
+            )
+        },
+    )
+
 
 def compile_native_dylib(repo_root: Path) -> Path:
     """Compile `native/laya_ane_runner.mm` -> `build/liblaya_ane_runner.dylib` cleanly."""
@@ -88,32 +188,31 @@ def _compile_laya_seq_bundle(
     cos_swa_np, sin_swa_np = _precompute_rope_cos_sin(seq_len, hd, theta_swa)
     swa_bias_np = _precompute_sliding_window_bias(seq_len, local_window)
 
-    def _layer_res_scale(li: int) -> float:
-        if li <= 4:
-            return 1.0
-        if li <= 13:
-            return 1.0 / 32.0
-        if li <= 18:
-            return 1.0 / 256.0
-        return 1.0 / 1024.0
+    layer_norm_eps = float(enc_cfg.get("norm_eps", enc_cfg.get("layer_norm_eps", 1e-5)))
 
     def _layernorm_ch(
         x: Any,
         gamma_1d: np.ndarray,
         beta_1d: np.ndarray | None,
         prefix: str,
-        inv_scale: float = 0.25,
+        *,
+        cum_r: float = 1.0,
+        base_inv_scale: float = 0.25,
     ) -> Any:
+        ln_gain, eps_u = _laya_ln_gain_and_eps(
+            cum_r,
+            base_inv_scale=base_inv_scale,
+            eps=layer_norm_eps,
+        )
         mean = mb.reduce_mean(x=x, axes=[1], keep_dims=True, name=prefix + "_mn")
         xc = mb.sub(x=x, y=mean, name=prefix + "_xc")
-        u = mb.mul(x=xc, y=np.float16(inv_scale), name=prefix + "_u")
+        u = xc if float(ln_gain) == 1.0 else mb.mul(x=xc, y=ln_gain, name=prefix + "_u")
         var_u = mb.reduce_mean(
             x=mb.mul(x=u, y=u, name=prefix + "_sq"),
             axes=[1],
             keep_dims=True,
             name=prefix + "_vu",
         )
-        eps_u = np.float16(max(1e-5 * (inv_scale * inv_scale), 1e-7))
         rsq = mb.rsqrt(x=mb.add(x=var_u, y=eps_u, name=prefix + "_ae"), name=prefix + "_rsq")
         gam4 = gamma_1d.astype(np.float16).reshape(1, H, 1, 1)
         if beta_1d is None:
@@ -154,13 +253,19 @@ def _compile_laya_seq_bundle(
         swa_c = mb.const(val=swa_bias_np, name="swa_const")
         swa_mask = mb.add(x=swa_c, y=ext_mask, name="swa_mask")
 
-        cur = _layernorm_ch(tok_emb_in, w["encoder.embeddings.norm.weight"], None, "emb_ln", inv_scale=0.25)
+        cur = _layernorm_ch(
+            tok_emb_in, w["encoder.embeddings.norm.weight"], None, "emb_ln", cum_r=1.0, base_inv_scale=1.0
+        )
 
         for i in range(n_layers):
             px = f"encoder.layers.{i}."
-            r_scale = _layer_res_scale(i)
+            r_scale = _laya_layer_res_scale(i)
             is_full = layer_types[i] == "full_attention"
-            x_attn = cur if i == 0 else _layernorm_ch(cur, w[px + "attn_norm.weight"], None, f"l{i}_aln", inv_scale=0.25)
+            x_attn = (
+                cur
+                if i == 0
+                else _layernorm_ch(cur, w[px + "attn_norm.weight"], None, f"l{i}_aln", cum_r=r_scale)
+            )
 
             wqkv_f32 = w[px + "attn.Wqkv.weight"].copy()
             wqkv_f32[:H, :] *= attn_scale
@@ -202,7 +307,7 @@ def _compile_laya_seq_bundle(
             ao = mb.conv(x=att_4d, weight=mb.const(val=wo_4d, name=f"l{i}_wo"), name=f"l{i}_ao")
             cur = mb.add(x=cur, y=ao, name=f"l{i}_res1")
 
-            x_mlp = _layernorm_ch(cur, w[px + "mlp_norm.weight"], None, f"l{i}_mln", inv_scale=0.25)
+            x_mlp = _layernorm_ch(cur, w[px + "mlp_norm.weight"], None, f"l{i}_mln", cum_r=r_scale)
             wi_4d = w[px + "mlp.Wi.weight"][:, :, None, None].astype(np.float16)
             wi_out = mb.conv(x=x_mlp, weight=mb.const(val=wi_4d, name=f"l{i}_wi"), name=f"l{i}_wio")
             val_h, gate_h = mb.split(x=wi_out, num_splits=2, axis=1, name=f"l{i}_spwi")
@@ -218,12 +323,15 @@ def _compile_laya_seq_bundle(
             elif i == 18:
                 cur = mb.mul(x=cur, y=np.float16(1.0 / 4.0), name="recenter_l18")
 
-        h = _layernorm_ch(cur, w["encoder.final_norm.weight"], None, "enc_final_ln", inv_scale=0.25)
+        final_cum_r = _laya_layer_res_scale(n_layers - 1)
+        h = _layernorm_ch(cur, w["encoder.final_norm.weight"], None, "enc_final_ln", cum_r=final_cum_r)
         h = mb.add(x=h, y=type_vec, name="add_qtype")
 
         for hi in range(2):
             hp = f"head.layers.{hi}."
-            hn1 = _layernorm_ch(h, w[hp + "norm1.weight"], w[hp + "norm1.bias"], f"hl{hi}_n1", inv_scale=0.0625)
+            hn1 = _layernorm_ch(
+                h, w[hp + "norm1.weight"], w[hp + "norm1.bias"], f"hl{hi}_n1", cum_r=1.0, base_inv_scale=0.25
+            )
             in_w = w[hp + "self_attn.in_proj_weight"].copy()
             in_b = w[hp + "self_attn.in_proj_bias"].copy()
             in_w[:H, :] *= attn_scale
@@ -267,7 +375,9 @@ def _compile_laya_seq_bundle(
             )
             h = mb.add(x=h, y=hao, name=f"hl{hi}_res1")
 
-            hn2 = _layernorm_ch(h, w[hp + "norm2.weight"], w[hp + "norm2.bias"], f"hl{hi}_n2", inv_scale=0.0625)
+            hn2 = _layernorm_ch(
+                h, w[hp + "norm2.weight"], w[hp + "norm2.bias"], f"hl{hi}_n2", cum_r=1.0, base_inv_scale=0.25
+            )
             hl1 = mb.conv(
                 x=hn2,
                 weight=mb.const(val=w[hp + "linear1.weight"][:, :, None, None].astype(np.float16), name=f"hl{hi}_w1"),
@@ -283,7 +393,9 @@ def _compile_laya_seq_bundle(
             )
             h = mb.add(x=h, y=hl2, name=f"hl{hi}_res2")
 
-        sn = _layernorm_ch(h, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", inv_scale=0.0625)
+        sn = _layernorm_ch(
+            h, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", cum_r=1.0, base_inv_scale=0.25
+        )
         s1 = mb.conv(
             x=sn,
             weight=mb.const(val=w["scorer.1.weight"][:, :, None, None].astype(np.float16), name="sc_w1"),
@@ -315,11 +427,7 @@ def _compile_laya_seq_bundle(
     )
     ml = cto.linear_quantize_weights(
         ml,
-        config=cto.OptimizationConfig(
-            global_config=cto.OpLinearQuantizerConfig(
-                mode="linear_symmetric", dtype="int8", granularity="per_channel"
-            )
-        ),
+        config=_build_laya_quant_config(cto),
     )
     tag = f"laya_typed_s{seq_len}_w8"
     pkg = out_dir / f"_{tag}.mlpackage"
@@ -390,10 +498,11 @@ def build_laya_ane_artifacts(
         for s_len in (256, 512):
             mc = out_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
             counts = (ctypes.c_int * 3)()
-            lib.laya_ane_inspect_plan(str(mc).encode("utf-8"), 1, counts)
+            # 0 == LAYA_COMPUTE_CPU_AND_ANE (aligned with fast_shared::ComputeMode::kCpuAndNeuralEngine)
+            lib.laya_ane_inspect_plan(str(mc).encode("utf-8"), 0, counts)
             print(f"[LAYA-ANE] {mc.name}: MLComputePlan ANE/GPU/CPU = {list(counts)}")
-            if int(counts[1]) != 0 or int(counts[0]) < 1000:
-                raise RuntimeError(f"Unexpected compute plan on {mc}: {list(counts)}")
+            if int(counts[1]) != 0 or int(counts[2]) != 0 or int(counts[0]) < 1000:
+                raise RuntimeError(f"Unexpected non-pure-ANE compute plan on {mc}: {list(counts)}")
     return out_dir
 
 
@@ -700,8 +809,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
+    "FP16_MIN_NORMAL",
     "KEV_SPECIAL_TOKENS",
+    "_build_laya_quant_config",
     "_compile_laya_seq_bundle",
+    "_laya_layer_res_scale",
+    "_laya_layernorm_ch_np",
+    "_laya_ln_gain_and_eps",
     "_load_kev_head_tensors",
     "_load_kev_head_tensors_stdlib_zip",
     "acquire_hw_lock",

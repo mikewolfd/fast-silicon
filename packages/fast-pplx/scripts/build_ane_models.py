@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
 """Build pure-ANE staged CoreML bundles for pplx-embed-v2-context-0.6b.
 
-Key hardware optimizations encoded from M4 Pro microbenchmarks:
+Key hardware optimizations encoded from Apple Silicon microbenchmarks:
 - Chunked B=1 4D WY GatedDeltaNet (C=32) with hierarchical block inversion (18 ops/layer
   at depth 4 instead of 31 sequential slice-concat steps) plus optional fwd_subst mode
 - Pure FP16 mul+add masking, tril matmul cumsum, and relu+log(1+exp(-|x|)) softplus
   (0 bool masks, 0 casts, 0 non-ANE ops on [CPU_AND_NE])
+- IEEE binary16 normal epsilon floor (`eps >= 2^-14 = 6.103515625e-5`) across all
+  RMSNorm / L2-norm ops so ANE FTZ never flushes `var + eps` to 0 -> `rsqrt(0) = Inf/NaN`
+- Extended `1/64` residual prescaling across `l5..l11` and `final_norm` (preventing FP16
+  `x*x` overflow on layers 5..8 where residuals can exceed `|x| > 2048`)
 - t_delta FP16 FTZ fix: scale v post-silu(conv1d) by ftz_alpha (default 128.0) and
   scale RMSNormGated eps by ftz_alpha^2 * 1e-6 = 0.016384 (exact 1-homogeneity)
+- High-outlier & sensitive GDN linear projection exclusion from global INT8 weight
+  quantization (preserving FP16 weights on `OUTLIER_LINEAR_KEYS_DEFAULT` and recurrent
+  GDN projections to prevent INT8 collapse)
 - Multi-doc bucket isolation via tok_valid [1,1,1,S] before conv1d, gdn_carry [1,S/32,1,1]
   between chunks, external per-doc cos32/sin32, and block-diagonal FP16 attn_bias
 - Stage splitting (configurable layers-per-stage, default 3 -> 4x3L) keeping each stage
-  well below E5RT compile limits with async IOSurface chaining in pplx_coreml_runner
-- Support for default W8A16 (conv weights int8) and W8A8 QDQ with explicit absmax>=15
-  outlier exclusion and mul(mul(gate, up), sigmoid(gate)) SwiGLU-QDQ lowering
+  well below E5RT compile limits with async ring chaining in pplx_coreml_runner
+- Support for FP16, selective W8A16 (outlier + GDN FP16 preserved), and W8A8 QDQ with
+  mul(mul(gate, up), sigmoid(gate)) SwiGLU-QDQ lowering, plus macOS 27.0+ Core AI probe
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
+from pathlib import Path
+import platform
 import shutil
 import subprocess
 import time
-from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
@@ -40,12 +50,13 @@ ATTN_KV_HEADS = 2
 ATTN_HEAD_DIM = 256
 ROPE_HALF = 32
 RMS_EPS = 1e-6
+FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)  # 2^-14 = 6.103515625e-5
 CHUNK_SIZE = 32
 DEFAULT_FTZ_ALPHA = 128.0
 DEFAULT_SEQ_LENS: tuple[int, ...] = (64, 128, 256, 512)
 DEFAULT_LAYERS_PER_STAGE = 3
 
-# Projections whose calibration absmax >= 50 stay in W8A16 when building W8A8 QDQ bundles.
+# Projections whose calibration absmax >= 50 stay in FP16 (excluded from naive global INT8 quantization).
 OUTLIER_LINEAR_KEYS_DEFAULT: frozenset[str] = frozenset(
     {
         "layers.5.mlp.down_proj",
@@ -59,6 +70,166 @@ OUTLIER_LINEAR_KEYS_DEFAULT: frozenset[str] = frozenset(
     }
 )
 
+_HF_TO_MIL_SUFFIX: dict[str, str] = {
+    "mlp.down_proj": "mlp_dn",
+    "mlp.gate_proj": "mlp_gu",
+    "mlp.up_proj": "mlp_gu",
+    "linear_attn.in_proj_qkv": "qkvzba",
+    "linear_attn.out_proj": "out_proj",
+    "linear_attn.conv1d": "conv1d",
+    "self_attn.q_proj": "qkvgate",
+    "self_attn.o_proj": "o_proj",
+}
+
+_PRESCALE_64_PREFIXES: tuple[str, ...] = (
+    "l5_",
+    "l6_",
+    "l7_",
+    "l8_",
+    "l9_",
+    "l10_",
+    "l11_",
+)
+
+
+def clamp_fp16_eps(eps: float) -> float:
+    """Clamp FP16 epsilon to >= 2^-14 (`6.103515625e-5`) so ANE FTZ never flushes var+eps to 0."""
+    return float(max(float(eps), FP16_MIN_NORMAL))
+
+
+def resolve_rmsnorm_prescale(
+    name: str,
+    calib_stats: dict[str, Any] | None = None,
+) -> float:
+    """Return power-of-2 prescale factor avoiding FP16 `x*x > 65504` overflow across deep layers."""
+    if calib_stats is not None:
+        entries = calib_stats.get("norms", calib_stats.get("layers", calib_stats))
+        info = entries.get(name) if isinstance(entries, dict) else None
+        if isinstance(info, dict) and float(info.get("absmax", 0.0)) > 0.0:
+            amax = float(info["absmax"])
+            if amax > 2048.0:
+                return 1.0 / 64.0
+            if amax > 256.0:
+                return 1.0 / 16.0
+            return 1.0
+
+    if name == "final_norm" or name.startswith(_PRESCALE_64_PREFIXES):
+        return 1.0 / 64.0
+    return 1.0
+
+
+def _hf_key_to_mil_op(hf_key: str) -> str | None:
+    if not hf_key.startswith("layers."):
+        return None
+    parts = hf_key.split(".", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        return None
+    li = int(parts[1])
+    mil_sfx = _HF_TO_MIL_SUFFIX.get(parts[2])
+    if mil_sfx is None:
+        return None
+    return f"l{li}_{mil_sfx}"
+
+
+def select_fp16_preserved_ops(
+    layer_start: int,
+    layer_end: int,
+    layer_types: Sequence[str],
+    *,
+    calib_stats: dict[str, Any] | None = None,
+    outlier_threshold: float = 15.0,
+    preserve_gdn_fp16: bool = True,
+) -> frozenset[str]:
+    """Return MIL `conv` op names excluded from INT8 weight quantization to prevent parity collapse.
+
+    Preserves:
+      1. All `OUTLIER_LINEAR_KEYS_DEFAULT` projections (`l5/7/8/9/10/11_mlp_dn`, `l8/10_out_proj`).
+      2. When `preserve_gdn_fp16=True`, all recurrent GDN projections (`l{i}_qkvzba`, `l{i}_conv1d`,
+         `l{i}_out_proj`) whose quantization noise compounds across DeltaNet recurrence steps.
+      3. Any projection whose calibrated `absmax >= outlier_threshold`.
+    """
+    preserved: set[str] = set()
+    layer_range = range(int(layer_start), int(layer_end))
+
+    for hf_key in OUTLIER_LINEAR_KEYS_DEFAULT:
+        mil_op = _hf_key_to_mil_op(hf_key)
+        if mil_op is not None:
+            li = int(hf_key.split(".")[1])
+            if li in layer_range:
+                preserved.add(mil_op)
+
+    for li in layer_range:
+        lt = layer_types[li]
+        if preserve_gdn_fp16 and lt == "linear_attention":
+            preserved.add(f"l{li}_qkvzba")
+            preserved.add(f"l{li}_conv1d")
+            preserved.add(f"l{li}_out_proj")
+
+    if calib_stats is not None:
+        entries = calib_stats.get("layers", calib_stats)
+        if isinstance(entries, dict):
+            for hf_key, info in entries.items():
+                if not isinstance(info, dict):
+                    continue
+                if float(info.get("absmax", 0.0)) >= float(outlier_threshold):
+                    mil_op = _hf_key_to_mil_op(hf_key)
+                    if mil_op is not None:
+                        li = int(hf_key.split(".")[1])
+                        if li in layer_range:
+                            preserved.add(mil_op)
+
+    return frozenset(preserved)
+
+
+def build_weight_quant_config(
+    preserved_ops: Sequence[str] | frozenset[str],
+    *,
+    weight_threshold: int = 512,
+    cto_module: Any | None = None,
+) -> Any:
+    """Build CoreML `OptimizationConfig` quantizing non-excluded conv weights to per-channel INT8."""
+    if cto_module is None:
+        import coremltools.optimize.coreml as cto_module
+    q_op_cfg = cto_module.OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        dtype="int8",
+        granularity="per_channel",
+        weight_threshold=int(weight_threshold),
+    )
+    op_name_configs = {str(op_name): None for op_name in sorted(set(preserved_ops))}
+    return cto_module.OptimizationConfig(
+        op_type_configs={"conv": q_op_cfg},
+        op_name_configs=op_name_configs,
+    )
+
+
+def check_coreai_backend_status(
+    *,
+    macos_version: str | None = None,
+    use_os_coreai: bool | None = None,
+) -> dict[str, Any]:
+    """Report readiness for optional macOS 27.0+ Core AI (`.aimodel` / Qwen3.5 dynamic linear-attn)."""
+    ver_str = platform.mac_ver()[0] if macos_version is None else str(macos_version)
+    parts = [int(p) for p in ver_str.split(".") if p.isdigit()]
+    major = parts[0] if parts else 0
+    flag = (os.environ.get("USE_OS_COREAI", "0") == "1") if use_os_coreai is None else bool(use_os_coreai)
+    has_coreai_torch = importlib.util.find_spec("coreai_torch") is not None
+    eligible = bool(flag and major >= 27 and has_coreai_torch)
+    reason = "ready"
+    if not flag:
+        reason = "USE_OS_COREAI=1 not enabled"
+    elif major < 27:
+        reason = f"requires macOS 27.0+ (detected {ver_str or 'unknown'})"
+    elif not has_coreai_torch:
+        reason = "coreai-torch package not installed"
+    return {
+        "eligible": eligible,
+        "macos_version": ver_str,
+        "use_os_coreai": flag,
+        "has_coreai_torch": has_coreai_torch,
+        "reason": reason,
+    }
+
 
 def plan_stage_ranges(num_layers: int = 12, layers_per_stage: int = DEFAULT_LAYERS_PER_STAGE) -> list[tuple[int, int]]:
     """Split layer indices [0, num_layers) into contiguous [start, end) stage ranges."""
@@ -67,8 +238,8 @@ def plan_stage_ranges(num_layers: int = 12, layers_per_stage: int = DEFAULT_LAYE
 
 
 def compute_gnorm_eps_scaled(ftz_alpha: float, rms_eps: float = RMS_EPS) -> float:
-    """Exact RMSNormGated epsilon matching pre-scaled v -> ftz_alpha * v."""
-    return float(rms_eps) * (float(ftz_alpha) ** 2)
+    """Exact RMSNormGated epsilon matching pre-scaled v -> ftz_alpha * v, clamped >= FP16_MIN_NORMAL."""
+    return clamp_fp16_eps(float(rms_eps) * (float(ftz_alpha) ** 2))
 
 
 def select_qdq_scales(
@@ -78,7 +249,7 @@ def select_qdq_scales(
     *,
     outlier_threshold: float = 15.0,
 ) -> dict[str, float | None]:
-    """Compute per-projection QDQ absmax bounds, returning None to preserve W8A16 for outliers."""
+    """Compute per-projection QDQ absmax bounds, returning None to preserve FP16/W8A16 for outliers."""
     if calib_stats is None:
         return {}
     entries = calib_stats.get("layers", calib_stats)
@@ -219,6 +390,7 @@ def build_stage_mil_program(
     inv_mode: str = "block",
     ftz_alpha: float = DEFAULT_FTZ_ALPHA,
     qdq_scales: dict[str, float | None] | None = None,
+    calib_stats: dict[str, Any] | None = None,
     swiglu_mode: str = "silu",
 ):
     """Build a pure-FP16 pure-ANE CoreML MIL program for layers [layer_start, layer_end)."""
@@ -243,7 +415,7 @@ def build_stage_mil_program(
         w_c = _const_f16(w_f16, name=f"{name}_w")
         amax = scales.get(name)
         if amax is not None and amax > 0.0:
-            s_val = np.float16(max(float(amax) / 127.0, 1e-5))
+            s_val = np.float16(clamp_fp16_eps(float(amax) / 127.0))
             s_c = mb.const(val=s_val, name=f"{name}_q_scale")
             xq = mb.quantize(input=x, scale=s_c, output_dtype="int8", name=f"{name}_aq")
             xdq = mb.dequantize(input=xq, scale=s_c, name=f"{name}_adq")
@@ -251,22 +423,16 @@ def build_stage_mil_program(
         return mb.conv(x=x, weight=w_c, name=name)
 
     def _rmsnorm_ch(x, weight_1c11: np.ndarray, name: str, eps: float = RMS_EPS):
-        # Deep residual streams reach absmax ~380..8092 in layers 6..11, overflowing
-        # x*x in FP16 (> sqrt(65504) = 255.94). Power-of-2 pre-scaling cancels in
-        # x_scaled * rsqrt(mean(x_scaled^2) + eps*s^2) with zero dynamic reduce_max.
-        if name.startswith(("l9_", "l10_", "l11_")) or name == "final_norm":
-            inv_scale = 1.0 / 64.0
-        elif name.startswith(("l6_", "l7_", "l8_")):
-            inv_scale = 1.0 / 8.0
-        else:
-            inv_scale = 1.0
-
+        # Deep residual streams reach high absmax in layers 5..11, risking x*x FP16 overflow
+        # (> sqrt(65504) = 255.94). Prescaling by 1/64 cancels out while eps is clamped to >= 2^-14
+        # so ANE FTZ never flushes var + eps to zero.
+        inv_scale = resolve_rmsnorm_prescale(name, calib_stats=calib_stats)
         if inv_scale != 1.0:
             x_in = mb.mul(x=x, y=_f16(inv_scale), name=f"{name}_prescale")
-            eps_val = max(eps * inv_scale * inv_scale, 1.2e-7)
+            eps_val = clamp_fp16_eps(eps * inv_scale * inv_scale)
         else:
             x_in = x
-            eps_val = eps
+            eps_val = clamp_fp16_eps(eps)
 
         sq = mb.mul(x=x_in, y=x_in, name=f"{name}_sq")
         msq = mb.reduce_mean(x=sq, axes=[1], keep_dims=True, name=f"{name}_mean")
@@ -275,16 +441,18 @@ def build_stage_mil_program(
         return mb.mul(x=normed, y=_const_f16(weight_1c11, name=f"{name}_w"), name=name)
 
     def _rmsnorm_axis(x, weight_arr: np.ndarray, axis: int, name: str, eps: float = RMS_EPS):
+        eps_val = clamp_fp16_eps(eps)
         sq = mb.mul(x=x, y=x, name=f"{name}_sq")
         msq = mb.reduce_mean(x=sq, axes=[axis], keep_dims=True, name=f"{name}_mean")
-        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps_val), name=f"{name}_eps"), name=f"{name}_rsqrt")
         normed = mb.mul(x=x, y=inv_rms, name=f"{name}_norm")
         return mb.mul(x=normed, y=_const_f16(weight_arr, name=f"{name}_w"), name=name)
 
     def _l2norm_last(x, dim: int, extra_scale: float, name: str, eps: float = RMS_EPS):
+        eps_val = clamp_fp16_eps(eps)
         sq = mb.mul(x=x, y=x, name=f"{name}_sq")
         msq = mb.reduce_mean(x=sq, axes=[3], keep_dims=True, name=f"{name}_mean")
-        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps_val), name=f"{name}_eps"), name=f"{name}_rsqrt")
         inv_norm_scaled = mb.mul(x=inv_rms, y=_f16((dim ** -0.5) * extra_scale), name=f"{name}_scale")
         return mb.mul(x=x, y=inv_norm_scaled, name=name)
 
@@ -720,14 +888,25 @@ def build_ane_bundle_suite(
     ftz_alpha: float = DEFAULT_FTZ_ALPHA,
     calib_stats_path: str | Path | None = None,
     outlier_threshold: float = 15.0,
+    preserve_gdn_fp16: bool = True,
+    backend: str = "coreml",
     keep_mlpackage: bool = False,
 ) -> dict[str, Any]:
+    if backend == "coreai":
+        status = check_coreai_backend_status()
+        raise RuntimeError(
+            "Core AI (.aimodel) backend export is gated on macOS 27.0+ with USE_OS_COREAI=1 and coreai-torch "
+            f"(status: {status['reason']}). Use --backend coreml on macOS 15/26."
+        )
+    if backend != "coreml":
+        raise ValueError(f"Unsupported backend={backend!r}; choose 'coreml' or 'coreai'")
+
     import coremltools as ct
     import coremltools.optimize.coreml as cto
 
     if variant:
         v_low = variant.strip().lower()
-        if v_low in ("w8a16", "w8a8"):
+        if v_low in ("fp16", "w8a16", "w8a8"):
             precision = v_low
         elif v_low in ("block", "fwd_subst"):
             inv_mode = v_low
@@ -748,33 +927,40 @@ def build_ane_bundle_suite(
     ane_weights = convert_weights_to_ane_layout({k: npz[k] for k in npz.files}, cfg=cfg)
 
     calib_stats: dict[str, Any] | None = None
-    if precision == "w8a8":
-        if calib_stats_path is None:
-            raise ValueError("--calib-stats is required for --precision w8a8")
+    if calib_stats_path is not None:
         calib_stats = json.loads(Path(calib_stats_path).read_text(encoding="utf-8"))
+    if precision == "w8a8":
+        if calib_stats is None:
+            raise ValueError("--calib-stats is required for --precision w8a8")
         swiglu_mode = "mul_sigmoid_reordered"
-    elif precision == "w8a16":
+    elif precision in ("w8a16", "fp16"):
         swiglu_mode = "silu"
     else:
-        raise ValueError(f"Unsupported precision={precision!r}; choose w8a16 or w8a8")
+        raise ValueError(f"Unsupported precision={precision!r}; choose fp16, w8a16, or w8a8")
 
     stage_ranges = plan_stage_ranges(cfg.num_hidden_layers, layers_per_stage=layers_per_stage)
     out_dir = paths.ane_models_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    q_op_cfg = cto.OpLinearQuantizerConfig(
-        mode="linear_symmetric",
-        dtype="int8",
-        granularity="per_channel",
-        weight_threshold=512,
+    all_preserved = sorted(
+        select_fp16_preserved_ops(
+            0,
+            cfg.num_hidden_layers,
+            cfg.layer_types,
+            calib_stats=calib_stats,
+            outlier_threshold=outlier_threshold,
+            preserve_gdn_fp16=preserve_gdn_fp16,
+        )
     )
-    q_cfg = cto.OptimizationConfig(op_type_configs={"conv": q_op_cfg})
-
     manifest: dict[str, Any] = {
         "model_name": "perplexity-ai/pplx-embed-v2-context-0.6b",
+        "backend": backend,
         "precision": precision,
         "inv_mode": inv_mode,
         "ftz_alpha": float(ftz_alpha),
+        "eps_floor_fp16": FP16_MIN_NORMAL,
+        "preserve_gdn_fp16": bool(preserve_gdn_fp16),
+        "fp16_preserved_ops": all_preserved if precision != "fp16" else ["all"],
         "chunk_size": CHUNK_SIZE,
         "hidden_size": HIDDEN,
         "rope_half": ROPE_HALF,
@@ -791,7 +977,7 @@ def build_ane_bundle_suite(
 
         for st_idx, (l0, l1) in enumerate(stage_ranges):
             stage_scales: dict[str, float | None] = {}
-            if calib_stats is not None:
+            if precision == "w8a8" and calib_stats is not None:
                 for li in range(l0, l1):
                     stage_scales.update(
                         select_qdq_scales(
@@ -810,6 +996,7 @@ def build_ane_bundle_suite(
                 inv_mode=inv_mode,
                 ftz_alpha=ftz_alpha,
                 qdq_scales=stage_scales,
+                calib_stats=calib_stats,
                 swiglu_mode=swiglu_mode,
             )
 
@@ -828,13 +1015,26 @@ def build_ane_bundle_suite(
                 compute_precision=ct.precision.FLOAT16,
                 skip_model_load=True,
             )
-            m_w8 = cto.linear_quantize_weights(ml, config=q_cfg)
+
+            if precision == "fp16":
+                ml_out = ml
+            else:
+                stage_preserved = select_fp16_preserved_ops(
+                    l0,
+                    l1,
+                    cfg.layer_types,
+                    calib_stats=calib_stats,
+                    outlier_threshold=outlier_threshold,
+                    preserve_gdn_fp16=preserve_gdn_fp16,
+                )
+                q_cfg = build_weight_quant_config(stage_preserved, weight_threshold=512, cto_module=cto)
+                ml_out = cto.linear_quantize_weights(ml, config=q_cfg)
 
             stem = f"pplx_s{seq_len}_st{st_idx}_{precision}"
             pkg_path = out_dir / f"{stem}.mlpackage"
             if pkg_path.exists():
                 shutil.rmtree(pkg_path)
-            m_w8.save(str(pkg_path))
+            ml_out.save(str(pkg_path))
 
             compiled_path = out_dir / f"{stem}.mlmodelc"
             if compiled_path.exists():
@@ -859,14 +1059,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build staged ANE CoreML bundles for fast-pplx")
     parser.add_argument("--home", type=Path, default=None)
     parser.add_argument("--model-dir", type=Path, default=None)
-    parser.add_argument("--variant", default=None, help="Precision/inverse shortcut (e.g. w8a16, w8a8, block, fwd_subst)")
+    parser.add_argument("--variant", default=None, help="Precision/inverse shortcut (e.g. fp16, w8a16, w8a8, block, fwd_subst)")
+    parser.add_argument("--backend", default="coreml", choices=["coreml", "coreai"])
     parser.add_argument("--seq-lens", nargs="+", default=[str(s) for s in DEFAULT_SEQ_LENS])
     parser.add_argument("--layers-per-stage", type=int, default=DEFAULT_LAYERS_PER_STAGE)
-    parser.add_argument("--precision", default="w8a16", choices=["w8a16", "w8a8"])
+    parser.add_argument("--precision", default="w8a16", choices=["fp16", "w8a16", "w8a8"])
     parser.add_argument("--inv-mode", default="block", choices=["block", "fwd_subst"])
     parser.add_argument("--ftz-alpha", type=float, default=DEFAULT_FTZ_ALPHA)
     parser.add_argument("--calib-stats", type=Path, default=None)
     parser.add_argument("--outlier-threshold", type=float, default=15.0)
+    parser.add_argument("--preserve-gdn-fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-mlpackage", action="store_true")
     args = parser.parse_args()
 
@@ -881,6 +1083,8 @@ def main() -> None:
         ftz_alpha=args.ftz_alpha,
         calib_stats_path=args.calib_stats,
         outlier_threshold=args.outlier_threshold,
+        preserve_gdn_fp16=args.preserve_gdn_fp16,
+        backend=args.backend,
         keep_mlpackage=args.keep_mlpackage,
     )
     print(json.dumps(manifest, indent=2))

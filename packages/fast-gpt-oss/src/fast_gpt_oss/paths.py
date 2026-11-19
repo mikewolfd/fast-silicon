@@ -58,7 +58,7 @@ def resolve_paths(home: str | Path | None = None) -> GptOssPaths:
         env_var="FAST_GPT_OSS_HOME",
         cache_name="fast-gpt-oss",
         home=home,
-        marker_dirs=("artifacts", "pyproject.toml"),
+        marker_dirs=("artifacts",),
     )
     art = root / "artifacts"
     return GptOssPaths(

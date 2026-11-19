@@ -2,7 +2,7 @@
 
 from .engine import FastBgeSmall
 from .gpu import FastBgeSmallGPU, pack_sequences
-from .paths import RepoPaths, resolve_paths
+from .paths import RepoPaths, resolve_home, resolve_paths
 from .tokenizer import BGE_QUERY_PREFIX, FastBgeTokenizer
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "FastBgeTokenizer",
     "RepoPaths",
     "pack_sequences",
+    "resolve_home",
     "resolve_paths",
 ]
 

@@ -1587,3 +1587,487 @@ def test_unified_memory_footprint_darwin_cpu() -> None:
         snap["lifetime_max_phys_footprint_bytes"] / 1e9, rel=1e-9
     )
     assert peak_footprint_gb() == snap["peak_footprint_gb"]
+
+
+def test_hw_check_six_chip_matrix_and_preflight_cpu(monkeypatch: Any) -> None:
+    import fast_shared.hw_check as hc
+
+    # All 6 M4/M5 chips validate cleanly without spurious warnings
+    six_chips = [
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac16,1", "brand": "Apple M4", "mem_gb": 16, "cpu_cores": 10, "perf_cores": 4, "eff_cores": 6, "gpu_cores": 10, "ane_cores": 16, "macos_version": "26.6"},
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac16,8", "brand": "Apple M4 Pro", "mem_gb": 48, "cpu_cores": 14, "perf_cores": 10, "eff_cores": 4, "gpu_cores": 20, "ane_cores": 16, "macos_version": "26.6"},
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac16,5", "brand": "Apple M4 Max", "mem_gb": 64, "cpu_cores": 16, "perf_cores": 12, "eff_cores": 4, "gpu_cores": 40, "ane_cores": 16, "macos_version": "26.6"},
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac17,2", "brand": "Apple M5", "mem_gb": 24, "cpu_cores": 10, "perf_cores": 4, "eff_cores": 6, "perflevel0_name": "Super", "perflevel1_name": "Efficiency", "gpu_cores": 10, "ane_cores": 16, "gpu_family": "Apple10", "supports_apple10": True, "supports_metal4": True, "macos_version": "26.2"},
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac17,6", "brand": "Apple M5 Pro", "mem_gb": 48, "cpu_cores": 18, "perf_cores": 6, "eff_cores": 12, "perflevel0_name": "Super", "perflevel1_name": "Performance", "gpu_cores": 20, "ane_cores": 16, "gpu_family": "Apple10", "supports_apple10": True, "supports_metal4": True, "macos_version": "27.2.1"},
+        {"system": "Darwin", "machine": "arm64", "hw_model": "Mac17,8", "brand": "Apple M5 Max", "mem_gb": 128, "cpu_cores": 18, "perf_cores": 6, "eff_cores": 12, "perflevel0_name": "Super", "perflevel1_name": "Performance", "gpu_cores": 40, "ane_cores": 16, "gpu_family": "Apple10", "supports_apple10": True, "supports_metal4": True, "macos_version": "27.2.1"},
+    ]
+    for chip in six_chips:
+        ok, mismatches, _ = hc.evaluate_hardware_support(chip)
+        assert ok is True and mismatches == [], f"Unexpected mismatch for {chip['brand']}: {mismatches}"
+
+    # supports_apple10_nax & supports_metal4_bf16 OS/flag gates
+    m5_262 = dict(six_chips[3])
+    assert hc.supports_apple10_nax(m5_262) is True
+    assert hc.supports_apple10_nax({**m5_262, "mlx_metal_no_nax": True}) is False
+    assert hc.supports_apple10_nax({**m5_262, "macos_version": "26.1"}) is False
+    assert hc.supports_apple10_nax(six_chips[1]) is False
+
+    assert hc.supports_metal4_fp16({**six_chips[1], "macos_version": "26.0", "supports_metal4": True}) is True
+    assert hc.supports_metal4_bf16({**six_chips[1], "macos_version": "26.0", "supports_metal4": True}) is False
+    assert hc.supports_metal4_bf16({**six_chips[1], "macos_version": "26.1", "supports_metal4": True}) is True
+
+    # Live host probe checks Missing != False and rich telemetry fields
+    live = hc.probe_host_hardware()
+    assert live["macos_version"] is not None
+    assert live["mlx_version"] is not None
+    assert isinstance(live["arm_features"], dict)
+    assert "FEAT_SME2" in live["arm_features"]
+    assert "FEAT_SVE_B16B16" in live["arm_features"]
+    # Missing arm feature keys must be None, not coerced to False
+    for val in live["arm_features"].values():
+        assert val in (True, False, None)
+
+    # preflight_silicon_env
+    pf = hc.preflight_silicon_env(require_mlx_min="0.32.4", check_tf32=True, strict=False)
+    assert pf["ok"] is True
+    assert pf["mlx_meets_min"] is True
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        hc.preflight_silicon_env(require_mlx_min="99.0.0", strict=True)
+
+
+def test_roofline_quant_audit_and_hybrid_moe_models_cpu() -> None:
+    from fast_shared.roofline import audit_safetensors_weights, compute_model_roofline, probe_hardware_identity
+
+    # 1. Exact bit-width vs group-size classification across 2/3/4/6/8-bit + MXFP4/NVFP4 .blocks/.scales_e8m0
+    tensors = {
+        # 4-bit g128 (previously misclassified as 8-bit!)
+        "model.layers.0.self_attn.q_proj.weight": {"dtype": "U32", "shape": [64, 16], "bytes": 4096, "elems": 1024},
+        "model.layers.0.self_attn.q_proj.scales": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        "model.layers.0.self_attn.q_proj.biases": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        # 8-bit g32 (previously misclassified as 4-bit!)
+        "model.layers.0.self_attn.k_proj.weight": {"dtype": "U32", "shape": [64, 8], "bytes": 2048, "elems": 512},
+        "model.layers.0.self_attn.k_proj.scales": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        "model.layers.0.self_attn.k_proj.biases": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        # 2-bit g64 (previously misclassified as 4-bit!)
+        "model.layers.0.self_attn.v_proj.weight": {"dtype": "U32", "shape": [64, 4], "bytes": 1024, "elems": 256},
+        "model.layers.0.self_attn.v_proj.scales": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        "model.layers.0.self_attn.v_proj.biases": {"dtype": "BF16", "shape": [64, 1], "bytes": 128, "elems": 64},
+        # MXFP4 .blocks + .scales_e8m0 U8 (16 bytes per 32-element group -> 4-bit)
+        "model.layers.0.mlp.experts.0.gate_up_proj.blocks": {"dtype": "U8", "shape": [64, 4, 16], "bytes": 4096, "elems": 4096},
+        "model.layers.0.mlp.experts.0.gate_up_proj.scales_e8m0": {"dtype": "U8", "shape": [64, 4], "bytes": 256, "elems": 256},
+    }
+    cfg_q = {
+        "quantization": {
+            "bits": 4,
+            "group_size": 64,
+            "model.layers.0.self_attn.q_proj": {"bits": 4, "group_size": 128},
+            "model.layers.0.self_attn.k_proj": {"bits": 8, "group_size": 32},
+            "model.layers.0.self_attn.v_proj": {"bits": 2, "group_size": 64},
+        }
+    }
+    audit = audit_safetensors_weights(tensors, config=cfg_q)
+    attn_prec = audit["effective_precision"]["attention"]
+    # Logical params: q=64*128=8192, k=64*32=2048, v=64*64=4096 => 14336 params total
+    assert attn_prec["params"] == 8192 + 2048 + 4096
+    assert set(attn_prec["formats"]) == {"q4_g128", "q8_g32", "q2_g64"}
+    moe_prec = audit["effective_precision"]["mlp_or_moe"]
+    # MXFP4: 4096 U8 bytes = 8192 4-bit params; (4096+256)*8 / 8192 = 4.25 bits/elem
+    assert moe_prec["params"] == 8192
+    assert moe_prec["bits_per_elem"] == 4.25
+    assert "mxfp4_g32" in moe_prec["formats"]
+
+    # 2. Hybrid linear_attention (Qwen3.5/DeltaNet) must NOT enter swa_own
+    hybrid_cfg = {
+        "num_hidden_layers": 28,
+        "hidden_size": 1024,
+        "intermediate_size": 3072,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "layer_types": ["linear_attention"] * 21 + ["full_attention"] * 7,
+    }
+    roof_f16 = compute_model_roofline(hybrid_cfg, 600_000_000, ctx=2048, kv_dtype_bytes=2.0)
+    roof_i8 = compute_model_roofline(hybrid_cfg, 600_000_000, ctx=2048, kv_dtype_bytes=1.0)
+    assert roof_f16["full_own"] == 7
+    assert roof_f16["linear_own"] == 21 and roof_f16["n_gdn"] == 21
+    assert roof_f16["swa_own"] == 0 and roof_f16["swa_fixed_mib"] == 0.0
+    assert roof_i8["kv_kib_per_tok"] == pytest.approx(roof_f16["kv_kib_per_tok"] / 2.0, rel=1e-6)
+
+    # 3. Calibrated MoE fixed vs routed weight partition
+    moe_cfg = {
+        "num_hidden_layers": 12,
+        "hidden_size": 2048,
+        "intermediate_size": 2048,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 65536,
+        "num_local_experts": 32,
+        "num_experts_per_tok": 2,
+    }
+    r_est = compute_model_roofline(moe_cfg, 10_000_000_000, gpu_tf=7.4, dram_gbs=200.0)
+    r_exact = compute_model_roofline(moe_cfg, 10_000_000_000, gpu_tf=7.4, dram_gbs=200.0, non_expert_weight_bytes=1_000_000_000)
+    assert r_exact["moe_fixed_weight_frac"] == 0.1
+    assert r_est["moe_fixed_weight_frac"] != 0.25  # Structural ratio, not hardcoded 0.25
+
+    hw_id = probe_hardware_identity()
+    for key in ("macos_version", "xcode_sdk_version", "mlx_version", "mlx_enable_tf32", "mlx_metal_no_nax", "gpu_family", "supports_placement_sparse"):
+        assert key in hw_id
+
+
+def test_metal_mpp_guards_and_tail_tiles() -> None:
+    import fast_shared.metal_mpp as mmpp
+    import fast_shared.metal_mpp_bf16 as mmpp_bf
+
+    assert "#include <metal_stdlib>" in mmpp.HEADER_SIMDGROUP
+    assert "#include <metal_stdlib>" in mmpp.HEADER_MPP
+
+    # Tail-tile safety: non-multiple of 64 (M=50, N=50) must not crash or read OOB
+    mx.set_default_device(mx.gpu)
+    k_none = mmpp.make_mpp_matmul_kernel("shared_test_tail_none", epilogue="none", tm=64, tn=64, sgs=4)
+    a = mx.ones((50, 64), dtype=mx.float16)
+    b = mx.ones((50, 64), dtype=mx.float16)
+    c = k_none(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
+    mx.eval(c)
+    assert c.shape == (50, 50)
+    assert np.allclose(np.array(c), 64.0)
+
+    # geglu epilogue uses exact_erf and matches reference on tail tile
+    k_geglu = mmpp.make_mpp_matmul_kernel("shared_test_tail_geglu", epilogue="geglu", tm=64, tn=64, sgs=4)
+    b_gu = mx.ones((100, 64), dtype=mx.float16) * 0.05
+    out_g = k_geglu(inputs=[a, b_gu], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
+    mx.eval(out_g)
+    assert out_g.shape == (50, 50)
+    assert np.isfinite(np.array(out_g)).all()
+
+    # metal_mpp_bf16 dtype / K-alignment / OS / Apple10 threshold fallback guards
+    x_fp16 = mx.ones((64, 64), dtype=mx.float16)
+    w_fp16 = mx.ones((64, 64), dtype=mx.float16)
+    out_fp16 = mmpp_bf.mpp_linear_bf16(x_fp16, w_fp16, min_m=16)
+    mx.eval(out_fp16)
+    assert out_fp16.dtype == mx.float16 and np.allclose(np.array(out_fp16), 64.0)
+
+    # Unaligned K=40 falls back cleanly without failing MPP
+    x_odd = mx.ones((32, 40), dtype=mx.bfloat16)
+    w_odd = mx.ones((32, 40), dtype=mx.bfloat16)
+    out_odd = mmpp_bf.mpp_linear_bf16(x_odd, w_odd, min_m=16)
+    mx.eval(out_odd)
+    assert out_odd.dtype == mx.bfloat16 and np.allclose(np.array(out_odd.astype(mx.float32)), 40.0)
+
+
+def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
+    import concurrent.futures
+    import http.client
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from fast_shared.server import (
+        ChatMicroBatcher,
+        EmbeddingHTTPServer,
+        ManagedHTTPServer,
+        OpenAIChatAdapter,
+        make_chat_handler,
+    )
+
+    # 1. Per-engine lock serialization + mode forwarding in EmbeddingHTTPServer
+    class _LockProbeEmbEngine(_DummyEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_concurrent = 0
+            self.seen_modes: list[str | None] = []
+            self._probe_mu = threading.Lock()
+
+        def encode_query(self, toks, mode=None):
+            with self._probe_mu:
+                self.active += 1
+                self.max_concurrent = max(self.max_concurrent, self.active)
+                self.seen_modes.append(mode)
+            time.sleep(0.02)
+            with self._probe_mu:
+                self.active -= 1
+            return super().encode_query(toks)
+
+    emb = _LockProbeEmbEngine()
+    with EmbeddingHTTPServer(emb, host="127.0.0.1", port=0, mode="gpu", max_body_bytes=512) as srv:
+        base = f"http://{srv.host}:{srv.port}"
+
+        def _post_emb(i: int) -> int:
+            req = urllib.request.Request(
+                f"{base}/v1/embeddings",
+                data=json.dumps({"input": f"hello-{i}"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            statuses = list(pool.map(_post_emb, range(4)))
+        assert statuses == [200, 200, 200, 200]
+        assert emb.max_concurrent == 1  # Strictly serialized by per-engine lock
+        assert emb.seen_modes == ["gpu"] * 4
+
+        # Chunked Transfer-Encoding request body works cleanly
+        conn = http.client.HTTPConnection(srv.host, srv.port, timeout=5)
+        body_bytes = json.dumps({"input": "chunked-ok"}).encode("utf-8")
+        c1, c2 = body_bytes[:10], body_bytes[10:]
+        chunked_wire = f"{len(c1):x}\r\n".encode() + c1 + b"\r\n" + f"{len(c2):x}\r\n".encode() + c2 + b"\r\n0\r\n\r\n"
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.endheaders()
+        conn.send(chunked_wire)
+        resp = conn.getresponse()
+        assert resp.status == 200
+        resp.read()
+        conn.close()
+
+        # Oversized body (> 512 bytes) returns HTTP 413
+        conn2 = http.client.HTTPConnection(srv.host, srv.port, timeout=5)
+        big_body = json.dumps({"input": "x" * 1000}).encode("utf-8")
+        conn2.request("POST", "/v1/embeddings", body=big_body, headers={"Content-Type": "application/json"})
+        resp2 = conn2.getresponse()
+        assert resp2.status == 413
+        resp2.read()
+        conn2.close()
+
+    # 2. ChatMicroBatcher coalesces heterogeneous max_tokens using max(max_tokens) AND handles /v1/completions
+    class _MaxTokEngine:
+        model_name = "dummy-llm"
+        default_mode = "gpu"
+        ane_available = False
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+            self.active = 0
+            self.max_concurrent = 0
+            self._mu = threading.Lock()
+
+        def generate_batch(self, prompts, **kwargs):
+            with self._mu:
+                self.active += 1
+                self.max_concurrent = max(self.max_concurrent, self.active)
+                self.calls.append((len(prompts), int(kwargs["max_tokens"])))
+            time.sleep(0.03)
+            with self._mu:
+                self.active -= 1
+            items = [
+                SimpleNamespace(
+                    text=f"ok:{p}",
+                    prompt_tokens=3,
+                    completion_tokens=2,
+                    finish_reason="stop",
+                )
+                for p in prompts
+            ]
+            return SimpleNamespace(items=items, stats={"docs": len(prompts)})
+
+    llm = _MaxTokEngine()
+    batcher = ChatMicroBatcher(llm, coalesce_ms=25.0, max_batch_size=16)
+
+    def _sub(max_tok: int) -> tuple[Any, dict[str, Any]]:
+        return batcher.submit(
+            [{"role": "user", "content": f"t-{max_tok}"}],
+            json_schema=None,
+            max_tokens=max_tok,
+            temperature=0.0,
+            top_p=1.0,
+            seed=42,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        res_pair = list(pool.map(_sub, [32, 128]))
+    assert len(res_pair) == 2
+    assert llm.max_concurrent == 1
+    assert llm.calls == [(2, 128)]  # Coalesced into 1 batch with max(32, 128) == 128!
+
+    # /v1/completions routes through ChatMicroBatcher too
+    llm2 = _MaxTokEngine()
+    adapter = OpenAIChatAdapter(llm2, coalesce_ms=25.0, max_batch_size=16)
+    with ManagedHTTPServer(make_chat_handler(adapter), host="127.0.0.1", port=0) as srv2:
+        base2 = f"http://{srv2.host}:{srv2.port}"
+
+        def _hit_cmpl(mt: int) -> dict[str, Any]:
+            req = urllib.request.Request(
+                f"{base2}/v1/completions",
+                data=json.dumps({"prompt": f"p-{mt}", "max_tokens": mt}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode())
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            cmpl_outs = list(pool.map(_hit_cmpl, [16, 96]))
+        assert len(cmpl_outs) == 2
+        assert llm2.max_concurrent == 1
+        assert len(llm2.calls) == 1 and llm2.calls[0] == (2, 96)
+
+
+def test_grammar_bounds_was_masked_and_thread_safety_cpu() -> None:
+    import concurrent.futures
+    llg = pytest.importorskip("llguidance")
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.grammar import GrammarHelper
+
+    vocab = {"<|endoftext|>": 0, "{": 1, '"': 2, "a": 3, ":": 4, "1": 5, "2": 6, "}": 7}
+    bt = Tokenizer(BPE(vocab=vocab, merges=[]))
+    bt.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bt.decoder = ByteLevelDecoder(add_prefix_space=False)
+    ltok = llg.LLTokenizer(bt.to_str(), eos_token=0)
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": False}
+
+    # Pruned helper (len=6) receiving full-vocab argmax_idx=5 (valid digit "1", out of pruned index range if len<6)
+    pruned = GrammarHelper(ltok, schema, new_to_old=np.array([0, 1, 2, 3, 5], dtype=np.int32), eos_token_id=0)
+    m = pruned.new_matcher()
+    full_logits = np.full(len(vocab), -10.0, dtype=np.float32)
+    full_logits[5] = 20.0  # valid token 5, index 5 >= len(new_to_old)==5!
+    # Previously raised IndexError at new_to_old[5] and hardcoded was_masked=True!
+    tok_id, was_masked = pruned.pick_valid_token(m, full_logits, 5)
+    assert tok_id == 5 and was_masked is False
+
+    # Concurrent threads sharing one GrammarHelper
+    full_gh = GrammarHelper(ltok, schema, eos_token_id=0)
+    logits = np.array([-5, -5, -5, -5, -5, 1.0, 2.0, 10.0], dtype=np.float32)
+
+    def _worker(_: int) -> tuple[int, bool]:
+        mw = full_gh.new_matcher()
+        return full_gh.pick_valid_token(mw, logits, 7)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_worker, range(32)))
+    assert all(tid == 6 and masked is True for tid, masked in results)
+
+
+def test_bench_wired_limit_quiescence_dtypes_and_paths_cpu(tmp_path: Path, monkeypatch: Any) -> None:
+    from fast_shared.bench import (
+        _classify_quiescence_line,
+        check_tensor_dtypes,
+        collect_env_telemetry,
+        interleaved_abba,
+        wired_limit,
+    )
+
+    with wired_limit(64 * 1024 * 1024) as applied:
+        assert applied == 64 * 1024 * 1024
+
+    telem = collect_env_telemetry()
+    for k in ("brand", "macos_version", "mlx_version", "mlx_enable_tf32", "mlx_metal_no_nax", "supports_apple10_nax"):
+        assert k in telem
+
+    # Widened quiescence classifier
+    for ps_line in (
+        "root 101 12.0 0.5 100 200 ?? R 10:00 0:10 /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds_stores",
+        "_windowserver 102 22.0 1.0 100 200 ?? R 10:00 0:10 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+        "root 103 8.0 0.5 100 200 ?? R 10:00 0:10 /System/Library/CoreServices/backupd.bundle/Contents/Resources/backupd",
+        "user 104 25.0 1.0 100 200 ?? R 10:00 0:10 /usr/bin/clang++ -O3 foo.cpp",
+        "user 105 3.0 1.0 100 200 ?? R 10:00 0:10 /Applications/Arc.app/Contents/Frameworks/Arc Helper (GPU).app/Contents/MacOS/Arc Helper (GPU)",
+        "user 106 3.0 1.0 100 200 ?? R 10:00 0:10 /Applications/Microsoft Edge.app/Contents/Frameworks/Microsoft Edge Helper (GPU)",
+    ):
+        assert _classify_quiescence_line(ps_line) is not None, f"Missed contention line: {ps_line}"
+
+    # Extended check_tensor_dtypes catches bool/int masks & fp16/bf16 mismatches
+    flags = check_tensor_dtypes([
+        ("attn_mask", mx.ones((1, 4), dtype=mx.bool_)),
+        ("q_proj", mx.ones((4,), dtype=mx.float16)),
+        ("k_proj", mx.ones((4,), dtype=mx.bfloat16)),
+    ])
+    assert any("attn_mask" in f for f in flags)
+    assert any("mixed fp16/bf16" in f for f in flags)
+
+    abba = interleaved_abba(lambda: {"v": 1}, lambda: {"v": 2}, warmup=False, rounds=2)
+    assert "drift" in abba and "env_telemetry" in abba and "A_last_over_first" in abba["drift"]
+
+    # Monorepo paths.resolve_home_dir: packages/<pkg>/native without artifacts/ must NOT stop prematurely!
+    mono_pkg = tmp_path / "fast-silicon" / "packages" / "fast-foo"
+    anchor = mono_pkg / "src" / "fast_foo" / "paths.py"
+    anchor.parent.mkdir(parents=True)
+    anchor.write_text("# anchor", encoding="utf-8")
+    (mono_pkg / "native").mkdir()
+
+    monkeypatch.delenv("TEST_FOO_HOME", raising=False)
+    monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
+    # 1. No sibling artifacts & no FAST_ARTIFACTS_ROOT -> falls back to ~/.cache/fast-foo (not mono_pkg!)
+    got_cache = resolve_home_dir(anchor, env_var="TEST_FOO_HOME", cache_name="fast-foo")
+    assert got_cache == (Path("~/.cache") / "fast-foo").expanduser().resolve()
+
+    # 2. Sibling ../fast-foo with artifacts/ -> resolves to sibling!
+    sib = tmp_path / "fast-foo"
+    (sib / "artifacts").mkdir(parents=True)
+    got_sib = resolve_home_dir(anchor, env_var="TEST_FOO_HOME", cache_name="fast-foo")
+    assert got_sib == sib.resolve()
+
+    # 3. FAST_ARTIFACTS_ROOT takes precedence over sibling fallback
+    art_root = tmp_path / "shared_arts"
+    monkeypatch.setenv("FAST_ARTIFACTS_ROOT", str(art_root))
+    got_env_root = resolve_home_dir(anchor, env_var="TEST_FOO_HOME", cache_name="fast-foo")
+    assert got_env_root == (art_root / "fast-foo").resolve()
+
+
+def test_parquet_resume_manifest_and_skill_scripts_cpu(tmp_path: Path) -> None:
+    import importlib.util
+
+    # 1. embed_parquet resume counts only newly encoded rows/tokens and validates manifest dimensions
+    rows = [{"id": i, "body": f"doc {i}"} for i in range(6)]
+    src = tmp_path / "in.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), src)
+    out_dir = tmp_path / "emb_shards"
+
+    class _CountingMrlEngine(_DummyEngine):
+        max_dim = 16
+        supports_dimensions = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def encode_corpus(self, tok_lists, mode=None):
+            self.calls += 1
+            return super().encode_corpus(tok_lists, mode=mode)
+
+    eng1 = _CountingMrlEngine()
+    s1 = embed_parquet(eng1, src, out_dir, shard_rows=3, dimensions=16, progress_every=0)
+    assert s1.rows_emitted == 6 and s1.total_tokens > 0 and eng1.calls == 2
+    assert (out_dir / ".embed_manifest.json").is_file()
+
+    eng2 = _CountingMrlEngine()
+    s2 = embed_parquet(eng2, src, out_dir, shard_rows=3, dimensions=16, resume=True, progress_every=0)
+    assert eng2.calls == 0
+    assert s2.rows_emitted == 0 and s2.total_tokens == 0
+
+    # Changing dimensions invalidates manifest match -> re-encodes!
+    eng3 = _CountingMrlEngine()
+    s3 = embed_parquet(eng3, src, out_dir, shard_rows=3, dimensions=8, resume=True, progress_every=0)
+    assert eng3.calls == 2 and s3.rows_emitted == 6
+
+    # 2. Skill scripts: query_capability_matrix semantic --min-os & 6-chip --diff-only + ab_bench_harness exports
+    scripts_dir = Path(__file__).resolve().parents[1] / "skills" / "apple-silicon-ml-optimizer" / "scripts"
+    q_spec = importlib.util.spec_from_file_location("qcm_test", scripts_dir / "query_capability_matrix.py")
+    assert q_spec and q_spec.loader
+    qcm = importlib.util.module_from_spec(q_spec)
+    q_spec.loader.exec_module(qcm)
+    cur = qcm.load_curated()
+
+    vg_27_0 = [r for r in qcm.iter_table_rows(cur, "version_gates") if qcm.matches_filters(r, None, "27.0", False)]
+    vg_27 = [r for r in qcm.iter_table_rows(cur, "version_gates") if qcm.matches_filters(r, None, "27", False)]
+    assert len(vg_27_0) == len(vg_27) and len(vg_27_0) >= 6
+    core_ai_26_2 = [r for r in qcm.iter_table_rows(cur, "core_ai") if qcm.matches_filters(r, None, "26.2", False)]
+    assert len(core_ai_26_2) >= 14
+    gpu_26_2 = [r for r in qcm.iter_table_rows(cur, "gpu_and_metal") if qcm.matches_filters(r, None, "26.2", False)]
+    assert len(gpu_26_2) > 0
+    # Six-chip diff-only catches M4 vs M4 Pro (e.g. Thunderbolt 4 vs 5 or ProRes count) even when M4 Pro == M5!
+    assert qcm._row_has_chip_diff({"M4": "TB4", "M4 Pro": "TB5", "M4 Max": "TB5", "M5": "TB4", "M5 Pro": "TB5", "M5 Max": "TB5"}) is True
+    assert qcm._row_has_chip_diff({"M4": "16", "M4 Pro": "16", "M4 Max": "16", "M5": "16", "M5 Pro": "16", "M5 Max": "16"}) is False
+
+    ab_spec = importlib.util.spec_from_file_location("ab_test", scripts_dir / "ab_bench_harness.py")
+    assert ab_spec and ab_spec.loader
+    ab = importlib.util.module_from_spec(ab_spec)
+    ab_spec.loader.exec_module(ab)
+    for sym in ("get_unified_memory_footprint", "peak_footprint_gb", "wired_limit", "collect_env_telemetry"):
+        assert hasattr(ab, sym)

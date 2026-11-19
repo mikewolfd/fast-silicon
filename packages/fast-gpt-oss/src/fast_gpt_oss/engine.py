@@ -21,6 +21,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Sequence
+import warnings
 
 import numpy as np
 
@@ -147,24 +148,52 @@ def resolve_reasoning_params(
     return eff, max(0, bud)
 
 
+def recommended_max_wave_batch(memory_bytes: int | None) -> int:
+    """Return safe wave batch ceiling for unified memory capacity (`16/24/32/48+ GiB`)."""
+    if memory_bytes is None or memory_bytes <= 0:
+        return 64
+    mem_gib = float(memory_bytes) / float(1 << 30)
+    if mem_gib <= 18.0:
+        return 8
+    if mem_gib <= 26.0:
+        return 16
+    if mem_gib <= 36.0:
+        return 32
+    return 64
+
+
 def select_gpt_oss_plan(
     mode: str | None,
     n_docs: int,
     batch_size: int | None,
+    *,
+    memory_bytes: int | None = None,
 ) -> tuple[str, int]:
-    """Choose `(engine_path, wave_batch_size)` across `auto`, `b1`, and `batched`."""
+    """Choose `(engine_path, wave_batch_size)` across `auto`, `b1`, and `batched` with `<=24 GiB` clamping."""
     eff_mode = (mode or "auto").lower().strip()
     if eff_mode not in ("auto", "b1", "batched", "batch"):
         raise ValueError(f"Unsupported mode={mode!r}; expected auto|b1|batched")
     if eff_mode == "b1":
         return "b1", 1
-    if eff_mode in ("batched", "batch"):
-        wb = int(batch_size or min(max(n_docs, 1), 64))
-        return "batched", max(1, wb)
-    if n_docs <= 1:
+    if eff_mode == "auto" and n_docs <= 1:
         return "b1", 1
-    wb = int(batch_size or min(n_docs, 64))
-    return "batched", max(1, wb)
+
+    mem_cap = recommended_max_wave_batch(memory_bytes)
+    default_wb = min(max(n_docs, 1), mem_cap)
+    wb = int(batch_size) if batch_size is not None else default_wb
+    wb = max(1, wb)
+
+    if memory_bytes is not None and memory_bytes > 0:
+        mem_gib = float(memory_bytes) / float(1 << 30)
+        if mem_gib <= 26.0 and wb > mem_cap:
+            warnings.warn(
+                f"Clamping wave batch_size from {wb} to {mem_cap} on {mem_gib:.1f} GiB unified-memory host "
+                f"to avoid OS swapout thrashing (gpt-oss-20b MXFP4 weights ~10.7 GiB).",
+                UserWarning,
+                stacklevel=2,
+            )
+            wb = mem_cap
+    return "batched", wb
 
 
 class FastGptOssEngine:
@@ -200,37 +229,70 @@ class FastGptOssEngine:
 
         import mlx.core as mx
 
+        self._prev_wired_limit: int | None = None
+        self._wired_limit_restored = False
+        self._host_memory_bytes: int = 0
+        self._max_rec_ws_bytes: int = 0
         try:
-            max_rec = mx.device_info()["max_recommended_working_set_size"]
-            mx.set_wired_limit(max_rec)
+            dev_info = mx.device_info()
+            self._host_memory_bytes = int(dev_info.get("memory_size", 0))
+            self._max_rec_ws_bytes = int(dev_info.get("max_recommended_working_set_size", 0))
+            set_wired = getattr(mx, "set_wired_limit", None)
+            if callable(set_wired) and self._max_rec_ws_bytes > 0:
+                if 0 < self._host_memory_bytes <= (24 << 30):
+                    wired_target = min(self._max_rec_ws_bytes, int(self._host_memory_bytes * 0.72))
+                else:
+                    wired_target = self._max_rec_ws_bytes
+                self._prev_wired_limit = int(set_wired(wired_target))
         except Exception:
-            pass
+            self._prev_wired_limit = None
 
-        self.tokenizer = FastGptOssTokenizer(tok_json)
-        self.model = FastGptOssModel(
-            self.model_dir,
-            vocab_out=vocab_out,
-            vocab_remap_npz=self.paths.vocab_remap_npz,
-            tokenizer_json_path=tok_json,
-            compile_kernels=True,
-        )
-        self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
-        self._grammar_cache: OrderedDict[tuple[str, bool], GrammarHelper] = OrderedDict()
-        self._max_prefix_cache = max(1, int(max_prefix_cache_entries))
-        self._max_grammar_cache = max(1, int(max_grammar_cache_entries))
+        try:
+            self.tokenizer = FastGptOssTokenizer(tok_json)
+            self.model = FastGptOssModel(
+                self.model_dir,
+                vocab_out=vocab_out,
+                vocab_remap_npz=self.paths.vocab_remap_npz,
+                tokenizer_json_path=tok_json,
+                compile_kernels=True,
+            )
+            self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
+            self._grammar_cache: OrderedDict[tuple[str, bool], GrammarHelper] = OrderedDict()
+            self._max_prefix_cache = max(1, int(max_prefix_cache_entries))
+            self._max_grammar_cache = max(1, int(max_grammar_cache_entries))
 
-        self._trans_ids = self.tokenizer.encode("<|end|><|start|>assistant<|channel|>final<|message|>")
-        self._trans_after_end_ids = self.tokenizer.encode("<|start|>assistant<|channel|>final<|message|>")
-        self._dummy_pad_id = int(self.tokenizer.encode(" ")[0]) if self.tokenizer.encode(" ") else 0
+            self._trans_ids = self.tokenizer.encode("<|end|><|start|>assistant<|channel|>final<|message|>")
+            self._trans_after_end_ids = self.tokenizer.encode("<|start|>assistant<|channel|>final<|message|>")
+            self._dummy_pad_id = int(self.tokenizer.encode(" ")[0]) if self.tokenizer.encode(" ") else 0
 
-        if warmup:
-            self.warmup()
+            if warmup:
+                self.warmup()
+        except Exception:
+            self._restore_wired_limit()
+            raise
+
+    def _restore_wired_limit(self) -> None:
+        if getattr(self, "_wired_limit_restored", True):
+            return
+        self._wired_limit_restored = True
+        prev = getattr(self, "_prev_wired_limit", None)
+        if prev is not None:
+            try:
+                import mlx.core as mx
+
+                set_wired = getattr(mx, "set_wired_limit", None)
+                if callable(set_wired):
+                    set_wired(prev)
+            except Exception:
+                pass
+            self._prev_wired_limit = None
 
     def close(self) -> None:
         with self._lock:
             self._prefix_cache.clear()
             self._grammar_cache.clear()
             gc.collect()
+            self._restore_wired_limit()
             try:
                 import mlx.core as mx
 
@@ -1334,10 +1396,12 @@ class FastGptOssEngine:
                 reasoning_effort=eff_effort,
             )
 
+            host_mem = getattr(self, "_host_memory_bytes", 0) or None
             path_mode, wave_bs = select_gpt_oss_plan(
                 mode or self.default_mode,
                 n_docs=n_docs,
                 batch_size=batch_size,
+                memory_bytes=host_mem,
             )
             # Budgeted reasoning before strict JSON schema transitions cleanly via B=1 phase-1->2.
             if has_any_schema and ana_budget > 0:
@@ -1407,18 +1471,26 @@ class FastGptOssEngine:
                     tot_top128_fast_hits += int(res_1.get("top128_fast_hits", 0))
                     tot_full_vocab_logit_copies += int(res_1.get("full_vocab_logit_copies", 0))
                     tot_unmasked_full_copies += int(res_1.get("unmasked_full_vocab_logit_copies", 0))
+                    if getattr(mx, "get_cache_memory", lambda: 0)() > (256 << 20):
+                        mx.clear_cache()
             else:
+                # Sort docs by prompt length before wave slicing to minimize per-wave KV padding (`suf_max`),
+                # while restoring exact original input ordering in `all_out_ids` / `all_finished`.
+                order = sorted(range(n_docs), key=lambda idx: len(prompt_ids_list[idx]))
                 for start in range(0, n_docs, wave_bs):
                     end = min(n_docs, start + wave_bs)
+                    wave_orig = order[start:end]
                     waves.append((start, end))
-                    sub_ids = prompt_ids_list[start:end]
+                    sub_ids = [prompt_ids_list[i] for i in wave_orig]
+                    sub_grammars = [doc_grammars[i] for i in wave_orig]
                     if len(sub_ids) == 1:
+                        orig_0 = wave_orig[0]
                         matched_sp, _ = self._match_cached_prefix_for_single(sub_ids[0])
                         sp_len = int(matched_sp["L_sys"]) if matched_sp is not None else 0
                         res_1 = self._run_b1_single(
                             sub_ids[0],
-                            grammar=doc_grammars[start],
-                            doc_index=start,
+                            grammar=sub_grammars[0],
+                            doc_index=orig_0,
                             whitespace_flexible=eff_ws,
                             shared_prefix=matched_sp,
                             prefix_len=sp_len,
@@ -1429,9 +1501,9 @@ class FastGptOssEngine:
                             started_in_final=started_in_final,
                             analysis_budget=ana_budget,
                         )
-                        all_out_ids[start] = res_1["out_ids"]
-                        all_ana_ids[start] = res_1["ana_ids"]
-                        all_finished[start] = bool(res_1["finished"])
+                        all_out_ids[orig_0] = res_1["out_ids"]
+                        all_ana_ids[orig_0] = res_1["ana_ids"]
+                        all_finished[orig_0] = bool(res_1["finished"])
                         tot_ff += int(res_1["ff_skipped"])
                         tot_mask_hits += int(res_1["mask_hits"])
                         tot_pre_sec += float(res_1["prefill_sec"])
@@ -1440,11 +1512,12 @@ class FastGptOssEngine:
                         tot_ff_lm_head_skipped_steps += int(res_1.get("ff_lm_head_skipped_steps", 0))
                         tot_top128_fast_hits += int(res_1.get("top128_fast_hits", 0))
                         tot_full_vocab_logit_copies += int(res_1.get("full_vocab_logit_copies", 0))
+                        tot_unmasked_full_copies += int(res_1.get("unmasked_full_vocab_logit_copies", 0))
                     else:
                         w_res = self._run_batched_wave(
                             sub_ids,
                             grammar=default_grammar,
-                            per_doc_grammars=doc_grammars[start:end],
+                            per_doc_grammars=sub_grammars,
                             whitespace_flexible=eff_ws,
                             max_tokens=max_tokens,
                             temperature=temperature,
@@ -1453,7 +1526,7 @@ class FastGptOssEngine:
                             started_in_final=started_in_final,
                             chunk_docs=chunk_docs,
                         )
-                        for loc_i, orig_i in enumerate(range(start, end)):
+                        for loc_i, orig_i in enumerate(wave_orig):
                             all_out_ids[orig_i] = w_res["out_ids"][loc_i]
                             all_finished[orig_i] = bool(w_res["finished"][loc_i])
                             tot_ff += int(w_res["ff_skipped"][loc_i])
@@ -1468,6 +1541,7 @@ class FastGptOssEngine:
                         tot_full_vocab_logit_copies += int(w_res.get("full_vocab_logit_copies", 0))
                         tot_unmasked_full_copies += int(w_res.get("unmasked_full_vocab_logit_copies", 0))
                         tot_compactions += int(w_res["compactions"])
+                    mx.clear_cache()
 
             items: list[GenerationItem] = []
             valid_json_cnt = 0
@@ -1568,7 +1642,7 @@ class FastGptOssEngine:
                 "compactions": tot_compactions,
                 "peak_gb": peak_gb,
             }
-            if n_docs >= 8 and getattr(mx, "get_cache_memory", lambda: 0)() > (256 << 20):
+            if getattr(mx, "get_cache_memory", lambda: 0)() > (256 << 20):
                 mx.clear_cache()
             return GenerationBatchResult(items=items, stats=stats)
 
@@ -1578,6 +1652,7 @@ __all__ = [
     "GenerationBatchResult",
     "GenerationItem",
     "PromptInput",
+    "recommended_max_wave_batch",
     "resolve_reasoning_params",
     "select_gpt_oss_plan",
     "split_lcp_ids",

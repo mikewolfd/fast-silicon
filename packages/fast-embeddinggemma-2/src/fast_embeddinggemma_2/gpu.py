@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import ctypes
+import os
 from pathlib import Path
-from typing import Sequence
+import platform
+import subprocess
+from typing import Any, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -47,10 +51,160 @@ OVER_B_OPTS: dict[int, tuple[int, ...]] = {
     2048: (1,),
 }
 
-_MPP_64 = make_mpp_matmul_kernel("emb2_mpp64", tm=64, tn=64, sgs=4, epilogue="none")
-_MPP_128 = make_mpp_matmul_kernel("emb2_mpp128", tm=128, tn=64, sgs=8, epilogue="none")
+# Only keep truly fused activation MPP kernels (plain projections use native mx.matmul(x, w.T),
+# which unlocks M5 Apple10 NAX / chip-tuned MLX steel_gemm schedules: -14.89% E2E on Base M5).
+# Roadmap note: on macOS 26.4+ direct FP16xINT8 TensorOps and on macOS 27.0+/27.2+ Core AI
+# shared MTLBuffer zero-copy can be evaluated behind OS gates without changing this packed scheduler.
 _MPP_GEGLU_64 = make_mpp_matmul_kernel("emb2_geglu64", tm=64, tn=64, sgs=4, epilogue="geglu")
 _MPP_PG_64 = make_mpp_matmul_kernel("emb2_pg64", tm=64, tn=64, sgs=4, epilogue="gelu_mul_pli")
+
+_METAL_CAP_CACHE: dict[str, Any] | None = None
+
+
+def _parse_version_tuple(raw: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for tok in raw.strip().split("."):
+        digits = ""
+        for ch in tok:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            parts.append(int(digits))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+def _probe_sdpa_force_fused() -> bool:
+    try:
+        q = mx.zeros((1, 4, 8, 64), dtype=mx.float16)
+        k = mx.zeros((1, 2, 8, 64), dtype=mx.float16)
+        v = mx.zeros((1, 2, 8, 64), dtype=mx.float16)
+        _ = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, force_fused=False)
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        return False
+
+
+def probe_metal_capabilities() -> dict[str, Any]:
+    """Probe Apple9/Apple10/Metal4/OS/MLX/TF32/SDPA capabilities once per process."""
+    global _METAL_CAP_CACHE
+    if _METAL_CAP_CACHE is not None:
+        return dict(_METAL_CAP_CACHE)
+
+    mac_ver_str = platform.mac_ver()[0] or ""
+    macos_version = _parse_version_tuple(mac_ver_str)
+    build_ver = ""
+    if platform.system() == "Darwin":
+        try:
+            build_ver = subprocess.check_output(
+                ["sw_vers", "-buildVersion"], text=True, stderr=subprocess.DEVNULL, timeout=2
+            ).strip()
+        except Exception:
+            build_ver = ""
+
+    apple9 = False
+    apple10 = False
+    metal4 = False
+    supports_placement_sparse: bool | None = None
+    if platform.system() == "Darwin":
+        try:
+            metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+            objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+            metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            dev = metal.MTLCreateSystemDefaultDevice()
+            if dev:
+                msg_family = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
+                    ("objc_msgSend", objc)
+                )
+                sel_family = objc.sel_registerName(b"supportsFamily:")
+                apple9 = bool(msg_family(dev, sel_family, 1009))
+                apple10 = bool(msg_family(dev, sel_family, 1010))
+                metal4 = bool(msg_family(dev, sel_family, 5002))
+                msg_resp = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+                    ("objc_msgSend", objc)
+                )
+                sel_resp = objc.sel_registerName(b"respondsToSelector:")
+                sel_sparse = objc.sel_registerName(b"supportsPlacementSparse")
+                if msg_resp(dev, sel_resp, sel_sparse):
+                    msg_bool = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+                    supports_placement_sparse = bool(msg_bool(dev, sel_sparse))
+                cf_rel = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+                cf_rel(dev, objc.sel_registerName(b"release"))
+        except Exception:
+            pass
+
+    dev_info: dict[str, Any] = {}
+    try:
+        dev_info = dict(mx.device_info())
+    except Exception:
+        pass
+
+    mlx_ver_str = str(getattr(mx, "__version__", "0.0.0"))
+    mlx_version = _parse_version_tuple(mlx_ver_str)
+    sdpa_force_fused = (mlx_version >= (0, 32, 2)) and _probe_sdpa_force_fused()
+
+    _METAL_CAP_CACHE = {
+        "macos_version": macos_version,
+        "macos_version_str": mac_ver_str,
+        "macos_build": build_ver,
+        "mlx_version": mlx_version,
+        "mlx_version_str": mlx_ver_str,
+        "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "1"),
+        "apple9": apple9,
+        "apple10": apple10,
+        "metal4": metal4,
+        "supports_placement_sparse": supports_placement_sparse,
+        "sdpa_supports_force_fused": sdpa_force_fused,
+        "device_name": str(dev_info.get("device_name", "")),
+        "architecture": str(dev_info.get("architecture", "")),
+    }
+    return dict(_METAL_CAP_CACHE)
+
+
+def should_use_fused_mpp(
+    *,
+    m_tot: int,
+    metal4: bool,
+    macos_version: tuple[int, ...],
+    dtype: Any = mx.float16,
+) -> bool:
+    """Gate FP16/BF16 fused MPP activation kernels by Metal 4, OS version, and 64-row alignment."""
+    if not metal4 or int(m_tot) <= 0 or (int(m_tot) % 64) != 0:
+        return False
+    min_os = (26, 1) if dtype == mx.bfloat16 else (26, 0)
+    return tuple(macos_version) >= min_os
+
+
+def should_force_fused_sdpa(
+    *,
+    is_apple10: bool,
+    is_swa: bool,
+    hd: int,
+    seq_l: int,
+    dtype: Any = mx.float16,
+    sdpa_supports_force_fused: bool = True,
+    macos_version: tuple[int, ...] = (26, 2),
+) -> bool:
+    """Gate SDPA `force_fused=True` strictly to M5 (Apple10) FP16 SWA D256 at S in {384, 512}.
+
+    Never enabled on Apple9 (M4 Pro regresses +6% on 8x512) and never on D512 full-attention layers.
+    """
+    return (
+        bool(is_apple10)
+        and bool(sdpa_supports_force_fused)
+        and tuple(macos_version) >= (26, 2)
+        and bool(is_swa)
+        and int(hd) == 256
+        and int(seq_l) in (384, 512)
+        and dtype == mx.float16
+    )
 
 # Fused QKNorm + VNorm + RoPE emitting directly in [B, H, L, D] layout for SDPA.
 _QKNORM_ROPE_256_BHLD = mx.fast.metal_kernel(
@@ -277,11 +431,11 @@ _SEG_MEAN_POOL_512_SRC = """
     for (int t = 0; t < len; ++t) {
         acc += float4(*(const device half4*)(base + (size_t)t * 512));
     }
-    device half* outp = Out + (size_t)doc * 512 + tid * 4;
-    *(device half4*)outp = half4(acc / float(n_pos));
+    device float* outp = Out + (size_t)doc * 512 + tid * 4;
+    *(device float4*)outp = acc / float(n_pos);
 """
-_SEG_MEAN_POOL_512_KERN = mx.fast.metal_kernel(
-    name="emb2_seg_mean_pool_512_f16",
+_SEG_MEAN_POOL_512_KERN = mx.fast.metal_kernel(  # guard: allow-fp32
+    name="emb2_seg_mean_pool_512_f32",
     input_names=["Ho", "SegStarts", "SegLens"],
     output_names=["Out"],
     header=HEADER_STD,
@@ -294,7 +448,7 @@ def mean_pool_segments(
     seg_starts: Sequence[int] | np.ndarray | mx.array,
     seg_lens: Sequence[int] | np.ndarray | mx.array,
 ) -> mx.array:
-    """Mean-pool variable-length token spans from `[M, 512]` FP16 hidden states into `[n_docs, 512]` FP32."""
+    """Mean-pool variable-length token spans from `[M, 512]` FP16 hidden states directly into `[n_docs, 512]` FP32."""
     if ho.ndim != 2 or int(ho.shape[1]) != HIDDEN_SIZE:
         raise ValueError(f"Expected ho shape (M, {HIDDEN_SIZE}), got {ho.shape}")
     if ho.dtype != mx.float16:
@@ -310,14 +464,13 @@ def mean_pool_segments(
         return mx.zeros((0, HIDDEN_SIZE), dtype=mx.float32)
     if int(lens_mx.shape[0]) != n_docs:
         raise ValueError(f"Mismatched seg_starts ({n_docs}) vs seg_lens ({int(lens_mx.shape[0])})")
-    out_f16 = _SEG_MEAN_POOL_512_KERN(
+    return _SEG_MEAN_POOL_512_KERN(  # guard: allow-fp32
         inputs=[ho, starts_mx, lens_mx],
         grid=(n_docs * 128, 1, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(n_docs, HIDDEN_SIZE)],
-        output_dtypes=[mx.float16],
+        output_dtypes=[mx.float32],
     )[0]
-    return out_f16.astype(mx.float32)
 
 
 def fused_gemma_res_rms(
@@ -407,6 +560,18 @@ def fused_gemma_res_rms(
     return y_res if len(orig_shape) == 2 else y_res.reshape(orig_shape)
 
 
+def make_rope_tables_np(max_l: int = MAX_SEQ_LEN) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pure-NumPy RoPE FP16 tables for ANE-only init without touching Metal GPU."""
+    pos = np.arange(max_l, dtype=np.float64)[:, None]
+    f256 = 1.0 / (10000.0 ** (np.arange(0, 256, 2, dtype=np.float64) / 256.0))
+    f512 = 1.0 / (1000000.0 ** (np.arange(0, 512, 2, dtype=np.float64) / 512.0))
+    c256 = np.ascontiguousarray(np.cos(pos * f256).astype(np.float16))
+    s256 = np.ascontiguousarray(np.sin(pos * f256).astype(np.float16))
+    c512 = np.ascontiguousarray(np.cos(pos * f512).astype(np.float16))
+    s512 = np.ascontiguousarray(np.sin(pos * f512).astype(np.float16))
+    return c256, s256, c512, s512
+
+
 def make_rope_tables(max_l: int = MAX_SEQ_LEN) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     pos = mx.arange(max_l, dtype=mx.float32)[:, None]
     f256 = 1.0 / (10000.0 ** (mx.arange(0, 256, 2, dtype=mx.float32) / 256.0))
@@ -417,24 +582,13 @@ def make_rope_tables(max_l: int = MAX_SEQ_LEN) -> tuple[mx.array, mx.array, mx.a
     return c256, s256, c512, s512
 
 
-def _mpp_matmul(x2d: mx.array, w_nk: mx.array) -> mx.array:
-    m_rows = int(x2d.shape[0])
-    n_cols = int(w_nk.shape[0])
-    if m_rows % 128 == 0:
-        return _MPP_128(
-            inputs=[x2d, w_nk],
-            grid=((n_cols // 64) * 256, m_rows // 128, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(m_rows, n_cols)],
-            output_dtypes=[mx.float16],
-        )[0]
-    return _MPP_64(
-        inputs=[x2d, w_nk],
-        grid=((n_cols // 64) * 128, m_rows // 64, 1),
-        threadgroup=(128, 1, 1),
-        output_shapes=[(m_rows, n_cols)],
-        output_dtypes=[mx.float16],
-    )[0]
+def _gelu_tanh_f16(x: mx.array) -> mx.array:
+    c_half = mx.array(0.5, dtype=mx.float16)
+    c_one = mx.array(1.0, dtype=mx.float16)
+    c_k0 = mx.array(0.7978845608, dtype=mx.float16)
+    c_k1 = mx.array(0.044715, dtype=mx.float16)
+    inner = mx.clip(c_k0 * (x + c_k1 * x * x * x), mx.array(-10.0, dtype=mx.float16), mx.array(10.0, dtype=mx.float16))
+    return c_half * x * (c_one + mx.tanh(inner))
 
 
 def fast_pack_cost_aware(
@@ -592,6 +746,12 @@ class FastEmbeddingGemma2GPU:
 
         self.c256, self.s256, self.c512, self.s512 = make_rope_tables(MAX_SEQ_LEN)
         self._arange_max = np.arange(MAX_SEQ_LEN, dtype=np.int32)
+        caps = probe_metal_capabilities()
+        self.metal_caps = caps
+        self._is_apple10 = bool(caps["apple10"])
+        self._metal4 = bool(caps["metal4"])
+        self._macos_version = tuple(caps["macos_version"])
+        self._sdpa_supports_force_fused = bool(caps["sdpa_supports_force_fused"])
 
         def _forward_trunk(ids_mx: mx.array, pos_mx: mx.array, mask_swa: mx.array, mask_full: mx.array) -> mx.array:
             b_sz, seq_l = ids_mx.shape
@@ -600,9 +760,15 @@ class FastEmbeddingGemma2GPU:
             ss = self.s256[pos_mx]
             cf = self.c512[pos_mx]
             sf = self.s512[pos_mx]
+            use_fused_mpp = should_use_fused_mpp(
+                m_tot=m_tot,
+                metal4=self._metal4,
+                macos_version=self._macos_version,
+                dtype=mx.float16,
+            )
 
             h = self.embed_scaled[ids_mx.reshape(m_tot)]
-            pl_raw = _mpp_matmul(h, self.ple_proj) * self.scale_ple
+            pl_raw = mx.matmul(h, self.ple_proj.T) * self.scale_ple
             pl_layers = mx.contiguous(
                 mx.fast.rms_norm(pl_raw.reshape(m_tot, NUM_LAYERS, HIDDEN_SIZE), self.ple_norm, 1e-6).transpose(1, 0, 2)
             )
@@ -611,7 +777,7 @@ class FastEmbeddingGemma2GPU:
 
             xn = mx.fast.rms_norm(h, self.layers[0]["in_ln"], 1e-6)
             for li, ld in enumerate(self.layers):
-                qkv = _mpp_matmul(xn, ld["qkv"])
+                qkv = mx.matmul(xn, ld["qkv"].T)
                 if ld["is_swa"]:
                     q, k, v = _QKNORM_ROPE_256_BHLD(
                         inputs=[qkv, ld["qn"], ld["kn"], cs, ss],
@@ -630,28 +796,48 @@ class FastEmbeddingGemma2GPU:
                         threadgroup=(192, 1, 1),
                     )
                     att_mask = mask_full
-                att = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=att_mask)
-                ao = _mpp_matmul(att.transpose(0, 2, 1, 3).reshape(m_tot, 4 * ld["hd"]), ld["o"])
+                if should_force_fused_sdpa(
+                    is_apple10=self._is_apple10,
+                    is_swa=ld["is_swa"],
+                    hd=ld["hd"],
+                    seq_l=seq_l,
+                    dtype=mx.float16,
+                    sdpa_supports_force_fused=self._sdpa_supports_force_fused,
+                    macos_version=self._macos_version,
+                ):
+                    att = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=att_mask, force_fused=True)
+                else:
+                    att = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=att_mask)
+                ao = mx.matmul(att.transpose(0, 2, 1, 3).reshape(m_tot, 4 * ld["hd"]), ld["o"].T)
                 h1, m_in = fused_gemma_res_rms(h, ao, ld["pa_ln"], ld["pff_ln"])
 
-                act = _MPP_GEGLU_64(
-                    inputs=[m_in, ld["gu"]],
-                    grid=grid_geglu,
-                    threadgroup=(128, 1, 1),
-                    output_shapes=[(m_tot, 2048)],
-                    output_dtypes=[mx.float16],
-                )[0]
-                dn = _mpp_matmul(act, ld["dn"])
+                if use_fused_mpp:
+                    act = _MPP_GEGLU_64(
+                        inputs=[m_in, ld["gu"]],
+                        grid=grid_geglu,
+                        threadgroup=(128, 1, 1),
+                        output_shapes=[(m_tot, 2048)],
+                        output_dtypes=[mx.float16],
+                    )[0]
+                else:
+                    gu = mx.matmul(m_in, ld["gu"].T)
+                    g_part, u_part = mx.split(gu, 2, axis=-1)
+                    act = _gelu_tanh_f16(g_part) * u_part
+                dn = mx.matmul(act, ld["dn"].T)
                 h2 = fused_gemma_res_rms(h1, dn, ld["poff_ln"])
 
-                pm = _MPP_PG_64(
-                    inputs=[h2, ld["pg"], pl_layers[li]],
-                    grid=grid_pg,
-                    threadgroup=(128, 1, 1),
-                    output_shapes=[(m_tot, HIDDEN_SIZE)],
-                    output_dtypes=[mx.float16],
-                )[0]
-                pp = _mpp_matmul(pm, ld["pp"])
+                if use_fused_mpp:
+                    pm = _MPP_PG_64(
+                        inputs=[h2, ld["pg"], pl_layers[li]],
+                        grid=grid_pg,
+                        threadgroup=(128, 1, 1),
+                        output_shapes=[(m_tot, HIDDEN_SIZE)],
+                        output_dtypes=[mx.float16],
+                    )[0]
+                else:
+                    pg = mx.matmul(h2, ld["pg"].T)
+                    pm = _gelu_tanh_f16(pg) * pl_layers[li]
+                pp = mx.matmul(pm, ld["pp"].T)
                 next_ln = self.layers[li + 1]["in_ln"] if li + 1 < NUM_LAYERS else self.final_norm
                 h, xn = fused_gemma_res_rms(h2, pp, ld["pple_ln"], next_ln, scalar=ld["scalar"])
 
@@ -670,8 +856,10 @@ class FastEmbeddingGemma2GPU:
             fm = msk_mx[:, None, None, :]
             sm = fm & (mx.abs(pos_1d[:, None] - pos_1d[None, :]) <= 512)
             ho = _forward_trunk(ids_mx, pos_mx, sm, fm).reshape(b_sz, seq_l, HIDDEN_SIZE)
-            mf = msk_mx.astype(mx.float16)[:, :, None]
-            return mx.sum(ho * mf, axis=1).astype(mx.float32) / mx.sum(msk_mx.astype(mx.float32), axis=1, keepdims=True)
+            zero_f32 = mx.array(0.0, dtype=mx.float32)
+            ho_f32 = mx.where(msk_mx[:, :, None], ho.astype(mx.float32), zero_f32)
+            denom = mx.maximum(mx.sum(msk_mx.astype(mx.float32), axis=1, keepdims=True), 1.0)
+            return mx.sum(ho_f32, axis=1) / denom
 
         self._packed_trunk_compiled = _packed_trunk_compiled
         self._over_compiled = _over_compiled

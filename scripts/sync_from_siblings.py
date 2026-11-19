@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 PACKAGES: tuple[str, ...] = (
     "fast-shared",
@@ -47,6 +48,55 @@ def _is_clean_relpath(rel_path: str) -> bool:
     if p.suffix == ".npz" and "tests/fixtures/" not in rel_path:
         return False
     return True
+
+
+def inspect_sibling_git_hygiene(src_pkg: Path) -> dict[str, Any]:
+    """Inspect a sibling git repo for zero commits, uncommitted edits, or untracked non-ignored files."""
+    head_res = subprocess.run(
+        ["git", "-C", str(src_pkg), "rev-parse", "--verify", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    has_commits = head_res.returncode == 0
+    head_sha = head_res.stdout.strip() if has_commits else None
+
+    st_res = subprocess.run(
+        ["git", "-C", str(src_pkg), "status", "--porcelain", "--untracked-files=normal"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    modified: list[str] = []
+    untracked: list[str] = []
+    if st_res.returncode == 0:
+        for line in st_res.stdout.splitlines():
+            if not line.strip():
+                continue
+            code = line[:2]
+            rel = line[3:].strip()
+            if code == "??":
+                untracked.append(rel)
+            else:
+                modified.append(rel)
+
+    reasons: list[str] = []
+    if not has_commits:
+        reasons.append("0 commits (unborn HEAD)")
+    if modified:
+        reasons.append(f"{len(modified)} uncommitted tracked change(s)")
+    if untracked:
+        reasons.append(f"{len(untracked)} untracked non-ignored file(s)")
+    is_clean = has_commits and not modified and not untracked
+    return {
+        "repo": str(src_pkg),
+        "has_commits": has_commits,
+        "head_sha": head_sha,
+        "modified": modified,
+        "untracked": untracked,
+        "is_clean": is_clean,
+        "summary": ", ".join(reasons) if reasons else "clean",
+    }
 
 
 def list_clean_files(src_pkg: Path) -> list[str]:
@@ -145,14 +195,50 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit non-zero if packages/ differs from sibling fast-* checkouts without writing.",
     )
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help=(
+            "Exit non-zero and refuse to sync if any sibling repo has zero commits, "
+            "uncommitted tracked changes, or untracked non-ignored files."
+        ),
+    )
     args = parser.parse_args(argv)
 
     source_root = args.source_root.resolve()
     packages_dir = repo_root / "packages"
+    selected = tuple(args.packages) if args.packages else all_packages
+
+    # Inspect sibling git hygiene upfront so `--require-clean` fails before writing any files,
+    # while default `make sync` prints clear visibility warnings for dirty / 0-commit trees.
+    dirty_siblings: list[tuple[str, dict[str, Any]]] = []
+    for pkg in selected:
+        src_pkg = source_root / pkg
+        if not src_pkg.is_dir():
+            continue
+        hygiene = inspect_sibling_git_hygiene(src_pkg)
+        if not hygiene["is_clean"]:
+            dirty_siblings.append((pkg, hygiene))
+            sample_paths = (hygiene["modified"] + hygiene["untracked"])[:4]
+            sample_txt = f" (e.g. {', '.join(sample_paths)})" if sample_paths else ""
+            prefix = "ERROR" if args.require_clean else "WARNING"
+            print(
+                f"[{prefix}] sibling {pkg} is dirty: {hygiene['summary']}{sample_txt}",
+                file=sys.stderr,
+            )
+
+    if args.require_clean and dirty_siblings:
+        names = ", ".join(pkg for pkg, _ in dirty_siblings)
+        print(
+            f"[ABORT] --require-clean refused sync due to dirty/uncommitted/0-commit sibling repo(s): {names}. "
+            "Commit or clean those sibling checkouts first.",
+            file=sys.stderr,
+        )
+        return 2
+
     if not args.check:
         packages_dir.mkdir(parents=True, exist_ok=True)
 
-    selected = tuple(args.packages) if args.packages else all_packages
     drifted = False
     for pkg in selected:
         src_pkg = source_root / pkg

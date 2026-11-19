@@ -391,13 +391,19 @@ int main(int argc, char** argv) {
     }
 
     const int sl = static_cast<int>(tokens.size());
-    const int caps[] = {24, 64, 128, 192, 320, 384, 448, 512};
+    const int caps[] = {24, 64, 128, 192, 256, 320, 384, 448, 512};
     int chosen_cap = 512;
     if (forced_bucket > 0) {
         chosen_cap = forced_bucket;
     } else {
         for (int c : caps) {
             if (sl <= c) {
+                if (c == 256) {
+                    // Use optional B=1 S=256 bundle if present; otherwise advance to 320.
+                    std::string p256 = ane_dir + "/bge_b1_s256_fp16.mlmodelc";
+                    std::ifstream chk(p256);
+                    if (!chk.good()) continue;
+                }
                 chosen_cap = c;
                 break;
             }
@@ -408,13 +414,18 @@ int main(int argc, char** argv) {
     snprintf(model_path, sizeof(model_path), "%s/bge_b1_s%d_fp16.mlmodelc", ane_dir.c_str(), chosen_cap);
     int bid = bge_ane_load_bucket(model_path, 1, chosen_cap, 1, 1);
     if (bid < 0) {
-        fprintf(stderr, "Failed to load ANE bucket %s (err=%d)\n", model_path, bid);
+        fprintf(stderr, "Failed to load ANE bucket %s (err=%d: %s)\n", model_path, bid, bge_ane_last_error());
         return 1;
     }
 
     float vec[384];
     int iters = (bench_iters > 0) ? bench_iters : 1;
     double elapsed_s = bge_ane_query(bid, tokens.data(), sl, vec, iters);
+    if (elapsed_s < 0.0) {
+        fprintf(stderr, "bge_ane_query failed (rc=%.1f: %s)\n", elapsed_s, bge_ane_last_error());
+        bge_ane_free_all();
+        return 1;
+    }
     double ms_per_call = (elapsed_s / iters) * 1e3;
 
     if (json_out) {
