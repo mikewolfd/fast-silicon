@@ -10,7 +10,7 @@ Optimize complete ML workloads on Apple Silicon. M4 (`Apple9`) runs Metal tensor
 ## Core Governing Principles
 
 1. **Optimize `valid_outputs/sec × task_accuracy` within `peak_gb` RAM.** Never ship an optimization that boosts raw `dec tok/s` while regressing end-to-end `docs/s` or blind accuracy (`longer JSON`, `repeat loops`, `extra fallbacks`).
-2. **Measure the target Mac.** Record the chip variant, macOS version and MLX version. Measure bandwidth and matrix throughput at the shapes you use. Check that the installed runtime supports the intended operand format. [M5 hardware and runtime support](references/m4-vs-m5-architecture.md#m5-hardware-and-runtime-support)
+2. **Measure the target Mac.** Record the chip variant, running macOS version, SDK and MLX version. Measure bandwidth and matrix throughput at the shapes you use. Check which tensor formats and operations the OS exposes on that GPU family. [Metal features by macOS version](references/m4-vs-m5-architecture.md#metal-features-by-macos-version)
 3. **Eliminate tokens and calls before tuning shaders.** Zero-LLM deterministic bypasses, reasoning/CoT skipping, `llguidance` forced-token jumping + lazy GPU `argmax`, and lossless/asymmetric vocab pruning routinely yield `1.5×–4×+` before writing a line of Metal.
 4. **Separate micro-benchmarks from E2E execution.** Single-layer `1×` extrapolation misattributes launch overhead (`PLE`) and hides double-wide/heterogeneous layers. Measure full `N`-layer pipelined graphs inside `mx.eval`, then validate E2E under paired interleaved `A/B` runs.
 
@@ -59,7 +59,7 @@ Apply these before custom Metal unless already present:
 
 ### Phase 3: Engine, Precision & Kernel Routing
 
-For dense M5 encoders, benchmark native MLX for plain matrix multiplies and tune the tile shape for projections that fuse bias, residuals or activations. Compare the full retrieval pipeline with the same inputs and query vectors. [Base M5 OCR embedding results](references/m4-vs-m5-architecture.md#base-m5-ocr-embeddings) · [Architecture and workload tables](references/m4-vs-m5-architecture.md) · [Metal, Core ML and MLX recipes](references/kernel-and-dtype-playbook.md)
+For dense encoders, compare native MLX for plain matrix multiplies and tune tile width for projections that fuse bias, residuals or activations. The wider BGE tiles and native Gemma projections passed a fixed-GPU output check on M4 Pro. The elapsed-time gains were measured on the base M5. Compare the full pipeline on the target Mac using the same passages and frozen query vectors. [M4 Pro encoder checks](references/m4-vs-m5-architecture.md#m4-pro-encoder-opportunities) · [Base M5 OCR timings](references/m4-vs-m5-architecture.md#base-m5-ocr-embeddings) · [Metal, Core ML and MLX recipes](references/kernel-and-dtype-playbook.md)
 
 Route workload stages strictly by arithmetic intensity (`AI = FLOPs / Bytes`), shape stability, and chip generation:
 

@@ -18,16 +18,36 @@ Measured cleanly under quiesced conditions (`macOS 26.6`, `Xcode 27.2`, `clang++
 | **CPU SME2 (`2` units)** | **`3.22–3.27 TF`** (`cblas_sgemm FP32` / `BNNSMatMul BF16`), **`7.24 TOp/s` `INT8` (`2` workers)**, **`5.30 TF` `BNNSGraph W8`**, **`2.25 eff TF` `MXFP4->BF16`** | Plateaus at `2` workers (2 physical shared SME2 units). Fights GPU on `273 GB/s` DRAM during `B=1` decode (`2.46×` slowdown). |
 | **3-Way Concurrency & Thermal** | Burst GEMMs (`7.46 + 12.35 + 3.08 = 22.89 TF`, `3.08×` solo GPU). Sustained `10–65s+`: GPU scales **`-25%` to `-33%`** (shared SoC TDP + heat soak), ANE `-25.4%`. | Multi-minute GPU saturation (`5–15 min`) heavily throttles GPU clocks; always cool or interleave `ABBA` runs. |
 
+### Metal features by macOS version
+
+Check the running OS, Metal GPU family and installed MLX version independently. M4 Pro reports `Apple9` and runs Metal Performance Primitives (MPP) on GPU shaders. M5 reports `Apple10` and adds a matrix accelerator to each GPU core. Core ML can also use a separate Apple Neural Engine (ANE) on both chips. [Apple GPU families](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf) · [Apple’s TensorOps architecture and release history](https://developer.apple.com/videos/play/tech-talks/111432/)
+
+| macOS | What changes for these kernels |
+|---|---|
+| 26.0 / 26.1 | Metal 4 introduced TensorOps for inline matrix operations. The 26.1 update added BF16 tensor operands. The M4 Pro’s packed embedding projections use FP16. [Metal 4 introduction](https://developer.apple.com/videos/play/wwdc2025/262/) · [TensorOps updates](https://developer.apple.com/videos/play/tech-talks/111432/) |
+| 26.2 | MLX can dispatch supported matrix operations to the M5 GPU accelerators. On Apple9, MLX uses its M4 GPU paths. [Apple’s MLX research](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) · [MLX 0.32.4 device check](https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/backend/metal/device.cpp#L978-L995) |
+| 26.3 | Matrix multiply accepts cooperative tensors as inputs. To reuse a previous operation’s output directly, check its layout with `is_compatible_as_left_input` or the right-input equivalent. Use threadgroup memory for incompatible layouts. The M4 probe below verified direct reuse on 26.6. [TensorOps updates](https://developer.apple.com/videos/play/tech-talks/111432/) · [Apple’s layout check and fallback](https://developer.apple.com/videos/play/wwdc2026/330/?time=753) |
+| 26.4 | TensorOps added four- and eight-bit integer tensor operands. M4 Pro can consume packed weights directly on its GPU shader path. Compare with MLX quantized matrix multiply at the encoder’s shapes and include the model’s block scales and offsets. [Apple’s TensorOps update](https://developer.apple.com/videos/play/tech-talks/111432/) |
+| 27 | Metal adds FP4, FP8 and two-bit integer tensor formats. Check support on the deployment OS. An installed 27 SDK can target a Mac still running 26.6. [Apple’s quantized tensor guide](https://developer.apple.com/videos/play/wwdc2026/330/) |
+
+### M4 Pro encoder opportunities
+
+The November 19, 2026 checks ran on the 20-core M4 Pro GPU with macOS 26.6, an installed 27.2 SDK and MLX 0.32.4. A runtime query reported `Apple9=true`, `Apple10=false` and `Metal4=true`.
+
+| Encoder | Existing path | What carried over from M5 |
+|---|---|---|
+| BGE-small, 384 dimensions | The packed GPU path already fuses bias, residuals and GELU with 64-column FP16 matrix tiles. | Widening these tiles to 128 output columns produced eight bit-identical vectors on eight real OCR passages with routing fixed to the GPU. |
+| EmbeddingGemma 2, 512 dimensions | The GPU uses custom FP16 MPP for plain projections and fused activations. The parallel ANE path already uses eight-bit weights. | Replacing only the plain projections with `mx.matmul(x, w.T)` gave a minimum cosine of 0.999999 on the same eight passages. Keep the fused operations and existing scheduler in a throughput comparison. |
+
+These are M4 correctness results. The additional elapsed-time savings for these two changes and their held-out M4 retrieval quality remain unmeasured. The earlier M4 Gemma experiment already compared GPU-only with GPU+ANE on 512 passages and found the mixed path 2.49× faster. For Perplexity, the M4 run already tested merging the two feed-forward projections. Adding the merge to the fused convolution took 17.43 s versus 17.27 s for the convolution path alone, with identical vectors on all 384 passages.
+
+**Two GPU features are available to the M4 encoders today.** A 64×64 FP16 multiply with direct signed INT4 and INT8 weights matched the CPU exactly for each format. This checks packed integer arithmetic. A model test also needs its quantization scales, real weights and passage ranks. A separate two-multiply probe reused a compatible cooperative tensor directly and matched the CPU. The running compiler required **one SIMD group** (32 GPU threads) and a **compile-time inner dimension** for the cooperative input. It rejected four groups and, separately, a dynamic inner dimension. The encoders’ fused MPP projections use four or eight groups and a dynamic inner dimension. Try a fixed tile in packed attention if profiling shows the intermediate store matters.
+
+The `spicy-stack` workspace retains the capability checks and encoder outputs in `output/m4-encoder-os-20261119/`, the earlier Gemma comparison in `output/fast-encoder-hypotheses-20261116/RESULTS.md`, and the Perplexity comparison in `output/ocr-chunk-research-20261118/pplx-metal/RESULTS.md`.
+
 ### M5 hardware and runtime support
 
-Query `[device supportsFamily:MTLGPUFamilyApple10]` to identify the M5 GPU neural accelerators. Check the macOS version, compiler SDK and installed MLX dispatch for the actual shape and dtype. Quantized weights can also run through kernels that unpack them in software. [Apple’s GPU architecture](https://developer.apple.com/videos/play/tech-talks/111432/) · [MLX 0.32.4 device check](https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/backend/metal/device.cpp#L978-L995)
-
-| macOS | Capability relevant to embedding kernels |
-|---|---|
-| 26.2 | MLX can use the M5 GPU accelerators for supported matrix operations. [Apple’s MLX research](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) |
-| 26.3 | A cooperative tensor can feed the next matrix multiply directly from GPU registers. [Apple’s TensorOps update](https://developer.apple.com/videos/play/tech-talks/111432/) |
-| 26.4 | Metal TensorOps accepts native four- and eight-bit integer tensors. [Apple’s TensorOps update](https://developer.apple.com/videos/play/tech-talks/111432/) |
-| 27 | Metal adds FP4, FP8 and two-bit integer tensor formats. [Apple’s quantized tensor guide](https://developer.apple.com/videos/play/wwdc2026/330/) |
+Query `[device supportsFamily:MTLGPUFamilyApple10]` for the M5 hardware family, then check MLX dispatch for the specific shape and dtype. [MLX matrix dispatch](https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/backend/metal/matmul.cpp#L962-L967)
 
 Apple rates the base M5 at 153 GB/s of memory bandwidth and the M4 Pro at 273 GB/s. The base M5 worker had 10 GPU cores, 24 GiB of unified memory, macOS 26.2 and MLX 0.32.4. Its quick probe measured **123.4 GB/s** streaming reads and **11.66 TFLOP/s** at best in the matrix sweep (`K=512`, `N=1024`). That gives a rough compute-to-bandwidth crossover of **94.5 FLOP/byte** (`1000 × TFLOP/s ÷ GB/s`). [M5 specifications](https://support.apple.com/en-us/125405) · [M4 Pro specifications](https://support.apple.com/en-us/121553)
 
