@@ -48,7 +48,7 @@ Full 6-package showcase on M4 Pro (`Mac16,8`, `48 GB`, recorded alongside `6` ba
 |---|---|---:|---:|---|---|---:|---:|---|
 | [`fast-bge-small`](packages/fast-bge-small) | `hetero` (`n=1,000`) | **207,264 tok/s** | `0.526 ms` (`B=1` ANE) | **`1.52x`** vs `gpu` (`136,416 tok/s`) | **`2.50x`** vs `transformers-mps` (`82,883 tok/s`) | `1.173 GB` | `4.813 GB` | `ok` |
 | [`fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | `hetero2` (`n=2,000`) | **31,786 tok/s** | `2.188 ms` (`B=1` ANE) | **`1.85x`** vs `gpu` (`17,177 tok/s`) | *skipped* (`transformers` lacks arch) | `2.224 GB` | `10.820 GB` | `ok` |
-| [`fast-pplx`](packages/fast-pplx) | `hetero2` (`doc_s256`, `B=8`) | **15,244.9 tok/s** | `4.46 ms` (`query_b1` ANE) | **`1.50x`** vs `gpu-bf16` (`mixed`) | **`5.50x`** vs `torch-mps` (`2,772.2 tok/s`) | `1.621 GB` | `2.591 GB` | `ok` |
+| [`fast-pplx`](packages/fast-pplx) | `ane` / `hetero2` (`doc_s256`, `B=8`) | **15,384.2 tok/s** | `3.93 ms` (`query_b1` ANE) | **`1.75x`** vs `gpu-bf16` (`mixed`) | **`1.71x`** vs `pplx-context-mlx-f16` (`8,984.9`; **`2.42x`** `mixed`), **`2.96x`** `torch-mps` | `1.621 GB` | `2.522 GB` | `ok` |
 | [`fast-gemma4`](packages/fast-gemma4) | `Concurrent ANE+GPU` (`2xB=128`) | **8.92 docs/s** | `1,192 dec tok/s` | **`1.21x`** vs `GPUOnly` (`7.36 docs/s`) | **`2.54x`** vs `stock-mlx_vlm B=64` (`3.51 docs/s`) | `6.718 GB` | `18.314 GB` | `ok` |
 | [`fast-gpt-oss`](packages/fast-gpt-oss) | `batched_B128` (`128` docs) | **555.5 dec tok/s** | `1.874 docs/s` | **`7.42x`** vs `B=1` (`74.9 dec tok/s`) | **`4.78x`** vs `stock-mlx_lm B=8` (`116.3 tok/s`) | `15.901 GB` | `21.709 GB` | `ok` |
 | [`fast-decision-models`](packages/fast-decision-models) | `kev_08b` (`w8 B=8`, `n=64`) | **50.95 q/s** | `19.63 ms/q` | **`1.86x`** vs `bf16 B=1` (`-0.553 GB` OS) | **`5.27x`** vs `transformers-mps B=8` (`9.67 q/s`) | `1.748 GB` | `3.166 GB` | `ok` |
@@ -64,13 +64,14 @@ Full 6-package showcase on M4 Pro (`Mac16,8`, `48 GB`, recorded alongside `6` ba
 | `fast-bge-small` | `24` | `transformers-mps-float16` | `8.446 ms` | — | `0.071 GB` | `3.520 GB` | `1.00x` | Public PyTorch MPS (`load=1.314 s`) |
 | `fast-embeddinggemma-2` | `32` | **`ane`** | **2.188 ms** | `1.943 ms` | `2.224 GB` *(suite)* | `10.820 GB` *(suite)* | — | **`4.36x`** vs `gpu` (`9.540 ms`) |
 | `fast-embeddinggemma-2` | `64` | `gpu` | `9.540 ms` | `9.089 ms` | `2.224 GB` *(suite)* | `10.820 GB` *(suite)* | — | Internal Metal baseline |
-| `fast-pplx` | `15` | **`ane`** | **4.46 ms** | — | `0.000 GB` | **0.245 GB** | **`7.86x`** | **`238.4x`** `torch-cpu`; `1.85x` `gpu` |
-| `fast-pplx` | `15` | `hetero2` | `4.51 ms` | — | `0.000 GB` | `0.696 GB` | `7.78x` | `1.83x` vs `gpu` |
-| `fast-pplx` | `15` | `gpu-no-mmap` | `6.65 ms` | — | `1.015 GB` | `1.306 GB` | `5.27x` | `load=0.46 s` |
-| `fast-pplx` | `15` | `gpu-bf16` | `7.21 ms` | — | `0.506 GB` | `1.293 GB` | `4.86x` | `load=0.53 s` |
-| `fast-pplx` | `15` | `gpu` (`mmap` FP16) | `8.26 ms` | — | `0.506 GB` | `0.798 GB` | `4.24x` | `-0.508 GB` OS vs `gpu-no-mmap` |
-| `fast-pplx` | `15` | `torch-mps` (Public) | `35.07 ms` | — | `1.193 GB` | `2.972 GB` | `1.00x` | Public PyTorch MPS (`load=2.68 s`) |
-| `fast-pplx` | `15` | `torch-cpu` (Public) | `1,063.43 ms` | — | `0.000 GB` | `0.767 GB` | `0.03x` | `threads=6`, `load=1.42 s` |
+| `fast-pplx` | `15` | **`ane`** | **3.93 ms** | `3,817.2 tok/s` | `0.000 GB` | **0.243 GB** | **`11.95x`** | **`2.28x`** `pplx-context-mlx-f16`; **`224.4x`** `torch-cpu`; `2.47x` `gpu` |
+| `fast-pplx` | `15` | `hetero2` | `4.32 ms` | `3,475.4 tok/s` | `0.000 GB` | `0.684 GB` | `10.88x` | **`2.07x`** `pplx-context-mlx-f16`; `2.25x` vs `gpu` |
+| `fast-pplx` | `15` | `gpu-no-mmap` | `6.06 ms` | `2,477.2 tok/s` | `1.015 GB` | `1.302 GB` | `7.76x` | `1.48x` `pplx-context-mlx-f16`; `load=0.42 s` |
+| `fast-pplx` | `15` | `gpu-bf16` | `7.21 ms` | `2,080.4 tok/s` | `0.506 GB` | `1.271 GB` | `6.52x` | `1.24x` `pplx-context-mlx-f16`; `load=0.33 s` |
+| `fast-pplx` | `15` | `pplx-context-mlx-f16` (Public) | `8.95 ms` | `1,675.7 tok/s` | `0.489 GB` | `0.890 GB` | `5.25x` | Public MLX GPU baseline (`load=0.40 s`) |
+| `fast-pplx` | `15` | `gpu` (`mmap` FP16) | `9.72 ms` | `1,543.6 tok/s` | `0.506 GB` | `0.796 GB` | `4.83x` | `-0.507 GB` OS vs `gpu-no-mmap` |
+| `fast-pplx` | `15` | `torch-mps` (Public) | `46.98 ms` | `319.3 tok/s` | `1.193 GB` | `2.875 GB` | `1.00x` | Public PyTorch MPS (`load=1.24 s`) |
+| `fast-pplx` | `15` | `torch-cpu` (Public) | `881.81 ms` | `17.0 tok/s` | `0.000 GB` | `0.644 GB` | `0.05x` | `threads=6`, `load=0.27 s` |
 
 #### 2a. Batch Embeddings (`fast-bge-small` `n=1,000` & `fast-embeddinggemma-2` `n=2,000`)
 
@@ -89,16 +90,20 @@ Full 6-package showcase on M4 Pro (`Mac16,8`, `48 GB`, recorded alongside `6` ba
 
 | Workload | Mode / Runtime | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | Comparison |
 |---|---|---:|---:|---:|---:|---:|---|
-| `doc_s256` (`B=8`) | **`hetero2`** | **15,244.9 tok/s** | **16.79 ms** | **59.55** | `0.000 GB` | `1.069 GB` | **`5.50x`** `torch-mps`, **`10.06x`** `torch-cpu`, **`1.55x`** `gpu` |
-| `doc_s256` (`B=8`) | `torch-mps` (Public) | `2,772.2 tok/s` | `115.43 ms` | `8.66` | `1.193 GB` | `3.457 GB` | `1.83x` `torch-cpu` |
-| `doc_s256` (`B=8`) | `torch-cpu` (Public) | `1,515.2 tok/s` | `211.19 ms` | — | `0.000 GB` | `1.375 GB` | `threads=1` |
-| `doc_s4096` (`B=4`) | **`hetero2`** | **6,425.3 tok/s** | **637.48 ms** | **1.57** | `1.226 GB` | `2.555 GB` | **`2.99x`** `torch-mps`, **`12.06x`** `torch-cpu` |
-| `doc_s4096` (`B=4`) | `torch-mps` (Public) | `2,147.7 tok/s` | `2,255.45 ms` | `0.44` | `1.193 GB` | `12.492 GB` | **`4.89x`** higher OS footprint than `hetero2` |
-| `doc_s4096` (`B=4`) | `torch-cpu` (Public) | `532.9 tok/s` | `9,089.62 ms` | — | `0.000 GB` | `13.113 GB` | `threads=1` |
-| `mixed` (`24x~128 + 4x2048`) | **`hetero2`** | **11,411.6 tok/s** | **1,064.00 ms** | — | `1.621 GB` | `2.591 GB` | `ane=24, gpu=4`; **`1.50x`** `gpu-bf16` (`7,615.6 tok/s`) |
-| `mixed` (`24x~128 + 4x2048`) | `gpu` (`mmap` FP16) | `8,502.7 tok/s` | `1,428.02 ms` | — | `1.621 GB` | `2.493 GB` | `ane=0, gpu=28`; `1.12x` `gpu-bf16` |
+| `doc_s256` (`B=8`) | **`ane`** | **15,384.2 tok/s** | **16.64 ms** | **60.09** | `0.000 GB` | **0.250 GB** | **`1.71x`** `pplx-context-mlx-f16`, **`2.96x`** `torch-mps`, **`11.20x`** `torch-cpu`, **`1.69x`** `gpu` |
+| `doc_s256` (`B=8`) | **`hetero2`** | **15,361.9 tok/s** | `16.66 ms` | `60.01` | `0.000 GB` | `1.057 GB` | **`1.71x`** `pplx-context-mlx-f16`, **`2.95x`** `torch-mps`, **`11.18x`** `torch-cpu`, **`1.69x`** `gpu` |
+| `doc_s256` (`B=8`) | `pplx-context-mlx-f16` (Public) | `8,984.9 tok/s` | `35.62 ms` | `28.08` | `1.057 GB` | `1.569 GB` | **`6.28x`** higher OS footprint than `ane` (`1.73x` `torch-mps`) |
+| `doc_s256` (`B=8`) | `torch-mps` (Public) | `5,200.9 tok/s` | `61.53 ms` | `16.25` | `1.193 GB` | `3.483 GB` | `3.79x` `torch-cpu` |
+| `doc_s256` (`B=8`) | `torch-cpu` (Public) | `1,373.5 tok/s` | `232.97 ms` | — | `0.000 GB` | `1.305 GB` | `threads=1` |
+| `doc_s4096` (`B=4`) | **`hetero2`** | **7,857.7 tok/s** | **521.27 ms** | **1.92** | **`1.226 GB`** | **2.480 GB** | **`1.51x`** `pplx-context-mlx-f16`, **`2.52x`** `torch-mps`, **`10.93x`** `torch-cpu` (`-0.248 GB` OS vs `pplx-mlx-f16`) |
+| `doc_s4096` (`B=4`) | `pplx-context-mlx-f16` (Public) | `5,190.5 tok/s` | `933.24 ms` | `1.07` | `1.857 GB` | `2.728 GB` | `1.66x` `torch-mps` (`+0.631 GB` Metal vs `hetero2`) |
+| `doc_s4096` (`B=4`) | `torch-mps` (Public) | `3,118.0 tok/s` | `1,553.58 ms` | `0.64` | `1.193 GB` | `15.690 GB` | **`6.33x`** higher OS footprint than `hetero2` |
+| `doc_s4096` (`B=4`) | `torch-cpu` (Public) | `719.2 tok/s` | `6,735.20 ms` | — | `0.000 GB` | `6.569 GB` | `threads=1` |
+| `mixed` (`24x~128 + 4x2048`) | **`hetero2`** | **13,935.0 tok/s** | **871.33 ms** | — | `1.621 GB` | **2.522 GB** | `ane=24, gpu=4`; **`2.42x`** `pplx-context-mlx-f16`, **`1.75x`** `gpu-bf16` (`1.49x` `gpu`) |
+| `mixed` (`24x~128 + 4x2048`) | `gpu` (`mmap` FP16) | `9,331.9 tok/s` | `1,301.12 ms` | — | `1.621 GB` | `2.497 GB` | `ane=0, gpu=28`; **`1.62x`** `pplx-context-mlx-f16`, `1.17x` `gpu-bf16` |
+| `mixed` (`24x~128 + 4x2048`) | `pplx-context-mlx-f16` (Public) | `5,762.7 tok/s` | `2,370.75 ms` | — | `1.439 GB` | `2.728 GB` | Public MLX GPU (`+0.206 GB` OS vs `hetero2`) |
 
-*(Full 47-row `fast-pplx` matrix across `query_b1`, `query_b32`, `doc_s256`, `doc_s512`, `doc_s2048`, `doc_s4096`, `mixed_short_long` is in [`packages/fast-pplx/README.md`](packages/fast-pplx/README.md#live-hardware-benchmarks-m4-pro-mac168-48-gb)).*
+*(Full 51-row `fast-pplx` matrix across `query_b1`, `query_b32`, `doc_s256`, `doc_s512`, `doc_s2048`, `doc_s4096`, `mixed_short_long` including [`zm2231/pplx-context-mlx`](https://github.com/zm2231/pplx-context-mlx) `pplx-context-mlx-f16` is in [`packages/fast-pplx/README.md`](packages/fast-pplx/README.md#live-hardware-benchmarks-m4-pro-mac168-48-gb)).*
 
 #### 3. Structured JSON Generation — `fast-gemma4` (`Gemma-4 E2B`)
 

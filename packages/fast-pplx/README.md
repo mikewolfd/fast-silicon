@@ -33,7 +33,7 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
 | What model & tokenizer behavior does it preserve? | `pplx-embed-v2-context-0.6b` (`12` layers, `full_attention_interval=2`, `+1.0` zero-centered RMSNorm shifts), matching upstream `split_special_tokens=True` (`[Q] ` = `248077`, `[D] ` = literal ordinary tokens, `<\|chunk_sep\|>` = `248079`). |
 | Why does `S > 2048` stay flat in memory? | `MappedEmbedding` keeps `embed_tokens` (~`1.02 GB`) out of Metal RAM; `S > 2048` automatically switches to streamed state-carried `GatedDeltaNet` (`1024`-tok slices) + tile-aligned `SDPA` (`512`-tok slices). |
 | How does `hetero2` combine ANE & GPU? | Short items (`<= 512` toks) pack chunk-aligned into `S{64,128,256,384,512}` CoreML ANE rings (`pipe_depth=4`), while Metal processes `> 512` sequences concurrently and steals from tail on idle. |
-| What is verified right now? | **All suites verified on M4 Pro (`Mac16,8`, `48 GB`):** CPU/fault-injection suites (`fast-ir-guard` `0` errors/warnings), live `.mlmodelc` ANE (`w8a16`), `16`-case GPU / `14`-case ANE / `16`-case `hetero2` parity, full `speed` (`gpu`, `ane`, `hetero2`, `torch-mps`, `torch-cpu`), `32K` `context-limit`, `context-windows` (`nDCG@5` `+0.1875`), and `19/19` `bit-identity` (`max_abs_err=0.0`). |
+| What is verified right now? | **All suites verified on M4 Pro (`Mac16,8`, `48 GB`):** CPU/fault-injection suites (`fast-ir-guard` `0` errors/warnings), live `.mlmodelc` ANE (`w8a16`), `16`-case GPU / `14`-case ANE / `16`-case `hetero2` parity, full `speed` (`gpu-no-mmap`, `gpu-bf16`, `gpu`, `ane`, `hetero2`, [`pplx-context-mlx-f16`](https://github.com/zm2231/pplx-context-mlx), `torch-mps`, `torch-cpu` — **`1.71x–2.42x`** vs `pplx-context-mlx-f16`), `32K` `context-limit`, `context-windows` (`nDCG@5` `+0.1875`), and `19/19` `bit-identity` (`max_abs_err=0.0`). |
 
 ## Verification Status (`48 GB` M4 Pro `Mac16,8`)
 
@@ -42,7 +42,7 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
 | Native build (`make native`) | **Verified** | Compiles `build/libpplx_fast_io.dylib`, `build/libpplx_coreml_runner.dylib`, and `build/pplx-ane-cli` (`Apple clang`, Accelerate/NEON + CoreML `IOSurface`) |
 | Static IR guard (`fast-ir-guard --strict-bool-mask`) | **Verified (`0` findings)** | Clean across `src`, `tests`, and `scripts` |
 | CPU & fault-injection suites (`pytest -m "not gpu_ane"`) | **Verified (passing)** | Covers Rust tokenizer/control-token isolation, packed ANE buckets + `conv_gap=3`, synthetic `libpplx_fast_io.dylib` Neon/cblas parity, `hetero2` routing, `S > 64` streamed CPU parity, fault injection, Parquet contextual windowing, HTTP `/v1/embeddings`, and benchmark harness CLI |
-| Live 16-case GPU/ANE/`hetero2` parity & speed | **Verified (passing)** | `gpu` `16/16` (`proj_min_cos=0.999997`, `int8_exact=0.9556`, `int8_min_cos=0.999896`), `ane` `14/14` (`<=512`, `proj_min_cos=0.988051`), `hetero2` `16/16` (`proj_min_cos=0.988051`), `hetero2` `S=256` `15,244.9 tok/s` (`5.50x` `torch-mps`, `10.06x` `torch-cpu`), `32K` `context-limit` in `2.690 GB` OS footprint, `19/19` `bit-identity` |
+| Live 16-case GPU/ANE/`hetero2` parity & speed | **Verified (passing)** | `gpu` `16/16` (`proj_min_cos=0.999997`, `int8_exact=0.9556`, `int8_min_cos=0.999896`), `ane` `14/14` (`<=512`, `proj_min_cos=0.988051`), `hetero2` `16/16` (`proj_min_cos=0.988051`), `ane` `query_b1` `3.93 ms` (**`2.28x`** `pplx-context-mlx-f16`, **`11.95x`** `torch-mps`), `ane`/`hetero2` `S=256` `15,384.2` / `15,361.9 tok/s` (**`1.71x`** `pplx-context-mlx-f16`, **`2.95x`** `torch-mps`, **`11.18x`** `torch-cpu`), `hetero2` `mixed` `13,935.0 tok/s` (**`2.42x`** `pplx-context-mlx-f16`), `32K` `context-limit` in `2.690 GB` OS footprint, `19/19` `bit-identity` |
 
 ## Speed, Parity & Memory Benchmarks (Reproducible Harness)
 
@@ -98,88 +98,95 @@ fast-pplx serve --host 127.0.0.1 --port 8080 --mode hetero2 --dimensions 512
 
 ## Live Hardware Benchmarks (M4 Pro `Mac16,8`, `48 GB`)
 
-Measured via `fast-pplx/scripts/benchmark.py` (`monorepo_bench` with `5` background quiescence warnings for `speed` and `parity`; standalone serialized runs for `context-limit`, `context-windows`, and `bit-identity`). Note: `pplx-context-mlx-f16` was skipped because `pplx_context_mlx` was not installed in the comparison venv.
+Measured via `fast-pplx/scripts/benchmark.py` (`monorepo_bench` unified 8-mode serialized sweep including upstream [`zm2231/pplx-context-mlx`](https://github.com/zm2231/pplx-context-mlx) `pplx-context-mlx-f16`, with `6` background quiescence warnings for `speed` and `parity`; standalone serialized runs for `context-limit`, `context-windows`, and `bit-identity`).
 
 ### 1. Throughput & Latency Across Workloads (`speed`)
 
 #### 1a. Single-Query Latency (`query_b1`, `S=15`)
 
-| Mode | Throughput | Latency | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---|
-| **`ane`** | **3,363.3 tok/s** | **4.46 ms** | `0.000 GB` | **0.245 GB** | **`7.86x`** | **`238.4x`** | **`1.85x`** vs `gpu`; `load=18.64 s` |
-| `hetero2` | `3,328.2 tok/s` | `4.51 ms` | `0.000 GB` | `0.696 GB` | `7.78x` | `236.0x` | `1.83x` vs `gpu`; `load=0.72 s` |
-| `gpu-no-mmap` | `2,255.7 tok/s` | `6.65 ms` | `1.015 GB` | `1.306 GB` | `5.27x` | `159.9x` | `load=0.46 s` |
-| `gpu-bf16` | `2,080.0 tok/s` | `7.21 ms` | `0.506 GB` | `1.293 GB` | `4.86x` | `147.5x` | `load=0.53 s` |
-| `gpu` (`mmap` FP16) | `1,815.0 tok/s` | `8.26 ms` | `0.506 GB` | `0.798 GB` | `4.24x` | `128.7x` | `-0.508 GB` vs `gpu-no-mmap`; `load=0.67 s` |
-| `torch-mps` (Public) | `427.7 tok/s` | `35.07 ms` | `1.193 GB` | `2.972 GB` | `1.00x` | `30.3x` | Public MPS baseline (`load=2.68 s`) |
-| `torch-cpu` (Public) | `14.1 tok/s` | `1,063.43 ms` | `0.000 GB` | `0.767 GB` | `0.03x` | `1.00x` | `threads=6`, `load=1.42 s` |
+| Mode | Throughput | Latency | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| **`ane`** | **3,817.2 tok/s** | **3.93 ms** | `0.000 GB` | **0.243 GB** | **`2.28x`** | **`11.95x`** | **`224.4x`** | **`2.47x`** vs `gpu`; `load=12.91 s` |
+| `hetero2` | `3,475.4 tok/s` | `4.32 ms` | `0.000 GB` | `0.684 GB` | **`2.07x`** | `10.88x` | `204.3x` | `2.25x` vs `gpu`; `load=0.61 s` |
+| `gpu-no-mmap` | `2,477.2 tok/s` | `6.06 ms` | `1.015 GB` | `1.302 GB` | `1.48x` | `7.76x` | `145.6x` | `load=0.42 s` |
+| `gpu-bf16` | `2,080.4 tok/s` | `7.21 ms` | `0.506 GB` | `1.271 GB` | `1.24x` | `6.52x` | `122.3x` | `load=0.33 s` |
+| `pplx-context-mlx-f16` (Public) | `1,675.7 tok/s` | `8.95 ms` | `0.489 GB` | `0.890 GB` | `1.00x` | `5.25x` | `98.5x` | Public MLX GPU baseline (`load=0.40 s`) |
+| `gpu` (`mmap` FP16) | `1,543.6 tok/s` | `9.72 ms` | `0.506 GB` | `0.796 GB` | `0.92x` | `4.83x` | `90.8x` | `-0.507 GB` vs `gpu-no-mmap`; `load=0.42 s` |
+| `torch-mps` (Public) | `319.3 tok/s` | `46.98 ms` | `1.193 GB` | `2.875 GB` | `0.19x` | `1.00x` | `18.8x` | Public MPS baseline (`load=1.24 s`) |
+| `torch-cpu` (Public) | `17.0 tok/s` | `881.81 ms` | `0.000 GB` | `0.644 GB` | `0.01x` | `0.05x` | `1.00x` | `threads=6`, `load=0.27 s` |
 
 #### 1b. Batched Queries (`query_b32`, `B=32`, `~11 tok/q`)
 
-| Mode | Throughput | Latency (`ms/q`) | Queries/s | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **`gpu-no-mmap`** | **9,616.0 tok/s** | **1.22 ms** | **822.8** | `1.682 GB` | `1.995 GB` | **`13.31x`** | **`30.86x`** | Peak un-mmap GPU query throughput |
-| `gpu-bf16` | `8,678.8 tok/s` | `1.35 ms` | `742.6` | `1.173 GB` | `1.839 GB` | `12.02x` | `27.85x` | `-0.156 GB` vs `gpu-no-mmap` |
-| `gpu` (`mmap` FP16) | `8,557.2 tok/s` | `1.37 ms` | `732.2` | `1.173 GB` | `1.487 GB` | `11.85x` | `27.46x` | `-0.508 GB` vs `gpu-no-mmap` |
-| `hetero2` | `8,214.3 tok/s` | `1.42 ms` | `702.8` | `0.743 GB` | **1.069 GB** | `11.37x` | `26.36x` | `-0.926 GB` vs `gpu-no-mmap` |
-| `ane` | `4,855.5 tok/s` | `2.41 ms` | `415.4` | `0.000 GB` | **0.245 GB** | `6.72x` | `15.58x` | Zero Metal allocation |
-| `torch-mps` (Public) | `722.3 tok/s` | `16.61 ms` | `60.2` | `1.193 GB` | `3.369 GB` | `1.00x` | `2.32x` | Public MPS baseline |
-| `torch-cpu` (Public) | `311.6 tok/s` | `38.51 ms` | — | `0.000 GB` | `0.947 GB` | `0.43x` | `1.00x` | `threads=6` |
+| Mode | Throughput | Latency (`ms/q`) | Queries/s | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`gpu-bf16`** | **9,844.1 tok/s** | **1.19 ms** | **842.3** | `1.173 GB` | `1.888 GB` | **`1.17x`** | **`5.54x`** | **`26.56x`** | Peak batched GPU query throughput (`-0.101 GB` vs `gpu-no-mmap`) |
+| `gpu-no-mmap` | `8,893.0 tok/s` | `1.31 ms` | `760.9` | `1.682 GB` | `1.989 GB` | `1.06x` | `5.01x` | `24.00x` | In-RAM embed table |
+| `pplx-context-mlx-f16` (Public) | `8,420.8 tok/s` | `1.43 ms` | `701.7` | `0.642 GB` | `0.987 GB` | `1.00x` | `4.74x` | `22.72x` | Public MLX GPU baseline |
+| `hetero2` | `8,419.7 tok/s` | `1.39 ms` | `720.4` | `0.743 GB` | `1.057 GB` | `1.00x` | `4.74x` | `22.72x` | `-0.932 GB` vs `gpu-no-mmap`; `1.03x` vs `gpu` |
+| `gpu` (`mmap` FP16) | `8,207.4 tok/s` | `1.42 ms` | `702.2` | `1.173 GB` | `1.486 GB` | `0.97x` | `4.62x` | `22.15x` | `-0.504 GB` vs `gpu-no-mmap` |
+| `ane` | `4,914.1 tok/s` | `2.38 ms` | `420.5` | `0.000 GB` | **0.243 GB** | `0.58x` | `2.77x` | `13.26x` | Zero Metal allocation |
+| `torch-mps` (Public) | `1,775.9 tok/s` | `6.76 ms` | `148.0` | `1.193 GB` | `3.358 GB` | `0.21x` | `1.00x` | `4.79x` | Public MPS baseline |
+| `torch-cpu` (Public) | `370.6 tok/s` | `32.38 ms` | — | `0.000 GB` | `0.927 GB` | `0.04x` | `0.21x` | `1.00x` | `threads=6` |
 
 #### 1c. Document Chunks — `S=256` (`doc_s256`, `B=8`)
 
-| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **`hetero2`** | **15,244.9 tok/s** | **16.79 ms** | **59.55** | `0.000 GB` | `1.069 GB` | **`5.50x`** | **`10.06x`** | **`1.55x`** vs `gpu` (`1.52x` vs `gpu-bf16`) |
-| `ane` | `15,096.0 tok/s` | `16.96 ms` | `58.97` | `0.000 GB` | **0.251 GB** | `5.45x` | `9.96x` | Lowest OS footprint (`0.251 GB`) |
-| `gpu-no-mmap` | `10,886.4 tok/s` | `23.52 ms` | `42.53` | `2.032 GB` | `2.793 GB` | `3.93x` | `7.19x` | In-RAM embed table |
-| `gpu-bf16` | `10,064.5 tok/s` | `25.44 ms` | `39.31` | `1.524 GB` | `2.241 GB` | `3.63x` | `6.64x` | `-0.551 GB` vs `gpu-no-mmap` |
-| `gpu` (`mmap` FP16) | `9,843.2 tok/s` | `26.01 ms` | `38.45` | `1.524 GB` | `2.286 GB` | `3.55x` | `6.50x` | Default memmap FP16 GPU path |
-| `torch-mps` (Public) | `2,772.2 tok/s` | `115.43 ms` | `8.66` | `1.193 GB` | `3.457 GB` | `1.00x` | `1.83x` | Public MPS baseline |
-| `torch-cpu` (Public) | `1,515.2 tok/s` | `211.19 ms` | — | `0.000 GB` | `1.375 GB` | `0.55x` | `1.00x` | `threads=1` |
+| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`ane`** | **15,384.2 tok/s** | **16.64 ms** | **60.09** | `0.000 GB` | **0.250 GB** | **`1.71x`** | **`2.96x`** | **`11.20x`** | Lowest OS footprint (`0.250 GB`, `6.28x` smaller than `pplx-mlx-f16`) |
+| **`hetero2`** | **15,361.9 tok/s** | **16.66 ms** | **60.01** | `0.000 GB` | `1.057 GB` | **`1.71x`** | **`2.95x`** | **`11.18x`** | **`1.69x`** vs `gpu` (`1.31x` vs `gpu-bf16`) |
+| `gpu-bf16` | `11,717.3 tok/s` | `21.85 ms` | `45.77` | `1.524 GB` | `2.227 GB` | `1.30x` | `2.25x` | `8.53x` | `-0.518 GB` vs `gpu-no-mmap` |
+| `gpu-no-mmap` | `10,280.8 tok/s` | `24.90 ms` | `40.16` | `2.032 GB` | `2.744 GB` | `1.14x` | `1.98x` | `7.48x` | In-RAM embed table |
+| `gpu` (`mmap` FP16) | `9,101.2 tok/s` | `28.13 ms` | `35.55` | `1.524 GB` | `2.241 GB` | `1.01x` | `1.75x` | `6.63x` | Default memmap FP16 GPU path (`-0.503 GB` vs `gpu-no-mmap`) |
+| `pplx-context-mlx-f16` (Public) | `8,984.9 tok/s` | `35.62 ms` | `28.08` | `1.057 GB` | `1.569 GB` | `1.00x` | `1.73x` | `6.54x` | Public MLX GPU baseline |
+| `torch-mps` (Public) | `5,200.9 tok/s` | `61.53 ms` | `16.25` | `1.193 GB` | `3.483 GB` | `0.58x` | `1.00x` | `3.79x` | Public MPS baseline |
+| `torch-cpu` (Public) | `1,373.5 tok/s` | `232.97 ms` | — | `0.000 GB` | `1.305 GB` | `0.15x` | `0.26x` | `1.00x` | `threads=1` |
 
 #### 1d. Document Chunks — `S=512` (`doc_s512`, `B=8`)
 
-| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **`hetero2`** | **13,577.3 tok/s** | **37.71 ms** | **26.52** | `0.000 GB` | `1.069 GB` | **`5.23x`** | **`9.96x`** | **`1.56x`** vs `gpu` |
-| `ane` | `13,528.2 tok/s` | `37.85 ms` | `26.42` | `0.000 GB` | **0.293 GB** | `5.22x` | `9.92x` | Max ANE bucket (`<=512`) |
-| `gpu-no-mmap` | `10,571.1 tok/s` | `48.43 ms` | `20.65` | `1.840 GB` | `2.793 GB` | `4.08x` | `7.76x` | In-RAM embed table |
-| `gpu` (`mmap` FP16) | `8,681.4 tok/s` | `58.98 ms` | `16.96` | `1.332 GB` | `2.286 GB` | `3.35x` | `6.37x` | `1.03x` vs `gpu-bf16` |
-| `gpu-bf16` | `8,415.2 tok/s` | `60.84 ms` | `16.44` | `1.332 GB` | `2.241 GB` | `3.24x` | `6.17x` | `-0.551 GB` vs `gpu-no-mmap` |
-| `torch-mps` (Public) | `2,594.0 tok/s` | `233.61 ms` | `4.28` | `1.193 GB` | `3.566 GB` | `1.00x` | `1.90x` | Public MPS baseline |
-| `torch-cpu` (Public) | `1,363.2 tok/s` | `444.54 ms` | — | `0.000 GB` | `2.245 GB` | `0.53x` | `1.00x` | `threads=1` |
+| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`ane`** | **13,677.4 tok/s** | **37.43 ms** | **26.71** | `0.000 GB` | **0.271 GB** | **`1.73x`** | **`2.66x`** | **`11.03x`** | Max ANE bucket (`<=512`); `7.30x` smaller OS vs `pplx-mlx-f16` |
+| **`hetero2`** | **13,619.1 tok/s** | **37.59 ms** | **26.60** | `0.000 GB` | `1.062 GB` | **`1.73x`** | **`2.65x`** | **`10.98x`** | **`1.42x`** vs `gpu` (`1.21x` vs `gpu-bf16`) |
+| `gpu-bf16` | `11,228.8 tok/s` | `45.60 ms` | `21.93` | `1.332 GB` | `2.227 GB` | `1.42x` | `2.18x` | `9.05x` | `-0.518 GB` vs `gpu-no-mmap` |
+| `gpu-no-mmap` | `10,806.8 tok/s` | `47.38 ms` | `21.11` | `1.840 GB` | `2.744 GB` | `1.37x` | `2.10x` | `8.71x` | In-RAM embed table |
+| `gpu` (`mmap` FP16) | `9,612.1 tok/s` | `53.27 ms` | `18.77` | `1.332 GB` | `2.241 GB` | `1.22x` | `1.87x` | `7.75x` | `-0.503 GB` vs `gpu-no-mmap` |
+| `pplx-context-mlx-f16` (Public) | `7,893.3 tok/s` | `76.77 ms` | `13.03` | `1.426 GB` | `1.978 GB` | `1.00x` | `1.53x` | `6.36x` | Public MLX GPU baseline |
+| `torch-mps` (Public) | `5,143.0 tok/s` | `117.83 ms` | `8.49` | `1.193 GB` | `3.924 GB` | `0.65x` | `1.00x` | `4.15x` | Public MPS baseline |
+| `torch-cpu` (Public) | `1,240.3 tok/s` | `488.59 ms` | — | `0.000 GB` | `2.108 GB` | `0.16x` | `0.24x` | `1.00x` | `threads=1` |
 
 #### 1e. Long Context — `S=2048` (`doc_s2048`, `B=4`)
 
-| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **`gpu`** (`mmap` FP16) | **7,750.5 tok/s** | **264.24 ms** | **3.78** | `1.621 GB` | **2.463 GB** | **`2.97x`** | **`9.54x`** | `-0.497 GB` OS vs `gpu-no-mmap` |
-| `gpu-no-mmap` | `7,522.5 tok/s` | `272.25 ms` | `3.67` | `2.129 GB` | `2.960 GB` | `2.88x` | `9.26x` | In-RAM embed table |
-| `gpu-bf16` | `7,424.0 tok/s` | `275.86 ms` | `3.62` | `1.621 GB` | `2.502 GB` | `2.84x` | `9.13x` | Memmap BF16 |
-| `hetero2` | `6,815.7 tok/s` | `300.48 ms` | `3.33` | `1.621 GB` | `2.555 GB` | `2.61x` | `8.39x` | Auto GPU offload above `S=512` |
-| `torch-mps` (Public) | `2,613.2 tok/s` | `928.37 ms` | `1.08` | `1.193 GB` | `6.408 GB` | `1.00x` | `3.22x` | Public MPS baseline |
-| `torch-cpu` (Public) | `812.8 tok/s` | `2,984.58 ms` | — | `0.000 GB` | `5.729 GB` | `0.31x` | `1.00x` | `threads=1` (`ane` skipped `>512`) |
+| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`hetero2`** | **9,963.5 tok/s** | **205.55 ms** | **4.86** | `1.621 GB` | `2.480 GB` | **`1.64x`** | **`2.70x`** | **`9.40x`** | Auto GPU offload above `S=512` (`-0.458 GB` vs `gpu-no-mmap`) |
+| `gpu-bf16` | `9,731.9 tok/s` | `210.44 ms` | `4.75` | `1.621 GB` | `2.486 GB` | `1.60x` | `2.64x` | `9.18x` | Memmap BF16 |
+| `gpu-no-mmap` | `9,026.3 tok/s` | `226.89 ms` | `4.41` | `2.129 GB` | `2.938 GB` | `1.48x` | `2.44x` | `8.52x` | In-RAM embed table |
+| `gpu` (`mmap` FP16) | `8,954.9 tok/s` | `228.70 ms` | `4.37` | `1.621 GB` | **2.461 GB** | `1.47x` | `2.42x` | `8.45x` | `-0.477 GB` OS vs `gpu-no-mmap` |
+| `pplx-context-mlx-f16` (Public) | `6,087.2 tok/s` | `398.54 ms` | `2.51` | `1.438 GB` | `2.047 GB` | `1.00x` | `1.65x` | `5.74x` | Public MLX GPU baseline |
+| `torch-mps` (Public) | `3,693.0 tok/s` | `656.91 ms` | `1.52` | `1.193 GB` | `8.564 GB` | `0.61x` | `1.00x` | `3.48x` | Public MPS baseline |
+| `torch-cpu` (Public) | `1,059.9 tok/s` | `2,288.87 ms` | — | `0.000 GB` | `3.766 GB` | `0.17x` | `0.29x` | `1.00x` | `threads=1` (`ane` skipped `>512`) |
 
 #### 1f. Long Context — `S=4096` (`doc_s4096`, `B=4`)
 
-| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `torch-mps` | vs `torch-cpu` | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **`hetero2`** | **6,425.3 tok/s** | **637.48 ms** | **1.57** | `1.226 GB` | `2.555 GB` | **`2.99x`** | **`12.06x`** | Streamed `1024`-tok GDN + `512`-tok SDPA |
-| `gpu-bf16` | `6,401.4 tok/s` | `639.86 ms` | `1.56` | `1.226 GB` | `2.502 GB` | `2.98x` | `12.01x` | Streamed BF16 |
-| `gpu` (`mmap` FP16) | `6,325.4 tok/s` | `647.55 ms` | `1.54` | `1.226 GB` | **2.463 GB** | `2.95x` | `11.87x` | `-0.497 GB` OS vs `gpu-no-mmap` |
-| `gpu-no-mmap` | `6,087.8 tok/s` | `672.82 ms` | `1.49` | `1.734 GB` | `2.960 GB` | `2.84x` | `11.42x` | In-RAM embed table |
-| `torch-mps` (Public) | `2,147.7 tok/s` | `2,255.45 ms` | `0.44` | `1.193 GB` | `12.492 GB` | `1.00x` | `4.03x` | **`4.89x`** higher OS footprint than `hetero2` |
-| `torch-cpu` (Public) | `532.9 tok/s` | `9,089.62 ms` | — | `0.000 GB` | `13.113 GB` | `0.25x` | `1.00x` | `threads=1` (`ane` skipped `>512`) |
+| Mode | Throughput | Batch Latency | Docs/s | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `torch-mps` | vs `torch-cpu` | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`hetero2`** | **7,857.7 tok/s** | **521.27 ms** | **1.92** | **1.226 GB** | `2.480 GB` | **`1.51x`** | **`2.52x`** | **`10.93x`** | Streamed `1024`-tok GDN + `512`-tok SDPA (`-0.248 GB` OS vs `pplx-mlx-f16`) |
+| `gpu-bf16` | `7,580.7 tok/s` | `540.32 ms` | `1.85` | `1.226 GB` | `2.486 GB` | `1.46x` | `2.43x` | `10.54x` | Streamed BF16 |
+| `gpu` (`mmap` FP16) | `7,368.4 tok/s` | `555.88 ms` | `1.80` | `1.226 GB` | **2.461 GB** | `1.42x` | `2.36x` | `10.25x` | `-0.477 GB` OS vs `gpu-no-mmap` |
+| `gpu-no-mmap` | `7,104.3 tok/s` | `576.55 ms` | `1.73` | `1.734 GB` | `2.938 GB` | `1.37x` | `2.28x` | `9.88x` | In-RAM embed table |
+| `pplx-context-mlx-f16` (Public) | `5,190.5 tok/s` | `933.24 ms` | `1.07` | `1.857 GB` | `2.728 GB` | `1.00x` | `1.66x` | `7.22x` | Public MLX GPU baseline (`+0.631 GB` Metal vs `hetero2`) |
+| `torch-mps` (Public) | `3,118.0 tok/s` | `1,553.58 ms` | `0.64` | `1.193 GB` | `15.690 GB` | `0.60x` | `1.00x` | `4.34x` | **`6.33x`** higher OS footprint than `hetero2` |
+| `torch-cpu` (Public) | `719.2 tok/s` | `6,735.20 ms` | — | `0.000 GB` | `6.569 GB` | `0.14x` | `0.23x` | `1.00x` | `threads=1` (`ane` skipped `>512`) |
 
 #### 1g. Mixed Short + Long Batch (`mixed_short_long`, `24x~128 + 4x2048`)
 
-| Mode | Throughput | Batch Latency | Routing (`ANE / GPU`) | Metal Peak | OS Footprint | vs `gpu-bf16` | Notes |
-|---|---:|---:|---|---:|---:|---:|---|
-| **`hetero2`** | **11,411.6 tok/s** | **1,064.00 ms** | `24 / 4` | `1.621 GB` | `2.591 GB` | **`1.50x`** | Short chunks on ANE + `2048`-tok docs on GPU (`1.34x` `gpu`) |
-| `gpu` (`mmap` FP16) | `8,502.7 tok/s` | `1,428.02 ms` | `0 / 28` | `1.621 GB` | **2.493 GB** | `1.12x` | Lowest mixed OS footprint (`-0.503 GB` vs `gpu-no-mmap`) |
-| `gpu-bf16` | `7,615.6 tok/s` | `1,594.35 ms` | `0 / 28` | `1.621 GB` | `2.574 GB` | `1.00x` | Internal mixed GPU BF16 baseline |
-| `gpu-no-mmap` | `6,884.4 tok/s` | `1,763.70 ms` | `0 / 28` | `2.129 GB` | `2.996 GB` | `0.90x` | In-RAM embed table |
+| Mode | Throughput | Batch Latency | Routing (`ANE / GPU`) | Metal Peak | OS Footprint | vs `pplx-mlx-f16` | vs `gpu-bf16` | Notes |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| **`hetero2`** | **13,935.0 tok/s** | **871.33 ms** | `24 / 4` | `1.621 GB` | `2.522 GB` | **`2.42x`** | **`1.75x`** | Short chunks on ANE + `2048`-tok docs on GPU (`1.49x` `gpu`, `-0.206 GB` OS vs `pplx-mlx-f16`) |
+| `gpu-no-mmap` | `10,028.4 tok/s` | `1,210.76 ms` | `0 / 28` | `2.130 GB` | `2.957 GB` | `1.74x` | `1.26x` | In-RAM embed table |
+| `gpu` (`mmap` FP16) | `9,331.9 tok/s` | `1,301.12 ms` | `0 / 28` | `1.621 GB` | **2.497 GB** | `1.62x` | `1.17x` | Lowest mixed OS footprint (`-0.460 GB` vs `gpu-no-mmap`) |
+| `gpu-bf16` | `7,952.9 tok/s` | `1,526.74 ms` | `0 / 28` | `1.621 GB` | `2.559 GB` | `1.38x` | `1.00x` | Internal mixed GPU BF16 baseline |
+| `pplx-context-mlx-f16` (Public) | `5,762.7 tok/s` | `2,370.75 ms` | `0 / 28` | `1.439 GB` | `2.728 GB` | `1.00x` | `0.72x` | Public MLX GPU baseline |
 
 ### 2. 16-Case Numerical Parity (`parity`)
 
