@@ -1,0 +1,42 @@
+[project]
+name = "fast-silicon"
+version = "0.1.0"
+description = "Hardware-limit Apple Silicon (M4 / M5+ Metal 4 MPP + 16-core ANE + CPU SME) ML inference and embedding workspace."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fast-shared",
+    "fast-bge-small",
+    "fast-embeddinggemma-2",
+    "fast-gemma4",
+    "fast-gpt-oss",
+    "fast-decision-models",
+    "fast-pplx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+build = [
+    "coremltools>=8.0",
+    "torch>=2.4",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+fast-shared = { workspace = true }
+fast-bge-small = { workspace = true }
+fast-embeddinggemma-2 = { workspace = true }
+fast-gemma4 = { workspace = true }
+fast-gpt-oss = { workspace = true }
+fast-decision-models = { workspace = true }
+fast-pplx = { workspace = true }
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu_ane: requires real model weights and Apple Silicon GPU/ANE hardware (serialized via lock)",
+]

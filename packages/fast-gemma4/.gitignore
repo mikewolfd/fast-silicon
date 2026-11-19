@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+artifacts/
+*.mlmodelc
+*.mlpackage
+*.npz
+*.safetensors
+.DS_Store
+.claude/

@@ -1,0 +1,199 @@
+"""fast-shared: DRY Apple Silicon MLX/Metal-MPP/CoreML utilities."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from .bench import (
+    check_system_quiescence,
+    check_tensor_dtypes,
+    clear_mlx_arena,
+    cos_sim,
+    get_unified_memory_footprint,
+    interleaved_abba,
+    peak_footprint_gb,
+)
+from .embeddings import (
+    MappedEmbedding,
+    accepts_kwarg,
+    resolve_embedding_dim,
+    set_mlx_cache_limit,
+    tile_aligned_slices,
+    truncate_and_normalize,
+)
+from .fault_injection import (
+    FaultInjectionCase,
+    FaultInjectionResult,
+    run_fault_injection_suite,
+)
+from .grammar import normalize_json_schema, sample_unconstrained, validate_json_against_schema
+from .hf import DEFAULT_TOKENIZER_FILES, copy_tokenizer_files, resolve_hf_model_dir
+from .hw_check import (
+    TESTED_REFERENCE_HARDWARE,
+    evaluate_hardware_support,
+    format_hardware_summary,
+    format_hardware_warning,
+    probe_host_hardware,
+    warn_if_untested_hardware,
+)
+from .ir_dtype_guard import (
+    GuardFinding,
+    GuardReport,
+    check_coreml_mil_program,
+    check_coreml_model,
+    check_mlx_file,
+    check_mlx_paths,
+    check_mlx_source,
+)
+from .metal_mpp import HEADER_MPP, HEADER_SIMDGROUP, HEADER_STD, make_mpp_matmul_kernel
+from .metal_mpp_bf16 import (
+    fused_geglu_split,
+    make_mpp_bf16_geglu_kernel,
+    make_mpp_bf16_linear_kernel,
+    mpp_fused_geglu_bf16,
+    mpp_linear_bf16,
+)
+from .parquet_pipeline import (
+    DEFAULT_TEXT_COLUMNS,
+    ParquetEmbedSummary,
+    embed_parquet,
+    resolve_input_files,
+    resolve_text_column,
+    slice_ocr_pages_utf8,
+)
+from .paths import resolve_home_dir
+from .pipeline_llm import (
+    ParquetExtractSummary,
+    extract_jsonl,
+    extract_parquet,
+    next_shard_index,
+    resolve_llm_text_column,
+    slice_first_pages_utf8,
+)
+from .roofline import (
+    audit_safetensors_weights,
+    compute_model_roofline,
+    measure_dram_bw,
+    measure_gemm_ceilings,
+    probe_hardware_identity,
+    read_safetensors_headers,
+)
+from .server import (
+    ChatMicroBatcher,
+    EmbeddingHTTPServer,
+    JsonHTTPHandler,
+    ManagedHTTPServer,
+    OpenAIChatAdapter,
+    UnifiedOpenAIServer,
+    build_chat_completion,
+    build_text_completion,
+    dispatch_chat_completion,
+    dispatch_completion,
+    embedding_health_payload,
+    extract_json_schema,
+    extract_request_param,
+    iter_chat_sse_events,
+    iter_completion_sse_events,
+    make_chat_handler,
+    make_embedding_handler,
+    make_unified_handler,
+    run_embedding_request,
+    schema_cache_key,
+)
+from .tokenizer import BaseFastTokenizer
+
+
+def native_include_dir() -> Path:
+    """Return path containing shared C++/ObjC++ headers (`fast_shared_apple.hpp`)."""
+    return Path(__file__).resolve().parent / "include"
+
+
+__all__ = [
+    "BaseFastTokenizer",
+    "ChatMicroBatcher",
+    "DEFAULT_TEXT_COLUMNS",
+    "DEFAULT_TOKENIZER_FILES",
+    "EmbeddingHTTPServer",
+    "FaultInjectionCase",
+    "FaultInjectionResult",
+    "GuardFinding",
+    "GuardReport",
+    "JsonHTTPHandler",
+    "ManagedHTTPServer",
+    "MappedEmbedding",
+    "OpenAIChatAdapter",
+    "UnifiedOpenAIServer",
+    "HEADER_MPP",
+    "HEADER_SIMDGROUP",
+    "HEADER_STD",
+    "ParquetEmbedSummary",
+    "ParquetExtractSummary",
+    "TESTED_REFERENCE_HARDWARE",
+    "accepts_kwarg",
+    "audit_safetensors_weights",
+    "build_chat_completion",
+    "build_text_completion",
+    "check_coreml_mil_program",
+    "check_coreml_model",
+    "check_mlx_file",
+    "check_mlx_paths",
+    "check_mlx_source",
+    "check_system_quiescence",
+    "check_tensor_dtypes",
+    "clear_mlx_arena",
+    "compute_model_roofline",
+    "copy_tokenizer_files",
+    "cos_sim",
+    "dispatch_chat_completion",
+    "dispatch_completion",
+    "embed_parquet",
+    "embedding_health_payload",
+    "evaluate_hardware_support",
+    "extract_json_schema",
+    "extract_jsonl",
+    "extract_parquet",
+    "extract_request_param",
+    "format_hardware_summary",
+    "format_hardware_warning",
+    "fused_geglu_split",
+    "get_unified_memory_footprint",
+    "interleaved_abba",
+    "peak_footprint_gb",
+    "iter_chat_sse_events",
+    "iter_completion_sse_events",
+    "make_chat_handler",
+    "make_embedding_handler",
+    "make_mpp_bf16_geglu_kernel",
+    "make_mpp_bf16_linear_kernel",
+    "make_mpp_matmul_kernel",
+    "make_unified_handler",
+    "measure_dram_bw",
+    "measure_gemm_ceilings",
+    "mpp_fused_geglu_bf16",
+    "mpp_linear_bf16",
+    "native_include_dir",
+    "next_shard_index",
+    "normalize_json_schema",
+    "probe_hardware_identity",
+    "probe_host_hardware",
+    "read_safetensors_headers",
+    "resolve_embedding_dim",
+    "resolve_hf_model_dir",
+    "resolve_home_dir",
+    "resolve_input_files",
+    "resolve_llm_text_column",
+    "resolve_text_column",
+    "run_embedding_request",
+    "run_fault_injection_suite",
+    "sample_unconstrained",
+    "schema_cache_key",
+    "set_mlx_cache_limit",
+    "slice_first_pages_utf8",
+    "slice_ocr_pages_utf8",
+    "tile_aligned_slices",
+    "truncate_and_normalize",
+    "validate_json_against_schema",
+    "warn_if_untested_hardware",
+]
+
+__version__ = "0.1.0"

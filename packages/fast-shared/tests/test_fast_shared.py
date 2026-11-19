@@ -1,0 +1,1563 @@
+from __future__ import annotations
+
+import json
+import urllib.request
+from pathlib import Path
+
+import mlx.core as mx
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from fast_shared import (
+    BaseFastTokenizer,
+    EmbeddingHTTPServer,
+    FaultInjectionCase,
+    FaultInjectionResult,
+    MappedEmbedding,
+    UnifiedOpenAIServer,
+    embed_parquet,
+    fused_geglu_split,
+    make_mpp_matmul_kernel,
+    mpp_fused_geglu_bf16,
+    mpp_linear_bf16,
+    native_include_dir,
+    resolve_embedding_dim,
+    resolve_home_dir,
+    run_fault_injection_suite,
+    set_mlx_cache_limit,
+    slice_ocr_pages_utf8,
+    tile_aligned_slices,
+    truncate_and_normalize,
+)
+
+
+class _DummyTokenizer:
+    def resolve_prefix(self, **kwargs):
+        return kwargs.get("prefix") or ""
+
+    def encode_batch(self, texts, *, prefix="", max_length=512):
+        return [[2, 10 + i, 1] for i, _ in enumerate(texts)]
+
+    def encode(self, text, *, prefix="", max_length=512):
+        return [2, 10, 1]
+
+    def chunk_text(self, text, *, max_body_tokens=510, overlap=51, prefix="", max_chunk_tokens=512):
+        mid = len(text) // 2 or len(text)
+        return [([2, 10, 1], 0, mid)]
+
+
+class _DummyEngine:
+    dim = 16
+    model_name = "dummy-emb"
+    default_mode = "gpu"
+    ane_available = False
+    max_seq_len = 512
+    ane_query_max_len = 512
+
+    def __init__(self):
+        self.tokenizer = _DummyTokenizer()
+
+    def encode_query(self, toks):
+        v = np.arange(1, 17, dtype=np.float32) + float(len(toks))
+        return v / np.linalg.norm(v)
+
+    def encode_corpus(self, tok_lists, mode=None):
+        out = np.zeros((len(tok_lists), self.dim), dtype=np.float32)
+        for i, toks in enumerate(tok_lists):
+            v = np.arange(1, self.dim + 1, dtype=np.float32) + float(sum(toks))
+            out[i] = v / np.linalg.norm(v)
+        return out
+
+
+def test_native_include_and_paths(tmp_path: Path, monkeypatch) -> None:
+    hdr = native_include_dir() / "fast_shared_apple.hpp"
+    coreml_hdr = native_include_dir() / "fast_shared_coreml.hpp"
+    assert hdr.exists()
+    assert coreml_hdr.exists()
+
+    monkeypatch.setenv("TEST_SHARED_HOME", str(tmp_path))
+    assert resolve_home_dir(__file__, env_var="TEST_SHARED_HOME", cache_name="x") == tmp_path.resolve()
+
+
+def test_mpp_matmul_kernel_compile_and_run() -> None:
+    mx.set_default_device(mx.gpu)
+    k = make_mpp_matmul_kernel("shared_test_mpp64", epilogue="none", tm=64, tn=64, sgs=4)
+    a = mx.ones((64, 64), dtype=mx.float16)
+    b = mx.ones((64, 64), dtype=mx.float16)
+    c = k(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(64, 64)], output_dtypes=[mx.float16])[0]
+    mx.eval(c)
+    assert np.allclose(np.array(c), 64.0)
+
+    a_bf = mx.ones((128, 64), dtype=mx.bfloat16) * 0.5
+    wg = mx.ones((64, 64), dtype=mx.bfloat16)
+    wu = mx.ones((64, 64), dtype=mx.bfloat16)
+    wd = mx.ones((32, 64), dtype=mx.bfloat16)
+    ge = mpp_fused_geglu_bf16(a_bf, wg, wu)
+    mm = mpp_linear_bf16(ge, wd, tm=32, tn=32)
+    sp = fused_geglu_split(mx.concatenate([a_bf @ wg.T, a_bf @ wu.T], axis=-1))
+    mx.eval(ge, mm, sp)
+    assert ge.shape == (128, 64) and ge.dtype == mx.bfloat16
+    assert mm.shape == (128, 32) and mm.dtype == mx.bfloat16
+    assert np.allclose(np.array(ge.astype(mx.float32)), np.array(sp.astype(mx.float32)), atol=0.5, rtol=1e-2)
+
+
+def test_slice_ocr_pages_utf8() -> None:
+    p1 = "Intro — header page."
+    p2 = "OCR scanned exhibit text."
+    p3 = "Native appendix."
+    full = p1 + p2 + p3
+    offsets = [0, len(p1.encode("utf-8")), len((p1 + p2).encode("utf-8"))]
+    assert slice_ocr_pages_utf8(full, offsets, [2]) == p2
+    assert slice_ocr_pages_utf8(full, offsets, [1, 3]) == f"{p1}\n\n{p3}"
+
+
+def test_base_fast_tokenizer_and_chunking(tmp_path: Path) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+
+    vocab = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "q:": 4, "hello": 5, "world": 6, "foo": 7, "bar": 8}
+    raw_tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", 2), ("<eos>", 1)],
+    )
+    tok_path = tmp_path / "tokenizer.json"
+    raw_tok.save(str(tok_path))
+
+    ftok = BaseFastTokenizer(
+        tok_path,
+        bos_token="<bos>",
+        eos_token="<eos>",
+        pad_token="<pad>",
+        query_prefix="q: ",
+        prompts={"q": "q: "},
+    )
+    ids = ftok.encode("hello world", add_query_prefix=True)
+    assert ids == [2, 4, 5, 6, 1]
+    assert ftok.encode("hello world", prompt_name="q") == ids
+
+    chunks = ftok.chunk_text("hello world foo bar hello world", max_body_tokens=3, overlap=1, prefix="q: ", max_chunk_tokens=6)
+    assert len(chunks) >= 2
+    for c_ids, c0, c1 in chunks:
+        assert len(c_ids) <= 6
+        assert c_ids[0] == 2 and c_ids[1] == 4 and c_ids[-1] == 1
+        assert 0 <= c0 < c1
+
+
+@pytest.fixture
+def bpe_tokenizer(tmp_path: Path) -> BaseFastTokenizer:
+    """A real byte-level BPE whose trailing prefix space merges with hello."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from tokenizers.processors import TemplateProcessing
+
+    vocab = {token: i for i, token in enumerate(["<pad>", "<eos>", "<bos>", "<unk>", *sorted(ByteLevel.alphabet())])}
+    merges = [("h", "e"), ("he", "l"), ("hel", "l"), ("hell", "o"), ("Ġ", "hello")]
+    for left, right in merges:
+        vocab[left + right] = len(vocab)
+    raw_tok = Tokenizer(BPE(vocab=vocab, merges=merges, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>", special_tokens=[("<bos>", 2), ("<eos>", 1)]
+    )
+    path = tmp_path / "bpe-tokenizer.json"
+    raw_tok.save(str(path))
+    return BaseFastTokenizer(
+        path, bos_token="<bos>", eos_token="<eos>", pad_token="<pad>", document_prefix="q: "
+    )
+
+
+@pytest.mark.parametrize("overlap", [0, 2])
+@pytest.mark.parametrize("text", ["", "hello", "  hello\nhello  ", "\n\t  ", "\n é🧪漢字 hello\n é🧪漢字 \t"])
+def test_chunk_text_matches_native_encoding_and_covers_source(bpe_tokenizer: BaseFastTokenizer, text: str, overlap: int) -> None:
+    tok = bpe_tokenizer
+    # This fixture detects the old separate-prefix/body concatenation bug.
+    separate = [tok.bos_id, *tok._tok.encode("q: ", add_special_tokens=False).ids,
+                *tok._tok.encode("hello", add_special_tokens=False).ids, tok.eos_id]
+    assert separate != tok.encode("hello", add_document_prefix=True)
+    chunks = tok.chunk_text(text, max_chunk_tokens=12, overlap=overlap, add_document_prefix=True)
+    assert chunks[0][1] == 0
+    assert chunks[-1][2] == len(text)
+    previous_end = 0
+    for ids, start, end in chunks:
+        assert 0 <= start <= previous_end <= len(text)
+        assert start <= end <= len(text)
+        assert ids == tok.encode(text[start:end], add_document_prefix=True, max_length=4096)
+        assert len(ids) <= 12
+        previous_end = max(previous_end, end)
+    if overlap == 0:
+        assert "".join(text[start:end] for _, start, end in chunks) == text
+
+
+def test_chunk_text_body_overlap_and_zero_overlap_coverage(bpe_tokenizer: BaseFastTokenizer) -> None:
+    text = "abcdefghijklmno"
+    chunks = bpe_tokenizer.chunk_text(text, max_chunk_tokens=8, overlap=2)
+    assert [(start, end) for _, start, end in chunks] == [(0, 6), (4, 10), (8, 14), (12, 15)]
+    text = "  hello \nabcdefghijklmno\n  "
+    chunks = bpe_tokenizer.chunk_text(text, max_chunk_tokens=8, overlap=0, max_body_tokens=100)
+    assert "".join(text[start:end] for _, start, end in chunks) == text
+    assert all(ids == bpe_tokenizer.encode(text[start:end]) for ids, start, end in chunks)
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"max_chunk_tokens": 0}, "max_chunk_tokens must be positive"),
+    ({"max_body_tokens": 0}, "max_body_tokens must be positive"),
+    ({"max_body_tokens": -2}, "max_body_tokens must be positive"),
+    ({"overlap": -1}, "overlap must be nonnegative"),
+    ({"max_body_tokens": 2, "overlap": 2}, "smaller than the usable body window"),
+    ({"max_chunk_tokens": 6, "prefix": "abcdef", "overlap": 0}, "leave room for body tokens"),
+])
+def test_chunk_text_rejects_invalid_windows(bpe_tokenizer: BaseFastTokenizer, kwargs: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        bpe_tokenizer.chunk_text("hello world", **kwargs)
+
+
+def test_chunk_text_refuses_unfittable_unicode_span(bpe_tokenizer: BaseFastTokenizer) -> None:
+    with pytest.raises(ValueError, match="source character or token span cannot fit"):
+        bpe_tokenizer.chunk_text("🧪", prefix="q: ", max_chunk_tokens=6, overlap=0)
+
+
+def test_chunk_text_rejects_overlap_that_prevents_character_progress(bpe_tokenizer: BaseFastTokenizer) -> None:
+    with pytest.raises(ValueError, match="overlap leaves no forward progress"):
+        bpe_tokenizer.chunk_text("é🧪漢字", prefix="q: ", max_chunk_tokens=12, overlap=6)
+
+
+@pytest.mark.parametrize(("batch_rows", "shard_rows", "single_file"), [(1, 4, True), (3, 8, True), (1, 8, False), (3, 4, False)])
+def test_parquet_caps_expanded_chunks_and_preserves_values(
+    tmp_path: Path, bpe_tokenizer: BaseFastTokenizer, batch_rows: int, shard_rows: int, single_file: bool
+) -> None:
+    class RecordingEngine(_DummyEngine):
+        supports_dimensions = True
+
+        def __init__(self):
+            self.tokenizer = bpe_tokenizer
+            self.calls: list[list[list[int]]] = []
+
+        def encode_corpus(self, tok_lists, mode=None):
+            self.calls.append(tok_lists)
+            return super().encode_corpus(tok_lists, mode=mode)
+
+    rows = [{"id": i, "tag": f"source-{i}", "body": f"  abcdefghijklmno {i}\n "} for i in range(3)]
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), source)
+    expected_rows = []
+    expected_toks = []
+    for row in rows:
+        for index, (ids, start, end) in enumerate(bpe_tokenizer.chunk_text(
+            row["body"], max_chunk_tokens=12, max_body_tokens=5, overlap=1, add_document_prefix=True
+        )):
+            expected_rows.append({"id": row["id"], "tag": row["tag"], "chunk_index": index,
+                                  "char_start": start, "char_end": end, "token_count": len(ids),
+                                  "chunk_text": row["body"][start:end]})
+            expected_toks.append(ids)
+    assert len(expected_rows) > 3
+    destination = tmp_path / ("out.parquet" if single_file else "out")
+    engine = RecordingEngine()
+    options = dict(keep_cols=["id", "tag"], chunk=True, include_chunk_text=True,
+                   max_chunk_tokens=12, max_body_tokens=5, overlap=1, add_document_prefix=True,
+                   batch_rows=batch_rows, encode_batch_rows=3, shard_rows=shard_rows, dimensions=8, progress_every=0)
+    summary = embed_parquet(engine, source, destination, **options)
+    files = [destination] if single_file else sorted(destination.glob("part-*.parquet"))
+    result = pa.concat_tables([pq.read_table(path) for path in files])
+    assert result.drop(["vector"]).to_pylist() == expected_rows
+    assert summary.rows_read == len(rows)
+    assert summary.rows_emitted == len(expected_rows)
+    assert summary.total_tokens == sum(map(len, expected_toks))
+    assert max(map(len, engine.calls)) <= 3
+    assert [ids for call in engine.calls for ids in call] == expected_toks
+    vectors = np.asarray(result["vector"].to_pylist(), dtype=np.float32)
+    assert result.schema.field("vector").type == pa.list_(pa.float32(), 8)
+    assert np.allclose(vectors, truncate_and_normalize(_DummyEngine().encode_corpus(expected_toks), 8), atol=1e-6)
+    if not single_file:
+        assert [pq.ParquetFile(path).metadata.num_rows for path in files[:-1]] == [shard_rows] * (len(files) - 1)
+        resumed = RecordingEngine()
+        embed_parquet(resumed, source, destination, resume=True, **options)
+        assert resumed.calls == []
+        assert pa.concat_tables([pq.read_table(path) for path in files]).equals(result)
+
+
+def test_parquet_per_ocr_page_preserves_original_page_offsets(tmp_path: Path, bpe_tokenizer: BaseFastTokenizer) -> None:
+    pages = ["Native page", "\n é🧪 hello \n", " \n\t "]
+    source = tmp_path / "pages.parquet"
+    pq.write_table(pa.table({"id": [7], "body": ["".join(pages)],
+                            "page_offsets": [[0, len(pages[0].encode()), len("".join(pages[:2]).encode())]],
+                            "ocr_pages": [[2, 3]]}), source)
+    engine = _DummyEngine()
+    engine.tokenizer = bpe_tokenizer
+    destination = tmp_path / "pages-out.parquet"
+    embed_parquet(engine, source, destination, per_ocr_page=True, chunk=True,
+                  include_chunk_text=True, skip_empty=True, max_chunk_tokens=12,
+                  overlap=0, keep_cols=["id"], encode_batch_rows=2, progress_every=0)
+    records = pq.read_table(destination).drop(["vector"]).to_pylist()
+    assert all(record["ocr_page_number"] == 2 and record["id"] == 7 for record in records)
+    assert records[0]["char_start"] == 0 and records[-1]["char_end"] == len(pages[1])
+    assert "".join(record["chunk_text"] for record in records) == pages[1]
+    for record in records:
+        assert record["chunk_text"] == pages[1][record["char_start"]:record["char_end"]]
+        assert record["token_count"] == len(bpe_tokenizer.encode(record["chunk_text"]))
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"batch_rows": 0}, "batch_rows must be positive"),
+    ({"encode_batch_rows": -1}, "encode_batch_rows must be positive"),
+    ({"shard_rows": 0}, "shard_rows must be positive"),
+    ({"max_length": 0}, "max_length must be positive"),
+    ({"max_length": 513}, "max_length must be positive"),
+    ({"chunk": True, "max_chunk_tokens": 513}, "max_chunk_tokens must be positive"),
+    ({"max_chunk_tokens": 0}, "max_chunk_tokens must be positive"),
+])
+def test_parquet_rejects_invalid_batch_and_sequence_limits(tmp_path: Path, kwargs: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        embed_parquet(_DummyEngine(), tmp_path / "missing.parquet", tmp_path / "out", **kwargs)
+
+
+def test_parquet_cli_controls_and_forwarding(monkeypatch, tmp_path: Path) -> None:
+    import argparse
+    from types import SimpleNamespace
+    import fast_shared.cli_common as cli
+
+    parser = argparse.ArgumentParser()
+    cli.add_parquet_arguments(parser, mode_choices=["gpu"], default_mode="gpu")
+    defaults = parser.parse_args(["--input", "in", "--output", "out"])
+    assert (defaults.max_body_tokens, defaults.max_chunk_tokens, defaults.encode_batch_rows, defaults.overlap) == (None, 512, 4096, 51)
+    args = parser.parse_args(["--input", "in", "--output", "out", "--chunk", "--batch-rows", "2",
+                              "--encode-batch-rows", "3", "--shard-rows", "4", "--max-chunk-tokens", "128",
+                              "--chunk-overlap", "7", "--max-body-tokens", "64"])
+    captured = {}
+    engine = object()
+
+    def fake_embed(given_engine, source, destination, **kwargs):
+        assert given_engine is engine and source == "in" and destination == "out"
+        captured.update(kwargs)
+        return SimpleNamespace(input_files=1, rows_read=2, rows_emitted=3, total_tokens=4,
+                               elapsed_seconds=1, tokens_per_sec=4, rows_per_sec=3, output_path=tmp_path)
+
+    monkeypatch.setattr(cli, "embed_parquet", fake_embed)
+    assert cli.run_parquet_command(args, lambda _: engine) == 0
+    assert {name: captured[name] for name in ("batch_rows", "encode_batch_rows", "shard_rows", "max_chunk_tokens", "overlap", "max_body_tokens")} == {
+        "batch_rows": 2, "encode_batch_rows": 3, "shard_rows": 4, "max_chunk_tokens": 128, "overlap": 7, "max_body_tokens": 64
+    }
+
+
+def test_parquet_and_http_server_generic_dim(tmp_path: Path) -> None:
+    eng = _DummyEngine()
+    in_p = tmp_path / "in.parquet"
+    rows = [{"id": i, "body": f"Doc number {i} content"} for i in range(6)]
+    pq.write_table(pa.Table.from_pylist(rows), in_p)
+
+    out_p = tmp_path / "out.parquet"
+    summary = embed_parquet(eng, in_p, out_p, text_col="body", dtype="float16", progress_every=0)
+    assert summary.rows_emitted == 6
+    tbl = pq.read_table(out_p)
+    assert tbl.schema.field("vector").type == pa.list_(pa.float16(), 16)
+
+    with EmbeddingHTTPServer(eng, host="127.0.0.1", port=0) as srv:
+        base = f"http://{srv.host}:{srv.port}"
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+            health = json.loads(r.read().decode())
+            assert health["dim"] == 16 and health["model"] == "dummy-emb"
+        req = urllib.request.Request(
+            f"{base}/v1/embeddings",
+            data=json.dumps({"input": ["alpha", "beta"]}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            payload = json.loads(r.read().decode())
+            assert len(payload["data"]) == 2
+            assert len(payload["data"][0]["embedding"]) == 16
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as r:
+            models = json.loads(r.read().decode())
+            assert [m["id"] for m in models["data"]] == ["dummy-emb"]
+
+
+class _DummyGenItem:
+    def __init__(self, text: str, prompt_tokens: int = 5, completion_tokens: int = 3, finish_reason: str = "stop") -> None:
+        self.text = text
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.finish_reason = finish_reason
+
+
+class _DummyGenResult:
+    def __init__(self, items, stats):
+        self.items = items
+        self.stats = stats
+
+
+class _DummyChatEngine:
+    model_name = "dummy-gemma4"
+    ane_available = False
+    default_mode = "gpu"
+
+    def generate_batch(self, prompts, **kwargs):
+        schema = kwargs.get("json_schema")
+        items = []
+        for p in prompts:
+            label = p[-1]["content"] if isinstance(p, list) else str(p)
+            txt = json.dumps({"echo": label, "has_schema": schema is not None})
+            items.append(_DummyGenItem(txt))
+        return _DummyGenResult(items, {"docs": len(prompts)})
+
+
+def test_unified_openai_server_routes_and_sse() -> None:
+    import urllib.error
+
+    emb = _DummyEngine()
+    chat = _DummyChatEngine()
+    with UnifiedOpenAIServer(
+        embedding_engines={"BAAI/bge-small-en-v1.5": emb},
+        chat_engines={"google/gemma-4-E2B-it": chat},
+        host="127.0.0.1",
+        port=0,
+    ) as srv:
+        base = f"http://{srv.host}:{srv.port}"
+
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+            h = json.loads(r.read().decode())
+            assert h["status"] == "ok"
+            assert "BAAI/bge-small-en-v1.5" in h["embedding_models"]
+            assert "google/gemma-4-E2B-it" in h["chat_models"]
+
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as r:
+            m = json.loads(r.read().decode())
+            ids = {row["id"] for row in m["data"]}
+            assert ids == {"BAAI/bge-small-en-v1.5", "google/gemma-4-E2B-it"}
+        with urllib.request.urlopen(f"{base}/v1/models/google%2Fgemma-4-E2B-it", timeout=5) as r:
+            one = json.loads(r.read().decode())
+            assert one["id"] == "google/gemma-4-E2B-it"
+
+        # Embedding route (float + base64)
+        emb_req = urllib.request.Request(
+            f"{base}/v1/embeddings",
+            data=json.dumps({"model": "BAAI/bge-small-en-v1.5", "input": "hello"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(emb_req, timeout=5) as r:
+            emb_res = json.loads(r.read().decode())
+            assert len(emb_res["data"][0]["embedding"]) == 16
+
+        import base64
+        emb_b64_req = urllib.request.Request(
+            f"{base}/v1/embeddings",
+            data=json.dumps({"model": "BAAI/bge-small-en-v1.5", "input": "hello", "encoding_format": "base64"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(emb_b64_req, timeout=5) as r:
+            b64_res = json.loads(r.read().decode())
+            vec_b64 = np.frombuffer(base64.b64decode(b64_res["data"][0]["embedding"]), dtype="<f4")
+            assert vec_b64.shape == (16,)
+
+        # Chat JSON schema + extra_body route
+        chat_req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=json.dumps({
+                "model": "google/gemma-4-E2B-it",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_object"},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(chat_req, timeout=5) as r:
+            chat_res = json.loads(r.read().decode())
+            parsed = json.loads(chat_res["choices"][0]["message"]["content"])
+            assert parsed == {"echo": "hi", "has_schema": True}
+
+        # Streaming SSE completion route
+        sse_req = urllib.request.Request(
+            f"{base}/v1/completions",
+            data=json.dumps({
+                "model": "google/gemma-4-E2B-it",
+                "prompt": ["p1", "p2"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(sse_req, timeout=5) as r:
+            raw_sse = r.read().decode()
+            assert "data: [DONE]" in raw_sse
+            first_line = raw_sse.splitlines()[0]
+            ev = json.loads(first_line.removeprefix("data: "))
+            assert len(ev["choices"]) == 2
+            assert ev["usage"]["total_tokens"] == 16
+
+        # Unknown model returns 404
+        bad_req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=json.dumps({"model": "missing", "messages": [{"role": "user", "content": "x"}]}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad_req, timeout=5)
+            raise AssertionError("Expected 404 for unknown model")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+
+def test_matryoshka_dimensions_and_server_cpu(tmp_path: Path) -> None:
+    import base64
+    import urllib.error
+
+    rng = np.random.default_rng(123)
+    raw = rng.standard_normal((5, 16)).astype(np.float32)
+    full_normed = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+    via_full = truncate_and_normalize(full_normed, 8)
+    direct = raw[:, :8] / np.linalg.norm(raw[:, :8], axis=1, keepdims=True)
+    assert np.allclose(via_full, direct, atol=1e-6)
+    assert np.allclose(np.linalg.norm(via_full, axis=1), 1.0, atol=1e-6)
+    assert truncate_and_normalize(raw[0], 4).shape == (4,)
+    assert truncate_and_normalize(np.empty((0, 16), dtype=np.float32), 8).shape == (0, 8)
+
+    assert resolve_embedding_dim(None, max_dim=16, default_dim=8) == 8
+    assert resolve_embedding_dim(12, max_dim=16) == 12
+    for bad in (0, -4, 17, True, 8.5, "8"):
+        with pytest.raises(ValueError):
+            resolve_embedding_dim(bad, max_dim=16)
+    with pytest.raises(ValueError):
+        resolve_embedding_dim(8, max_dim=16, supports_dimensions=False)
+
+    class _MrlDummyEngine(_DummyEngine):
+        max_dim = 16
+        supports_dimensions = True
+        mrl_dimensions = (4, 8, 16)
+
+    mrl_eng = _MrlDummyEngine()
+    non_mrl_eng = _DummyEngine()
+
+    in_p = tmp_path / "mrl_in.parquet"
+    out_p = tmp_path / "mrl_out.parquet"
+    pq.write_table(pa.Table.from_pylist([{"body": "one"}, {"body": "two"}]), in_p)
+    embed_parquet(mrl_eng, in_p, out_p, text_col="body", dtype="float16", dimensions=8, progress_every=0)
+    tbl = pq.read_table(out_p)
+    assert tbl.schema.field("vector").type == pa.list_(pa.float16(), 8)
+    arr = np.asarray(tbl["vector"].to_pylist(), dtype=np.float32)
+    assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=5e-3)
+
+    with UnifiedOpenAIServer(
+        embedding_engines={"mrl": mrl_eng, "fixed": non_mrl_eng},
+        host="127.0.0.1",
+        port=0,
+    ) as srv:
+        base = f"http://{srv.host}:{srv.port}"
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+            h = json.loads(r.read().decode())
+            assert h["embedding_models"]["mrl"]["max_dim"] == 16
+            assert h["embedding_models"]["mrl"]["mrl_dimensions"] == [4, 8, 16]
+
+        for fmt in ("float", "base64"):
+            req = urllib.request.Request(
+                f"{base}/v1/embeddings",
+                data=json.dumps({"model": "mrl", "input": ["a", "b"], "dimensions": 8, "encoding_format": fmt}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                body = json.loads(r.read().decode())
+                for row in body["data"]:
+                    vec = (
+                        np.frombuffer(base64.b64decode(row["embedding"]), dtype="<f4")
+                        if fmt == "base64"
+                        else np.asarray(row["embedding"], dtype=np.float32)
+                    )
+                    assert vec.shape == (8,)
+                    assert np.isclose(np.linalg.norm(vec), 1.0, atol=1e-5)
+
+        for bad_payload in (
+            {"model": "fixed", "input": "a", "dimensions": 8},
+            {"model": "mrl", "input": "a", "dimensions": 32},
+            {"model": "mrl", "input": [], "dimensions": -1},
+        ):
+            bad_req = urllib.request.Request(
+                f"{base}/v1/embeddings",
+                data=json.dumps(bad_payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(bad_req, timeout=5)
+            assert exc.value.code == 400
+
+
+def test_promoted_llm_server_pipeline_and_grammar_cpu(tmp_path: Path) -> None:
+    import concurrent.futures
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from fast_shared import (
+        ManagedHTTPServer,
+        OpenAIChatAdapter,
+        extract_jsonl,
+        extract_parquet,
+        make_chat_handler,
+        slice_first_pages_utf8,
+        validate_json_against_schema,
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {"q": {"type": "string"}, "n": {"type": "integer", "minimum": 0}},
+        "required": ["q"],
+        "additionalProperties": False,
+    }
+    validate_json_against_schema({"q": "ok", "n": 2}, schema)
+    with pytest.raises(ValueError):
+        validate_json_against_schema({"q": "ok", "n": -1}, schema)
+
+    p1, p2 = "Page1\n", "Page2\n"
+    assert slice_first_pages_utf8(p1 + p2, [0, len(p1.encode()), len((p1 + p2).encode())], 1) == p1
+
+    class _CoalesceEngine:
+        model_name = "dummy-llm"
+        default_mode = "auto"
+        ane_available = False
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self._lock = threading.Lock()
+
+        def generate_batch(self, prompts, **kwargs):
+            with self._lock:
+                self.calls.append(len(prompts))
+            time.sleep(0.02)
+            items = [
+                SimpleNamespace(
+                    text=json.dumps({"q": p[-1]["content"] if isinstance(p, list) else str(p)}),
+                    reasoning="brief-cot" if kwargs.get("reasoning_effort") == "low" else None,
+                    parsed={"q": "x"},
+                    prompt_tokens=6,
+                    completion_tokens=4,
+                    valid_json=True,
+                    valid_schema=True,
+                    finish_reason="stop",
+                )
+                for p in prompts
+            ]
+            return SimpleNamespace(
+                items=items,
+                stats={
+                    "docs": len(prompts),
+                    "valid_json_count": len(items),
+                    "valid_schema_count": len(items),
+                    "prompt_tokens": 6 * len(items),
+                    "completion_tokens": 4 * len(items),
+                    "decode_sec": 0.05,
+                },
+            )
+
+    eng = _CoalesceEngine()
+    adapter = OpenAIChatAdapter(eng, owned_by="openai", extra_key="fast_gpt_oss", coalesce_ms=20.0, max_batch_size=16)
+    with ManagedHTTPServer(make_chat_handler(adapter), host="127.0.0.1", port=0) as srv:
+        base = f"http://{srv.host}:{srv.port}"
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+            h = json.loads(r.read().decode())
+            assert h["model"] == "dummy-llm" and h["coalesce_ms"] == 20.0
+
+        def _hit(i: int) -> dict:
+            req = urllib.request.Request(
+                f"{base}/v1/chat/completions",
+                data=json.dumps({
+                    "messages": [{"role": "user", "content": f"m-{i}"}],
+                    "response_format": {"type": "json_schema", "json_schema": {"name": "s", "schema": schema}},
+                    "extra_body": {"reasoning_effort": "low"},
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode())
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            out = list(pool.map(_hit, range(4)))
+        assert len(out) == 4
+        assert out[0]["choices"][0]["message"]["reasoning"] == "brief-cot"
+        assert "fast_gpt_oss" in out[0]
+        assert len(eng.calls) < 4
+
+    in_jsonl = tmp_path / "in.jsonl"
+    out_jsonl = tmp_path / "out.jsonl"
+    in_jsonl.write_text('{"id":1,"text":"hello"}\n{"id":2,"text":"world"}\n', encoding="utf-8")
+    extract_jsonl(eng, in_jsonl, out_jsonl, system_prompt="sys", json_schema=schema)
+    assert len(out_jsonl.read_text(encoding="utf-8").splitlines()) == 2
+
+    in_pq = tmp_path / "in.parquet"
+    out_dir = tmp_path / "shards"
+    pq.write_table(pa.table({"id": [1, 2], "body_text": ["alpha", "beta"]}), in_pq)
+    summary = extract_parquet(eng, in_pq, out_dir, system_prompt="sys", json_schema=schema, drop_text_col=True)
+    assert summary.docs_processed == 2 and summary.valid_schema == 2
+    resumed = extract_parquet(eng, in_pq, out_dir, system_prompt="sys", json_schema=schema, resume=True)
+    assert resumed.docs_processed == 0
+
+
+def test_promoted_grammar_helper_cpu() -> None:
+    # Lazy llguidance verification (skipped automatically if optional [llm] extra not installed)
+    llg = pytest.importorskip("llguidance")
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.grammar import GrammarHelper
+
+    assert llg is not None
+    vocab = {"<|endoftext|>": 0, "{": 1, '"': 2, "a": 3, ":": 4, "1": 5, "}": 6}
+    bt = Tokenizer(BPE(vocab=vocab, merges=[]))
+    bt.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bt.decoder = ByteLevelDecoder(add_prefix_space=False)
+    ltok = llg.LLTokenizer(bt.to_str(), eos_token=0)
+    gh = GrammarHelper(
+        ltok,
+        {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": False},
+        whitespace_flexible=False,
+        eos_token_id=0,
+    )
+    assert gh.upfront_ff == [1, 2, 3, 2, 4]
+    m = gh.new_matcher()
+    called = [0]
+
+    def _lazy():
+        called[0] += 1
+        return np.zeros(len(vocab), dtype=np.float32)
+
+    tok_id, masked = gh.pick_valid_token(m, _lazy, 5)
+    assert tok_id == 5 and not masked and called[0] == 0
+
+    tok_id2, masked2 = gh.pick_valid_token(m, lambda: np.array([0, 0, 0, 0, 0, 10.0, 0], dtype=np.float32), 6)
+    assert tok_id2 == 5 and masked2 is True
+
+
+def test_roofline_audit_bench_and_plugin_cpu(tmp_path: Path) -> None:
+    import struct
+    from fast_shared import (
+        audit_safetensors_weights,
+        check_system_quiescence,
+        check_tensor_dtypes,
+        compute_model_roofline,
+        cos_sim,
+        read_safetensors_headers,
+    )
+
+    # Synthetic safetensors file exercising header parsing + category/bit accounting
+    st_header = json.dumps({
+        "__metadata__": {"format": "mlx"},
+        "model.embed_tokens.weight": {"dtype": "BF16", "shape": [100, 64], "data_offsets": [0, 12800]},
+        "model.layers.0.self_attn.q_proj.weight": {"dtype": "U32", "shape": [64, 8], "data_offsets": [12800, 14848]},
+        "model.layers.0.self_attn.q_proj.scales": {"dtype": "BF16", "shape": [64, 1], "data_offsets": [14848, 14976]},
+        "model.layers.0.mlp.experts.0.gate_up_proj.weight": {"dtype": "U32", "shape": [64, 8], "data_offsets": [14976, 17024]},
+        "model.layers.0.mlp.experts.0.gate_up_proj.scales": {"dtype": "U8", "shape": [64, 2], "data_offsets": [17024, 17152]},
+    }).encode("utf-8")
+    st_path = tmp_path / "model.safetensors"
+    with st_path.open("wb") as f:
+        f.write(struct.pack("<Q", len(st_header)))
+        f.write(st_header)
+        f.write(b"\x00" * 17152)
+
+    tensors = read_safetensors_headers(tmp_path)
+    assert len(tensors) == 5
+    anatomy = audit_safetensors_weights(tensors)
+    assert anatomy["total_bytes"] == 17152
+    assert "mlp_or_moe" in anatomy["effective_precision"]
+
+    moe_cfg = {
+        "num_hidden_layers": 24,
+        "hidden_size": 2880,
+        "intermediate_size": 2880,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "vocab_size": 201088,
+        "tie_word_embeddings": False,
+        "num_local_experts": 32,
+        "num_experts_per_tok": 4,
+        "sliding_window": 128,
+        "layer_types": ["sliding_attention", "full_attention"] * 12,
+    }
+    roof = compute_model_roofline(moe_cfg, 11_180_000_000, gpu_tf=7.4, dram_gbs=200.0, ctx=2048)
+    assert roof["kv_kib_per_tok"] == 24.0
+    assert roof["decode"][0]["B"] == 1 and roof["decode"][0]["regime"] == "MEM-BW"
+    assert roof["decode"][-1]["B"] == 256 and roof["decode"][-1]["regime"] == "COMPUTE"
+
+    # Bench & dtype guard helpers
+    assert abs(cos_sim(np.array([1.0, 2.0]), np.array([2.0, 4.0])) - 1.0) < 1e-9
+    flags = check_tensor_dtypes([
+        ("sinks_f32", mx.zeros((4,), dtype=mx.float32)),
+        ("k_cache", mx.zeros((4,), dtype=mx.float32)),
+        ("q_proj", mx.zeros((4,), dtype=mx.float16)),
+    ])
+    assert len(flags) == 1 and "k_cache" in flags[0]
+    assert isinstance(check_system_quiescence(), list)
+
+    # Plugin manifests & skill directory structure
+    repo_root = Path(__file__).resolve().parents[1]
+    c_manifest = json.loads((repo_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    x_manifest = json.loads((repo_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    m_manifest = json.loads((repo_root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+    assert c_manifest["skills"] == "./skills/" and x_manifest["skills"] == "./skills/"
+    assert m_manifest["plugins"][0]["name"] == "apple-silicon-ml-optimizer"
+    skill_dir = repo_root / "skills" / "apple-silicon-ml-optimizer"
+    assert (skill_dir / "SKILL.md").is_file()
+    for rel in (
+        "references/m4-vs-m5-architecture.md",
+        "references/kernel-and-dtype-playbook.md",
+        "references/dead-ends-registry.md",
+        "scripts/probe_silicon_ceilings.py",
+        "scripts/probe_mpp_metal4.mm",
+        "scripts/probe_ane_and_hetero.mm",
+        "scripts/audit_safetensors_model.py",
+        "scripts/ab_bench_harness.py",
+    ):
+        assert (skill_dir / rel).is_file()
+
+
+def test_grammar_fallback_and_temperature_was_masked_cpu() -> None:
+    llg = pytest.importorskip("llguidance")
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.grammar import GrammarHelper
+
+    vocab = {"<|endoftext|>": 0, "{": 1, '"': 2, "a": 3, ":": 4, "1": 5, "2": 6, "}": 7}
+    bt = Tokenizer(BPE(vocab=vocab, merges=[]))
+    bt.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bt.decoder = ByteLevelDecoder(add_prefix_space=False)
+    ltok = llg.LLTokenizer(bt.to_str(), eos_token=0)
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    # Pruned helper drops both valid digit tokens `5` ("1") and `6` ("2").
+    pruned_gh = GrammarHelper(
+        ltok,
+        schema,
+        new_to_old=np.array([0, 1, 2, 3, 4, 7], dtype=np.int32),
+        whitespace_flexible=False,
+        eos_token_id=0,
+    )
+    m_pruned = pruned_gh.new_matcher()
+    pruned_logits = np.full(6, -10.0, dtype=np.float32)
+    full_logits = np.full(len(vocab), -10.0, dtype=np.float32)
+    full_logits[5] = -2.0  # lowest valid bit
+    full_logits[6] = 15.0  # higher-logit valid token ("2")
+
+    # 1a. Full-vocab fallback must score valid candidates against unpruned logits (not lowest bit 5).
+    tok_fb, masked_fb = pruned_gh.pick_valid_token(
+        m_pruned,
+        pruned_logits,
+        0,
+        fallback_to_full_vocab=True,
+        full_logits_1d=full_logits,
+    )
+    assert tok_fb == 6 and masked_fb is True
+
+    # 1b. Passing full-vocab array directly as logits_1d also ranks properly.
+    m_pruned2 = pruned_gh.new_matcher()
+    tok_fb2, masked_fb2 = pruned_gh.pick_valid_token(
+        m_pruned2,
+        full_logits,
+        0,
+        fallback_to_full_vocab=True,
+    )
+    assert tok_fb2 == 6 and masked_fb2 is True
+
+    # 1c. Missing unpruned logits with no EOS allowed raises ValueError instead of blind lowest-bit pick.
+    m_pruned3 = pruned_gh.new_matcher()
+    with pytest.raises(ValueError, match="full_logits_1d"):
+        pruned_gh.pick_valid_token(
+            m_pruned3,
+            pruned_logits,
+            0,
+            fallback_to_full_vocab=True,
+        )
+
+    # 2. Temperature > 0 returns was_masked=True when unconstrained argmax is disallowed, False when allowed.
+    full_gh = GrammarHelper(ltok, schema, whitespace_flexible=False, eos_token_id=0)
+    m_temp = full_gh.new_matcher()
+    logits_bad_argmax = np.full(len(vocab), -50.0, dtype=np.float32)
+    logits_bad_argmax[5] = 2.0
+    logits_bad_argmax[6] = 3.0
+    logits_bad_argmax[7] = 100.0  # '}' disallowed before integer digit
+    tok_t1, masked_t1 = full_gh.pick_valid_token(
+        m_temp,
+        logits_bad_argmax,
+        7,
+        temperature=0.8,
+        rng=np.random.default_rng(0),
+    )
+    assert tok_t1 in (5, 6) and masked_t1 is True
+
+    logits_ok_argmax = np.full(len(vocab), -50.0, dtype=np.float32)
+    logits_ok_argmax[5] = 100.0  # '1' allowed
+    logits_ok_argmax[6] = 2.0
+    tok_t2, masked_t2 = full_gh.pick_valid_token(
+        m_temp,
+        logits_ok_argmax,
+        5,
+        temperature=0.8,
+        rng=np.random.default_rng(0),
+    )
+    assert tok_t2 in (5, 6) and masked_t2 is False
+
+
+def test_pipeline_resume_atomic_and_roll_slots_cpu(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from fast_shared.pipeline_llm import extract_jsonl, extract_parquet
+
+    schema = {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
+    n_docs = 300
+    in_pq = tmp_path / "in.parquet"
+    pq.write_table(
+        pa.table({"id": list(range(n_docs)), "body_text": [f"doc-{i}" for i in range(n_docs)]}),
+        in_pq,
+    )
+    out_dir = tmp_path / "shards"
+
+    class _Pass1Engine:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_batch(self, prompts, **kwargs):
+            self.calls.append({"n": len(prompts), **kwargs})
+            items = []
+            vs_cnt = 0
+            for p in prompts:
+                doc_idx = int(p.split("-")[1])
+                if doc_idx == 0:
+                    # Schema failure must be retried on --resume
+                    items.append(SimpleNamespace(
+                        text='{"bad":1}', parsed=None, valid_json=True, valid_schema=False,
+                        finish_reason="stop", prompt_tokens=4, completion_tokens=3,
+                    ))
+                elif doc_idx == 1:
+                    # Truncated length row must be retried on --resume even if valid_schema wasn't False
+                    items.append(SimpleNamespace(
+                        text='{"id":1', parsed=None, valid_json=False, valid_schema=True,
+                        finish_reason="length", prompt_tokens=4, completion_tokens=8,
+                    ))
+                else:
+                    vs_cnt += 1
+                    items.append(SimpleNamespace(
+                        text=f'{{"id":{doc_idx}}}', parsed={"id": doc_idx}, valid_json=True, valid_schema=True,
+                        finish_reason="stop", prompt_tokens=4, completion_tokens=3,
+                    ))
+            return SimpleNamespace(
+                items=items,
+                stats={
+                    "docs": len(prompts),
+                    "valid_json_count": len(prompts) - 1,
+                    "valid_schema_count": vs_cnt,
+                    "prompt_tokens": 4 * len(prompts),
+                    "completion_tokens": 3 * len(prompts),
+                    "decode_sec": 0.05,
+                },
+            )
+
+    eng1 = _Pass1Engine()
+    sum1 = extract_parquet(
+        eng1,
+        in_pq,
+        out_dir,
+        system_prompt="sys",
+        json_schema=schema,
+        roll_slots=256,
+        shard_rows=1000,
+    )
+    assert sum1.docs_processed == n_docs
+    # roll_slots=256 must NOT be clamped to 128 in iter_batches or gen_kw["batch_size"]
+    assert eng1.calls[0]["n"] == 256 and eng1.calls[0]["batch_size"] == 256
+    shard0 = pq.read_table(out_dir / "part-00000.parquet")
+    assert "finish_reason" in shard0.column_names
+    assert shard0.column("finish_reason").to_pylist()[1] == "length"
+
+    class _Pass2Engine:
+        def __init__(self) -> None:
+            self.seen_prompts: list[str] = []
+
+        def generate_batch(self, prompts, **kwargs):
+            self.seen_prompts.extend(prompts)
+            items = [
+                SimpleNamespace(
+                    text=f'{{"id":{int(p.split("-")[1])}}}',
+                    parsed={"id": int(p.split("-")[1])},
+                    valid_json=True,
+                    valid_schema=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                )
+                for p in prompts
+            ]
+            return SimpleNamespace(
+                items=items,
+                stats={
+                    "docs": len(prompts),
+                    "valid_json_count": len(prompts),
+                    "valid_schema_count": len(prompts),
+                    "prompt_tokens": 4 * len(prompts),
+                    "completion_tokens": 3 * len(prompts),
+                    "decode_sec": 0.02,
+                },
+            )
+
+    eng2 = _Pass2Engine()
+    sum2 = extract_parquet(
+        eng2,
+        in_pq,
+        out_dir,
+        system_prompt="sys",
+        json_schema=schema,
+        roll_slots=256,
+        resume=True,
+    )
+    assert eng2.seen_prompts == ["doc-0", "doc-1"]
+    assert sum2.docs_processed == 2
+
+    # Next --resume pass skips everything cleanly once repaired
+    eng3 = _Pass2Engine()
+    sum3 = extract_parquet(eng3, in_pq, out_dir, system_prompt="sys", json_schema=schema, resume=True)
+    assert sum3.docs_processed == 0 and eng3.seen_prompts == []
+
+    # Crash during shard write must leave NO partial/final part-*.parquet or .tmp file
+    crash_in = tmp_path / "crash.parquet"
+    crash_out = tmp_path / "crash_shards"
+    pq.write_table(pa.table({"id": [1, 2, 3, 4], "body_text": ["a", "b", "c", "d"]}), crash_in)
+
+    class _CrashingEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_batch(self, prompts, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("boom")
+            items = [
+                SimpleNamespace(
+                    text='{"id":1}', parsed={"id": 1}, valid_json=True, valid_schema=True,
+                    finish_reason="stop", prompt_tokens=2, completion_tokens=2,
+                )
+                for _ in prompts
+            ]
+            return SimpleNamespace(items=items, stats={"valid_json_count": 2, "valid_schema_count": 2})
+
+    with pytest.raises(RuntimeError, match="boom"):
+        extract_parquet(
+            _CrashingEngine(),
+            crash_in,
+            crash_out,
+            system_prompt="sys",
+            json_schema=schema,
+            batch_rows=2,
+            shard_rows=10,
+        )
+    assert list(crash_out.glob("*")) == []
+
+    # extract_jsonl atomic write & finish_reason
+    in_jl = tmp_path / "in.jsonl"
+    out_jl = tmp_path / "out.jsonl"
+    in_jl.write_text('{"id":0,"text":"doc-0"}\n', encoding="utf-8")
+    extract_jsonl(eng2, in_jl, out_jl, system_prompt="sys", json_schema=schema)
+    rec0 = json.loads(out_jl.read_text(encoding="utf-8").splitlines()[0])
+    assert rec0["finish_reason"] == "stop"
+
+
+
+
+def test_parquet_async_writer_overlaps_encode_and_propagates_errors(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+    import fast_shared.parquet_pipeline as pp
+
+    n_rows = 12
+    tbl = pa.table({"id": list(range(n_rows)), "text": [f"doc {i}" for i in range(n_rows)]})
+    in_p = tmp_path / "in.parquet"
+    pq.write_table(tbl, in_p)
+
+    # 1) Sharded async writer must overlap batch (k+1) encode with batch (k) Parquet write
+    events: list[tuple[str, int, float, float]] = []
+    ev_lock = threading.Lock()
+    orig_write_table = pp.pq.write_table
+    shard_call_idx = 0
+
+    def slow_write_table(table, where, *args, **kwargs):
+        nonlocal shard_call_idx
+        with ev_lock:
+            idx = shard_call_idx
+            shard_call_idx += 1
+        t0 = time.perf_counter()
+        time.sleep(0.06)
+        orig_write_table(table, where, *args, **kwargs)
+        t1 = time.perf_counter()
+        with ev_lock:
+            events.append(("write", idx, t0, t1))
+
+    class _SlowEngine(_DummyEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self._enc_idx = 0
+
+        def encode_corpus(self, tok_lists, mode=None):
+            idx = self._enc_idx
+            self._enc_idx += 1
+            t0 = time.perf_counter()
+            time.sleep(0.06)
+            out = super().encode_corpus(tok_lists, mode=mode)
+            t1 = time.perf_counter()
+            with ev_lock:
+                events.append(("encode", idx, t0, t1))
+            return out
+
+    monkeypatch.setattr(pp.pq, "write_table", slow_write_table)
+    out_dir = tmp_path / "shards_async"
+    eng = _SlowEngine()
+    stats = embed_parquet(
+        eng,
+        input_path=in_p,
+        output_path=out_dir,
+        batch_rows=4,
+        shard_rows=4,
+        progress_every=0,
+    )
+    assert stats.rows_emitted == n_rows
+    enc_ev = {idx: (t0, t1) for kind, idx, t0, t1 in events if kind == "encode"}
+    wrt_ev = {idx: (t0, t1) for kind, idx, t0, t1 in events if kind == "write"}
+    assert len(enc_ev) == 3 and len(wrt_ev) == 3
+    assert enc_ev[1][0] < wrt_ev[0][1], (
+        f"Expected async writer overlap (encode[1] start {enc_ev[1][0]:.4f} < write[0] end {wrt_ev[0][1]:.4f})"
+    )
+    assert not list(out_dir.glob("*.tmp")) and not list(out_dir.glob(".*.tmp"))
+
+    # Reference parity against plain synchronous _DummyEngine values
+    ref_eng = _DummyEngine()
+    parts = sorted(out_dir.glob("part-*.parquet"))
+    assert len(parts) == 3
+    joined = pa.concat_tables([pq.read_table(p) for p in parts])
+    got_vecs = np.asarray(joined.column("vector").to_pylist(), dtype=np.float32)
+    txt_list = tbl.column("text").to_pylist()
+    exp_vecs = np.concatenate(
+        [ref_eng.encode_corpus(ref_eng.tokenizer.encode_batch(txt_list[k : k + 4])) for k in range(0, n_rows, 4)],
+        axis=0,
+    )
+    assert np.allclose(got_vecs, exp_vecs, atol=1e-6)
+
+    # 2) Single-file async writer overlap + parity + no leftover .tmp
+    events.clear()
+    orig_pw_write = pp.pq.ParquetWriter.write_table
+    pw_idx = 0
+
+    def slow_pw_write(self_pw, table, *args, **kwargs):
+        nonlocal pw_idx
+        with ev_lock:
+            idx = pw_idx
+            pw_idx += 1
+        t0 = time.perf_counter()
+        time.sleep(0.06)
+        orig_pw_write(self_pw, table, *args, **kwargs)
+        t1 = time.perf_counter()
+        with ev_lock:
+            events.append(("pw_write", idx, t0, t1))
+
+    monkeypatch.setattr(pp.pq.ParquetWriter, "write_table", slow_pw_write)
+    out_single = tmp_path / "single_async.parquet"
+    stats_single = embed_parquet(
+        _SlowEngine(),
+        input_path=in_p,
+        output_path=out_single,
+        batch_rows=4,
+        progress_every=0,
+    )
+    assert stats_single.rows_emitted == n_rows
+    enc_s = {idx: (t0, t1) for kind, idx, t0, t1 in events if kind == "encode"}
+    wrt_s = {idx: (t0, t1) for kind, idx, t0, t1 in events if kind == "pw_write"}
+    assert enc_s[1][0] < wrt_s[0][1], "Expected single-file async writer overlap"
+    assert out_single.exists() and not out_single.with_suffix(".parquet.tmp").exists()
+    got_single = np.asarray(pq.read_table(out_single).column("vector").to_pylist(), dtype=np.float32)
+    assert np.allclose(got_single, exp_vecs, atol=1e-6)
+
+    # 3) Error propagation & .tmp cleanup in both sharded and single-file modes
+    def fail_shard_write(table, where, *args, **kwargs):
+        if "part-00001" in str(where):
+            raise RuntimeError("simulated disk error")
+        orig_write_table(table, where, *args, **kwargs)
+
+    monkeypatch.setattr(pp.pq, "write_table", fail_shard_write)
+    err_dir = tmp_path / "shards_err"
+    with pytest.raises(RuntimeError, match="simulated disk error"):
+        embed_parquet(_DummyEngine(), input_path=in_p, output_path=err_dir, batch_rows=4, shard_rows=4, progress_every=0)
+    assert not list(err_dir.glob("*.tmp")) and not list(err_dir.glob(".*.tmp"))
+
+    def fail_pw_write(self_pw, table, *args, **kwargs):
+        raise RuntimeError("simulated single writer error")
+
+    monkeypatch.setattr(pp.pq.ParquetWriter, "write_table", fail_pw_write)
+    err_single = tmp_path / "err_single.parquet"
+    with pytest.raises(RuntimeError, match="simulated single writer error"):
+        embed_parquet(_DummyEngine(), input_path=in_p, output_path=err_single, batch_rows=4, progress_every=0)
+    assert not err_single.exists() and not err_single.with_suffix(".parquet.tmp").exists()
+
+
+def test_hw_check_baseline_and_warning_cpu(monkeypatch: Any, capsys: Any) -> None:
+    import fast_shared.hw_check as hc
+
+    ref = dict(hc.TESTED_REFERENCE_HARDWARE)
+    ok, mismatches, _ = hc.evaluate_hardware_support(ref)
+    assert ok is True and mismatches == []
+
+    other_mac = {
+        **ref,
+        "hw_model": "Mac15,6",
+        "brand": "Apple M3 Pro",
+        "mem_gb": 36,
+        "cpu_cores": 12,
+        "perf_cores": 6,
+        "eff_cores": 6,
+        "gpu_cores": 18,
+    }
+    ok2, mismatches2, _ = hc.evaluate_hardware_support(other_mac)
+    assert ok2 is False
+    assert any("Apple M3 Pro" in m for m in mismatches2)
+    assert any("36 GB" in m for m in mismatches2)
+    assert any("gpu_cores=18" in m for m in mismatches2)
+
+    monkeypatch.setattr(hc, "probe_host_hardware", lambda: other_mac)
+    monkeypatch.setattr(hc, "_WARNED", False)
+    monkeypatch.delenv("FAST_SILICON_NO_HW_WARN", raising=False)
+    assert hc.warn_if_untested_hardware() is False
+    err = capsys.readouterr().err
+    assert "WARNING: Untested hardware configuration detected!" in err
+    assert "48 GB Apple M4 Pro" in err
+    assert "14 CPU cores (10P + 4E)" in err
+    assert "20 GPU cores" in err
+
+    # Second call with once=True does not spam stderr again
+    assert hc.warn_if_untested_hardware() is False
+    assert capsys.readouterr().err == ""
+
+    # Opt-out env var silences stderr warning
+    monkeypatch.setattr(hc, "_WARNED", False)
+    monkeypatch.setenv("FAST_SILICON_NO_HW_WARN", "1")
+    assert hc.warn_if_untested_hardware(once=False) is False
+    assert capsys.readouterr().err == ""
+
+    assert hc.main(["--strict"]) == 2
+    capsys.readouterr()
+    assert hc.main(["--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["matched_tested_baseline"] is False
+    assert payload["tested_reference"]["gpu_cores"] == 20
+
+    # Matched host produces no stderr warning and exits 0 even with --strict
+    monkeypatch.setattr(hc, "probe_host_hardware", lambda: ref)
+    monkeypatch.setattr(hc, "_WARNED", False)
+    monkeypatch.delenv("FAST_SILICON_NO_HW_WARN", raising=False)
+    assert hc.warn_if_untested_hardware() is True
+    assert hc.main(["--strict"]) == 0
+    captured = capsys.readouterr()
+    assert "matches tested baseline" in captured.out
+    assert captured.err == ""
+
+
+def test_set_mlx_cache_limit_cpu(monkeypatch: Any) -> None:
+    import sys
+
+    prev = mx.set_cache_limit(64 * 1024 * 1024)
+    try:
+        applied = set_mlx_cache_limit(128)
+        assert applied == 128 * 1024 * 1024
+        assert mx.set_cache_limit(prev) == 128 * 1024 * 1024
+
+        assert set_mlx_cache_limit(0) == 0
+        assert mx.set_cache_limit(prev) == 0
+
+        assert set_mlx_cache_limit(-4) == 0
+        assert mx.set_cache_limit(prev) == 0
+    finally:
+        mx.set_cache_limit(prev)
+
+    for bad in (True, "128", 1.5):
+        with pytest.raises(ValueError):
+            set_mlx_cache_limit(bad)  # type: ignore[arg-type]
+
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+    assert set_mlx_cache_limit(512) is None
+
+
+def _write_safetensors(
+    path: Path,
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]],
+) -> None:
+    import struct
+
+    header: dict[str, Any] = {"__metadata__": {"format": "test"}}
+    offset = 0
+    chunks: list[bytes] = []
+    for name, (dtype_name, shape, payload) in tensors.items():
+        end = offset + len(payload)
+        header[name] = {
+            "dtype": dtype_name,
+            "shape": list(shape),
+            "data_offsets": [offset, end],
+        }
+        chunks.append(payload)
+        offset = end
+    hdr_bytes = json.dumps(header).encode("utf-8")
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", len(hdr_bytes)))
+        handle.write(hdr_bytes)
+        for chunk in chunks:
+            handle.write(chunk)
+
+
+def test_mapped_embedding_safetensors_cpu(tmp_path: Path) -> None:
+    # Exact BF16 bit patterns (lower 16 bits zeroed in float32)
+    raw_f32 = np.array(
+        [
+            [0.0, 1.0, -2.5, 3.25],
+            [-0.125, 4.5, 16.0, -32.0],
+            [0.5, -0.75, 128.0, 6.5],
+            [1.25, -8.0, 0.25, -1.5],
+        ],
+        dtype=np.float32,
+    )
+    bf16_u16 = (raw_f32.view(np.uint32) >> 16).astype("<u2")
+    bf16_path = tmp_path / "bf16.safetensors"
+    _write_safetensors(
+        bf16_path,
+        {
+            "other.bias": ("F32", (4,), np.zeros(4, dtype="<f4").tobytes()),
+            "model.embed_tokens.weight": ("BF16", raw_f32.shape, bf16_u16.tobytes()),
+        },
+    )
+
+    with MappedEmbedding(bf16_path, tensor_name="model.embed_tokens.weight") as emb:
+        assert emb.vocab_size == 4
+        assert emb.hidden_size == 4
+        assert emb.dtype == "BF16"
+
+        out_f32 = emb.gather(np.array([2, 0, 3], dtype=np.int32), out_dtype="float32")
+        assert out_f32.dtype == np.float32 and out_f32.shape == (3, 4)
+        assert np.array_equal(out_f32, raw_f32[[2, 0, 3]])
+
+        ids_2d = np.array([[1, 2], [0, 3]], dtype=np.int64)
+        out_f16 = emb.gather(ids_2d, out_dtype="float16")
+        assert out_f16.dtype == np.float16 and out_f16.shape == (2, 2, 4)
+        assert np.allclose(out_f16, raw_f32[ids_2d].astype(np.float16), atol=1e-3)
+
+        # 0D scalar and empty shape handling
+        assert np.array_equal(emb.gather(np.array(1), out_dtype="float32"), raw_f32[1])
+        empty_1d = emb.gather(np.empty((0,), dtype=np.int32), out_dtype="float16")
+        assert empty_1d.shape == (0, 4) and empty_1d.dtype == np.float16
+        empty_2d = emb.gather(np.empty((2, 0), dtype=np.int64), out_dtype="float32")
+        assert empty_2d.shape == (2, 0, 4) and empty_2d.dtype == np.float32
+        assert emb.gather([], out_dtype="float16").shape == (0, 4)
+
+        with pytest.raises(IndexError):
+            emb.gather(np.array([-1]))
+        with pytest.raises(IndexError):
+            emb.gather(np.array([4]))
+        with pytest.raises(TypeError):
+            emb.gather(np.array([0.5]))
+        with pytest.raises(TypeError):
+            emb.gather(np.array([True]))
+        with pytest.raises(ValueError, match="Unsupported out_dtype"):
+            emb.gather(np.array([0]), out_dtype="bfloat16")
+
+    with pytest.raises(ValueError, match="closed MappedEmbedding"):
+        emb.gather(np.array([0]))
+
+    # F16 + F32 via single-file model.safetensors directory
+    single_dir = tmp_path / "single_ckpt"
+    single_dir.mkdir()
+    f16_vals = raw_f32.astype("<f2")
+    _write_safetensors(
+        single_dir / "model.safetensors",
+        {
+            "model.embed_tokens.weight": ("F16", f16_vals.shape, f16_vals.tobytes()),
+            "extra.f32": ("F32", raw_f32.shape, raw_f32.astype("<f4").tobytes()),
+        },
+    )
+    with MappedEmbedding.from_checkpoint(single_dir) as emb_f16:
+        assert emb_f16.dtype == "F16"
+        assert np.array_equal(emb_f16.gather(np.array([0, 3]), out_dtype="float16"), f16_vals[[0, 3]])
+    with MappedEmbedding.from_checkpoint(single_dir, tensor_name="extra.f32") as emb_f32:
+        assert emb_f32.dtype == "F32"
+        assert np.array_equal(emb_f32.gather(np.array([1, 2]), out_dtype="float32"), raw_f32[[1, 2]])
+
+    # Sharded checkpoint directory via model.safetensors.index.json
+    sharded_dir = tmp_path / "sharded_ckpt"
+    sharded_dir.mkdir()
+    _write_safetensors(
+        sharded_dir / "model-00001-of-00002.safetensors",
+        {"layer0.weight": ("F32", (2, 2), np.ones((2, 2), dtype="<f4").tobytes())},
+    )
+    _write_safetensors(
+        sharded_dir / "model-00002-of-00002.safetensors",
+        {"language_model.embed_tokens.weight": ("BF16", raw_f32.shape, bf16_u16.tobytes())},
+    )
+    (sharded_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 1},
+                "weight_map": {
+                    "layer0.weight": "model-00001-of-00002.safetensors",
+                    "language_model.embed_tokens.weight": "model-00002-of-00002.safetensors",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with MappedEmbedding.from_checkpoint(
+        sharded_dir, tensor_name="language_model.embed_tokens.weight"
+    ) as emb_sharded:
+        assert emb_sharded.vocab_size == 4 and emb_sharded.hidden_size == 4
+        assert np.array_equal(emb_sharded.gather(np.array([1, 3]), out_dtype="float32"), raw_f32[[1, 3]])
+
+    with pytest.raises(KeyError):
+        MappedEmbedding.from_checkpoint(sharded_dir, tensor_name="missing.weight")
+    with pytest.raises(FileNotFoundError):
+        MappedEmbedding.from_checkpoint(tmp_path / "does_not_exist")
+
+
+def test_tile_aligned_slices_cpu() -> None:
+    assert tile_aligned_slices(0) == []
+    assert tile_aligned_slices(10, slice_len=512, min_tail=64) == [(0, 10)]
+    assert tile_aligned_slices(512, slice_len=512, min_tail=64) == [(0, 512)]
+    assert tile_aligned_slices(513, slice_len=512, min_tail=64) == [(0, 513)]
+    assert tile_aligned_slices(575, slice_len=512, min_tail=64) == [(0, 575)]
+    assert tile_aligned_slices(576, slice_len=512, min_tail=64) == [(0, 512), (512, 576)]
+    assert tile_aligned_slices(1087, slice_len=512, min_tail=64) == [(0, 512), (512, 1087)]
+    assert tile_aligned_slices(1088, slice_len=512, min_tail=64) == [(0, 512), (512, 1024), (1024, 1088)]
+    assert tile_aligned_slices(130, slice_len=64, min_tail=0) == [(0, 64), (64, 128), (128, 130)]
+
+    for bad_kwargs in (
+        {"seq_len": -1},
+        {"seq_len": 100, "slice_len": 0},
+        {"seq_len": 100, "slice_len": -16},
+        {"seq_len": 100, "min_tail": -1},
+        {"seq_len": True},
+    ):
+        with pytest.raises(ValueError):
+            tile_aligned_slices(**bad_kwargs)  # type: ignore[arg-type]
+
+
+def test_fault_injection_suite_cpu() -> None:
+    from contextlib import contextmanager
+
+    state = {"scale": 1.0, "permute": False, "explode": False}
+    calls = 0
+
+    def baseline_fn() -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        if state["explode"]:
+            raise RuntimeError("injected failure")
+        vec = np.array([1.0, 2.0, -3.0, 0.5], dtype=np.float32) * state["scale"]
+        if state["permute"]:
+            vec = vec[::-1].copy()
+        return vec
+
+    @contextmanager
+    def _patch(key: str, val: Any):
+        old = state[key]
+        state[key] = val
+        try:
+            yield
+        finally:
+            state[key] = old
+
+    cases = [
+        FaultInjectionCase(
+            name="scale_shift",
+            apply_fault=lambda: _patch("scale", 0.5),
+            min_delta=1.0,
+            metric="max_abs_diff",
+        ),
+        FaultInjectionCase(
+            name="permute_cos_drop",
+            apply_fault=lambda: _patch("permute", True),
+            min_delta=0.1,
+            metric="cos_drop",
+        ),
+        FaultInjectionCase(
+            name="noop_missed_fault",
+            apply_fault=lambda: _patch("scale", 1.0),
+            min_delta=1e-2,
+            metric="max_abs_diff",
+        ),
+        FaultInjectionCase(
+            name="expected_exception",
+            apply_fault=lambda: _patch("explode", True),
+            metric="raises",
+        ),
+        FaultInjectionCase(
+            name="missing_expected_exception",
+            apply_fault=lambda: _patch("scale", 1.0),
+            metric="raises",
+        ),
+        FaultInjectionCase(
+            name="unexpected_exception_in_delta_case",
+            apply_fault=lambda: _patch("explode", True),
+            min_delta=1e-2,
+            metric="max_abs_diff",
+        ),
+    ]
+
+    results = run_fault_injection_suite(baseline_fn, cases)
+    assert calls == 1 + len(cases)
+    assert state == {"scale": 1.0, "permute": False, "explode": False}
+    assert all(isinstance(r, FaultInjectionResult) for r in results)
+
+    by_name = {r.name: r for r in results}
+    assert by_name["scale_shift"].passed is True
+    assert np.isclose(by_name["scale_shift"].measured_delta, 1.5, atol=1e-6)
+    assert by_name["scale_shift"].error is None
+
+    assert by_name["permute_cos_drop"].passed is True
+    assert by_name["permute_cos_drop"].measured_delta > 0.1
+    assert by_name["permute_cos_drop"].error is None
+
+    assert by_name["noop_missed_fault"].passed is False
+    assert by_name["noop_missed_fault"].measured_delta == 0.0
+    assert by_name["noop_missed_fault"].error is None
+
+    assert by_name["expected_exception"].passed is True
+    assert by_name["expected_exception"].error is None
+
+    assert by_name["missing_expected_exception"].passed is False
+    assert by_name["missing_expected_exception"].error is not None
+
+    assert by_name["unexpected_exception_in_delta_case"].passed is False
+    assert "RuntimeError" in (by_name["unexpected_exception_in_delta_case"].error or "")
+
+    with pytest.raises(ValueError, match="metric"):
+        FaultInjectionCase(name="bad_metric", apply_fault=lambda: _patch("scale", 1.0), metric="unknown")
+    with pytest.raises(ValueError, match="min_delta"):
+        FaultInjectionCase(name="neg_delta", apply_fault=lambda: _patch("scale", 1.0), min_delta=-0.1)
+
+
+def test_unified_memory_footprint_darwin_cpu() -> None:
+    from fast_shared.bench import get_unified_memory_footprint, peak_footprint_gb
+
+    snap = get_unified_memory_footprint()
+    assert snap["phys_footprint_bytes"] > 0
+    assert snap["lifetime_max_phys_footprint_bytes"] >= snap["phys_footprint_bytes"]
+    assert snap["rss_bytes"] > 0
+    assert snap["peak_footprint_gb"] == pytest.approx(
+        snap["lifetime_max_phys_footprint_bytes"] / 1e9, rel=1e-9
+    )
+    assert peak_footprint_gb() == snap["peak_footprint_gb"]

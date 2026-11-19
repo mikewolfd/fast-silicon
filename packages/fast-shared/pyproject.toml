@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-shared"
+version = "0.1.0"
+description = "Shared Apple Silicon MLX/Metal-MPP/CoreML utilities and M4/M5 optimization plugin for fast-bge-small, fast-embeddinggemma-2, fast-gemma4, fast-gpt-oss, and fast-decision-models"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.30.0",
+    "numpy>=1.26.0",
+    "tokenizers>=0.20.0",
+    "pyarrow>=18.0.0",
+    "huggingface-hub>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+llm = [
+    "llguidance>=1.0.0",
+]
+
+[project.scripts]
+fast-silicon-hw-check = "fast_shared.hw_check:main"
+fast-silicon-probe = "fast_shared.roofline:main_probe"
+fast-silicon-audit = "fast_shared.roofline:main_audit"
+fast-bench-check = "fast_shared.bench:main"
+fast-ir-guard = "fast_shared.ir_dtype_guard:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fast_shared = ["include/*.hpp"]

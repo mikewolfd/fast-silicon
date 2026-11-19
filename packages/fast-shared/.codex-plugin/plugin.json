@@ -1,0 +1,6 @@
+{
+  "name": "apple-silicon-ml-optimizer",
+  "version": "0.1.0",
+  "description": "Apple Silicon M4 (Apple9) & M5+ (Apple10+ / NAX) ML inference and training optimization plugin: Metal 4 MPP, MLX rooflines, CoreML/ANE conv1x1, CPU SME, and ABBA contention-free benchmarking.",
+  "skills": "./skills/"
+}

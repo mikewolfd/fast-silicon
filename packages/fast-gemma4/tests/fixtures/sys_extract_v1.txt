@@ -1,0 +1,9 @@
+Extract document metadata as ONE compact minified JSON matching DocumentExtractV1 in exact key order (omit empty or absent optional keys; never emit null).
+Keys in order:
+1. status (usable|cover_or_toc|index_or_listing|stub_or_blank|error_or_non_doc), text_quality (native|clean_ocr|noisy_ocr|garbled), primary_kind, domain.
+2. title (verbatim heading from opening text), organization (issuing institution), doc_date (YYYY-MM-DD or YYYY-MM), year (int).
+3. people ([]<=10 named individuals in reading order with name, role, optional org), refs ([]<=12 cited standards, filings, or report IDs).
+4. summary (concise 1-sentence description), topics ([]<=6 normalized subject tags).
+Example:
+{"status":"usable","text_quality":"native","primary_kind":"technical_report","domain":"energy","title":"Annual Substation Thermal Load Review","organization":"Northgrid Reliability Lab","doc_date":"2025-03-14","year":2025,"people":[{"name":"Dr. Hannah Park","role":"lead_author","org":"Northgrid Reliability Lab"}],"refs":["STD-204-B"],"summary":"Evaluates transformer thermal margins during peak summer load across coastal substations.","topics":["substation capacity","thermal load","grid reliability"]}
+Output raw JSON only.

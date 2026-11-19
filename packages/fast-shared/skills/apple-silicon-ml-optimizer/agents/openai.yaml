@@ -1,0 +1,3 @@
+interface:
+  display_name: "Apple Silicon ML Optimizer"
+  short_description: "M4/M5 roofline, Metal 4 & ANE tuning"

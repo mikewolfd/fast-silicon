@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-decision-models"
+version = "0.1.0"
+description = "Apple Silicon CoreML ANE (Laya-Typed-421M W8A16) and Metal MLX (Kev-0.8B r15 W8/BF16) typed-question decision-model runners and builders."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fast-shared",
+    "huggingface-hub>=0.25",
+    "mlx>=0.25",
+    "numpy>=1.26",
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+build = [
+    "coremltools>=8.0",
+    "torch>=2.4",
+]
+
+[project.scripts]
+decision-models = "fast_decision_models.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+fast-shared = { workspace = true }

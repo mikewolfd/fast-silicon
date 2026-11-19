@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentExtractV1",
+  "description": "Compact key-ordered metadata schema for extracting structured attributes from document opening pages.",
+  "type": "object",
+  "required": ["status", "text_quality", "primary_kind", "domain"],
+  "additionalProperties": false,
+  "$defs": {
+    "doc_kind": {
+      "type": "string",
+      "enum": [
+        "technical_report",
+        "policy_brief",
+        "financial_filing",
+        "meeting_minutes",
+        "audit_memo",
+        "disclosure_form",
+        "press_release",
+        "correspondence",
+        "specification",
+        "other"
+      ]
+    }
+  },
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["usable", "cover_or_toc", "index_or_listing", "stub_or_blank", "error_or_non_doc"]
+    },
+    "text_quality": {
+      "type": "string",
+      "enum": ["native", "clean_ocr", "noisy_ocr", "garbled"]
+    },
+    "primary_kind": { "$ref": "#/$defs/doc_kind" },
+    "domain": {
+      "type": "string",
+      "enum": ["energy", "healthcare", "finance", "transportation", "cybersecurity", "environment", "education", "other"]
+    },
+    "title": { "type": "string" },
+    "organization": { "type": "string" },
+    "doc_date": { "type": "string" },
+    "year": { "type": "integer", "minimum": 1900, "maximum": 2100 },
+    "people": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["name", "role"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "role": { "type": "string" },
+          "org": { "type": "string" }
+        }
+      }
+    },
+    "refs": {
+      "type": "array",
+      "maxItems": 12,
+      "items": { "type": "string" }
+    },
+    "summary": { "type": "string" },
+    "topics": {
+      "type": "array",
+      "maxItems": 6,
+      "items": { "type": "string" }
+    }
+  }
+}

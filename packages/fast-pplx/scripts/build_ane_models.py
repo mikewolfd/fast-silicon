@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""Build pure-ANE staged CoreML bundles for pplx-embed-v2-context-0.6b.
+
+Key hardware optimizations encoded from M4 Pro microbenchmarks:
+- Chunked B=1 4D WY GatedDeltaNet (C=32) with hierarchical block inversion (18 ops/layer
+  at depth 4 instead of 31 sequential slice-concat steps) plus optional fwd_subst mode
+- Pure FP16 mul+add masking, tril matmul cumsum, and relu+log(1+exp(-|x|)) softplus
+  (0 bool masks, 0 casts, 0 non-ANE ops on [CPU_AND_NE])
+- t_delta FP16 FTZ fix: scale v post-silu(conv1d) by ftz_alpha (default 128.0) and
+  scale RMSNormGated eps by ftz_alpha^2 * 1e-6 = 0.016384 (exact 1-homogeneity)
+- Multi-doc bucket isolation via tok_valid [1,1,1,S] before conv1d, gdn_carry [1,S/32,1,1]
+  between chunks, external per-doc cos32/sin32, and block-diagonal FP16 attn_bias
+- Stage splitting (configurable layers-per-stage, default 3 -> 4x3L) keeping each stage
+  well below E5RT compile limits with async IOSurface chaining in pplx_coreml_runner
+- Support for default W8A16 (conv weights int8) and W8A8 QDQ with explicit absmax>=50
+  outlier exclusion and mul(mul(gate, up), sigmoid(gate)) SwiGLU-QDQ lowering
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from fast_pplx.config import DEFAULT_PPLX_CONFIG, PplxConfig
+from fast_pplx.paths import resolve_paths
+
+HIDDEN = 1024
+MLP_INTER = 3584
+GDN_HEADS = 16
+GDN_DIM = 128
+ATTN_Q_HEADS = 8
+ATTN_KV_HEADS = 2
+ATTN_HEAD_DIM = 256
+ROPE_HALF = 32
+RMS_EPS = 1e-6
+CHUNK_SIZE = 32
+DEFAULT_FTZ_ALPHA = 128.0
+DEFAULT_SEQ_LENS: tuple[int, ...] = (64, 128, 256, 512)
+DEFAULT_LAYERS_PER_STAGE = 3
+
+# Projections whose calibration absmax >= 50 stay in W8A16 when building W8A8 QDQ bundles.
+OUTLIER_LINEAR_KEYS_DEFAULT: frozenset[str] = frozenset(
+    {
+        "layers.5.mlp.down_proj",
+        "layers.7.mlp.down_proj",
+        "layers.8.mlp.down_proj",
+        "layers.9.mlp.down_proj",
+        "layers.10.mlp.down_proj",
+        "layers.11.mlp.down_proj",
+        "layers.8.linear_attn.out_proj",
+        "layers.10.linear_attn.out_proj",
+    }
+)
+
+
+def plan_stage_ranges(num_layers: int = 12, layers_per_stage: int = DEFAULT_LAYERS_PER_STAGE) -> list[tuple[int, int]]:
+    """Split layer indices [0, num_layers) into contiguous [start, end) stage ranges."""
+    lps = max(1, int(layers_per_stage))
+    return [(s, min(num_layers, s + lps)) for s in range(0, num_layers, lps)]
+
+
+def compute_gnorm_eps_scaled(ftz_alpha: float, rms_eps: float = RMS_EPS) -> float:
+    """Exact RMSNormGated epsilon matching pre-scaled v -> ftz_alpha * v."""
+    return float(rms_eps) * (float(ftz_alpha) ** 2)
+
+
+def select_qdq_scales(
+    layer_idx: int,
+    layer_type: str,
+    calib_stats: dict[str, Any] | None,
+    *,
+    outlier_threshold: float = 50.0,
+) -> dict[str, float | None]:
+    """Compute per-projection QDQ absmax bounds, returning None to preserve W8A16 for outliers."""
+    if calib_stats is None:
+        return {}
+    entries = calib_stats.get("layers", calib_stats)
+    scales: dict[str, float | None] = {}
+
+    def _pick(hf_key: str, mil_key: str) -> None:
+        if hf_key in OUTLIER_LINEAR_KEYS_DEFAULT and hf_key not in entries:
+            scales[mil_key] = None
+            return
+        info = entries.get(hf_key)
+        if not info:
+            scales[mil_key] = None
+            return
+        amax = float(info.get("absmax", 0.0))
+        if amax <= 0.0 or amax >= outlier_threshold:
+            scales[mil_key] = None
+        else:
+            scales[mil_key] = amax
+
+    if layer_type == "linear_attention":
+        in_info = entries.get(f"layers.{layer_idx}.linear_attn.in_proj_qkv")
+        if in_info and 0.0 < float(in_info.get("absmax", 0.0)) < outlier_threshold:
+            scales[f"l{layer_idx}_qkvzba"] = float(in_info["absmax"])
+        else:
+            scales[f"l{layer_idx}_qkvzba"] = None
+        _pick(f"layers.{layer_idx}.linear_attn.out_proj", f"l{layer_idx}_out_proj")
+    else:
+        _pick(f"layers.{layer_idx}.self_attn.q_proj", f"l{layer_idx}_qkvgate")
+        _pick(f"layers.{layer_idx}.self_attn.o_proj", f"l{layer_idx}_o_proj")
+
+    _pick(f"layers.{layer_idx}.mlp.gate_proj", f"l{layer_idx}_mlp_gu")
+    _pick(f"layers.{layer_idx}.mlp.down_proj", f"l{layer_idx}_mlp_dn")
+    return scales
+
+
+def convert_weights_to_ane_layout(
+    npz_weights: dict[str, np.ndarray],
+    cfg: PplxConfig = DEFAULT_PPLX_CONFIG,
+) -> dict[str, np.ndarray]:
+    """Convert Track-2 canonical NPZ weights into ANE 4D conv/norm FP16 arrays."""
+    if "l0_in_ln" in npz_weights:
+        return dict(npz_weights)
+
+    norms_shifted = bool(int(np.asarray(npz_weights.get("__norms_shifted__", 0)).item()))
+    out: dict[str, np.ndarray] = {}
+
+    def _norm(arr: np.ndarray, *, already_shifted: bool) -> np.ndarray:
+        f32 = np.asarray(arr, dtype=np.float32)
+        return (f32 if already_shifted else (1.0 + f32)).astype(np.float16)
+
+    for i, layer_type in enumerate(cfg.layer_types):
+        mp = f"layers.{i}."
+        out[f"l{i}_in_ln"] = _norm(npz_weights[f"{mp}input_layernorm.weight"], already_shifted=norms_shifted)[
+            None, :, None, None
+        ]
+        out[f"l{i}_post_ln"] = _norm(
+            npz_weights[f"{mp}post_attention_layernorm.weight"], already_shifted=norms_shifted
+        )[None, :, None, None]
+
+        if layer_type == "linear_attention":
+            w_qkv = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_qkv.weight"], dtype=np.float16)
+            w_z = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_z.weight"], dtype=np.float16)
+            w_b = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_b.weight"], dtype=np.float16)
+            w_a = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_a.weight"], dtype=np.float16)
+            out[f"l{i}_qkvzba"] = np.concatenate([w_qkv, w_z, w_b, w_a], axis=0)[:, :, None, None]
+
+            conv_raw = np.asarray(npz_weights[f"{mp}linear_attn.conv1d.weight"], dtype=np.float16)
+            if conv_raw.ndim == 3 and conv_raw.shape[1] == 4 and conv_raw.shape[2] == 1:
+                conv_4d = np.ascontiguousarray(np.swapaxes(conv_raw, 1, 2)[:, :, None, :])
+            elif conv_raw.ndim == 3 and conv_raw.shape[1] == 1 and conv_raw.shape[2] == 4:
+                conv_4d = np.ascontiguousarray(conv_raw[:, :, None, :])
+            elif conv_raw.ndim == 4:
+                conv_4d = np.ascontiguousarray(conv_raw)
+            else:
+                raise ValueError(f"Unexpected conv1d shape {conv_raw.shape} at layer {i}")
+            out[f"l{i}_conv1d"] = conv_4d
+
+            a_log = np.asarray(npz_weights[f"{mp}linear_attn.A_log"], dtype=np.float32)
+            out[f"l{i}_neg_A"] = (-np.exp(a_log)).astype(np.float16)
+            out[f"l{i}_dt_bias"] = np.asarray(npz_weights[f"{mp}linear_attn.dt_bias"], dtype=np.float16)
+            out[f"l{i}_gnorm_w"] = np.asarray(npz_weights[f"{mp}linear_attn.norm.weight"], dtype=np.float16)
+            out[f"l{i}_out_proj"] = np.asarray(npz_weights[f"{mp}linear_attn.out_proj.weight"], dtype=np.float16)[
+                :, :, None, None
+            ]
+        elif layer_type == "full_attention":
+            qkv_key = f"{mp}self_attn.qkv_proj.weight"
+            q_dim_inter = cfg.num_attention_heads * 2 * cfg.head_dim
+            kv_dim = cfg.num_key_value_heads * cfg.head_dim
+            if qkv_key in npz_weights:
+                qkv = np.asarray(npz_weights[qkv_key], dtype=np.float16)
+                w_q_raw = qkv[:q_dim_inter]
+                w_k = qkv[q_dim_inter : q_dim_inter + kv_dim]
+                w_v = qkv[q_dim_inter + kv_dim :]
+            else:
+                w_q_raw = np.asarray(npz_weights[f"{mp}self_attn.q_proj.weight"], dtype=np.float16)
+                w_k = np.asarray(npz_weights[f"{mp}self_attn.k_proj.weight"], dtype=np.float16)
+                w_v = np.asarray(npz_weights[f"{mp}self_attn.v_proj.weight"], dtype=np.float16)
+
+            wqg = w_q_raw.reshape(cfg.num_attention_heads, 2, cfg.head_dim, cfg.hidden_size)
+            w_q = wqg[:, 0, :, :].reshape(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size)
+            w_gate = wqg[:, 1, :, :].reshape(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size)
+            out[f"l{i}_qkvgate"] = np.concatenate([w_q, w_k, w_v, w_gate], axis=0)[:, :, None, None]
+            out[f"l{i}_qn"] = _norm(npz_weights[f"{mp}self_attn.q_norm.weight"], already_shifted=norms_shifted)[
+                None, None, None, :
+            ]
+            out[f"l{i}_kn"] = _norm(npz_weights[f"{mp}self_attn.k_norm.weight"], already_shifted=norms_shifted)[
+                None, None, None, :
+            ]
+            out[f"l{i}_o_proj"] = np.asarray(npz_weights[f"{mp}self_attn.o_proj.weight"], dtype=np.float16)[
+                :, :, None, None
+            ]
+        else:
+            raise ValueError(f"Unsupported layer_type {layer_type!r} at layer {i}")
+
+        gu_key = f"{mp}mlp.gate_up_proj.weight"
+        if gu_key in npz_weights:
+            w_gu = np.asarray(npz_weights[gu_key], dtype=np.float16)
+        else:
+            w_g = np.asarray(npz_weights[f"{mp}mlp.gate_proj.weight"], dtype=np.float16)
+            w_u = np.asarray(npz_weights[f"{mp}mlp.up_proj.weight"], dtype=np.float16)
+            w_gu = np.concatenate([w_g, w_u], axis=0)
+        out[f"l{i}_mlp_gu"] = w_gu[:, :, None, None]
+        out[f"l{i}_mlp_dn"] = np.asarray(npz_weights[f"{mp}mlp.down_proj.weight"], dtype=np.float16)[:, :, None, None]
+
+    out["final_norm"] = _norm(npz_weights["norm.weight"], already_shifted=norms_shifted)[None, :, None, None]
+    return out
+
+
+def build_stage_mil_program(
+    ane_weights: dict[str, np.ndarray],
+    *,
+    seq_len: int,
+    layer_start: int,
+    layer_end: int,
+    layer_types: tuple[str, ...],
+    apply_final_norm: bool,
+    chunk_size: int = CHUNK_SIZE,
+    inv_mode: str = "block",
+    ftz_alpha: float = DEFAULT_FTZ_ALPHA,
+    qdq_scales: dict[str, float | None] | None = None,
+    swiglu_mode: str = "silu",
+):
+    """Build a pure-FP16 pure-ANE CoreML MIL program for layers [layer_start, layer_end)."""
+    import coremltools as ct  # noqa: F401
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+
+    if seq_len % chunk_size != 0:
+        raise ValueError(f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})")
+
+    scales = qdq_scales or {}
+    n_c = seq_len // chunk_size
+    gnorm_eps = compute_gnorm_eps_scaled(ftz_alpha)
+
+    def _f16(val: float):
+        return mb.const(val=np.float16(val))
+
+    def _const_f16(arr: np.ndarray, name: str):
+        return mb.const(val=np.ascontiguousarray(arr, dtype=np.float16), name=name)
+
+    def _conv_or_qdq(x, w_f16: np.ndarray, name: str):
+        w_c = _const_f16(w_f16, name=f"{name}_w")
+        amax = scales.get(name)
+        if amax is not None and amax > 0.0:
+            s_val = np.float16(max(float(amax) / 127.0, 1e-5))
+            s_c = mb.const(val=s_val, name=f"{name}_q_scale")
+            xq = mb.quantize(input=x, scale=s_c, output_dtype="int8", name=f"{name}_aq")
+            xdq = mb.dequantize(input=xq, scale=s_c, name=f"{name}_adq")
+            return mb.conv(x=xdq, weight=w_c, name=name)
+        return mb.conv(x=x, weight=w_c, name=name)
+
+    def _rmsnorm_ch(x, weight_1c11: np.ndarray, name: str, eps: float = RMS_EPS):
+        sq = mb.mul(x=x, y=x, name=f"{name}_sq")
+        msq = mb.reduce_mean(x=sq, axes=[1], keep_dims=True, name=f"{name}_mean")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        normed = mb.mul(x=x, y=inv_rms, name=f"{name}_norm")
+        return mb.mul(x=normed, y=_const_f16(weight_1c11, name=f"{name}_w"), name=name)
+
+    def _rmsnorm_axis(x, weight_arr: np.ndarray, axis: int, name: str, eps: float = RMS_EPS):
+        sq = mb.mul(x=x, y=x, name=f"{name}_sq")
+        msq = mb.reduce_mean(x=sq, axes=[axis], keep_dims=True, name=f"{name}_mean")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        normed = mb.mul(x=x, y=inv_rms, name=f"{name}_norm")
+        return mb.mul(x=normed, y=_const_f16(weight_arr, name=f"{name}_w"), name=name)
+
+    def _l2norm_last(x, dim: int, extra_scale: float, name: str, eps: float = RMS_EPS):
+        sq = mb.mul(x=x, y=x, name=f"{name}_sq")
+        msq = mb.reduce_mean(x=sq, axes=[3], keep_dims=True, name=f"{name}_mean")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        inv_norm_scaled = mb.mul(x=inv_rms, y=_f16((dim ** -0.5) * extra_scale), name=f"{name}_scale")
+        return mb.mul(x=x, y=inv_norm_scaled, name=name)
+
+    def _softplus_ane(x, name: str):
+        r = mb.relu(x=x, name=f"{name}_relu")
+        neg_abs = mb.mul(x=mb.abs(x=x, name=f"{name}_abs"), y=_f16(-1.0), name=f"{name}_nabs")
+        exp_n = mb.exp(x=neg_abs, name=f"{name}_exp")
+        log1p = mb.log(x=mb.add(x=exp_n, y=_f16(1.0), name=f"{name}_add1"), name=f"{name}_log")
+        return mb.add(x=r, y=log1p, name=name)
+
+    def _cumsum_tril(g_4d, prefix: str):
+        triu_ones = np.triu(np.ones((chunk_size, chunk_size), dtype=np.float16), k=0)[None, None, :, :]
+        return mb.matmul(x=g_4d, y=_const_f16(triu_ones, name=f"{prefix}_triu"), name=f"{prefix}_mm")
+
+    def _invert_unit_lower_block(m_strict, prefix: str):
+        """Exact hierarchical block inversion (2->4->8->16->32) solving (I - m_strict)^-1 in 18 ops."""
+        eye_np = np.eye(chunk_size, dtype=np.float16)[None, None, :, :]
+        m2_np = np.zeros((1, 1, chunk_size, chunk_size), dtype=np.float16)
+        for k in range(0, chunk_size, 2):
+            if k + 1 < chunk_size:
+                m2_np[0, 0, k + 1, k] = np.float16(1.0)
+        t_cur = mb.add(
+            x=_const_f16(eye_np, name=f"{prefix}_eye"),
+            y=mb.mul(x=m_strict, y=_const_f16(m2_np, name=f"{prefix}_m2"), name=f"{prefix}_t2"),
+            name=f"{prefix}_init2",
+        )
+        b = 2
+        while b < chunk_size:
+            mask_np = np.zeros((1, 1, chunk_size, chunk_size), dtype=np.float16)
+            for k in range(0, chunk_size, 2 * b):
+                r1 = min(chunk_size, k + 2 * b)
+                if k + b < r1:
+                    mask_np[0, 0, k + b : r1, k : k + b] = np.float16(1.0)
+            off = mb.mul(x=m_strict, y=_const_f16(mask_np, name=f"{prefix}_mb{b}"), name=f"{prefix}_off{b}")
+            t_off = mb.matmul(x=t_cur, y=off, name=f"{prefix}_toff{b}")
+            t21 = mb.matmul(x=t_off, y=t_cur, name=f"{prefix}_t21_{b}")
+            t_cur = mb.add(x=t_cur, y=t21, name=f"{prefix}_merge{b}")
+            b *= 2
+        return t_cur
+
+    def _invert_unit_lower_fwd_subst(m_strict, d0: int, d1: int, prefix: str):
+        eye = np.eye(chunk_size, dtype=np.float16)
+        row0 = np.broadcast_to(eye[0:1, :][None, None, :, :], (d0, d1, 1, chunk_size)).copy()
+        rows = [_const_f16(row0, name=f"{prefix}_row0")]
+        for i in range(1, chunk_size):
+            prev = mb.concat(values=rows, axis=2, name=f"{prefix}_prev_{i}")
+            m_row = mb.slice_by_index(
+                x=m_strict, begin=[0, 0, i, 0], end=[d0, d1, i + 1, i], name=f"{prefix}_mrow_{i}"
+            )
+            if i == 1:
+                t_prefix = m_row
+            else:
+                prev_prefix = mb.slice_by_index(
+                    x=prev, begin=[0, 0, 0, 0], end=[d0, d1, i, i], name=f"{prefix}_pprev_{i}"
+                )
+                t_prefix = mb.matmul(x=m_row, y=prev_prefix, name=f"{prefix}_mm_{i}")
+            tail_arr = np.broadcast_to(
+                eye[i : i + 1, i:][None, None, :, :], (d0, d1, 1, chunk_size - i)
+            ).copy()
+            row_i = mb.concat(
+                values=[t_prefix, _const_f16(tail_arr, name=f"{prefix}_tail_{i}")],
+                axis=3,
+                name=f"{prefix}_row_{i}",
+            )
+            rows.append(row_i)
+        return mb.concat(values=rows, axis=2, name=f"{prefix}_out")
+
+    def _gated_delta_chunked_b1(q_ch, k_ch, v_ch, b_ch, a_ch, neg_A: np.ndarray, dt_bias: np.ndarray, gdn_carry, prefix: str):
+        nc_h = n_c * GDN_HEADS
+
+        def _to_b1_chunks(x_ch, tag: str):
+            r1 = mb.reshape(x=x_ch, shape=[1, GDN_HEADS * GDN_DIM, n_c, chunk_size], name=f"{prefix}_{tag}r1")
+            t1 = mb.transpose(x=r1, perm=[0, 2, 1, 3], name=f"{prefix}_{tag}t1")
+            r2 = mb.reshape(x=t1, shape=[1, nc_h, GDN_DIM, chunk_size], name=f"{prefix}_{tag}r2")
+            return mb.transpose(x=r2, perm=[0, 1, 3, 2], name=f"{prefix}_{tag}t2")
+
+        q_4d = _to_b1_chunks(q_ch, "q")
+        k_4d = _to_b1_chunks(k_ch, "k")
+        v_4d = _to_b1_chunks(v_ch, "v")
+
+        q_norm = _l2norm_last(q_4d, dim=GDN_DIM, extra_scale=GDN_DIM ** -0.5, name=f"{prefix}_ql2")
+        k_norm = _l2norm_last(k_4d, dim=GDN_DIM, extra_scale=1.0, name=f"{prefix}_kl2")
+
+        b_sig = mb.sigmoid(x=b_ch, name=f"{prefix}_beta_sig")
+        b_t = mb.transpose(
+            x=mb.reshape(x=b_sig, shape=[1, GDN_HEADS, n_c, chunk_size], name=f"{prefix}_br1"),
+            perm=[0, 2, 1, 3],
+            name=f"{prefix}_bt1",
+        )
+        beta = mb.reshape(x=b_t, shape=[1, nc_h, chunk_size, 1], name=f"{prefix}_beta_4d")
+
+        neg_a_c = _const_f16(neg_A.reshape(1, GDN_HEADS, 1, 1), name=f"{prefix}_negA")
+        dt_b_c = _const_f16(dt_bias.reshape(1, GDN_HEADS, 1, 1), name=f"{prefix}_dt_bias")
+        g_raw = mb.mul(
+            x=neg_a_c,
+            y=_softplus_ane(mb.add(x=a_ch, y=dt_b_c, name=f"{prefix}_adt"), name=f"{prefix}_softplus"),
+            name=f"{prefix}_g_raw",
+        )
+        g_t = mb.transpose(
+            x=mb.reshape(x=g_raw, shape=[1, GDN_HEADS, n_c, chunk_size], name=f"{prefix}_gr1"),
+            perm=[0, 2, 1, 3],
+            name=f"{prefix}_gt1",
+        )
+        g_4d = mb.reshape(x=g_t, shape=[1, nc_h, 1, chunk_size], name=f"{prefix}_g_4d")
+
+        cum_decay = _cumsum_tril(g_4d, prefix=f"{prefix}_cumsum")
+        cum_decay_col = mb.transpose(x=cum_decay, perm=[0, 1, 3, 2], name=f"{prefix}_cum_col")
+        pairwise = mb.sub(x=cum_decay_col, y=cum_decay, name=f"{prefix}_pairwise")
+
+        tril_np = np.tril(np.ones((chunk_size, chunk_size), dtype=np.float16), k=0)[None, None, :, :]
+        neg100_upper_np = (-100.0 * np.triu(np.ones((chunk_size, chunk_size), dtype=np.float16), k=1))[
+            None, None, :, :
+        ]
+        tril_f16 = _const_f16(tril_np, name=f"{prefix}_tril_f16")
+        neg100_upper_f16 = _const_f16(neg100_upper_np, name=f"{prefix}_neg100_upper")
+        neg_strict_f16 = _const_f16(
+            (-np.tril(np.ones((chunk_size, chunk_size), dtype=np.float16), k=-1))[None, None, :, :],
+            name=f"{prefix}_neg_strict",
+        )
+
+        pw_masked = mb.add(
+            x=mb.mul(x=pairwise, y=tril_f16, name=f"{prefix}_pw_tril"),
+            y=neg100_upper_f16,
+            name=f"{prefix}_pw_mask",
+        )
+        pw_exp = mb.mul(
+            x=mb.exp(x=pw_masked, name=f"{prefix}_pw_exp"),
+            y=tril_f16,
+            name=f"{prefix}_pw_exp_zero",
+        )
+
+        v_beta = mb.mul(x=v_4d, y=beta, name=f"{prefix}_v_beta")
+        k_beta = mb.mul(x=k_norm, y=beta, name=f"{prefix}_k_beta")
+
+        ut = mb.mul(
+            x=mb.matmul(x=k_beta, y=k_norm, transpose_x=False, transpose_y=True, name=f"{prefix}_kk"),
+            y=pw_exp,
+            name=f"{prefix}_ut",
+        )
+        intra = mb.mul(
+            x=mb.matmul(x=q_norm, y=k_norm, transpose_x=False, transpose_y=True, name=f"{prefix}_qk"),
+            y=pw_exp,
+            name=f"{prefix}_intra",
+        )
+
+        m_strict = mb.mul(x=ut, y=neg_strict_f16, name=f"{prefix}_m_strict")
+        if inv_mode == "block":
+            t_mat = _invert_unit_lower_block(m_strict, prefix=f"{prefix}_binv")
+        elif inv_mode == "fwd_subst":
+            t_mat = _invert_unit_lower_fwd_subst(m_strict, d0=1, d1=nc_h, prefix=f"{prefix}_inv")
+        else:
+            raise ValueError(f"Unsupported inv_mode={inv_mode!r}")
+
+        exp_cum = mb.exp(x=cum_decay_col, name=f"{prefix}_exp_cum")
+        decayed_k_beta = mb.mul(x=k_beta, y=exp_cum, name=f"{prefix}_dec_kb")
+
+        new_values = mb.matmul(x=t_mat, y=v_beta, name=f"{prefix}_new_values")
+        k_cumdecay = mb.matmul(x=t_mat, y=decayed_k_beta, name=f"{prefix}_k_cumdecay")
+
+        q_dec = mb.mul(x=q_norm, y=exp_cum, name=f"{prefix}_q_dec")
+        cum_last = mb.slice_by_index(
+            x=cum_decay_col,
+            begin=[0, 0, chunk_size - 1, 0],
+            end=[1, nc_h, chunk_size, 1],
+            name=f"{prefix}_cum_last",
+        )
+        k_dec = mb.mul(
+            x=k_norm,
+            y=mb.exp(
+                x=mb.sub(x=cum_last, y=cum_decay_col, name=f"{prefix}_k_dec_diff"),
+                name=f"{prefix}_k_dec_exp",
+            ),
+            name=f"{prefix}_k_dec",
+        )
+        chunk_dec = mb.exp(x=cum_last, name=f"{prefix}_chunk_dec")
+
+        outs = []
+        state = None
+        for i in range(n_c):
+            h0, h1 = i * GDN_HEADS, (i + 1) * GDN_HEADS
+            nv_i = mb.slice_by_index(
+                x=new_values, begin=[0, h0, 0, 0], end=[1, h1, chunk_size, GDN_DIM], name=f"{prefix}_nv_{i}"
+            )
+            intra_i = mb.slice_by_index(
+                x=intra, begin=[0, h0, 0, 0], end=[1, h1, chunk_size, chunk_size], name=f"{prefix}_in_{i}"
+            )
+            q_dec_i = mb.slice_by_index(
+                x=q_dec, begin=[0, h0, 0, 0], end=[1, h1, chunk_size, GDN_DIM], name=f"{prefix}_qd_{i}"
+            )
+            k_dec_i = mb.slice_by_index(
+                x=k_dec, begin=[0, h0, 0, 0], end=[1, h1, chunk_size, GDN_DIM], name=f"{prefix}_kd_{i}"
+            )
+            c_dec_i = mb.slice_by_index(
+                x=chunk_dec, begin=[0, h0, 0, 0], end=[1, h1, 1, 1], name=f"{prefix}_cd_{i}"
+            )
+
+            if i == 0:
+                v_new = nv_i
+                out_i = mb.matmul(x=intra_i, y=v_new, name=f"{prefix}_rec_out_{i}")
+                state = mb.matmul(
+                    x=k_dec_i, y=v_new, transpose_x=True, transpose_y=False, name=f"{prefix}_rec_st_{i}"
+                )
+            else:
+                carry_i = mb.slice_by_index(
+                    x=gdn_carry, begin=[0, i, 0, 0], end=[1, i + 1, 1, 1], name=f"{prefix}_gcarry_{i}"
+                )
+                gated_state = mb.mul(x=state, y=carry_i, name=f"{prefix}_rec_carry_{i}")
+                kc_i = mb.slice_by_index(
+                    x=k_cumdecay, begin=[0, h0, 0, 0], end=[1, h1, chunk_size, GDN_DIM], name=f"{prefix}_kc_{i}"
+                )
+                k_state = mb.matmul(x=kc_i, y=gated_state, name=f"{prefix}_rec_kst_{i}")
+                v_new = mb.sub(x=nv_i, y=k_state, name=f"{prefix}_rec_vnew_{i}")
+                inter = mb.matmul(x=q_dec_i, y=gated_state, name=f"{prefix}_rec_inter_{i}")
+                intra_out = mb.matmul(x=intra_i, y=v_new, name=f"{prefix}_rec_intra_{i}")
+                out_i = mb.add(x=inter, y=intra_out, name=f"{prefix}_rec_out_{i}")
+                state_dec = mb.mul(x=gated_state, y=c_dec_i, name=f"{prefix}_rec_st_dec_{i}")
+                state_upd = mb.matmul(
+                    x=k_dec_i, y=v_new, transpose_x=True, transpose_y=False, name=f"{prefix}_rec_st_upd_{i}"
+                )
+                state = mb.add(x=state_dec, y=state_upd, name=f"{prefix}_rec_st_{i}")
+            outs.append(out_i)
+
+        out_chunks = mb.concat(values=outs, axis=1, name=f"{prefix}_rec_concat")
+        out_t1 = mb.transpose(x=out_chunks, perm=[0, 1, 3, 2], name=f"{prefix}_out_t1")
+        out_r1 = mb.reshape(x=out_t1, shape=[1, n_c, GDN_HEADS * GDN_DIM, chunk_size], name=f"{prefix}_out_r1")
+        out_t2 = mb.transpose(x=out_r1, perm=[0, 2, 1, 3], name=f"{prefix}_out_t2")
+        return mb.reshape(x=out_t2, shape=[1, GDN_HEADS * GDN_DIM, 1, seq_len], name=f"{prefix}_out_nchw")
+
+    def _mlp_swiglu(x, prefix: str):
+        gu = _conv_or_qdq(x, ane_weights[f"{prefix}_mlp_gu"], name=f"{prefix}_mlp_gu")
+        gate = mb.slice_by_index(x=gu, begin=[0, 0, 0, 0], end=[1, MLP_INTER, 1, seq_len], name=f"{prefix}_mlp_g")
+        up = mb.slice_by_index(
+            x=gu, begin=[0, MLP_INTER, 0, 0], end=[1, 2 * MLP_INTER, 1, seq_len], name=f"{prefix}_mlp_u"
+        )
+        if swiglu_mode == "mul_sigmoid_reordered":
+            gu_prod = mb.mul(x=gate, y=up, name=f"{prefix}_mlp_gu_prod")
+            act = mb.mul(x=gu_prod, y=mb.sigmoid(x=gate, name=f"{prefix}_mlp_gsig"), name=f"{prefix}_mlp_act")
+        elif swiglu_mode == "silu":
+            act = mb.mul(x=mb.silu(x=gate, name=f"{prefix}_mlp_gsilu"), y=up, name=f"{prefix}_mlp_act")
+        else:
+            raise ValueError(f"Unsupported swiglu_mode={swiglu_mode!r}")
+        return _conv_or_qdq(act, ane_weights[f"{prefix}_mlp_dn"], name=f"{prefix}_mlp_dn")
+
+    def _apply_linear_layer(h_in, tok_valid, gdn_carry, li: int):
+        p = f"l{li}"
+        xn = _rmsnorm_ch(h_in, ane_weights[f"{p}_in_ln"], name=f"{p}_in_ln")
+        qkvzba = _conv_or_qdq(xn, ane_weights[f"{p}_qkvzba"], name=f"{p}_qkvzba")
+
+        mqkv_raw = mb.slice_by_index(x=qkvzba, begin=[0, 0, 0, 0], end=[1, 6144, 1, seq_len], name=f"{p}_sl_qkv")
+        mqkv = mb.mul(x=mqkv_raw, y=tok_valid, name=f"{p}_mqkv_mask")
+        z = mb.slice_by_index(x=qkvzba, begin=[0, 6144, 0, 0], end=[1, 8192, 1, seq_len], name=f"{p}_sl_z")
+        b_ch = mb.slice_by_index(x=qkvzba, begin=[0, 8192, 0, 0], end=[1, 8208, 1, seq_len], name=f"{p}_sl_b")
+        a_ch = mb.slice_by_index(x=qkvzba, begin=[0, 8208, 0, 0], end=[1, 8224, 1, seq_len], name=f"{p}_sl_a")
+
+        w_conv = _const_f16(ane_weights[f"{p}_conv1d"], name=f"{p}_conv1d_w")
+        conv_raw = mb.conv(
+            x=mqkv,
+            weight=w_conv,
+            pad_type="custom",
+            pad=[0, 0, 3, 0],
+            groups=6144,
+            name=f"{p}_conv1d",
+        )
+        conv_act = mb.silu(x=conv_raw, name=f"{p}_conv_silu")
+        q_ch = mb.slice_by_index(x=conv_act, begin=[0, 0, 0, 0], end=[1, 2048, 1, seq_len], name=f"{p}_sl_q")
+        k_ch = mb.slice_by_index(x=conv_act, begin=[0, 2048, 0, 0], end=[1, 4096, 1, seq_len], name=f"{p}_sl_k")
+        v_raw = mb.slice_by_index(x=conv_act, begin=[0, 4096, 0, 0], end=[1, 6144, 1, seq_len], name=f"{p}_sl_v")
+        v_ch = mb.mul(x=v_raw, y=_f16(ftz_alpha), name=f"{p}_v_ftz_scale") if ftz_alpha != 1.0 else v_raw
+
+        delta_nchw = _gated_delta_chunked_b1(
+            q_ch,
+            k_ch,
+            v_ch,
+            b_ch,
+            a_ch,
+            neg_A=ane_weights[f"{p}_neg_A"],
+            dt_bias=ane_weights[f"{p}_dt_bias"],
+            gdn_carry=gdn_carry,
+            prefix=f"{p}_gdn",
+        )
+        delta_hd = mb.reshape(x=delta_nchw, shape=[1, GDN_HEADS, GDN_DIM, seq_len], name=f"{p}_delta_hd")
+        z_hd = mb.reshape(x=z, shape=[1, GDN_HEADS, GDN_DIM, seq_len], name=f"{p}_z_hd")
+        gnorm_w = ane_weights[f"{p}_gnorm_w"].reshape(1, 1, GDN_DIM, 1)
+        normed_hd = _rmsnorm_axis(delta_hd, gnorm_w, axis=2, name=f"{p}_gnorm", eps=gnorm_eps)
+        gated_hd = mb.mul(x=normed_hd, y=mb.silu(x=z_hd, name=f"{p}_z_silu"), name=f"{p}_gated_hd")
+        gated_nchw = mb.reshape(x=gated_hd, shape=[1, 2048, 1, seq_len], name=f"{p}_gated_nchw")
+
+        attn_out = _conv_or_qdq(gated_nchw, ane_weights[f"{p}_out_proj"], name=f"{p}_out_proj")
+        h_mid = mb.add(x=h_in, y=attn_out, name=f"{p}_res1")
+        xn_post = _rmsnorm_ch(h_mid, ane_weights[f"{p}_post_ln"], name=f"{p}_post_ln")
+        mlp_out = _mlp_swiglu(xn_post, prefix=p)
+        return mb.add(x=h_mid, y=mlp_out, name=f"{p}_res2")
+
+    def _apply_full_layer(h_in, attn_bias, cos32, sin32, li: int):
+        p = f"l{li}"
+        xn = _rmsnorm_ch(h_in, ane_weights[f"{p}_in_ln"], name=f"{p}_in_ln")
+        qkvgate = _conv_or_qdq(xn, ane_weights[f"{p}_qkvgate"], name=f"{p}_qkvgate")
+
+        q_ch = mb.slice_by_index(x=qkvgate, begin=[0, 0, 0, 0], end=[1, 2048, 1, seq_len], name=f"{p}_sl_q")
+        k_ch = mb.slice_by_index(x=qkvgate, begin=[0, 2048, 0, 0], end=[1, 2560, 1, seq_len], name=f"{p}_sl_k")
+        v_ch = mb.slice_by_index(x=qkvgate, begin=[0, 2560, 0, 0], end=[1, 3072, 1, seq_len], name=f"{p}_sl_v")
+        gate_ch = mb.slice_by_index(x=qkvgate, begin=[0, 3072, 0, 0], end=[1, 5120, 1, seq_len], name=f"{p}_sl_gate")
+
+        q_hsd = mb.transpose(
+            x=mb.reshape(x=q_ch, shape=[1, ATTN_Q_HEADS, ATTN_HEAD_DIM, seq_len], name=f"{p}_qr"),
+            perm=[0, 1, 3, 2],
+            name=f"{p}_qt",
+        )
+        k_hsd = mb.transpose(
+            x=mb.reshape(x=k_ch, shape=[1, ATTN_KV_HEADS, ATTN_HEAD_DIM, seq_len], name=f"{p}_kr"),
+            perm=[0, 1, 3, 2],
+            name=f"{p}_kt",
+        )
+        v_hsd = mb.transpose(
+            x=mb.reshape(x=v_ch, shape=[1, ATTN_KV_HEADS, ATTN_HEAD_DIM, seq_len], name=f"{p}_vr"),
+            perm=[0, 1, 3, 2],
+            name=f"{p}_vt",
+        )
+
+        q_n = _rmsnorm_axis(q_hsd, ane_weights[f"{p}_qn"], axis=3, name=f"{p}_qnorm")
+        k_n = _rmsnorm_axis(k_hsd, ane_weights[f"{p}_kn"], axis=3, name=f"{p}_knorm")
+
+        def apply_partial_rope(x_hsd, nh: int, rp: str):
+            r1 = mb.slice_by_index(x=x_hsd, begin=[0, 0, 0, 0], end=[1, nh, seq_len, ROPE_HALF], name=f"{rp}_r1")
+            r2 = mb.slice_by_index(
+                x=x_hsd, begin=[0, 0, 0, ROPE_HALF], end=[1, nh, seq_len, 2 * ROPE_HALF], name=f"{rp}_r2"
+            )
+            pass_part = mb.slice_by_index(
+                x=x_hsd, begin=[0, 0, 0, 2 * ROPE_HALF], end=[1, nh, seq_len, ATTN_HEAD_DIM], name=f"{rp}_pass"
+            )
+            o1 = mb.sub(
+                x=mb.mul(x=r1, y=cos32, name=f"{rp}_c1"),
+                y=mb.mul(x=r2, y=sin32, name=f"{rp}_s2"),
+                name=f"{rp}_o1",
+            )
+            o2 = mb.add(
+                x=mb.mul(x=r2, y=cos32, name=f"{rp}_c2"),
+                y=mb.mul(x=r1, y=sin32, name=f"{rp}_s1"),
+                name=f"{rp}_o2",
+            )
+            return mb.concat(values=[o1, o2, pass_part], axis=3, name=f"{rp}_out")
+
+        q_rope = apply_partial_rope(q_n, ATTN_Q_HEADS, f"{p}_qrope")
+        k_rope = apply_partial_rope(k_n, ATTN_KV_HEADS, f"{p}_krope")
+
+        k0 = mb.slice_by_index(x=k_rope, begin=[0, 0, 0, 0], end=[1, 1, seq_len, ATTN_HEAD_DIM], name=f"{p}_k0")
+        k1 = mb.slice_by_index(x=k_rope, begin=[0, 1, 0, 0], end=[1, 2, seq_len, ATTN_HEAD_DIM], name=f"{p}_k1")
+        k_rep = mb.concat(values=[k0, k0, k0, k0, k1, k1, k1, k1], axis=1, name=f"{p}_krep")
+
+        v0 = mb.slice_by_index(x=v_hsd, begin=[0, 0, 0, 0], end=[1, 1, seq_len, ATTN_HEAD_DIM], name=f"{p}_v0")
+        v1 = mb.slice_by_index(x=v_hsd, begin=[0, 1, 0, 0], end=[1, 2, seq_len, ATTN_HEAD_DIM], name=f"{p}_v1")
+        v_rep = mb.concat(values=[v0, v0, v0, v0, v1, v1, v1, v1], axis=1, name=f"{p}_vrep")
+
+        q_scaled = mb.mul(x=q_rope, y=_f16(ATTN_HEAD_DIM ** -0.5), name=f"{p}_q_scale")
+        scores_raw = mb.matmul(
+            x=q_scaled, y=k_rep, transpose_x=False, transpose_y=True, name=f"{p}_qk_scores"
+        )
+        scores = mb.add(x=scores_raw, y=attn_bias, name=f"{p}_bias_add")
+        probs = mb.softmax(x=scores, axis=3, name=f"{p}_attn_softmax")
+        attn_hsd = mb.matmul(x=probs, y=v_rep, name=f"{p}_av_matmul")
+
+        attn_nchw = mb.reshape(
+            x=mb.transpose(x=attn_hsd, perm=[0, 1, 3, 2], name=f"{p}_attn_t"),
+            shape=[1, 2048, 1, seq_len],
+            name=f"{p}_attn_nchw",
+        )
+        gated = mb.mul(x=attn_nchw, y=mb.sigmoid(x=gate_ch, name=f"{p}_gate_sig"), name=f"{p}_gated")
+        attn_out = _conv_or_qdq(gated, ane_weights[f"{p}_o_proj"], name=f"{p}_o_proj")
+        h_mid = mb.add(x=h_in, y=attn_out, name=f"{p}_res1")
+
+        xn_post = _rmsnorm_ch(h_mid, ane_weights[f"{p}_post_ln"], name=f"{p}_post_ln")
+        mlp_out = _mlp_swiglu(xn_post, prefix=p)
+        return mb.add(x=h_mid, y=mlp_out, name=f"{p}_res2")
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec(shape=(1, HIDDEN, 1, seq_len), dtype=types.fp16),
+            mb.TensorSpec(shape=(1, 1, seq_len, seq_len), dtype=types.fp16),
+            mb.TensorSpec(shape=(1, 1, seq_len, ROPE_HALF), dtype=types.fp16),
+            mb.TensorSpec(shape=(1, 1, seq_len, ROPE_HALF), dtype=types.fp16),
+            mb.TensorSpec(shape=(1, 1, 1, seq_len), dtype=types.fp16),
+            mb.TensorSpec(shape=(1, n_c, 1, 1), dtype=types.fp16),
+        ]
+    )
+    def prog(h_in, attn_bias, cos32, sin32, tok_valid, gdn_carry):
+        h = h_in
+        for li in range(layer_start, layer_end):
+            lt = layer_types[li]
+            if lt == "linear_attention":
+                h = _apply_linear_layer(h, tok_valid, gdn_carry, li)
+            elif lt == "full_attention":
+                h = _apply_full_layer(h, attn_bias, cos32, sin32, li)
+            else:
+                raise ValueError(f"Unsupported layer type {lt!r} at {li}")
+        if apply_final_norm:
+            h = _rmsnorm_ch(h, ane_weights["final_norm"], name="final_norm")
+        return mb.identity(x=h, name="h_out")
+
+    return prog
+
+
+def _compile_mlpackage(pkg_path: Path, out_dir: Path) -> Path:
+    cmd = ["xcrun", "coremlc", "compile", str(pkg_path), str(out_dir)]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return out_dir / (pkg_path.stem + ".mlmodelc")
+
+
+def _parse_seq_lens(raw: Sequence[str | int]) -> tuple[int, ...]:
+    out: list[int] = []
+    for item in raw:
+        for tok in str(item).split(","):
+            tok = tok.strip()
+            if tok:
+                val = int(tok)
+                if val <= 0 or val % CHUNK_SIZE != 0:
+                    raise ValueError(f"seq_len must be a positive multiple of {CHUNK_SIZE}, got {val}")
+                out.append(val)
+    if not out:
+        raise ValueError("Expected at least one seq_len")
+    return tuple(out)
+
+
+def build_ane_bundle_suite(
+    *,
+    home: str | Path | None = None,
+    model_dir: str | Path | None = None,
+    variant: str | None = None,
+    seq_lens: tuple[int, ...] = DEFAULT_SEQ_LENS,
+    layers_per_stage: int = DEFAULT_LAYERS_PER_STAGE,
+    precision: str = "w8a16",
+    inv_mode: str = "block",
+    ftz_alpha: float = DEFAULT_FTZ_ALPHA,
+    calib_stats_path: str | Path | None = None,
+    outlier_threshold: float = 50.0,
+    keep_mlpackage: bool = False,
+) -> dict[str, Any]:
+    import coremltools as ct
+    import coremltools.optimize.coreml as cto
+
+    if variant:
+        v_low = variant.strip().lower()
+        if v_low in ("w8a16", "w8a8"):
+            precision = v_low
+        elif v_low in ("block", "fwd_subst"):
+            inv_mode = v_low
+
+    paths = resolve_paths(home)
+    if not paths.weights_npz.exists():
+        if model_dir is not None:
+            from export_weights import export_model_weights
+
+            export_model_weights(home=paths.home, model_dir=model_dir, local_files_only=True)
+        else:
+            raise FileNotFoundError(f"Missing weights NPZ at {paths.weights_npz}; run export_weights.py first.")
+
+    cfg_file = paths.tokenizer_dir / "config.json"
+    cfg = PplxConfig.from_json(cfg_file) if cfg_file.exists() else DEFAULT_PPLX_CONFIG
+
+    npz = np.load(paths.weights_npz)
+    ane_weights = convert_weights_to_ane_layout({k: npz[k] for k in npz.files}, cfg=cfg)
+
+    calib_stats: dict[str, Any] | None = None
+    if precision == "w8a8":
+        if calib_stats_path is None:
+            raise ValueError("--calib-stats is required for --precision w8a8")
+        calib_stats = json.loads(Path(calib_stats_path).read_text(encoding="utf-8"))
+        swiglu_mode = "mul_sigmoid_reordered"
+    elif precision == "w8a16":
+        swiglu_mode = "silu"
+    else:
+        raise ValueError(f"Unsupported precision={precision!r}; choose w8a16 or w8a8")
+
+    stage_ranges = plan_stage_ranges(cfg.num_hidden_layers, layers_per_stage=layers_per_stage)
+    out_dir = paths.ane_models_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    q_op_cfg = cto.OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        dtype="int8",
+        granularity="per_channel",
+    )
+    q_cfg = cto.OptimizationConfig(op_type_configs={"conv": q_op_cfg})
+
+    manifest: dict[str, Any] = {
+        "model_name": "perplexity-ai/pplx-embed-v2-context-0.6b",
+        "precision": precision,
+        "inv_mode": inv_mode,
+        "ftz_alpha": float(ftz_alpha),
+        "chunk_size": CHUNK_SIZE,
+        "hidden_size": HIDDEN,
+        "rope_half": ROPE_HALF,
+        "num_layers": cfg.num_hidden_layers,
+        "layers_per_stage": layers_per_stage,
+        "num_stages": len(stage_ranges),
+        "buckets": {},
+    }
+
+    for seq_len in seq_lens:
+        n_c = seq_len // CHUNK_SIZE
+        stage_entries: list[str] = []
+        t_bucket = time.perf_counter()
+
+        for st_idx, (l0, l1) in enumerate(stage_ranges):
+            stage_scales: dict[str, float | None] = {}
+            if calib_stats is not None:
+                for li in range(l0, l1):
+                    stage_scales.update(
+                        select_qdq_scales(
+                            li, cfg.layer_types[li], calib_stats, outlier_threshold=outlier_threshold
+                        )
+                    )
+
+            prog = build_stage_mil_program(
+                ane_weights,
+                seq_len=seq_len,
+                layer_start=l0,
+                layer_end=l1,
+                layer_types=cfg.layer_types,
+                apply_final_norm=(st_idx == len(stage_ranges) - 1),
+                chunk_size=CHUNK_SIZE,
+                inv_mode=inv_mode,
+                ftz_alpha=ftz_alpha,
+                qdq_scales=stage_scales,
+                swiglu_mode=swiglu_mode,
+            )
+
+            ml = ct.convert(
+                prog,
+                inputs=[
+                    ct.TensorType(name="h_in", shape=(1, HIDDEN, 1, seq_len), dtype=np.float16),
+                    ct.TensorType(name="attn_bias", shape=(1, 1, seq_len, seq_len), dtype=np.float16),
+                    ct.TensorType(name="cos32", shape=(1, 1, seq_len, ROPE_HALF), dtype=np.float16),
+                    ct.TensorType(name="sin32", shape=(1, 1, seq_len, ROPE_HALF), dtype=np.float16),
+                    ct.TensorType(name="tok_valid", shape=(1, 1, 1, seq_len), dtype=np.float16),
+                    ct.TensorType(name="gdn_carry", shape=(1, n_c, 1, 1), dtype=np.float16),
+                ],
+                outputs=[ct.TensorType(name="h_out", dtype=np.float16)],
+                minimum_deployment_target=ct.target.macOS15,
+                compute_precision=ct.precision.FLOAT16,
+                skip_model_load=True,
+            )
+            m_w8 = cto.linear_quantize_weights(ml, config=q_cfg)
+
+            stem = f"pplx_s{seq_len}_st{st_idx}_{precision}"
+            pkg_path = out_dir / f"{stem}.mlpackage"
+            if pkg_path.exists():
+                shutil.rmtree(pkg_path)
+            m_w8.save(str(pkg_path))
+
+            compiled_path = out_dir / f"{stem}.mlmodelc"
+            if compiled_path.exists():
+                shutil.rmtree(compiled_path)
+            _compile_mlpackage(pkg_path, out_dir)
+            if not keep_mlpackage:
+                shutil.rmtree(pkg_path)
+            stage_entries.append(compiled_path.name)
+
+        manifest["buckets"][str(seq_len)] = {
+            "seq_len": int(seq_len),
+            "stages": stage_entries,
+            "build_s": round(time.perf_counter() - t_bucket, 2),
+        }
+
+    manifest_path = out_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build staged ANE CoreML bundles for fast-pplx")
+    parser.add_argument("--home", type=Path, default=None)
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--variant", default=None, help="Precision/inverse shortcut (e.g. w8a16, w8a8, block, fwd_subst)")
+    parser.add_argument("--seq-lens", nargs="+", default=[str(s) for s in DEFAULT_SEQ_LENS])
+    parser.add_argument("--layers-per-stage", type=int, default=DEFAULT_LAYERS_PER_STAGE)
+    parser.add_argument("--precision", default="w8a16", choices=["w8a16", "w8a8"])
+    parser.add_argument("--inv-mode", default="block", choices=["block", "fwd_subst"])
+    parser.add_argument("--ftz-alpha", type=float, default=DEFAULT_FTZ_ALPHA)
+    parser.add_argument("--calib-stats", type=Path, default=None)
+    parser.add_argument("--outlier-threshold", type=float, default=50.0)
+    parser.add_argument("--keep-mlpackage", action="store_true")
+    args = parser.parse_args()
+
+    manifest = build_ane_bundle_suite(
+        home=args.home,
+        model_dir=args.model_dir,
+        variant=args.variant,
+        seq_lens=_parse_seq_lens(args.seq_lens),
+        layers_per_stage=args.layers_per_stage,
+        precision=args.precision,
+        inv_mode=args.inv_mode,
+        ftz_alpha=args.ftz_alpha,
+        calib_stats_path=args.calib_stats,
+        outlier_threshold=args.outlier_threshold,
+        keep_mlpackage=args.keep_mlpackage,
+    )
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+[
+  [
+    "1_grid_report",
+    "pacific_grid_reliability_2025.pdf",
+    "{\"domain\": \"energy\", \"org\": \"Pacific Transmission Consortium\", \"date\": \"2025-05-12\"}",
+    "Pacific Transmission Consortium TECHNICAL REPORT PTR-2025-09 Seasonal Inverter & Synchronous Reserve Assessment By Dr. Elena Rostova (Principal Systems Engineer) and Marcus Chen (Grid Operations Director) Published May 12, 2025 Executive Summary: Across twelve coastal transmission corridors, battery-backed grid-forming inverters maintained frequency stability within 0.04 Hz during simulated line-trip contingencies in Q1 2025. Reference standard IEEE-2800-2022 compliance was verified at 19 of 21 substations, with two legacy synchronous condensers scheduled for protection-relay upgrades under Work Order WO-4418 before autumn peak ramping. Data telemetry sampled at 60 Hz indicated zero subsynchronous oscillation events above threshold."
+  ],
+  [
+    "2_clinical_disclosure",
+    "novabio_phase3_disclosure_2026.pdf",
+    "{\"domain\": \"healthcare\", \"org\": \"NovaBio Therapeutics\", \"date\": \"2026-01-22\"}",
+    "NovaBio Therapeutics Clinical Investigator Conflict & Grant Disclosure Form Protocol ID: NBX-304-P3 Date Signed: January 22, 2026 Lead Investigator: Dr. Priya Nair, M.D., Department of Pulmonary Medicine, Harbor Medical Center Biostatistical Reviewer: David K. Morales, Ph.D., Pacific Clinical Trials Institute Section 1. Institutional Support: Harbor Medical Center received $420,000 in multi-center trial coordination awards during fiscal years 2024 and 2025 under Grant Ref NIH-U01-8842. Section 2. Equity & Patent Declaration: Neither the Lead Investigator nor immediate staff hold royalty assignments or equity options in NovaBio Therapeutics above reporting thresholds. All site monitoring logs remain archived under GCP-E6-R3 audit guidelines."
+  ],
+  [
+    "3_audit_memo",
+    "port_telemetry_audit_memo.pdf",
+    "{\"domain\": \"cybersecurity\", \"org\": \"Maritime Infrastructure Security Office\", \"date\": \"2025-08-19\"}",
+    "MEMORANDUM TO: Container Crane Operations Board FROM: Sarah Lin, Chief Security Auditor, Maritime Infrastructure Security Office REVIEWER: Owen Takahashi, Principal OT Architect DATE: August 19, 2025 SUBJECT: Internal Audit Memo AUDIT-2025-OT12 — SCADA Segment Isolation Findings Field inspection of Berth 4 and Berth 7 programmable logic controllers identified three unsegmented diagnostic ports bridging crane telemetry VLANS to contractor maintenance laptops. Immediate remediation under NIST-SP-800-82r3 is underway: firewall ACLs were deployed on August 17, certificate pinning was enforced on OPC-UA endpoints, and legacy SSH keys were rotated across 24 edge switches. Follow-up penetration testing is scheduled for October 2025."
+  ],
+  [
+    "4_transit_minutes",
+    "metro_rail_board_minutes_2025.html",
+    "{\"domain\": \"transportation\", \"org\": \"Metro Regional Transit Authority\", \"date\": \"2025-03-18\"}",
+    "Metro Regional Transit Authority Regular Board Meeting Minutes March 18, 2025 Civic Transit Center, Room 4B Chair Carla Reyes called the meeting to order at 9:30 AM. General Manager Henrik Lindqvist presented the Q1 Automated Train Control Cutover Report covering the Blue Line Signal Modernization Project (Contract MRTA-SIG-119). Following verification testing of platform screen door interlocks and traction power substations, the Board unanimously approved Resolution 2025-14 authorizing revenue service trials at 90-second headways beginning April 7, 2025. Chief Engineer Tomas Vega noted that acoustic wheel-flat detectors installed at Central Yard reduced unscheduled axle maintenance by 18 percent year-over-year."
+  ],
+  [
+    "5_water_report",
+    "basin_water_sampling_2025.pdf",
+    "{\"domain\": \"environment\", \"org\": \"Cascade Watershed Laboratory\", \"date\": \"2025-07-14\"}",
+    "Cascade Watershed Laboratory Environmental Monitoring Report CWL-WQ-2025-04 Lower Cedar River Dissolved Oxygen & Nitrate Survey Authors: Dr. Nadia Benali (Hydrochemist) and Thomas Okafor (Field Monitoring Coordinator) Survey Date: July 14, 2025 Grab and continuous sonde measurements across 14 riffle monitoring stations measured mean dissolved oxygen at 9.4 mg/L (minimum 7.8 mg/L at Station CR-09) and total nitrate-nitrogen below 0.35 mg/L under EPA Method 300.1. Riparian shade restoration plots established in 2022 lowered midday stream temperatures by 1.2 degrees Celsius relative to upstream reference gauges."
+  ],
+  [
+    "6_financial_filing",
+    "meridian_q4_risk_filing.pdf",
+    "{\"domain\": \"finance\", \"org\": \"Meridian Clearing Corp.\", \"date\": \"2025-02-11\"}",
+    "Meridian Clearing Corp. Annual Risk & Liquidity Disclosure (Form MCC-10K-SUPP) Filed February 11, 2025 Prepared by Rachel Kim, Chief Risk Officer, and Arthur Pendelton, Treasurer During Q4 2024, aggregate initial margin held across fixed-income repo clearing tiers averaged $18.6 billion, with stressed liquidity coverage ratios exceeding the 1.25 internal floor on every settlement business day under Rule SEC-17Ad-22. Cross-margining agreements enacted in November 2024 lowered intraday variation margin peak transfers by 11.4 percent while preserving 99.5 percent two-day closeout confidence intervals."
+  ],
+  [
+    "7_curriculum_brief",
+    "stem_lab_modernization_brief.pdf",
+    "{\"domain\": \"education\", \"org\": \"Great Lakes Technical Consortium\", \"date\": \"2025-04-21\"}",
+    "Great Lakes Technical Consortium Policy Brief GLTC-PB-2025-02 Shared Photonics & Robotics Teaching Laboratories for Community Colleges Prepared by Prof. Daniel Alvarez (Director of Curriculum Standards) and Mei-Ling Zhou (Equipment Consortium Lead) April 21, 2025 Summary: Establishing three regional shared instrumentation hubs enables fourteen two-year engineering technology programs to offer accredited fiber-optic splicing, collaborative manipulator safety, and PLC diagnostics coursework without duplicating cleanroom capital costs. Consortium matching stipends under Award ED-TEG-550 fund faculty summer externships and open lab manuals."
+  ],
+  [
+    "8_firmware_spec",
+    "edge_gateway_v4_spec.txt",
+    "{\"domain\": \"cybersecurity\", \"org\": \"Northstar Embedded Systems\", \"date\": \"2025-09-05\"}",
+    "Northstar Embedded Systems Engineering Specification SPEC-EGW-410 Rev 2.3 Edge Telemetry Gateway Bootloader & Measured Attestation Protocol Author: Ravi Subramanian (Principal Firmware Architect) Reviewed by: Hannah Lindholm (Hardware Verification Lead) Date: September 5, 2025 Scope: Defines ECDSA P-384 signed image headers, monotonic rollback counters stored in OTP fuses, and CBOR attestation token framing for industrial edge gateways running v4.2 firmware. Every cold boot hashes stage-1 SRAM loader, device-tree blob, and signed RTOS kernel into PCR-0 through PCR-2 before enabling CAN-FD or Ethernet PHYs."
+  ]
+]
