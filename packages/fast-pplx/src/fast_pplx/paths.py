@@ -5,7 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from fast_shared.paths import resolve_home_dir
+try:
+    from fast_shared.paths import resolve_home_dir
+except ImportError:  # pragma: no cover - lean CoreML build venv without MLX
+    import importlib.util
+
+    _shared_paths = Path(__file__).resolve().parents[3] / "fast-shared/src/fast_shared/paths.py"
+    if not _shared_paths.is_file():
+        raise
+    _spec = importlib.util.spec_from_file_location("_fast_shared_paths_fallback", _shared_paths)
+    if _spec is None or _spec.loader is None:
+        raise
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    resolve_home_dir = _mod.resolve_home_dir
 
 
 @dataclass(frozen=True)

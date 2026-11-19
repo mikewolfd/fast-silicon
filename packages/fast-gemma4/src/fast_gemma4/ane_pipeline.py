@@ -85,7 +85,7 @@ def inspect_ane_bundle_plan(
     compute_mode: int = 0,
     use_cache: bool = True,
 ) -> dict[str, Any]:
-    """Inspect CoreML `MLComputePlan` with 8s native timeout guard + check MIL quantization ops."""
+    """Inspect CoreML `MLComputePlan` with 30s native timeout guard + check MIL quantization ops."""
     lp = Path(lib_path)
     mp = Path(mlmodelc_path)
     if not lp.exists():

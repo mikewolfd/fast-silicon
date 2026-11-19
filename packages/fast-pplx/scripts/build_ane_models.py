@@ -12,7 +12,7 @@ Key hardware optimizations encoded from M4 Pro microbenchmarks:
   between chunks, external per-doc cos32/sin32, and block-diagonal FP16 attn_bias
 - Stage splitting (configurable layers-per-stage, default 3 -> 4x3L) keeping each stage
   well below E5RT compile limits with async IOSurface chaining in pplx_coreml_runner
-- Support for default W8A16 (conv weights int8) and W8A8 QDQ with explicit absmax>=50
+- Support for default W8A16 (conv weights int8) and W8A8 QDQ with explicit absmax>=15
   outlier exclusion and mul(mul(gate, up), sigmoid(gate)) SwiGLU-QDQ lowering
 """
 
@@ -76,7 +76,7 @@ def select_qdq_scales(
     layer_type: str,
     calib_stats: dict[str, Any] | None,
     *,
-    outlier_threshold: float = 50.0,
+    outlier_threshold: float = 15.0,
 ) -> dict[str, float | None]:
     """Compute per-projection QDQ absmax bounds, returning None to preserve W8A16 for outliers."""
     if calib_stats is None:
@@ -251,10 +251,27 @@ def build_stage_mil_program(
         return mb.conv(x=x, weight=w_c, name=name)
 
     def _rmsnorm_ch(x, weight_1c11: np.ndarray, name: str, eps: float = RMS_EPS):
-        sq = mb.mul(x=x, y=x, name=f"{name}_sq")
+        # Deep residual streams reach absmax ~380..8092 in layers 6..11, overflowing
+        # x*x in FP16 (> sqrt(65504) = 255.94). Power-of-2 pre-scaling cancels in
+        # x_scaled * rsqrt(mean(x_scaled^2) + eps*s^2) with zero dynamic reduce_max.
+        if name.startswith(("l9_", "l10_", "l11_")) or name == "final_norm":
+            inv_scale = 1.0 / 64.0
+        elif name.startswith(("l6_", "l7_", "l8_")):
+            inv_scale = 1.0 / 8.0
+        else:
+            inv_scale = 1.0
+
+        if inv_scale != 1.0:
+            x_in = mb.mul(x=x, y=_f16(inv_scale), name=f"{name}_prescale")
+            eps_val = max(eps * inv_scale * inv_scale, 1.2e-7)
+        else:
+            x_in = x
+            eps_val = eps
+
+        sq = mb.mul(x=x_in, y=x_in, name=f"{name}_sq")
         msq = mb.reduce_mean(x=sq, axes=[1], keep_dims=True, name=f"{name}_mean")
-        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps), name=f"{name}_eps"), name=f"{name}_rsqrt")
-        normed = mb.mul(x=x, y=inv_rms, name=f"{name}_norm")
+        inv_rms = mb.rsqrt(x=mb.add(x=msq, y=_f16(eps_val), name=f"{name}_eps"), name=f"{name}_rsqrt")
+        normed = mb.mul(x=x_in, y=inv_rms, name=f"{name}_norm")
         return mb.mul(x=normed, y=_const_f16(weight_1c11, name=f"{name}_w"), name=name)
 
     def _rmsnorm_axis(x, weight_arr: np.ndarray, axis: int, name: str, eps: float = RMS_EPS):
@@ -650,7 +667,8 @@ def build_stage_mil_program(
             mb.TensorSpec(shape=(1, 1, seq_len, ROPE_HALF), dtype=types.fp16),
             mb.TensorSpec(shape=(1, 1, 1, seq_len), dtype=types.fp16),
             mb.TensorSpec(shape=(1, n_c, 1, 1), dtype=types.fp16),
-        ]
+        ],
+        opset_version=ct.target.macOS15,
     )
     def prog(h_in, attn_bias, cos32, sin32, tok_valid, gdn_carry):
         h = h_in
@@ -701,7 +719,7 @@ def build_ane_bundle_suite(
     inv_mode: str = "block",
     ftz_alpha: float = DEFAULT_FTZ_ALPHA,
     calib_stats_path: str | Path | None = None,
-    outlier_threshold: float = 50.0,
+    outlier_threshold: float = 15.0,
     keep_mlpackage: bool = False,
 ) -> dict[str, Any]:
     import coremltools as ct
@@ -748,6 +766,7 @@ def build_ane_bundle_suite(
         mode="linear_symmetric",
         dtype="int8",
         granularity="per_channel",
+        weight_threshold=512,
     )
     q_cfg = cto.OptimizationConfig(op_type_configs={"conv": q_op_cfg})
 
@@ -847,7 +866,7 @@ def main() -> None:
     parser.add_argument("--inv-mode", default="block", choices=["block", "fwd_subst"])
     parser.add_argument("--ftz-alpha", type=float, default=DEFAULT_FTZ_ALPHA)
     parser.add_argument("--calib-stats", type=Path, default=None)
-    parser.add_argument("--outlier-threshold", type=float, default=50.0)
+    parser.add_argument("--outlier-threshold", type=float, default=15.0)
     parser.add_argument("--keep-mlpackage", action="store_true")
     args = parser.parse_args()
 

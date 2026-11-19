@@ -958,6 +958,31 @@ class FastPplxGPU:
             raw_weights = dict(mx.load(str(source_path)))
             flag = raw_weights.pop("__norms_shifted__", None)
             norms_shifted = bool(int(flag.item())) if flag is not None else False
+            if not using_mapped and not any(
+                _strip_language_prefix(k) == "embed_tokens.weight" or k in _EMBED_TENSOR_CANDIDATES
+                for k in raw_weights
+            ):
+                embed_cand = next(
+                    (
+                        p
+                        for p in (
+                            embed_st,
+                            self.paths.embed_tokens_safetensors,
+                            self.paths.model_dir / "embed_tokens.safetensors",
+                        )
+                        if p is not None and p.is_file()
+                    ),
+                    None,
+                )
+                if embed_cand is not None:
+                    loaded_embed = mx.load(str(embed_cand))
+                    for cand in (*_EMBED_TENSOR_CANDIDATES, *loaded_embed.keys()):
+                        if cand in loaded_embed and (
+                            cand in _EMBED_TENSOR_CANDIDATES
+                            or _strip_language_prefix(cand) == "embed_tokens.weight"
+                        ):
+                            raw_weights["embed_tokens.weight"] = loaded_embed[cand]
+                            break
 
         backbone_items, head_w = _canonicalize_weights(
             raw_weights,

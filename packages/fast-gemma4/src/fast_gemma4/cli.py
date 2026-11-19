@@ -391,6 +391,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                 mode="hetero",
                 speculative=False,
                 batch_size=b_wave,
+                use_ane_ring=("auto" if getattr(args, "ane_variant", "fp16") == "w8" else False),
             )
             print(
                 f"[Concurrent ANE+GPU {args.waves}xB={b_wave}] JSON={res_het.stats['valid_json_count']}/{n_tot} "

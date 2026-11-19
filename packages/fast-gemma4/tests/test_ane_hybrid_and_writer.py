@@ -63,7 +63,7 @@ def gpu_lock():
 
 @pytest.fixture(scope="module")
 def paths() -> Gemma4Paths:
-    return resolve_paths(REPO_ROOT)
+    return resolve_paths()
 
 
 @pytest.fixture(scope="module")

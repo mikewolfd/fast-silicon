@@ -466,10 +466,10 @@ int gemma4_px_inspect_plan_ex(
             }
             dispatch_semaphore_signal(sem);
         }];
-        // 8-second timeout guard prevents unhandled E5RT _ANECompiler C++ STL exceptions from hanging MLComputePlan.
-        long timed_out = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8LL * NSEC_PER_SEC));
+        // 30-second timeout guard prevents unhandled E5RT _ANECompiler C++ STL exceptions from hanging MLComputePlan under contention.
+        long timed_out = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
         if (timed_out != 0) {
-            fprintf(stderr, "[MLComputePlan] TIMEOUT (>8s) inspecting %s\n", mlmodelc_path);
+            fprintf(stderr, "[MLComputePlan] TIMEOUT (>30s) inspecting %s\n", mlmodelc_path);
             failed = 1;
         }
         if (out_ane) *out_ane = ane_ops;

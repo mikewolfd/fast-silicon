@@ -1,47 +1,17 @@
 # fast-bge-small
 
-Hardware-limit **BAAI/bge-small-en-v1.5** inference engine for Apple Silicon (**M4 Pro / Metal 4 + MPP + 16-core Apple Neural Engine**).
+Hardware-limit inference engine for **BAAI/bge-small-en-v1.5** (`33M`, `384`-d) on Apple Silicon **M4 Pro** combining 20-core Metal 4 `MPP::matmul2d` GPU kernels and 16-core Apple Neural Engine (`CoreML` / `IOSurface`) concurrent execution.
+No `transformers`, `torch`, or Python runtime overhead is required for inference, with a standalone C++/CoreML binary (`build/bge-ane-cli`) for zero-Python single-query ANE execution.
 
-Combines zero-contention concurrent execution across both compute engines:
-- **16-core Apple Neural Engine (`MLComputeUnitsCPUAndNeuralEngine`)**: custom Objective-C++ CoreML runner ([`native/bge_ane_runner.mm`](native/bge_ane_runner.mm)) with NEON FP16 word+position addition, 8x8 register transpose, zero-copy `MLMultiArray` backing, Layer-11 `[CLS]` slicing, and 4-slot asynchronous prediction pipelining (`~0.49 ms` single query at `S=24`).
-- **20-core Metal GPU (`FastBgeSmallGPU`)**: custom Metal kernels via `mx.fast.metal_kernel` ([`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py)) using packed variable-length batching (zero attention padding), custom bidirectional `D=32` FlashAttention, Metal 4 `MPP::matmul2d` fused bias+GELU/residual epilogues, single-pass LayerNorm + L2 normalization, and Layer-11 `[CLS]`-only attention/FFN slicing.
-- **Two-Ended Work Stealing Scheduler**: GPU consumes longest sequences forward while ANE concurrently pulls shortest sequences backward with zero GPU contention.
-
-## Requirements
-
-- **macOS 15+ / Xcode 26–27 SDK** (uses `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` `MPP::matmul2d`; verified on Apple M4 Pro, macOS 26.6, Xcode SDK 27.2).
-- **Python >= 3.11** (`mlx`, `numpy`, `tokenizers`, `pyarrow`, `huggingface-hub`). No `transformers` or `torch` required at runtime.
-- `coremltools >= 8.0` (Python 3.12) is only required if rebuilding `.mlmodelc` ANE bundles from scratch via `scripts/build_ane_models.py`.
-
-## Build & Setup
+## Quick start
 
 ```bash
-# 1. Compile native Objective-C++ ANE/CPU libraries and standalone CLI binary
 make native
-
-# 2. Create isolated Python environment (links sibling ../fast-shared DRY utilities)
 uv venv --python cpython-3.13.14 .venv
 uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
-
-# 3. Export FP16 weights & tokenizer assets into artifacts/ (from HF cache or download)
 .venv/bin/bge-small setup-weights
-
-# 4. Run parity & integration suite
-.venv/bin/pytest -v
+.venv/bin/bge-small verify
 ```
-
-## Usage
-
-### 1. Standalone Compiled C++/CoreML Binary (Zero Python)
-
-`build/bge-ane-cli` embeds single queries directly on the Apple Neural Engine:
-
-```bash
-./build/bge-ane-cli --text "distributed cache invalidation strategy" --query-prefix --json
-./build/bge-ane-cli --text "What is the budget deficit?" --bench 20
-```
-
-### 2. Python Library
 
 ```python
 from fast_bge_small import FastBgeSmall
@@ -51,59 +21,38 @@ q = eng.encode_texts("What is the budget deficit?", is_query=True, add_query_pre
 vecs = eng.encode_texts(["passage one...", "passage two..."], mode="hetero")            # (2, 384)
 ```
 
-### 3. CLI Commands
-
 ```bash
-# Embed text from CLI or stdin
-.venv/bin/bge-small embed "first passage" "second passage" --json
-
-# Stream-embed a Parquet file, directory of .parquet shards, or glob
-.venv/bin/bge-small parquet \
-  --input path/to/input.parquet \
-  --output path/to/output.parquet \
-  --text-col body
-
-# Persistent OpenAI-compatible HTTP daemon (/v1/embeddings, /health)
-.venv/bin/bge-small serve --host 127.0.0.1 --port 8080
-
-# Verify numerical parity against 64-doc fixture
-.venv/bin/bge-small verify
-
-# Run query latency and corpus throughput benchmarks
-.venv/bin/bge-small bench
+./build/bge-ane-cli --text "distributed cache invalidation strategy" --query-prefix --json
 ```
 
-### 4. Streaming Parquet Pipeline Options
+## At a glance
 
-For document collections and multi-file Iceberg/Parquet tables:
-- `--input`: `.parquet` file, directory, or glob pattern.
-- `--output`: `.parquet` file (single streaming output) or directory (resumable `part-00000.parquet` shards with `--resume`).
-- `--dtype float32|float16`: output vector precision (`fixed_size_list<float32|float16>[384]`).
-- `--chunk --max-body-tokens 510 --overlap 51`: sliding-window token chunking preserving source metadata columns plus `chunk_index`, `char_start`, `char_end`, `token_count`.
-- `--filter-ocr`: filters `is_ocr == true` or `len(ocr_pages) > 0` when present.
-- `--ocr-pages-only` / `--per-ocr-page`: slices UTF-8 `page_offsets` using 1-based `ocr_pages` (`body_text` schema).
+| Question | Answer |
+|---|---|
+| How close to float reference? | `0.999998` min cos (`GPU` vs `F16` and `BF16`); `0.999984` (`Hetero` vs `F16`); `0.999986` (`ANE` vs `GPU` `B=1 S=24`). |
+| How fast is single query (`B=1 S=24`)? | **`0.493 ms`** ANE median (synth) / **`0.560 ms`** ANE median (OCR) / **`0.526 ms`** (`monorepo_bench`, **`3.83x`** faster than `2.015 ms` GPU; `0.502 ms` in zero-Python `bge-ane-cli`). |
+| How fast is bulk throughput (`hetero`)? | **`207,264 tok/s`** (`monorepo_bench n=1,000`, **`2.50x`** vs `transformers-mps-float16`, **`1.52x`** vs GPU, `1.173 GB` Metal / `4.813 GB` OS); standalone `n=4,000` up to **`215,022 tok/s`** OCR (`4.566 s`) and **`189,338 tok/s`** synth (`5.250 s`). |
+| Requires `torch` or `transformers`? | No at runtime (`mlx`, `numpy`, `tokenizers`, `pyarrow`, `huggingface-hub` only; `coremltools >= 8.0` only to rebuild `.mlmodelc`). |
 
-## Measured Verification & Benchmarks (M4 Pro)
+## Parity (`64`-doc fixture, `bge-small verify`)
 
-- `make native`: compiles `build/libbge_ane_runner.dylib`, `build/libbge_cpu_query.dylib`, and standalone `build/bge-ane-cli` with 0 compiler warnings (`Apple clang 21.0.0`, macOS 26.6 / SDK 27.2).
-- Standalone ANE binary (`./build/bge-ane-cli --text "What is the budget deficit?" --query-prefix --bench 30`): `tokens=16 bucket=S24 iters=30 latency_ms=0.502` (zero Python runtime).
-- `bge-small verify` on 64-doc reference fixture:
-  - `GPU_vs_F16` min cosine: `0.999998` (mean `0.999999`)
-  - `GPU_vs_BF16` min cosine: `0.999998`
-  - `Hetero_vs_F16` min cosine: `0.999984`
-  - `Single-query B=1 S=24 ANE_vs_GPU` cosine: `0.999986`
-- `pytest -v`: `7 passed` covering 64-doc multi-mode parity, ANE bucket routing across lengths `16..500`, chunking + Rust WordPiece tokenizer, native `bge-ane-cli`, UTF-8 `page_offsets` OCR slicing, streaming/sharded/resumable Parquet embedding, and HTTP `/v1/embeddings` server.
+| Comparison | Min Cosine | Mean Cosine / Notes |
+|---|---:|---|
+| `GPU` vs `F16` reference | `0.999998` | Mean `0.999999` across `64` docs |
+| `GPU` vs `BF16` reference | `0.999998` | Matches BF16 reference |
+| `Hetero` (`GPU + ANE`) vs `F16` | `0.999984` | Two-ended bucket routing |
+| `Single-query B=1 S=24 ANE` vs `GPU` | `0.999986` | `build/bge-ane-cli`: `0.502 ms` (`tokens=16`, `iters=30`) |
 
-### Throughput & Query Latency (`bge-small bench`, measured during concurrent session GPU/CPU activity)
+## Speed (`bge-small bench`, `n = 4,000` docs, M4 Pro `48 GB`)
 
-Single-query `B=1 S=24` latency:
-- Synthetic run: `ANE_B1_S24` median `0.493 ms` (min `0.475 ms`) vs `GPU_B1_S24` median `1.937 ms` (min `1.843 ms`).
-- OCR Parquet run: `ANE_B1_S24` median `0.560 ms` (min `0.485 ms`) vs `GPU_B1_S24` median `4.067 ms` (min `2.227 ms`).
+Single-query `B=1 S=24` (`ANE` vs `GPU`):
+- Synthetic: `ANE_B1_S24` median **`0.493 ms`** (min `0.475 ms`) vs `GPU_B1_S24` median `1.937 ms` (min `1.843 ms`).
+- Document OCR: `ANE_B1_S24` median **`0.560 ms`** (min `0.485 ms`) vs `GPU_B1_S24` median `4.067 ms` (min `2.227 ms`).
 
-Corpus throughput (`n = 4,000` documents):
+Corpus throughput:
 
-| Workload | Mode | Elapsed (s) | Throughput (tok/s) | Split (`gpu_docs` / `ane_docs`, `gpu_toks` / `ane_toks`) |
-| --- | --- | ---: | ---: | --- |
+| Workload | Mode | Elapsed (s) | Throughput (tok/s) | Split (`gpu_docs / ane_docs`, tokens) |
+|---|---|---:|---:|---|
 | Synthetic (`993,944` toks) | `gpu` | 7.185 | 138,335 | 4,000 / 0 (`993,944` / `0`) |
 | Synthetic (`993,944` toks) | `ane` | 16.772 | 59,261 | 0 / 4,000 (`0` / `993,944`) |
 | Synthetic (`993,944` toks) | `hetero` | **5.250** | **189,338** | 1,504 / 2,496 (`577,600` / `416,344`) |
@@ -111,4 +60,47 @@ Corpus throughput (`n = 4,000` documents):
 | Document OCR (`981,829` toks) | `ane` | 16.272 | 60,339 | 0 / 4,000 (`0` / `981,829`) |
 | Document OCR (`981,829` toks) | `hetero` | **4.566** | **215,022** | 1,856 / 2,144 (`632,487` / `349,342`) |
 
-*Note: Measured on Apple M4 Pro (48 GiB) while background sessions were potentially sharing GPU/CPU resources; uncontended throughput may be higher.*
+### Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`, M4 Pro `48 GB`)
+
+Verified in the unified monorepo runner (`scripts/benchmark_monorepo.py --packages fast-bge-small`, `n=1,000` docs / `249,303` tokens, Metal Peak `1.173 GB`, OS Footprint `4.813 GB` via `RUSAGE_INFO_V4`):
+
+| Workload / Mode | Latency (`B=1 S=24`) | Time (`s`) | Throughput | Notes / Split |
+|---|---:|---:|---:|---|
+| **`hetero` (Metal 4 + ANE)** | ANE **0.526 ms** (min `0.467`) | **1.203** | **207,264 tok/s** | `424` GPU / `576` ANE docs (**`1.52x`** `gpu`; **`2.50x`** vs `transformers-mps`) |
+| `gpu` (Metal 4 MPP) | GPU `2.015 ms` (min `1.847`) | 1.828 | 136,416 tok/s | `1,000` GPU docs (`ANE B=1` is **`3.83x`** lower latency) |
+| `ane` (CoreML ANE) | ANE `0.526 ms` | 4.388 | 56,808 tok/s | `1,000` ANE docs |
+| `transformers-mps-float16` (Public) | `8.446 ms` | — | `82,883.2 tok/s` (`332.46 docs/s`) | OS Footprint `3.520 GB` (`load=1.314 s`) |
+
+Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `Hetero_vs_F16` `min=0.999984`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999986`.
+
+*Note: Monorepo capture ran alongside light background system activity (`6` quiescence warnings recorded in the run manifest).*
+
+## What keeps it fast
+
+| Component | Optimization | Source |
+|---|---|---|
+| **16-core ANE Runner** | `MLComputeUnitsCPUAndNeuralEngine`, NEON FP16 add, `8x8` register transpose, Layer-11 `[CLS]` slice, 4-slot async ring | [`native/bge_ane_runner.mm`](native/bge_ane_runner.mm) |
+| **20-core Metal 4 GPU** | Packed varlen batching (0 attn pad), custom `D=32` bidirectional FlashAttention, `MPP::matmul2d` fused GELU/residual, single-pass LN+L2 | [`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py) |
+| **Work-Stealing Scheduler** | GPU consumes longest sequences forward while ANE pulls shortest sequences backward with zero contention | [`src/fast_bge_small/`](src/fast_bge_small/) |
+
+## CLI, Parquet & Reproduce
+
+```bash
+.venv/bin/bge-small embed "first passage" "second passage" --json
+.venv/bin/bge-small parquet --input in.parquet --output out/ --text-col body \
+  --dtype float32 --chunk --max-body-tokens 510 --overlap 51 --filter-ocr --resume
+.venv/bin/bge-small serve --host 127.0.0.1 --port 8080
+.venv/bin/bge-small bench --mode all --n 4000
+.venv/bin/pytest -v   # 7 passed (native bge-ane-cli, parity, ANE buckets 16..500, Parquet OCR, HTTP)
+```
+
+Parquet options also include `--ocr-pages-only`, `--per-ocr-page` (UTF-8 `page_offsets`), directory shard `--resume`, and `float16` output vectors.
+
+## Scope & Not-tested
+
+- Verified on **Apple M4 Pro (`Mac16,8`, `48 GB`, macOS 26.6, Xcode SDK 27.2, `Apple clang 21.0.0`)** producing `0`-warning native builds (`libbge_ane_runner.dylib`, `libbge_cpu_query.dylib`, `bge-ane-cli`).
+- **Not tested:** Other Apple Silicon generations/RAM tiers, Linux/x86/CUDA, or sequences exceeding the model's `512`-token context window.
+
+## Author & License
+
+**Michael Deeb** ([`@mikewolfd`](https://github.com/mikewolfd)) · **TealWolf Consulting LLC** · [MIT License](LICENSE).
