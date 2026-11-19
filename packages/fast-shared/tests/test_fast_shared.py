@@ -809,15 +809,41 @@ def test_roofline_audit_bench_and_plugin_cpu(tmp_path: Path) -> None:
     assert (skill_dir / "SKILL.md").is_file()
     for rel in (
         "references/m4-vs-m5-architecture.md",
+        "references/m4-m5-capability-matrix.md",
         "references/kernel-and-dtype-playbook.md",
         "references/dead-ends-registry.md",
+        "references/data/matrix_curated.json",
+        "references/data/catalog_instruction_differences.jsonl",
+        "references/data/catalog_a64_encodings.jsonl",
+        "references/data/catalog_metal_gpu.jsonl",
+        "references/data/catalog_mlx_api.jsonl",
+        "references/data/catalog_apple_apis.jsonl",
+        "references/data/catalog_metal_sdk.jsonl",
+        "references/data/catalog_bnns_graph_api.jsonl",
         "scripts/probe_silicon_ceilings.py",
         "scripts/probe_mpp_metal4.mm",
         "scripts/probe_ane_and_hetero.mm",
         "scripts/audit_safetensors_model.py",
         "scripts/ab_bench_harness.py",
+        "scripts/query_capability_matrix.py",
     ):
         assert (skill_dir / rel).is_file()
+
+    # Validate merged capability matrix dataset & CLI helper
+    import importlib.util
+
+    matrix_data = json.loads((skill_dir / "references/data/matrix_curated.json").read_text(encoding="utf-8"))
+    assert matrix_data["metadata"]["validation_summary"]["a64_boolean_predicate_logic_errors"] == 0
+    assert matrix_data["metadata"]["validation_summary"]["apple_apis_exact_duplicates_collapsed"] == 2
+    assert len(matrix_data["six_chip_matrices"]["mlx"]["rows"]) == 57
+    assert len(matrix_data["cpu_features"]) == 99
+
+    q_spec = importlib.util.spec_from_file_location("query_capability_matrix", skill_dir / "scripts" / "query_capability_matrix.py")
+    assert q_spec is not None and q_spec.loader is not None
+    q_mod = importlib.util.module_from_spec(q_spec)
+    q_spec.loader.exec_module(q_mod)
+    assert q_mod.main(["--stats", "--json"]) == 0
+    assert q_mod.main(["--table", "mlx", "--search", "MLX_ENABLE_TF32", "--limit", "5"]) == 0
 
 
 def test_grammar_fallback_and_temperature_was_masked_cpu() -> None:

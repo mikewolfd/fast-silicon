@@ -10,7 +10,7 @@ Optimize complete ML workloads on Apple Silicon. M4 (`Apple9`) runs Metal tensor
 ## Core Governing Principles
 
 1. **Optimize `valid_outputs/sec × task_accuracy` within `peak_gb` RAM.** Never ship an optimization that boosts raw `dec tok/s` while regressing end-to-end `docs/s` or blind accuracy (`longer JSON`, `repeat loops`, `extra fallbacks`).
-2. **Measure the target Mac.** Record the chip variant, running macOS version, SDK and MLX version. Measure bandwidth and matrix throughput at the shapes you use. Check which tensor formats and operations the OS exposes on that GPU family. [Metal features by macOS version](references/m4-vs-m5-architecture.md#metal-features-by-macos-version)
+2. **Measure the target Mac.** Record the chip variant, running macOS version, SDK and MLX version. Measure bandwidth and matrix throughput at the shapes you use. Check which tensor formats and operations the OS exposes on that GPU family. [Metal features by macOS version](references/m4-vs-m5-architecture.md#metal-features-by-macos-version) · [Six-chip capability matrix](references/m4-m5-capability-matrix.md)
 3. **Eliminate tokens and calls before tuning shaders.** Zero-LLM deterministic bypasses, reasoning/CoT skipping, `llguidance` forced-token jumping + lazy GPU `argmax`, and lossless/asymmetric vocab pruning routinely yield `1.5×–4×+` before writing a line of Metal.
 4. **Separate micro-benchmarks from E2E execution.** Single-layer `1×` extrapolation misattributes launch overhead (`PLE`) and hides double-wide/heterogeneous layers. Measure full `N`-layer pipelined graphs inside `mx.eval`, then validate E2E under paired interleaved `A/B` runs.
 
@@ -30,7 +30,7 @@ Before modifying model code or writing custom kernels:
    ```bash
    python3 scripts/probe_silicon_ceilings.py          # or: fast-silicon-probe
    ```
-   On macOS 26.4 or later with a matching SDK, the native Metal probe measures FP16, BF16, INT8 and INT4. It builds those kernels in one library. On 26.2, use the MLX probe above for floating-point throughput and query `[device supportsFamily:MTLGPUFamilyApple10]` for the hardware family.
+   On macOS 26.4 or later with a matching SDK, the native Metal probe measures FP16, BF16, INT8 and INT4. It builds those kernels in one library. On 26.2, use the MLX probe above for floating-point throughput and query `[device supportsFamily:MTLGPUFamilyApple10]` for the hardware family. For exact six-chip specs, macOS `15.0–27.2.1` gates, `MLX` version ceilings, Darwin `hw.optional.arm.*` keys, Metal/CoreML/CoreAI/BNNS SDK declarations, or A64 encodings without loading raw sheets into context, read [references/m4-m5-capability-matrix.md](references/m4-m5-capability-matrix.md) or query `python3 scripts/query_capability_matrix.py --search <term>`.
    ```bash
    xcrun clang++ -O3 -std=c++20 -fobjc-arc -framework Foundation -framework Metal -framework MetalPerformancePrimitives scripts/probe_mpp_metal4.mm -o /tmp/probe_mpp_metal4 && /tmp/probe_mpp_metal4
    ```
