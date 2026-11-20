@@ -100,6 +100,38 @@ def compute_analytical_bpw(module: Any, excluded_modules: set[str], bits_quant: 
     return round(total_b / max(1, total_w), 4)
 
 
+def _cast_floating_tensors(obj: Any, dtype: Any) -> Any:
+    """Cast floating-point PyTorch tensors recursively while keeping integer/bool tensors untouched."""
+    if hasattr(obj, "is_floating_point") and obj.is_floating_point():
+        return obj.to(dtype=dtype)
+    if isinstance(obj, tuple):
+        return tuple(_cast_floating_tensors(x, dtype) for x in obj)
+    if isinstance(obj, list):
+        return [_cast_floating_tensors(x, dtype) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _cast_floating_tensors(v, dtype) for k, v in obj.items()}
+    return obj
+
+
+def _resolve_coreai_compute_dtype(export_backend: str, preset: str, compute_dtype: str = "auto") -> str:
+    """Resolve effective graph compute dtype; default `coreai` dense/int presets to FP16 for ANE eligibility."""
+    norm = compute_dtype.strip().lower()
+    if norm in ("auto", ""):
+        if export_backend.strip().lower() == "coreai" and preset.strip().lower() in (
+            "fp16",
+            "w8",
+            "w4",
+            "w4_per_block",
+        ):
+            return "fp16"
+        return "fp32"
+    if norm in ("fp16", "float16"):
+        return "fp16"
+    if norm in ("fp32", "float32"):
+        return "fp32"
+    raise ValueError(f"Unsupported compute_dtype={compute_dtype!r}; choose 'auto', 'fp16', or 'fp32'")
+
+
 def inspect_coreml_bundle_placement(
     bundle_path: str | Path,
     *,
@@ -113,8 +145,17 @@ def inspect_coreml_bundle_placement(
 
     p = Path(bundle_path)
     if compute_units is None:
-        compute_units = ct.ComputeUnit.CPU_AND_NE if target_device.lower() in ("ane", "neural_engine") else ct.ComputeUnit.ALL
-    plan = ct.models.compute_plan.MLComputePlan.load_from_path(str(p), compute_units=compute_units)
+        compute_units = ct.ComputeUnit.ALL
+    compiled_tmp: Path | None = None
+    try:
+        load_path = p
+        if p.suffix == ".mlpackage":
+            compiled_tmp = Path(ct.utils.compile_model(str(p)))
+            load_path = compiled_tmp
+        plan = ct.models.compute_plan.MLComputePlan.load_from_path(str(load_path), compute_units=compute_units)
+    finally:
+        if compiled_tmp is not None and compiled_tmp.exists():
+            shutil.rmtree(compiled_tmp, ignore_errors=True)
     return summarize_accelerator_placement(
         extract_coreml_compute_plan_ops(plan),
         target_device=target_device,
@@ -133,6 +174,7 @@ def build_coreai_opt_config(
     weight_shapes: Mapping[str, tuple[int, ...]] | None = None,
     block_axis: int = 1,
     os_version: str | None = None,
+    allow_experimental_coreml_w4_block: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Build a Pattern-7 & export-backend guarded `coreai_opt.quantization.QuantizerConfig`."""
     import torch
@@ -160,6 +202,12 @@ def build_coreai_opt_config(
     probe = probe_core_ai_support(
         hw={"system": "Darwin", "machine": "arm64", "macos_version": os_version} if os_version else None
     )
+    if preset_norm == "w4_per_block" and eb == ExportBackend.CoreML and not allow_experimental_coreml_w4_block:
+        raise ValueError(
+            "preset='w4_per_block' on export_backend='coreml' produces corrupted CoreML logits and CPU "
+            "fallback on ios18.conv (use preset='w8' for CoreML, preset='w4_per_block' with "
+            "export_backend='coreai', or pass allow_experimental_coreml_w4_block=True)"
+        )
     if preset_norm == "fp4_fp8" and eb == ExportBackend.CoreML:
         raise ValueError("preset='fp4_fp8' requires export_backend='coreai' (CoreML target does not support FP4/FP8)")
     if preset_norm == "fp4_fp8" and os_version is not None and not probe["fp4_fp8_preset_eligible"]:
@@ -251,14 +299,17 @@ def run_coreai_opt_calibration_and_export(
     flag_add_fp16_cast: bool = False,
     inspect_placement: bool = False,
     target_device: str = "ane",
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> CoreAiExportResult:
     """Calibrate, quantize (CoreAI-Opt), export (`.aimodel` / `.mlpackage`), and guard any `nn.Module`."""
     import torch
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    eff_compute_dtype = _resolve_coreai_compute_dtype(export_backend, preset, compute_dtype)
     module = module_factory().eval()
-    sample = sample_inputs_factory(0)
+    raw_sample = sample_inputs_factory(0)
 
     weight_shapes = {
         name: tuple(int(d) for d in sub.weight.shape)
@@ -273,14 +324,30 @@ def run_coreai_opt_calibration_and_export(
         requested_dtypes=requested_dtypes,
         weight_shapes=weight_shapes,
         block_axis=block_axis,
+        allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
     )
 
     with torch.no_grad():
-        ref_vec = _flat_outputs(module(*sample))
+        ref_vec = _flat_outputs(module(*raw_sample))
+
+    if eff_compute_dtype == "fp16":
+        # Cast floating weights/buffers + sample inputs to FP16 so Core AI exports stay ANE/FP16-eligible.
+        module = module.to(dtype=torch.float16)
+        sample = _cast_floating_tensors(raw_sample, torch.float16)
+
+        def _calib_inputs(bi: int) -> tuple[Any, ...]:
+            return _cast_floating_tensors(sample_inputs_factory(bi), torch.float16)
+    else:
+        sample = raw_sample
+        _calib_inputs = sample_inputs_factory
 
     if preset == "fp16":
         finalized = module
-        q_vec = ref_vec
+        if eff_compute_dtype == "fp16":
+            with torch.no_grad():
+                q_vec = _flat_outputs(finalized(*sample))
+        else:
+            q_vec = ref_vec
     else:
         from coreai_opt import ExportBackend
         from coreai_opt.quantization import Quantizer
@@ -291,7 +358,7 @@ def run_coreai_opt_calibration_and_export(
         with quantizer.calibration_mode():
             with torch.no_grad():
                 for bi in range(max(1, int(calib_batches))):
-                    prepared(*sample_inputs_factory(bi))
+                    prepared(*_calib_inputs(bi))
         with torch.no_grad():
             q_vec = _flat_outputs(prepared(*sample))
         finalized = quantizer.finalize(backend=eb)
@@ -304,6 +371,7 @@ def run_coreai_opt_calibration_and_export(
         "cosine_vs_teacher": round(cos, 6),
         "mse_vs_teacher": round(mse, 8),
         "analytical_bpw": compute_analytical_bpw(module, set(qmeta["excluded_modules"]), bits_q),
+        "compute_dtype": eff_compute_dtype,
         "excluded_modules": qmeta["excluded_modules"],
         "skipped_non_divisible": qmeta["skipped_non_divisible"],
     }
@@ -313,6 +381,7 @@ def run_coreai_opt_calibration_and_export(
             "model_name": model_name,
             "preset": preset,
             "backend": export_backend,
+            "compute_dtype": eff_compute_dtype,
             "excluded": qmeta["excluded_modules"],
             "extra": dict(spec_metadata or {}),
         },
@@ -323,6 +392,7 @@ def run_coreai_opt_calibration_and_export(
     spec_options: dict[str, Any] = {
         "backend": export_backend,
         "preset": preset,
+        "compute_dtype": eff_compute_dtype,
         **_sanitize_custom_metadata(dict(spec_metadata or {})),
     }
     if preset == "w4_per_block":
@@ -445,15 +515,23 @@ def run_coreai_opt_preset_sweep(
     ml_inputs: Sequence[Any] | None = None,
     ml_outputs: Sequence[Any] | None = None,
     export_backend: str = "coreml",
-    presets: Sequence[str] = ("fp16", "w8", "w4", "w4_per_block"),
+    presets: Sequence[str] | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
     block_axis: int = 1,
     excluded_modules: Sequence[str] = (),
     calib_batches: int = 2,
     spec_metadata: Mapping[str, Any] | None = None,
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> list[dict[str, Any]]:
     """Run a sensitivity & BPW calibration sweep across CoreAI-Opt presets."""
     out_root = Path(out_dir)
+    if presets is None:
+        presets = (
+            ("fp16", "w8", "w4")
+            if export_backend.strip().lower() == "coreml" and not allow_experimental_coreml_w4_block
+            else ("fp16", "w8", "w4", "w4_per_block")
+        )
     rows: list[dict[str, Any]] = []
     for preset in presets:
         res = run_coreai_opt_calibration_and_export(
@@ -473,6 +551,8 @@ def run_coreai_opt_preset_sweep(
             excluded_modules=excluded_modules,
             calib_batches=calib_batches,
             spec_metadata=spec_metadata,
+            allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
+            compute_dtype=compute_dtype,
         )
         rows.append(
             {

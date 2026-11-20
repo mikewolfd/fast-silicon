@@ -5908,6 +5908,78 @@
           "Additional source URLs": "https://github.com/apple/coreai-models/blob/main/models/qwen3/README.md\nhttps://github.com/apple/coreai-models/blob/da9fb21d1f74ba6f85685b150d14a723b51f4c0c/models/README.md",
           "Original record": "Merged addition: FP4/FP8 weights + FP8 activations and KV cache",
           "Detailed reference": "Apple APIs"
+        },
+        {
+          "Domain": "Core AI",
+          "Capability / form": "Specialization cache mapping & asset inspection (AIModelAsset)",
+          "M4": "Offline export on 26.x; runtime OS cache requires 27.0+",
+          "M4 Pro": "Offline export on 26.x; runtime OS cache requires 27.0+",
+          "M4 Max": "Offline export on 26.x; runtime OS cache requires 27.0+",
+          "M5": "Verified 27.2.1 (26B131): ~/Library/Caches/coreai-cache/<os_build>/python/<modelHash>/<optionsHash>/model.aimodelx/ captures specialized pages in mapped_all_mb; coreai.authoring.AIModelAsset.load()",
+          "M5 Pro": "Same Core AI cache & authoring API as M5 on 27.0+",
+          "M5 Max": "Same Core AI cache & authoring API as M5 on 27.0+",
+          "macOS / runtime requirement": "27.0",
+          "Package / compiler requirement": "coreai.authoring.AIModelAsset (not coreai.runtime); offline coreai-torch >= 0.4.1",
+          "Implementation / interpretation": "Passing an unspecialized .aimodel directory to model_mapped misses specialized pages (mapped_model_mb=0.0) while mapped_all_mb captures the cached model.aimodelx (2383.28 MB on emb2_bf16).",
+          "Evidence class": "Verified Track B Host (Base M5 27.2.1)",
+          "Primary source URL": "https://developer.apple.com/documentation/coreai",
+          "Additional source URLs": "",
+          "Original record": "Track B T0.5/T2.1 empirical lock-in",
+          "Detailed reference": "m4-vs-m5-architecture.md"
+        },
+        {
+          "Domain": "Core AI",
+          "Capability / form": "FP16 compute dtype & ANE routing vs FP32 MPSGraph fallback (.aimodel)",
+          "M4": "Offline export only on 26.x",
+          "M4 Pro": "Offline export only on 26.x",
+          "M4 Max": "Offline export only on 26.x",
+          "M5": "Verified 27.2.1: FP32 compute -> 0 ANE ops / MPSGraph (Laya w8 94.18 ms; fast-pplx w8 130.62 ms EOT 0.184x FAIL). FP16 compute + ANE -> Laya w8_f16 23.00 ms isolated (4.09x), 1,652 ANE ops, 62.3 MB phys",
+          "M5 Pro": "Same Core AI FP16 ANE compute rules on 27.0+",
+          "M5 Max": "Same Core AI FP16 ANE compute rules on 27.0+",
+          "macOS / runtime requirement": "27.0",
+          "Package / compiler requirement": "coreai_pipeline compute_dtype='fp16' + ANE-safe ops (no F.softplus)",
+          "Implementation / interpretation": "Casting floating weights/buffers & inputs to FP16 unlocks ANE placement without losing quality (Laya logit_cos=0.999831, fast-pplx st0 cos=0.999862). DynamicSiliconPolicy keeps coreml_mil default unless promoted on 27.2.1.",
+          "Evidence class": "Verified Track B Host (Base M5 27.2.1)",
+          "Primary source URL": "https://developer.apple.com/documentation/coreai",
+          "Additional source URLs": "",
+          "Original record": "Track B T2.3 empirical lock-in",
+          "Detailed reference": "m4-vs-m5-architecture.md"
+        },
+        {
+          "Domain": "CoreAI tooling",
+          "Capability / form": "CoreAI-Opt w4_per_block vs w8 on ExportBackend.CoreML vs ExportBackend.CoreAI",
+          "M4": "CoreML w4_per_block block=32 unsafe; use w8 or CoreAI",
+          "M4 Pro": "Verified 26.6 (CoreML 9.0): Laya w4_per_block corrupted compiled logits (live_real_cos=-0.198452, 121 ios18.conv CPU fallbacks); w8 hit 100% ANE (24.651 ms) but failed ABBA N=1400 Gate 3 (eot_ratio=0.9879)",
+          "M4 Max": "Same CoreML 9.0 MIL lowering semantics",
+          "M5": "Verified 27.2.1 (CoreAI): Laya w4_per_block finite (S=0.3810, 0.3267 GB) on MPSGraph, still 0.273x vs custom ANE; fast-pplx w4_per_block 138.5 ms / 3.07 GB FAIL",
+          "M5 Pro": "Same CoreML/CoreAI lowering semantics",
+          "M5 Max": "Same CoreML/CoreAI lowering semantics",
+          "macOS / runtime requirement": "26.x CoreML / 27.0+ CoreAI",
+          "Package / compiler requirement": "coreai-opt >= 0.4.0; fast_shared blocks CoreML w4_per_block unless allow_experimental_coreml_w4_block=True",
+          "Implementation / interpretation": "Never run w4_per_block on ExportBackend.CoreML by default; reserve w4_per_block for ExportBackend.CoreAI or use w8 / hand-crafted W8A16 conv1x1 on CoreML.",
+          "Evidence class": "Verified Track A (M4 Pro 26.6) & Track B (Base M5 27.2.1)",
+          "Primary source URL": "https://developer.apple.com/documentation/coreai",
+          "Additional source URLs": "",
+          "Original record": "Track A T1.1-T1.3 & Track B T2.3 lock-in",
+          "Detailed reference": "dead-ends-registry.md"
+        },
+        {
+          "Domain": "Core AI",
+          "Capability / form": "Qwen3.5-4B fp4_fp8 vs 4bit live runtime baseline",
+          "M4": "Requires 27.2+",
+          "M4 Pro": "Requires 27.2+",
+          "M4 Max": "Requires 27.2+",
+          "M5": "Verified 27.2.1 (26B131): fp4_fp8 1050.14 ms warm median vs 4bit 1423.64 ms (1.36x), peak RAM 0.6986 GB vs 0.9063 GB (-22.9%), all outputs finite, MPSGraph (52 delegates)",
+          "M5 Pro": "Eligible on 27.2+",
+          "M5 Max": "Eligible on 27.2+",
+          "macOS / runtime requirement": "27.2",
+          "Package / compiler requirement": "coreai-models fp4_weights_fp8_activations_fp8_kv_cache",
+          "Implementation / interpretation": "Establishes live 27.2+ Base M5 speedup and memory reduction on Qwen3.5-4B MPSGraph path.",
+          "Evidence class": "Verified Track B Host (Base M5 27.2.1)",
+          "Primary source URL": "https://github.com/apple/coreai-models/blob/main/models/README.md",
+          "Additional source URLs": "",
+          "Original record": "Track B T0.5 subprocess smoke lock-in",
+          "Detailed reference": "m4-vs-m5-architecture.md"
         }
       ]
     },
@@ -7439,6 +7511,28 @@
       "framework_version": "Third-party, private AppleNeuralEngine framework",
       "practical_effect": "An experimental numerical graph backend. Its authors' results do not establish stable support or OCR throughput for either of our machines.",
       "primary_source": "https://aneforge.readthedocs.io/en/stable/faq/"
+    },
+    {
+      "layer": "CoreAI-Opt • CoreML MIL",
+      "feature": "w4_per_block on ExportBackend.CoreML vs ExportBackend.CoreAI",
+      "m4_pro_26_6": "FAIL: corrupted Laya .mlmodelc logits (-0.1985 real cos) + 121 ios18.conv CPU fallbacks; pplx st3 cos=0.8910",
+      "base_m5_26_2": "Projected CoreML failure; untested on 26.2",
+      "base_m5_27_2_1": "CoreAI (.aimodel) w4_per_block finite (Laya 0.3267 GB; pplx 3.07 GB FAIL); blocked on CoreML by default",
+      "macos_requirement": "27.0 for .aimodel; blocked on CoreML",
+      "framework_version": "coreai-opt 0.5.0 / coremltools 9.0",
+      "practical_effect": "fast_shared.coreai_pipeline rejects (coreml, w4_per_block) unless allow_experimental_coreml_w4_block=True; DynamicSiliconPolicy retains coreml_mil W8A16 default.",
+      "primary_source": "Track A T1.1-T1.3 / Track B T2.3 empirical evaluation"
+    },
+    {
+      "layer": "Core AI • ANE / MPSGraph",
+      "feature": "FP16 compute I/O + F.softplus avoidance for ANE placement in .aimodel",
+      "m4_pro_26_6": "Requires 27.0+ runtime (M4 Pro still on 26.6)",
+      "base_m5_26_2": "Requires 27.0+ runtime",
+      "base_m5_27_2_1": "VERIFIED: FP32->MPSGraph (Laya 94.18 ms, 0 ANE); FP16->ANE (23.00 ms isolated, 1,652 ANE ops, 62.3 MB phys)",
+      "macos_requirement": "27.0",
+      "framework_version": "coreai-torch 0.4.4 / Core AI OS runtime",
+      "practical_effect": "Casting floating weights/buffers+inputs to FP16 and avoiding F.softplus unlocks ANE execution on 27.2.1; fast-pplx still fails promotion vs hetero2 (0.184x EOT).",
+      "primary_source": "Track B T2.3 empirical evaluation"
     }
   ],
   "native_tests": [
@@ -11043,6 +11137,12 @@
       "source_or_method": "Public disclosure boundary",
       "coverage_and_interpretation": "No authoritative complete public map of Apple GPU binary instructions, ANE firmware opcodes, CPU internal micro-ops or all instruction latencies is established by either input.",
       "reference": "Original source scope and row-level references."
+    },
+    {
+      "evidence_area": "CoreAI / CoreAI-Opt empirical Track A & Track B matrix lock-in (T1.1-T2.4)",
+      "source_or_method": "Live M4 Pro 26.6 (ABBA N=1400) & Base M5 27.2.1 (26B131) paired promotion gates",
+      "coverage_and_interpretation": "Records verified CoreML w4_per_block logit corruption, ABBA Gate 3 miss on CoreAI-Opt w8 Laya (0.9879x), ~/Library/Caches/coreai-cache specialization mapped_all_mb accounting, Qwen3.5-4B fp4_fp8 (1.36x, -22.9% RAM), and FP16 compute ANE unlocking (94.18 -> 23.00 ms, 1,652 ANE ops) keeping coreml_mil default in DynamicSiliconPolicy.",
+      "reference": "references/m4-vs-m5-architecture.md; references/dead-ends-registry.md"
     }
   ]
 }

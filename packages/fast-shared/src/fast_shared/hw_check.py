@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from typing import Any, Callable
 
 TESTED_REFERENCE_HARDWARE: dict[str, Any] = {
@@ -926,7 +927,8 @@ def extract_coreml_compute_plan_ops(plan: Any) -> list[dict[str, Any]]:
     """Extract normalized per-operation placement records from a ``coremltools`` ``MLComputePlan``."""
     struct = getattr(plan, "model_structure", None)
     prog = getattr(struct, "program", None) if struct is not None else None
-    if not isinstance(prog, dict):
+    funcs = prog if isinstance(prog, Mapping) else getattr(prog, "functions", None)
+    if funcs is None or not hasattr(funcs, "items"):
         return []
 
     records: list[dict[str, Any]] = []
@@ -962,7 +964,7 @@ def extract_coreml_compute_plan_ops(plan: Any) -> list[dict[str, Any]]:
             for sub in getattr(op, "blocks", ()) or ():
                 _walk_block(fn_name, sub)
 
-    for fn_name, fn in prog.items():
+    for fn_name, fn in funcs.items():
         blk = getattr(fn, "block", None)
         if blk is not None:
             _walk_block(str(fn_name), blk)

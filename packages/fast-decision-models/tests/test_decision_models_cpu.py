@@ -731,9 +731,10 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
         w_np[hp + "self_attn.in_proj_bias"] = np.zeros((3 * h,), dtype=np.float32)
         w_np[hp + "self_attn.out_proj.weight"] = (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32)
         w_np[hp + "self_attn.out_proj.bias"] = np.zeros((h,), dtype=np.float32)
-        w_np[hp + "linear1.weight"] = (rng.normal(0.0, 0.02, size=(inter, h))).astype(np.float32)
-        w_np[hp + "linear1.bias"] = np.zeros((inter,), dtype=np.float32)
-        w_np[hp + "linear2.weight"] = (rng.normal(0.0, 0.02, size=(h, inter))).astype(np.float32)
+        head_ff = inter * 2  # Explicitly decouple head FFN width (4096 vs 2624 in prod Laya-Typed-421M).
+        w_np[hp + "linear1.weight"] = (rng.normal(0.0, 0.02, size=(head_ff, h))).astype(np.float32)
+        w_np[hp + "linear1.bias"] = np.zeros((head_ff,), dtype=np.float32)
+        w_np[hp + "linear2.weight"] = (rng.normal(0.0, 0.02, size=(h, head_ff))).astype(np.float32)
         w_np[hp + "linear2.bias"] = np.zeros((h,), dtype=np.float32)
 
     # 3. Core AI (.aimodel) + CoreML (.mlpackage) export & sensitivity sweep
@@ -749,9 +750,24 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
     )
     assert res_ai.asset_path.exists()
     assert res_ai.asset_summary is not None and res_ai.asset_summary["asset_valid"] is True
+    assert "Float16" in res_ai.asset_summary["compute_types"]
     assert res_ai.sensitivity_report is not None
     assert "scorer_l2" in res_ai.sensitivity_report["excluded_modules"]
+    assert res_ai.sensitivity_report["compute_dtype"] == "fp16"
     assert res_ai.sensitivity_report["cosine_vs_teacher"] > 0.99
+
+    # Bug 4: w4_per_block is blocked on CoreML by default, while w8 CoreML export passes cleanly.
+    with pytest.raises(ValueError, match="allow_experimental_coreml_w4_block"):
+        run_laya_coreai_export(
+            out_dir=tmp_path / "ml_bad",
+            weights=w_np,
+            enc_cfg=enc_cfg,
+            seq_len=seq_len,
+            export_backend="coreml",
+            preset="w4_per_block",
+            calib_batches=1,
+            stem="tiny_laya_ml_bad",
+        )
 
     res_ml = run_laya_coreai_export(
         out_dir=tmp_path / "ml",
@@ -759,7 +775,7 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
         enc_cfg=enc_cfg,
         seq_len=seq_len,
         export_backend="coreml",
-        preset="w4_per_block",
+        preset="w8",
         calib_batches=1,
         stem="tiny_laya_ml",
     )
@@ -794,3 +810,57 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
     assert ns.coreai_preset == "w4_per_block"
     assert ns.guard_ir is True
     assert ns.inspect_placement is True
+
+
+def test_build_laya_ane_artifacts_coreai_uses_export_ready_key_cpu(monkeypatch: Any, tmp_path: Path) -> None:
+    import json
+    import types
+    import fast_shared.hw_check as fs_hw
+    import fast_decision_models.builder as fdm_builder
+    import fast_decision_models.coreai_export as fdm_ce
+
+    src_dir = tmp_path / "laya_src"
+    (src_dir / "encoder").mkdir(parents=True)
+    (src_dir / "tokenizer").mkdir(parents=True)
+    (src_dir / "rl_agent_config.json").write_text("{}", encoding="utf-8")
+    (src_dir / "encoder" / "config.json").write_text(
+        json.dumps({"hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 1, "num_attention_heads": 4, "layer_types": ["full_attention"]}),
+        encoding="utf-8",
+    )
+    (src_dir / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    # Mock weights loading without MLX safetensors file by intercepting mx.load and _resolve_dir_or_hf.
+    import mlx.core as mx
+
+    fake_weights = {
+        "encoder.embeddings.tok_embeddings.weight": mx.zeros((8, 64), dtype=mx.float32),
+        "type_emb.weight": mx.zeros((4, 64), dtype=mx.float32),
+    }
+    monkeypatch.setattr(fdm_builder, "_resolve_dir_or_hf", lambda p, repo: src_dir)
+    monkeypatch.setattr(mx, "load", lambda p: fake_weights)
+    # Bug 1 regression guard: probe_core_ai_support exposes `export_ready` (NOT `coreai_export_ready`).
+    monkeypatch.setattr(fs_hw, "probe_core_ai_support", lambda hw=None: {"export_ready": True})
+
+    seen_stems: list[str] = []
+
+    def _fake_export(**kwargs: Any) -> Any:
+        seen_stems.append(kwargs["stem"])
+        p = Path(kwargs["out_dir"]) / f"{kwargs['stem']}.aimodel"
+        p.mkdir(parents=True, exist_ok=True)
+        return types.SimpleNamespace(
+            asset_path=p,
+            cache_key_sha256="abc123",
+            sensitivity_report={"cosine_vs_teacher": 1.0},
+            asset_summary={"asset_valid": True},
+        )
+
+    monkeypatch.setattr(fdm_ce, "run_laya_coreai_export", _fake_export)
+    out = fdm_builder.build_laya_ane_artifacts(
+        repo_root=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        laya_dir=str(src_dir),
+        backend="coreai",
+        coreai_preset="w8",
+    )
+    assert out.is_dir()
+    assert seen_stems == ["laya_typed_s256_w8", "laya_typed_s512_w8"]

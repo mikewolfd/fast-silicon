@@ -243,3 +243,52 @@ def test_benchmark_outcomes_merge_daemon_telemetry_schema_cpu() -> None:
     assert diag["cold_warm_latency"]["warm_median_ms"] == 2.0
     assert diag["asset_summary"]["asset_valid"] is True
     assert diag["profiler_available"] is True
+
+
+def test_inspect_aimodel_asset_uses_authoring_load_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import sys
+    import types
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import _outcome_public_backends as opb  # type: ignore[import-not-found]
+
+    fake_bundle = tmp_path / "demo.aimodel"
+    fake_bundle.mkdir()
+
+    class _FakeSummary:
+        storage_types = [("Float16", 12), ("Int8", 34)]
+        compute_types = ["Float16", "Int8"]
+        operation_distribution = [("conv2d", 4)]
+
+    class _FakeAsset:
+        @classmethod
+        def load(cls, path: str) -> "_FakeAsset":
+            assert path == str(fake_bundle)
+            return cls()
+
+        def is_valid(self, path: Path) -> bool:
+            assert path == fake_bundle
+            return True
+
+        def summary(self, *, include_statistics: bool = False) -> _FakeSummary:
+            assert include_statistics is True
+            return _FakeSummary()
+
+    # Execute _COREAI_DAEMON_PREAMBLE directly so we exercise the subprocess daemon code path
+    # and confirm coreai.authoring.AIModelAsset.load is preferred without requiring coreai.runtime.
+    monkeypatch.setitem(sys.modules, "coreai", types.ModuleType("coreai"))
+    monkeypatch.setitem(sys.modules, "coreai.authoring", types.SimpleNamespace(AIModelAsset=_FakeAsset))
+    monkeypatch.setitem(sys.modules, "coreai.runtime", types.ModuleType("coreai.runtime"))
+
+    daemon_ns: dict[str, object] = {}
+    exec(compile(opb._COREAI_DAEMON_PREAMBLE, "<_COREAI_DAEMON_PREAMBLE>", "exec"), daemon_ns)
+    inspect_fn = daemon_ns["_inspect_aimodel_asset"]
+    assert callable(inspect_fn)
+    res = inspect_fn(fake_bundle)
+    assert res == {
+        "asset_valid": True,
+        "path": str(fake_bundle),
+        "storage_types": [("Float16", 12), ("Int8", 34)],
+        "compute_types": ["Float16", "Int8"],
+        "operation_distribution": [("conv2d", 4)],
+    }

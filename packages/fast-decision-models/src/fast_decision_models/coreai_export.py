@@ -93,6 +93,23 @@ def build_coreai_opt_laya_config(**kwargs: Any) -> tuple[Any, dict[str, Any]]:
     return build_coreai_opt_config(**kwargs)
 
 
+def _resolve_laya_head_ff_dim(
+    enc_cfg: Mapping[str, Any],
+    weights: Mapping[str, np.ndarray] | None,
+    h_dim: int,
+    inter_dim: int,
+) -> int:
+    """Resolve typed head FFN width (4096 in production Laya-Typed-421M vs 2624 encoder inter_dim)."""
+    for cfg_key in ("head_ffn_dim", "head_ff_dim", "head_intermediate_size"):
+        if cfg_key in enc_cfg and enc_cfg[cfg_key] is not None:
+            return int(enc_cfg[cfg_key])
+    if weights is not None:
+        for w_key in ("head.layers.0.linear1.weight", "head_layers.0.linear1.weight"):
+            if w_key in weights:
+                return int(np.asarray(weights[w_key]).shape[0])
+    return 4096 if h_dim >= 512 else inter_dim
+
+
 def build_laya_torch_module(
     weights: Mapping[str, np.ndarray] | None = None,
     *,
@@ -108,6 +125,7 @@ def build_laya_torch_module(
 
     h_dim = int(enc_cfg["hidden_size"])
     inter_dim = int(enc_cfg.get("intermediate_size", h_dim * 2))
+    head_ff_dim = _resolve_laya_head_ff_dim(enc_cfg, weights, h_dim, inter_dim)
     n_layers = int(enc_cfg["num_hidden_layers"])
     n_heads = int(enc_cfg["num_attention_heads"])
     hd = h_dim // n_heads
@@ -211,8 +229,8 @@ def build_laya_torch_module(
             self.register_buffer("norm2_b", torch.zeros(1, h_dim, 1, 1))
             self.qkv = nn.Conv2d(h_dim, 3 * h_dim, kernel_size=1, bias=True)
             self.out_proj = nn.Conv2d(h_dim, h_dim, kernel_size=1, bias=True)
-            self.linear1 = nn.Conv2d(h_dim, inter_dim, kernel_size=1, bias=True)
-            self.linear2 = nn.Conv2d(inter_dim, h_dim, kernel_size=1, bias=True)
+            self.linear1 = nn.Conv2d(h_dim, head_ff_dim, kernel_size=1, bias=True)
+            self.linear2 = nn.Conv2d(head_ff_dim, h_dim, kernel_size=1, bias=True)
 
         def forward(self, h: torch.Tensor, ext_mask: torch.Tensor) -> torch.Tensor:
             hn1 = _ln_ch(h, self.norm1_w, self.norm1_b, gain=self.ln_gain, eps_u=self.ln_eps)
@@ -370,6 +388,8 @@ def run_laya_coreai_export(
     use_recenter: bool = True,
     stem: str = "laya_typed",
     inspect_placement: bool = False,
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> CoreAiExportResult:
     """Calibrate, quantize (CoreAI-Opt), export (`.aimodel`/`.mlpackage`), and guard Laya-Typed."""
     h_dim = int(enc_cfg["hidden_size"])
@@ -404,6 +424,8 @@ def run_laya_coreai_export(
         flag_add_fp16_cast=False,
         inspect_placement=inspect_placement,
         target_device="ane",
+        allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
+        compute_dtype=compute_dtype,
     )
 
 
@@ -414,12 +436,14 @@ def run_laya_coreai_sensitivity_sweep(
     enc_cfg: Mapping[str, Any] = DEFAULT_LAYA_CONFIG,
     seq_len: int = 256,
     export_backend: str = "coreml",
-    presets: Sequence[str] = ("fp16", "w8", "w4", "w4_per_block"),
+    presets: Sequence[str] | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
     preserve_scorer_fp16: bool = True,
     calib_batches: int = 2,
     use_recenter: bool = True,
     stem_prefix: str = "laya_typed",
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> list[dict[str, Any]]:
     """Run a calibration sensitivity & BPW sweep across `CoreAI-Opt` presets on Laya-Typed."""
     h_dim = int(enc_cfg["hidden_size"])
@@ -447,4 +471,6 @@ def run_laya_coreai_sensitivity_sweep(
         excluded_modules=excluded,
         calib_batches=calib_batches,
         spec_metadata={"seq_len": int(seq_len), "num_hidden_layers": int(enc_cfg["num_hidden_layers"])},
+        allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
+        compute_dtype=compute_dtype,
     )

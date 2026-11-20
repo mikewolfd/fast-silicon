@@ -131,6 +131,22 @@ The following measurements come from the M4 Pro. Use them to choose candidates f
   - *Recurrent + KV prefix trees (`CoreAIPipelinedEngine+PrefixTree`):* `256`-token block trees snapshotting both attention KV and hybrid GDN recurrent/conv state across multi-turn prompts.
   - *Mixed-precision & QAT recipes:* Keeping `8`-bit `per_layer_input_gate`/`per_layer_projection`, `NativeLutQuantConv1x1` 2-bit QAT on shared-KV layers, and `symmetric_with_clipping` `block=32` INT4 weights.
 
+### Empirical CoreAI / `CoreAI-Opt` Promotion Findings (`M4 Pro 26.6` & `Base M5 27.2.1`)
+
+Paired `Two-Gate + Memory Ceiling` evaluations across `T1.1–T2.4` establish strict guardrails before switching any engine from custom `CoreML` (`mlmodelc` 4D `conv1x1`) + `MLX` to `CoreAI-Opt` or Core AI (`.aimodel`):
+
+1. **`CoreAI-Opt` on `ExportBackend.CoreML` (`M4 Pro`, `macOS 26.6`, `CoreML 9.0`):**
+   - `pplx-embed-v2-context-0.6b` (`T1.1`): Torch-exported `CoreML` `.mlpackage` (`fp16`..`w4_per_block`) failed `_ANECompiler: ANECCompile() FAILED` (`0/349` ANE ops, `~9.29–9.43 ms` CPU fallback vs hand-crafted MIL `build_stage_mil_program` `375/375` ANE ops, `2.24 ms`), and Stage-3 `w4_per_block` dropped cosine to `0.890970`.
+   - `Laya-Typed-421M` (`T1.2` / `T1.3`): **`w4_per_block` (`block_size=32, axis=1`) corrupted compiled `.mlmodelc` logits** (`live_synth_cos = -0.913277`, `live_real_cos = -0.198452`) with `121` unsupported `ios18.conv` ops (`827 ANE / 613 CPU`, `0.0%` ANE cost share, `65.389 ms`) — now rejected by default unless `allow_experimental_coreml_w4_block=True`. **`w8`** hit `[1440, 0, 0]` (`100%` ANE, `24.651 ms`, `live_real_cos = 0.999488`, improved calibration `ece_15 = 0.0970` vs `0.1131`), **but** lost paired `ABBA` `N=1400` (`verdict=FAIL`, `eot_ratio = 0.9879 < 1.0000`: `S=0.501429` vs `0.505000`, `5.7556` vs `5.8261` EOT, `1.0019` vs `0.9947 GB`).
+2. **Base M5 `27.2.1` (`26B131`) OS Specialization & Profiler Mechanics (`T2.1` / `T0.5`):**
+   - `MLNeuralEngineComputeDevice.totalCoreCount` corrected from `2` (`26.2`) to **`16`**, `supportsPlacementSparse = True`, `hw.optional.arm.FEAT_SVE_B16B16 = 1`, `os_runtime_eligible = True`, `fp4_fp8_preset_eligible = True`, while `coreai_build_available = False` (offline export still works cleanly via `coreai-torch >= 0.4.1`).
+   - Core AI specializes `.aimodel` bundles into `~/Library/Caches/coreai-cache/<os_build>/python/<modelHash>/<optionsHash>/model.aimodelx/`; **`mapped_all_mb`** captures those mapped specialized pages (`2383.28 MB` on `emb2_bf16`) even when passing the unspecialized `.aimodel` path leaves `mapped_model_mb = 0.0`. `AIModelAsset.load(...)` resides in **`coreai.authoring`**, not `coreai.runtime`.
+   - `Qwen3.5-4B` smoke on `27.2.1`: `qwen35_4b_fp4_fp8` outperformed `qwen35_4b_4bit` by **`1.36×`** (`1050.14 ms` vs `1423.64 ms` warm median) and **`-22.9%` RAM** (`0.6986` vs `0.9063 GB`, all finite `["4", "8", "42"]`, `MPSGraph`).
+3. **`FP32` vs `FP16` Compute & ANE Lowering Trap in `.aimodel` (`T2.3`):**
+   - Exporting FP32 PyTorch modules with default FP32 graph I/O (`w8` / `w4_per_block`) compiles to **`MPSGraph` GPU (`0` ANE ops)**: `fast-pplx` `w8` (`130.62 ms`, `2.5934 GB`, `EOT=0.6602` vs live `hetero2` `3.5846` = `0.184×`, `FAIL`; `w4_per_block` `138.5 ms`, `3.0712 GB`) and `Laya` `w8` (`94.18–102.75 ms`, `0.5685 GB`, `0.285×` EOT vs custom `LayaAneBackend` `3.6960`).
+   - **Casting floating weights/buffers + inputs to `FP16`** (`Laya w8_f16 + neural_engine`) unlocks **`1,652` ANE ops**, cuts isolated `s=256` `warm_median_ms` **`4.09×`** (`94.18 -> 23.00 ms` vs custom `LayaAneBackend` `22.64 ms`), and drops `phys_footprint` to **`62.3 MB`** (`neural_footprint = 360.83 MB`, `0.4437 GB` combined, `logit_cos = 0.999831`, `argmax_agree = 1.0`). On `fast-pplx`, `F.softplus` also blocked ANE lowering and must be rewritten to `F.relu(x) + log(1 + exp(-|x|))` alongside `FP16` compute (`st0 s128 w8_f16` `2.997 ms`).
+4. **Locked `DynamicSiliconPolicy` Rule:** Default `preferred_ane_backend = "coreml_mil"` (`100%` pure ANE 4D `conv1x1`) on every OS; switch to `"coreai"` only when `os_coreai_runtime_ready` (`macOS >= 27.2.1`, active delegate) **AND** `(model_name, batch_size)` explicitly clears `Two-Gate + Memory Ceiling`.
+
 ---
 
 ## 3. M4 Pro unified memory capacity (48 GiB)

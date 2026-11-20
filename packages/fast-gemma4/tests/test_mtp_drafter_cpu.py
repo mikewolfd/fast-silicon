@@ -31,30 +31,41 @@ def test_should_use_mtp_drafter_strict_batch_gate() -> None:
     sentinel = object()
     assert MAX_MTP_BATCH_SIZE == 4
     for b in (1, 2, 3, 4):
-        assert should_use_mtp_drafter(sentinel, False, b, 0.0) is True
-        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True) is True
-        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=False) is False
-        assert should_use_mtp_drafter(sentinel, True, b, 0.0) is False
-        assert should_use_mtp_drafter(sentinel, False, b, 0.2) is False
-        assert should_use_mtp_drafter(None, False, b, 0.0) is False
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False) is True
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True, apple10_nax=False) is True
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=False, apple10_nax=False) is False
+        assert should_use_mtp_drafter(sentinel, True, b, 0.0, apple10_nax=False) is False
+        assert should_use_mtp_drafter(sentinel, False, b, 0.2, apple10_nax=False) is False
+        assert should_use_mtp_drafter(None, False, b, 0.0, apple10_nax=False) is False
+
+    assert should_use_mtp_drafter(sentinel, False, 1, 0.0, apple10_nax=True) is True
+    for b in (2, 3, 4):
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=True) is False
 
     for b in (0, -1, 5, 8, 16, 64, 128):
-        assert should_use_mtp_drafter(sentinel, False, b, 0.0) is False
-        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True) is False
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False) is False
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True, apple10_nax=False) is False
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=True) is False
 
 
 def test_recommended_mtp_draft_k_and_hard_gate() -> None:
-    assert recommended_mtp_draft_k(1, has_grammar=False) == 4
-    assert recommended_mtp_draft_k(1, has_grammar=True) == 3
+    assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=False) == 4
+    assert recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=False) == 3
+    assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 4
+    assert recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=True) == 3
     for b in (2, 3, 4):
-        assert recommended_mtp_draft_k(b, has_grammar=False) == 2
-        assert recommended_mtp_draft_k(b, has_grammar=True) == 2
+        assert recommended_mtp_draft_k(b, has_grammar=False, apple10_nax=False) == 2
+        assert recommended_mtp_draft_k(b, has_grammar=True, apple10_nax=False) == 2
         # Keep M = B * (K + 1) < 16 to avoid the 16<=M<=64 MPP tile cliff.
-        assert b * (recommended_mtp_draft_k(b, has_grammar=True) + 1) < 16
+        assert b * (recommended_mtp_draft_k(b, has_grammar=True, apple10_nax=False) + 1) < 16
+        with pytest.raises(ValueError, match="strictly gated"):
+            recommended_mtp_draft_k(b, apple10_nax=True)
 
     for bad_b in (0, 5, 8, 32, 128):
         with pytest.raises(ValueError, match="strictly gated"):
-            recommended_mtp_draft_k(bad_b)
+            recommended_mtp_draft_k(bad_b, apple10_nax=False)
+        with pytest.raises(ValueError, match="strictly gated"):
+            recommended_mtp_draft_k(bad_b, apple10_nax=True)
 
 
 def test_mtp_drafter_rejects_e4b_and_invalid_top_k() -> None:

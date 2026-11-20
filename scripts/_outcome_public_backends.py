@@ -49,13 +49,22 @@ def _inspect_aimodel_asset(aimodel_path):
     if not p.exists():
         return None
     try:
-        from coreai.runtime import AIModelAsset
-        raw = AIModelAsset(str(p)).summary(include_statistics=True)
-        out = {"asset_valid": True, "path": str(p)}
+        try:
+            from coreai.authoring import AIModelAsset
+
+            asset = AIModelAsset.load(str(p))
+            asset_valid = bool(asset.is_valid(p)) if hasattr(asset, "is_valid") else True
+        except (ImportError, AttributeError):
+            from coreai.runtime import AIModelAsset
+
+            asset = AIModelAsset(str(p))
+            asset_valid = True
+        raw = asset.summary(include_statistics=True)
+        out = {"asset_valid": asset_valid, "path": str(p)}
         for k in ("storage_types", "compute_types", "operation_distribution"):
             val = raw.get(k) if isinstance(raw, dict) else getattr(raw, k, None)
             if val is not None:
-                out[k] = dict(val) if isinstance(val, dict) else val
+                out[k] = dict(val) if isinstance(val, dict) else list(val)
         return out
     except Exception:
         return None

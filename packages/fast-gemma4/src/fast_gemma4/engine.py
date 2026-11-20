@@ -33,6 +33,7 @@ from .mtp_drafter import (
     DEFAULT_MTP_DRAFTER_REPO,
     DEFAULT_MTP_TOP_K,
     Gemma4MtpDrafter,
+    resolve_mtp_drafter_dir,
     run_decode_mtp,
     should_use_mtp_drafter,
 )
@@ -121,6 +122,107 @@ def should_use_speculative(
     return (not use_ane) and batch_w <= 4
 
 
+def _probe_host_hardware_safe() -> dict[str, Any] | None:
+    """Probe host hardware via `fast_shared.hw_check.probe_host_hardware()`, returning None on failure."""
+    try:
+        import fast_shared.hw_check as _hw_check
+
+        hw = _hw_check.probe_host_hardware()
+        return dict(hw) if isinstance(hw, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_host_mem_gb(hw: dict[str, Any] | None, *, fallback_ram_gib: float = 0.0) -> float:
+    """Extract host RAM in GiB/GB from probed hardware metadata with fallback to `_host_ram_gib()`."""
+    if isinstance(hw, dict):
+        if "mem_gb" in hw and hw["mem_gb"] is not None:
+            try:
+                return float(hw["mem_gb"])
+            except (TypeError, ValueError):
+                pass
+        if "mem_bytes" in hw and hw["mem_bytes"] is not None:
+            try:
+                mem_b = float(hw["mem_bytes"])
+                if mem_b > 0.0:
+                    return mem_b / (1024.0**3)
+            except (TypeError, ValueError):
+                pass
+    if fallback_ram_gib > 0.0:
+        return float(fallback_ram_gib)
+    return float(_host_ram_gib())
+
+
+def _resolve_ane_bundle_safe(
+    paths: Any,
+    variant: str,
+    *,
+    model_dir: Any,
+    local_files_only: bool,
+    exit_layer: int,
+) -> Path | None:
+    if paths is None:
+        return None
+    try:
+        return paths.resolve_ane_bundle(
+            variant,
+            model_dir=model_dir,
+            local_files_only=local_files_only,
+            exit_layer=exit_layer,
+        )
+    except TypeError:
+        return paths.resolve_ane_bundle(
+            variant,
+            model_dir=model_dir,
+            local_files_only=local_files_only,
+        )
+
+
+def _select_auto_ane_ring_variant(
+    paths: Any,
+    *,
+    model_dir: Any,
+    local_files_only: bool = True,
+    exit_layer: int = 14,
+    hw: dict[str, Any] | None = None,
+    fallback_ram_gib: float = 0.0,
+) -> tuple[str, Any | None]:
+    """Resolve `ane_ring_variant='auto'` via `probe_host_hardware()` + `DynamicSiliconPolicy`.
+
+    On `0 < host_mem_gb <= 24`, selects `"w8"` only when a staged `w8` ring bundle exists and
+    `is_w8_bundle_calibrated(...)` is `True`; otherwise falls back cleanly to `"fp16"`.
+    """
+    hw_info = _probe_host_hardware_safe() if hw is None else dict(hw)
+    host_mem_gb = _extract_host_mem_gb(hw_info, fallback_ram_gib=fallback_ram_gib)
+
+    has_calibrated_w8 = False
+    if 0.0 < host_mem_gb <= 24.0:
+        w8_cand = _resolve_ane_bundle_safe(
+            paths,
+            "w8",
+            model_dir=model_dir,
+            local_files_only=local_files_only,
+            exit_layer=exit_layer,
+        )
+        has_calibrated_w8 = bool(w8_cand is not None and is_w8_bundle_calibrated(w8_cand))
+
+    variant = "w8" if (0.0 < host_mem_gb <= 24.0 and has_calibrated_w8) else "fp16"
+    policy: Any | None = None
+    if host_mem_gb > 0.0:
+        try:
+            from fast_shared.runtime_lessons import DynamicSiliconPolicy
+
+            policy = DynamicSiliconPolicy(
+                hw=hw_info if hw_info is not None else {},
+                host_mem_gb=host_mem_gb,
+                has_calibrated_ane_w8=has_calibrated_w8,
+            )
+            variant = str(policy.host.ane_ring_variant)
+        except Exception:
+            pass
+    return variant, policy
+
+
 class FastGemma4Engine:
     """Thread-safe hardware-limit Gemma-4 E2B/E4B engine for Apple Silicon (M4 / M5+)."""
 
@@ -154,7 +256,7 @@ class FastGemma4Engine:
             raise ValueError(f"Unsupported default_mode={default_mode!r}")
         if ane_variant not in ("fp16", "w8", "auto"):
             raise ValueError(f"Unsupported ane_variant={ane_variant!r}")
-        if ane_ring_variant not in ("fp16", "w8"):
+        if ane_ring_variant not in ("fp16", "w8", "auto"):
             raise ValueError(f"Unsupported ane_ring_variant={ane_ring_variant!r}")
 
         self._host_ram_gib = _host_ram_gib()
@@ -198,8 +300,6 @@ class FastGemma4Engine:
         self.model_name = "google/gemma-4-E4B-it" if is_e4b else "google/gemma-4-E2B-it"
         self.default_mode = default_mode
         self.ane_variant = ane_variant
-        # Default hybrid prefill ring to FP16 unless the caller opts into a domain-calibrated / QAT-validated W8 bundle.
-        self.ane_ring_variant = ane_ring_variant
         self.max_prefix_cache = max(1, eff_prefix_cache)
 
         self._gpu_lock = threading.Lock()
@@ -216,6 +316,23 @@ class FastGemma4Engine:
         self._local_files_only = bool(local_files_only)
 
         exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
+        # Default hybrid prefill ring to FP16 unless the caller opts into W8 or dynamic "auto" (calibrated W8 on <=24 GB).
+        self._ane_ring_variant_requested = ane_ring_variant
+        self._host_hw: dict[str, Any] | None = None
+        self.silicon_policy: Any | None = None
+        if ane_ring_variant == "auto":
+            self._host_hw = _probe_host_hardware_safe()
+            self.ane_ring_variant, self.silicon_policy = _select_auto_ane_ring_variant(
+                self.paths,
+                model_dir=self.model.model_dir,
+                local_files_only=local_files_only,
+                exit_layer=exit_layer,
+                hw=self._host_hw,
+                fallback_ram_gib=self._host_ram_gib,
+            )
+        else:
+            self.ane_ring_variant = ane_ring_variant
+
         eff_var = "fp16" if ane_variant == "auto" else ane_variant
         bundle = self.paths.resolve_ane_bundle(
             eff_var, model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
@@ -236,12 +353,17 @@ class FastGemma4Engine:
 
         self.mtp_drafter: Gemma4MtpDrafter | None = None
         self.mtp_draft_k: int | None = None if mtp_draft_k is None else int(mtp_draft_k)
-        if mtp_drafter:
+        self._mtp_top_k: int = int(mtp_top_k)
+        self._mtp_drafter_auto: bool = False
+        self._mtp_drafter_auto_attempted: bool = False
+        if isinstance(mtp_drafter, str) and mtp_drafter.strip().lower() == "auto":
+            self._mtp_drafter_auto = True
+        elif mtp_drafter:
             drafter_ref: str | Path = DEFAULT_MTP_DRAFTER_REPO if mtp_drafter is True else mtp_drafter
             self.mtp_drafter = Gemma4MtpDrafter(
                 self.model,
                 drafter_ref,
-                top_k=mtp_top_k,
+                top_k=self._mtp_top_k,
                 local_files_only=local_files_only,
             )
 
@@ -275,6 +397,7 @@ class FastGemma4Engine:
 
     def close(self) -> None:
         self.mtp_drafter = None
+        self._mtp_drafter_auto_attempted = False
         self.release_ane_resources()
         prev_wl = getattr(self, "_prev_wired_limit", None)
         if prev_wl is not None:
@@ -366,26 +489,141 @@ class FastGemma4Engine:
         """Bundle the hybrid prefill ring runs on; None until a ring engaged, and when it fell back to GPU only."""
         return getattr(self, "_ane_ring_bundle", None)
 
+    def _effective_ane_ring_variant(self) -> str:
+        """Return concrete `'fp16'` or `'w8'` ring variant, resolving `'auto'` dynamically if needed."""
+        variant = getattr(self, "ane_ring_variant", "fp16")
+        if variant != "auto":
+            return variant
+        paths = getattr(self, "paths", None)
+        local_only = bool(getattr(self, "_local_files_only", True))
+        exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
+        resolved, policy = _select_auto_ane_ring_variant(
+            paths,
+            model_dir=self.model.model_dir,
+            local_files_only=local_only,
+            exit_layer=exit_layer,
+            hw=getattr(self, "_host_hw", None),
+            fallback_ram_gib=float(getattr(self, "_host_ram_gib", 0.0)),
+        )
+        self._ane_ring_variant_requested = "auto"
+        self.ane_ring_variant = resolved
+        if policy is not None:
+            self.silicon_policy = policy
+        return resolved
+
+    def _engine_apple10_nax(self) -> bool | None:
+        pol = getattr(self, "silicon_policy", None)
+        hw = getattr(self, "_host_hw", None)
+        if pol is not None and isinstance(hw, dict) and any(
+            k in hw for k in ("supports_apple10", "gpu_family", "brand", "mlx_architecture")
+        ):
+            return bool(pol.host.apple10_nax)
+        return None
+
+    def _has_mtp_drafter_candidate(self) -> bool:
+        return getattr(self, "mtp_drafter", None) is not None or (
+            bool(getattr(self, "_mtp_drafter_auto", False))
+            and not bool(getattr(self, "_mtp_drafter_auto_attempted", False))
+        )
+
+    def _maybe_ensure_mtp_drafter(
+        self,
+        *,
+        use_ane: bool,
+        batch_w: int,
+        temperature: float,
+        speculative: bool | None = None,
+    ) -> Gemma4MtpDrafter | None:
+        """Return active MTP drafter for this wave, lazy-loading once under `mtp_drafter='auto'`."""
+        apple10_nax = self._engine_apple10_nax()
+        existing = getattr(self, "mtp_drafter", None)
+        if existing is not None:
+            return (
+                existing
+                if should_use_mtp_drafter(
+                    existing,
+                    use_ane,
+                    batch_w,
+                    temperature,
+                    speculative=speculative,
+                    apple10_nax=apple10_nax,
+                )
+                else None
+            )
+        if not getattr(self, "_mtp_drafter_auto", False) or getattr(self, "_mtp_drafter_auto_attempted", False):
+            return None
+        if not should_use_mtp_drafter(
+            True,
+            use_ane,
+            batch_w,
+            temperature,
+            speculative=speculative,
+            apple10_nax=apple10_nax,
+        ):
+            return None
+
+        self._mtp_drafter_auto_attempted = True
+        if (
+            int(getattr(self.model, "hidden_size", 1536)) != 1536
+            or int(getattr(self.model, "n_kv_heads", 1)) != 1
+        ):
+            return None
+        try:
+            drafter_dir = resolve_mtp_drafter_dir(DEFAULT_MTP_DRAFTER_REPO, local_files_only=True)
+        except Exception:
+            return None
+        if drafter_dir is None:
+            return None
+        try:
+            self.mtp_drafter = Gemma4MtpDrafter(
+                self.model,
+                drafter_dir,
+                top_k=int(getattr(self, "_mtp_top_k", DEFAULT_MTP_TOP_K)),
+                local_files_only=True,
+            )
+        except Exception:
+            self.mtp_drafter = None
+            return None
+        return self.mtp_drafter
+
     def _resolve_ane_ring_runner(self, *, require: bool) -> AnePrefixRunner | None:
         """Runner for the `ane_ring_variant` bundle, or None when that bundle is missing or not fully on the ANE."""
-        variant = getattr(self, "ane_ring_variant", "fp16")
+        auto_mode = (
+            getattr(self, "_ane_ring_variant_requested", None) == "auto"
+            or getattr(self, "ane_ring_variant", "fp16") == "auto"
+        )
+        variant = self._effective_ane_ring_variant()
         if not getattr(self, "_ane_ring_checked", False):
             paths = getattr(self, "paths", None)
             local_only = bool(getattr(self, "_local_files_only", True))
             exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
-            cand = None
-            if paths is not None:
-                try:
-                    cand = paths.resolve_ane_bundle(
-                        variant, model_dir=self.model.model_dir, local_files_only=local_only, exit_layer=exit_layer
-                    )
-                except TypeError:
-                    cand = paths.resolve_ane_bundle(
-                        variant, model_dir=self.model.model_dir, local_files_only=local_only
-                    )
-            self._ane_ring_bundle = (
+            cand = _resolve_ane_bundle_safe(
+                paths,
+                variant,
+                model_dir=self.model.model_dir,
+                local_files_only=local_only,
+                exit_layer=exit_layer,
+            )
+            resident_cand = (
                 cand if (paths is not None and is_ane_resident_bundle(paths.lib_ane_prefix, cand)) else None
             )
+            if resident_cand is None and auto_mode and variant == "w8":
+                fp16_cand = _resolve_ane_bundle_safe(
+                    paths,
+                    "fp16",
+                    model_dir=self.model.model_dir,
+                    local_files_only=local_only,
+                    exit_layer=exit_layer,
+                )
+                resident_cand = (
+                    fp16_cand
+                    if (paths is not None and is_ane_resident_bundle(paths.lib_ane_prefix, fp16_cand))
+                    else None
+                )
+                if resident_cand is not None:
+                    variant = "fp16"
+                    self.ane_ring_variant = "fp16"
+            self._ane_ring_bundle = resident_cand
             self._ane_ring_checked = True
         if self._ane_ring_bundle is None:
             if require:
@@ -575,7 +813,7 @@ class FastGemma4Engine:
                 ane_ring=ring,
                 ane_cohort_size=ane_cohort_size,
                 enable_ff_jump=enable_ff_jump,
-                ane_ring_variant=getattr(self, "ane_ring_variant", "fp16"),
+                ane_ring_variant=self._effective_ane_ring_variant(),
             )
 
     def generate_batch(
@@ -710,9 +948,13 @@ class FastGemma4Engine:
             def _decode_wave(w_indices: list[int], lg0: mx.array, ob0: mx.array, cache: dict[str, Any]) -> dict[str, Any]:
                 nonlocal any_spec_used
                 Bw = len(w_indices)
-                mtp_drafter = getattr(self, "mtp_drafter", None)
-                if should_use_mtp_drafter(mtp_drafter, use_ane, Bw, temperature, speculative=speculative):
-                    assert mtp_drafter is not None
+                mtp_drafter = self._maybe_ensure_mtp_drafter(
+                    use_ane=use_ane,
+                    batch_w=Bw,
+                    temperature=temperature,
+                    speculative=speculative,
+                )
+                if mtp_drafter is not None:
                     any_spec_used = True
                     return run_decode_mtp(
                         self.model,
@@ -820,11 +1062,12 @@ class FastGemma4Engine:
                 and resolved_grammars is None
                 and (
                     should_use_mtp_drafter(
-                        getattr(self, "mtp_drafter", None),
+                        True if self._has_mtp_drafter_candidate() else None,
                         False,
                         min(n_docs, wave_bs),
                         temperature,
                         speculative=speculative,
+                        apple10_nax=self._engine_apple10_nax(),
                     )
                     or should_use_speculative(speculative, False, min(n_docs, wave_bs), temperature)
                 )
@@ -905,7 +1148,7 @@ class FastGemma4Engine:
                     ane_ring=ring_for_batch,
                     ane_cohort_size=ane_cohort_size,
                     enable_ff_jump=enable_ff_jump,
-                    ane_ring_variant=getattr(self, "ane_ring_variant", "fp16"),
+                    ane_ring_variant=self._effective_ane_ring_variant(),
                 )
                 all_gen_toks = roll_res["gen_toks"]
                 roll_valid_schemas = roll_res.get("valid_schemas")

@@ -2,8 +2,11 @@
 
 Builds exportable 4D-NCHW PyTorch stage modules (`PplxCoreAiStageBlock`) matching
 `build_stage_mil_program` (`2^-14` RMSNorm epsilon floor, `ftz_alpha` 1-homogeneous GDN
-scaling, additive FP16/float causal attention masks) and delegates quantization, sensitivity
-sweeps, Pattern-7/IR guarding, and `.aimodel`/`.mlpackage` export to `fast_shared.coreai_pipeline`.
+scaling, ANE-safe `relu + log(1 + exp(-|x|))` softplus, additive FP16/float causal
+attention masks) and delegates quantization, sensitivity sweeps, Pattern-7/IR guarding,
+and `.aimodel` (default FP16 compute) / `.mlpackage` export to `fast_shared.coreai_pipeline`.
+Note: hand-crafted MIL `build_stage_mil_program` (`2.24 ms` pure ANE) remains the primary
+backend until an `.aimodel` candidate clears Two-Gate promotion against `hetero2`.
 """
 
 from __future__ import annotations
@@ -210,7 +213,9 @@ def build_pplx_torch_stage_module(
             beta = torch.sigmoid(b_ch).reshape(1, gdn_heads, n_c, chunk_size).permute(0, 2, 1, 3).reshape(
                 1, nc_h, chunk_size, 1
             )
-            g_raw = self.neg_a * F.softplus(a_ch + self.dt_bias)
+            # Avoid PyTorch `F.softplus` so TorchConverter/CoreML keep ANE-eligible primitive ops.
+            g_in = a_ch + self.dt_bias
+            g_raw = self.neg_a * (F.relu(g_in) + torch.log(1.0 + torch.exp(-torch.abs(g_in))))
             g_4d = g_raw.reshape(1, gdn_heads, n_c, chunk_size).permute(0, 2, 1, 3).reshape(1, nc_h, 1, chunk_size)
 
             cum_decay = torch.matmul(g_4d, self._tril.transpose(-1, -2))
@@ -441,6 +446,8 @@ def run_pplx_coreai_export(
     ftz_alpha: float = DEFAULT_FTZ_ALPHA,
     stem: str = "pplx_stage",
     inspect_placement: bool = False,
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> CoreAiExportResult:
     """Calibrate, quantize (CoreAI-Opt), export (`.aimodel`/`.mlpackage`), and guard a PPLX stage."""
     eff_end = cfg.num_hidden_layers if layer_end is None else int(layer_end)
@@ -487,6 +494,8 @@ def run_pplx_coreai_export(
         flag_add_fp16_cast=False,
         inspect_placement=inspect_placement,
         target_device="ane",
+        allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
+        compute_dtype=compute_dtype,
     )
 
 
@@ -501,7 +510,7 @@ def run_pplx_coreai_sensitivity_sweep(
     seq_len: int = 64,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     export_backend: str = "coreml",
-    presets: Sequence[str] = ("fp16", "w8", "w4", "w4_per_block"),
+    presets: Sequence[str] | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
     preserve_gdn_fp16: bool = True,
     preserve_outliers: bool = True,
@@ -509,6 +518,8 @@ def run_pplx_coreai_sensitivity_sweep(
     calib_batches: int = 2,
     ftz_alpha: float = DEFAULT_FTZ_ALPHA,
     stem_prefix: str = "pplx_stage",
+    allow_experimental_coreml_w4_block: bool = False,
+    compute_dtype: str = "auto",
 ) -> list[dict[str, Any]]:
     """Run a calibration sensitivity & BPW sweep across `CoreAI-Opt` presets on a PPLX stage."""
     eff_end = cfg.num_hidden_layers if layer_end is None else int(layer_end)
@@ -546,4 +557,6 @@ def run_pplx_coreai_sensitivity_sweep(
         excluded_modules=excluded,
         calib_batches=calib_batches,
         spec_metadata={"seq_len": int(seq_len), "layer_start": int(layer_start), "layer_end": eff_end},
+        allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
+        compute_dtype=compute_dtype,
     )

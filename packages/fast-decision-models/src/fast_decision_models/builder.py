@@ -504,7 +504,7 @@ def build_laya_ane_artifacts(
         from .coreai_export import run_laya_coreai_export
 
         probe = probe_core_ai_support()
-        if not probe.get("coreai_export_ready", False):
+        if not probe.get("export_ready", probe.get("coreai_export_ready", False)):
             raise RuntimeError(
                 f"Core AI (.aimodel) offline export requires coreai-torch >= 0.4.1 (status: {probe})"
             )

@@ -2326,3 +2326,152 @@ def test_summarize_accelerator_placement_and_coreml_plan_cpu() -> None:
     assert coreai_summary["all_on_target"] is False
     assert coreai_summary["decline_reason_counts"] == {"unsupported dynamic k": 1}
     assert len(coreai_summary["operations"]) == 2
+
+    # Bug 3: coremltools 9 MLComputePlan exposes `.program.functions` on MLModelStructureProgram, not a raw dict.
+    class _FakeProgramObj:
+        def __init__(self, functions: dict[str, _FakeFn]) -> None:
+            self.functions = functions
+
+    class _FakeObjStruct:
+        def __init__(self, prog: _FakeProgramObj) -> None:
+            self.program = prog
+
+    class _FakeObjPlan(_FakePlan):
+        model_structure = _FakeObjStruct(_FakeProgramObj({"main": _FakeFn(_FakeBlock([op1, op2, nested]))}))
+
+    extracted_obj = fs_hw.extract_coreml_compute_plan_ops(_FakeObjPlan())
+    assert [r["op_type"] for r in extracted_obj] == ["conv", "softmax", "while_loop", "cast"]
+
+
+def test_coreml_bundle_placement_defaults_to_all_compute_units_cpu(monkeypatch: Any, tmp_path: Path) -> None:
+    import sys
+    import types
+    import fast_shared.coreai_pipeline as cap
+
+    seen: dict[str, Any] = {}
+
+    class _FakeCU:
+        ALL = "CU_ALL"
+        CPU_AND_NE = "CU_CPU_AND_NE"
+
+    def _fake_load_from_path(path: str, compute_units: Any = None) -> object:
+        seen["path"] = path
+        seen["compute_units"] = compute_units
+        return types.SimpleNamespace(model_structure=None)
+
+    fake_ct = types.SimpleNamespace(
+        ComputeUnit=_FakeCU,
+        models=types.SimpleNamespace(
+            compute_plan=types.SimpleNamespace(MLComputePlan=types.SimpleNamespace(load_from_path=_fake_load_from_path))
+        ),
+        utils=types.SimpleNamespace(compile_model=lambda p: p),
+    )
+    monkeypatch.setitem(sys.modules, "coremltools", fake_ct)
+    bundle = tmp_path / "m.mlmodelc"
+    bundle.mkdir()
+    out = cap.inspect_coreml_bundle_placement(bundle, target_device="ane")
+    assert seen["compute_units"] == "CU_ALL"
+    assert out["total_ops"] == 0
+
+
+def test_coreai_pipeline_coreml_w4_block_guard_and_fp16_cast_cpu(monkeypatch: Any, tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn
+    import fast_shared.coreai_pipeline as cap
+
+    # Bug 4: w4_per_block on coreml must require explicit allow_experimental_coreml_w4_block=True.
+    with pytest.raises(ValueError, match="allow_experimental_coreml_w4_block"):
+        cap.build_coreai_opt_config(preset="w4_per_block", export_backend="coreml")
+
+    _, meta_opt = cap.build_coreai_opt_config(
+        preset="w4_per_block",
+        export_backend="coreml",
+        allow_experimental_coreml_w4_block=True,
+    )
+    assert meta_opt["preset"] == "w4_per_block"
+
+    assert cap._resolve_coreai_compute_dtype("coreai", "w8") == "fp16"
+    assert cap._resolve_coreai_compute_dtype("coreai", "fp16") == "fp16"
+    assert cap._resolve_coreai_compute_dtype("coreai", "fp4_fp8") == "fp32"
+    assert cap._resolve_coreai_compute_dtype("coreml", "w8") == "fp32"
+    assert cap._resolve_coreai_compute_dtype("coreai", "w8", "fp32") == "fp32"
+
+    # Default preset sweep on coreml excludes w4_per_block unless explicitly opted in.
+    seen_presets: list[str] = []
+
+    def _fake_export(**kwargs: Any) -> cap.CoreAiExportResult:
+        seen_presets.append(kwargs["preset"])
+        return cap.CoreAiExportResult(
+            backend=kwargs["export_backend"],
+            preset=kwargs["preset"],
+            asset_path=tmp_path / f"{kwargs['stem']}.mlpackage",
+            cache_key_parts={},
+            cache_key_sha256="deadbeef",
+        )
+
+    monkeypatch.setattr(cap, "run_coreai_opt_calibration_and_export", _fake_export)
+    cap.run_coreai_opt_preset_sweep(
+        module_factory=lambda: nn.Linear(4, 4),
+        sample_inputs_factory=lambda _: (torch.randn(1, 4),),
+        out_dir=tmp_path / "sweep",
+        stem_prefix="demo",
+        model_name="Demo",
+        input_names=["x"],
+        output_names=["y"],
+        export_backend="coreml",
+    )
+    assert seen_presets == ["fp16", "w8", "w4"]
+
+    # Bug 7: FP16 cast casts floating tensors/buffers while preserving integer/bool inputs & buffers.
+    monkeypatch.undo()
+    casted = cap._cast_floating_tensors(
+        (torch.ones(2, dtype=torch.float32), torch.ones(2, dtype=torch.int64), {"b": torch.tensor([True])}),
+        torch.float16,
+    )
+    assert casted[0].dtype == torch.float16
+    assert casted[1].dtype == torch.int64
+    assert casted[2]["b"].dtype == torch.bool
+
+    pytest.importorskip("coreai_torch")
+
+    class _ToyMod(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("scale_buf", torch.ones(1, 16, 1, 1))
+            self.register_buffer("idx_buf", torch.arange(4, dtype=torch.int64))
+            self.c = nn.Conv2d(16, 16, 1)
+
+        def forward(self, x: torch.Tensor, tok_ids: torch.Tensor) -> torch.Tensor:
+            return self.c(x * self.scale_buf) + float(self.idx_buf.shape[0]) + tok_ids.float().mean() * 0.0
+
+    res_f16 = cap.run_coreai_opt_calibration_and_export(
+        module_factory=_ToyMod,
+        sample_inputs_factory=lambda _: (torch.randn(1, 16, 4, 4), torch.ones(1, 2, dtype=torch.int64)),
+        out_dir=tmp_path / "coreai_f16",
+        stem="toy_w8_f16",
+        model_name="Toy",
+        input_names=["x", "tok_ids"],
+        output_names=["y"],
+        export_backend="coreai",
+        preset="w8",
+    )
+    assert res_f16.asset_summary is not None
+    assert "Float16" in res_f16.asset_summary["compute_types"]
+    assert res_f16.sensitivity_report is not None
+    assert res_f16.sensitivity_report["compute_dtype"] == "fp16"
+
+    res_f32 = cap.run_coreai_opt_calibration_and_export(
+        module_factory=_ToyMod,
+        sample_inputs_factory=lambda _: (torch.randn(1, 16, 4, 4), torch.ones(1, 2, dtype=torch.int64)),
+        out_dir=tmp_path / "coreai_f32",
+        stem="toy_w8_f32",
+        model_name="Toy",
+        input_names=["x", "tok_ids"],
+        output_names=["y"],
+        export_backend="coreai",
+        preset="w8",
+        compute_dtype="fp32",
+    )
+    assert res_f32.sensitivity_report is not None
+    assert res_f32.sensitivity_report["compute_dtype"] == "fp32"
+    assert res_f32.cache_key_sha256 != res_f16.cache_key_sha256

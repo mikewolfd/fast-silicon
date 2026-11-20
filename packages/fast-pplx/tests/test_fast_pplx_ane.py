@@ -1220,10 +1220,13 @@ def test_pplx_coreai_export_calibration_and_guards(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="requires export_backend='coreai'"):
         build_coreai_opt_pplx_config(preset="fp4_fp8", export_backend="coreml")
 
+    with pytest.raises(ValueError, match="allow_experimental_coreml_w4_block"):
+        build_coreai_opt_pplx_config(preset="w4_per_block", export_backend="coreml")
+
     _, qmeta = build_coreai_opt_pplx_config(
         preset="w4_per_block",
         block_size=32,
-        export_backend="coreml",
+        export_backend="coreai",
         weight_shapes={"blocks.l0.conv1d": (96, 1, 1, 4), "blocks.l1.mlp_gu": (128, 64, 1, 1)},
     )
     assert "blocks.l0.conv1d" in qmeta["excluded_modules"]
@@ -1260,7 +1263,11 @@ def test_pplx_coreai_export_calibration_and_guards(tmp_path: Path) -> None:
     )
     assert res_ai.asset_path.exists()
     assert res_ai.asset_summary is not None and res_ai.asset_summary["asset_valid"] is True
+    assert "Float16" in res_ai.asset_summary["compute_types"]
+    op_names = {op for op, _ in res_ai.asset_summary["operation_distribution"]}
+    assert "softplus" not in op_names
     assert res_ai.sensitivity_report is not None
+    assert res_ai.sensitivity_report["compute_dtype"] == "fp16"
     assert res_ai.sensitivity_report["cosine_vs_teacher"] > 0.99
     assert "blocks.l0.qkvzba" in res_ai.sensitivity_report["excluded_modules"]
     assert res_ai.cache_key_parts["min_os"] == "27.0"
@@ -1273,7 +1280,7 @@ def test_pplx_coreai_export_calibration_and_guards(tmp_path: Path) -> None:
         seq_len=32,
         chunk_size=16,
         export_backend="coreml",
-        preset="w4_per_block",
+        preset="w8",
         stem="tiny_pplx_ml",
     )
     assert res_ml.asset_path.exists()

@@ -1653,3 +1653,443 @@ def test_ane_ring_chunk_count_and_previous_chunk_bookkeeping_cpu() -> None:
     with pytest.raises(ValueError, match="26 ring slots"):
         small.prefill_cohort_into_ring(list(range(len(lens))), sufs)
     assert small._free_ring_q.qsize() == 20 and small.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_mtp_drafter_apple10_nax_vs_apple9_gating_and_cache_cpu() -> None:
+    """Verify Apple10 NAX (`B == 1`) vs Apple9 (`1 <= B <= 4`) MTP gating, `K` selection, and cached host probe."""
+    import fast_gemma4.mtp_drafter as fg4_mtp
+    import fast_shared.hw_check as fs_hw
+
+    sentinel = object()
+
+    # 1. Explicit Apple10 NAX (M5+): strictly B == 1; B=2..4 disabled so NAX TensorOps accelerate M >= 8 directly.
+    assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 1, 0.0, apple10_nax=True) is True
+    assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 1, 0.0, speculative=True, apple10_nax=True) is True
+    assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 1, 0.0, speculative=False, apple10_nax=True) is False
+    assert fg4_mtp.should_use_mtp_drafter(sentinel, True, 1, 0.0, apple10_nax=True) is False
+    assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 1, 0.1, apple10_nax=True) is False
+    assert fg4_mtp.should_use_mtp_drafter(None, False, 1, 0.0, apple10_nax=True) is False
+    for b in (0, 2, 3, 4, 8):
+        assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=True) is False
+        assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True, apple10_nax=True) is False
+
+    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 4
+    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=True) == 3
+    for bad_b in (0, 2, 3, 4, 8):
+        with pytest.raises(ValueError, match="strictly gated"):
+            fg4_mtp.recommended_mtp_draft_k(bad_b, apple10_nax=True)
+
+    # 2. Explicit Apple9 (M4): preserve 1 <= B <= 4 (K=3/4 at B=1, K=2 at B=2..4), B >= 5 gated out.
+    for b in (1, 2, 3, 4):
+        assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False) is True
+    for b in (0, 5, 8, 16):
+        assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False) is False
+
+    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=False) == 4
+    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=False) == 3
+    for b in (2, 3, 4):
+        assert fg4_mtp.recommended_mtp_draft_k(b, has_grammar=False, apple10_nax=False) == 2
+        assert fg4_mtp.recommended_mtp_draft_k(b, has_grammar=True, apple10_nax=False) == 2
+    for bad_b in (0, 5, 8):
+        with pytest.raises(ValueError, match="strictly gated"):
+            fg4_mtp.recommended_mtp_draft_k(bad_b, apple10_nax=False)
+
+    # 3. Cached host probe (`apple10_nax=None`): probes once per process with safe False fallback.
+    prev_cache = fg4_mtp._APPLE10_NAX_CACHE
+    try:
+        m5_calls = 0
+
+        def _probe_m5() -> dict[str, Any]:
+            nonlocal m5_calls
+            m5_calls += 1
+            return {
+                "system": "Darwin",
+                "machine": "arm64",
+                "brand": "Apple M5",
+                "gpu_family": "Apple10",
+                "supports_apple10": True,
+                "macos_version": "26.6",
+            }
+
+        fg4_mtp._APPLE10_NAX_CACHE = None
+        with patch.object(fs_hw, "probe_host_hardware", side_effect=_probe_m5):
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 1, 0.0) is True
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 2, 0.0) is False
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 4, 0.0) is False
+            assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=True) == 3
+            with pytest.raises(ValueError, match="strictly gated"):
+                fg4_mtp.recommended_mtp_draft_k(2)
+        assert m5_calls == 1
+
+        m4_calls = 0
+
+        def _probe_m4() -> dict[str, Any]:
+            nonlocal m4_calls
+            m4_calls += 1
+            return {
+                "system": "Darwin",
+                "machine": "arm64",
+                "brand": "Apple M4 Pro",
+                "gpu_family": "Apple9",
+                "supports_apple10": False,
+                "macos_version": "26.6",
+            }
+
+        fg4_mtp._APPLE10_NAX_CACHE = None
+        with patch.object(fs_hw, "probe_host_hardware", side_effect=_probe_m4):
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 4, 0.0) is True
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 8, 0.0) is False
+            assert fg4_mtp.recommended_mtp_draft_k(3, has_grammar=False) == 2
+        assert m4_calls == 1
+
+        fg4_mtp._APPLE10_NAX_CACHE = None
+        with patch.object(fs_hw, "probe_host_hardware", side_effect=RuntimeError("probe failed")):
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 4, 0.0) is True
+            assert fg4_mtp.should_use_mtp_drafter(sentinel, False, 8, 0.0) is False
+            assert fg4_mtp.recommended_mtp_draft_k(2) == 2
+    finally:
+        fg4_mtp._APPLE10_NAX_CACHE = prev_cache
+
+
+def test_ane_ring_variant_auto_dynamic_silicon_policy_cpu(tmp_path: Path) -> None:
+    """Verify `ane_ring_variant='auto'` on 24 GB (calibrated w8 vs uncalibrated/missing -> fp16) vs 48 GB."""
+    import fast_shared.hw_check as fs_hw
+
+    assert inspect.signature(FastGemma4Engine.__init__).parameters["ane_ring_variant"].default == "fp16"
+
+    ane_dir = tmp_path / "ane_models"
+    ane_dir.mkdir()
+    fp16_bundle = ane_dir / "gemma4_early14_prefix_S256_fp16.mlmodelc"
+    w8_bundle = ane_dir / "gemma4_early14_prefix_S256_w8.mlmodelc"
+    fp16_bundle.mkdir()
+    w8_bundle.mkdir()
+    dylib_stub = tmp_path / "libgemma4_ane_prefix.dylib"
+    dylib_stub.write_bytes(b"stub")
+
+    manifest_path = ane_dir / "ane_calibration_manifest.json"
+
+    def _write_manifest(*, calibrated: bool) -> None:
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "bundles": {
+                        w8_bundle.name: {
+                            "awq_mse": True,
+                            "calibration_source": "domain_corpus" if calibrated else "synthetic",
+                            "calibration_docs": 16,
+                            "qat_validated": False,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    class _Paths:
+        def __init__(self, *, has_w8: bool = True) -> None:
+            self.lib_ane_prefix = dylib_stub
+            self.has_w8 = has_w8
+
+        def resolve_ane_bundle(
+            self,
+            variant: str,
+            *,
+            model_dir: Any = None,
+            local_files_only: bool = True,
+            exit_layer: int | None = None,
+        ) -> Path | None:
+            if variant == "w8":
+                return w8_bundle if self.has_w8 else None
+            if variant == "fp16":
+                return fp16_bundle
+            return None
+
+    class _DummyModel:
+        hidden_size = 1536
+        num_layers = 35
+        n_kv_heads = 1
+        first_kv_shared = 15
+        model_dir = tmp_path / "ckpt"
+        tokenizer_json = tmp_path / "tokenizer.json"
+        kv_i8 = True
+
+    class _Runner:
+        def __init__(self, lib_path: Path, bundle: Path, **_kw: Any) -> None:
+            self.bundle = bundle
+
+    fake_mx = _FakeMx()
+    hw_24gb = {
+        "system": "Darwin",
+        "machine": "arm64",
+        "brand": "Apple M5",
+        "gpu_family": "Apple10",
+        "supports_apple10": True,
+        "mem_gb": 24,
+        "macos_version": "26.6",
+    }
+    hw_48gb = {
+        "system": "Darwin",
+        "machine": "arm64",
+        "brand": "Apple M4 Pro",
+        "gpu_family": "Apple9",
+        "supports_apple10": False,
+        "mem_gb": 48,
+        "macos_version": "26.6",
+    }
+
+    def _build_engine(hw_dict: dict[str, Any], *, has_w8: bool = True) -> FastGemma4Engine:
+        with (
+            patch.object(fs_hw, "probe_host_hardware", return_value=hw_dict),
+            patch.object(fg4_engine, "mx", fake_mx),
+            patch.object(fg4_engine, "_host_ram_gib", return_value=float(hw_dict.get("mem_gb", 0))),
+            patch.object(fg4_engine, "resolve_paths", return_value=_Paths(has_w8=has_w8)),
+            patch.object(fg4_engine, "FastGemma4Model", return_value=_DummyModel()),
+            patch.object(fg4_engine, "FastGemma4Tokenizer", return_value=object()),
+        ):
+            return FastGemma4Engine(ane_ring_variant="auto", warmup=False)
+
+    # 1. 24 GB + calibrated W8 bundle -> selects "w8" cleanly via DynamicSiliconPolicy.
+    _write_manifest(calibrated=True)
+    eng_24_cal = _build_engine(hw_24gb, has_w8=True)
+    assert eng_24_cal.ane_ring_variant == "w8"
+    assert eng_24_cal.silicon_policy is not None
+    assert eng_24_cal.silicon_policy.host.ane_ring_variant == "w8"
+    with (
+        patch.object(fg4_engine, "AnePrefixRunner", _Runner),
+        patch.object(fg4_engine, "is_ane_resident_bundle", return_value=True),
+    ):
+        runner = eng_24_cal._resolve_ane_ring_runner(require=True)
+        assert runner is not None and runner.bundle == w8_bundle
+
+    # 2. 24 GB + calibrated W8 fails residency check while FP16 passes -> falls back to "fp16".
+    eng_24_nonres = _build_engine(hw_24gb, has_w8=True)
+    assert eng_24_nonres.ane_ring_variant == "w8"
+    with (
+        patch.object(fg4_engine, "AnePrefixRunner", _Runner),
+        patch.object(fg4_engine, "is_ane_resident_bundle", side_effect=lambda _lib, b: b == fp16_bundle),
+    ):
+        runner = eng_24_nonres._resolve_ane_ring_runner(require=True)
+        assert runner is not None and runner.bundle == fp16_bundle
+        assert eng_24_nonres.ane_ring_variant == "fp16"
+
+    # 3. 24 GB + uncalibrated W8 bundle -> falls back to "fp16".
+    _write_manifest(calibrated=False)
+    eng_24_uncal = _build_engine(hw_24gb, has_w8=True)
+    assert eng_24_uncal.ane_ring_variant == "fp16"
+    assert eng_24_uncal.silicon_policy is not None
+    assert eng_24_uncal.silicon_policy.host.ane_ring_variant == "fp16"
+
+    # 4. 24 GB + missing W8 bundle -> falls back to "fp16".
+    _write_manifest(calibrated=True)
+    eng_24_missing = _build_engine(hw_24gb, has_w8=False)
+    assert eng_24_missing.ane_ring_variant == "fp16"
+
+    # 5. 48 GB + calibrated W8 bundle -> stays on "fp16".
+    eng_48_cal = _build_engine(hw_48gb, has_w8=True)
+    assert eng_48_cal.ane_ring_variant == "fp16"
+    assert eng_48_cal.silicon_policy is not None
+    assert eng_48_cal.silicon_policy.host.ane_ring_variant == "fp16"
+    with (
+        patch.object(fg4_engine, "AnePrefixRunner", _Runner),
+        patch.object(fg4_engine, "is_ane_resident_bundle", return_value=True),
+    ):
+        runner = eng_48_cal._resolve_ane_ring_runner(require=True)
+        assert runner is not None and runner.bundle == fp16_bundle
+
+    # 6. Unknown RAM (0 GB) + calibrated W8 bundle -> stays safely on "fp16".
+    eng_0_ram = _build_engine({**hw_24gb, "mem_gb": 0}, has_w8=True)
+    assert eng_0_ram.ane_ring_variant == "fp16"
+
+
+def test_mtp_drafter_auto_lazy_load_cpu(tmp_path: Path) -> None:
+    """Verify `mtp_drafter='auto'` pays 0 init load, skips B=8/T>0/absent drafter, and lazy-loads on B=1, T=0."""
+    import fast_gemma4.mtp_drafter as fg4_mtp
+
+    fake_mx = _FakeMx()
+
+    class _DummyPaths:
+        lib_ane_prefix = tmp_path / "missing.dylib"
+
+        def resolve_ane_bundle(self, *_a: Any, **_kw: Any) -> None:
+            return None
+
+    class _DummyModel:
+        hidden_size = 1536
+        num_layers = 35
+        n_kv_heads = 1
+        first_kv_shared = 15
+        window_size = 512
+        kv_i8 = True
+        model_dir = tmp_path / "ckpt"
+        tokenizer_json = tmp_path / "tokenizer.json"
+
+        def prefill_prefix(self, key: Any) -> dict[str, Any]:
+            return {"l_sys": len(key), "k_sys": [], "v_sys": []}
+
+        def make_batch_cache(self, pkv: dict[str, Any], *, batch_size: int, doc_cap_full: int, swa_ring_cap: int) -> dict[str, Any]:
+            return {"batch_size": batch_size, "l_sys": pkv["l_sys"], "layers": []}
+
+        def prefill_suffix_batch(self, sufs: Any, cache: dict[str, Any], *, group_size: int = 8, apply_softcap: bool = True) -> tuple[_FakeArray, _FakeArray]:
+            B = len(sufs)
+            return (
+                _FakeArray(np.zeros((B, 1, 8), dtype=np.float32)),
+                _FakeArray(np.full((B,), 4, dtype=np.int32), dtype=fake_mx.int32),
+            )
+
+    class _DummyTokenizer:
+        bos_token_id = 2
+        stop_token_ids = frozenset({1})
+
+        def format_chat(self, msgs: Any, **_kw: Any) -> str:
+            return str(msgs)
+
+        def encode_batch(self, texts: list[str], **_kw: Any) -> list[list[int]]:
+            return [[2, 10, 11 + i] for i in range(len(texts))]
+
+        @staticmethod
+        def decode(ids: list[int], skip_special_tokens: bool = True) -> str:
+            return "ok"
+
+    def _fake_roll(_model: Any, _stop: Any, _g: Any, _pkv: Any, sufs: Any, **_kw: Any) -> dict[str, Any]:
+        return {
+            "prefill_sec": 0.01,
+            "decode_sec": 0.01,
+            "gen_toks": [[5] for _ in sufs],
+            "valid_schemas": [True for _ in sufs],
+            "tot_out_tok": len(sufs),
+            "llm_steps": 1,
+            "ff_early14_steps": 0,
+            "ff_tokens": 0,
+            "mask_fallbacks": 0,
+            "used_speculative": False,
+        }
+
+    def _fake_prompt_lookup(_model: Any, _stop: Any, _g: Any, _lg: Any, _ob: Any, _c: Any, _wp: Any, B: int, **_kw: Any) -> dict[str, Any]:
+        return {
+            "decode_sec": 0.01,
+            "gen_toks": [[6] for _ in range(B)],
+            "tot_out_tok": B,
+            "ff_tokens": 0,
+            "used_speculative": True,
+        }
+
+    mtp_decode_calls: list[int] = []
+
+    def _fake_mtp_decode(_model: Any, drafter: Any, _stop: Any, _g: Any, _lg: Any, _ob: Any, _c: Any, B: int, **_kw: Any) -> dict[str, Any]:
+        mtp_decode_calls.append(B)
+        return {
+            "decode_sec": 0.01,
+            "gen_toks": [[7] for _ in range(B)],
+            "tot_out_tok": B,
+            "ff_tokens": 0,
+            "mtp_rounds": 1,
+            "mtp_accepted": 2,
+            "mtp_proposed": 3,
+            "used_speculative": True,
+            "speculative_backend": "mtp",
+        }
+
+    def _make_auto_engine() -> FastGemma4Engine:
+        with (
+            patch.object(fg4_engine, "mx", fake_mx),
+            patch.object(fg4_engine, "_host_ram_gib", return_value=48.0),
+            patch.object(fg4_engine, "resolve_paths", return_value=_DummyPaths()),
+            patch.object(fg4_engine, "FastGemma4Model", return_value=_DummyModel()),
+            patch.object(fg4_engine, "FastGemma4Tokenizer", return_value=_DummyTokenizer()),
+        ):
+            return FastGemma4Engine(default_mode="gpu", mtp_drafter="auto", warmup=False)
+
+    resolve_calls: list[tuple[Any, bool]] = []
+    drafter_init_calls: list[Path] = []
+    staged_dir = tmp_path / "staged_drafter"
+    staged_dir.mkdir()
+    (staged_dir / "model.safetensors").write_bytes(b"stub")
+
+    def _fake_resolve_present(repo: Any, *, local_files_only: bool = True) -> Path:
+        resolve_calls.append((repo, local_files_only))
+        return staged_dir
+
+    def _fake_resolve_absent(repo: Any, *, local_files_only: bool = True) -> Path:
+        resolve_calls.append((repo, local_files_only))
+        raise FileNotFoundError("no local drafter staged")
+
+    def _fake_drafter_ctor(_model: Any, ddir: Any, **_kw: Any) -> object:
+        drafter_init_calls.append(Path(ddir))
+        return object()
+
+    prev_cache = fg4_mtp._APPLE10_NAX_CACHE
+    try:
+        fg4_mtp._APPLE10_NAX_CACHE = True  # Also verify Apple10 NAX skips B=2 lazy-load!
+
+        # 1. Init with mtp_drafter="auto" performs ZERO drafter resolution or loading.
+        with (
+            patch.object(fg4_engine, "resolve_mtp_drafter_dir", side_effect=_fake_resolve_present),
+            patch.object(fg4_engine, "Gemma4MtpDrafter", side_effect=_fake_drafter_ctor),
+        ):
+            eng = _make_auto_engine()
+        assert eng.mtp_drafter is None
+        assert resolve_calls == [] and drafter_init_calls == []
+
+        with (
+            patch.object(fg4_engine, "mx", fake_mx),
+            patch.object(fg4_engine, "resolve_mtp_drafter_dir", side_effect=_fake_resolve_present),
+            patch.object(fg4_engine, "Gemma4MtpDrafter", side_effect=_fake_drafter_ctor),
+            patch.object(fg4_engine, "run_decode_rolling", side_effect=_fake_roll),
+            patch.object(fg4_engine, "run_decode_prompt_lookup", side_effect=_fake_prompt_lookup),
+            patch.object(fg4_engine, "run_decode_mtp", side_effect=_fake_mtp_decode),
+        ):
+            # 2. B=8 batch ETL -> 0 lazy-load, uses rolling.
+            r_b8 = eng.generate_batch(["doc"] * 8, temperature=0.0, mode="gpu")
+            assert r_b8.stats["rolling"] is True
+            assert eng.mtp_drafter is None and resolve_calls == [] and drafter_init_calls == []
+
+            # 3. B=1 with temperature > 0 -> 0 lazy-load, uses rolling.
+            r_temp = eng.generate_batch(["doc"], temperature=0.7, mode="gpu")
+            assert r_temp.stats["rolling"] is True
+            assert eng.mtp_drafter is None and resolve_calls == [] and drafter_init_calls == []
+
+            # 4. B=2 on Apple10 NAX -> 0 lazy-load, falls back to PromptLookup.
+            r_b2_nax = eng.generate_batch(["d1", "d2"], temperature=0.0, mode="gpu")
+            assert r_b2_nax.stats.get("speculative_backend") != "mtp"
+            assert eng.mtp_drafter is None and resolve_calls == [] and drafter_init_calls == []
+
+            # 5. First qualifying call (B=1, temperature=0.0) -> triggers lazy-load once!
+            r_b1_a = eng.generate_batch(["doc"], temperature=0.0, mode="gpu")
+            assert r_b1_a.stats.get("speculative_backend") == "mtp"
+            assert eng.mtp_drafter is not None
+            assert len(resolve_calls) == 1 and resolve_calls[0][1] is True
+            assert drafter_init_calls == [staged_dir]
+            assert mtp_decode_calls == [1]
+
+            # 6. Second B=1, T=0 call reuses cached drafter (still 1 init call).
+            r_b1_b = eng.generate_batch(["doc"], temperature=0.0, mode="gpu")
+            assert r_b1_b.stats.get("speculative_backend") == "mtp"
+            assert len(resolve_calls) == 1 and len(drafter_init_calls) == 1
+            assert mtp_decode_calls == [1, 1]
+
+            # 7. Subsequent B=8 call never invokes MTP even after drafter is resident.
+            r_b8_after = eng.generate_batch(["doc"] * 8, temperature=0.0, mode="gpu")
+            assert r_b8_after.stats["rolling"] is True
+            assert mtp_decode_calls == [1, 1]
+
+        # 8. Absent local drafter under mtp_drafter="auto": falls back cleanly without raising or re-probing.
+        resolve_calls.clear()
+        drafter_init_calls.clear()
+        mtp_decode_calls.clear()
+        eng_absent = _make_auto_engine()
+        with (
+            patch.object(fg4_engine, "mx", fake_mx),
+            patch.object(fg4_engine, "resolve_mtp_drafter_dir", side_effect=_fake_resolve_absent),
+            patch.object(fg4_engine, "Gemma4MtpDrafter", side_effect=_fake_drafter_ctor),
+            patch.object(fg4_engine, "run_decode_prompt_lookup", side_effect=_fake_prompt_lookup),
+            patch.object(fg4_engine, "run_decode_mtp", side_effect=_fake_mtp_decode),
+        ):
+            r_miss1 = eng_absent.generate_batch(["doc"], temperature=0.0, mode="gpu")
+            r_miss2 = eng_absent.generate_batch(["doc"], temperature=0.0, mode="gpu")
+            assert r_miss1.stats.get("speculative_backend") != "mtp"
+            assert r_miss2.stats.get("speculative_backend") != "mtp"
+            assert eng_absent.mtp_drafter is None
+            assert len(resolve_calls) == 1 and resolve_calls[0][1] is True
+            assert drafter_init_calls == [] and mtp_decode_calls == []
+    finally:
+        fg4_mtp._APPLE10_NAX_CACHE = prev_cache

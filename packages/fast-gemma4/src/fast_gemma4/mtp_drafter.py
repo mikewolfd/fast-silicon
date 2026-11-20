@@ -25,6 +25,40 @@ DEFAULT_MTP_DRAFTER_REPO: str = "google/gemma-4-E2B-it-assistant"
 DEFAULT_MTP_TOP_K: int = 32
 MAX_MTP_BATCH_SIZE: int = 4
 
+_APPLE10_NAX_CACHE: bool | None = None
+
+
+def _host_supports_apple10_nax() -> bool:
+    """Probe Apple10+ NAX support via `fast_shared.hw_check.probe_host_hardware()` once per process."""
+    global _APPLE10_NAX_CACHE
+    if _APPLE10_NAX_CACHE is not None:
+        return _APPLE10_NAX_CACHE
+    detected = False
+    try:
+        from fast_shared.hw_check import probe_host_hardware, supports_apple10_nax
+
+        hw = probe_host_hardware()
+        if isinstance(hw, dict):
+            probe_dict = dict(hw)
+            if "system" not in probe_dict and (
+                probe_dict.get("gpu_family") in ("Apple9", "Apple10")
+                or probe_dict.get("supports_apple10") is not None
+                or "apple" in str(probe_dict.get("brand") or "").lower()
+            ):
+                probe_dict["system"] = "Darwin"
+                probe_dict.setdefault("machine", "arm64")
+            detected = bool(supports_apple10_nax(probe_dict))
+    except Exception:
+        detected = False
+    _APPLE10_NAX_CACHE = detected
+    return detected
+
+
+def _resolve_apple10_nax(apple10_nax: bool | None) -> bool:
+    if apple10_nax is not None:
+        return bool(apple10_nax)
+    return _host_supports_apple10_nax()
+
 
 def should_use_mtp_drafter(
     drafter: Any | None,
@@ -33,22 +67,39 @@ def should_use_mtp_drafter(
     temperature: float,
     *,
     speculative: bool | None = None,
+    apple10_nax: bool | None = None,
 ) -> bool:
-    """Enable MTP drafter strictly for `1 <= B <= 4`, `temperature == 0.0`, non-ANE GPU waves."""
+    """Enable MTP drafter strictly for `B == 1` on Apple10+ NAX or `1 <= B <= 4` on Apple9, `T == 0`, non-ANE GPU waves."""
     if drafter is None or speculative is False or use_ane or temperature > 0.0:
         return False
-    return 1 <= int(batch_w) <= MAX_MTP_BATCH_SIZE
+    max_b = 1 if _resolve_apple10_nax(apple10_nax) else MAX_MTP_BATCH_SIZE
+    return 1 <= int(batch_w) <= max_b
 
 
-def recommended_mtp_draft_k(batch_size: int, *, has_grammar: bool = False) -> int:
-    """Select roof-line optimal draft depth `K` for `1 <= B <= 4` on Apple Silicon.
+def recommended_mtp_draft_k(
+    batch_size: int,
+    *,
+    has_grammar: bool = False,
+    apple10_nax: bool | None = None,
+) -> int:
+    """Select roof-line optimal draft depth `K` for Apple9 (`1 <= B <= 4`) or Apple10+ NAX (`B == 1`).
 
-    - `B == 1`: `K = 3` (`L_q = 4`, optimal `2.63x` JSON / `2.13x` free-text; `K = 4` also strong on free-text).
-    - `2 <= B <= 4`: `K = 2` keeps `M = B * (K + 1) <= 12 < 16`, staying below the `16 <= M <= 64`
-      MPP tile threshold where verify latency jumps `~2.4x`.
+    - `Apple10+ NAX` (M5+): strictly `B == 1` (`K = 3` with grammar, `K = 4` free-text); for `B >= 2`,
+      NAX TensorOps (`M >= 8`) already accelerate batched decode by `1.5x–1.9x`, whereas MTP adds overhead.
+    - `Apple9` (M4):
+      - `B == 1`: `K = 3` (`L_q = 4`, optimal `2.63x` JSON / `2.13x` free-text; `K = 4` also strong on free-text).
+      - `2 <= B <= 4`: `K = 2` keeps `M = B * (K + 1) <= 12 < 16`, staying below the `16 <= M <= 64`
+        MPP tile threshold where verify latency jumps `~2.4x`.
     """
     b = int(batch_size)
-    if not (1 <= b <= MAX_MTP_BATCH_SIZE):
+    is_nax = _resolve_apple10_nax(apple10_nax)
+    max_b = 1 if is_nax else MAX_MTP_BATCH_SIZE
+    if not (1 <= b <= max_b):
+        if is_nax:
+            raise ValueError(
+                f"MTP speculative drafting on Apple10+ NAX is strictly gated to B == 1 "
+                f"(NAX TensorOps accelerate B >= 2 directly); got B={b}"
+            )
         raise ValueError(
             f"MTP speculative drafting is strictly gated to 1 <= B <= {MAX_MTP_BATCH_SIZE} "
             f"(never enable for B >= 8); got B={b}"
