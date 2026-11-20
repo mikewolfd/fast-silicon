@@ -1,0 +1,1002 @@
+{
+  "schema_version": 1,
+  "default_cache_dir": "~/.cache/fast-silicon/outcome-benchmarks",
+  "sampling_algorithm": "sha256_stratified_v1",
+  "datasets": {
+    "nanobeir_en": {
+      "category": 1,
+      "repo_id": "sentence-transformers/NanoBEIR-en",
+      "license": "Apache-2.0",
+      "format": "parquet",
+      "tier1_subsets": [
+        "NanoSciFact",
+        "NanoArguAna",
+        "NanoHotpotQA"
+      ],
+      "tier2_subsets": [
+        "NanoArguAna",
+        "NanoClimateFEVER",
+        "NanoDBPedia",
+        "NanoFEVER",
+        "NanoFiQA2018",
+        "NanoHotpotQA",
+        "NanoMSMARCO",
+        "NanoNFCorpus",
+        "NanoNQ",
+        "NanoQuoraRetrieval",
+        "NanoSCIDOCS",
+        "NanoSciFact",
+        "NanoTouche2020"
+      ],
+      "revision": "beb106fbcfaa599c508c667041bf8c85fd78736b",
+      "gated": false,
+      "pinned_files": {
+        "corpus/NanoArguAna-00000-of-00001.parquet": {
+          "size": 2191184,
+          "sha256": "9ae34836d485a4b1f83fd0605f444e8f3f0677a375cb6c8b542904a7b4c904a9"
+        },
+        "queries/NanoArguAna-00000-of-00001.parquet": {
+          "size": 43582,
+          "sha256": "e0dfec4d3c90355e0d11bc8e50a54622a533ee1c8feeb89ece700a7134d8b237"
+        },
+        "qrels/NanoArguAna-00000-of-00001.parquet": {
+          "size": 3382,
+          "sha256": "bb469a9580d0872c54d9f8ff118243f1b77abfe8809a033ce5817ecf25bd9370"
+        },
+        "corpus/NanoClimateFEVER-00000-of-00001.parquet": {
+          "size": 3290470,
+          "sha256": "01da7329c55ecc4a8e8a3544e3df99e6bea9f40aa511db18befcb10de39f2990"
+        },
+        "queries/NanoClimateFEVER-00000-of-00001.parquet": {
+          "size": 7252,
+          "sha256": "4cea2c60a71aca2efde3d2aa64e4e4a2441da8f460e0d6a43fe7657975edd3b7"
+        },
+        "qrels/NanoClimateFEVER-00000-of-00001.parquet": {
+          "size": 3774,
+          "sha256": "806b8b8f787b1f8f19c367512e92c73d933716d9f6b079999ba2b2ed442d8340"
+        },
+        "corpus/NanoDBPedia-00000-of-00001.parquet": {
+          "size": 1464364,
+          "sha256": "fdaca6b15b4f2231c31ecd50569e31c4743bf2961598c577ce0f9a4a2ee4ac1f"
+        },
+        "queries/NanoDBPedia-00000-of-00001.parquet": {
+          "size": 3497,
+          "sha256": "d90da885f45533a77b7b671666afbe22fbba2a3a691ac06c044d990959b50b0a"
+        },
+        "qrels/NanoDBPedia-00000-of-00001.parquet": {
+          "size": 22296,
+          "sha256": "3090230e42a469717641985eccd839b78b1d54aa6cabbb0a83f08ee2f963068a"
+        },
+        "corpus/NanoFEVER-00000-of-00001.parquet": {
+          "size": 3928084,
+          "sha256": "44ba16cc807bab801c3e45df054c9b711a6b58260e3a18d76e91f3ef160d1c4e"
+        },
+        "queries/NanoFEVER-00000-of-00001.parquet": {
+          "size": 3872,
+          "sha256": "bdaba371eb97e4ed2a8d7a59446197d708993402abef0a584791d2717c9b2a51"
+        },
+        "qrels/NanoFEVER-00000-of-00001.parquet": {
+          "size": 2748,
+          "sha256": "32758317a399a6569b1325bbbf2259c397bb43b5fe4aa59e9993f52a3d071902"
+        },
+        "corpus/NanoFiQA2018-00000-of-00001.parquet": {
+          "size": 2530909,
+          "sha256": "e6ff315a9fbd61e70c0f320c9ef04602b3d71794ee3ed422ea232ede87d314a0"
+        },
+        "queries/NanoFiQA2018-00000-of-00001.parquet": {
+          "size": 4200,
+          "sha256": "0529ff05670678d9896ccb60d45c35ce730d1dc6d6fed522e66fdec7d1291a92"
+        },
+        "qrels/NanoFiQA2018-00000-of-00001.parquet": {
+          "size": 2677,
+          "sha256": "21bc1504b6d5efb1bf78236d08b5b0a81c352fb1aadb02d8959ba94fbf01e8ba"
+        },
+        "corpus/NanoHotpotQA-00000-of-00001.parquet": {
+          "size": 1234345,
+          "sha256": "2b57b69da195e7349d210405fc4250d5ab20373aadf2cae6c15247eae30727e7"
+        },
+        "queries/NanoHotpotQA-00000-of-00001.parquet": {
+          "size": 6301,
+          "sha256": "08a64060e167573c974a965a944effafa89e2aa9dd4d97a3411c82571e249387"
+        },
+        "qrels/NanoHotpotQA-00000-of-00001.parquet": {
+          "size": 3431,
+          "sha256": "2bb77ea2883970e1a48b00e5c24a5a61206bf534f7f892e0b8070d7112de7a1b"
+        },
+        "corpus/NanoMSMARCO-00000-of-00001.parquet": {
+          "size": 1102442,
+          "sha256": "685715c7e0a66d0219572dcd43c3905782868d1aae885259768431f7d7eda830"
+        },
+        "queries/NanoMSMARCO-00000-of-00001.parquet": {
+          "size": 3226,
+          "sha256": "7cb9d7534660847f303211b9bdf84bcb3a3530f6e20e3c6050e77fc7ae77d0cd"
+        },
+        "qrels/NanoMSMARCO-00000-of-00001.parquet": {
+          "size": 2133,
+          "sha256": "6cd84c97a6ed813ffccbbb0b7aacc3051641f40a5869e0a15415823caf65c0d1"
+        },
+        "corpus/NanoNFCorpus-00000-of-00001.parquet": {
+          "size": 2474144,
+          "sha256": "d50e7ac973d4367434b68c1e7eb54d7827b29d85aa54a1dde42883f05fbf7d95"
+        },
+        "queries/NanoNFCorpus-00000-of-00001.parquet": {
+          "size": 2813,
+          "sha256": "e9a58c2e1f392a83b26eade3d9838f7448c8a6cdb34f7257f3475cb76024aec2"
+        },
+        "qrels/NanoNFCorpus-00000-of-00001.parquet": {
+          "size": 13239,
+          "sha256": "d97ea8176db52aa04773f2459d02e20c582ed9aa694801201cd21e841a00f200"
+        },
+        "corpus/NanoNQ-00000-of-00001.parquet": {
+          "size": 1763476,
+          "sha256": "85d306945cd09cb748ca5b198b281a4f1f034b8240f8c5ecacceb68e38a1db0a"
+        },
+        "queries/NanoNQ-00000-of-00001.parquet": {
+          "size": 3647,
+          "sha256": "3731f4ac7be9dc1054783ea700ee883d8fd8ad2283da259b1216fff0b4107a5e"
+        },
+        "qrels/NanoNQ-00000-of-00001.parquet": {
+          "size": 2051,
+          "sha256": "f08f73ba0246a9ec1282ca26b48faa24cffb7e1e223354b7fb14fa9f4339e112"
+        },
+        "corpus/NanoQuoraRetrieval-00000-of-00001.parquet": {
+          "size": 227554,
+          "sha256": "c1e1efd3ed13e3458788f973706ff0ef8cdaedd028ba8ca3454421a92eee0659"
+        },
+        "queries/NanoQuoraRetrieval-00000-of-00001.parquet": {
+          "size": 3888,
+          "sha256": "6c5d11240a0d3868bd4fd8c2d2dc76b4de0b21e777501832aae5ce659faaf633"
+        },
+        "qrels/NanoQuoraRetrieval-00000-of-00001.parquet": {
+          "size": 2310,
+          "sha256": "d7ea957c68ea0736465643ee388b37669e21b953aae715f7f22aeedbd0819b12"
+        },
+        "corpus/NanoSCIDOCS-00000-of-00001.parquet": {
+          "size": 1265503,
+          "sha256": "4552d68895b1203ab2e01d79d8bd77b51815f0b41e798da0ca60273fa3157250"
+        },
+        "queries/NanoSCIDOCS-00000-of-00001.parquet": {
+          "size": 6768,
+          "sha256": "6dea625938502cb758fcf225bb45ecb00fe01c474ffecb266ed31fd3a123b548"
+        },
+        "qrels/NanoSCIDOCS-00000-of-00001.parquet": {
+          "size": 13954,
+          "sha256": "132c06c8315fd020d9573dd5b34d69dc276f057ebe1adc265ad62751c21a0265"
+        },
+        "corpus/NanoSciFact-00000-of-00001.parquet": {
+          "size": 2413104,
+          "sha256": "ece958f761f10a813a3ca17bfb63455629b110116abf00a3f51396b69664d358"
+        },
+        "queries/NanoSciFact-00000-of-00001.parquet": {
+          "size": 5436,
+          "sha256": "0b621d5ea9ba032b88a52c4ea894f98114cc6eb5d6a999520ada0c6bee9c6f27"
+        },
+        "qrels/NanoSciFact-00000-of-00001.parquet": {
+          "size": 2124,
+          "sha256": "0bfe8b38bac22fafab42cc3d9f0161ff57e50cd13c49757ade474e9acc675f55"
+        },
+        "corpus/NanoTouche2020-00000-of-00001.parquet": {
+          "size": 7227529,
+          "sha256": "5ae883dbf2cb6573672722741ad7b34761346bf99c2adaf85727ea69eb86b146"
+        },
+        "queries/NanoTouche2020-00000-of-00001.parquet": {
+          "size": 3338,
+          "sha256": "d1673ebd1175a1b135e8641092e2ad87b5e76a526853d1f75e3c1c16fc621cd3"
+        },
+        "qrels/NanoTouche2020-00000-of-00001.parquet": {
+          "size": 17734,
+          "sha256": "e1b7500589ed1356a38623d816e05073c5c7e48bcf6e9d263b22741b62940ed5"
+        }
+      }
+    },
+    "legalbench_rag": {
+      "category": 1,
+      "repo_id": "awinml/legalbench-rag",
+      "license": "MIT/CC-BY-4.0",
+      "subset_licenses": {
+        "cuad": "CC-BY-4.0",
+        "contractnli": "CC-BY-4.0",
+        "privacy_qa": "MIT"
+      },
+      "allowed_subsets": [
+        "cuad",
+        "contractnli",
+        "privacy_qa"
+      ],
+      "excluded_subsets": [
+        "maud"
+      ],
+      "format": "json_corpus",
+      "tier1": {
+        "subsets": [
+          "cuad",
+          "contractnli"
+        ],
+        "max_docs": 20,
+        "max_queries": 180
+      },
+      "tier2": {
+        "subsets": [
+          "cuad",
+          "contractnli",
+          "privacy_qa"
+        ],
+        "max_docs": 60,
+        "max_queries": 600
+      },
+      "revision": "2b9c248bc8179ef0908fd6ba01d50b156facd48b",
+      "gated": false,
+      "pinned_files": {
+        "benchmarks/cuad.json": {
+          "size": 5331921,
+          "blob_id": "64e9209fa972c8a0983138c6d299bde17ae5aa1c"
+        },
+        "benchmarks/contractnli.json": {
+          "size": 1079894,
+          "blob_id": "06dc9be6d67eb59d374565a962512bdd605e1223"
+        },
+        "benchmarks/privacy_qa.json": {
+          "size": 376390,
+          "blob_id": "b3696f5d9305355260cedc70901ac13402bf89ed"
+        }
+      }
+    },
+    "longembed": {
+      "category": 1,
+      "repo_id": "dwzhu/LongEmbed",
+      "license": "OpenMDW-1.1/Apache-2.0/MIT",
+      "subset_licenses": {
+        "2wikimqa": "Apache-2.0",
+        "passkey": "OpenMDW-1.1",
+        "qmsum": "MIT"
+      },
+      "allowed_subsets": [
+        "2wikimqa",
+        "passkey",
+        "qmsum"
+      ],
+      "excluded_subsets": [
+        "summ_screen_fd"
+      ],
+      "format": "jsonl",
+      "tier1": {
+        "subsets": [],
+        "max_queries": 0
+      },
+      "tier2": {
+        "subsets": [
+          "2wikimqa",
+          "passkey"
+        ],
+        "passkey_context_lengths": [
+          4096,
+          8192,
+          16384,
+          32768
+        ],
+        "max_queries_2wikimqa": 300,
+        "max_queries_passkey": 200
+      },
+      "revision": "10039a580487dacecf79db69166e17ace3ede392",
+      "gated": false,
+      "pinned_files": {
+        "2wikimqa/corpus.jsonl": {
+          "size": 11384376,
+          "sha256": "f50e7df1dbd5bdf27d8c16a7e85390a1485c2c13b7e4f3e147d7718d52ae787b"
+        },
+        "2wikimqa/queries.jsonl": {
+          "size": 34293,
+          "blob_id": "0180979453a7aa5c20e31f80b9237782fe5cc340"
+        },
+        "2wikimqa/qrels.jsonl": {
+          "size": 15980,
+          "sha256": "ae65eec5dfbcd0169d0af92b19e732ab4c07d875061343b317804ed4dc226aea"
+        },
+        "passkey/corpus.jsonl": {
+          "size": 23227066,
+          "sha256": "0b75d2ecd00324b40949ecd7d5d343908a057ac0df83f4bd49a33bac698b0bbe"
+        },
+        "passkey/queries.jsonl": {
+          "size": 45875,
+          "blob_id": "afcafd643450b2a9bc340d348e5f14ac6e9c6a2a"
+        },
+        "passkey/qrels.jsonl": {
+          "size": 35912,
+          "sha256": "d67c04043d14b08c4dec2878644edb37db9ecfda6cd8cf4ee99e5cfbbb66af0c"
+        },
+        "qmsum/corpus.jsonl": {
+          "size": 10633507,
+          "sha256": "ce495b73ba31bb5203a8f1f3b086a5f0e6421de05d921b6c0727368fa128b02b"
+        },
+        "qmsum/queries.jsonl": {
+          "size": 734324,
+          "blob_id": "2d26b3cd704d401d399b3056d8f76f41b7a3f255"
+        },
+        "qmsum/qrels.jsonl": {
+          "size": 82040,
+          "sha256": "65a2dc5c1db95d7a0a7c0e49eb10f62d9ffd4e885c9fac84c300f00a954f22a3"
+        }
+      }
+    },
+    "ragtruth": {
+      "category": 2,
+      "repo_id": "wandb/RAGTruth-processed",
+      "license": "MIT",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "n": 600,
+        "stratify_by": [
+          "task_type",
+          "is_faithful"
+        ]
+      },
+      "tier2": {
+        "n": 2700
+      },
+      "revision": "eb4f4b9d1b68eb7092d3e1a61c0cd82d9808737b",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00001.parquet": {
+          "size": 3882700,
+          "sha256": "2fc4fb703ea47ee0d4ab6110b86312f94fdf0bda157bc6ee67c7e61fb90d3bbd"
+        }
+      }
+    },
+    "clinc_oos": {
+      "category": 2,
+      "repo_id": "clinc/clinc_oos",
+      "license": "CC-BY-3.0",
+      "format": "parquet",
+      "files": [
+        "plus/test-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "n": 550,
+        "in_scope": 450,
+        "oos": 100
+      },
+      "tier2": {
+        "n": 2000,
+        "in_scope": 1500,
+        "oos": 500
+      },
+      "revision": "155b9c710419136e17307b80d0a13e68cd46b4ec",
+      "gated": false,
+      "pinned_files": {
+        "plus/test-00000-of-00001.parquet": {
+          "size": 135844,
+          "sha256": "3e60e45b25bf86543aa5df8ba4fcc674114164e6184f0197690648c2908d0102"
+        }
+      }
+    },
+    "banking77": {
+      "category": 2,
+      "repo_id": "PolyAI/banking77",
+      "license": "CC-BY-4.0",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "n": 1000,
+        "stratify_by": [
+          "label"
+        ]
+      },
+      "revision": "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00001.parquet": {
+          "size": 92409,
+          "sha256": "1f40f777c33f0edfa6c530ff84fe2878db6490838c12d22d036f626948905341"
+        }
+      }
+    },
+    "reward_bench_2": {
+      "category": 2,
+      "repo_id": "allenai/reward-bench-2",
+      "license": "ODC-BY",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00001.parquet"
+      ],
+      "allowed_subsets": [
+        "Factuality",
+        "Precise IF",
+        "Math",
+        "Safety",
+        "Focus"
+      ],
+      "excluded_subsets": [
+        "Ties"
+      ],
+      "tier1": {
+        "n": 250,
+        "per_subset": 50
+      },
+      "tier2": {
+        "n": 1763
+      },
+      "revision": "7ff08853b0d5686e79b13fda8677024f566a104a",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00001.parquet": {
+          "size": 6973189,
+          "sha256": "c8ec60efbd75d2f9dcba4121e6101f7a6015abc38a34e034ae2c7ae886265958"
+        }
+      }
+    },
+    "ifbench_test": {
+      "category": 3,
+      "repo_id": "allenai/IFBench_test",
+      "license": "ODC-BY-1.0",
+      "format": "parquet",
+      "files": [
+        "data/train-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "n": 100,
+        "stratify_by": [
+          "primary_family"
+        ]
+      },
+      "tier2": {
+        "n": 300
+      },
+      "revision": "ed7c12452594b7028b15807b86d3938150b663ae",
+      "gated": false,
+      "pinned_files": {
+        "data/train-00000-of-00001.parquet": {
+          "size": 94446,
+          "sha256": "80037e4d99c39a55c1e2e7d5a863d8d9edeb5ebe136ba8c1e849f8c015027c6a"
+        }
+      }
+    },
+    "ifeval": {
+      "category": 3,
+      "repo_id": "google/IFEval",
+      "license": "Apache-2.0",
+      "format": "jsonl",
+      "files": [
+        "ifeval_input_data.jsonl"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "n": 300,
+        "stratify_by": [
+          "primary_family"
+        ]
+      },
+      "revision": "966cd89545d6b6acfd7638bc708b98261ca58e84",
+      "gated": false,
+      "pinned_files": {
+        "ifeval_input_data.jsonl": {
+          "size": 207111,
+          "blob_id": "7c875005c09550bc3fd94c7f42867f78490bc554"
+        }
+      }
+    },
+    "mmlu_redux_2": {
+      "category": 3,
+      "repo_id": "edinburgh-dawg/mmlu-redux-2.0",
+      "license": "CC-BY-4.0",
+      "format": "arrow_ipc",
+      "error_type_filter": "ok",
+      "tier1": {
+        "n": 285,
+        "per_subject": 5
+      },
+      "tier2": {
+        "n": null,
+        "per_subject": null
+      },
+      "revision": "372ea425445d51e1ba1188c56e5e893f8138621f",
+      "gated": false,
+      "subjects": [
+        "abstract_algebra",
+        "anatomy",
+        "astronomy",
+        "business_ethics",
+        "clinical_knowledge",
+        "college_biology",
+        "college_chemistry",
+        "college_computer_science",
+        "college_mathematics",
+        "college_medicine",
+        "college_physics",
+        "computer_security",
+        "conceptual_physics",
+        "econometrics",
+        "electrical_engineering",
+        "elementary_mathematics",
+        "formal_logic",
+        "global_facts",
+        "high_school_biology",
+        "high_school_chemistry",
+        "high_school_computer_science",
+        "high_school_european_history",
+        "high_school_geography",
+        "high_school_government_and_politics",
+        "high_school_macroeconomics",
+        "high_school_mathematics",
+        "high_school_microeconomics",
+        "high_school_physics",
+        "high_school_psychology",
+        "high_school_statistics",
+        "high_school_us_history",
+        "high_school_world_history",
+        "human_aging",
+        "human_sexuality",
+        "international_law",
+        "jurisprudence",
+        "logical_fallacies",
+        "machine_learning",
+        "management",
+        "marketing",
+        "medical_genetics",
+        "miscellaneous",
+        "moral_disputes",
+        "moral_scenarios",
+        "nutrition",
+        "philosophy",
+        "prehistory",
+        "professional_accounting",
+        "professional_law",
+        "professional_medicine",
+        "professional_psychology",
+        "public_relations",
+        "security_studies",
+        "sociology",
+        "us_foreign_policy",
+        "virology",
+        "world_religions"
+      ],
+      "pinned_files": {
+        "abstract_algebra/data-00000-of-00001.arrow": {
+          "size": 39376,
+          "sha256": "fe3b1b5aeb5a4a8542707fffb71011757e58102c963891723e72f85ed59e7360"
+        },
+        "anatomy/data-00000-of-00001.arrow": {
+          "size": 36088,
+          "sha256": "02e5430bb850c999fd0360c4d0a7b8b497d6a77baa032ddf75a9bbb61edfa2e1"
+        },
+        "astronomy/data-00000-of-00001.arrow": {
+          "size": 39448,
+          "sha256": "14ce04c3ab6cce3041b72d5b669d5a2f02bb847e86ea37b45c248b189e5a7b04"
+        },
+        "business_ethics/data-00000-of-00001.arrow": {
+          "size": 52200,
+          "sha256": "a951880958fb05bf5a1b413fb8f67db98a4454f8d6c659240fe918039d106028"
+        },
+        "clinical_knowledge/data-00000-of-00001.arrow": {
+          "size": 38656,
+          "sha256": "22751969c400ca778350327bf672389cf998b2243c8774ec799fe1dde73cfb70"
+        },
+        "college_biology/data-00000-of-00001.arrow": {
+          "size": 45472,
+          "sha256": "e1f6533faf45cc16a5931d73ef73a0f730604aeea55314a2c9304ddb91cefd12"
+        },
+        "college_chemistry/data-00000-of-00001.arrow": {
+          "size": 32296,
+          "sha256": "f6c3c5955ef320051bae52881ffd6006bb1d2d1f187fde18a241111f5b155800"
+        },
+        "college_computer_science/data-00000-of-00001.arrow": {
+          "size": 51160,
+          "sha256": "f4c2115b5da06e23b5bfcfb5be7d909bb658ac86a1506b564f83339b1163f6ca"
+        },
+        "college_mathematics/data-00000-of-00001.arrow": {
+          "size": 29288,
+          "sha256": "86d49192ad35f31bf9666ee194d43d3b852dd52f7463474e8b7b1d691e86cc37"
+        },
+        "college_medicine/data-00000-of-00001.arrow": {
+          "size": 57112,
+          "sha256": "77c854a9268649408cce3dc7b9bac2d7140f01b52b8f6fdf1ee70895ce264802"
+        },
+        "college_physics/data-00000-of-00001.arrow": {
+          "size": 37184,
+          "sha256": "9877df1697482b5c1add4f1e0169e96ca7413aac9a361d599b23bf3d2cfc7a6a"
+        },
+        "computer_security/data-00000-of-00001.arrow": {
+          "size": 41856,
+          "sha256": "c8c91dad780d00c0d6a51123bc870a0eb85fc6d9198b86d053e04c9036b23cf8"
+        },
+        "conceptual_physics/data-00000-of-00001.arrow": {
+          "size": 32584,
+          "sha256": "82f09349d8ffb74646bbbe7ce0fa10e43d9c898ee4370b2799cdc25f7e4dcefc"
+        },
+        "econometrics/data-00000-of-00001.arrow": {
+          "size": 51232,
+          "sha256": "95ae4551a0df3b6cc84924f5d9fc4bd17f1743b44f5dab7725057126b86354f0"
+        },
+        "electrical_engineering/data-00000-of-00001.arrow": {
+          "size": 20720,
+          "sha256": "5c88d812fcb1b10d57d5fa735e2ee8c0d4974ba5e5d3e33a01a3cc2378e0e5b9"
+        },
+        "elementary_mathematics/data-00000-of-00001.arrow": {
+          "size": 24512,
+          "sha256": "f4b986d25dd5b76c3dd5bbba6109f39c84caee7b604b97c01fe0d8cc25806cbe"
+        },
+        "formal_logic/data-00000-of-00001.arrow": {
+          "size": 45808,
+          "sha256": "9c1b0d50c4c871fe0e8e59d36b53e16f4e241fa6fdb21055336eac180273bb03"
+        },
+        "global_facts/data-00000-of-00001.arrow": {
+          "size": 32568,
+          "sha256": "47d3e105a90e91210a942e1d73b36bd86b3c9acf642be5c9e5bbc4090ccb7c97"
+        },
+        "high_school_biology/data-00000-of-00001.arrow": {
+          "size": 47760,
+          "sha256": "7921b3460b8faacbe3125e09129f8c8b43d9115ac108b585c96d145af7559026"
+        },
+        "high_school_chemistry/data-00000-of-00001.arrow": {
+          "size": 37520,
+          "sha256": "df3ac67951d86f992e997fae622ae8b07b4b54f60ef5cfefdc636880920f8706"
+        },
+        "high_school_computer_science/data-00000-of-00001.arrow": {
+          "size": 49936,
+          "sha256": "f478f5265e23fbd20005accdf9631fdc1bf41feb5ae76e50770ce0179f4573db"
+        },
+        "high_school_european_history/data-00000-of-00001.arrow": {
+          "size": 168016,
+          "sha256": "bbcd2d1c51a96698f0581b8db6795ed6be4216ca7429822b2ca634d1f15590cf"
+        },
+        "high_school_geography/data-00000-of-00001.arrow": {
+          "size": 30720,
+          "sha256": "4fad69de3874d0a36ac2aa5ade2d6700e507d67e9ea11deacac7f424d482d8f3"
+        },
+        "high_school_government_and_politics/data-00000-of-00001.arrow": {
+          "size": 46720,
+          "sha256": "d6309c6050c3d5da9320320887504c1b1bd7d34681e3ea38c27e0dab27226658"
+        },
+        "high_school_macroeconomics/data-00000-of-00001.arrow": {
+          "size": 45056,
+          "sha256": "4049f204336f1314b84219100f45d857a995a6d33e6e84e0a4a341053fe83e94"
+        },
+        "high_school_mathematics/data-00000-of-00001.arrow": {
+          "size": 23880,
+          "sha256": "2b738b8cfeab0ded298c13a8dd5de316304148ddbf345134210a5b10cd748143"
+        },
+        "high_school_microeconomics/data-00000-of-00001.arrow": {
+          "size": 41488,
+          "sha256": "a55042dbeb07e799515a0e1da593220d2050fa32ca1e6aceb2fca86cc1775871"
+        },
+        "high_school_physics/data-00000-of-00001.arrow": {
+          "size": 50688,
+          "sha256": "645ee034f57fbd95d4200f5ea11303dd0e5a0f059ea6bda6e5b5dd439ae9eec0"
+        },
+        "high_school_psychology/data-00000-of-00001.arrow": {
+          "size": 38040,
+          "sha256": "c153b49f62249eed94acd0edec9bd99b60ff3276191424721086c030e65af63b"
+        },
+        "high_school_statistics/data-00000-of-00001.arrow": {
+          "size": 57440,
+          "sha256": "56b17e083f6a2a1603425108e84bace31a17003aa1a499d3feabbc14f5090ef5"
+        },
+        "high_school_us_history/data-00000-of-00001.arrow": {
+          "size": 155744,
+          "sha256": "97dd3acc62d9e8e6b6a75f8c5e4021a34e27b5e9737228c9384f21bb84c5772d"
+        },
+        "high_school_world_history/data-00000-of-00001.arrow": {
+          "size": 162792,
+          "sha256": "e1cb493310b14c680342f67f0b7673543555fb16f4287a6fcd36f2cf39b08f79"
+        },
+        "human_aging/data-00000-of-00001.arrow": {
+          "size": 37816,
+          "sha256": "d307bbeb48f2f3aadab26a205f92333a079f455d2fceb0fd69cb9f43118b6fcd"
+        },
+        "human_sexuality/data-00000-of-00001.arrow": {
+          "size": 32888,
+          "sha256": "6aa24317b00dc19b2fbd60ad283f4bc1f9377bfab7de74b93cbc6cfdc191af56"
+        },
+        "international_law/data-00000-of-00001.arrow": {
+          "size": 47048,
+          "sha256": "f6efce8412ceeed65e96425c6ce2f1e38a4fc1386bdae24225b81e7edab9970d"
+        },
+        "jurisprudence/data-00000-of-00001.arrow": {
+          "size": 35240,
+          "sha256": "e76c98d24d27ce8e846a73dbdd54c217d2bcf35d172bc50b303d0a140ee01f57"
+        },
+        "logical_fallacies/data-00000-of-00001.arrow": {
+          "size": 41024,
+          "sha256": "38485e4408802f675196563d3e58f613c53b6481e0c78f54f4bc0411d839ac41"
+        },
+        "machine_learning/data-00000-of-00001.arrow": {
+          "size": 40448,
+          "sha256": "3b02f5e1b78c35f055c32b7eee84df7b51afa675546742d4118d3e2f1a9c7734"
+        },
+        "management/data-00000-of-00001.arrow": {
+          "size": 31656,
+          "sha256": "def84bb6273b45fa6edbfd40481119a0fb71f7e5120d62027e8b1e7fbab7c28c"
+        },
+        "marketing/data-00000-of-00001.arrow": {
+          "size": 35344,
+          "sha256": "9519c42a10af236db619dc7bae97dc512a0b2a69ad2eb0a47d93d5da2e7e7675"
+        },
+        "medical_genetics/data-00000-of-00001.arrow": {
+          "size": 30432,
+          "sha256": "5e986a5c15a0608b70d56d57ecfb1a1407200519930f96f4e652b03ce1919b3c"
+        },
+        "miscellaneous/data-00000-of-00001.arrow": {
+          "size": 22640,
+          "sha256": "e889cf0f0c5a7548addeeeae9b466ced84e7ef5e4ae0634bd837240ae54dfe48"
+        },
+        "moral_disputes/data-00000-of-00001.arrow": {
+          "size": 36872,
+          "sha256": "7a82a2394729c58858c0ecbf793c1503727cfe55aee57483c9a8794383c57cc7"
+        },
+        "moral_scenarios/data-00000-of-00001.arrow": {
+          "size": 46120,
+          "sha256": "2bb49ed349c1b197745062937029032a75bac696489c514e9518f509c7b1ce87"
+        },
+        "nutrition/data-00000-of-00001.arrow": {
+          "size": 40576,
+          "sha256": "bc091ad9e2e0f8a9138d8a63fee63ea1db0ab74b5ef30157975c446b90102e2a"
+        },
+        "philosophy/data-00000-of-00001.arrow": {
+          "size": 36696,
+          "sha256": "ef81ced829d9ba6ef07cdb738f2b1684f392b32793dbeff73a9e9f4aaef0019d"
+        },
+        "prehistory/data-00000-of-00001.arrow": {
+          "size": 38336,
+          "sha256": "0b19068bddbd35c09492fac5b446cdda08270e4eed2c7627d2f8832fdc6c3066"
+        },
+        "professional_accounting/data-00000-of-00001.arrow": {
+          "size": 57488,
+          "sha256": "5bcc48f8dc90f7ca1c6cfcacd2fd2d1912f882008ebd6e80bee77c467793ad69"
+        },
+        "professional_law/data-00000-of-00001.arrow": {
+          "size": 121408,
+          "sha256": "96e999ac932c6f16dfabc6a75ca010e4e834df5fc4c232a5111b39ab63cead73"
+        },
+        "professional_medicine/data-00000-of-00001.arrow": {
+          "size": 90616,
+          "sha256": "4ac9504b1c446a79970f9b738e257bcee6bd23861ed53feb04ee15441d375adc"
+        },
+        "professional_psychology/data-00000-of-00001.arrow": {
+          "size": 48664,
+          "sha256": "c2ce518a4e5a77ee8eac6888301b0d1f5cffdef7664631c3a790b979e8a872e0"
+        },
+        "public_relations/data-00000-of-00001.arrow": {
+          "size": 38176,
+          "sha256": "fd73ee7872e32e7b92ad1b17623a6b5267fc25673eacadb2655c7a48e20b4980"
+        },
+        "security_studies/data-00000-of-00001.arrow": {
+          "size": 96088,
+          "sha256": "b107d1a96a3cf0afd220a82ef1a88b50cf8efe51279b06f30e4cd05b972a9203"
+        },
+        "sociology/data-00000-of-00001.arrow": {
+          "size": 43632,
+          "sha256": "f4ba2696248ad871f13a86f937e8f4151b486ac90b667172e9c2cec51ff9fa97"
+        },
+        "us_foreign_policy/data-00000-of-00001.arrow": {
+          "size": 40192,
+          "sha256": "f116de49a5b8fa99b28f139ed9033ef633ff00549cad74894808e8e8613f2b73"
+        },
+        "virology/data-00000-of-00001.arrow": {
+          "size": 33288,
+          "sha256": "0582accdff6d056143441c1a1170876f51b09098cbca31cbd0b9ecbca5210c53"
+        },
+        "world_religions/data-00000-of-00001.arrow": {
+          "size": 28648,
+          "sha256": "17982b7da6d53701879648508ecd674dbb497f37eb43bf6d75b90af1a682deac"
+        }
+      }
+    },
+    "math_500": {
+      "category": 3,
+      "repo_id": "HuggingFaceH4/MATH-500",
+      "license": "MIT",
+      "format": "jsonl",
+      "files": [
+        "test.jsonl"
+      ],
+      "tier1": {
+        "n": 50,
+        "per_level": 10
+      },
+      "tier2": {
+        "n": 500
+      },
+      "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
+      "gated": false,
+      "pinned_files": {
+        "test.jsonl": {
+          "size": 446564,
+          "blob_id": "2376b9a194b46c0790e197c91b7249e5f88ac09b"
+        }
+      }
+    },
+    "livebench_reasoning": {
+      "category": 3,
+      "repo_id": "livebench/reasoning",
+      "license": "Apache-2.0",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "n": 200
+      },
+      "revision": "6fc6498a5dfba553f69f4413feabade1f1a2d384",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00001.parquet": {
+          "size": 88219,
+          "sha256": "4204bb94c812690ef8ba5f4c1f10b5b1082ca0b7bc532166834f798aa56e2a3c"
+        }
+      }
+    },
+    "liquidai_extraction": {
+      "category": 4,
+      "repo_id": "LiquidAI/structured-extraction",
+      "license": "Apache-2.0",
+      "format": "parquet",
+      "files": [
+        "test_unseen.parquet",
+        "test.parquet"
+      ],
+      "tier1": {
+        "test_unseen": 150,
+        "test": 0
+      },
+      "tier2": {
+        "test_unseen": 300,
+        "test": 300
+      },
+      "revision": "8e75ddc465f0785ff1030eb2e0aecfce695e3130",
+      "gated": false,
+      "pinned_files": {
+        "test_unseen.parquet": {
+          "size": 359120,
+          "sha256": "ab47c57935e6b1d742b925b544d7564282fb43996276e7053109fc54ca44c5cb"
+        },
+        "test.parquet": {
+          "size": 605150,
+          "sha256": "f1b352868c0caf86ed8a0e32946bc691389655338999c8782c2b3196acafb80c"
+        }
+      }
+    },
+    "bfcl_v3": {
+      "category": 4,
+      "repo_id": "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+      "license": "Apache-2.0",
+      "format": "jsonl",
+      "splits": {
+        "simple": {
+          "questions": "BFCL_v3_simple.json",
+          "answers": "possible_answer/BFCL_v3_simple.json"
+        },
+        "multiple": {
+          "questions": "BFCL_v3_multiple.json",
+          "answers": "possible_answer/BFCL_v3_multiple.json"
+        },
+        "parallel_multiple": {
+          "questions": "BFCL_v3_parallel_multiple.json",
+          "answers": "possible_answer/BFCL_v3_parallel_multiple.json"
+        },
+        "live_multiple": {
+          "questions": "BFCL_v3_live_multiple.json",
+          "answers": "possible_answer/BFCL_v3_live_multiple.json"
+        },
+        "irrelevance": {
+          "questions": "BFCL_v3_irrelevance.json",
+          "answers": null
+        }
+      },
+      "tier1": {
+        "per_split": 30,
+        "n": 150
+      },
+      "tier2": {
+        "per_split": 100,
+        "n": 500
+      },
+      "revision": "61fc0608cfd831fcfbbaa676ebdfef0ed963eeda",
+      "gated": false,
+      "pinned_files": {
+        "BFCL_v3_simple.json": {
+          "size": 280474,
+          "blob_id": "927611976758b084570299cbda641199b9368765"
+        },
+        "possible_answer/BFCL_v3_simple.json": {
+          "size": 60809,
+          "blob_id": "4985e93c8035ed012e1f38123761bc719aed146e"
+        },
+        "BFCL_v3_multiple.json": {
+          "size": 316583,
+          "blob_id": "83643fa853e7a29a50e7303b0279284c37dd63c8"
+        },
+        "possible_answer/BFCL_v3_multiple.json": {
+          "size": 32254,
+          "blob_id": "1f2f1fbfd9b7c8859ef5a92d6c18b0a6b2bc2663"
+        },
+        "BFCL_v3_parallel_multiple.json": {
+          "size": 347080,
+          "blob_id": "832039d6758e2569d65342b3fc9524924a03832a"
+        },
+        "possible_answer/BFCL_v3_parallel_multiple.json": {
+          "size": 74601,
+          "blob_id": "9f91131098d7b93492043ea55e7754a55bb57d69"
+        },
+        "BFCL_v3_live_multiple.json": {
+          "size": 3891342,
+          "blob_id": "fd956897939d662b40562a5f045beb694195e44c"
+        },
+        "possible_answer/BFCL_v3_live_multiple.json": {
+          "size": 199668,
+          "blob_id": "b2f4c71547d3a534e2e40231db14943bfa81cc74"
+        },
+        "BFCL_v3_irrelevance.json": {
+          "size": 160114,
+          "blob_id": "9daeeff29ddb6ba7edb6383d42ca322a3ad0d7fe"
+        }
+      }
+    },
+    "jsonschemabench": {
+      "category": 4,
+      "repo_id": "epfl-dlab/JSONSchemaBench",
+      "license": "MIT",
+      "format": "parquet",
+      "files": [
+        "Github_hard/test-00000-of-00001.parquet",
+        "Kubernetes/test-00000-of-00001.parquet"
+      ],
+      "tier1": {
+        "per_subset": 20,
+        "n": 40
+      },
+      "tier2": {
+        "per_subset": 100,
+        "n": 200
+      },
+      "revision": "5bd0f4640badc6f3f02df796421d21cb0ca0b141",
+      "gated": false,
+      "pinned_files": {
+        "Github_hard/test-00000-of-00001.parquet": {
+          "size": 964404,
+          "sha256": "fe8ff2dba5e004368e9f0beaa129d55f1e9c54c61591286d8b52cf5caab6da5c"
+        },
+        "Kubernetes/test-00000-of-00001.parquet": {
+          "size": 2181186,
+          "sha256": "963fe0a0496a1eb59798b92e87957ddc73efbcfddbe5e558ac44b762dfd2825c"
+        }
+      }
+    },
+    "extractbench": {
+      "category": 4,
+      "repo_id": "llamaindex/ExtractBench",
+      "license": "Apache-2.0",
+      "format": "jsonl_pdf",
+      "files": [
+        "short.jsonl"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "n": 80,
+        "split": "short",
+        "level": "L1"
+      },
+      "revision": "f9b910906cd7e73cc9eb5379a8d5d935c67b92c4",
+      "gated": false,
+      "pinned_files": {
+        "short.jsonl": {
+          "size": 30717761,
+          "sha256": "3373bfdd44077f852b8f60e1d5b878a582c0c9517b22bcc5f4ec0d28f2ada36c"
+        }
+      }
+    }
+  }
+}
