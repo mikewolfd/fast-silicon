@@ -423,9 +423,61 @@ def _run_cat1_worker(
         ctx_max_len = 4096 if tier == "tier1" else 16384
 
         def _enc_ctx(doc_groups: list[list[str]]) -> list[np.ndarray]:
-            return eng.encode_contextual_chunks(
-                doc_groups, max_length=ctx_max_len, mode=eff_mode, output_dtype="float32", normalize=True
+            # Partition oversized multi-thousand-token contracts into <= ctx_max_len windows
+            # (anchoring chunk[0] header/party context on continuation windows) so no chunk
+            # beyond ctx_max_len receives an empty truncated span (zero-norm vector).
+            chunk_tok_lens: list[list[int]] = []
+            flat_windows: list[list[str]] = []
+            window_meta: list[tuple[int, bool, int]] = []  # (doc_idx, has_anchor_prefix, n_real)
+            safe_budget = max(512, ctx_max_len - 64)
+            for d_idx, chunks in enumerate(doc_groups):
+                if not chunks:
+                    chunk_tok_lens.append([])
+                    continue
+                lens = [len(eng.tokenizer.encode(c)) + 2 for c in chunks]
+                chunk_tok_lens.append(lens)
+                if sum(lens) <= safe_budget or len(chunks) == 1:
+                    flat_windows.append(list(chunks))
+                    window_meta.append((d_idx, False, len(chunks)))
+                else:
+                    anchor_txt = chunks[0][:2048]
+                    anchor_len = len(eng.tokenizer.encode(anchor_txt)) + 2
+                    cur: list[str] = [chunks[0]]
+                    cur_tok = lens[0]
+                    has_anchor = False
+                    for c_txt, c_len in zip(chunks[1:], lens[1:]):
+                        if cur and (cur_tok + c_len > safe_budget):
+                            flat_windows.append(cur)
+                            window_meta.append((d_idx, has_anchor, len(cur) - (1 if has_anchor else 0)))
+                            cur = [anchor_txt, c_txt]
+                            cur_tok = anchor_len + c_len
+                            has_anchor = True
+                        else:
+                            cur.append(c_txt)
+                            cur_tok += c_len
+                    if cur:
+                        flat_windows.append(cur)
+                        window_meta.append((d_idx, has_anchor, len(cur) - (1 if has_anchor else 0)))
+
+            win_mats = (
+                eng.encode_contextual_chunks(
+                    flat_windows, max_length=ctx_max_len, mode=eff_mode, output_dtype="float32", normalize=True
+                )
+                if flat_windows
+                else []
             )
+            per_doc_parts: list[list[np.ndarray]] = [[] for _ in doc_groups]
+            for (d_idx, has_anchor, _n_real), mat in zip(window_meta, win_mats):
+                per_doc_parts[d_idx].append(mat[1:] if has_anchor else mat)
+            out_mats: list[np.ndarray] = []
+            for d_idx, parts in enumerate(per_doc_parts):
+                if not parts:
+                    out_mats.append(np.zeros((0, 1024), dtype=np.float32))
+                elif len(parts) == 1:
+                    out_mats.append(parts[0])
+                else:
+                    out_mats.append(np.vstack(parts))
+            return out_mats
     else:
         raise ValueError(f"Unsupported Cat 1 package: {pkg_name}")
 
