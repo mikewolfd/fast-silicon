@@ -282,6 +282,21 @@ def test_clean_pass_on_fast_repos() -> None:
             f.format() for f in rep.errors
         )
 
+    script_targets = (
+        ("fast-bge-small/scripts", WORK_ROOT / "fast-bge-small" / "scripts"),
+        ("fast-embeddinggemma-2/scripts", WORK_ROOT / "fast-embeddinggemma-2" / "scripts"),
+        ("fast-gemma4/scripts", WORK_ROOT / "fast-gemma4" / "scripts"),
+        ("fast-pplx/scripts", WORK_ROOT / "fast-pplx" / "scripts"),
+        ("fast-decision-models/scripts", WORK_ROOT / "fast-decision-models" / "scripts"),
+    )
+    for label, scripts_dir in script_targets:
+        if not scripts_dir.exists():
+            continue
+        rep_scripts = check_mlx_paths([scripts_dir], flag_bool_sdpa_as_error=True, check_coreml_ast=True)
+        assert rep_scripts.findings == [], f"Unexpected guard findings in {label}:\n" + "\n".join(
+            f.format() for f in rep_scripts.findings
+        )
+
 
 def test_detects_new_metal4_quantize_transpose_and_loop_sync_rules() -> None:
     src = """
@@ -456,3 +471,228 @@ def test_coreml_mil_guard_detects_fp32_casts_and_passes_clean_fp16() -> None:
     assert "COREML_FP32_COMPUTE_OP" not in allowed_rules
     # Bad fp32 SDPA mask is still caught!
     assert "COREML_SDPA_MASK_NOT_FP16" in allowed_rules
+
+
+def test_coreml_mil_guard_detects_fp16_subnormal_mask_and_divisibility() -> None:
+    ct = pytest.importorskip("coremltools")
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+
+    @mb.program(
+        input_specs=[mb.TensorSpec(shape=(1, 16, 1, 8), dtype=types.fp16)],
+        opset_version=ct.target.macOS15,
+    )
+    def bad_fp16_numerics_prog(x):
+        w_odd = np.ones((20, 16, 1, 1), dtype=np.float16)
+        c0 = mb.conv(x=x, weight=w_odd, name="conv_odd")
+        msq = mb.reduce_mean(x=mb.mul(x=c0, y=c0, name="sq"), axes=[1], keep_dims=True, name="msq")
+        rn = mb.mul(
+            x=c0,
+            y=mb.rsqrt(x=mb.add(x=msq, y=np.float16(1e-6), name="sub_ae"), name="sub_rsq"),  # guard: allow-coreml-eps
+            name="rn",
+        )
+        cl = mb.clip(x=rn, alpha=np.float16(2e-5), beta=np.float16(65504.0), name="sub_clip")  # guard: allow-coreml-eps
+        with np.errstate(over="ignore"):
+            inf_arr = np.full((1, 20, 1, 8), -1e9, dtype=np.float16)  # guard: allow-coreml-mask
+        bad_bias = mb.const(val=inf_arr, name="inf_bias")  # guard: allow-coreml-mask
+        return mb.add(x=cl, y=bad_bias, name="out")  # guard: allow-coreml-mask
+
+    rep_num = check_coreml_mil_program(
+        bad_fp16_numerics_prog,
+        model_name="bad_fp16_numerics_prog",
+        check_block_size=32,
+        block_axis=0,
+    )
+    num_rules = [f.rule_id for f in rep_num.errors]
+    assert num_rules.count("COREML_ANE_SUBNORMAL_EPS") == 2
+    assert num_rules.count("COREML_FP16_MASK_OVERFLOW") == 1
+    assert num_rules.count("COREML_QUANT_BLOCK_NOT_DIVISIBLE") == 1
+
+
+def test_check_divisibility_pattern7_and_ast_quant_block_guard() -> None:
+    # 1. Pure-Python `check_divisibility` helper (dict, list, and `.named_modules()`)
+    shapes = {
+        "layers.0.q_proj": (1536, 1536),
+        "layers.0.ple_gate": (256, 1536),
+        "layers.0.odd_head": (50, 1536),
+        "norm.weight": (1536,),  # 1D norm skipped by default min_ndim=2
+    }
+    incompat = ir_dtype_guard.check_divisibility(shapes, axis=0, block_size=32)
+    assert incompat == {"layers.0.odd_head": (50, 32)}
+    assert ir_dtype_guard.check_divisibility(shapes, axis=-1, block_size=64) == {}
+
+    class _FakeMod:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.weight = np.zeros(shape, dtype=np.float16)
+
+    class _FakeModel:
+        def named_modules(self):
+            return [("ok", _FakeMod((64, 128))), ("bad", _FakeMod((64, 100)))]
+
+    assert ir_dtype_guard.check_divisibility(_FakeModel(), axis=1, block_size=32) == {"bad": (100, 32)}
+    with pytest.raises(ValueError, match="block_size must be positive"):
+        ir_dtype_guard.check_divisibility(shapes, axis=0, block_size=0)
+
+    # 2. Static AST `COREML_QUANT_BLOCK_NOT_DIVISIBLE` check (true positive + clean exemption)
+    bad_quant_src = """
+import mlx.core as mx
+import coremltools.optimize.coreml as cto
+
+def quant_bad():
+    w_odd = mx.ones((64, 50), dtype=mx.bfloat16)
+    wq, sc, bi = mx.quantize(w_odd, group_size=64, bits=4)
+    w_ok = mx.ones((64, 128), dtype=mx.bfloat16)
+    wq2, sc2, bi2 = mx.quantize(w_ok, group_size=64, bits=4)
+    cfg_bad = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int4", granularity="per_block", block_size=0)
+    return wq, wq2, cfg_bad
+"""
+    rep = check_mlx_source(bad_quant_src, filename="quantize_weights.py", check_coreml_ast=True)
+    div_errs = [f for f in rep.errors if f.rule_id == "COREML_QUANT_BLOCK_NOT_DIVISIBLE"]
+    assert len(div_errs) == 2
+    assert [f.line for f in div_errs] == [7, 10]
+
+
+def test_coreml_ast_subnormal_eps_mask_overflow_and_float_literals() -> None:
+    bad_src = """
+import coremltools as ct
+from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.mil import types
+import numpy as np
+
+def make_bad_ane_mask(vis):
+    m1 = np.where(vis, 0.0, -1e9).astype(np.float16)
+    m2 = np.ascontiguousarray(np.where(vis, 0.0, float("-inf")), dtype=np.float16)
+    m3 = np.full((1, 1, 8, 8), -np.inf, dtype=np.float16)
+    return m1, m2, m3
+
+def build_ane_bad(w_np):
+    H = 512
+
+    def _bad_rms_default(x, eps: float = 1e-6):
+        msq = mb.reduce_mean(x=mb.mul(x=x, y=x), axes=[1], keep_dims=True)
+        ae = mb.add(x=msq, y=np.float16(eps))
+        return mb.rsqrt(x=ae)
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 16, 1, 8), dtype=types.fp16)])
+    def prog(x):
+        r1 = mb.rsqrt(x=mb.add(x=x, y=np.float16(6.1e-5)))
+        c1 = mb.clip(x=r1, alpha=np.float16(1e-6), beta=np.float16(65504.0))
+        m1 = mb.maximum(x=c1, y=np.float16(2e-5))
+        ln1 = mb.layer_norm(x=m1, axes=[1], epsilon=np.float16(1e-12))
+        s1 = mb.select(cond=x, a=np.float16(0.0), b=np.float16(-65505.0))
+        f1 = mb.add(x=ln1, y=1.0)
+        scale = 0.5
+        f2 = mb.mul(x=f1, y=scale)
+        f3 = mb.mul(x=f2, y=H ** -0.5)
+        f4 = mb.const(val=0.25)
+        f5 = mb.fill(shape=[1, 16, 1, 8], value=0.0)
+        return mb.add(x=mb.add(x=s1, y=f3), y=mb.add(x=f4, y=f5))
+
+    return prog
+
+def torch_ane_bad(v, scores, mask):
+    v = v.clamp(min=1e-6)
+    return scores.masked_fill(mask, float("-inf"))
+"""
+    rep = check_mlx_source(bad_src, filename="build_ane_models.py", check_coreml_ast=True)
+    counts: dict[str, int] = {}
+    for f in rep.errors:
+        counts[f.rule_id] = counts.get(f.rule_id, 0) + 1
+    assert counts.get("COREML_ANE_SUBNORMAL_EPS", 0) == 6
+    assert counts.get("COREML_FP16_MASK_OVERFLOW", 0) == 5
+    assert counts.get("COREML_PY_UNCAST_FLOAT_LITERAL", 0) == 5
+
+
+def test_coreml_ast_clean_exemptions_for_fp32_helpers_timers_and_valid_ane_ops() -> None:
+    clean_src = """
+import coremltools as ct
+from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.mil import types
+import numpy as np
+
+FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)
+FP16_LDEXP_NORMAL = float(np.ldexp(1.0, -14))
+RMS_EPS = 1e-6
+
+def clamp_fp16_eps(eps: float) -> float:
+    return float(max(float(eps), FP16_MIN_NORMAL))
+
+def bench_timer(toks: int, dt: float, vec: np.ndarray) -> float:
+    norm = np.maximum(np.linalg.norm(vec), 1e-12)
+    return (toks / max(dt, 1e-9)) + float(norm)
+
+def build_cpu_mix_w8(w4d):
+    def _rmsnorm_mm32(x, w_arr, eps=1e-6, name="rn"):
+        sq = mb.mul(x=x, y=x, name=f"{name}_sq")
+        ms = mb.reduce_mean(x=sq, axes=[-1], keep_dims=True, name=f"{name}_ms")
+        rs = mb.rsqrt(x=mb.add(x=ms, y=np.float32(eps), name=f"{name}_ae"), name=f"{name}_rs")
+        return mb.mul(x=x, y=rs, name=f"{name}_n")
+
+    def _lin32(x, w_mat, name="lin"):
+        w2d = np.ascontiguousarray(w_mat[:, :, 0, 0].T.astype(np.float32))
+        return mb.matmul(x=x, y=mb.const(val=w2d, name=f"{name}_w"), name=name)
+
+    return _rmsnorm_mm32, _lin32
+
+def make_clean_masks(vis):
+    ane_mask = np.ascontiguousarray(np.where(vis, 0.0, -40000.0), dtype=np.float16)
+    ane_mask2 = np.where(vis, 0.0, -65504.0).astype(np.float16)
+    fp32_ref = np.full((1, 1, 8, 8), -1e9, dtype=np.float32)
+    best_err = np.full((8, 1), np.inf, dtype=np.float32)
+    return ane_mask, ane_mask2, fp32_ref, best_err
+
+def build_ane_clean(H: int = 512, chunk_size: int = 32):
+    def _f16(val: float):
+        return mb.const(val=np.float16(val))
+
+    def _const_f16(arr: np.ndarray, name: str):
+        return mb.const(val=np.ascontiguousarray(arr, dtype=np.float16), name=name)
+
+    def _cumsum_tril(g_4d, prefix: str):
+        triu_ones = np.triu(np.ones((chunk_size, chunk_size), dtype=np.float16), k=0)[None, None, :, :]
+        return mb.matmul(x=g_4d, y=_const_f16(triu_ones, name=f"{prefix}_triu"), name=f"{prefix}_mm")
+
+    def _rmsnorm_ok(x, eps: float = RMS_EPS):
+        eps_val = clamp_fp16_eps(eps)
+        msq = mb.reduce_mean(x=mb.mul(x=x, y=x), axes=[1], keep_dims=True)
+        return mb.mul(x=x, y=mb.rsqrt(x=mb.add(x=msq, y=_f16(eps_val))))
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 16, 1, 8), dtype=types.fp16)])
+    def prog(x):
+        n1 = _rmsnorm_ok(x)
+        r_floor = mb.rsqrt(x=mb.add(x=n1, y=np.float16(FP16_MIN_NORMAL)))
+        r_ldexp = mb.rsqrt(x=mb.add(x=r_floor, y=np.float16(FP16_LDEXP_NORMAL)))
+        relu = mb.maximum(x=r_ldexp, y=np.float16(0.0))
+        relu6 = mb.clip(x=relu, alpha=np.float16(0.0), beta=np.float16(6.0))
+        safe_max = mb.maximum(x=relu6, y=np.float16(1e-4))
+        scaled = mb.mul(x=safe_max, y=np.float16(H ** -0.5))
+        q = mb.reshape(x=scaled, shape=[1, 2, 8, 8])
+        k = mb.transpose(x=q, perm=[0, 1, 3, 2])
+        qk = mb.matmul(x=q, y=k)
+        cs = _cumsum_tril(qk, "cs")
+        return mb.layer_norm(x=cs, axes=[1], epsilon=np.float16(FP16_MIN_NORMAL))
+
+    return prog
+"""
+    rep = check_mlx_source(clean_src, filename="build_ane_models.py", check_coreml_ast=True)
+    assert rep.findings == [], [f.format() for f in rep.findings]
+
+
+def test_coreml_matmul_ane_refined_true_positives_and_exemptions() -> None:
+    src = """
+import numpy as np
+
+def build_causal_transformer_ane(mb, x, w_proj):
+    # Static-weight matmuls & mb.linear MUST still warn even if function name contains 'causal'
+    y1 = mb.matmul(x=x, y=mb.const(val=w_proj, name="w_proj"))
+    y2 = mb.linear(x=y1, weight=mb.const(val=w_proj, name="w_lin"))
+    # Dynamic activation x activation matmul (Q@K^T) MUST be cleanly exempt
+    q = mb.reshape(x=y2, shape=[1, 4, 8, 16])
+    k = mb.transpose(x=q, perm=[0, 1, 3, 2])
+    scores = mb.matmul(x=q, y=k)
+    return scores
+"""
+    rep = check_mlx_source(src, filename="builder.py", check_coreml_ast=True)
+    assert rep.errors == []
+    assert [f.rule_id for f in rep.warnings] == ["COREML_PY_MATMUL_ANE", "COREML_PY_MATMUL_ANE"]
+    assert [f.line for f in rep.warnings] == [6, 7]

@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import ctypes
+from dataclasses import dataclass
 import gc
 import os
+from pathlib import Path
 import platform
 import resource
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Iterator, Sequence
 
@@ -20,9 +23,51 @@ from .hw_check import probe_host_hardware, supports_apple10_nax, supports_metal4
 
 _RUSAGE_INFO_V4 = 4
 _RUSAGE_INFO_V4_SIZE = 296
+_RUSAGE_INFO_V6 = 6
+_RUSAGE_INFO_V6_SIZE = 464
+_RESIDENT_SIZE_OFFSET = 64
 _PHYS_FOOTPRINT_OFFSET = 72
 _LIFETIME_MAX_FOOTPRINT_OFFSET = 240
+_NEURAL_FOOTPRINT_V6_OFFSET = 368
+_LIFETIME_MAX_NEURAL_FOOTPRINT_V6_OFFSET = 376
+
+# Public macOS Mach / POSIX VM constants (verified against arm64 Darwin SDK headers; zero private SPIs).
+_TASK_VM_INFO = 22
+_TASK_VM_INFO_COUNT = 93
+_TVMI_INTERNAL_OFFSET = 48
+_TVMI_EXTERNAL_OFFSET = 64
+_TVMI_COMPRESSED_OFFSET = 120
+_TVMI_PHYS_FOOTPRINT_OFFSET = 144
+_TVMI_NEURAL_FOOTPRINT_OFFSET = 304
+_TVMI_NEURAL_NOFOOTPRINT_OFFSET = 320
+_TVMI_NEURAL_NOFOOTPRINT_TOTAL_OFFSET = 356
+
+_VM_REGION_SUBMAP_INFO_COUNT_64 = 21
+_VRS_PAGES_RESIDENT_OFFSET = 24
+_VRS_EXTERNAL_PAGER_OFFSET = 46
+_VRS_SHARE_MODE_OFFSET = 47
+_VRS_IS_SUBMAP_OFFSET = 48
+_VRS_OBJECT_ID_FULL_OFFSET = 68
+_SM_SHARED = 4
+_SM_TRUESHARED = 5
+_SM_SHARED_ALIASED = 7
+_SHARED_REGION_BASE_ARM64 = 0x180000000
+_SHARED_REGION_SIZE_ARM64 = 0xE40000000
+_SHARED_REGION_BASE_X86_64 = 0x7FF800000000
+_SHARED_REGION_SIZE_X86_64 = 0x80000000
+_MS_SYNC = 0x0010
+_MS_INVALIDATE = 0x0002
+_PROC_PIDPATHINFO_MAXSIZE = 4096
+
+ANE_DAEMON_PROCESS_NAMES: frozenset[str] = frozenset(
+    {"aned", "ANECompilerService", "ANELargeModelCompilerService"}
+)
+DEFAULT_METAL_TRIP_FRACTION: float = 0.98
+DEFAULT_PAST_ARM_MARGIN: float = 0.02
+
 _LIBPROC_CACHE: Any = None
+_LIBSYSTEM_CACHE: Any = None
+_MACH_TASK_SELF_CACHE: int | None = None
 
 
 def _load_libproc() -> Any:
@@ -31,16 +76,54 @@ def _load_libproc() -> Any:
         lib = ctypes.CDLL("/usr/lib/libproc.dylib")
         lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         lib.proc_pid_rusage.restype = ctypes.c_int
+        lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.proc_listallpids.restype = ctypes.c_int
+        lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        lib.proc_pidpath.restype = ctypes.c_int
+        lib.proc_regionfilename.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint32]
+        lib.proc_regionfilename.restype = ctypes.c_int
         _LIBPROC_CACHE = lib
     return _LIBPROC_CACHE
 
 
-def get_unified_memory_footprint(pid: int | None = None) -> dict[str, float | int]:
-    """Read current & lifetime-peak OS physical footprint (Metal + ANE + CPU) on macOS.
+def _load_libsystem() -> tuple[Any, int]:
+    global _LIBSYSTEM_CACHE, _MACH_TASK_SELF_CACHE
+    if _LIBSYSTEM_CACHE is None:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        lib.task_info.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.task_info.restype = ctypes.c_int
+        lib.mach_vm_region_recurse.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.mach_vm_region_recurse.restype = ctypes.c_int
+        lib.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        lib.msync.restype = ctypes.c_int
+        _MACH_TASK_SELF_CACHE = int(ctypes.c_uint32.in_dll(lib, "mach_task_self_").value)
+        _LIBSYSTEM_CACHE = lib
+    assert _MACH_TASK_SELF_CACHE is not None
+    return _LIBSYSTEM_CACHE, _MACH_TASK_SELF_CACHE
 
-    Uses ``proc_pid_rusage(..., RUSAGE_INFO_V4)`` from ``/usr/lib/libproc.dylib``
-    so Metal IOSurface/buffer allocations and mmap pages are reflected alongside CPU RSS.
-    Falls back cleanly to ``ru_maxrss`` on non-Darwin platforms.
+
+def get_unified_memory_footprint(pid: int | None = None) -> dict[str, float | int]:
+    """Read current & lifetime-peak OS physical footprint (dirty/anonymous CPU + Metal/IOSurface) on macOS.
+
+    Uses ``proc_pid_rusage(..., RUSAGE_INFO_V4)`` from ``/usr/lib/libproc.dylib``.
+    Note: ``ri_phys_footprint`` reflects dirty/anonymous CPU, Metal, and IOSurface allocations
+    but **excludes** clean file-backed ``mmap`` pages (e.g. ``MappedEmbedding`` weights),
+    ``task_vm_info.ledger_tag_neural_nofootprint``, and out-of-process ANE daemons
+    (``aned`` / ``ANECompilerService`` / ``ANELargeModelCompilerService``). Use
+    ``probe_four_bucket_memory()`` or ``FourBucketMemoryProbe`` when full 4-bucket accounting
+    is needed. Falls back cleanly to ``ru_maxrss`` on non-Darwin platforms.
     """
     ru_self = resource.getrusage(resource.RUSAGE_SELF)
     is_darwin = platform.system() == "Darwin"
@@ -76,6 +159,640 @@ def get_unified_memory_footprint(pid: int | None = None) -> dict[str, float | in
 def peak_footprint_gb(pid: int | None = None) -> float:
     """Return process lifetime-max unified-memory physical footprint in decimal GB."""
     return float(get_unified_memory_footprint(pid=pid)["peak_footprint_gb"])
+
+
+def _normalize_model_prefixes(model_directories: Sequence[str | Path] | None) -> tuple[str, ...]:
+    if not model_directories:
+        return ()
+    out: list[str] = []
+    for raw in model_directories:
+        rp = os.path.realpath(os.fspath(raw))
+        if os.path.isfile(rp):
+            out.append(rp)
+        else:
+            out.append(rp.rstrip("/") + "/")
+    return tuple(dict.fromkeys(out))
+
+
+def _path_matches_prefixes(path: str, prefixes: Sequence[str]) -> bool:
+    return any(path == p or (p.endswith("/") and path.startswith(p)) for p in prefixes)
+
+
+def probe_task_vm_info() -> dict[str, int | bool]:
+    """Read current task VM ledger stats via public Mach ``task_info(..., TASK_VM_INFO)``.
+
+    Exposes ``phys_footprint_bytes``, clean file-backed ``external_bytes``, and
+    ``ledger_tag_neural_nofootprint_bytes`` without using any private SPIs.
+    """
+    if platform.system() != "Darwin":
+        return {
+            "available": False,
+            "phys_footprint_bytes": 0,
+            "internal_bytes": 0,
+            "external_bytes": 0,
+            "compressed_bytes": 0,
+            "ledger_tag_neural_footprint_bytes": 0,
+            "ledger_tag_neural_nofootprint_bytes": 0,
+            "ledger_tag_neural_nofootprint_total_bytes": 0,
+        }
+
+    lib, task_self = _load_libsystem()
+    buf = ctypes.create_string_buffer(512)
+    cnt = ctypes.c_uint32(_TASK_VM_INFO_COUNT)
+    kr = int(lib.task_info(task_self, _TASK_VM_INFO, ctypes.byref(buf), ctypes.byref(cnt)))
+    if kr != 0:
+        raise OSError(f"task_info(TASK_VM_INFO) failed (kr={kr})")
+
+    filled_bytes = int(cnt.value) * 4
+
+    def _u64(off: int) -> int:
+        if filled_bytes < off + 8:
+            return 0
+        return int.from_bytes(buf.raw[off : off + 8], "little", signed=False)
+
+    def _i64(off: int) -> int:
+        if filled_bytes < off + 8:
+            return 0
+        return int.from_bytes(buf.raw[off : off + 8], "little", signed=True)
+
+    return {
+        "available": True,
+        "phys_footprint_bytes": _u64(_TVMI_PHYS_FOOTPRINT_OFFSET),
+        "internal_bytes": _u64(_TVMI_INTERNAL_OFFSET),
+        "external_bytes": _u64(_TVMI_EXTERNAL_OFFSET),
+        "compressed_bytes": _u64(_TVMI_COMPRESSED_OFFSET),
+        "ledger_tag_neural_footprint_bytes": _i64(_TVMI_NEURAL_FOOTPRINT_OFFSET),
+        "ledger_tag_neural_nofootprint_bytes": _i64(_TVMI_NEURAL_NOFOOTPRINT_OFFSET),
+        "ledger_tag_neural_nofootprint_total_bytes": _i64(_TVMI_NEURAL_NOFOOTPRINT_TOTAL_OFFSET),
+    }
+
+
+def _iter_darwin_vm_regions() -> Iterator[tuple[int, int, int, int, int, int]]:
+    """Yield `(address, size, pages_resident, external_pager, share_mode, object_id_full)` for non-submap VM regions."""
+    lib, task_self = _load_libsystem()
+    is_arm64 = platform.machine().lower() in ("arm64", "aarch64")
+    shared_base = _SHARED_REGION_BASE_ARM64 if is_arm64 else _SHARED_REGION_BASE_X86_64
+    shared_end = shared_base + (_SHARED_REGION_SIZE_ARM64 if is_arm64 else _SHARED_REGION_SIZE_X86_64)
+
+    addr = ctypes.c_uint64(0)
+    size = ctypes.c_uint64(0)
+    depth = ctypes.c_uint32(0)
+    rbuf = ctypes.create_string_buffer(128)
+    while True:
+        rcnt = ctypes.c_uint32(_VM_REGION_SUBMAP_INFO_COUNT_64)
+        kr = int(
+            lib.mach_vm_region_recurse(
+                task_self,
+                ctypes.byref(addr),
+                ctypes.byref(size),
+                ctypes.byref(depth),
+                ctypes.byref(rbuf),
+                ctypes.byref(rcnt),
+            )
+        )
+        if kr != 0:
+            break
+        cur_addr = int(addr.value)
+        cur_size = int(size.value)
+        if cur_size <= 0 or (cur_addr + cur_size) <= cur_addr:
+            break
+        addr.value = cur_addr + cur_size
+
+        is_submap = int.from_bytes(rbuf.raw[_VRS_IS_SUBMAP_OFFSET : _VRS_IS_SUBMAP_OFFSET + 4], "little")
+        if is_submap != 0 or (shared_base <= cur_addr < shared_end):
+            continue
+
+        pages_resident = int.from_bytes(
+            rbuf.raw[_VRS_PAGES_RESIDENT_OFFSET : _VRS_PAGES_RESIDENT_OFFSET + 4], "little"
+        )
+        external_pager = int(rbuf.raw[_VRS_EXTERNAL_PAGER_OFFSET])
+        share_mode = int(rbuf.raw[_VRS_SHARE_MODE_OFFSET])
+        object_id_full = int.from_bytes(
+            rbuf.raw[_VRS_OBJECT_ID_FULL_OFFSET : _VRS_OBJECT_ID_FULL_OFFSET + 8], "little"
+        )
+        yield (cur_addr, cur_size, pages_resident, external_pager, share_mode, object_id_full)
+
+
+def probe_mapped_files(model_directories: Sequence[str | Path] | None = None) -> dict[str, Any]:
+    """Walk this process's VM regions to measure resident clean file-backed ``mmap`` pages.
+
+    Skips submaps and the dyld shared cache region, deduplicates shared mappings by
+    ``object_id_full``, and optionally partitions resident bytes into ``model_bytes``
+    (under ``model_directories``) vs ``shared_bytes`` (framework/code).
+    """
+    prefixes = _normalize_model_prefixes(model_directories)
+    if platform.system() != "Darwin":
+        return {
+            "available": False,
+            "total_bytes": 0,
+            "model_bytes": 0,
+            "shared_bytes": 0,
+            "resident_by_path": {},
+            "model_directories": list(prefixes),
+        }
+
+    libproc = _load_libproc()
+    pid = os.getpid()
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    path_buf = ctypes.create_string_buffer(_PROC_PIDPATHINFO_MAXSIZE)
+    seen_shared_objects: set[int] = set()
+    resident_by_path: dict[str, int] = {}
+
+    for cur_addr, _cur_size, pages_resident, external_pager, share_mode, object_id_full in _iter_darwin_vm_regions():
+        if share_mode in (_SM_SHARED, _SM_TRUESHARED, _SM_SHARED_ALIASED):
+            if object_id_full in seen_shared_objects:
+                continue
+            seen_shared_objects.add(object_id_full)
+        if external_pager == 0 or pages_resident <= 0:
+            continue
+        resident_bytes = pages_resident * page_size
+        nlen = int(libproc.proc_regionfilename(pid, cur_addr, path_buf, _PROC_PIDPATHINFO_MAXSIZE))
+        path_str = path_buf.value.decode("utf-8", errors="ignore") if nlen > 0 else "(unnamed file)"
+        resident_by_path[path_str] = resident_by_path.get(path_str, 0) + resident_bytes
+
+    total_bytes = sum(resident_by_path.values())
+    if prefixes:
+        model_bytes = sum(v for k, v in resident_by_path.items() if _path_matches_prefixes(k, prefixes))
+        shared_bytes = total_bytes - model_bytes
+    else:
+        model_bytes = 0
+        shared_bytes = total_bytes
+
+    return {
+        "available": True,
+        "total_bytes": total_bytes,
+        "model_bytes": model_bytes,
+        "shared_bytes": shared_bytes,
+        "resident_by_path": resident_by_path,
+        "model_directories": list(prefixes),
+    }
+
+
+def evict_mapped_files(model_directories: Sequence[str | Path]) -> dict[str, int | bool]:
+    """Drop clean resident page-cache pages for mapped files under ``model_directories`` via ``msync``.
+
+    Uses POSIX ``msync(addr, size, MS_SYNC | MS_INVALIDATE)`` so dirty pages are written back
+    before clean pages are invalidated (pages wired by Metal/GPU drivers stay resident).
+    """
+    prefixes = _normalize_model_prefixes(model_directories)
+    if platform.system() != "Darwin" or not prefixes:
+        return {
+            "available": platform.system() == "Darwin",
+            "regions_evicted": 0,
+            "bytes_requested": 0,
+            "failed_regions": 0,
+        }
+
+    libsys, _ = _load_libsystem()
+    libproc = _load_libproc()
+    pid = os.getpid()
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    path_buf = ctypes.create_string_buffer(_PROC_PIDPATHINFO_MAXSIZE)
+    regions_evicted = 0
+    bytes_requested = 0
+    failed_regions = 0
+
+    for cur_addr, cur_size, pages_resident, external_pager, _share_mode, _obj_id in _iter_darwin_vm_regions():
+        if external_pager == 0 or pages_resident <= 0:
+            continue
+        nlen = int(libproc.proc_regionfilename(pid, cur_addr, path_buf, _PROC_PIDPATHINFO_MAXSIZE))
+        if nlen <= 0:
+            continue
+        path_str = path_buf.value.decode("utf-8", errors="ignore")
+        if not _path_matches_prefixes(path_str, prefixes):
+            continue
+        rc = int(libsys.msync(ctypes.c_void_p(cur_addr), ctypes.c_size_t(cur_size), _MS_SYNC | _MS_INVALIDATE))
+        if rc == 0:
+            regions_evicted += 1
+            bytes_requested += pages_resident * page_size
+        else:
+            failed_regions += 1
+
+    return {
+        "available": True,
+        "regions_evicted": regions_evicted,
+        "bytes_requested": bytes_requested,
+        "failed_regions": failed_regions,
+    }
+
+
+def read_process_rusage_v6(pid: int) -> dict[str, int] | None:
+    """Read ``RUSAGE_INFO_V6`` RSS, physical footprint, and neural footprint for ``pid``, or ``None`` if unreadable."""
+    if platform.system() != "Darwin":
+        return None
+    buf = ctypes.create_string_buffer(512)
+    rc = int(_load_libproc().proc_pid_rusage(int(pid), _RUSAGE_INFO_V6, ctypes.byref(buf)))
+    if rc != 0:
+        return None
+    return {
+        "pid": int(pid),
+        "rss_bytes": int.from_bytes(buf.raw[_RESIDENT_SIZE_OFFSET : _RESIDENT_SIZE_OFFSET + 8], "little"),
+        "phys_footprint_bytes": int.from_bytes(buf.raw[_PHYS_FOOTPRINT_OFFSET : _PHYS_FOOTPRINT_OFFSET + 8], "little"),
+        "lifetime_max_phys_footprint_bytes": int.from_bytes(
+            buf.raw[_LIFETIME_MAX_FOOTPRINT_OFFSET : _LIFETIME_MAX_FOOTPRINT_OFFSET + 8], "little"
+        ),
+        "neural_footprint_bytes": int.from_bytes(
+            buf.raw[_NEURAL_FOOTPRINT_V6_OFFSET : _NEURAL_FOOTPRINT_V6_OFFSET + 8], "little"
+        ),
+        "lifetime_max_neural_footprint_bytes": int.from_bytes(
+            buf.raw[_LIFETIME_MAX_NEURAL_FOOTPRINT_V6_OFFSET : _LIFETIME_MAX_NEURAL_FOOTPRINT_V6_OFFSET + 8],
+            "little",
+        ),
+    }
+
+
+def _scan_processes_rusage_v6(
+    names: frozenset[str],
+    *,
+    excluded_pids: frozenset[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Scan matching executable basenames via ``libproc``; return ``(readable_readings, inaccessible_pids)``."""
+    if platform.system() != "Darwin":
+        return [], []
+    libproc = _load_libproc()
+    excluded = excluded_pids if excluded_pids is not None else frozenset({os.getpid()})
+    cap = max(64, int(libproc.proc_listallpids(None, 0)) + 64)
+    pid_arr = (ctypes.c_int * cap)()
+    cnt = int(libproc.proc_listallpids(pid_arr, ctypes.sizeof(pid_arr)))
+    path_buf = ctypes.create_string_buffer(_PROC_PIDPATHINFO_MAXSIZE)
+
+    readable: list[dict[str, Any]] = []
+    inaccessible: list[dict[str, Any]] = []
+    for idx in range(max(0, min(cnt, cap))):
+        pid = int(pid_arr[idx])
+        if pid <= 0 or pid in excluded:
+            continue
+        if int(libproc.proc_pidpath(pid, path_buf, _PROC_PIDPATHINFO_MAXSIZE)) <= 0:
+            continue
+        proc_name = os.path.basename(path_buf.value.decode("utf-8", errors="ignore"))
+        if proc_name not in names:
+            continue
+        ru = read_process_rusage_v6(pid)
+        if ru is None:
+            inaccessible.append({"pid": pid, "name": proc_name})
+        else:
+            readable.append(
+                {
+                    "pid": pid,
+                    "name": proc_name,
+                    "footprint_bytes": int(ru["phys_footprint_bytes"]),
+                    "rss_bytes": int(ru["rss_bytes"]),
+                    "neural_footprint_bytes": int(ru["neural_footprint_bytes"]),
+                }
+            )
+    return readable, inaccessible
+
+
+class AneDaemonMemoryProbe:
+    """Track ``RUSAGE_INFO_V6`` RSS & footprint deltas for out-of-process ANE daemons.
+
+    Watches ``aned``, ``ANECompilerService``, and ``ANELargeModelCompilerService`` by default.
+    Without root privileges, macOS returns ``EPERM`` for root-owned services; those PIDs are
+    reported explicitly under ``inaccessible_pids`` with ``permission_limited=True``.
+    """
+
+    def __init__(
+        self,
+        names: Sequence[str] = tuple(sorted(ANE_DAEMON_PROCESS_NAMES)),
+        *,
+        reader: Callable[[frozenset[str]], tuple[list[dict[str, Any]], list[dict[str, Any]]]] | None = None,
+    ) -> None:
+        self.names: frozenset[str] = frozenset(str(n) for n in names)
+        self._reader = reader or (lambda ns: _scan_processes_rusage_v6(ns))
+        init_readings, init_inacc = self._reader(self.names)
+        self._baseline_footprint: dict[int, int] = {int(r["pid"]): int(r["footprint_bytes"]) for r in init_readings}
+        self._baseline_rss: dict[int, int] = {int(r["pid"]): int(r["rss_bytes"]) for r in init_readings}
+        self._initial_inaccessible = list(init_inacc)
+
+    def poll(self) -> dict[str, Any]:
+        """Sample watched daemons and return current totals plus positive growth above baseline."""
+        readings, inaccessible = self._reader(self.names)
+        procs: list[dict[str, Any]] = []
+        tot_fp = 0
+        tot_rss = 0
+        tot_fp_delta = 0
+        tot_rss_delta = 0
+        for r in readings:
+            pid = int(r["pid"])
+            fp = int(r["footprint_bytes"])
+            rss = int(r["rss_bytes"])
+            fp_base = self._baseline_footprint.get(pid, 0)
+            rss_base = self._baseline_rss.get(pid, 0)
+            fp_delta = max(0, fp - fp_base)
+            rss_delta = max(0, rss - rss_base)
+            tot_fp += fp
+            tot_rss += rss
+            tot_fp_delta += fp_delta
+            tot_rss_delta += rss_delta
+            procs.append(
+                {
+                    "pid": pid,
+                    "name": str(r["name"]),
+                    "footprint_bytes": fp,
+                    "rss_bytes": rss,
+                    "footprint_delta_bytes": fp_delta,
+                    "rss_delta_bytes": rss_delta,
+                }
+            )
+        return {
+            "processes": procs,
+            "total_footprint_bytes": tot_fp,
+            "total_rss_bytes": tot_rss,
+            "total_footprint_delta_bytes": tot_fp_delta,
+            "total_rss_delta_bytes": tot_rss_delta,
+            "inaccessible_pids": inaccessible,
+            "permission_limited": bool(inaccessible),
+        }
+
+
+class FourBucketMemoryProbe:
+    """Opt-in, zero-private-SPI 4-bucket macOS unified-memory probe.
+
+    Captures:
+      1. ``phys_footprint``: process dirty/anonymous CPU + Metal/IOSurface (``RUSAGE_INFO_V4``).
+      2. ``neural_nofootprint``: ``task_vm_info.ledger_tag_neural_nofootprint`` (plus ``external``).
+      3. ``mapped_files``: clean file-backed ``mmap`` resident pages (optional ``MS_SYNC|MS_INVALIDATE`` eviction).
+      4. ``ane_daemons``: ``RUSAGE_INFO_V6`` RSS & footprint deltas for ``aned`` / ``ANECompilerService`` / ``ANELargeModelCompilerService``.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_directories: Sequence[str | Path] | None = None,
+        daemon_names: Sequence[str] = tuple(sorted(ANE_DAEMON_PROCESS_NAMES)),
+        daemon_reader: Callable[[frozenset[str]], tuple[list[dict[str, Any]], list[dict[str, Any]]]] | None = None,
+        evict_baseline: bool = False,
+    ) -> None:
+        self.model_directories = _normalize_model_prefixes(model_directories)
+        self._daemon_probe = AneDaemonMemoryProbe(names=daemon_names, reader=daemon_reader)
+        if evict_baseline and self.model_directories:
+            evict_mapped_files(self.model_directories)
+        self.baseline = self.snapshot(evict_mapped=False)
+
+    def snapshot(self, *, evict_mapped: bool = False) -> dict[str, Any]:
+        """Capture all 4 memory buckets (optionally evicting clean model page-cache pages first)."""
+        evict_stats: dict[str, int | bool] | None = None
+        if evict_mapped and self.model_directories:
+            evict_stats = evict_mapped_files(self.model_directories)
+
+        fp = get_unified_memory_footprint()
+        vm = probe_task_vm_info()
+        mapped = probe_mapped_files(self.model_directories or None)
+        daemons = self._daemon_probe.poll()
+
+        phys_b = int(fp["phys_footprint_bytes"])
+        neural_nf_b = max(0, int(vm["ledger_tag_neural_nofootprint_bytes"]))
+        model_map_b = int(mapped["model_bytes"])
+        all_map_b = int(mapped["total_bytes"])
+        daemon_delta_b = int(daemons["total_footprint_delta_bytes"])
+
+        combined_model_b = phys_b + neural_nf_b + model_map_b + daemon_delta_b
+        combined_all_b = phys_b + neural_nf_b + all_map_b + daemon_delta_b
+
+        return {
+            "phys_footprint": fp,
+            "task_vm_info": vm,
+            "mapped_files": {
+                "available": mapped["available"],
+                "total_bytes": all_map_b,
+                "model_bytes": model_map_b,
+                "shared_bytes": int(mapped["shared_bytes"]),
+                "file_count": len(mapped["resident_by_path"]),
+                "model_directories": mapped["model_directories"],
+                "eviction": evict_stats,
+            },
+            "ane_daemons": daemons,
+            "combined_with_model_mapped_bytes": combined_model_b,
+            "combined_with_all_mapped_bytes": combined_all_b,
+            "combined_with_model_mapped_gb": round(combined_model_b / 1e9, 4),
+            "combined_with_all_mapped_gb": round(combined_all_b / 1e9, 4),
+        }
+
+    def delta(self, *, evict_mapped: bool = False) -> dict[str, Any]:
+        """Take a current 4-bucket snapshot and report deltas against baseline."""
+        cur = self.snapshot(evict_mapped=evict_mapped)
+        base = self.baseline
+        phys_delta = int(cur["phys_footprint"]["phys_footprint_bytes"]) - int(
+            base["phys_footprint"]["phys_footprint_bytes"]
+        )
+        neural_delta = int(cur["task_vm_info"]["ledger_tag_neural_nofootprint_bytes"]) - int(
+            base["task_vm_info"]["ledger_tag_neural_nofootprint_bytes"]
+        )
+        model_map_delta = int(cur["mapped_files"]["model_bytes"]) - int(base["mapped_files"]["model_bytes"])
+        all_map_delta = int(cur["mapped_files"]["total_bytes"]) - int(base["mapped_files"]["total_bytes"])
+        daemon_fp_delta = int(cur["ane_daemons"]["total_footprint_delta_bytes"])
+        daemon_rss_delta = int(cur["ane_daemons"]["total_rss_delta_bytes"])
+        return {
+            "current": cur,
+            "deltas": {
+                "phys_footprint_delta_bytes": phys_delta,
+                "neural_nofootprint_delta_bytes": neural_delta,
+                "model_mapped_delta_bytes": model_map_delta,
+                "all_mapped_delta_bytes": all_map_delta,
+                "ane_daemon_footprint_delta_bytes": daemon_fp_delta,
+                "ane_daemon_rss_delta_bytes": daemon_rss_delta,
+            },
+        }
+
+
+def probe_four_bucket_memory(
+    *,
+    model_directories: Sequence[str | Path] | None = None,
+    evict_mapped: bool = False,
+) -> dict[str, Any]:
+    """One-shot opt-in 4-bucket memory snapshot (``phys_footprint``, ``task_vm_info``, ``mapped_files``, ``ane_daemons``)."""
+    probe = FourBucketMemoryProbe(model_directories=model_directories, evict_baseline=False)
+    return probe.snapshot(evict_mapped=evict_mapped)
+
+
+@dataclass(frozen=True)
+class DeviceMemorySnapshot:
+    """Point-in-time Metal working-set and process resident memory snapshot."""
+
+    allocated_bytes: int
+    recommended_bytes: int
+    footprint_bytes: int
+    mapped_bytes: int = 0
+
+    @property
+    def resident_bytes(self) -> int:
+        return int(self.footprint_bytes) + int(self.mapped_bytes)
+
+    @property
+    def allocated_fraction(self) -> float:
+        return (float(self.allocated_bytes) / float(self.recommended_bytes)) if self.recommended_bytes > 0 else 0.0
+
+    @property
+    def resident_fraction(self) -> float:
+        return (float(self.resident_bytes) / float(self.recommended_bytes)) if self.recommended_bytes > 0 else 0.0
+
+    def format_summary(self) -> str:
+        gib = 1024.0**3
+        return (
+            f"Metal {self.allocated_bytes / gib:.2f} GiB allocated of "
+            f"{self.recommended_bytes / gib:.2f} GiB recommended "
+            f"({self.allocated_fraction * 100.0:.1f}%), "
+            f"footprint {self.footprint_bytes / gib:.2f} GiB + "
+            f"mapped files {self.mapped_bytes / gib:.2f} GiB "
+            f"(resident {self.resident_bytes / gib:.2f} GiB)"
+        )
+
+
+def measure_device_memory_snapshot() -> DeviceMemorySnapshot:
+    """Measure Metal allocated/recommended working-set bytes plus process footprint & mapped external bytes."""
+    allocated = 0
+    recommended = 0
+    try:
+        import mlx.core as mx
+
+        get_active = getattr(mx, "get_active_memory", None)
+        get_cache = getattr(mx, "get_cache_memory", None)
+        if callable(get_active):
+            allocated = int(get_active()) + (int(get_cache()) if callable(get_cache) else 0)
+        dev_info_fn = getattr(mx, "device_info", None)
+        if callable(dev_info_fn):
+            dev = dev_info_fn()
+            if isinstance(dev, dict):
+                recommended = int(dev.get("max_recommended_working_set_size", 0))
+    except Exception:
+        pass
+
+    vm = probe_task_vm_info()
+    if vm.get("available"):
+        footprint = int(vm["phys_footprint_bytes"])
+        mapped = int(vm["external_bytes"])
+    else:
+        fp = get_unified_memory_footprint()
+        footprint = int(fp["phys_footprint_bytes"])
+        mapped = 0
+    return DeviceMemorySnapshot(
+        allocated_bytes=allocated,
+        recommended_bytes=recommended,
+        footprint_bytes=footprint,
+        mapped_bytes=mapped,
+    )
+
+
+class DeviceMemoryGuard:
+    """``DeviceMemoryGuard``-style Metal working-set guard (``0.98 * recommended``, ``past_arm_margin=0.02``).
+
+    Watches two thresholds once ``arm()`` is called after model load:
+      - Metal allocated bytes against ``trip_fraction * recommendedMaxWorkingSetSize`` (default ``0.98``).
+      - Process resident bytes (``phys_footprint + mapped_external``) against ``recommendedMaxWorkingSetSize``.
+
+    If a figure is already above its baseline threshold at ``arm()``, its refusal line is placed
+    ``past_arm_margin * recommended`` (default ``0.02``) above its armed level so already-loaded
+    servers can still run while tripping on further growth. Refusal clears automatically once
+    memory falls back under both lines.
+    """
+
+    def __init__(
+        self,
+        *,
+        trip_fraction: float = DEFAULT_METAL_TRIP_FRACTION,
+        past_arm_margin: float = DEFAULT_PAST_ARM_MARGIN,
+        measure: Callable[[], DeviceMemorySnapshot] | None = None,
+    ) -> None:
+        if not (0.0 < float(trip_fraction) <= 1.0):
+            raise ValueError(f"trip_fraction must be in (0, 1], got {trip_fraction}")
+        if float(past_arm_margin) < 0.0:
+            raise ValueError(f"past_arm_margin must be >= 0, got {past_arm_margin}")
+        self.trip_fraction = float(trip_fraction)
+        self.past_arm_margin = float(past_arm_margin)
+        self._measure = measure or measure_device_memory_snapshot
+        self._lock = threading.Lock()
+        self._allocated_line: int | None = None
+        self._resident_line: int | None = None
+        self._refusing: bool = False
+
+    @property
+    def armed(self) -> bool:
+        with self._lock:
+            return self._allocated_line is not None and self._resident_line is not None
+
+    @property
+    def lines(self) -> tuple[int, int] | None:
+        with self._lock:
+            if self._allocated_line is None or self._resident_line is None:
+                return None
+            return (self._allocated_line, self._resident_line)
+
+    def snapshot(self) -> DeviceMemorySnapshot:
+        return self._measure()
+
+    def arm(self) -> DeviceMemorySnapshot:
+        """Latch refusal thresholds against current memory; no-op if device reports no recommendation."""
+        start = self._measure()
+        if start.recommended_bytes <= 0:
+            return start
+        margin = int(float(start.recommended_bytes) * self.past_arm_margin)
+        metal_line = int(float(start.recommended_bytes) * self.trip_fraction)
+        alloc_line = metal_line if start.allocated_bytes < metal_line else (start.allocated_bytes + margin)
+        res_line = (
+            start.recommended_bytes if start.resident_bytes < start.recommended_bytes else (start.resident_bytes + margin)
+        )
+        with self._lock:
+            self._allocated_line = alloc_line
+            self._resident_line = res_line
+            self._refusing = False
+        return start
+
+    def check(self) -> tuple[DeviceMemorySnapshot, str | None]:
+        """Measure once and return ``(snapshot, refusal_reason_or_None)``."""
+        now = self._measure()
+        with self._lock:
+            if self._allocated_line is None or self._resident_line is None:
+                return now, None
+            refusal: str | None = None
+            if now.allocated_bytes >= self._allocated_line:
+                refusal = (
+                    f"Metal allocated memory exceeded guard line "
+                    f"({now.allocated_bytes / (1024**3):.2f} >= {self._allocated_line / (1024**3):.2f} GiB; "
+                    f"{now.format_summary()})"
+                )
+            elif now.resident_bytes >= self._resident_line:
+                refusal = (
+                    f"Process resident memory (footprint + mapped) exceeded guard line "
+                    f"({now.resident_bytes / (1024**3):.2f} >= {self._resident_line / (1024**3):.2f} GiB; "
+                    f"{now.format_summary()})"
+                )
+            self._refusing = refusal is not None
+            return now, refusal
+
+
+def check_metal_working_set_headroom(
+    *,
+    trip_fraction: float = DEFAULT_METAL_TRIP_FRACTION,
+    measure: Callable[[], DeviceMemorySnapshot] | None = None,
+) -> dict[str, Any]:
+    """One-shot preflight check against ``trip_fraction * recommendedMaxWorkingSetSize`` (default ``0.98``)."""
+    snap = (measure or measure_device_memory_snapshot)()
+    warning: str | None = None
+    if snap.recommended_bytes > 0:
+        metal_line = int(float(snap.recommended_bytes) * float(trip_fraction))
+        if snap.allocated_bytes >= metal_line:
+            warning = (
+                f"Metal allocated {snap.allocated_bytes / (1024**3):.2f} GiB >= "
+                f"{trip_fraction * 100.0:.0f}% of recommended {snap.recommended_bytes / (1024**3):.2f} GiB"
+            )
+        elif snap.resident_bytes >= snap.recommended_bytes:
+            warning = (
+                f"Process resident {snap.resident_bytes / (1024**3):.2f} GiB >= "
+                f"recommended {snap.recommended_bytes / (1024**3):.2f} GiB ({snap.format_summary()})"
+            )
+    return {
+        "ok": warning is None,
+        "warning": warning,
+        "allocated_fraction": round(snap.allocated_fraction, 4),
+        "resident_fraction": round(snap.resident_fraction, 4),
+        "snapshot": {
+            "allocated_bytes": snap.allocated_bytes,
+            "recommended_bytes": snap.recommended_bytes,
+            "footprint_bytes": snap.footprint_bytes,
+            "mapped_bytes": snap.mapped_bytes,
+            "resident_bytes": snap.resident_bytes,
+        },
+    }
 
 
 @contextmanager
@@ -382,15 +1099,29 @@ def main(argv: list[str] | None = None) -> None:
 
 
 __all__ = [
+    "ANE_DAEMON_PROCESS_NAMES",
+    "AneDaemonMemoryProbe",
+    "DEFAULT_METAL_TRIP_FRACTION",
+    "DEFAULT_PAST_ARM_MARGIN",
+    "DeviceMemoryGuard",
+    "DeviceMemorySnapshot",
+    "FourBucketMemoryProbe",
+    "check_metal_working_set_headroom",
     "check_system_quiescence",
     "check_tensor_dtypes",
     "clear_mlx_arena",
     "collect_env_telemetry",
     "cos_sim",
+    "evict_mapped_files",
     "get_unified_memory_footprint",
     "interleaved_abba",
     "main",
+    "measure_device_memory_snapshot",
     "peak_footprint_gb",
+    "probe_four_bucket_memory",
+    "probe_mapped_files",
+    "probe_task_vm_info",
+    "read_process_rusage_v6",
     "wired_limit",
 ]
 

@@ -1,6 +1,6 @@
 ---
 name: apple-silicon-ml-optimizer
-description: Optimize local ML inference, quantization, custom Metal/MLX kernels, CoreML/ANE pipelines, and LoRA training across Apple Silicon M4 (Apple9) and M5+ (Apple10+ / NAX) Macs. Use when profiling hardware bottlenecks, reducing RAM/DRAM traffic, writing Metal 4 MPP or CoreML/CPU-SME kernels, debugging dtype regressions, or maximizing end-to-end throughput and schema/task accuracy on dense encoders, dense LLMs, and sparse MoE models.
+description: Optimize local ML inference, quantization, custom Metal/MLX kernels, CoreML/ANE pipelines, and training/distillation/QAT/RLVR workloads across Apple Silicon M4 (Apple9) and M5+ (Apple10+ / NAX) Macs. Use when profiling hardware bottlenecks, reducing RAM/DRAM traffic, writing Metal 4 MPP or CoreML/CPU-SME kernels, accelerating LoRA/QLoRA, teacher distillation, encoder/head fine-tuning, or GRPO rollouts, debugging dtype regressions, or maximizing end-to-end throughput and schema/task accuracy on dense encoders, dense LLMs, and sparse MoE models.
 ---
 
 # Apple Silicon ML Roofline Optimizer (M4 & M5+)
@@ -85,3 +85,13 @@ Route workload stages strictly by arithmetic intensity (`AI = FLOPs / Bytes`), s
 2. **Check output parity before scaling up.** For a drop-in kernel, compare 4–8 representative inputs on the same processor. Check output count, shape and validity, embedding cosine (`>= 0.9998`), and exact integer codes where the model returns them. For GPU/ANE scheduling changes, repeat the baseline and re-encode the largest differences on each fixed processor. For retrieval, check source passage IDs and held-out passage ranks. Treat an intentional precision change as a separate quality experiment.
 3. **Control for warmup and thermal drift.** Warm both paths, reset peak memory with `mx.reset_peak_memory()`, and alternate runs in `ABBA` order. On sustained workloads, check whether repeated baseline times drift as the Mac heats up. Compare end-to-end time and task quality. [Benchmark harness](scripts/ab_bench_harness.py)
 4. **Audit [references/dead-ends-registry.md](references/dead-ends-registry.md)** before testing speculative decoding on MoE, `KV_i8` on `hd=64`, `SpinQuant` norm-folding, scalar `kv_sys_i8`, or tight batch-1 custom heads.
+
+---
+
+### Phase 5: Training, Distillation & Post-Training Acceleration
+
+Training flips the roofline from `M=1` DRAM-bandwidth-bound decode to **`3×`-GEMM (`Y`, `dX`, `dW`) TFLOPS + activation-RAM-bound backprop** (where `M5+` `NAX` scales `1.5×–4×` over `M4` shader ALUs). Read [references/training-and-distillation-playbook.md](references/training-and-distillation-playbook.md) before writing or tuning any training, distillation, calibration, or RLVR loop:
+
+1. **Autograd & memory hygiene:** Split frozen bottom trunks outside `nn.value_and_grad`, unwrap dead KV-shared `k_proj`/`v_proj` LoRAs, gather `lm_head` strictly on answer tokens with `256`-token sliced `FP32` CE (`5×–8×` fewer `262K`-head FLOPs), pre-cast frozen weights once at load, keep self-attention `BF16` (no `FP32` SDPA upcast), and stay below `75–80%` wired RAM to avoid `50×` swap cliffs.
+2. **Tile saturation & checkpoint elimination:** Pack variable-length examples into fixed `M=2048..4096` bins (`position_ids` reset + block-diagonal mask) instead of `B=1` or padded batches (`1.5×–2.6×`), and freeze base trunks in `8-bit g64` / `MXFP4` (`QLoRA`) so `nn.utils.checkpoint` (`+30–35%` 2nd-forward tax) stays off (`1.25×–1.4×`).
+3. **Silicon co-execution & kernel fusion:** Pipeline frozen prefixes on ANE (`pipe_depth=4`, `IOSurface -> Metal`) or cache `h_{frozen}` on NVMe across multi-epoch/head sweeps; broadcast shared prompt KVs across `grad_accum` micro-batches; fuse chunked softcap+CE, `GeGLU`/`RMSNorm` VJPs, and `AdamW` with `@mx.compile`; and drive teacher distillation / `GRPO` rollouts with `PrefixTree` + rolling engines + parallel `coremltools` bucket builds (`3×–6×`).

@@ -26,3 +26,16 @@ Always gate quantization & approximation experiments on **`e2e docs/s × blind a
 2. `Gemma-4 PrefixANE W8`: Raw speed rose `+34%` (`33.96` vs `44.14 ms`), **but** unaligned `W8` triggered a `515`-token repeat loop (`2.18` vs `3.47 docs/s`).
 3. `Gemma-4 MLX-4bit` PTQ vs Aligned V4: High raw decode (`704.8 t/s`) trailed aligned throughput (`1.648` vs `2.079–2.537 docs/s`) due to verbose outputs and `72×` more grammar mask fallbacks.
 4. `Gemma-4 E4B` QAT vs PTQ unconstrained: QAT emitted `374.4` tokens vs PTQ `194.8` tokens for the exact same prompt batch (`llguidance` required for both).
+
+---
+
+## Training, Distillation & Post-Training Anti-Targets
+
+| Anti-Target | Observed Failure / Cost | Hardware Root Cause & Correct Pattern |
+|---|---|---|
+| **Backprop or Per-Step Dynamic Weights on ANE** | Multi-second `.mlmodelc` recompilation per step; no MIL backward ops. | CoreML/ANE is forward-only fixed-weight `conv1x1` (`FP16`/`W8`). Keep gradients on Metal (`MLX`); use ANE strictly for frozen lower prefixes, frozen teachers, and async reward critics. |
+| **Exceeding `75–80%` Wired RAM During Backprop** | Step latency collapses `~0.9s -> 56s/step` (`>38 GiB` on `48 GiB`, `>18 GiB` on `24 GiB`, or hard wedge). | Saved autograd activations spill into macOS compressed memory / NVMe swap. Clamp `mx.set_wired_limit` / cache, use `8-bit g64` `QLoRA`, and slice `FP32` CE into `256`-token chunks. |
+| **Right-Padded Multi-Batch or Unpacked `B=1` SFT** | `B=1` caps `Gemma-4 E2B` around `~440 tok/s` + ragged JIT recompiles; padded `B>=2` triggers `nn.utils.checkpoint` (`+30–35%` 2nd forward pass) on `[PAD]` tokens. | Pack sequences end-to-end into fixed `M=2048..4096` bins with per-segment RoPE reset and block-diagonal masks (`0%` pad waste, saturated matrix tiles). |
+| **Differentiating Frozen Prefix, Dead KV-Shared LoRAs, or Full-Seq `lm_head`** | `2×–5×` slower LoRA steps and `+2 GB` wasted peak RAM. | Run frozen `L0..k-1` outside `nn.value_and_grad`, unwrap dead `k_proj`/`v_proj` LoRAs on KV-shared layers (`40` on `Gemma-4 E2B`), and gather `lm_head` only on supervised answer tokens. |
+| **`FP32` Head Attention Upcasts & Per-Step `.astype(bfloat16)` Casts** | `-36%` self-attention throughput from `FP32` SDPA register spills + redundant weight-cast launches every step. | Pre-cast frozen weights once at load time and keep trainable transformer heads/masks in `BF16` (`mx.where` / additive `BF16` bias), reserving `FP32` strictly for final loss reductions. |
+| **PyTorch `MPS` for `BF16` LoRA / Transformer Training** | Silent CPU host-sync fallbacks on unfused backward ops and earlier allocator fragmentation near wired-memory limits. | Use native `MLX` (`@mx.compile` + `nn.value_and_grad`) for Apple Silicon training loops; reserve `torch` for offline `coremltools` MIL tracing. |

@@ -117,6 +117,14 @@ The following measurements come from the M4 Pro. Use them to choose candidates f
 | **MLP Dispatch Pattern** | Packed `MPP` w/ bias+GELU/res fusion | `16<=M<=64`: `MPP_pad32 gate_up` + `MLX down`; Prefill `MPP` only when `M>=2048` | Single-launch **Hot-`MPP` + Cold-`QMV`** (power-law expert skew) + `gather_qmm(sorted_indices=True)` |
 | **Scheduler Sweet Spot** | FFD bucketed packing (`S<=512`, `96%` fill) | Continuous Rolling `B_slots=128..256` (`swa_ring_cap=512`, `refill_min=32`) + `EarlyExit` `ff` drain | Amortize experts via real micro-batches (`B=8..64+`); watch sustained thermal + refill correctness |
 
+### CoreAI (`macOS 27.2+`) vs. Custom MLX+CoreML Pipelines
+
+- **Toolchain & OS boundary:** Apple's `coreai-models` / `aimodel` stack (`coreai-core`, `coreai-torch`, `coreai-opt`, `FoundationModels`) requires macOS/iOS 27.0+ (`27.2+` for Gemma-4/Qwen3.5) and Xcode 27.0+, targeting unified AOT single-stream/iOS deployment with multimodal encoders (`Conv2d` + static padded buckets). Custom `MLX` + `CoreML` (`mlmodelc` / Metal 4 `MPP`) runs across both macOS `26.x` and `27.x` with Command Line Tools only and unlocks text-optimized throughput (`fast-gemma4` ragged `B_slots=128` + `KV_i8` + pruned `150,786` vocab + lazy full-vocab fallback + `llguidance` forced-token jump at `2.54x mlx_vlm`; `fast-gpt-oss` Hydragen v2 + `Hot-MPP/Cold-QMV` `MXFP4` + `skip_lm_head` at `555.5 dec tok/s`, `4.78x mlx_lm`; `fast-pplx` depth-4 `_invert_unit_lower_block` at `18` ops vs 15-step Horner).
+- **High-value techniques portable back to CoreML + MLX:**
+  - *Draft-head packs (`gemma-4-E2B-it-assistant`):* `150.3 MiB` BF16 4-layer (`kv_heads=1`) CPU MTP head attending over the target's `last_storing_layer` KV cache (`1024`-tok window) with `2048`-centroid scan (`top_k=32`), combinable with N-gram prompt lookup and schema jumps for `B=1..4` non-extractive decode.
+  - *Recurrent + KV prefix trees (`CoreAIPipelinedEngine+PrefixTree`):* `256`-token block trees snapshotting both attention KV and hybrid GDN recurrent/conv state across multi-turn prompts.
+  - *Mixed-precision & QAT recipes:* Keeping `8`-bit `per_layer_input_gate`/`per_layer_projection`, `NativeLutQuantConv1x1` 2-bit QAT on shared-KV layers, and `symmetric_with_clipping` `block=32` INT4 weights.
+
 ---
 
 ## 3. M4 Pro unified memory capacity (48 GiB)

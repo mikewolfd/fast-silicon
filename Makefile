@@ -32,12 +32,12 @@ guard:
 	$(FAST_IR_GUARD) --strict-bool-mask --coreml \
 		packages/fast-shared/src packages/fast-shared/tests \
 		packages/fast-shared/skills/apple-silicon-ml-optimizer/scripts \
-		packages/fast-bge-small/src packages/fast-bge-small/tests \
-		packages/fast-embeddinggemma-2/src packages/fast-embeddinggemma-2/tests \
-		packages/fast-gemma4/src packages/fast-gemma4/tests \
+		packages/fast-bge-small/src packages/fast-bge-small/tests packages/fast-bge-small/scripts \
+		packages/fast-embeddinggemma-2/src packages/fast-embeddinggemma-2/tests packages/fast-embeddinggemma-2/scripts \
+		packages/fast-gemma4/src packages/fast-gemma4/tests packages/fast-gemma4/scripts \
 		packages/fast-gpt-oss/src packages/fast-gpt-oss/tests \
-		packages/fast-pplx/src packages/fast-pplx/tests \
-		packages/fast-decision-models/src packages/fast-decision-models/tests \
+		packages/fast-pplx/src packages/fast-pplx/tests packages/fast-pplx/scripts \
+		packages/fast-decision-models/src packages/fast-decision-models/tests packages/fast-decision-models/scripts \
 		scripts tests
 	$(PYTHON) -m pytest -q packages/fast-shared/tests/test_ir_dtype_guard_cpu.py -k test_clean_pass_on_fast_repos
 
