@@ -20,13 +20,31 @@ from datetime import datetime, timezone
 import fcntl
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Iterator, Sequence
 
 import numpy as np
+
+try:
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
+except ModuleNotFoundError:  # pragma: no cover - standalone / ephemeral uv invocation
+    _shared_src = Path(__file__).resolve().parents[2] / "fast-shared" / "src"
+    if _shared_src.is_dir() and str(_shared_src) not in sys.path:
+        sys.path.insert(0, str(_shared_src))
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
 
 DEFAULT_ANE_CHUNK_S = 256
 DEFAULT_ANE_P_SWA = 512
@@ -839,21 +857,100 @@ def _inspect_compiled_bundle(
 
 
 def compile_mlpackage_in_process(pkg_path: Path, dst_mc: Path) -> Path:
-    """Compile a saved `.mlpackage` to `dst_mc` via `coremltools.utils.compile_model` (no Xcode `coremlcompiler` CLI)."""
+    """Compile a saved `.mlpackage` to `dst_mc` via `coremltools.utils.compile_model` (atomic publish)."""
     import coremltools as ct
 
     dst_mc.parent.mkdir(parents=True, exist_ok=True)
     compiled_tmp = Path(ct.utils.compile_model(str(pkg_path)))
     if compiled_tmp.resolve() == dst_mc.resolve():
         return dst_mc
-    if dst_mc.exists():
-        shutil.rmtree(dst_mc)
     try:
-        shutil.move(str(compiled_tmp), str(dst_mc))
+        return atomic_publish_dir(compiled_tmp, dst_mc, move=True)
     except Exception:
         shutil.rmtree(compiled_tmp, ignore_errors=True)
         raise
-    return dst_mc
+
+
+def _resolve_ct_precision(ct: Any, compute_precision_mode: str) -> Any:
+    if compute_precision_mode == "fp32":
+        return ct.precision.FLOAT32
+    if compute_precision_mode == "fp32_norms":
+        fp16_cls = getattr(getattr(ct, "transform", None), "FP16ComputePrecision", None)
+        if fp16_cls is not None:
+            return fp16_cls(
+                op_selector=lambda op: getattr(op, "op_type", "")
+                not in ("reduce_mean", "rsqrt", "softmax", "gelu", "real_div")
+            )
+    return ct.precision.FLOAT16
+
+
+def _compile_gemma4_ane_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Top-level `spawn`-safe worker compiling one `(variant, S)` Gemma-4 EarlyExit `.mlmodelc`."""
+    import coremltools as ct
+
+    variant = str(task["variant"])
+    npz_path = Path(task["npz_path"])
+    out_ane_dir = Path(task["out_ane_dir"])
+    S = int(task["S"])
+    P_SWA = int(task["P_SWA"])
+    P_FULL = int(task["P_FULL"])
+    compute_precision_mode = str(task["compute_precision_mode"])
+    keep_mlpackage = bool(task["keep_mlpackage"])
+
+    t0 = time.perf_counter()
+    with np.load(npz_path) as npz_obj:
+        npz_dict = {k: npz_obj[k] for k in npz_obj.files}
+    prog, arch = build_early_prefix_mil_program(npz_dict, S=S, P_SWA=P_SWA, P_FULL=P_FULL)
+    del npz_dict
+
+    ct_precision = _resolve_ct_precision(ct, compute_precision_mode)
+    ml_model = ct.convert(
+        prog,
+        convert_to="mlprogram",
+        compute_precision=ct_precision,
+        minimum_deployment_target=ct.target.macOS15,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        skip_model_load=True,
+    )
+    if variant == "w8":
+        ml_model = quantize_mlmodel_linear_w8_per_channel(ml_model, weight_threshold=2048)
+
+    name_stem = f"gemma4_early{arch['exit_layer']}_prefix_S{S}_{variant}"
+    pkg = (
+        out_ane_dir / f"{name_stem}.mlpackage"
+        if keep_mlpackage
+        else out_ane_dir / f".{name_stem}.{os.getpid()}.mlpackage"
+    )
+    mc = out_ane_dir / f"{name_stem}.mlmodelc"
+    if pkg.exists():
+        shutil.rmtree(pkg)
+    try:
+        ml_model.save(str(pkg))
+        compile_mlpackage_in_process(pkg, mc)
+    finally:
+        if not keep_mlpackage and pkg.exists():
+            shutil.rmtree(pkg, ignore_errors=True)
+
+    return {
+        "bundle_path": str(mc),
+        "bundle_name": mc.name,
+        "variant": variant,
+        "arch": arch,
+        "S": S,
+        "elapsed_sec": round(time.perf_counter() - t0, 3),
+    }
+
+
+def _parse_chunk_sizes(spec: str | Sequence[int] | None, default_s: int) -> tuple[int, ...]:
+    if spec is None:
+        return (int(default_s),)
+    if isinstance(spec, str):
+        vals = tuple(int(tok.strip()) for tok in spec.split(",") if tok.strip())
+    else:
+        vals = tuple(int(x) for x in spec)
+    if not vals or any(v < 16 for v in vals):
+        raise ValueError(f"Invalid chunk_sizes={spec!r}; H16ANE requires static chunk sizes >= 16.")
+    return vals
 
 
 def compile_ane_bundles_from_npz(
@@ -869,101 +966,95 @@ def compile_ane_bundles_from_npz(
     P_FULL: int = DEFAULT_ANE_P_FULL,
     compute_precision_mode: str = "fp16_safe",
     manifest_meta: dict[str, Any] | None = None,
+    jobs: int | None = None,
+    chunk_sizes: Sequence[int] | None = None,
 ) -> list[Path]:
-    import coremltools as ct
-
     if compute_precision_mode not in ("fp16_safe", "fp32_norms", "fp32"):
         raise ValueError(f"Unsupported compute_precision_mode={compute_precision_mode!r}")
 
     out_ane_dir.mkdir(parents=True, exist_ok=True)
-    built: list[Path] = []
     meta = dict(manifest_meta or {})
+    eff_chunks = _parse_chunk_sizes(chunk_sizes, S)
+    eff_jobs = default_compile_jobs(jobs)
 
-    def _resolve_precision() -> Any:
-        if compute_precision_mode == "fp32":
-            return ct.precision.FLOAT32
-        if compute_precision_mode == "fp32_norms":
-            fp16_cls = getattr(getattr(ct, "transform", None), "FP16ComputePrecision", None)
-            if fp16_cls is not None:
-                return fp16_cls(
-                    op_selector=lambda op: getattr(op, "op_type", "")
-                    not in ("reduce_mean", "rsqrt", "softmax", "gelu", "real_div")
-                )
-        return ct.precision.FLOAT16
+    variants: list[str] = []
+    if variant in ("both", "fp16"):
+        variants.append("fp16")
+    if variant in ("both", "w8"):
+        variants.append("w8")
 
-    def _compile(model_obj: Any, name_stem: str) -> Path:
-        pkg = out_ane_dir / f"{name_stem}.mlpackage"
-        mc = out_ane_dir / f"{name_stem}.mlmodelc"
-        if pkg.exists():
-            shutil.rmtree(pkg)
-        if mc.exists():
-            shutil.rmtree(mc)
-        model_obj.save(str(pkg))
-        compile_mlpackage_in_process(pkg, mc)
-        if not keep_mlpackage and pkg.exists():
-            shutil.rmtree(pkg)
+    tasks: list[dict[str, Any]] = []
+    for chunk_s in eff_chunks:
+        for var in variants:
+            tasks.append(
+                {
+                    "variant": var,
+                    "npz_path": str((fp16_npz_path if var == "fp16" else w8_npz_path).resolve()),
+                    "out_ane_dir": str(out_ane_dir.resolve()),
+                    "S": int(chunk_s),
+                    "P_SWA": int(P_SWA),
+                    "P_FULL": int(P_FULL),
+                    "compute_precision_mode": compute_precision_mode,
+                    "keep_mlpackage": bool(keep_mlpackage),
+                }
+            )
+
+    t_all0 = time.perf_counter()
+    results = compile_buckets_parallel(
+        tasks,
+        _compile_gemma4_ane_bundle_task,
+        max_workers=eff_jobs,
+        label_fn=lambda t: f"gemma4_S{t['S']}_{t['variant']}",
+        extra_sys_paths=(Path(__file__).resolve().parent,),
+    )
+
+    built: list[Path] = []
+    for res in results:
+        info = res.value
+        mc = Path(info["bundle_path"])
+        var = str(info["variant"])
+        arch = info["arch"]
+        res_s = int(info["S"])
+
         if lib_ane_prefix is not None and compute_precision_mode == "fp16_safe":
-            plan_info = _inspect_compiled_bundle(lib_ane_prefix, mc, S=S, P_SWA=P_SWA, P_FULL=P_FULL)
+            plan_info = _inspect_compiled_bundle(lib_ane_prefix, mc, S=res_s, P_SWA=P_SWA, P_FULL=P_FULL)
             if plan_info is not None:
-                print(f"[MLComputePlan] {mc.name}: {plan_info}")
+                print(f"[MLComputePlan] {mc.name}: {plan_info}", flush=True)
                 if plan_info["cpu_runtime_ops"] > 0:
                     raise RuntimeError(f"Unexpected CPU runtime fallback ops in {mc}: {plan_info}")
-        return mc
 
-    ct_precision = _resolve_precision()
-
-    if variant in ("both", "fp16"):
-        npz_f16 = dict(np.load(fp16_npz_path))
-        prog_fp16, arch = build_early_prefix_mil_program(npz_f16, S=S, P_SWA=P_SWA, P_FULL=P_FULL)
-        stem_prefix = f"gemma4_early{arch['exit_layer']}_prefix_S{S}"
-        ml_fp16 = ct.convert(
-            prog_fp16,
-            convert_to="mlprogram",
-            compute_precision=ct_precision,
-            minimum_deployment_target=ct.target.macOS15,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-        )
-        mc = _compile(ml_fp16, f"{stem_prefix}_fp16")
-        write_ane_calibration_manifest(
-            out_ane_dir,
-            bundle_name=mc.name,
-            variant="fp16",
-            arch=arch,
-            compute_precision_mode=compute_precision_mode,
-            checkpoint_key=meta.get("checkpoint_ane_key"),
-        )
-        print(f"Compiled {mc}")
+        if var == "fp16":
+            write_ane_calibration_manifest(
+                out_ane_dir,
+                bundle_name=mc.name,
+                variant="fp16",
+                arch=arch,
+                compute_precision_mode=compute_precision_mode,
+                checkpoint_key=meta.get("checkpoint_ane_key"),
+            )
+        else:
+            write_ane_calibration_manifest(
+                out_ane_dir,
+                bundle_name=mc.name,
+                variant="w8",
+                arch=arch,
+                compute_precision_mode=compute_precision_mode,
+                awq_mse=bool(meta.get("awq_mse", False)),
+                mean_alpha=float(meta.get("mean_alpha", 1.0)),
+                calibration_source=str(meta.get("calibration_source", "none")),
+                calibration_docs=int(meta.get("calibration_docs", 0)),
+                qat_validated=bool(meta.get("qat_validated", False)),
+                checkpoint_key=meta.get("checkpoint_ane_key"),
+            )
+        print(f"Compiled {mc} ({info['elapsed_sec']:.2f}s)", flush=True)
         built.append(mc)
 
-    if variant in ("both", "w8"):
-        npz_w8 = dict(np.load(w8_npz_path))
-        prog_w8, arch = build_early_prefix_mil_program(npz_w8, S=S, P_SWA=P_SWA, P_FULL=P_FULL)
-        stem_prefix = f"gemma4_early{arch['exit_layer']}_prefix_S{S}"
-        ml_for_w8 = ct.convert(
-            prog_w8,
-            convert_to="mlprogram",
-            compute_precision=ct_precision,
-            minimum_deployment_target=ct.target.macOS15,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
+    if len(built) > 1:
+        print(
+            f"Compiled {len(built)} Gemma-4 ANE bundle(s) with jobs={min(eff_jobs, len(built))} "
+            f"in {time.perf_counter() - t_all0:.2f}s -> {out_ane_dir}",
+            flush=True,
         )
-        ml_w8 = quantize_mlmodel_linear_w8_per_channel(ml_for_w8, weight_threshold=2048)
-        mc8 = _compile(ml_w8, f"{stem_prefix}_w8")
-        write_ane_calibration_manifest(
-            out_ane_dir,
-            bundle_name=mc8.name,
-            variant="w8",
-            arch=arch,
-            compute_precision_mode=compute_precision_mode,
-            awq_mse=bool(meta.get("awq_mse", False)),
-            mean_alpha=float(meta.get("mean_alpha", 1.0)),
-            calibration_source=str(meta.get("calibration_source", "none")),
-            calibration_docs=int(meta.get("calibration_docs", 0)),
-            qat_validated=bool(meta.get("qat_validated", False)),
-            checkpoint_key=meta.get("checkpoint_ane_key"),
-        )
-        print(f"Compiled {mc8}")
-        built.append(mc8)
-
     return built
 
 
@@ -993,12 +1084,25 @@ def main() -> int:
     )
     parser.add_argument("--reexport", action="store_true", help="Re-export FP16 EarlyExit weights npz from model")
     parser.add_argument("--keep-mlpackage", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help=f"Parallel CoreML worker processes (default: min(4, cpu_count)={default_compile_jobs()})",
+    )
+    parser.add_argument(
+        "--chunk-sizes",
+        default=None,
+        help=f"Optional comma-separated static ANE chunk sizes S (default: {DEFAULT_ANE_CHUNK_S})",
+    )
     parser.add_argument("--compile-only-fp16-npz", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-w8-npz", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-out-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-lib", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-meta-json", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    eff_jobs = default_compile_jobs(args.jobs)
 
     if args.compile_only_out_dir is not None:
         fp16_p = Path(args.compile_only_fp16_npz)
@@ -1014,6 +1118,8 @@ def main() -> int:
             lib_ane_prefix=lib_p,
             compute_precision_mode=args.compute_precision,
             manifest_meta=meta_obj,
+            jobs=eff_jobs,
+            chunk_sizes=_parse_chunk_sizes(args.chunk_sizes, DEFAULT_ANE_CHUNK_S),
         )
         return 0
 
@@ -1117,6 +1223,8 @@ def main() -> int:
                 P_FULL=ANE_P_FULL,
                 compute_precision_mode=args.compute_precision,
                 manifest_meta=calib_meta,
+                jobs=eff_jobs,
+                chunk_sizes=_parse_chunk_sizes(args.chunk_sizes, ANE_CHUNK_S),
             )
         else:
             uv_bin = shutil.which("uv")
@@ -1136,6 +1244,8 @@ def main() -> int:
                 args.variant,
                 "--compute-precision",
                 args.compute_precision,
+                "--jobs",
+                str(eff_jobs),
                 "--compile-only-fp16-npz",
                 str(weights_npz),
                 "--compile-only-w8-npz",
@@ -1147,9 +1257,16 @@ def main() -> int:
                 "--compile-only-meta-json",
                 json.dumps(calib_meta),
             ]
+            if args.chunk_sizes:
+                cmd.extend(["--chunk-sizes", str(args.chunk_sizes)])
             if args.keep_mlpackage:
                 cmd.append("--keep-mlpackage")
-            subprocess.check_call(cmd)
+            sub_env = dict(os.environ)
+            shared_root = str(Path(sys.modules["fast_shared.parallel_coreml"].__file__ or "").resolve().parents[1])
+            if shared_root:
+                cur_pp = sub_env.get("PYTHONPATH", "")
+                sub_env["PYTHONPATH"] = f"{shared_root}{os.pathsep}{cur_pp}" if cur_pp else shared_root
+            subprocess.check_call(cmd, env=sub_env)
     finally:
         if tmp_awq_npz is not None and tmp_awq_npz.exists():
             tmp_awq_npz.unlink()

@@ -30,6 +30,7 @@ from pathlib import Path
 import random
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Iterator
 
@@ -39,6 +40,9 @@ os.environ["TOKENIZERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = REPO_ROOT / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 DEFAULT_BF16_BASE_DIR = (
     Path.home()
@@ -147,7 +151,60 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=2, help="batches per optimizer step")
     ap.add_argument("--max-batch-tokens", type=int, default=3800)
-    ap.add_argument("--ckpt-tokens", type=int, default=2200, help="activation-checkpoint batches above this size")
+    ap.add_argument(
+        "--ckpt-tokens",
+        type=int,
+        default=None,
+        help="activation-checkpoint batches above this size (default: 2200 for BF16, 4096 for --qlora-8bit)",
+    )
+    ap.add_argument(
+        "--pack-tokens",
+        type=int,
+        default=0,
+        help="fixed-bin varlen sequence packing capacity (e.g. 2048 or 4096); 0 disables packing",
+    )
+    ap.add_argument(
+        "--loss-norm",
+        choices=("token", "example"),
+        default="token",
+        help="answer loss weighting in packed bins (token-mean or example-mean)",
+    )
+    ap.add_argument(
+        "--no-fixed-pad",
+        action="store_true",
+        help="disable trailing bin padding to --pack-tokens (allows variable bin shapes)",
+    )
+    ap.add_argument(
+        "--qlora-8bit",
+        action="store_true",
+        help="quantize frozen trunk to 8-bit g64 with BF16 LoRA adapters and auto-raise --ckpt-tokens to 4096",
+    )
+    ap.add_argument(
+        "--qlora-quantize-lm-head",
+        action="store_true",
+        help="also quantize tied embed_tokens/lm_head to 8-bit g64 under --qlora-8bit",
+    )
+    ap.add_argument(
+        "--bf16-lora",
+        action="store_true",
+        help="cast LoRA (A, B) adapter weights to BF16 (automatically enabled under --qlora-8bit)",
+    )
+    ap.add_argument(
+        "--shared-sys-kv",
+        action="store_true",
+        help="reuse differentiable system-prefix KV across grad_accum micro-batches",
+    )
+    ap.add_argument(
+        "--min-shared-prefix",
+        type=int,
+        default=32,
+        help="minimum common prefix tokens required to activate --shared-sys-kv",
+    )
+    ap.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="disable @mx.compile on chunked softcap+CE and AdamW updates (for A/B baselines)",
+    )
     ap.add_argument("--val-loss-docs", type=int, default=96, help="held-out docs scored at each eval")
     ap.add_argument("--resume", action="store_true", help="continue from adapters_last + train_state.json")
     ap.add_argument("--init-adapter", type=Path, default=None, help="warm-start weights for a fresh schedule")
@@ -179,11 +236,29 @@ def main() -> int:
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
-    from mlx.utils import tree_flatten, tree_map
-    from mlx_lm.models.gemma4_text import logit_softcap
+    from mlx.utils import tree_flatten
     from mlx_lm.tuner.lora import LoRALinear
     from mlx_lm.tuner.utils import linear_to_lora_layers, print_trainable_parameters
     from mlx_lm.utils import load_model
+    from fast_gemma4.lora_accel import (
+        CompiledOptimizerStep,
+        build_packed_groups,
+        build_shared_prefix_packed_groups,
+        cast_lora_adapters_dtype,
+        chunked_softcap_ce_loss,
+        compute_effective_ckpt_tokens,
+        compute_packed_tail_ce_loss,
+        find_shared_prefix_len,
+        pack_examples_to_bin,
+        pack_suffixes_for_shared_prefix,
+        quantize_frozen_trunk_8bit,
+        run_frozen_prefix_packed,
+        run_shared_prefix_grad_accum_step,
+        unwrap_kv_shared_lora_modules,
+    )
+
+    use_compile = not args.no_compile
+    eff_ckpt_tokens = compute_effective_ckpt_tokens(args.ckpt_tokens, qlora_8bit=args.qlora_8bit)
 
     # GPU memory is wired and cannot be paged out, so clamp cleanly to host RAM & Metal recommended working set.
     host_ram = _host_ram_gib()
@@ -211,19 +286,7 @@ def main() -> int:
     random.seed(args.seed)
 
     def unwrap_kv_shared_lora(model: Any) -> int:
-        tm = model.language_model.model
-        unwrapped = 0
-        for idx, layer in enumerate(tm.layers):
-            # Layers that read another layer's KV have dead k/v projections (E2B: 15..34, E4B: 24..41).
-            if tm.previous_kvs[idx] != idx:
-                attn = layer.self_attn
-                if isinstance(attn.k_proj, LoRALinear):
-                    attn.k_proj = attn.k_proj.linear
-                    unwrapped += 1
-                if isinstance(attn.v_proj, LoRALinear):
-                    attn.v_proj = attn.v_proj.linear
-                    unwrapped += 1
-        return unwrapped
+        return unwrap_kv_shared_lora_modules(model)
 
     def run_frozen_prefix(model: Any, inputs: Any, first_lora_layer: int) -> tuple[Any, list[Any], list[Any], list[Any]]:
         tm = model.language_model.model
@@ -295,21 +358,50 @@ def main() -> int:
         # Gather ONLY true answer positions across the batch -> zero 262K lm_head FLOPs on prompt or pad tokens!
         h_slices = [h_norm[b_i, s0:s1, :] for b_i, (s0, s1) in enumerate(spans)]
         h_ans_2d = mx.concatenate(h_slices, axis=0)
-        n_tot_ans = int(h_ans_2d.shape[0])
-        chunk_losses: list[Any] = []
-        for c0 in range(0, n_tot_ans, 256):
-            c1 = min(n_tot_ans, c0 + 256)
-            h_sub = h_ans_2d[c0:c1]
-            lg_sub = tm.embed_tokens.as_linear(h_sub) if lm.tie_word_embeddings else lm.lm_head(h_sub)
-            if lm.final_logit_softcapping is not None:
-                lg_sub = logit_softcap(lm.final_logit_softcapping, lg_sub)
-            chunk_losses.append(nn.losses.cross_entropy(lg_sub.astype(mx.float32), y_flat[c0:c1], reduction="sum"))
-        return sum(chunk_losses) * (1.0 / max(n_tot_ans, 1))
+        lm_head_fn = tm.embed_tokens.as_linear if lm.tie_word_embeddings else lm.lm_head
+        return chunked_softcap_ce_loss(
+            lm_head_fn,
+            h_ans_2d,
+            y_flat,
+            softcap=lm.final_logit_softcapping,
+            chunk_size=256,
+            compiled=use_compile,
+        )
 
     def eval_dataset_loss(model: Any, dataset: list[tuple[list[int], int]], first_lora_layer: int) -> float:
         model.eval()
         tot_loss = 0.0
         tot_toks = 0
+        if args.pack_tokens > 0:
+            eval_bins = build_packed_groups(dataset, pack_tokens=args.pack_tokens, seed=1)
+            for grp in eval_bins:
+                pbin = pack_examples_to_bin(
+                    grp,
+                    pack_tokens=args.pack_tokens,
+                    pad_to_fixed=not args.no_fixed_pad,
+                    loss_norm="token",
+                )
+                n_ans = int(pbin.y_flat.shape[0])
+                h, masks, inter, pli_list, rope_tables = run_frozen_prefix_packed(model, pbin, first_lora_layer)
+                loss = compute_packed_tail_ce_loss(
+                    model,
+                    h,
+                    masks,
+                    inter,
+                    pli_list,
+                    rope_tables,
+                    pbin.ans_indices,
+                    pbin.y_flat,
+                    None,
+                    first_lora_layer,
+                    use_ckpt=False,
+                    compiled_ce=use_compile,
+                )
+                mx.eval(loss)
+                tot_loss += float(loss.item()) * n_ans
+                tot_toks += n_ans
+            return tot_loss / max(tot_toks, 1)
+
         eval_batches = build_length_bucketed_batches(
             dataset, batch_size=args.batch_size, max_batch_tokens=args.max_batch_tokens, pool_factor=64, seed=1
         )
@@ -346,15 +438,39 @@ def main() -> int:
         gc.collect()
         mx.clear_cache()
 
+        q_stats: dict[str, int] | None = None
+        if args.qlora_8bit and not args.fuse_only:
+            q_stats = quantize_frozen_trunk_8bit(
+                model,
+                group_size=64,
+                bits=8,
+                quantize_ple_embedding=True,
+                quantize_embed_tokens=args.qlora_quantize_lm_head,
+            )
+            mx.eval(model.parameters())
+            gc.collect()
+            mx.clear_cache()
+
         model.freeze()
         lora_cfg = {"rank": args.rank, "scale": args.scale, "dropout": args.dropout}
         linear_to_lora_layers(model, num_layers=args.num_layers, config=lora_cfg)
+        n_bf16_cast = 0
+        if args.qlora_8bit or args.bf16_lora:
+            n_bf16_cast = cast_lora_adapters_dtype(model, mx.bfloat16)
         n_unwrapped = unwrap_kv_shared_lora(model)
         expected_lora_modules = sum(1 for _, m in model.named_modules() if isinstance(m, LoRALinear))
         first_lora_layer = len(model.layers) - args.num_layers
+        mode_tag = "QLoRA-8bit-g64" if args.qlora_8bit else "BF16"
+        q_desc = (
+            f" | q8_linears={q_stats['linear_quantized']} q8_embs={q_stats['embedding_quantized']}"
+            if q_stats is not None
+            else ""
+        )
         print(
-            f"   Loaded BF16 base in {time.perf_counter() - t_start:.2f}s | active LoRA modules={expected_lora_modules} "
-            f"(unwrapped={n_unwrapped}) | layers=[{first_lora_layer}..{len(model.layers) - 1}]",
+            f"   Loaded {mode_tag} base in {time.perf_counter() - t_start:.2f}s | "
+            f"active LoRA modules={expected_lora_modules} (unwrapped={n_unwrapped}, bf16_lora={n_bf16_cast}) | "
+            f"layers=[{first_lora_layer}..{len(model.layers) - 1}] | ckpt_tokens={eff_ckpt_tokens} "
+            f"pack_tokens={args.pack_tokens} shared_sys_kv={args.shared_sys_kv} compiled={use_compile}{q_desc}",
             flush=True,
         )
         print_trainable_parameters(model)
@@ -369,17 +485,38 @@ def main() -> int:
             val_data = [(list(ids), int(p_len)) for ids, p_len in pairs["valid"]]
             d_stats = pairs.get("stats", {})
             del pairs
-            epoch_batches = [
-                build_length_bucketed_batches(
-                    train_data,
-                    batch_size=args.batch_size,
-                    max_batch_tokens=args.max_batch_tokens,
-                    seed=args.data_seed + ep,
-                )
-                for ep in range(1, args.epochs + 1)
-            ]
-            total_steps = sum(len(b) for b in epoch_batches)
             accum = max(1, args.grad_accum)
+            if args.shared_sys_kv:
+                epoch_batches = [
+                    build_shared_prefix_packed_groups(
+                        train_data,
+                        pack_tokens=args.pack_tokens,
+                        min_shared_prefix=args.min_shared_prefix,
+                        grad_accum=accum,
+                        seed=args.data_seed + ep,
+                    )
+                    for ep in range(1, args.epochs + 1)
+                ]
+            elif args.pack_tokens > 0:
+                epoch_batches = [
+                    build_packed_groups(
+                        train_data,
+                        pack_tokens=args.pack_tokens,
+                        seed=args.data_seed + ep,
+                    )
+                    for ep in range(1, args.epochs + 1)
+                ]
+            else:
+                epoch_batches = [
+                    build_length_bucketed_batches(
+                        train_data,
+                        batch_size=args.batch_size,
+                        max_batch_tokens=args.max_batch_tokens,
+                        seed=args.data_seed + ep,
+                    )
+                    for ep in range(1, args.epochs + 1)
+                ]
+            total_steps = sum(len(b) for b in epoch_batches)
             total_opt_steps = math.ceil(total_steps / accum)
             print(f"2. Dataset prepared: {json.dumps(d_stats)} | total_batches={total_steps}", flush=True)
 
@@ -423,7 +560,11 @@ def main() -> int:
                 return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * min(1.0, prog)))
 
             optimizer = optim.AdamW(learning_rate=args.lr, weight_decay=0.01)
+            opt_stepper = CompiledOptimizerStep(
+                optimizer, model, max_grad_norm=1.0, compiled=use_compile
+            )
             loss_and_grad_fn = nn.value_and_grad(model, compute_batched_tail_ce_loss)
+            packed_loss_and_grad_fn = nn.value_and_grad(model, compute_packed_tail_ce_loss)
 
             step = 0
             skip_batches = int(state["batches_done"])
@@ -435,90 +576,193 @@ def main() -> int:
             acc_n = 0
             cur_lr = get_lr(skip_batches // accum)
 
-            for ep_idx, batches in enumerate(epoch_batches, start=1):
-                model.train()
-                for batch in batches:
-                    step += 1
-                    if step <= skip_batches:
-                        continue
+            def _maybe_log_eval_or_stop(
+                ep_idx_: int,
+                prev_step_: int,
+                cur_step_: int,
+                shape_desc_: str,
+            ) -> bool:
+                nonlocal running_loss, running_cnt, best_val, best_step
+                should_log = (
+                    (prev_step_ // 50) < (cur_step_ // 50)
+                    or prev_step_ == skip_batches
+                    or (args.smoke_steps > 0 and cur_step_ >= args.smoke_steps)
+                )
+                if should_log:
+                    elapsed = time.perf_counter() - t_train0
+                    tok_s = toks_done / max(elapsed, 1e-6)
+                    s_per_step = elapsed / max(1, cur_step_ - skip_batches)
+                    eta_m = s_per_step * max(0, total_steps - cur_step_) / 60.0
+                    peak_gb = mx.get_peak_memory() / (1024**3)
+                    avg_l = running_loss / max(running_cnt, 1)
+                    running_loss = 0.0
+                    running_cnt = 0
+                    print(
+                        f"   [Ep {ep_idx_}/{args.epochs} | Batch {cur_step_}/{total_steps}] "
+                        f"train_loss={avg_l:.4f} lr={cur_lr:.2e} {shape_desc_} "
+                        f"({s_per_step:.2f}s/batch, {tok_s:.0f} tok/s, ETA={eta_m:.1f}m, peak_mem={peak_gb:.2f}GB)",
+                        flush=True,
+                    )
+
+                if args.smoke_steps and cur_step_ >= args.smoke_steps:
+                    v_smoke = eval_dataset_loss(model, val_loss_set, first_lora_layer)
+                    print(
+                        f"   [Smoke] post-{cur_step_}-batches val_loss ({len(val_loss_set)} docs) = {v_smoke:.4f}",
+                        flush=True,
+                    )
+                    return True
+
+                if (prev_step_ // args.eval_every) < (cur_step_ // args.eval_every) or cur_step_ == total_steps:
+                    t_ev = time.perf_counter()
+                    v_cur = eval_dataset_loss(model, val_loss_set, first_lora_layer)
+                    val_history.append({"step": cur_step_, "epoch": ep_idx_, "val_loss": round(v_cur, 5)})
+                    marker = ""
+                    if v_cur < best_val:
+                        best_val = v_cur
+                        best_step = cur_step_
+                        save_adapter(best_adapter_path)
+                        marker = " *BEST*"
+                    # Only a batch count on an optimizer-step boundary is resumable without dropping gradients.
+                    if acc_n == 0:
+                        save_adapter(last_adapter_path)
+                        state_path.write_text(
+                            json.dumps(
+                                {
+                                    "batches_done": cur_step_,
+                                    "best_val": best_val,
+                                    "best_step": best_step,
+                                    "val_history": val_history,
+                                },
+                                indent=1,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    print(
+                        f"   >>> [Eval @ batch {cur_step_}] val_loss={v_cur:.4f} (ppl={math.exp(v_cur):.3f}, {time.perf_counter()-t_ev:.1f}s){marker}",
+                        flush=True,
+                    )
+                    gc.collect()
+                    mx.clear_cache()
+                    model.train()
+                return False
+
+            def _run_single_batch(batch: list[tuple[list[int], int]]) -> tuple[float, int, str]:
+                nonlocal acc_grads, acc_n, cur_lr
+                if args.pack_tokens > 0:
+                    pbin = pack_examples_to_bin(
+                        batch,
+                        pack_tokens=args.pack_tokens,
+                        pad_to_fixed=not args.no_fixed_pad,
+                        pad_multiple=64 if args.no_fixed_pad else 1,
+                        loss_norm=args.loss_norm,
+                    )
+                    use_ckpt = pbin.bin_tokens > eff_ckpt_tokens
+                    h, masks, inter, pli_list, rope_tables = run_frozen_prefix_packed(
+                        model, pbin, first_lora_layer
+                    )
+                    loss, grads = packed_loss_and_grad_fn(
+                        model,
+                        h,
+                        masks,
+                        inter,
+                        pli_list,
+                        rope_tables,
+                        pbin.ans_indices,
+                        pbin.y_flat,
+                        pbin.token_weights,
+                        first_lora_layer,
+                        use_ckpt=use_ckpt,
+                        compiled_ce=use_compile,
+                    )
+                    b_toks = pbin.real_tokens
+                    shape_desc = f"P={pbin.num_examples}docs/{pbin.real_tokens}->{pbin.bin_tokens}"
+                else:
                     inputs, spans, y_flat = make_padded_batch(batch)
                     b_toks = int(inputs.shape[0] * inputs.shape[1])
-                    use_ckpt = b_toks > args.ckpt_tokens
+                    use_ckpt = b_toks > eff_ckpt_tokens
                     h, masks, inter, pli_list = run_frozen_prefix(model, inputs, first_lora_layer)
                     loss, grads = loss_and_grad_fn(
                         model, h, masks, inter, pli_list, spans, y_flat, first_lora_layer, use_ckpt
                     )
-                    acc_grads = grads if acc_grads is None else tree_map(lambda a, g: a + g, acc_grads, grads)
-                    acc_n += 1
-                    mx.eval(loss, acc_grads)
-                    if acc_n >= accum or step == total_steps:
-                        if acc_n > 1:
-                            acc_grads = tree_map(lambda g, _n=acc_n: g / _n, acc_grads)
-                        acc_grads, _ = optim.clip_grad_norm(acc_grads, max_norm=1.0)
-                        cur_lr = get_lr((step - 1) // accum)
-                        optimizer.learning_rate = cur_lr
-                        optimizer.update(model, acc_grads)
-                        mx.eval(model.parameters(), optimizer.state)
-                        acc_grads = None
-                        acc_n = 0
+                    shape_desc = f"B={inputs.shape[0]}x{inputs.shape[1]}"
 
-                    running_loss += float(loss.item())
+                acc_grads = opt_stepper.accumulate(acc_grads, grads)
+                acc_n += 1
+                mx.eval(loss, acc_grads)
+                if acc_n >= accum or step == total_steps:
+                    cur_lr = get_lr((step - 1) // accum)
+                    opt_stepper.step(model, acc_grads, lr=cur_lr, accum_divisor=acc_n)
+                    mx.eval(model.parameters(), optimizer.state)
+                    acc_grads = None
+                    acc_n = 0
+                return float(loss.item()), b_toks, shape_desc
+
+            for ep_idx, batches in enumerate(epoch_batches, start=1):
+                model.train()
+                b_cursor = 0
+                while b_cursor < len(batches):
+                    if args.shared_sys_kv and acc_n == 0 and step >= skip_batches:
+                        win_len = min(accum, len(batches) - b_cursor)
+                        if args.smoke_steps > 0:
+                            win_len = min(win_len, max(1, args.smoke_steps - step))
+                        window = batches[b_cursor : b_cursor + win_len]
+                        all_ex = [ex for b in window for ex in b]
+                        sys_len = find_shared_prefix_len(all_ex, min_len=args.min_shared_prefix)
+                        if sys_len >= args.min_shared_prefix:
+                            prev_step = step
+                            step += win_len
+                            b_cursor += win_len
+                            suf_cap = args.pack_tokens if args.pack_tokens > 0 else 0
+                            suffix_bins = [
+                                pack_suffixes_for_shared_prefix(
+                                    b,
+                                    sys_len=sys_len,
+                                    pack_tokens=suf_cap,
+                                    pad_to_fixed=(args.pack_tokens > 0 and not args.no_fixed_pad),
+                                    pad_multiple=64 if (args.pack_tokens > 0 and args.no_fixed_pad) else 1,
+                                    loss_norm=args.loss_norm,
+                                )
+                                for b in window
+                            ]
+                            avg_l, total_grads, per_bin_losses = run_shared_prefix_grad_accum_step(
+                                model,
+                                all_ex[0][0][:sys_len],
+                                suffix_bins,
+                                first_lora_layer,
+                                ckpt_tokens=eff_ckpt_tokens,
+                                compiled_ce=use_compile,
+                                sys_dropout_seed=(args.seed + step) if args.dropout > 0.0 else None,
+                            )
+                            cur_lr = get_lr((step - 1) // accum)
+                            opt_stepper.step(model, total_grads, lr=cur_lr, accum_divisor=1)
+                            mx.eval(model.parameters(), optimizer.state)
+                            running_loss += sum(per_bin_losses)
+                            running_cnt += len(per_bin_losses)
+                            toks_done += sum(sb.logical_total_tokens for sb in suffix_bins)
+                            shape_desc = (
+                                f"SYS={sys_len}+K={win_len}x"
+                                f"{sum(sb.real_suffix_tokens for sb in suffix_bins) // max(1, win_len)}"
+                            )
+                            if _maybe_log_eval_or_stop(ep_idx, prev_step, step, shape_desc):
+                                return 0
+                            continue
+
+                    batch = batches[b_cursor]
+                    b_cursor += 1
+                    prev_step = step
+                    step += 1
+                    if step <= skip_batches:
+                        continue
+                    l_val, b_toks, shape_desc = _run_single_batch(batch)
+                    running_loss += l_val
                     running_cnt += 1
                     toks_done += b_toks
-
-                    if step % 50 == 0 or step == skip_batches + 1 or (args.smoke_steps and step >= args.smoke_steps):
-                        elapsed = time.perf_counter() - t_train0
-                        tok_s = toks_done / max(elapsed, 1e-6)
-                        s_per_step = elapsed / (step - skip_batches)
-                        eta_m = s_per_step * max(0, total_steps - step) / 60.0
-                        peak_gb = mx.get_peak_memory() / (1024**3)
-                        avg_l = running_loss / max(running_cnt, 1)
-                        running_loss = 0.0
-                        running_cnt = 0
-                        print(
-                            f"   [Ep {ep_idx}/{args.epochs} | Batch {step}/{total_steps}] "
-                            f"train_loss={avg_l:.4f} lr={cur_lr:.2e} B={inputs.shape[0]}x{inputs.shape[1]} "
-                            f"({s_per_step:.2f}s/batch, {tok_s:.0f} tok/s, ETA={eta_m:.1f}m, peak_mem={peak_gb:.2f}GB)",
-                            flush=True,
-                        )
-
-                    if args.smoke_steps and step >= args.smoke_steps:
-                        v_smoke = eval_dataset_loss(model, val_loss_set, first_lora_layer)
-                        print(f"   [Smoke] post-{step}-batches val_loss ({len(val_loss_set)} docs) = {v_smoke:.4f}", flush=True)
+                    if _maybe_log_eval_or_stop(ep_idx, prev_step, step, shape_desc):
                         return 0
 
-                    if step % args.eval_every == 0 or step == total_steps:
-                        t_ev = time.perf_counter()
-                        v_cur = eval_dataset_loss(model, val_loss_set, first_lora_layer)
-                        val_history.append({"step": step, "epoch": ep_idx, "val_loss": round(v_cur, 5)})
-                        marker = ""
-                        if v_cur < best_val:
-                            best_val = v_cur
-                            best_step = step
-                            save_adapter(best_adapter_path)
-                            marker = " *BEST*"
-                        # Only a batch count on an optimizer-step boundary is resumable without dropping gradients.
-                        if acc_n == 0:
-                            save_adapter(last_adapter_path)
-                            state_path.write_text(
-                                json.dumps(
-                                    {"batches_done": step, "best_val": best_val, "best_step": best_step,
-                                     "val_history": val_history},
-                                    indent=1,
-                                )
-                                + "\n",
-                                encoding="utf-8",
-                            )
-                        print(
-                            f"   >>> [Eval @ batch {step}] val_loss={v_cur:.4f} (ppl={math.exp(v_cur):.3f}, {time.perf_counter()-t_ev:.1f}s){marker}",
-                            flush=True,
-                        )
-                        gc.collect()
-                        mx.clear_cache()
-                        model.train()
-
             adapter_meta = {
-                "fine_tune_type": "lora",
+                "fine_tune_type": "qlora_8bit" if args.qlora_8bit else "lora",
                 "version": "v6_4_c2_c4_bf16",
                 "base_snap": str(args.base_snap),
                 "num_layers": args.num_layers,
@@ -535,6 +779,12 @@ def main() -> int:
                 "batch_size": args.batch_size,
                 "grad_accum": accum,
                 "lr": args.lr,
+                "qlora_8bit": bool(args.qlora_8bit),
+                "pack_tokens": int(args.pack_tokens),
+                "loss_norm": str(args.loss_norm),
+                "shared_sys_kv": bool(args.shared_sys_kv),
+                "compiled_ce_adamw": bool(use_compile),
+                "effective_ckpt_tokens": int(eff_ckpt_tokens),
                 "val_history": val_history,
             }
             (adapter_dir / "adapter_config.json").write_text(

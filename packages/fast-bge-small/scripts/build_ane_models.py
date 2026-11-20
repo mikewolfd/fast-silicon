@@ -8,11 +8,28 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import time
 from pathlib import Path
+import sys
+import time
+from typing import Sequence
 
 import numpy as np
+
+try:
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
+except ModuleNotFoundError:  # pragma: no cover - standalone invocation without editable install
+    _shared_src = Path(__file__).resolve().parents[2] / "fast-shared" / "src"
+    if _shared_src.is_dir() and str(_shared_src) not in sys.path:
+        sys.path.insert(0, str(_shared_src))
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
 
 # Smallest positive normal IEEE-754 binary16 value: 2^-14 ~= 6.103515625e-5.
 # Clamping LayerNorm epsilon to >= MIN_FP16_LAYERNORM_EPS prevents np.float16(1e-12)
@@ -184,6 +201,9 @@ def build_bert_ane_mil(
     return bge_body
 
 
+_WORKER_NPZ_CACHE: dict[tuple[str, int], dict[str, np.ndarray]] = {}
+
+
 def compile_bucket(
     weights: dict[str, np.ndarray],
     ane_dir: Path,
@@ -193,33 +213,123 @@ def compile_bucket(
     layer_norm_eps: float = 1e-12,
 ) -> Path:
     import coremltools as ct
+    import shutil
+    import tempfile
 
     tag = f"bge_b{batch_size}_s{seq_len}_fp16"
     out_mlmodelc = ane_dir / f"{tag}.mlmodelc"
-    if out_mlmodelc.exists():
-        shutil.rmtree(out_mlmodelc)
 
     t0 = time.perf_counter()
     prog = build_bert_ane_mil(weights, batch_size, seq_len, layer_norm_eps=layer_norm_eps)
     mlmodel = ct.convert(
         prog,
+        convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS15,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
+        skip_model_load=True,
     )
-    compiled_tmp = mlmodel.get_compiled_model_path()
-    shutil.copytree(compiled_tmp, out_mlmodelc)
-    print(f"Built {tag}.mlmodelc in {time.perf_counter() - t0:.2f}s -> {out_mlmodelc}")
+    with tempfile.TemporaryDirectory(prefix=f"{tag}_") as tmp_dir:
+        pkg_path = Path(tmp_dir) / f"{tag}.mlpackage"
+        mlmodel.save(str(pkg_path))
+        compiled_tmp = Path(ct.utils.compile_model(str(pkg_path)))
+        try:
+            atomic_publish_dir(compiled_tmp, out_mlmodelc, move=True)
+        except Exception:
+            shutil.rmtree(compiled_tmp, ignore_errors=True)
+            raise
+    print(f"Built {tag}.mlmodelc in {time.perf_counter() - t0:.2f}s -> {out_mlmodelc}", flush=True)
     return out_mlmodelc
+
+
+def _compile_bge_bucket_task(task: tuple[str, str, int, int, float]) -> str:
+    """Top-level `spawn`-safe worker task compiling one `(B, S)` BGE-small `.mlmodelc` bucket."""
+    npz_path_str, ane_dir_str, batch_size, seq_len, layer_norm_eps = task
+    npz_p = Path(npz_path_str)
+    cache_key = (str(npz_p), npz_p.stat().st_mtime_ns)
+    weights = _WORKER_NPZ_CACHE.get(cache_key)
+    if weights is None:
+        with np.load(npz_p) as npz_obj:
+            weights = {k: npz_obj[k] for k in npz_obj.files}
+        _WORKER_NPZ_CACHE.clear()
+        _WORKER_NPZ_CACHE[cache_key] = weights
+    out_path = compile_bucket(
+        weights,
+        Path(ane_dir_str),
+        int(batch_size),
+        int(seq_len),
+        layer_norm_eps=float(layer_norm_eps),
+    )
+    return str(out_path)
+
+
+def _parse_bucket_specs(spec: str) -> list[tuple[int, int]]:
+    buckets: list[tuple[int, int]] = []
+    for raw in spec.split(","):
+        tok = raw.strip().lower()
+        if not tok:
+            continue
+        if "x" not in tok:
+            raise ValueError(f"Invalid bucket spec {raw!r}; expected '<B>x<S>' (e.g. '1x64,8x256').")
+        b_str, s_str = tok.split("x", 1)
+        b_val, s_val = int(b_str), int(s_str)
+        if b_val < 1 or s_val < 1:
+            raise ValueError(f"Bucket dimensions must be >= 1, got {raw!r}")
+        buckets.append((b_val, s_val))
+    if not buckets:
+        raise ValueError("At least one bucket specification is required.")
+    return buckets
+
+
+def build_buckets(
+    npz_path: Path,
+    ane_dir: Path,
+    buckets: Sequence[tuple[int, int]],
+    *,
+    jobs: int | None = None,
+    layer_norm_eps: float = 1e-12,
+) -> list[Path]:
+    """Compile BGE-small CoreML buckets across `spawn` workers and return paths in deterministic order."""
+    ane_dir.mkdir(parents=True, exist_ok=True)
+    eff_jobs = default_compile_jobs(jobs)
+    tasks = [
+        (str(npz_path.resolve()), str(ane_dir.resolve()), int(b), int(s), float(layer_norm_eps))
+        for b, s in buckets
+    ]
+    results = compile_buckets_parallel(
+        tasks,
+        _compile_bge_bucket_task,
+        max_workers=eff_jobs,
+        label_fn=lambda t: f"bge_b{t[2]}_s{t[3]}_fp16",
+        extra_sys_paths=(Path(__file__).resolve().parent,),
+    )
+    return [Path(res.value) for res in results]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile CoreML .mlmodelc ANE buckets.")
     parser.add_argument("--home", type=Path, default=repo_root())
     parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Override output directory for compiled .mlmodelc bundles (default: <home>/artifacts/ane_models).",
+    )
+    parser.add_argument(
         "--include-s256-query",
         action="store_true",
         help="Also build optional bge_b1_s256_fp16.mlmodelc single-query bucket (fills 193..256 gap).",
+    )
+    parser.add_argument(
+        "--buckets",
+        default=None,
+        help="Optional comma-separated BxS subset, e.g. '1x24,1x64,1x128,1x192'.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help=f"Parallel CoreML worker processes (default: min(4, cpu_count)={default_compile_jobs()}).",
     )
     args = parser.parse_args()
 
@@ -228,16 +338,22 @@ def main() -> None:
     if not npz_path.exists():
         raise FileNotFoundError(f"Run scripts/export_weights.py first to create {npz_path}")
 
-    ane_dir = home / "artifacts" / "ane_models"
-    ane_dir.mkdir(parents=True, exist_ok=True)
-    weights = dict(np.load(npz_path))
+    ane_dir = args.out_dir.resolve() if args.out_dir is not None else (home / "artifacts" / "ane_models")
+    if args.buckets:
+        buckets = _parse_bucket_specs(args.buckets)
+    else:
+        buckets = list(PRODUCTION_BUCKETS)
+        if args.include_s256_query:
+            buckets.extend(OPTIONAL_QUERY_BUCKETS)
 
-    buckets = list(PRODUCTION_BUCKETS)
-    if args.include_s256_query:
-        buckets.extend(OPTIONAL_QUERY_BUCKETS)
-
-    for b, s in buckets:
-        compile_bucket(weights, ane_dir, b, s)
+    eff_jobs = default_compile_jobs(args.jobs)
+    t0 = time.perf_counter()
+    built = build_buckets(npz_path, ane_dir, buckets, jobs=eff_jobs)
+    print(
+        f"Compiled {len(built)} BGE-small ANE bucket(s) with jobs={min(eff_jobs, len(built))} "
+        f"in {time.perf_counter() - t0:.2f}s -> {ane_dir}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
