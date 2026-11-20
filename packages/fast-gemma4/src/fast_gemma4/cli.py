@@ -35,19 +35,26 @@ def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
     )
 
 
+def _resolve_script(paths: Any, name: str) -> Path:
+    script = paths.home / "scripts" / name
+    if script.exists():
+        return script
+    return Path(__file__).resolve().parents[2] / "scripts" / name
+
+
 def _cmd_setup_weights(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
     model_dir = resolve_hf_model_dir(args.model_dir, DEFAULT_HF_REPO, local_files_only=args.local_files_only)
     copy_tokenizer_files(model_dir, paths.tokenizer_dir)
 
-    script_vocab = paths.home / "scripts" / "build_vocab_remap.py"
+    script_vocab = _resolve_script(paths, "build_vocab_remap.py")
     if script_vocab.exists():
         rc = subprocess.call([sys.executable, str(script_vocab), "--home", str(paths.home)])
         if rc != 0:
             return rc
 
     if not args.skip_early14:
-        script_exp = paths.home / "scripts" / "export_early14_f16.py"
+        script_exp = _resolve_script(paths, "export_early14_f16.py")
         if script_exp.exists():
             cmd = [sys.executable, str(script_exp), "--home", str(paths.home), "--model-dir", str(model_dir)]
             return subprocess.call(cmd)
@@ -56,7 +63,7 @@ def _cmd_setup_weights(args: argparse.Namespace) -> int:
 
 def _cmd_setup_ane(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
-    script = paths.home / "scripts" / "build_ane_models.py"
+    script = _resolve_script(paths, "build_ane_models.py")
     if not script.exists():
         raise FileNotFoundError(f"Missing {script}")
     cmd = [sys.executable, str(script), "--home", str(paths.home), "--variant", args.variant]

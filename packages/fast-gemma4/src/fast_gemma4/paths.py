@@ -212,7 +212,10 @@ def resolve_paths(home: str | Path | None = None) -> Gemma4Paths:
         art = data_root / "artifacts"
     else:
         build_root = pkg_root if (pkg_root / "build").exists() or (pkg_root / "native").exists() else data_root
-        art = (data_root / "artifacts") if (data_root / "artifacts").is_dir() or data_root == pkg_root else data_root
+        has_direct_art = any(
+            (data_root / d).is_dir() for d in ("ane_models", "weights", "models", "tokenizer", "hf_model")
+        )
+        art = (data_root / "artifacts") if ((data_root / "artifacts").is_dir() or data_root == pkg_root or not has_direct_art) else data_root
     ane_dir = art / "ane_models"
     return Gemma4Paths(
         home=build_root if (home is None and not os.environ.get("FAST_GEMMA4_HOME") and (build_root / "tests").is_dir() and data_root == pkg_root) else data_root,

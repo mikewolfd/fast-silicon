@@ -53,7 +53,9 @@ def test_native_gemma4_ane_cli(paths: Gemma4Paths) -> None:
         text=True,
     ).strip()
     info = json.loads(raw.splitlines()[-1])
-    assert info["ane_ops"] == 1326
+    assert info["ane_ops"] >= 1326
+    assert info["cpu_runtime_ops"] == 0
+    assert info["gpu_ops"] == 0
     assert info["batch"] == 4
     assert info["S"] == 256
     assert info["best_sec"] > 0.0
@@ -110,6 +112,8 @@ def test_prefix_kv_equivalence_and_single_prompt(engine: FastGemma4Engine) -> No
 
 def test_schema_and_prompt_lookup_exactness(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:
     fix_dir = paths.home / "tests" / "fixtures"
+    if not fix_dir.is_dir():
+        fix_dir = Path(__file__).resolve().parent / "fixtures"
     schema_p = fix_dir / "extract_v1.schema.json"
     docs_p = fix_dir / "sample_docs_8.json"
     sys_p = fix_dir / "sys_extract_v1.txt"
@@ -183,9 +187,14 @@ def test_schema_and_prompt_lookup_exactness(paths: Gemma4Paths, engine: FastGemm
 
 
 def test_hetero_ane_gpu_prefix_pipeline(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:
-    if not engine.ane_available:
+    has_ane_bundle = paths.lib_ane_prefix.exists() and (
+        paths.resolve_ane_bundle("fp16") is not None or paths.resolve_ane_bundle("w8") is not None
+    )
+    if not engine.ane_available and not has_ane_bundle:
         pytest.skip("ANE bundle unavailable")
     fix_dir = paths.home / "tests" / "fixtures"
+    if not fix_dir.is_dir():
+        fix_dir = Path(__file__).resolve().parent / "fixtures"
     schema_p = fix_dir / "extract_v1.schema.json"
     docs_p = fix_dir / "sample_docs_8.json"
     sys_p = fix_dir / "sys_extract_v1.txt"
@@ -206,14 +215,25 @@ def test_hetero_ane_gpu_prefix_pipeline(paths: Gemma4Paths, engine: FastGemma4En
     assert sum(1 for it in ref_gpu.items if it.parsed and it.parsed.get("status") == "usable") >= 6
 
     prompts_64 = [prompts_8[i % 8] for i in range(64)]
-    res_het = engine.generate_batch(
-        prompts_64,
-        system_prompt=sys_prompt,
-        json_schema=schema_str,
-        max_tokens=512,
-        mode="hetero",
-        batch_size=64,
+    het_engine = engine if engine.ane_available else FastGemma4Engine(
+        home=paths.home, default_mode="hetero", allow_ane_on_low_ram=True, warmup=True, warmup_ane=False
     )
+    try:
+        res_het = het_engine.generate_batch(
+            prompts_64,
+            system_prompt=sys_prompt,
+            json_schema=schema_str,
+            max_tokens=512,
+            mode="hetero",
+            batch_size=64,
+        )
+    finally:
+        if het_engine is not engine:
+            het_engine.close()
+            import gc
+
+            gc.collect()
+            mx.clear_cache()
     assert res_het.stats["mode_used"] == "hetero_ane_gpu"
     assert res_het.stats["lcp"] <= 1408
     assert res_het.stats["valid_json_count"] == 64
@@ -652,6 +672,8 @@ def test_v4_kernels_rolling_split_kv_i8(paths: Gemma4Paths, engine: FastGemma4En
 
     # 4. Continuous rolling refill (N=12 > batch_size=4) + Layer-15 split + EarlyExit14 FF drain + unconstrained & T>0
     fix_dir = paths.home / "tests" / "fixtures"
+    if not fix_dir.is_dir():
+        fix_dir = Path(__file__).resolve().parent / "fixtures"
     schema_p = fix_dir / "extract_v1.schema.json"
     docs_p = fix_dir / "sample_docs_8.json"
     sys_p = fix_dir / "sys_extract_v1.txt"

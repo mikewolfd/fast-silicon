@@ -2,7 +2,7 @@ UV ?= uv
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 NATIVE_PACKAGES := packages/fast-bge-small packages/fast-embeddinggemma-2 packages/fast-gemma4 packages/fast-decision-models packages/fast-pplx
 
-.PHONY: uv-sync hw-check native clean guard test-cpu test-hw sync sync-check sync-clean-check leak-check
+.PHONY: uv-sync hw-check native clean setup guard test-cpu test-hw sync sync-check sync-clean-check leak-check
 
 uv-sync:
 	$(UV) sync --extra dev
@@ -21,6 +21,11 @@ clean:
 		$(MAKE) -C $$pkg clean; \
 	done
 
+SETUP_ARGS ?=
+
+setup:
+	$(PYTHON) scripts/setup_all.py $(SETUP_ARGS)
+
 FAST_IR_GUARD ?= $(shell if [ -x .venv/bin/fast-ir-guard ]; then echo .venv/bin/fast-ir-guard; else echo fast-ir-guard; fi)
 
 guard:
@@ -32,7 +37,8 @@ guard:
 		packages/fast-gemma4/src packages/fast-gemma4/tests \
 		packages/fast-gpt-oss/src packages/fast-gpt-oss/tests \
 		packages/fast-pplx/src packages/fast-pplx/tests \
-		packages/fast-decision-models/src packages/fast-decision-models/tests
+		packages/fast-decision-models/src packages/fast-decision-models/tests \
+		scripts tests
 	$(PYTHON) -m pytest -q packages/fast-shared/tests/test_ir_dtype_guard_cpu.py -k test_clean_pass_on_fast_repos
 
 test-cpu: hw-check
@@ -45,6 +51,7 @@ test-cpu: hw-check
 		packages/fast-gemma4/tests/test_per_doc_grammar.py \
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \
+		tests/test_setup_all_cpu.py \
 		-k "not mpp_matmul and not _gpu"
 	$(PYTHON) -m pytest -v \
 		packages/fast-bge-small/tests/test_fast_bge_small.py \
@@ -59,6 +66,7 @@ test-hw: hw-check
 		echo "==> Running full pytest suite for packages/$$pkg"; \
 		$(PYTHON) -m pytest -v packages/$$pkg/tests || exit 1; \
 	done
+	$(PYTHON) -m pytest -v tests/test_setup_all_cpu.py
 
 sync:
 	$(PYTHON) scripts/sync_from_siblings.py
@@ -71,4 +79,4 @@ sync-clean-check:
 
 leak-check:
 	@! rg -n -i "/users/|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \
-		packages scripts pyproject.toml .agents LICENSE .gitignore uv.lock README.md
+		packages scripts tests pyproject.toml .agents LICENSE .gitignore uv.lock README.md

@@ -5,19 +5,28 @@
 `fast-silicon` is a `uv` workspace of focused inference engines, CLI tools, OpenAI-compatible HTTP servers, and resumable Parquet pipelines built on Apple MLX, CoreML (16-core Neural Engine), and Metal 4. By scheduling work across GPU and ANE without heavy PyTorch runtime bloat, the suite embeds at **183K tok/s** (**0.51 ms** single query; **215K tok/s** standalone OCR), holds **32K**-context embeddings in **2.69 GB** (**1.61x–2.16x** vs `pplx-context-mlx-f16`), extracts strict JSON with **Gemma-4 E2B** (**2.45x** raw / **4.90x** schema-valid vs `mlx_vlm`), and serves **GPT-OSS-20B** at **431.0 tok/s** across `128` parallel documents (**2.73x** vs `mlx_lm`). It also ships a unified monorepo benchmark and `RUSAGE_INFO_V4` memory-footprint harness ([`scripts/benchmark_monorepo.py`](scripts/benchmark_monorepo.py)).
 
 > [!NOTE]
-> **Tested Hardware Baseline (`Mac16,8` — `48 GB` Apple M4 Pro):** Built and verified on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` unified RAM, `14` CPU `[10P + 4E]`, `20` GPU, `16` ANE `h16g` cores, macOS 26.6 / Metal 4), plus a partial hardware cross-check on **Apple M5 (`Mac17,2`, `24 GB`, macOS 27.2.1)** ([comparison below](#cross-chip-comparison-apple-m5-mac172-24-gb-macos-2721)). Other Apple Silicon chips and memory sizes emit a non-fatal startup note (`FAST_SILICON_NO_HW_WARN=1` to mute).
+> **Tested Hardware Baseline (`Mac16,8` — `48 GB` Apple M4 Pro) & M5 (`Mac17,2`) Cross-Check:** Built and verified on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` unified RAM, `14` CPU `[10P + 4E]`, `20` GPU, `16` ANE `h16g` cores, macOS 26.6 / Metal 4), and cross-checked across all 7 package test suites (`0` failures, `0` skips) on **Apple M5 (`Mac17,2`, `24 GB`, macOS 27.2.1, Xcode CLT-only)** ([comparison below](#cross-chip-comparison-apple-m5-mac172-24-gb-macos-2721)). Other Apple Silicon chips and memory sizes emit a non-fatal startup note (`FAST_SILICON_NO_HW_WARN=1` to mute).
 
 ## Quick start
 
 ```bash
-uv sync --extra dev --extra extract  # Create workspace .venv (`extract` needed for R8/schema/Parquet pipelines)
-make hw-check                        # Verify Mac16,8 48 GB M4 Pro host baseline
-make native                          # Compile CoreML / Objective-C++ / NEON libraries across packages
-make guard                           # Run fast-ir-guard --strict-bool-mask (`0` errors)
-make test-cpu                        # Run offline CPU + fault-injection + native parity suites
+uv sync --extra dev --extra extract --extra build  # Create .venv (`extract`: Parquet/schema; `build`: Torch/CoreML ANE export)
+make hw-check                                      # Verify Mac16,8 48 GB M4 Pro host baseline
+make setup                                         # Build native libs, download HF repos, export weights, and compile ANE bundles (~35 GB)
+make guard                                         # Run fast-ir-guard --strict-bool-mask (`0` errors)
+make test-cpu                                      # Run offline CPU + fault-injection + native parity suites
 ```
 
 ```bash
+# Preview what `make setup` will build/download (idempotent; zero GPU/ANE/network work)
+.venv/bin/python scripts/setup_all.py --dry-run
+
+# Useful `setup_all.py` / `make setup SETUP_ARGS="..."` options:
+#   --skip-gpt-oss --skip-test-extras   Skip ~24.8 GB optional checkpoints (useful on 24 GB Macs)
+#   --skip-ane                          Skip CoreML .mlmodelc compilation
+#   --packages bge-small,pplx           Stage only selected package(s)
+#   --target auto|in-repo|cache         Choose layout (or `--artifacts-root <dir>`)
+
 # Dry-run unified M4 Pro benchmark sweep (zero GPU/ANE work)
 .venv/bin/python scripts/benchmark_monorepo.py --dry-run
 
@@ -164,17 +173,17 @@ We cross-checked the compute-bound NAX architecture on a base **Apple M5 (`Mac17
 | `fast-pplx` `doc_s256` (`hetero2` / `ane` / `gpu`) | `14,620.6` / `14,883.7` / `9,772.6 tok/s` | **15,234.7** (`16.80 ms`) / `15,101.0` / `14,144.6 tok/s` | **`1.45x`** `gpu`, `1.04x` `hetero2`; `0.245 GB` OS (`ane`) |
 | `fast-pplx` `doc_s4096` (`gpu-no-mmap` / `gpu` / `hetero2`) | `~7,160–7,531 tok/s` | **9,697.4** (`422.38 ms`) / `9,652.0` (`3.073 GB`) / `9,637.1 tok/s` | M5 NAX **`+28%–35%`** at `4K` (`-0.465 GB` `mmap`; `gpu-bf16 9,673.0`) |
 | `fast-pplx` `mixed` (`24x~128 + 4x2048`) | `12,624.1 tok/s` (`961.81 ms`) | **16,720.7 tok/s** (`726.16 ms`) | **`1.32x`** vs M4 Pro (`1.331x` vs M5 `gpu-bf16`) |
-| `fast-decision-models` `laya_ane` (`W8A16` ANE `P=4`, `n=64`) | `42.03 q/s` (`23.80 ms/q`) | **44.4 q/s** (`22.52 ms/q`, `1.4413 s`) | **`1.06x`** pure ANE (`kev_08b` not staged on `24 GB` M5) |
+| `fast-decision-models` `laya_ane` (`W8A16` ANE `P=4`, `n=64`) | `42.03 q/s` (`23.80 ms/q`) | **44.4 q/s** (`22.52 ms/q`, `1.4413 s`) | **`1.06x`** pure ANE (`kev_08b` pytest passes on M5; M5 speed sweep pending) |
 
 > [!NOTE]
-> **M5 Scope & `h17` CoreML Layout:** `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HuggingFace baseline tokenizers were not staged on the `24 GB` M5 test machine. On M5 `h17` (`macOS 27.2.1`), `emb2_pk_s{32,64,128}_w8` bundles fell back to `CPU=1` for a trailing `H↔S` transpose; returning ANE-native `[1, 512, 1, S]` NCHW `out_h` and untiling in NEON eliminates the CPU fallback (`ANE=2288, GPU=0, CPU=0` across all `9` buckets, `40/40` passing on M5 and M4 Pro).
+> **M5 Scope & `h17` CoreML Notes:** All 7 package test suites + root setup tests pass (`0` failures, `0` skips) on M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only via pure CoreML `compile_model`), while `gpt-oss-20b` (`~12 GB` checkpoint) and public HF benchmark baselines were benchmarked on M4 Pro only (`test_fast_gpt_oss.py` exercises pure-CPU/tokenizer/contract paths on M5). On M5 `h17`, `emb2_pk_s{32,64,128}_w8` bundles fell back to `CPU=1` for a trailing `H↔S` transpose; returning ANE-native `[1, 512, 1, S]` NCHW `out_h` and untiling in NEON eliminates the CPU fallback (`ANE=2288, GPU=0, CPU=0` across all `9` buckets, `40/40` passing on M5 and M4 Pro). On `fast-gemma4` E2B, default uncalibrated `w8` ANE bundles satisfy `cos_l14k >= 0.9983` with `0` CPU runtime ops and `0` GPU ops, and hardware tests opt into ANE on `24 GB` hosts via scoped `allow_ane_on_low_ram=True`.
 
 ## Hardware Suites, Weight Setup & Serialization
 
-Model weights and compiled `.mlmodelc` bundles live outside git. Stage artifacts per package (`<cli> setup-weights` / `setup-ane`), then run serialized hardware validation:
+Model weights and compiled `.mlmodelc` bundles live outside git. Stage the full workspace in one command (`make setup`, or `--skip-gpt-oss --skip-test-extras` on `24 GB` Macs — individual packages also support `<cli> setup-weights` / `setup-ane`), then run serialized hardware validation:
 
 ```bash
-make test-hw    # Checks host Mac16,8, then runs each package's full pytest suite sequentially
+make test-hw    # Checks host baseline, then runs all 7 package suites + root setup tests sequentially
 ```
 
 > [!IMPORTANT]
@@ -197,7 +206,7 @@ make sync-clean-check  # Also fail if any sibling ../fast-* checkout has uncommi
 make leak-check        # Fail on private domain tokens or local absolute user paths
 ```
 
-**Scope & not tested:** Full suite verified on Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`). Partial hardware verification on Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only) covers `fast-shared`, `fast-bge-small`, `fast-embeddinggemma-2` (`40/40`, `CPU=0` across all `9` ANE buckets), `fast-pplx`, and `fast-decision-models` (`laya_ane`), with `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HF public baselines un-staged. Untested on M1/M2/M3/M4 Max/Ultra/M5 Pro/Max Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
+**Scope & not tested:** Full suite and [`scripts/benchmark_monorepo.py`](scripts/benchmark_monorepo.py) baselines verified on Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`). Cross-check on Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only) verifies `0`-failure / `0`-skip `make test-hw` across all 7 package suites (`fast-shared`, `fast-bge-small`, `fast-embeddinggemma-2` with `40/40` & `CPU=0` across all `9` ANE buckets, `fast-gpt-oss`, `fast-gemma4` E2B, `fast-decision-models`, `fast-pplx`) plus `test_setup_all_cpu.py` and throughput sweeps for `fast-bge-small`, `fast-embeddinggemma-2`, `fast-pplx`, and `fast-decision-models` `laya_ane`; the `~12 GB` `gpt-oss-20b` checkpoint, `kev_08b` & `gemma4` E2B M5 throughput sweeps, and public HF benchmark baselines remain M4 Pro-only. Untested on M1/M2/M3/M4 Max/Ultra/M5 Pro/Max Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
 
 ## Acknowledgments
 

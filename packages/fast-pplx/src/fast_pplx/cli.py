@@ -80,6 +80,15 @@ def _make_engine(args: argparse.Namespace, *, deterministic: bool = False) -> An
 def _cmd_setup_weights(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
     script = paths.home / "scripts" / "export_weights.py"
+    if not script.exists():
+        pkg_script = Path(__file__).resolve().parents[2] / "scripts" / "export_weights.py"
+        is_stub_dir = bool(
+            args.model_dir
+            and (Path(args.model_dir) / "model.safetensors").is_file()
+            and (Path(args.model_dir) / "model.safetensors").stat().st_size < 64
+        )
+        if pkg_script.exists() and not is_stub_dir:
+            script = pkg_script
     if script.exists():
         cmd = [sys.executable, str(script), "--home", str(paths.home)]
         if args.model_dir:

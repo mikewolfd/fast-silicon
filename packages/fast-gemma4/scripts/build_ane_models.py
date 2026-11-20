@@ -409,7 +409,9 @@ def collect_awq_calibration_col_sq(
             vf = mx.concatenate([vs_b, v_norm_t], axis=2)
             mk = ("full", off, S)
             if mk not in masks:
-                masks[mk] = _select_sdpa_mask(S, offset=off, window_size=None, dtype=model.act_dtype)
+                masks[mk] = _select_sdpa_mask(
+                    S, offset=off, is_full=True, window_size=None, dtype=model.act_dtype
+                )
         else:
             t_start = max(0, off - model.window_size + 1)
             ks_b = mx.broadcast_to(ks_i[t_start:l_sys].transpose(1, 0, 2)[None], (B, n_kv_l, l_sys - t_start, D))
@@ -419,7 +421,7 @@ def collect_awq_calibration_col_sq(
             mk = ("swa", off - t_start, S)
             if mk not in masks:
                 masks[mk] = _select_sdpa_mask(
-                    S, offset=(off - t_start), window_size=model.window_size, dtype=model.act_dtype
+                    S, offset=(off - t_start), is_full=False, window_size=model.window_size, dtype=model.act_dtype
                 )
         att = (
             mx.fast.scaled_dot_product_attention(q_rot.transpose(0, 2, 1, 3), kf, vf, scale=1.0, mask=masks[mk])
@@ -974,7 +976,7 @@ def main() -> int:
         "--compute-precision",
         choices=("fp16_safe", "fp32_norms", "fp32"),
         default="fp16_safe",
-        help="CoreML precision policy (`fp16_safe` folds L10..L14 residual scales + safe RMSNorm for 100% ANE placement)",
+        help="CoreML precision policy (`fp16_safe` folds L10..L14 residual scales + safe RMSNorm for 100%% ANE placement)",
     )
     parser.add_argument(
         "--awq-mse",
@@ -1088,6 +1090,11 @@ def main() -> int:
         if paths._is_default_model_dir(args.model_dir)
         else paths.ane_models_dir / paths.checkpoint_ane_key(Path(args.model_dir))
     )
+    lib_ane = paths.lib_ane_prefix
+    if not lib_ane.exists():
+        cand_lib = Path(__file__).resolve().parents[1] / "build" / "libgemma4_ane_prefix.dylib"
+        if cand_lib.exists():
+            lib_ane = cand_lib
 
     try:
         try:
@@ -1104,7 +1111,7 @@ def main() -> int:
                 out_ane_dir=out_ane_dir,
                 variant=args.variant,
                 keep_mlpackage=args.keep_mlpackage,
-                lib_ane_prefix=paths.lib_ane_prefix,
+                lib_ane_prefix=lib_ane,
                 S=ANE_CHUNK_S,
                 P_SWA=ANE_P_SWA,
                 P_FULL=ANE_P_FULL,
@@ -1136,7 +1143,7 @@ def main() -> int:
                 "--compile-only-out-dir",
                 str(out_ane_dir),
                 "--compile-only-lib",
-                str(paths.lib_ane_prefix),
+                str(lib_ane),
                 "--compile-only-meta-json",
                 json.dumps(calib_meta),
             ]
