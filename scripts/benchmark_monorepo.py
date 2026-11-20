@@ -277,6 +277,7 @@ def parse_child_metrics(stdout: str) -> tuple[dict[str, Any] | None, str]:
 
 
 def _try_parse_json_tail(clean_stdout: str) -> dict[str, Any] | None:
+    """Extract the last top-level JSON dict from stdout, ignoring trailing C-runtime noise."""
     stripped = clean_stdout.strip()
     if not stripped:
         return None
@@ -285,14 +286,23 @@ def _try_parse_json_tail(clean_stdout: str) -> dict[str, Any] | None:
         return obj if isinstance(obj, dict) else None
     except Exception:
         pass
-    idx = stripped.rfind("{")
-    if idx >= 0:
+    decoder = json.JSONDecoder()
+    last_dict: dict[str, Any] | None = None
+    idx = 0
+    n = len(stripped)
+    while idx < n:
+        brace = stripped.find("{", idx)
+        if brace < 0:
+            break
         try:
-            obj = json.loads(stripped[idx:])
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            pass
-    return None
+            obj, end = decoder.raw_decode(stripped, brace)
+        except json.JSONDecodeError:
+            idx = brace + 1
+            continue
+        if isinstance(obj, dict):
+            last_dict = obj
+        idx = end
+    return last_dict
 
 
 def summarize_throughput(pkg_name: str, clean_stdout: str) -> str:
@@ -311,6 +321,15 @@ def summarize_throughput(pkg_name: str, clean_stdout: str) -> str:
             elif q1_het:
                 parts.append(f"B=1 het2 {q1_het['latency_ms']:.2f}ms")
             return "; ".join(parts)
+        reports = parsed.get("reports")
+        if parsed.get("suite") == "parity" and isinstance(reports, list) and reports:
+            rep_parts = [
+                f"{rep.get('mode', '?')}={rep.get('status', '?')}({rep.get('cases_evaluated', 0)})"
+                for rep in reports
+                if isinstance(rep, dict)
+            ]
+            if rep_parts:
+                return "parity: " + ", ".join(rep_parts)
 
     if pkg_name == "fast-gemma4":
         pat_g = re.search(r"\[GPUOnly[^\]]*\][^\n]*?\((\d+)\s+tok/s\)[^\n]*?([0-9\.]+)\s+docs/s", clean_stdout)

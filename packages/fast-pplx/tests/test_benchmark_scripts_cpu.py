@@ -296,3 +296,26 @@ def test_monorepo_benchmark_dry_run_and_parsers(capsys: pytest.CaptureFixture[st
     assert "if args.allow_contended:" in spd_src
     assert "if args.allow_contended:" in clim_src
     assert "interleaved_abba" in inspect.getsource(pplx_bench.run_abba_speed_pair)
+
+    noisy_stdout = (
+        "Telemetry {ignored: single-quoted}\n"
+        + json.dumps({"suite": "parity", "reports": [{"mode": "gpu", "status": "ok", "cases_evaluated": 16}], "nested": {"k": 1}})
+        + "\nE5RT encountered an STL exception. msg = Could not open weights/weights.bin."
+    )
+    extracted = pplx_bench._extract_last_json_dict(noisy_stdout)
+    assert extracted["suite"] == "parity"
+    assert extracted["nested"] == {"k": 1}
+
+    pretty_noisy = (
+        "{\n"
+        '  "rows": [\n'
+        '    {"workload": "doc_s256", "tok_s": 14178.6}\n'
+        "  ]\n"
+        "}\nE5RT encountered an STL exception."
+    )
+    extracted_pretty = pplx_bench._extract_last_json_dict(pretty_noisy)
+    assert extracted_pretty["rows"][0]["workload"] == "doc_s256"
+
+    mono_parsed = mod._try_parse_json_tail(noisy_stdout)
+    assert mono_parsed is not None and mono_parsed["suite"] == "parity"
+    assert "parity: gpu=ok(16)" == mod.summarize_throughput("fast-pplx", noisy_stdout)

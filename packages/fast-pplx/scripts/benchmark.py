@@ -194,6 +194,39 @@ def _reset_mlx_peak() -> None:
         pass
 
 
+def _extract_last_json_dict(raw_stdout: str) -> dict[str, Any]:
+    """Extract the final top-level JSON dict from stdout, ignoring C-runtime log noise."""
+    stripped = raw_stdout.strip()
+    if not stripped:
+        raise ValueError("empty subprocess stdout")
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    last_dict: dict[str, Any] | None = None
+    idx = 0
+    n = len(stripped)
+    while idx < n:
+        brace = stripped.find("{", idx)
+        if brace < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(stripped, brace)
+        except json.JSONDecodeError:
+            idx = brace + 1
+            continue
+        if isinstance(obj, dict):
+            last_dict = obj
+        idx = end
+    if last_dict is None:
+        raise ValueError(f"no JSON object found in stdout ({stripped[:120]!r})")
+    return last_dict
+
+
 @contextmanager
 def _wired_limit_ctx() -> Iterator[int | None]:
     try:
@@ -1058,7 +1091,7 @@ def _run_pplx_context_mlx_baseline(args: argparse.Namespace, *, dtype: str) -> d
         if proc.returncode != 0 or not proc.stdout.strip():
             reason = (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit={proc.returncode}")
             return {"mode": label, "status": "skipped", "reason": reason, "rows": []}
-        return json.loads(proc.stdout.strip().splitlines()[-1])
+        return _extract_last_json_dict(proc.stdout)
     except Exception as exc:
         return {"mode": label, "status": "skipped", "reason": str(exc), "rows": []}
 
@@ -1078,7 +1111,7 @@ def _run_torch_mps_baseline(args: argparse.Namespace) -> dict[str, Any]:
         if proc.returncode != 0 or not proc.stdout.strip():
             reason = (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit={proc.returncode}")
             return {"mode": "torch-mps", "status": "skipped", "reason": reason, "rows": []}
-        return json.loads(proc.stdout.strip().splitlines()[-1])
+        return _extract_last_json_dict(proc.stdout)
     except Exception as exc:
         return {"mode": "torch-mps", "status": "skipped", "reason": str(exc), "rows": []}
 
@@ -1099,7 +1132,7 @@ def _run_torch_cpu_baseline(args: argparse.Namespace) -> dict[str, Any]:
         if proc.returncode != 0 or not proc.stdout.strip():
             reason = (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit={proc.returncode}")
             return {"mode": "torch-cpu", "status": "skipped", "reason": reason, "rows": []}
-        return json.loads(proc.stdout.strip().splitlines()[-1])
+        return _extract_last_json_dict(proc.stdout)
     except Exception as exc:
         return {"mode": "torch-cpu", "status": "skipped", "reason": str(exc), "rows": []}
 
@@ -1383,7 +1416,7 @@ def cmd_speed(args: argparse.Namespace) -> dict[str, Any]:
                 if args.no_mapped_embedding:
                     child_cmd.append("--no-mapped-embedding")
                 proc = subprocess.run(child_cmd, capture_output=True, text=True, check=True)
-                parsed = json.loads(proc.stdout)
+                parsed = _extract_last_json_dict(proc.stdout)
                 mode_results.extend(parsed.get("mode_results", []))
                 all_rows.extend(parsed.get("rows", []))
             else:
@@ -1667,7 +1700,7 @@ def cmd_context_limit(args: argparse.Namespace) -> dict[str, Any]:
                 cmd.append("--no-mapped-embedding")
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout_sec, check=True)
-                rows.append(json.loads(proc.stdout))
+                rows.append(_extract_last_json_dict(proc.stdout))
             except Exception as exc:
                 rows.append({"target_tokens": length, "status": "error", "reason": str(exc)})
                 break

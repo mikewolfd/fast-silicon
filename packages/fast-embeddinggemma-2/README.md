@@ -1,8 +1,8 @@
 # fast-embeddinggemma-2
 
-**2,048-context Matryoshka embeddings at 31K–37K tok/s and ~2 ms latency on Apple Silicon, with no PyTorch runtime required.**
+**2,048-context Matryoshka embeddings at 35K–37K tok/s and ~2 ms latency on Apple Silicon, with no PyTorch runtime required.**
 
-`fast-embeddinggemma-2` executes `google/embeddinggemma-2` (`300M`, `128..768`-d MRL) across Apple M4 Pro's Metal GPU and 16-core Neural Engine — cutting single-query latency to **1.87–2.19 ms** (**4.36x** faster than GPU-only) and reaching **31,786 tok/s** (**36,911 tok/s** standalone) at **0.999997** GPU / **0.999705** hetero cosine parity. Ships with a Python API, chunked OCR-aware Parquet ingestion, an OpenAI `/v1/embeddings` server (`"dimensions"` support), and the zero-Python `emb2-ane-cli`.
+`fast-embeddinggemma-2` executes `google/embeddinggemma-2` (`300M`, `128..768`-d MRL) across Apple M4 Pro's Metal GPU and 16-core Neural Engine — cutting single-query latency to **1.87–2.17 ms** (**3.60x** faster than GPU-only in `monorepo_bench`) and reaching **35,717 tok/s** (**36,911 tok/s** standalone) at **0.999998** GPU / **0.999728** hetero cosine parity (`monorepo verify`; `0.999997` / `0.999705` standalone). Ships with a Python API, chunked OCR-aware Parquet ingestion, an OpenAI `/v1/embeddings` server (`"dimensions"` support), and the zero-Python `emb2-ane-cli`.
 
 ## Quick start
 
@@ -24,8 +24,8 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 | Question | Answer |
 |---|---|
 | How close to float reference (`64`-doc fixture)? | `0.999997` min cos (`GPU` vs `F16`), `0.999891` (`GPU` vs `BF16`), `0.999705` (`Hetero` vs `F16`), `0.999890` (`ANE B=1 S=24`). |
-| How fast is single query (`B=1 S=32`)? | **`1.8713 ms`** standalone `emb2-ane-cli` (`1.899 / 1.868 ms` ANE min); **`2.188 ms`** ANE vs `9.540 ms` GPU (`S=64`) in `monorepo_bench` (**`4.36x`** lower latency). |
-| How fast is bulk `hetero2` throughput (`n=2,000`)? | **`31,786 tok/s`** (`115.2 doc/s`, **`1.85x`** GPU, `2.224 GB` Metal / `10.820 GB` OS in `monorepo_bench`); standalone up to **`36,911 tok/s`** (`133.8 doc/s`) synth and **`32,569 tok/s`** (`116.4 doc/s`) Document OCR (**`3.1x`** GPU OCR). |
+| How fast is single query (`B=1 S=32`)? | **`1.8713 ms`** standalone `emb2-ane-cli` (`1.899 / 1.868 ms` ANE min); **`2.171 ms`** ANE (`1.892 ms` min) vs `7.806 ms` GPU (`S=64`) in `monorepo_bench` (**`3.60x`** lower latency). |
+| How fast is bulk `hetero` throughput (`n=2,000`)? | **`35,717 tok/s`** (`129.4 doc/s`, **`2.09x`** GPU, `1.465 GB` Metal / `3.318 GB` OS in `monorepo_bench`); standalone up to **`36,911 tok/s`** (`133.8 doc/s`) synth and **`32,569 tok/s`** (`116.4 doc/s`) Document OCR (**`3.1x`** GPU OCR). |
 | Does Matryoshka (`dimensions`) work everywhere? | Yes: `128, 256, 512, 768` (or any `1..768`) in Python, `parquet --dimensions`, and `/v1/embeddings` `"dimensions"`, all L2 re-normalized. |
 
 ## Parity (`64`-doc fixture, `embeddinggemma-2 verify`)
@@ -66,25 +66,24 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 
 ### 2. Monorepo Showcase & Parity (`benchmark_monorepo.py`, `n = 2,000` / `551,889` toks)
 
-Captured alongside `6` background quiescence warnings (`Metal Peak: 2.224 GB`, `OS Footprint: 10.820 GB` via `RUSAGE_INFO_V4`; public `transformers-mps` skipped because installed `transformers` lacked `embedding_gemma2` support):
+Recorded alongside `4` background quiescence warnings (`Metal Peak: 1.465 GB`, `OS Footprint: 3.318 GB` via `RUSAGE_INFO_V4`; public `transformers-mps` skipped because installed `transformers` lacked `embedding_gemma2` support):
 
 #### Single-Query Latency (`B=1`)
 
 | Mode | Seq | Median | Min | Speedup vs GPU |
 |---|---:|---:|---:|---:|
-| **`ane`** | `32` | **2.188 ms** | `1.943 ms` | **`4.36x`** |
-| `gpu` | `64` | `9.540 ms` | `9.089 ms` | `1.00x` |
+| **`ane`** | `32` | **2.171 ms** | `1.892 ms` | **`3.60x`** |
+| `gpu` | `64` | `7.806 ms` | `7.381 ms` | `1.00x` |
 
 #### Corpus Throughput (`n = 2,000` docs, `551,889` toks)
 
 | Mode | Elapsed | Tok/s | Docs/s | Doc Split (`GPU / ANE / CPU`) | Token Split (`GPU / ANE / CPU`) | Speedup vs GPU |
 |---|---:|---:|---:|---|---|---:|
-| **`hetero2` (`GPU+ANE`)** | **17.363 s** | **31,786** | **115.2** | `591 / 1,409 / 0` | `208,158 / 343,731 / 0` | **`1.85x`** |
-| `hetero` (`GPU+ANE+CPU`) | `17.621 s` | `31,319` | `113.5` | `650 / 1,322 / 28` | `232,550 / 311,494 / 7,845` | `1.82x` |
-| `ane` (16-core ANE) | `27.149 s` | `20,328` | `73.7` | `0 / 2,000 / 0` | `0 / 551,889 / 0` | `1.18x` |
-| `gpu` (Metal 4 MPP) | `32.129 s` | `17,177` | `62.2` | `2,000 / 0 / 0` | `551,889 / 0 / 0` | `1.00x` |
+| **`hetero` (`GPU+ANE`)** | **15.452 s** | **35,717** | **129.4** | `—` | `—` | **`2.09x`** |
+| `ane` (16-core ANE) | `25.885 s` | `21,321` | `77.3` | `0 / 2,000 / 0` | `0 / 551,889 / 0` | `1.25x` |
+| `gpu` (Metal 4 MPP) | `32.265 s` | `17,105` | `62.0` | `2,000 / 0 / 0` | `551,889 / 0 / 0` | `1.00x` |
 
-Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `GPU_vs_BF16` `min=0.999894`, `Hetero_vs_F16` `min=0.999724`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999887`.
+Parity (`verify`, `13.189 s`, `2.786 GB` OS): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `GPU_vs_BF16` `min=0.999889`, `Hetero_vs_F16` `min=0.999728`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999887`.
 
 ## What keeps it fast
 
@@ -97,10 +96,10 @@ Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `GPU_
 ## CLI, Parquet & Reproduce
 
 ```bash
-# Chunked Parquet ingestion into shards (`--max-chunk-tokens 512` keeps ANE buckets active; up to 2048 on GPU)
+# Chunked Parquet ingestion into shards (`--mode hetero` = 2-way GPU+ANE [`hetero2` alias]; `--mode hetero3` opts into +CPU-SME; `--max-chunk-tokens 512` keeps ANE buckets active)
 .venv/bin/embeddinggemma-2 parquet \
   --input ocr-text.parquet --output embeddings/ --text-col body \
-  --mode hetero2 --dimensions 512 --document-prefix \
+  --mode hetero --dimensions 512 --document-prefix \
   --chunk --max-chunk-tokens 512 --overlap 64 \
   --batch-rows 32 --encode-batch-rows 4096 --shard-rows 65536 \
   --drop-text-col --include-chunk-text

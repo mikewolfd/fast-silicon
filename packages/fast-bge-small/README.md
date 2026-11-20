@@ -1,8 +1,8 @@
 # fast-bge-small
 
-**Sub-millisecond text embeddings and 207K tok/s corpus indexing on a Mac — with zero `torch` or `transformers` runtime dependencies.**
+**Sub-millisecond text embeddings and 183K–215K tok/s corpus indexing on a Mac — with zero `torch` or `transformers` runtime dependencies.**
 
-`fast-bge-small` runs `BAAI/bge-small-en-v1.5` (`33M`, `384`-d) by routing short queries onto the 16-core Apple Neural Engine (**0.49–0.53 ms** `B=1`) and splitting bulk workloads concurrently across Metal GPU and ANE (**207,264 tok/s**, **2.50x** faster than PyTorch MPS) while matching float16 reference cosine similarity to **0.999998**. Use it from Python, an OpenAI-compatible `/v1/embeddings` server, a resumable OCR-aware Parquet CLI, or the standalone zero-Python `bge-ane-cli` binary.
+`fast-bge-small` runs `BAAI/bge-small-en-v1.5` (`33M`, `384`-d) by routing short queries onto the 16-core Apple Neural Engine (**0.49–0.56 ms** `B=1`) and splitting bulk workloads concurrently across Metal GPU and ANE (**183,015 tok/s** and **2.24x** faster than PyTorch MPS in `monorepo_bench`; **215,022 tok/s** standalone Document OCR) while matching float16 reference cosine similarity to **0.999998**. Use it from Python, an OpenAI-compatible `/v1/embeddings` server, a resumable OCR-aware Parquet CLI, or the standalone zero-Python `bge-ane-cli` binary.
 
 ## Quick start
 
@@ -31,8 +31,8 @@ vecs = eng.encode_texts(["passage one...", "passage two..."], mode="hetero")    
 | Question | Answer |
 |---|---|
 | How close to float reference? | `0.999998` min cos (`GPU` vs `F16` and `BF16`); `0.999984` (`Hetero` vs `F16`); `0.999986` (`ANE` vs `GPU` `B=1 S=24`). |
-| How fast is single query (`B=1 S=24`)? | **`0.493 ms`** ANE median (synth) / **`0.560 ms`** ANE median (OCR) / **`0.526 ms`** (`monorepo_bench`, **`3.83x`** faster than `2.015 ms` GPU; `0.502 ms` in zero-Python `bge-ane-cli`). |
-| How fast is bulk throughput (`hetero`)? | **`207,264 tok/s`** (`monorepo_bench n=1,000`, **`2.50x`** vs `transformers-mps-float16`, **`1.52x`** vs GPU, `1.173 GB` Metal / `4.813 GB` OS); standalone `n=4,000` up to **`215,022 tok/s`** OCR (`4.566 s`) and **`189,338 tok/s`** synth (`5.250 s`). |
+| How fast is single query (`B=1 S=24`)? | **`0.493 ms`** ANE median (synth) / **`0.560 ms`** ANE median (OCR) / **`0.506 ms`** (`monorepo_bench`, **`3.92x`** faster than `1.985 ms` GPU; `0.502 ms` in zero-Python `bge-ane-cli`). |
+| How fast is bulk throughput (`hetero`)? | **`183,015 tok/s`** (`monorepo_bench n=1,000`, **`2.24x`** vs `transformers-mps-float16`, **`1.58x`** vs GPU, `1.186 GB` Metal / `2.081 GB` OS); standalone `n=4,000` up to **`215,022 tok/s`** OCR (`4.566 s`) and **`189,338 tok/s`** synth (`5.250 s`). |
 | Requires `torch` or `transformers`? | No at runtime (`mlx`, `numpy`, `tokenizers`, `pyarrow`, `huggingface-hub` only; `coremltools >= 8.0` only to rebuild `.mlmodelc`). |
 
 ## Parity (`64`-doc fixture, `bge-small verify`)
@@ -71,26 +71,26 @@ vecs = eng.encode_texts(["passage one...", "passage two..."], mode="hetero")    
 
 ### 2. Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`, `n = 1,000` / `249,303` toks)
 
-Captured alongside `6` background quiescence warnings (`RUSAGE_INFO_V4` OS footprint):
+Recorded alongside `4` host background quiescence warnings (`RUSAGE_INFO_V4` OS footprint):
 
 #### Single-Query Latency (`B=1`, `S=24`)
 
 | Engine / Runtime | Mode | Median | Min | Speedup vs Public MPS |
 |---|---|---:|---:|---:|
-| **`fast-bge-small`** | **`ane`** | **0.526 ms** | `0.467 ms` | **`16.06x`** (`3.83x` vs GPU) |
-| `fast-bge-small` | `gpu` | `2.015 ms` | `1.847 ms` | `4.19x` |
-| `transformers-mps-float16` (Public) | PyTorch MPS | `8.446 ms` | — | `1.00x` (Baseline) |
+| **`fast-bge-small`** | **`ane`** | **0.506 ms** | `0.464 ms` | **`14.67x`** (`3.92x` vs GPU) |
+| `fast-bge-small` | `gpu` | `1.985 ms` | `1.881 ms` | `3.74x` |
+| `transformers-mps-float16` (Public) | PyTorch MPS | `7.425 ms` | — | `1.00x` (Baseline) |
 
 #### Corpus Throughput (`n = 1,000` docs, `249,303` toks)
 
 | Engine / Runtime | Mode | Elapsed | Throughput | Doc Split (`GPU / ANE`) | Token Split (`GPU / ANE`) | Metal Peak | OS Footprint | vs Public MPS | Notes |
 |---|---|---:|---:|---|---|---:|---:|---:|---|
-| **`fast-bge-small`** | **`hetero`** | **1.203 s** | **207,264 tok/s** | `424 / 576` | `158,312 / 90,991` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | **`2.50x`** | **`1.52x`** vs `gpu` |
-| `fast-bge-small` | `gpu` | `1.828 s` | `136,416 tok/s` | `1,000 / 0` | `249,303 / 0` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | `1.65x` | Metal-only baseline |
-| `fast-bge-small` | `ane` | `4.388 s` | `56,808 tok/s` | `0 / 1,000` | `0 / 249,303` | `1.173 GB` *(suite)* | `4.813 GB` *(suite)* | `0.69x` | ANE-only baseline |
-| `transformers-mps-float16` (Public) | PyTorch MPS | — | `82,883.2 tok/s` | — | — | `0.071 GB` | `3.520 GB` | `1.00x` | `332.46 docs/s`; `load=1.314 s` |
+| **`fast-bge-small`** | **`hetero`** | **1.362 s** | **183,015 tok/s** | `—` | `—` | `1.186 GB` *(suite)* | **2.081 GB** *(suite)* | **`2.24x`** | **`1.58x`** vs `gpu` (`1.583x`) |
+| `fast-bge-small` | `gpu` | `2.156 s` | `115,632 tok/s` | `—` | `—` | `1.186 GB` *(suite)* | `2.081 GB` *(suite)* | `1.42x` | Metal-only baseline |
+| `fast-bge-small` | `ane` | `4.211 s` | `59,209 tok/s` | `0 / 1,000` | `0 / 249,303` | `1.186 GB` *(suite)* | `2.081 GB` *(suite)* | `0.73x` | `237.5 doc/s`; ANE-only baseline |
+| `transformers-mps-float16` (Public) | PyTorch MPS | — | `81,592.6 tok/s` | — | — | `0.071 GB` | `3.532 GB` | `1.00x` | `327.28 docs/s`; `load=1.424 s` |
 
-Parity (`verify`): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `Hetero_vs_F16` `min=0.999984`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999986`.
+Parity (`verify`, `1.897 s`, `1.949 GB` OS): `64-doc` `GPU_vs_F16` `min=0.999998` (`mean=0.999999`), `Hetero_vs_F16` `min=0.999984`, `Single-query B=1 S=24 ANE_vs_GPU` `cos=0.999986`.
 
 ## What keeps it fast
 
@@ -115,7 +115,7 @@ Parquet options also include `--ocr-pages-only`, `--per-ocr-page` (UTF-8 `page_o
 
 ## Scope & Not-tested
 
-- Verified on **Apple M4 Pro (`Mac16,8`, `48 GB`, macOS 26.6, Xcode SDK 27.2, `Apple clang 21.0.0`)** producing `0`-warning native builds (`libbge_ane_runner.dylib`, `libbge_cpu_query.dylib`, `bge-ane-cli`).
+- Verified on **Apple M4 Pro (`Mac16,8`, `48 GB`, macOS 26.6, Xcode SDK 27.2, `Apple clang 21.0.0`)** producing `0`-warning native builds (`libbge_ane_runner.dylib`, `bge-ane-cli`, plus optional `libbge_cpu_query.dylib` via `make cpu-query`).
 - **Not tested:** Other Apple Silicon generations/RAM tiers, Linux/x86/CUDA, or sequences exceeding the model's `512`-token context window.
 
 ## Author & License

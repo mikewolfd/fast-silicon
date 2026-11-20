@@ -1,8 +1,8 @@
 # fast-decision-models
 
-**Fast local document classification, scoring, and validation on Apple Silicon — 4.2x–5.3x faster and 2.1 GB smaller than PyTorch MPS.**
+**Fast local document classification, scoring, and validation on Apple Silicon — 4.5x–5.8x faster and 2.9 GB smaller than PyTorch MPS.**
 
-`fast-decision-models` runs typed binary (`noul`), multi-choice (`choice`), and scalar (`score`) judges for **Kev-0.8B** on Metal (**50.95 queries/s**, `19.63 ms/q`) and **Laya-Typed-421M** purely on the 16-core Apple Neural Engine (**40.53–41.72 queries/s** with `0` GPU ops, keeping your GPU completely free for LLM or embedding work). Importing the package is pure Python stdlib with zero runtime PyTorch dependency, backed by CLI (`score`) and Python APIs.
+`fast-decision-models` runs typed binary (`noul`), multi-choice (`choice`), and scalar (`score`) judges for **Kev-0.8B** on Metal (**54.82 queries/s**, `18.24 ms/q`; `59.68 q/s` standalone `n=24`) and **Laya-Typed-421M** purely on the 16-core Apple Neural Engine (**41.72–42.03 queries/s** with `0` GPU ops, keeping your GPU completely free for LLM or embedding work). Importing the package is pure Python stdlib with zero runtime PyTorch dependency, backed by CLI (`score`) and Python APIs.
 
 ## Quick start
 
@@ -33,25 +33,25 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:
 |---|---|
 | `Laya-Typed-421M` ANE compute plan? | `[1585, 0, 0]` (`ANE / GPU / CPU` ops) on both `S=256` and `S=512` buckets (`0` GPU contention). |
 | `Kev-0.8B` (`w8`) batch parity? | `B=1` vs `B=3` `max_diff = 0.005613` (`probs = [0.8747, 0.1441, 0.1485]`). |
-| Measured throughput (`monorepo_bench`, `n=64`)? | **`50.95 q/s`** (`19.63 ms/q`, `kev_08b w8 B=8` = **`5.27x`** vs `transformers-mps-bf16` & **`-2.13 GB`** OS footprint); **`40.53 q/s`** (`24.67 ms/q`, `laya_ane` = **`4.19x`**). Standalone `n=24`: **`59.68`** / **`41.72 q/s`**. |
+| Measured throughput (`monorepo_bench`, `n=64`)? | **`54.82 q/s`** (`18.24 ms/q`, `kev_08b w8 B=8` = **`5.82x`** vs `transformers-mps-bf16` & **`-2.87 GB`** OS footprint); **`42.03 q/s`** (`23.80 ms/q`, `laya_ane` = **`4.46x`**). Standalone `n=24`: **`59.68`** / **`41.72 q/s`**. |
 | PyTorch needed at runtime? | No. Both `.mlpackage` conversion and `head.pt` extraction use stdlib `zipfile` + `numpy`. |
 
 ## Parity & Benchmarks (`decision-models verify` / `bench`, M4 Pro `48 GB`)
 
 ### 1. Monorepo Showcase, `bf16` Ablation & Public Baseline (`benchmark_monorepo.py`, `n=64`)
 
-Default suite (`kev_08b w8 B=8` + `laya_ane`) Metal Peak **`1.748 GB`**, OS Footprint **`3.166 GB`** (`RUSAGE_INFO_V4`; `verify` recorded `6` quiescence warnings):
+Default suite (`kev_08b w8 B=8` + `laya_ane`) Metal Peak **`1.556 GB`**, OS Footprint **`2.440 GB`** (`RUSAGE_INFO_V4`; recorded with `4` background quiescence warnings):
 
 | Engine / Baseline | Precision | Batch | Questions | Elapsed | Throughput | Latency | Metal Peak | OS Footprint | vs MPS `B=8` | Notes |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **`kev_08b` (Default)** | `W8` (`g64`) | `8` | `64` | `1.2562 s` | **50.95 q/s** | **19.63 ms/q** | `1.748 GB` *(suite)* | **3.166 GB** *(suite)* | **`5.27x`** | **`-2.13 GB`** OS vs MPS; **`-0.553 GB`** vs `bf16 B=8` |
-| `laya_ane` (`Laya-Typed-421M`) | `W8A16` ANE | `P=4` | `64` | `1.5789 s` | **40.53 q/s** | **24.67 ms/q** | `1.748 GB` *(suite)* | **3.166 GB** *(suite)* | **`4.19x`** | `[1585,0,0]` ANE/GPU/CPU ops |
-| `kev_08b` (Internal baseline) | `BF16` | `8` | `64` | `1.2390 s` | `51.65 q/s` | `19.36 ms/q` | `2.439 GB` | `3.718 GB` | `5.34x` | `w8 B=8` runs at `0.99x` speed with lower memory |
-| `kev_08b` (Internal baseline) | `BF16` | `1` | `24` | `0.8754 s` | `27.42 q/s` | `36.48 ms/q` | `1.642 GB` | `2.086 GB` | `2.84x` | `w8 B=8` is **`1.86x`** faster |
-| `transformers-mps-bf16` (Public) | `BF16` | `8` | — | — | `9.67 q/s` | `103.38 ms/q` | `1.505 GB` | `5.295 GB` | `1.00x` | Public MPS (`load=11.554 s`) |
-| `transformers-mps-bf16` (Public) | `BF16` | `1` | — | — | `2.98 q/s` | — | — | — | `0.31x` | Public single-stream baseline |
+| **`kev_08b` (Default)** | `W8` (`g64`) | `8` | `64` | `1.1675 s` | **54.82 q/s** | **18.24 ms/q** | `1.556 GB` *(suite)* | **2.440 GB** *(suite)* | **`5.82x`** | **`-2.87 GB`** OS vs MPS; **`-0.605 GB`** vs `bf16 B=8` |
+| `laya_ane` (`Laya-Typed-421M`) | `W8A16` ANE | `P=4` | `64` | `1.5229 s` | **42.03 q/s** | **23.80 ms/q** | `1.556 GB` *(suite)* | **2.440 GB** *(suite)* | **`4.46x`** | `[1585,0,0]` ANE/GPU/CPU ops |
+| `kev_08b` (Internal baseline) | `BF16` | `8` | `64` | `1.1863 s` | `53.95 q/s` | `18.54 ms/q` | `2.283 GB` | `3.045 GB` | `5.73x` | `w8 B=8` runs at `1.02x` speed with **`-0.605 GB`** OS |
+| `kev_08b` (Internal baseline) | `BF16` | `1` | `24` | `0.8198 s` | `29.27 q/s` | `34.16 ms/q` | `1.622 GB` | `2.061 GB` | `3.11x` | `w8 B=8` is **`1.87x`** faster |
+| `transformers-mps-bf16` (Public) | `BF16` | `8` | — | — | `9.42 q/s` | `106.12 ms/q` | `1.505 GB` | `5.308 GB` | `1.00x` | Public MPS (`load=10.934 s`) |
+| `transformers-mps-bf16` (Public) | `BF16` | `1` | — | — | `8.87 q/s` | — | — | — | `0.94x` | Public single-stream baseline |
 
-Monorepo `verify`: `laya-ane` `[1585, 0, 0]` (`s256` & `s512`, `probs=[0.7107, 0.2738, 0.3558]`) and `kev-0.8b (w8)` `B=1 vs B=3` `max_diff=0.005613` (`probs=[0.8747, 0.1441, 0.1485]`).
+Monorepo `verify` (`1.671 s`, `1.782 GB` OS): `laya-ane` `[1585, 0, 0]` (`s256` & `s512`, `probs=[0.7107, 0.2738, 0.3558]`) and `kev-0.8b (w8)` `B=1 vs B=3` `max_diff=0.005613` (`probs=[0.8747, 0.1441, 0.1485]`).
 
 ### 2. Standalone Quick Bench (`decision-models bench`, `n=24`, `batch_docs=8`)
 

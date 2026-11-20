@@ -1,8 +1,8 @@
 # fast-gpt-oss
 
-**Serve `openai/gpt-oss-20b` across 128 parallel documents on one Mac at 555.5 tok/s — 4.78x faster than `mlx_lm` (`B=8`) with 100% schema-valid JSON.**
+**Serve `openai/gpt-oss-20b` across 128 parallel documents on one Mac at 431–463 tok/s — 2.73x faster than `mlx_lm` (`B=8`) with 100% schema-valid JSON.**
 
-`fast-gpt-oss` eliminates redundant shared-prompt KV cache copies and pairs Metal 4 GPU kernels with hybrid quantized MoE routing so a **20.9B MXFP4** model runs at **14.81 GB** peak (`B=128`, **1.874 docs/s**) or **10.70 GB** single-stream (**74.9–97.4 tok/s**), keeping all `201K` input prompt tokens intact with zero misses. Ready out of the box with OpenAI-compatible SSE serving (`serve`), Parquet/JSONL batch extraction (`parquet` / `extract`), and CLI generation.
+`fast-gpt-oss` eliminates redundant shared-prompt KV cache copies and pairs Metal 4 GPU kernels with hybrid quantized MoE routing so a **20.9B MXFP4** model runs at **14.79 GB** peak (`B=128`, **1.413 docs/s** under host VM/CPU contention; **462.8 tok/s** standalone long-prompt) or **10.50 GB** single-stream (**87.5–97.4 tok/s**), keeping all `201K` input prompt tokens intact with zero misses. Ready out of the box with OpenAI-compatible SSE serving (`serve`), Parquet/JSONL batch extraction (`parquet` / `extract`), and CLI generation.
 
 ## Quick start
 
@@ -19,26 +19,26 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 | Question | Answer |
 |---|---|
 | Does it match float schema/prefix outputs? | Yes: `gpt-oss verify` passes `b1_valid=4/4`, `b8_valid=8/8`, `prefix16_token_matches=4`, `key_field_matches=4`. |
-| Peak batched throughput (`B=128`)? | **`555.5 dec tok/s`** (**`1.874 docs/s`**, `128/128` valid JSON, `14.81 GB` peak in `monorepo_bench`) = **`4.78x`** decode tok/s vs `stock-mlx_lm B=8` (`116.3 tok/s`). Standalone long-prompt (`L_sys=1,275`): **`462.8 dec tok/s`** (`0.710 docs/s`, `16.56 GB`). |
-| Isolated `B=1` latency & memory? | `74.9 dec tok/s` (`0.464 docs/s`, `10.70 GB` `monorepo_bench` vs `63.5 tok/s` `stock-mlx_lm B=1`); cool async `forward_b1` standalone: **`97.4 tok/s`**. |
+| Peak batched throughput (`B=128`)? | **`431.0 dec tok/s`** (**`1.413 docs/s`**, `128/128` valid JSON, `14.79 GB` peak in `monorepo_bench` under host VM/CPU contention) = **`2.73x`** decode tok/s vs `stock-mlx_lm B=8` (`158.0 tok/s`). Standalone long-prompt (`L_sys=1,275`): **`462.8 dec tok/s`** (`0.710 docs/s`, `16.56 GB`). |
+| Isolated `B=1` latency & memory? | **`87.5 dec tok/s`** (`0.495 docs/s`, `10.50 GB` `monorepo_bench` vs `74.2 tok/s` `stock-mlx_lm B=1`, `1.18x`); cool async `forward_b1` standalone: **`97.4 tok/s`**. |
 | Are input tokens pruned? | No: input `embed_tokens` keeps all `201,088` `o200k` tokens (`0%` prompt miss); only `lm_head` prunes to lossless `131,072`. |
 
 ## Parity & Benchmarks (`mlx-community/gpt-oss-20b-MXFP4-Q4`, M4 Pro `48 GB`)
 
 ### 1. Monorepo Showcase & Public Baseline (`benchmark_monorepo.py`)
 
-Suite Metal Peak **`15.901 GB`**, OS Footprint **`21.709 GB`** (`RUSAGE_INFO_V4`; recorded with `6` background quiescence warnings):
+Suite Metal Peak **`15.880 GB`**, OS Footprint **`23.831 GB`** (`RUSAGE_INFO_V4`; recorded with `4` background quiescence warnings including `mediaanalysisd` CPU & `5.1 GB` active VM):
 
 | Engine / Mode | Batch (Docs) | Valid | Prefill | Decode / Wall | Decode tok/s | Docs/s | Peak Mem | vs Stock `B=8` | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `b1_seq` | `1` (`8`) | `8/8` | — | `17.27 s` *(wall)* | `74.9` | `0.464` | **10.70 GB** | `0.64x` | **`1.18x`** vs `stock-mlx_lm B=1` (`63.5 tok/s`) |
-| `batched_B8` | `8` (`8`) | `8/8` | `2.030 s` | `6.960 s` | `162.1` | `0.888` | `11.46 GB` | `1.39x` | Same batch size as `stock-mlx_lm B=8` |
-| `batched_B64` | `64` (`64`) | `64/64` | `15.532 s` | `22.625 s` | `410.0` | `1.636` | `12.63 GB` | `3.53x` | Hydragen v2 + Hybrid MoE |
-| **`batched_B128`** | `128` (`128`) | **`128/128`** | `34.024 s` | `33.182 s` | **555.5** | **1.874** | `14.81 GB` | **`4.78x`** | **`7.42x`** vs `b1_seq`; `4.04x` `docs/s` |
-| `stock-mlx_lm` (Public) | `8` | — | — | — | `116.3` | `0.871` | `11.384 GB` | `1.00x` | `12.139 GB` OS (`load=3.985 s`) |
-| `stock-mlx_lm` (Public) | `1` | — | — | — | `63.5` | — | — | `0.55x` | Single-stream baseline |
+| `b1_seq` | `1` (`8`) | `8/8` | — | `16.157 s` *(wall)* | `87.5` | `0.495` | **10.50 GB** | `0.55x` | **`1.18x`** vs `stock-mlx_lm B=1` (`74.2 tok/s`) |
+| `batched_B8` | `8` (`8`) | `8/8` | `3.266 s` | `6.551 s` | `174.8` | `0.813` | `10.92 GB` | `1.11x` | Same batch size as `stock-mlx_lm B=8` (`-0.299 GB` Metal) |
+| `batched_B64` | `64` (`64`) | `64/64` | `23.849 s` | `25.161 s` | `363.0` | `1.303` | `12.63 GB` | `2.30x` | Hydragen v2 + Hybrid MoE |
+| **`batched_B128`** | `128` (`128`) | **`128/128`** | `48.268 s` | `42.010 s` | **431.0** | **1.413** | `14.79 GB` | **`2.73x`** | **`4.93x`** vs `b1_seq`; `2.85x` `docs/s` |
+| `stock-mlx_lm` (Public) | `8` | — | — | — | `158.0` | `1.168` | `11.219 GB` | `1.00x` | `12.133 GB` OS (`load=2.533 s`) |
+| `stock-mlx_lm` (Public) | `1` | — | — | — | `74.2` | — | — | `0.47x` | Single-stream baseline |
 
-Monorepo `verify` (`29.706 s`): `b1_valid=4/4` (`71.3 dec tok/s`, `0.367 docs/s`), `b8_valid=8/8` (`104.9 dec tok/s`, `0.582 docs/s`), `prefix16_token_matches=4`, `key_field_matches=4`.
+Monorepo `verify` (`20.389 s`, `18.863 GB` OS): `b1_valid=4/4` (`89.0 dec tok/s`, `0.433 docs/s`), `b8_valid=8/8` (`185.0 dec tok/s`, `0.888 docs/s`), `prefix16_token_matches=4`, `key_field_matches=4`.
 
 ### 2. Standalone Long-Prefix Suite (`gpt-oss bench --batches 8,64,128`)
 
