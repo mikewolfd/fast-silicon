@@ -291,3 +291,15 @@ def test_full_24_layer_res_rms_chain_equivalence() -> None:
         np.linalg.norm(xn_fus.astype(np.float64), axis=-1) * np.linalg.norm(out_ref.astype(np.float64), axis=-1) + 1e-12
     )
     assert float(np.min(cos)) > 0.99999
+
+
+def test_ane_builder_uses_fp16_min_normal_eps_floor() -> None:
+    builder_path = Path(__file__).resolve().parents[1] / "scripts" / "build_ane_models.py"
+    src = builder_path.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(builder_path))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "build_ane_packed_w8")
+    fn_src = ast.get_source_segment(src, fn) or ""
+    assert "FP16_MIN_NORMAL" in src
+    assert "np.float16(1e-6)" not in fn_src
+    assert float(np.finfo(np.float16).tiny) == pytest.approx(2.0**-14)
+    assert "FP16_MIN_NORMAL" in fn_src

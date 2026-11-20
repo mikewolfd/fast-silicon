@@ -17,6 +17,7 @@ FULL_LAYERS = {5, 11, 17, 23}
 DEFAULT_ANE_SEQS = (32, 64, 128, 192, 256, 320, 384, 448, 512)
 DEFAULT_CPU_SEQS = (256, 384, 512)
 CPU_FP32_SKIP_OPS = "reduce_mean,rsqrt,gelu,softmax,add,sub,mul,transpose,reshape,split,concat"
+FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)  # 2^-14 = 6.103515625e-5 ANE normal floor
 
 
 def repo_root() -> Path:
@@ -51,13 +52,13 @@ def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path
     H = 512
 
     def _rmsnorm_ch(x, weight_1xCx1x1, prefix: str):
-        eps = np.float16(1e-6)
+        eps = np.float16(FP16_MIN_NORMAL)
         msq = mb.reduce_mean(x=mb.mul(x=x, y=x, name=prefix + "_sq"), axes=[1], keep_dims=True, name=prefix + "_msq")
         rsq = mb.rsqrt(x=mb.add(x=msq, y=eps, name=prefix + "_ae"), name=prefix + "_rsq")
         return mb.mul(x=mb.mul(x=x, y=rsq, name=prefix + "_n"), y=weight_1xCx1x1, name=prefix + "_w")
 
     def _rmsnorm_last(x, weight_opt, prefix: str):
-        eps = np.float16(1e-6)
+        eps = np.float16(FP16_MIN_NORMAL)
         msq = mb.reduce_mean(x=mb.mul(x=x, y=x, name=prefix + "_sq"), axes=[-1], keep_dims=True, name=prefix + "_msq")
         xn = mb.mul(x=x, y=mb.rsqrt(x=mb.add(x=msq, y=eps, name=prefix + "_ae"), name=prefix + "_rsq"), name=prefix + "_n")
         return mb.mul(x=xn, y=weight_opt, name=prefix + "_w") if weight_opt is not None else xn
@@ -84,7 +85,7 @@ def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path
         pl4 = mb.reshape(x=pl, shape=[1, 24, H, S], name="pl_r4")
         pl_msq = mb.reduce_mean(x=mb.mul(x=pl4, y=pl4, name="pln_sq"), axes=[2], keep_dims=True, name="pln_msq")
         pl_n = mb.mul(
-            x=mb.mul(x=pl4, y=mb.rsqrt(x=mb.add(x=pl_msq, y=np.float16(1e-6), name="pln_ae"), name="pln_rsq"), name="pln_n"),
+            x=mb.mul(x=pl4, y=mb.rsqrt(x=mb.add(x=pl_msq, y=np.float16(FP16_MIN_NORMAL), name="pln_ae"), name="pln_rsq"), name="pln_n"),
             y=w["ple_norm"][None, None, :, None],
             name="pln_w",
         )
