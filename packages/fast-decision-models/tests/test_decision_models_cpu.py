@@ -421,8 +421,12 @@ def test_laya_selective_quantization_coreml_optional() -> None:
         skip_model_load=True,
     )
     q_ml = cto.linear_quantize_weights(ml, config=_build_laya_quant_config(cto))
+    q_ops = [op for op in q_ml._mil_program["main"].operations if op.op_type == "constexpr_blockwise_shift_scale"]
+    assert len(q_ops) == 1
+    assert q_ops[0].name == "proj_w_quantized"
+    assert np.dtype(q_ops[0].inputs["data"].val.dtype) == np.int8
     mil_str = str(q_ml._mil_program)
-    assert "proj_w" in mil_str and "int8" in mil_str
+    assert "proj_w_quantized" in mil_str
     assert "rope_cos_quantized" not in mil_str
     assert "swa_const_quantized" not in mil_str
 

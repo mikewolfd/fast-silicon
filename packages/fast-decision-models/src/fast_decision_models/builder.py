@@ -293,10 +293,10 @@ def _compile_laya_seq_bundle(
             qrp = _rope(qh, c_t, s_t, f"l{i}_qrp")
             krp = _rope(kh, c_t, s_t, f"l{i}_krp")
 
-            qk = mb.matmul(x=qrp, y=krp, transpose_y=True, name=f"l{i}_qk")
+            qk = mb.matmul(x=qrp, y=krp, transpose_y=True, name=f"l{i}_qk")  # guard: allow-coreml-matmul (dynamic Q@K^T activations; [1585,0,0] ANE)
             m_bias = ext_mask if is_full else swa_mask
             probs = mb.softmax(x=mb.add(x=qk, y=m_bias, name=f"l{i}_qkb"), axis=-1, name=f"l{i}_sm")
-            att = mb.matmul(x=probs, y=vh, name=f"l{i}_att")
+            att = mb.matmul(x=probs, y=vh, name=f"l{i}_att")  # guard: allow-coreml-matmul (dynamic P@V activations; weights use 4D mb.conv)
             att_4d = mb.reshape(
                 x=mb.transpose(x=att, perm=[0, 1, 3, 2], name=f"l{i}_at"),
                 shape=[1, H, 1, seq_len],
@@ -359,9 +359,9 @@ def _compile_laya_seq_bundle(
                 perm=[0, 1, 3, 2],
                 name=f"hl{hi}_vt",
             )
-            hqk = mb.matmul(x=hqh, y=hkh, transpose_y=True, name=f"hl{hi}_qk")
+            hqk = mb.matmul(x=hqh, y=hkh, transpose_y=True, name=f"hl{hi}_qk")  # guard: allow-coreml-matmul (dynamic head Q@K^T activations; [1585,0,0] ANE)
             hpr = mb.softmax(x=mb.add(x=hqk, y=ext_mask, name=f"hl{hi}_qkb"), axis=-1, name=f"hl{hi}_sm")
-            hatt = mb.matmul(x=hpr, y=hvh, name=f"hl{hi}_att")
+            hatt = mb.matmul(x=hpr, y=hvh, name=f"hl{hi}_att")  # guard: allow-coreml-matmul (dynamic head P@V activations; weights use 4D mb.conv)
             hatt_4d = mb.reshape(
                 x=mb.transpose(x=hatt, perm=[0, 1, 3, 2], name=f"hl{hi}_at"),
                 shape=[1, H, 1, seq_len],

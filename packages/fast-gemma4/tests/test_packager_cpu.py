@@ -32,8 +32,30 @@ from fast_gemma4.packager import (
     write_safetensors_dir,
 )
 
+from fast_gemma4.paths import resolve_paths
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VOCAB_REMAP_150786 = REPO_ROOT / "artifacts" / "vocab" / "vocab_remap_150786.npz"
+_PATHS = resolve_paths()
+VOCAB_REMAP_150786 = (
+    REPO_ROOT / "artifacts" / "vocab" / "vocab_remap_150786.npz"
+    if (REPO_ROOT / "artifacts" / "vocab" / "vocab_remap_150786.npz").exists()
+    else _PATHS.vocab_remap_npz
+)
+
+
+def _resolve_local_tokenizer_json() -> Path | None:
+    cand = REPO_ROOT / "artifacts" / "tokenizer" / "tokenizer.json"
+    if cand.exists():
+        return cand
+    try:
+        resolved = _PATHS.resolve_tokenizer_json(local_files_only=True)
+        if resolved.exists():
+            return resolved
+    except FileNotFoundError:
+        pass
+    if BF16_HF_SNAPSHOT.exists() and (BF16_HF_SNAPSHOT / "tokenizer.json").exists():
+        return BF16_HF_SNAPSHOT / "tokenizer.json"
+    return None
 BF16_HF_SNAPSHOT = (
     Path.home()
     / ".cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-bf16/snapshots/fb0b166bbb9a0eb4b37915bfc515a197c9122f39"
@@ -442,9 +464,9 @@ def test_packed_checkpoint_matches_fast_gemma4_model_contract_cpu(tmp_path: Path
     from fast_gemma4.model import _compute_previous_kvs
     from fast_gemma4.tokenizer import FULL_VOCAB_SIZE, VocabRemapper
 
-    tok_json = REPO_ROOT / "artifacts" / "tokenizer" / "tokenizer.json"
-    if not tok_json.exists() and BF16_HF_SNAPSHOT.exists():
-        tok_json = BF16_HF_SNAPSHOT / "tokenizer.json"
+    tok_json = _resolve_local_tokenizer_json()
+    if tok_json is None:
+        tok_json = Path("/nonexistent/tokenizer.json")
 
     rng = np.random.default_rng(99)
     h_dim, ple_dim, mlp_int, d_swa, d_full = 1536, 256, 256, 256, 512
@@ -556,9 +578,9 @@ def test_latin_extended_vocab162304_covers_accented_names_cpu(tmp_path: Path) ->
     """Verify Latin-Extended 162,304 vocab covers accented names with 0 misses and 1-to-1 token mapping."""
     from fast_gemma4.tokenizer import FastGemma4Tokenizer, LATIN_EXTENDED_KEPT_VOCAB_SIZE, VocabRemapper
 
-    tok_json = REPO_ROOT / "artifacts" / "tokenizer" / "tokenizer.json"
-    if not tok_json.exists():
-        pytest.skip(f"Missing {tok_json}")
+    tok_json = _resolve_local_tokenizer_json()
+    if tok_json is None:
+        pytest.skip("Missing tokenizer.json in REPO_ROOT, resolve_paths(), or HF snapshot")
 
     tok = FastGemma4Tokenizer(tok_json)
     rem_150k = VocabRemapper(tok_json, target_size=DEFAULT_KEPT_VOCAB_SIZE)

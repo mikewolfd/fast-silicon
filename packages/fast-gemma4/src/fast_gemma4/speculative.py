@@ -652,6 +652,21 @@ def run_decode_prompt_lookup(
             queues[orig_b].clear()
         return True
 
+    def _fallback_sample_step_row(
+        orig_b: int,
+        r_idx: int,
+        pos_idx: int,
+        lg_full_np: np.ndarray | None,
+        lg_step_mx: Any,
+        last_x: Any,
+        am_rows: list[list[int]],
+    ) -> np.ndarray:
+        if lg_full_np is None:
+            lg_full_np = np.array(lg_step_mx.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
+        xr = last_x[r_idx, pos_idx] if last_x is not None else None
+        sample_and_queue(orig_b, lg_full_np[r_idx, pos_idx], am_rows[r_idx][pos_idx], x_row_mx=xr)
+        return lg_full_np
+
     if init_lg is not None:
         am_mx0 = safe_argmax_with_nan_guard(init_lg[:, 0, :], axis=-1)
         mx.eval(am_mx0)
@@ -743,7 +758,7 @@ def run_decode_prompt_lookup(
         else:
             lg_step = model.forward_step_ragged(batch_mx, cache, off_cur, apply_softcap=True)
         am_mx = safe_argmax_with_nan_guard(lg_step, axis=-1)
-        mx.eval(am_mx)
+        mx.eval(am_mx)  # guard: allow-eval (speculative draft verification step requires synchronous token IDs)
         am_list = am_mx.tolist()
         if np.any(np.asarray(am_list, dtype=np.int32) < 0):
             raise FloatingPointError("NaN logits detected in run_decode_prompt_lookup verification step")
@@ -771,10 +786,7 @@ def run_decode_prompt_lookup(
                 if grammar is not None:
                     assert matchers is not None
                     if not matchers[b].validate_tokens([pred_orig]):
-                        if lg_full_np is None:
-                            lg_full_np = np.array(lg_step.astype(mx.float32))
-                        xr = last_x_step[r, pos] if last_x_step is not None else None
-                        sample_and_queue(b, lg_full_np[r, pos], am_list[r][pos], x_row_mx=xr)
+                        lg_full_np = _fallback_sample_step_row(b, r, pos, lg_full_np, lg_step, last_x_step, am_list)
                         acc_lens[r] = nf + matched
                         total_acc += nf + matched
                         stopped = True
@@ -838,10 +850,7 @@ def run_decode_prompt_lookup(
                 if pos >= 0:
                     ok = sample_and_queue(b, None, am_list[r][pos])
                     if not ok:
-                        if lg_full_np is None:
-                            lg_full_np = np.array(lg_step.astype(mx.float32))
-                        xr = last_x_step[r, pos] if last_x_step is not None else None
-                        sample_and_queue(b, lg_full_np[r, pos], am_list[r][pos], x_row_mx=xr)
+                        lg_full_np = _fallback_sample_step_row(b, r, pos, lg_full_np, lg_step, last_x_step, am_list)
                 acc_lens[r] = nf + len(dr)
                 total_acc += nf + len(dr)
 

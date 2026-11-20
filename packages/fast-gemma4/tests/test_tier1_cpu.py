@@ -1213,12 +1213,24 @@ def test_mixed_8bit_g64_non_mlp_bf16_mlp_vocab150786_loader_cpu(tmp_path: Path) 
     assert DEFAULT_KEPT_VOCAB_SIZE == 150786
     assert FULL_VOCAB_SIZE == 262144
 
-    # 1. Verify real VocabRemapper if artifacts tokenizer is present locally (read-only), else synthetic
+    # 1. Verify real VocabRemapper if artifacts tokenizer is present locally or via sibling resolve_paths, else synthetic
+    from fast_gemma4.paths import resolve_paths
+
     repo_root = Path(__file__).resolve().parents[1]
     real_tok = repo_root / "artifacts" / "tokenizer" / "tokenizer.json"
+    real_remap = repo_root / "artifacts" / "vocab" / "vocab_remap_150786.npz"
+    if not real_tok.exists():
+        try:
+            paths_r = resolve_paths()
+            cand_tok = paths_r.resolve_tokenizer_json(local_files_only=True)
+            if cand_tok.exists():
+                real_tok = cand_tok
+            if not real_remap.exists() and paths_r.vocab_remap_npz.exists():
+                real_remap = paths_r.vocab_remap_npz
+        except FileNotFoundError:
+            pass
     if real_tok.exists():
         tok_path = real_tok
-        real_remap = repo_root / "artifacts" / "vocab" / "vocab_remap_150786.npz"
         rem = VocabRemapper.load_or_build(tok_path, real_remap if real_remap.exists() else None, target_size=150786)
         assert rem.vocab_size == 150786
         assert rem.old_to_new.shape == (262144,)
