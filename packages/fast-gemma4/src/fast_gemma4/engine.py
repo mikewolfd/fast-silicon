@@ -27,8 +27,15 @@ from .ane_pipeline import (
     is_ane_resident_bundle,
     is_w8_bundle_calibrated,
 )
-from .grammar import GrammarHelper
+from .grammar import DEFAULT_MAX_WHITESPACE_RUN, GrammarHelper
 from .model import FastGemma4Model
+from .mtp_drafter import (
+    DEFAULT_MTP_DRAFTER_REPO,
+    DEFAULT_MTP_TOP_K,
+    Gemma4MtpDrafter,
+    run_decode_mtp,
+    should_use_mtp_drafter,
+)
 from .paths import Gemma4Paths, resolve_paths
 from .speculative import (
     _host_ram_gib,
@@ -61,10 +68,19 @@ class GenerationBatchResult:
 PromptInput = str | Sequence[dict[str, Any]]
 
 
-def _normalize_schema_key(json_schema: str | dict[str, Any], whitespace_flexible: bool) -> tuple[str, bool]:
+def _normalize_schema_key(
+    json_schema: str | dict[str, Any],
+    whitespace_flexible: bool,
+    max_whitespace_run: int | None = None,
+) -> tuple[str, bool, int]:
+    eff_ws = (
+        0
+        if not whitespace_flexible
+        else (DEFAULT_MAX_WHITESPACE_RUN if max_whitespace_run is None else max(0, int(max_whitespace_run)))
+    )
     if isinstance(json_schema, str):
-        return json_schema, whitespace_flexible
-    return json.dumps(json_schema, sort_keys=True, ensure_ascii=False), whitespace_flexible
+        return json_schema, whitespace_flexible, eff_ws
+    return json.dumps(json_schema, sort_keys=True, ensure_ascii=False), whitespace_flexible, eff_ws
 
 
 def select_execution_plan(
@@ -127,6 +143,9 @@ class FastGemma4Engine:
         max_prefix_cache: int | None = None,
         max_b_slots: int | None = None,
         allow_ane_on_low_ram: bool = False,
+        mtp_drafter: str | Path | bool | None = None,
+        mtp_top_k: int = DEFAULT_MTP_TOP_K,
+        mtp_draft_k: int | None = None,
         local_files_only: bool = True,
         warmup: bool = True,
         warmup_ane: bool = False,
@@ -185,7 +204,7 @@ class FastGemma4Engine:
 
         self._gpu_lock = threading.Lock()
         self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
-        self._grammar_cache: dict[tuple[str, bool], GrammarHelper] = {}
+        self._grammar_cache: dict[tuple[str, bool, int], GrammarHelper] = {}
         self._ane_runner: AnePrefixRunner | None = None
         self._ane_ring_runner: AnePrefixRunner | None = None
         self._ane_ring_checked: bool = False
@@ -214,6 +233,17 @@ class FastGemma4Engine:
         self.ane_available = bool(
             (not low_ram_ane_disabled) and bundle is not None and self.paths.lib_ane_prefix.exists()
         )
+
+        self.mtp_drafter: Gemma4MtpDrafter | None = None
+        self.mtp_draft_k: int | None = None if mtp_draft_k is None else int(mtp_draft_k)
+        if mtp_drafter:
+            drafter_ref: str | Path = DEFAULT_MTP_DRAFTER_REPO if mtp_drafter is True else mtp_drafter
+            self.mtp_drafter = Gemma4MtpDrafter(
+                self.model,
+                drafter_ref,
+                top_k=mtp_top_k,
+                local_files_only=local_files_only,
+            )
 
         if warmup:
             self.warmup(enable_ane=warmup_ane)
@@ -244,6 +274,7 @@ class FastGemma4Engine:
         gc.collect()
 
     def close(self) -> None:
+        self.mtp_drafter = None
         self.release_ane_resources()
         prev_wl = getattr(self, "_prev_wired_limit", None)
         if prev_wl is not None:
@@ -291,8 +322,9 @@ class FastGemma4Engine:
         json_schema: str | dict[str, Any],
         *,
         whitespace_flexible: bool = False,
+        max_whitespace_run: int | None = None,
     ) -> GrammarHelper:
-        key = _normalize_schema_key(json_schema, whitespace_flexible)
+        key = _normalize_schema_key(json_schema, whitespace_flexible, max_whitespace_run)
         gh = self._grammar_cache.get(key)
         if gh is None:
             gh = GrammarHelper(
@@ -300,6 +332,7 @@ class FastGemma4Engine:
                 json_schema,
                 self.model.new_to_old,
                 whitespace_flexible=whitespace_flexible,
+                max_whitespace_run=max_whitespace_run,
             )
             self._grammar_cache[key] = gh
         return gh
@@ -466,6 +499,7 @@ class FastGemma4Engine:
         speculative: bool | None = None,
         use_chat_template: bool = True,
         whitespace_flexible: bool = True,
+        max_whitespace_run: int | None = None,
     ) -> GenerationItem:
         res = self.generate_batch(
             [prompt],
@@ -479,6 +513,7 @@ class FastGemma4Engine:
             speculative=speculative,
             use_chat_template=use_chat_template,
             whitespace_flexible=whitespace_flexible,
+            max_whitespace_run=max_whitespace_run,
         )
         return res.items[0]
 
@@ -560,6 +595,7 @@ class FastGemma4Engine:
         use_chat_template: bool = True,
         enable_thinking: bool = False,
         whitespace_flexible: bool = False,
+        max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
         use_ane_ring: bool | str = False,
         ane_cohort_size: int = 16,
@@ -586,7 +622,11 @@ class FastGemma4Engine:
                 enable_thinking=enable_thinking,
             )
             grammar = (
-                self.get_grammar(json_schema, whitespace_flexible=whitespace_flexible)
+                self.get_grammar(
+                    json_schema,
+                    whitespace_flexible=whitespace_flexible,
+                    max_whitespace_run=max_whitespace_run,
+                )
                 if (json_schema is not None and per_doc_grammars is None)
                 else None
             )
@@ -597,7 +637,13 @@ class FastGemma4Engine:
                     if g_spec is None:
                         resolved_grammars.append(None)
                     elif isinstance(g_spec, (str, dict)):
-                        resolved_grammars.append(self.get_grammar(g_spec, whitespace_flexible=whitespace_flexible))
+                        resolved_grammars.append(
+                            self.get_grammar(
+                                g_spec,
+                                whitespace_flexible=whitespace_flexible,
+                                max_whitespace_run=max_whitespace_run,
+                            )
+                        )
                     else:
                         resolved_grammars.append(g_spec)
 
@@ -664,6 +710,23 @@ class FastGemma4Engine:
             def _decode_wave(w_indices: list[int], lg0: mx.array, ob0: mx.array, cache: dict[str, Any]) -> dict[str, Any]:
                 nonlocal any_spec_used
                 Bw = len(w_indices)
+                mtp_drafter = getattr(self, "mtp_drafter", None)
+                if should_use_mtp_drafter(mtp_drafter, use_ane, Bw, temperature, speculative=speculative):
+                    assert mtp_drafter is not None
+                    any_spec_used = True
+                    return run_decode_mtp(
+                        self.model,
+                        mtp_drafter,
+                        self.tokenizer.stop_token_ids,
+                        grammar,
+                        lg0,
+                        ob0,
+                        cache,
+                        Bw,
+                        max_tokens=max_tokens,
+                        draft_k=getattr(self, "mtp_draft_k", None),
+                        enable_ff_jump=enable_ff_jump,
+                    )
                 use_spec = should_use_speculative(speculative, use_ane, Bw, temperature)
                 if use_spec:
                     any_spec_used = True
@@ -755,7 +818,16 @@ class FastGemma4Engine:
             elif (
                 ring_for_batch is None
                 and resolved_grammars is None
-                and should_use_speculative(speculative, False, min(n_docs, wave_bs), temperature)
+                and (
+                    should_use_mtp_drafter(
+                        getattr(self, "mtp_drafter", None),
+                        False,
+                        min(n_docs, wave_bs),
+                        temperature,
+                        speculative=speculative,
+                    )
+                    or should_use_speculative(speculative, False, min(n_docs, wave_bs), temperature)
+                )
             ):
                 for w_docs in waves:
                     Bw = len(w_docs)
@@ -783,6 +855,20 @@ class FastGemma4Engine:
                         )
                         extra_roll_stats["ff_jump_tokens"] = extra_roll_stats.get("ff_jump_tokens", 0) + int(
                             dec_res.get("ff_jump_tokens", 0)
+                        )
+                    if dec_res.get("speculative_backend") == "mtp":
+                        extra_roll_stats["speculative_backend"] = "mtp"
+                        extra_roll_stats["mtp_rounds"] = extra_roll_stats.get("mtp_rounds", 0) + int(
+                            dec_res.get("mtp_rounds", 0)
+                        )
+                        extra_roll_stats["mtp_accepted"] = extra_roll_stats.get("mtp_accepted", 0) + int(
+                            dec_res.get("mtp_accepted", 0)
+                        )
+                        extra_roll_stats["mtp_proposed"] = extra_roll_stats.get("mtp_proposed", 0) + int(
+                            dec_res.get("mtp_proposed", 0)
+                        )
+                        extra_roll_stats["mtp_accept_rate"] = extra_roll_stats["mtp_accepted"] / max(
+                            extra_roll_stats["mtp_proposed"], 1
                         )
                     for r, doc_i in enumerate(w_docs):
                         all_gen_toks[doc_i] = dec_res["gen_toks"][r]

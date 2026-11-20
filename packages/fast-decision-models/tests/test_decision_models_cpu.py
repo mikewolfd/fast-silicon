@@ -501,6 +501,42 @@ def test_laya_encode_item_truncation_modes() -> None:
     assert enc_ign["truncated"] is True and len(rec_ign) == 0
 
 
+def test_laya_choice6_honors_head_max_len_256_without_option_clipping() -> None:
+    """Verify `head_max_len=256` from `rl_agent_config.json` prevents `Choice(6)` option clipping at `S=512`."""
+    assert LayaAneBackend._resolve_head_max_len({}, 512) == 192
+    assert LayaAneBackend._resolve_head_max_len({"head_max_len": 256}, 512) == 256
+    assert LayaAneBackend._resolve_head_max_len({"head_max_len": 512}, 512) == 256
+
+    mock_laya = LayaAneBackend.__new__(LayaAneBackend)
+    mock_laya.max_len = 512
+    mock_laya.head_max_len = LayaAneBackend._resolve_head_max_len({"head_max_len": 256}, 512)
+    mock_laya.cls_id = 1
+    mock_laya.sep_id = 2
+    mock_laya.pad_id = 3
+    mock_laya.mask_id = 4
+    mock_laya.mask_tok = "[MASK]"
+    mock_laya._encode_ids = lambda text: [10 + (i % 50) for i in range(len(text.split()))]  # type: ignore[method-assign]
+
+    # 6 router options of 30 tokens each (+1 [MASK] = 31 tokens -> 186 total option tokens) + 25-token instructions.
+    # At legacy `head_max_len=192`, `opt_budget = 6 < 16` clipped each option to 29 tokens; `head_max_len=256` preserves all 31!
+    crit = {f"kind_{j}": " ".join(["desc"] * 29) for j in range(6)}
+    qdef = {
+        "type": "choice",
+        "instructions": " ".join(["select"] * 22),
+        "criteria": crit,
+    }
+    enc_512 = mock_laya.encode_item(" ".join(["body"] * 40), qdef, on_truncate="error")
+    assert enc_512["truncated"] is False
+    # Each consecutive marker is separated by exactly 31 tokens (`[MASK]` + 30 option tokens)
+    gaps = [enc_512["markers"][i + 1] - enc_512["markers"][i] for i in range(5)]
+    assert gaps == [31, 31, 31, 31, 31]
+
+    # At `max_len=256`, `eff_head` safely drops to `128` leaving room for state tokens.
+    enc_256 = mock_laya.encode_item(" ".join(["body"] * 20), qdef, max_len=256, on_truncate="ignore")
+    assert len(enc_256["ids"]) <= 256
+    assert enc_256["markers"][-1] < 128
+
+
 def test_kev_vectorized_masks_cache_limits_and_zero_clone_gdn_gpu() -> None:
     """Verify vectorized BF16 masks, cache/wired restoration, and zero-clone GDN `owner_idx` parity."""
     import mlx.core as mx

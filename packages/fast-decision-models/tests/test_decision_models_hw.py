@@ -194,3 +194,84 @@ def test_laya_ane_compute_plan_and_batch_parity() -> None:
             assert len(c_probs) == 3 and abs(sum(c_probs) - 1.0) < 1e-5
         finally:
             laya.close()
+
+
+def test_kev08b_prefix_tree_parity_and_budget_invariants() -> None:
+    """Verify 256-token `PrefixTree` KV+GDN cache gives bit-exact hit replay and tight full-prefill parity."""
+    from fast_decision_models.prefix_tree import PrefixTree
+
+    kev_dir = resolve_kev_dir()
+    if not (kev_dir / "model_w8.safetensors").exists() and not (kev_dir / "model.safetensors").exists():
+        pytest.skip(f"Missing Kev-0.8B artifacts in {kev_dir}")
+
+    shared_preamble = " ".join(
+        [
+            f"Policy Section {i}: All production TLS certificates on edge load balancers must rotate every 30 days "
+            "with automated renewal alerts forwarded to the site reliability escalation channel."
+            for i in range(18)
+        ]
+    )
+    doc_a = shared_preamble + " " + _SAMPLE_CASES[0][0]
+    doc_b = shared_preamble + " " + _SAMPLE_CASES[1][0]
+    q_tls = _SAMPLE_CASES[0][1]
+    q_inv = _SAMPLE_CASES[1][1]
+
+    tree = PrefixTree(chunk_tokens=256, byte_budget=128 << 20)
+    with acquire_hw_lock("test_kev08b_prefix_tree_parity"):
+        kev_ref = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=1)
+        try:
+            ref_a_all = kev_ref.score_multi_states([(doc_a, [q_tls, q_inv])], batch_docs=1)[0]
+            ref_b_all = kev_ref.score_multi_states([(doc_b, [q_tls, q_inv])], batch_docs=1)[0]
+        finally:
+            kev_ref.close()
+
+        kev_pt = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=1, prefix_tree=tree)
+        try:
+            s_ids_a, _ = kev_pt.encode_questions(doc_a, [q_tls])
+            s_ids_b, _ = kev_pt.encode_questions(doc_b, [q_tls])
+            assert len(s_ids_a) >= 512 and len(s_ids_b) >= 512
+            lcp = 0
+            for x, y in zip(s_ids_a, s_ids_b):
+                if x != y:
+                    break
+                lcp += 1
+            assert lcp >= 512
+
+            # 1. Cold pass on doc_a populates chunks + GDN snapshots.
+            cold_a = kev_pt.score_multi_states([(doc_a, [q_tls, q_inv])], batch_docs=1)[0]
+            assert tree.misses == 1 and tree.hits == 0
+            assert 0 < tree.bytes_held <= tree.byte_budget
+
+            # 2. Warm repeat on doc_a hits full 256-aligned chunks -> bit-exact match vs cold chunked!
+            warm_a = kev_pt.score_multi_states([(doc_a, [q_tls, q_inv])], batch_docs=1)[0]
+            assert tree.hits == 1 and tree.reused_tokens >= 512
+
+            # 3. Partial-prefix hit on doc_b (shared >=512-token preamble + distinct doc suffix)!
+            warm_b = kev_pt.score_multi_states([(doc_b, [q_tls, q_inv])], batch_docs=1)[0]
+            assert tree.hits == 2 and tree.reused_tokens >= 1024
+            assert 0 < tree.bytes_held <= tree.byte_budget
+
+            # 4. Exact 512-token boundary (zero tail tokens!) hit check.
+            exact_512_text = kev_pt.tok.decode(s_ids_a[1:512])
+            exact_s_ids, _ = kev_pt.encode_questions(exact_512_text, [q_tls])
+            if len(exact_s_ids) >= 256:
+                exact_cold = kev_pt.score_multi_states([(exact_512_text, [q_tls])], batch_docs=1)[0]
+                exact_warm = kev_pt.score_multi_states([(exact_512_text, [q_tls])], batch_docs=1)[0]
+                assert exact_cold == exact_warm
+        finally:
+            kev_pt.close()
+
+    # Cold chunked vs warm restored hit must be bit-exact (0.0 logit delta)!
+    for idx, ((cp, cz), (wp, wz)) in enumerate(zip(cold_a, warm_a)):
+        assert max(abs(a - b) for a, b in zip(cz, wz)) == 0.0, f"doc_a q[{idx}] cold vs hit drift: {cz} vs {wz}"
+        assert max(abs(a - b) for a, b in zip(cp, wp)) == 0.0
+
+    # Warm hit vs unchunked full prefill differs only by BF16 GEMM M-tile rounding across 256-tok chunk stops.
+    for tag, ref_all, got_all in (("doc_a", ref_a_all, warm_a), ("doc_b", ref_b_all, warm_b)):
+        for idx, ((rp, rz), (gp, gz)) in enumerate(zip(ref_all, got_all)):
+            assert max(abs(a - b) for a, b in zip(rz, gz)) < 0.15, f"{tag} q[{idx}] logit drift: {rz} vs {gz}"
+            assert max(abs(a - b) for a, b in zip(rp, gp)) < 1e-2, f"{tag} q[{idx}] prob drift: {rp} vs {gp}"
+            assert (gp[1] >= 0.5) == (rp[1] >= 0.5)
+
+    assert tree.shed() > 0
+    assert tree.bytes_held == 0

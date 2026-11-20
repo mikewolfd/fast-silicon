@@ -21,11 +21,14 @@ from .paths import (
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "Kev08bMlxBackend": (".kev_mlx", "Kev08bMlxBackend"),
     "LayaAneBackend": (".laya_ane", "LayaAneBackend"),
+    "PrefixMatch": (".prefix_tree", "PrefixMatch"),
+    "PrefixTree": (".prefix_tree", "PrefixTree"),
     "acquire_hw_lock": ("._common", "acquire_hw_lock"),
     "build_kev_mlx_artifacts": (".builder", "build_kev_mlx_artifacts"),
     "build_laya_ane_artifacts": (".builder", "build_laya_ane_artifacts"),
     "compile_native_dylib": (".builder", "compile_native_dylib"),
     "quantize_kev_w8_artifacts": (".builder", "quantize_kev_w8_artifacts"),
+    "recommended_prefix_budget_bytes": (".prefix_tree", "recommended_prefix_budget_bytes"),
 }
 
 
@@ -46,12 +49,15 @@ __all__ = [
     "DecisionModelPaths",
     "Kev08bMlxBackend",
     "LayaAneBackend",
+    "PrefixMatch",
+    "PrefixTree",
     "acquire_hw_lock",
     "build_kev_mlx_artifacts",
     "build_laya_ane_artifacts",
     "compile_native_dylib",
     "ensure_laya_dylib",
     "quantize_kev_w8_artifacts",
+    "recommended_prefix_budget_bytes",
     "resolve_artifacts_dir",
     "resolve_home",
     "resolve_kev_dir",

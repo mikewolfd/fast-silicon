@@ -21,6 +21,7 @@ from .server import FastGemma4Server
 
 def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
     ane_var = getattr(args, "ane_variant", "fp16")
+    mtp_ref = getattr(args, "mtp_drafter_path", None) or (True if getattr(args, "mtp_drafter", False) else None)
     return FastGemma4Engine(
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
@@ -30,6 +31,7 @@ def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
         mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
         kv_i8=not getattr(args, "no_kv_i8", False),
+        mtp_drafter=mtp_ref,
         warmup=not getattr(args, "no_warmup", False),
         warmup_ane=bool(getattr(args, "mode", "auto") == "hetero"),
     )
@@ -88,6 +90,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             mode=args.mode,
             speculative=spec,
             whitespace_flexible=(not args.compact_json),
+            max_whitespace_run=getattr(args, "json_max_whitespace", None),
         )
         if args.json:
             print(
@@ -420,6 +423,16 @@ def _add_model_args(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--no-kv-i8", action="store_true", help="Disable INT8 rolling KV cache compression")
     subparser.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
     subparser.add_argument("--mlp-dtype", choices=("bfloat16", "quantized"), default="bfloat16")
+    subparser.add_argument(
+        "--mtp-drafter",
+        action="store_true",
+        help="Opt-in Gemma-4 E2B MTP speculative drafter (google/gemma-4-E2B-it-assistant; strictly gated to B=1..4, T=0)",
+    )
+    subparser.add_argument(
+        "--mtp-drafter-path",
+        default=None,
+        help="Opt-in local path or HF repo for the Gemma-4 E2B MTP drafter (strictly gated to B=1..4, T=0)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -452,6 +465,12 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--speculative", action="store_true")
     gn.add_argument("--no-speculative", action="store_true")
     gn.add_argument("--compact-json", action="store_true", help="Disallow optional JSON whitespace for maximum jump-forward speed")
+    gn.add_argument(
+        "--json-max-whitespace",
+        type=int,
+        default=32,
+        help="Max consecutive whitespace chars between JSON tokens when flexible JSON is active (default: 32; 0 disables)",
+    )
     gn.add_argument("--no-warmup", action="store_true")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=_cmd_generate)

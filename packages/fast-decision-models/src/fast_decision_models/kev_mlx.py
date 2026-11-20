@@ -13,6 +13,12 @@ from typing import Any, Literal, Mapping, Sequence
 
 from ._common import softmax_vec
 from .paths import resolve_kev_dir
+from .prefix_tree import (
+    DEFAULT_CHUNK_TOKENS,
+    PrefixTree,
+    recommended_prefix_budget_bytes,
+    snapshot_boundaries,
+)
 
 _KEV_SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 _KEV_CACHE_LIMIT_BYTES = 512 << 20
@@ -633,6 +639,10 @@ class Kev08bMlxBackend:
         max_state: int = 1024,
         max_branch: int = 2048,
         max_branch_batch: int | None = None,
+        prefix_tree: PrefixTree | None = None,
+        prefix_cache_mb: int | Literal["auto"] | None = None,
+        prefix_chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+        prefix_snapshot_stride: int = 1,
     ) -> None:
         import mlx.core as mx
         import numpy as np
@@ -695,6 +705,24 @@ class Kev08bMlxBackend:
 
         default_max_br = 16 if (0 < host_mem_bytes <= (24 << 30)) else 32
         self.max_branch_batch = max(1, int(max_branch_batch or default_max_br))
+        self.prefix_snapshot_stride = max(1, int(prefix_snapshot_stride))
+        self._owns_prefix_tree = False
+        if prefix_tree is not None:
+            self.prefix_tree: PrefixTree | None = prefix_tree
+        elif prefix_cache_mb == "auto":
+            self.prefix_tree = PrefixTree(
+                chunk_tokens=int(prefix_chunk_tokens),
+                byte_budget=recommended_prefix_budget_bytes(host_mem_bytes),
+            )
+            self._owns_prefix_tree = True
+        elif prefix_cache_mb is not None:
+            self.prefix_tree = PrefixTree(
+                chunk_tokens=int(prefix_chunk_tokens),
+                byte_budget=max(0, int(prefix_cache_mb)) << 20,
+            )
+            self._owns_prefix_tree = True
+        else:
+            self.prefix_tree = None
 
         try:
             weights = mx.load(str(sf_p))
@@ -705,6 +733,8 @@ class Kev08bMlxBackend:
             self.ptr_scale = 1.0 / math.sqrt(float(self.q_w.shape[0]))
 
             self.backbone = _build_qwen35_backbone(meta["text_config"], weights, quant_cfg=self.quantization)
+            self._full_layer_indices = [i for i, blk in enumerate(self.backbone.layers) if not blk.is_linear]
+            self._linear_layer_indices = [i for i, blk in enumerate(self.backbone.layers) if blk.is_linear]
             del weights
             mx.clear_cache()
         except Exception:
@@ -808,6 +838,155 @@ class Kev08bMlxBackend:
             except Exception:
                 pass
 
+    def shed_prefix_cache(self) -> int:
+        """Drop all cached prefix chunks/snapshots from `prefix_tree` and clear MLX allocator cache."""
+        if self.prefix_tree is None:
+            return 0
+        freed = self.prefix_tree.clear()
+        self._mx.clear_cache()
+        return freed
+
+    def _detach_kv_chunk(self, arr: Any, start: int, end: int) -> Any:
+        mx = self._mx
+        if start == 0 and int(arr.shape[2]) == end:
+            return mx.contiguous(arr)
+        sl = arr[:, :, start:end, :]
+        if int(arr.shape[1]) > 1:
+            return mx.contiguous(sl)
+        return mx.concatenate([sl], axis=2)
+
+    def _prefill_state_with_prefix_tree(
+        self,
+        state_ids: Sequence[int],
+        *,
+        eval_restored_concat: bool = False,
+    ) -> list[Any]:
+        """Unpadded `256`-token chunked prefill restoring/publishing KV + hybrid GDN states in `PrefixTree`."""
+        mx = self._mx
+        tree = self.prefix_tree
+        assert tree is not None
+        s_len = len(state_ids)
+        chunk_sz = tree.chunk_tokens
+        cache = self.backbone.make_cache()
+
+        if tree.byte_budget <= 0 or s_len < chunk_sz:
+            h_st = self.backbone(mx.array([state_ids], dtype=mx.int32), cache, write_state=True)
+            mx.eval(h_st)
+            return cache
+
+        match = tree.match(state_ids, limit=s_len, needs_snapshot=True)
+        pos = match.reused_tokens
+        parent_key = match.keys[-1] if match.keys else None
+        depth = len(match.keys)
+
+        if pos > 0:
+            n_chunks = len(match.chunks)
+            for fa_i, l_idx in enumerate(self._full_layer_indices):
+                if n_chunks == 1:
+                    cache[l_idx].keys = match.chunks[0][0][fa_i]
+                    cache[l_idx].values = match.chunks[0][1][fa_i]
+                else:
+                    cache[l_idx].keys = mx.concatenate([c[0][fa_i] for c in match.chunks], axis=2)
+                    cache[l_idx].values = mx.concatenate([c[1][fa_i] for c in match.chunks], axis=2)
+                cache[l_idx].offset = pos
+            conv_snaps, rec_snaps = match.snapshot
+            for gdn_i, l_idx in enumerate(self._linear_layer_indices):
+                cache[l_idx].conv_state = conv_snaps[gdn_i]
+                cache[l_idx].rec_state = rec_snaps[gdn_i]
+            tree.record(match, restored=True)
+        else:
+            tree.record(match, restored=False)
+
+        full_end = (s_len // chunk_sz) * chunk_sz
+        if pos < full_end:
+            snap_positions = set(
+                snapshot_boundaries(
+                    pos,
+                    s_len,
+                    chunk_tokens=chunk_sz,
+                    snapshot_stride=self.prefix_snapshot_stride,
+                    include_deepest=True,
+                )
+            )
+            for c_start in range(pos, full_end, chunk_sz):
+                c_end = c_start + chunk_sz
+                chunk_toks = state_ids[c_start:c_end]
+                h_c = self.backbone(mx.array([chunk_toks], dtype=mx.int32), cache, write_state=True)
+                k_chunk = tuple(
+                    self._detach_kv_chunk(cache[l_idx].keys, c_start, c_end) for l_idx in self._full_layer_indices
+                )
+                v_chunk = tuple(
+                    self._detach_kv_chunk(cache[l_idx].values, c_start, c_end) for l_idx in self._full_layer_indices
+                )
+                want_snap = c_end in snap_positions
+                if want_snap:
+                    conv_snap = tuple(mx.contiguous(cache[l_idx].conv_state) for l_idx in self._linear_layer_indices)
+                    rec_snap = tuple(mx.contiguous(cache[l_idx].rec_state) for l_idx in self._linear_layer_indices)
+                    mx.eval(h_c, *k_chunk, *v_chunk, *conv_snap, *rec_snap)
+                else:
+                    conv_snap = ()
+                    rec_snap = ()
+                    mx.eval(h_c, *k_chunk, *v_chunk)
+
+                new_key = tree.insert(
+                    parent=parent_key,
+                    tokens=chunk_toks,
+                    depth=depth + 1,
+                    chunk=(k_chunk, v_chunk),
+                )
+                pos = c_end
+                if new_key is None:
+                    break
+                parent_key = new_key
+                depth += 1
+                if want_snap and not tree.has_snapshot(new_key):
+                    tree.attach_snapshot(new_key, (conv_snap, rec_snap), keeping_chain_to=new_key)
+
+        if pos < s_len:
+            h_tail = self.backbone(mx.array([state_ids[pos:]], dtype=mx.int32), cache, write_state=True)
+            mx.eval(h_tail)
+        elif eval_restored_concat and pos > 0 and len(match.chunks) > 1:
+            mx.eval(
+                *[cache[i].keys for i in self._full_layer_indices],
+                *[cache[i].values for i in self._full_layer_indices],
+            )
+        return cache
+
+    def _score_single_cache_branches(
+        self,
+        cache: list[Any],
+        rows: Sequence[Mapping[str, Any]],
+        br_chunk_lim: int,
+        *,
+        temperature: float | None = None,
+    ) -> list[tuple[list[float], list[float]]]:
+        mx = self._mx
+        np = self._np
+        doc_outs: list[tuple[list[float], list[float]]] = []
+        for c0 in range(0, len(rows), br_chunk_lim):
+            sub_rows = rows[c0 : c0 + br_chunk_lim]
+            n_sub = len(sub_rows)
+            max_l = max(len(r["ids"]) for r in sub_rows)
+            ids_mx = mx.array(
+                [r["ids"] + [self.pad_id] * (max_l - len(r["ids"])) for r in sub_rows],
+                dtype=mx.int32,
+            )
+            owner_mx = mx.zeros((n_sub,), dtype=mx.int32)
+            h_mx = self.backbone(
+                ids_mx,
+                cache,
+                owner_idx=owner_mx,
+                owner_is_identity=(n_sub == 1),
+                write_state=False,
+            )
+            mx.eval(h_mx)
+            h_np = np.asarray(h_mx.astype(mx.float32))
+            for ri, r in enumerate(sub_rows):
+                doc_outs.append(
+                    self._pointer_logits_and_probs(h_np[ri], r["decide"], r["opts"], temperature=temperature)
+                )
+        return doc_outs
+
     def _run_batched_pointer(
         self,
         items: Sequence[tuple[Any, Sequence[Mapping[str, Any]]]],
@@ -827,6 +1006,28 @@ class Kev08bMlxBackend:
         order = sorted(range(len(items)), key=lambda idx: len(encoded_all[idx][0]))
         out_by_orig: list[list[tuple[list[float], list[float]]]] = [[] for _ in items]
 
+        if self.prefix_tree is not None and self.prefix_tree.byte_budget > 0:
+            chunk_sz = self.prefix_tree.chunk_tokens
+            short_order: list[int] = []
+            for orig_i in order:
+                state_ids, rows = encoded_all[orig_i]
+                if not rows:
+                    out_by_orig[orig_i] = []
+                    continue
+                if len(state_ids) < chunk_sz:
+                    short_order.append(orig_i)
+                    continue
+                cache = self._prefill_state_with_prefix_tree(
+                    state_ids,
+                    eval_restored_concat=(len(rows) > br_chunk_lim),
+                )
+                out_by_orig[orig_i] = self._score_single_cache_branches(
+                    cache, rows, br_chunk_lim, temperature=temperature
+                )
+                del cache
+                self._maybe_clear_wave_cache()
+            order = short_order
+
         for wave_start in range(0, len(order), eff_b):
             wave_orig = order[wave_start : wave_start + eff_b]
             B = len(wave_orig)
@@ -840,31 +1041,9 @@ class Kev08bMlxBackend:
                 cache = self.backbone.make_cache()
                 h_st = self.backbone(mx.array([state_ids], dtype=mx.int32), cache, write_state=True)
                 mx.eval(h_st)
-
-                doc_outs: list[tuple[list[float], list[float]]] = []
-                for c0 in range(0, len(rows), br_chunk_lim):
-                    sub_rows = rows[c0 : c0 + br_chunk_lim]
-                    n_sub = len(sub_rows)
-                    max_l = max(len(r["ids"]) for r in sub_rows)
-                    ids_mx = mx.array(
-                        [r["ids"] + [self.pad_id] * (max_l - len(r["ids"])) for r in sub_rows],
-                        dtype=mx.int32,
-                    )
-                    owner_mx = mx.zeros((n_sub,), dtype=mx.int32)
-                    h_mx = self.backbone(
-                        ids_mx,
-                        cache,
-                        owner_idx=owner_mx,
-                        owner_is_identity=(n_sub == 1),
-                        write_state=False,
-                    )
-                    mx.eval(h_mx)
-                    h_np = np.asarray(h_mx.astype(mx.float32))
-                    for ri, r in enumerate(sub_rows):
-                        doc_outs.append(
-                            self._pointer_logits_and_probs(h_np[ri], r["decide"], r["opts"], temperature=temperature)
-                        )
-                out_by_orig[orig_0] = doc_outs
+                out_by_orig[orig_0] = self._score_single_cache_branches(
+                    cache, rows, br_chunk_lim, temperature=temperature
+                )
                 del cache, h_st
                 self._maybe_clear_wave_cache()
                 continue
@@ -1003,7 +1182,9 @@ class Kev08bMlxBackend:
         ]
 
     def close(self) -> None:
-        """Release model weights, restore MLX memory/cache limits, and clear the MLX buffer cache."""
+        """Release model weights, owned prefix cache, restore MLX memory/cache limits, and clear MLX cache."""
+        if getattr(self, "_owns_prefix_tree", False) and getattr(self, "prefix_tree", None) is not None:
+            self.prefix_tree.clear()
         self.backbone = None
         self._restore_mlx_limits()
         self._mx.clear_cache()

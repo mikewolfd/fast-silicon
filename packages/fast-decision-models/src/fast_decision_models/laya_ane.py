@@ -49,7 +49,7 @@ class LayaAneBackend:
             str(k): float(v) for k, v in cfg.get("temperature_by_options", {}).items()
         }
         self.max_len = 512
-        self.head_max_len = 192
+        self.head_max_len = self._resolve_head_max_len(cfg, self.max_len)
 
         tok_path = self.laya_dir / "tokenizer" / "tokenizer.json"
         self.tok = Tokenizer.from_file(str(tok_path))
@@ -96,8 +96,10 @@ class LayaAneBackend:
             self._lib.laya_ane_last_error.restype = ctypes.c_char_p
         self._lib.laya_ane_free.argtypes = [ctypes.c_void_p]
 
-        self._mc_s256 = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
-        self._mc_s512 = self.laya_dir / "laya_typed_s512_w8.mlmodelc"
+        mc_s256_raw = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
+        mc_s512_raw = self.laya_dir / "laya_typed_s512_w8.mlmodelc"
+        self._mc_s256 = mc_s256_raw.resolve() if mc_s256_raw.exists() else mc_s256_raw
+        self._mc_s512 = mc_s512_raw.resolve() if mc_s512_raw.exists() else mc_s512_raw
         if not self._mc_s512.exists():
             raise FileNotFoundError(
                 f"Missing ANE bundle {self._mc_s512}. Run 'decision-models setup-weights --build-laya-ane'."
@@ -141,7 +143,7 @@ class LayaAneBackend:
         for tag, mc in (("s256", self._mc_s256), ("s512", self._mc_s512)):
             if mc.exists():
                 counts = (ctypes.c_int * 3)()
-                self._lib.laya_ane_inspect_plan(str(mc).encode("utf-8"), self.compute_mode, counts)
+                self._lib.laya_ane_inspect_plan(str(mc.resolve()).encode("utf-8"), self.compute_mode, counts)
                 plans[tag] = (int(counts[0]), int(counts[1]), int(counts[2]))
         return plans
 
@@ -163,6 +165,12 @@ class LayaAneBackend:
             return float(self.temperature_by_options.get(f"{prefix}:6-10", default_t))
         return float(self.temperature_by_options.get(f"{prefix}:11+", 1.0))
 
+    @staticmethod
+    def _resolve_head_max_len(cfg: Mapping[str, Any], max_len: int) -> int:
+        raw = int(cfg.get("head_max_len", 192))
+        cap = min(256, max(128, int(max_len) - 128))
+        return max(128, min(cap, raw))
+
     def encode_item(
         self,
         state: Any,
@@ -180,7 +188,7 @@ class LayaAneBackend:
         if on_truncate not in ("warn", "error", "ignore"):
             raise ValueError(f"Unsupported on_truncate={on_truncate!r}; expected 'warn', 'error', or 'ignore'.")
         eff_max = min(self.max_len, int(max_len)) if max_len is not None else self.max_len
-        eff_head = min(self.head_max_len, 128) if eff_max <= 256 else self.head_max_len
+        eff_head = min(self.head_max_len, max(64, eff_max - 128))
         t = str(qdef["type"])
         if t not in _QTYPES:
             raise ValueError(f"Unsupported question type={t!r}; expected one of {tuple(_QTYPES)}.")
