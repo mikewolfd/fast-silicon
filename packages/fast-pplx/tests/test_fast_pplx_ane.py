@@ -794,3 +794,373 @@ def test_native_ane_cli_zip_bit3_and_alignment_and_error_propagation(tmp_path: P
     assert not handle
     err_txt = _coreml_last_error(lib)
     assert "MLComputePlan" in err_txt or "failed" in err_txt.lower()
+
+
+def _make_dummy_ane_layer0_weights() -> dict[str, np.ndarray]:
+    hidden = 1024
+    mlp_inter = 3584
+    gdn_heads = 16
+    gdn_dim = 128
+    qkvzba_out = 6144 + 2048 + gdn_heads + gdn_heads
+    return {
+        "l0_in_ln": np.ones((1, hidden, 1, 1), dtype=np.float16),
+        "l0_post_ln": np.ones((1, hidden, 1, 1), dtype=np.float16),
+        "l0_qkvzba": np.zeros((qkvzba_out, hidden, 1, 1), dtype=np.float16),
+        "l0_conv1d": np.zeros((6144, 1, 1, 4), dtype=np.float16),
+        "l0_neg_A": np.full((gdn_heads,), -1.0, dtype=np.float16),
+        "l0_dt_bias": np.zeros((gdn_heads,), dtype=np.float16),
+        "l0_gnorm_w": np.ones((gdn_dim,), dtype=np.float16),
+        "l0_out_proj": np.zeros((hidden, 2048, 1, 1), dtype=np.float16),
+        "l0_mlp_gu": np.zeros((2 * mlp_inter, hidden, 1, 1), dtype=np.float16),
+        "l0_mlp_dn": np.zeros((hidden, mlp_inter, 1, 1), dtype=np.float16),
+        "final_norm": np.ones((1, hidden, 1, 1), dtype=np.float16),
+    }
+
+
+def test_build_ane_silu_and_max_abs_rmsnorm_modes_cpu() -> None:
+    pytest.importorskip("coremltools")
+    bam = _load_script_module("fast_pplx_build_ane_modes", _BUILD_ANE_PATH)
+    weights = _make_dummy_ane_layer0_weights()
+    cfg = PplxConfig()
+
+    def _op_types(silu_mode: str, rmsnorm_mode: str) -> list[str]:
+        prog = bam.build_stage_mil_program(
+            weights,
+            seq_len=32,
+            layer_start=0,
+            layer_end=1,
+            layer_types=cfg.layer_types,
+            apply_final_norm=True,
+            silu_mode=silu_mode,
+            rmsnorm_mode=rmsnorm_mode,
+        )
+        return [op.op_type for op in prog.functions["main"].operations]
+
+    ops_default = _op_types("silu", "prescale")
+    assert ops_default.count("silu") == 3
+    assert "tanh" not in ops_default
+    assert "reduce_max" not in ops_default
+
+    ops_tanh_gdn = _op_types("tanh_gdn", "prescale")
+    assert ops_tanh_gdn.count("silu") == 1  # MLP keeps silu; GDN conv+z use TanhSiLU
+    assert ops_tanh_gdn.count("tanh") == 2
+
+    ops_tanh_all_max = _op_types("tanh_all", "max_abs")
+    assert "silu" not in ops_tanh_all_max
+    assert ops_tanh_all_max.count("tanh") == 3
+    assert ops_tanh_all_max.count("reduce_max") == 3  # in_ln, post_ln, final_norm
+    assert bam.MAX_ABS_FLOOR >= bam.FP16_MIN_NORMAL
+
+    with pytest.raises(ValueError, match="silu_mode"):
+        _op_types("bad_silu", "prescale")
+    with pytest.raises(ValueError, match="rmsnorm_mode"):
+        _op_types("silu", "bad_rms")
+
+    ns = build_parser().parse_args(["setup-ane", "--silu-mode", "tanh_all", "--rmsnorm-mode", "max_abs"])
+    assert ns.silu_mode == "tanh_all"
+    assert ns.rmsnorm_mode == "max_abs"
+    assert ns.ane_profile is None
+
+    ns_prof = build_parser().parse_args(["setup-ane", "--ane-profile", "parity"])
+    assert ns_prof.ane_profile == "parity"
+    assert ns_prof.silu_mode is None
+    assert ns_prof.rmsnorm_mode is None
+
+    ns_bal = build_parser().parse_args(["setup-ane", "--ane-profile", "balanced"])
+    assert ns_bal.ane_profile == "balanced"
+    for cmd, extra in (
+        ("embed", ["--ane-profile", "parity", "hello"]),
+        ("verify", ["--ane-profile", "balanced", "--mode", "all"]),
+        ("bench", ["--ane-profile", "fast"]),
+        ("parquet", ["--input", "in.parquet", "--output", "out.parquet", "--ane-profile", "parity"]),
+        ("serve", ["--ane-profile", "custom"]),
+    ):
+        ns_eng = build_parser().parse_args([cmd, *extra])
+        assert ns_eng.ane_profile in ("fast", "balanced", "parity", "custom")
+
+    # Profile resolution & explicit override semantics
+    assert bam.resolve_ane_profile() == ("fast", "silu", "prescale")
+    assert bam.resolve_ane_profile("fast") == ("fast", "silu", "prescale")
+    assert bam.resolve_ane_profile("balanced") == ("balanced", "tanh_gdn", "max_abs")
+    assert bam.resolve_ane_profile("parity") == ("parity", "tanh_all", "max_abs")
+    assert bam.resolve_ane_profile("parity", silu_mode="tanh_gdn") == ("balanced", "tanh_gdn", "max_abs")
+    assert bam.resolve_ane_profile("parity", rmsnorm_mode="prescale") == ("custom", "tanh_all", "prescale")
+    assert bam.resolve_ane_profile("fast", silu_mode="tanh_all", rmsnorm_mode="max_abs") == (
+        "parity",
+        "tanh_all",
+        "max_abs",
+    )
+    with pytest.raises(ValueError, match="ane_profile"):
+        bam.resolve_ane_profile("ultra")
+
+
+def test_ane_profile_cli_forwarding_manifest_invalidation_and_discovery_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as sp
+    from fast_pplx.cli import _ane_verify_min_cos_threshold, _cmd_setup_ane, _cmd_verify
+    from fast_pplx.engine import _discover_ane_stage_paths, read_ane_manifest
+
+    bam = _load_script_module("fast_pplx_build_ane_manifest", _BUILD_ANE_PATH)
+
+    # 1. Verify CLI setup-ane forwards --ane-profile to build_ane_models.py
+    captured: list[list[str]] = []
+    monkeypatch.setattr(sp, "call", lambda cmd: captured.append(list(cmd)) or 0)
+    ns = build_parser().parse_args(["setup-ane", "--home", str(tmp_path), "--ane-profile", "balanced"])
+    assert _cmd_setup_ane(ns) == 0
+    assert captured and "--ane-profile" in captured[0]
+    assert captured[0][captured[0].index("--ane-profile") + 1] == "balanced"
+
+    # 2. Config hash and bundle stems distinguish modes/profiles/precision cleanly
+    h_fast = bam.compute_ane_config_hash(
+        backend="coreml",
+        precision="w8a16",
+        inv_mode="block",
+        silu_mode="silu",
+        rmsnorm_mode="prescale",
+        ftz_alpha=128.0,
+        preserve_gdn_fp16=True,
+        layers_per_stage=3,
+        outlier_threshold=15.0,
+        num_layers=12,
+    )
+    h_parity = bam.compute_ane_config_hash(
+        backend="coreml",
+        precision="w8a16",
+        inv_mode="block",
+        silu_mode="tanh_all",
+        rmsnorm_mode="max_abs",
+        ftz_alpha=128.0,
+        preserve_gdn_fp16=True,
+        layers_per_stage=3,
+        outlier_threshold=15.0,
+        num_layers=12,
+    )
+    h_bal = bam.compute_ane_config_hash(
+        backend="coreml",
+        precision="w8a16",
+        inv_mode="block",
+        silu_mode="tanh_gdn",
+        rmsnorm_mode="max_abs",
+        ftz_alpha=128.0,
+        preserve_gdn_fp16=True,
+        layers_per_stage=3,
+        outlier_threshold=15.0,
+        num_layers=12,
+    )
+    assert len({h_fast, h_parity, h_bal}) == 3
+
+    stem_fast = bam.make_ane_stage_stem(
+        128, 0, "w8a16", ane_profile="fast", silu_mode="silu", rmsnorm_mode="prescale", config_hash=h_fast
+    )
+    stem_bal = bam.make_ane_stage_stem(
+        128, 0, "w8a16", ane_profile="balanced", silu_mode="tanh_gdn", rmsnorm_mode="max_abs", config_hash=h_bal
+    )
+    stem_parity = bam.make_ane_stage_stem(
+        128, 0, "w8a16", ane_profile="parity", silu_mode="tanh_all", rmsnorm_mode="max_abs", config_hash=h_parity
+    )
+    stem_custom = bam.make_ane_stage_stem(
+        128, 0, "w8a16", ane_profile="custom", silu_mode="tanh_all", rmsnorm_mode="prescale", config_hash=h_bal
+    )
+    assert len({stem_fast, stem_bal, stem_parity, stem_custom}) == 4
+    assert f"_fast_{h_fast[:8]}" in stem_fast
+    assert f"_balanced_{h_bal[:8]}" in stem_bal
+    assert f"_parity_{h_parity[:8]}" in stem_parity
+    assert f"_tanh_all_prescale_{h_bal[:8]}" in stem_custom
+
+    # 3. Manifest bucket preservation on same hash vs full invalidation + pruning on hash change
+    ane_dir = tmp_path / "artifacts" / "ane_models"
+    ane_dir.mkdir(parents=True)
+    fast_64 = [f"{bam.make_ane_stage_stem(64, i, 'w8a16', ane_profile='fast', silu_mode='silu', rmsnorm_mode='prescale', config_hash=h_fast)}.mlmodelc" for i in range(4)]
+    fast_128 = [f"{bam.make_ane_stage_stem(128, i, 'w8a16', ane_profile='fast', silu_mode='silu', rmsnorm_mode='prescale', config_hash=h_fast)}.mlmodelc" for i in range(4)]
+    for name in (*fast_64, *fast_128):
+        (ane_dir / name).mkdir()
+    man_fast = {
+        "schema_version": bam.MANIFEST_SCHEMA_VERSION,
+        "ane_profile": "fast",
+        "config_hash": h_fast,
+        "silu_mode": "silu",
+        "rmsnorm_mode": "prescale",
+        "precision": "w8a16",
+        "num_stages": 4,
+        "buckets": {
+            "64": {"seq_len": 64, "config_hash": h_fast, "stages": fast_64},
+            "128": {"seq_len": 128, "config_hash": h_fast, "stages": fast_128},
+        },
+    }
+    (ane_dir / "manifest.json").write_text(json.dumps(man_fast), encoding="utf-8")
+
+    # Same hash rebuilding only S=128 preserves S=64
+    preserved_same = bam._load_preserved_buckets_for_hash(
+        ane_dir, config_hash=h_fast, requested_seq_lens=(128,), expected_num_stages=4
+    )
+    assert list(preserved_same.keys()) == ["64"]
+
+    # Different hash (switching to parity) invalidates ALL previous buckets
+    preserved_diff = bam._load_preserved_buckets_for_hash(
+        ane_dir, config_hash=h_parity, requested_seq_lens=(128,), expected_num_stages=4
+    )
+    assert preserved_diff == {}
+
+    # Discovery enforces expected_profile and per-bucket config_hash strictly (no silent glob fallback)
+    assert list(_discover_ane_stage_paths(ane_dir).keys()) == [64, 128]
+    assert list(_discover_ane_stage_paths(ane_dir, expected_profile="fast").keys()) == [64, 128]
+    assert _discover_ane_stage_paths(ane_dir, expected_profile="parity") == {}
+
+    # Mixed/stale bucket config_hash inside manifest is rejected
+    man_mixed = json.loads((ane_dir / "manifest.json").read_text(encoding="utf-8"))
+    man_mixed["buckets"]["64"]["config_hash"] = h_parity
+    (ane_dir / "manifest.json").write_text(json.dumps(man_mixed), encoding="utf-8")
+    assert list(_discover_ane_stage_paths(ane_dir).keys()) == [128]
+
+    # Pruning removes stale .mlmodelc AND stale .mlpackage while preserving active .mlpackage when keep_mlpackage=True
+    parity_128 = [f"{bam.make_ane_stage_stem(128, i, 'w8a16', ane_profile='parity', silu_mode='tanh_all', rmsnorm_mode='max_abs', config_hash=h_parity)}.mlmodelc" for i in range(4)]
+    for name in parity_128:
+        (ane_dir / name).mkdir()
+        (ane_dir / f"{Path(name).stem}.mlpackage").mkdir()
+    stale_pkg = f"{Path(fast_64[0]).stem}.mlpackage"
+    (ane_dir / stale_pkg).mkdir()
+    pruned = bam._prune_stale_ane_bundles(ane_dir, active_stage_names=set(parity_128), keep_mlpackage=True)
+    assert set(pruned) == set(fast_64) | set(fast_128) | {stale_pkg}
+    assert sorted(p.name for p in ane_dir.glob("*.mlmodelc")) == sorted(parity_128)
+    assert sorted(p.name for p in ane_dir.glob("*.mlpackage")) == sorted(f"{Path(n).stem}.mlpackage" for n in parity_128)
+
+    # 4. Legacy v1 manifest without schema_version/ane_profile/config_hash still normalizes cleanly
+    legacy_dir = tmp_path / "legacy_ane"
+    legacy_dir.mkdir()
+    legacy_stages = [f"pplx_s64_st{i}_w8a16.mlmodelc" for i in range(4)]
+    for name in legacy_stages:
+        (legacy_dir / name).mkdir()
+    (legacy_dir / "manifest.json").write_text(
+        json.dumps({"precision": "w8a16", "num_stages": 4, "buckets": {"64": {"seq_len": 64, "stages": legacy_stages}}}),
+        encoding="utf-8",
+    )
+    leg_man = read_ane_manifest(legacy_dir)
+    assert leg_man is not None and leg_man["schema_version"] == 1 and leg_man["ane_profile"] == "fast"
+    assert list(_discover_ane_stage_paths(legacy_dir, expected_profile="fast").keys()) == [64]
+    assert _discover_ane_stage_paths(legacy_dir, expected_profile="parity") == {}
+    # Legacy v1 manifest is invalidated when building schema v2
+    assert bam._load_preserved_buckets_for_hash(
+        legacy_dir, config_hash=h_fast, requested_seq_lens=(128,), expected_num_stages=4
+    ) == {}
+    # Balanced profile inference when ane_profile field is omitted
+    bal_dir = tmp_path / "bal_ane"
+    bal_dir.mkdir()
+    (bal_dir / "manifest.json").write_text(
+        json.dumps({"silu_mode": "tanh_gdn", "rmsnorm_mode": "max_abs", "buckets": {}}),
+        encoding="utf-8",
+    )
+    bal_man = read_ane_manifest(bal_dir)
+    assert bal_man is not None and bal_man["ane_profile"] == "balanced"
+
+    # 5. Profile-aware verify thresholds
+    assert _ane_verify_min_cos_threshold(man_fast, "fast") == pytest.approx(0.980)
+    assert _ane_verify_min_cos_threshold({"silu_mode": "tanh_all", "rmsnorm_mode": "prescale"}, "custom") == pytest.approx(0.980)
+    assert _ane_verify_min_cos_threshold(bal_man, "balanced") == pytest.approx(0.998)
+    assert _ane_verify_min_cos_threshold({"silu_mode": "tanh_all", "rmsnorm_mode": "max_abs"}, "parity") == pytest.approx(0.998)
+    assert _ane_verify_min_cos_threshold({"silu_mode": "tanh_gdn", "rmsnorm_mode": "max_abs"}, "custom") == pytest.approx(0.998)
+
+    # 6. FastPplx(ane_profile="parity") sets ane_profile=None & staged_ane_profile="fast" on mismatch
+    tok_json = _write_test_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, PplxConfig())
+    (tmp_path / "build").mkdir(exist_ok=True)
+    (tmp_path / "build" / "libpplx_coreml_runner.dylib").write_bytes(b"")
+    (tmp_path / "build" / "libpplx_fast_io.dylib").write_bytes(b"")
+    (ane_dir / "manifest.json").write_text(json.dumps(man_fast), encoding="utf-8")
+
+    class _StubGPU:
+        max_seq_len = 32768
+        def close(self):
+            pass
+
+    with FastPplx(home=tmp_path, mode="auto", ane_profile="parity", _gpu_backend=_StubGPU(), _tokenizer=tok) as eng:
+        assert eng.ane_available is False
+        assert eng.ane_profile is None
+        assert eng.staged_ane_profile == "fast"
+        assert eng._ane_init_error is not None and "--ane-profile parity" in eng._ane_init_error
+
+    with FastPplx(home=tmp_path, mode="gpu", _gpu_backend=_StubGPU(), _tokenizer=tok) as eng_gpu_only:
+        assert eng_gpu_only.ane_available is False
+        assert eng_gpu_only.ane_profile is None
+        assert eng_gpu_only.staged_ane_profile == "fast"
+
+    # 7. _cmd_verify --mode all fails (exit 1) on explicit profile mismatch or broken staged ANE,
+    #    and enforces 0.980 (fast) vs 0.998 (parity) thresholds cleanly.
+    import fast_pplx.cli as pplx_cli_mod
+
+    class _FakeVerifyEngine:
+        def __init__(self, *, ane_available: bool, ane_profile: str | None, staged: str | None, err: str | None, ane_cos: float):
+            self.ane_available = ane_available
+            self.ane_profile = ane_profile
+            self.staged_ane_profile = staged
+            self._ane_init_error = err
+            self.ane_query_max_len = 512
+            self._ane_cos = ane_cos
+
+        def encode_documents(self, texts, *, mode="gpu", normalize=True, **_kw):
+            v_gpu = np.zeros((len(texts), 4), dtype=np.float32)
+            v_gpu[:, 0] = 1.0
+            if mode == "gpu":
+                return v_gpu
+            c = float(self._ane_cos)
+            v_ane = np.zeros((len(texts), 4), dtype=np.float32)
+            v_ane[:, 0] = c
+            v_ane[:, 1] = float(np.sqrt(max(0.0, 1.0 - c * c)))
+            return v_ane
+
+        def close(self):
+            pass
+
+    # Force smoke path by hiding fixture files inside tmp_path & monkeypatching pkg_root
+    smoke_home = tmp_path / "verify_smoke"
+    (smoke_home / "artifacts" / "ane_models").mkdir(parents=True)
+    (smoke_home / "artifacts" / "ane_models" / "manifest.json").write_text(json.dumps(man_fast), encoding="utf-8")
+    monkeypatch.setattr(pplx_cli_mod, "Path", lambda p: (smoke_home / "src" / "fast_pplx" / "cli.py") if p == pplx_cli_mod.__file__ else Path(p))
+
+    # Case A: requested --ane-profile parity mismatched against staged fast -> verify --mode all exits 1
+    monkeypatch.setattr(
+        pplx_cli_mod,
+        "_make_engine",
+        lambda a, deterministic=False: _FakeVerifyEngine(
+            ane_available=False,
+            ane_profile=None,
+            staged="fast",
+            err="Staged ANE bundle profile 'fast' does not match requested ane_profile='parity'",
+            ane_cos=0.9828,
+        ),
+    )
+    ns_mismatch = build_parser().parse_args(["verify", "--home", str(smoke_home), "--mode", "all", "--ane-profile", "parity", "--json"])
+    assert _cmd_verify(ns_mismatch) == 1
+
+    # Case B: active fast profile with cos=0.9828 passes (>=0.980)
+    monkeypatch.setattr(
+        pplx_cli_mod,
+        "_make_engine",
+        lambda a, deterministic=False: _FakeVerifyEngine(
+            ane_available=True, ane_profile="fast", staged="fast", err=None, ane_cos=0.9828
+        ),
+    )
+    ns_fast_ok = build_parser().parse_args(["verify", "--home", str(smoke_home), "--mode", "all", "--json"])
+    assert _cmd_verify(ns_fast_ok) == 0
+
+    # Case C: active parity profile with cos=0.9828 FAILS (<0.998), cos=0.9991 PASSES (>=0.998)
+    man_parity = dict(man_fast, ane_profile="parity", silu_mode="tanh_all", rmsnorm_mode="max_abs")
+    (smoke_home / "artifacts" / "ane_models" / "manifest.json").write_text(json.dumps(man_parity), encoding="utf-8")
+    monkeypatch.setattr(
+        pplx_cli_mod,
+        "_make_engine",
+        lambda a, deterministic=False: _FakeVerifyEngine(
+            ane_available=True, ane_profile="parity", staged="parity", err=None, ane_cos=0.9828
+        ),
+    )
+    ns_par_fail = build_parser().parse_args(["verify", "--home", str(smoke_home), "--mode", "all", "--ane-profile", "parity", "--json"])
+    assert _cmd_verify(ns_par_fail) == 1
+
+    monkeypatch.setattr(
+        pplx_cli_mod,
+        "_make_engine",
+        lambda a, deterministic=False: _FakeVerifyEngine(
+            ane_available=True, ane_profile="parity", staged="parity", err=None, ane_cos=0.9991
+        ),
+    )
+    assert _cmd_verify(ns_par_fail) == 0

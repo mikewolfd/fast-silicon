@@ -26,6 +26,7 @@ Key hardware optimizations encoded from Apple Silicon microbenchmarks:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -50,6 +51,16 @@ ATTN_HEAD_DIM = 256
 ROPE_HALF = 32
 RMS_EPS = 1e-6
 FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)  # 2^-14 = 6.103515625e-5
+MAX_ABS_FLOOR = 1e-4  # > 2^-14 ANE clamp floor; prevents NaN/zero-div on all-zero rows
+VALID_SILU_MODES = ("silu", "tanh_gdn", "tanh_all")
+VALID_RMSNORM_MODES = ("prescale", "max_abs")
+MANIFEST_SCHEMA_VERSION = 2
+ANE_PROFILES: dict[str, tuple[str, str]] = {
+    "fast": ("silu", "prescale"),
+    "balanced": ("tanh_gdn", "max_abs"),
+    "parity": ("tanh_all", "max_abs"),
+}
+VALID_ANE_PROFILES = ("fast", "balanced", "parity")
 CHUNK_SIZE = 32
 DEFAULT_FTZ_ALPHA = 128.0
 DEFAULT_SEQ_LENS: tuple[int, ...] = (64, 128, 256, 512)
@@ -94,6 +105,159 @@ _PRESCALE_64_PREFIXES: tuple[str, ...] = (
 def clamp_fp16_eps(eps: float) -> float:
     """Clamp FP16 epsilon to >= 2^-14 (`6.103515625e-5`) so ANE FTZ never flushes var+eps to 0."""
     return float(max(float(eps), FP16_MIN_NORMAL))
+
+
+def resolve_ane_profile(
+    ane_profile: str | None = None,
+    silu_mode: str | None = None,
+    rmsnorm_mode: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve `(--ane-profile, --silu-mode, --rmsnorm-mode)` -> `(canonical_profile, silu_mode, rmsnorm_mode)`.
+
+    `ane_profile="fast"` selects `("silu", "prescale")` (default peak speed);
+    `ane_profile="balanced"` selects `("tanh_gdn", "max_abs")` (~5% throughput cost, `>=0.999` cos);
+    `ane_profile="parity"` selects `("tanh_all", "max_abs")` (max ANE/GPU parity, recommended for
+    `--dtype int8` or `--dimensions 128`).
+    Explicit `silu_mode` / `rmsnorm_mode` flags override the preset and record `"custom"`
+    when the combination does not match a named preset.
+    """
+    if ane_profile is not None and ane_profile not in VALID_ANE_PROFILES:
+        raise ValueError(f"Unsupported ane_profile={ane_profile!r}; choose from {VALID_ANE_PROFILES}")
+    base_silu, base_rms = ANE_PROFILES[ane_profile or "fast"]
+    eff_silu = base_silu if silu_mode is None else str(silu_mode)
+    eff_rms = base_rms if rmsnorm_mode is None else str(rmsnorm_mode)
+    if eff_silu not in VALID_SILU_MODES:
+        raise ValueError(f"Unsupported silu_mode={eff_silu!r}; choose from {VALID_SILU_MODES}")
+    if eff_rms not in VALID_RMSNORM_MODES:
+        raise ValueError(f"Unsupported rmsnorm_mode={eff_rms!r}; choose from {VALID_RMSNORM_MODES}")
+
+    canonical = "custom"
+    for pname, pair in ANE_PROFILES.items():
+        if (eff_silu, eff_rms) == pair:
+            canonical = pname
+            break
+    return canonical, eff_silu, eff_rms
+
+
+def compute_ane_config_hash(
+    *,
+    backend: str,
+    precision: str,
+    inv_mode: str,
+    silu_mode: str,
+    rmsnorm_mode: str,
+    ftz_alpha: float,
+    preserve_gdn_fp16: bool,
+    layers_per_stage: int,
+    outlier_threshold: float,
+    num_layers: int,
+    calib_stats: dict[str, Any] | None = None,
+) -> str:
+    """Return a deterministic 12-hex-char fingerprint of all build-affecting ANE graph knobs."""
+    calib_digest: str | None = None
+    if calib_stats is not None:
+        calib_digest = hashlib.sha256(
+            json.dumps(calib_stats, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+    payload = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backend": str(backend),
+        "precision": str(precision),
+        "inv_mode": str(inv_mode),
+        "silu_mode": str(silu_mode),
+        "rmsnorm_mode": str(rmsnorm_mode),
+        "ftz_alpha": float(ftz_alpha),
+        "eps_floor_fp16": FP16_MIN_NORMAL,
+        "preserve_gdn_fp16": bool(preserve_gdn_fp16),
+        "layers_per_stage": int(layers_per_stage),
+        "outlier_threshold": float(outlier_threshold),
+        "chunk_size": CHUNK_SIZE,
+        "hidden_size": HIDDEN,
+        "num_layers": int(num_layers),
+        "calib_stats_sha256": calib_digest,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def make_ane_stage_stem(
+    seq_len: int,
+    stage_idx: int,
+    precision: str,
+    *,
+    ane_profile: str,
+    silu_mode: str,
+    rmsnorm_mode: str,
+    config_hash: str,
+) -> str:
+    """Build a mode- and config-distinguishing `.mlmodelc` filename stem for a compiled stage."""
+    mode_tag = ane_profile if ane_profile in VALID_ANE_PROFILES else f"{silu_mode}_{rmsnorm_mode}"
+    return f"pplx_s{int(seq_len)}_st{int(stage_idx)}_{precision}_{mode_tag}_{config_hash[:8]}"
+
+
+def _load_preserved_buckets_for_hash(
+    out_dir: Path,
+    *,
+    config_hash: str,
+    requested_seq_lens: Sequence[int],
+    expected_num_stages: int,
+) -> dict[str, dict[str, Any]]:
+    """Preserve untouched buckets ONLY when existing `manifest.json` matches `config_hash` exactly."""
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return {}
+    try:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(existing, dict):
+        return {}
+    if int(existing.get("schema_version", 1)) != MANIFEST_SCHEMA_VERSION:
+        return {}
+    if existing.get("config_hash") != config_hash:
+        return {}
+    if int(existing.get("num_stages", -1)) != int(expected_num_stages):
+        return {}
+
+    req_set = {int(s) for s in requested_seq_lens}
+    preserved: dict[str, dict[str, Any]] = {}
+    for k_str, entry in existing.get("buckets", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        cap = int(entry.get("seq_len", k_str))
+        if cap in req_set:
+            continue
+        if entry.get("config_hash") != config_hash:
+            continue
+        stages = entry.get("stages", [])
+        if len(stages) != int(expected_num_stages):
+            continue
+        if stages and all((out_dir / name).exists() for name in stages):
+            preserved[str(cap)] = dict(entry)
+    return preserved
+
+
+def _prune_stale_ane_bundles(
+    out_dir: Path,
+    *,
+    active_stage_names: set[str],
+    keep_mlpackage: bool = False,
+) -> list[str]:
+    """Remove stale `pplx_s*_st*.mlmodelc` and `.mlpackage` dirs not referenced by the active manifest."""
+    active_stems = {Path(name).stem for name in active_stage_names}
+    removed: list[str] = []
+    for pat in ("pplx_s*_st*.mlmodelc", "pplx_s*_st*.mlpackage"):
+        for cand in sorted(out_dir.glob(pat)):
+            if cand.name in active_stage_names:
+                continue
+            if keep_mlpackage and cand.suffix == ".mlpackage" and cand.stem in active_stems:
+                continue
+            if cand.is_dir():
+                shutil.rmtree(cand, ignore_errors=True)
+            else:
+                cand.unlink(missing_ok=True)
+            removed.append(cand.name)
+    return removed
 
 
 def resolve_rmsnorm_prescale(
@@ -391,12 +555,18 @@ def build_stage_mil_program(
     qdq_scales: dict[str, float | None] | None = None,
     calib_stats: dict[str, Any] | None = None,
     swiglu_mode: str = "silu",
+    silu_mode: str = "silu",
+    rmsnorm_mode: str = "prescale",
 ):
     """Build a pure-FP16 pure-ANE CoreML MIL program for layers [layer_start, layer_end)."""
     import coremltools as ct  # noqa: F401
     from coremltools.converters.mil import Builder as mb
     from coremltools.converters.mil.mil import types
 
+    if silu_mode not in VALID_SILU_MODES:
+        raise ValueError(f"Unsupported silu_mode={silu_mode!r}; choose from {VALID_SILU_MODES}")
+    if rmsnorm_mode not in VALID_RMSNORM_MODES:
+        raise ValueError(f"Unsupported rmsnorm_mode={rmsnorm_mode!r}; choose from {VALID_RMSNORM_MODES}")
     if seq_len % chunk_size != 0:
         raise ValueError(f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})")
 
@@ -421,7 +591,32 @@ def build_stage_mil_program(
             return mb.conv(x=xdq, weight=w_c, name=name)
         return mb.conv(x=x, weight=w_c, name=name)
 
+    def _tanh_silu(x, name: str):
+        """High-precision ANE SiLU via tanh: x * (0.5 * tanh(0.5 * x) + 0.5)."""
+        half = _f16(0.5)
+        cx = mb.mul(x=x, y=half, name=f"{name}_half")
+        th = mb.tanh(x=cx, name=f"{name}_tanh")
+        sig = mb.add(x=mb.mul(x=th, y=half, name=f"{name}_htanh"), y=half, name=f"{name}_sig")
+        return mb.mul(x=x, y=sig, name=name)
+
+    def _silu_op(x, name: str, *, is_mlp: bool):
+        use_tanh = (silu_mode == "tanh_all") or (silu_mode == "tanh_gdn" and not is_mlp)
+        return _tanh_silu(x, name=name) if use_tanh else mb.silu(x=x, name=name)
+
     def _rmsnorm_ch(x, weight_1c11: np.ndarray, name: str, eps: float = RMS_EPS):
+        if rmsnorm_mode == "max_abs":
+            # Dynamic per-token max-abs scaling prevents FP16 x*x overflow (>255.94)
+            # without compiler prescale folding or 2^-14 eps inflation on small rows.
+            amax = mb.reduce_max(x=mb.abs(x=x, name=f"{name}_abs"), axes=[1], keep_dims=True, name=f"{name}_amax")
+            m = mb.maximum(x=amax, y=_f16(MAX_ABS_FLOOR), name=f"{name}_mfloor")
+            xn = mb.real_div(x=x, y=m, name=f"{name}_divm")
+            e_ratio = mb.real_div(x=_f16(float(eps) ** 0.5), y=m, name=f"{name}_eratio")
+            eps_term = mb.mul(x=e_ratio, y=e_ratio, name=f"{name}_eterm")
+            msq = mb.reduce_mean(x=mb.mul(x=xn, y=xn, name=f"{name}_sq"), axes=[1], keep_dims=True, name=f"{name}_mean")
+            inv_rms = mb.rsqrt(x=mb.add(x=msq, y=eps_term, name=f"{name}_eps"), name=f"{name}_rsqrt")
+            normed = mb.mul(x=xn, y=inv_rms, name=f"{name}_norm")
+            return mb.mul(x=normed, y=_const_f16(weight_1c11, name=f"{name}_w"), name=name)
+
         # Deep residual streams reach high absmax in layers 5..11, risking x*x FP16 overflow
         # (> sqrt(65504) = 255.94). Prescaling by 1/64 cancels out while eps is clamped to >= 2^-14
         # so ANE FTZ never flushes var + eps to zero.
@@ -440,6 +635,10 @@ def build_stage_mil_program(
         return mb.mul(x=normed, y=_const_f16(weight_1c11, name=f"{name}_w"), name=name)
 
     def _rmsnorm_axis(x, weight_arr: np.ndarray, axis: int, name: str, eps: float = RMS_EPS):
+        # qnorm/knorm/gnorm inputs stay well below sqrt(65504) (observed absmax <= 62.9,
+        # q/k rms_min >= 0.387, gnorm_eps=0.016384 >> 2^-14). MaxAbsRMSNorm on axis=2 (gnorm)
+        # triggers ANECCompile() failure (100% CPU fallback) and axis=3 (q/k) adds +1.0% latency
+        # for <=3e-6 cosine delta, so _rmsnorm_axis intentionally stays on clamp_fp16_eps.
         eps_val = clamp_fp16_eps(eps)
         sq = mb.mul(x=x, y=x, name=f"{name}_sq")
         msq = mb.reduce_mean(x=sq, axes=[axis], keep_dims=True, name=f"{name}_mean")
@@ -690,7 +889,7 @@ def build_stage_mil_program(
             gu_prod = mb.mul(x=gate, y=up, name=f"{prefix}_mlp_gu_prod")
             act = mb.mul(x=gu_prod, y=mb.sigmoid(x=gate, name=f"{prefix}_mlp_gsig"), name=f"{prefix}_mlp_act")
         elif swiglu_mode == "silu":
-            act = mb.mul(x=mb.silu(x=gate, name=f"{prefix}_mlp_gsilu"), y=up, name=f"{prefix}_mlp_act")
+            act = mb.mul(x=_silu_op(gate, name=f"{prefix}_mlp_gsilu", is_mlp=True), y=up, name=f"{prefix}_mlp_act")
         else:
             raise ValueError(f"Unsupported swiglu_mode={swiglu_mode!r}")
         return _conv_or_qdq(act, ane_weights[f"{prefix}_mlp_dn"], name=f"{prefix}_mlp_dn")
@@ -715,7 +914,7 @@ def build_stage_mil_program(
             groups=6144,
             name=f"{p}_conv1d",
         )
-        conv_act = mb.silu(x=conv_raw, name=f"{p}_conv_silu")
+        conv_act = _silu_op(conv_raw, name=f"{p}_conv_silu", is_mlp=False)
         q_ch = mb.slice_by_index(x=conv_act, begin=[0, 0, 0, 0], end=[1, 2048, 1, seq_len], name=f"{p}_sl_q")
         k_ch = mb.slice_by_index(x=conv_act, begin=[0, 2048, 0, 0], end=[1, 4096, 1, seq_len], name=f"{p}_sl_k")
         v_raw = mb.slice_by_index(x=conv_act, begin=[0, 4096, 0, 0], end=[1, 6144, 1, seq_len], name=f"{p}_sl_v")
@@ -736,7 +935,7 @@ def build_stage_mil_program(
         z_hd = mb.reshape(x=z, shape=[1, GDN_HEADS, GDN_DIM, seq_len], name=f"{p}_z_hd")
         gnorm_w = ane_weights[f"{p}_gnorm_w"].reshape(1, 1, GDN_DIM, 1)
         normed_hd = _rmsnorm_axis(delta_hd, gnorm_w, axis=2, name=f"{p}_gnorm", eps=gnorm_eps)
-        gated_hd = mb.mul(x=normed_hd, y=mb.silu(x=z_hd, name=f"{p}_z_silu"), name=f"{p}_gated_hd")
+        gated_hd = mb.mul(x=normed_hd, y=_silu_op(z_hd, name=f"{p}_z_silu", is_mlp=False), name=f"{p}_gated_hd")
         gated_nchw = mb.reshape(x=gated_hd, shape=[1, 2048, 1, seq_len], name=f"{p}_gated_nchw")
 
         attn_out = _conv_or_qdq(gated_nchw, ane_weights[f"{p}_out_proj"], name=f"{p}_out_proj")
@@ -903,7 +1102,15 @@ def build_ane_bundle_suite(
     preserve_gdn_fp16: bool = True,
     backend: str = "coreml",
     keep_mlpackage: bool = False,
+    ane_profile: str | None = None,
+    silu_mode: str | None = None,
+    rmsnorm_mode: str | None = None,
 ) -> dict[str, Any]:
+    eff_profile, eff_silu_mode, eff_rmsnorm_mode = resolve_ane_profile(
+        ane_profile=ane_profile,
+        silu_mode=silu_mode,
+        rmsnorm_mode=rmsnorm_mode,
+    )
     if backend == "coreai":
         status = check_coreai_backend_status()
         raise RuntimeError(
@@ -954,6 +1161,26 @@ def build_ane_bundle_suite(
     out_dir = paths.ane_models_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    config_hash = compute_ane_config_hash(
+        backend=backend,
+        precision=precision,
+        inv_mode=inv_mode,
+        silu_mode=eff_silu_mode,
+        rmsnorm_mode=eff_rmsnorm_mode,
+        ftz_alpha=ftz_alpha,
+        preserve_gdn_fp16=preserve_gdn_fp16,
+        layers_per_stage=layers_per_stage,
+        outlier_threshold=outlier_threshold,
+        num_layers=cfg.num_hidden_layers,
+        calib_stats=calib_stats,
+    )
+    preserved_buckets = _load_preserved_buckets_for_hash(
+        out_dir,
+        config_hash=config_hash,
+        requested_seq_lens=seq_lens,
+        expected_num_stages=len(stage_ranges),
+    )
+
     all_preserved = sorted(
         select_fp16_preserved_ops(
             0,
@@ -965,10 +1192,15 @@ def build_ane_bundle_suite(
         )
     )
     manifest: dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "model_name": "perplexity-ai/pplx-embed-v2-context-0.6b",
         "backend": backend,
+        "ane_profile": eff_profile,
+        "config_hash": config_hash,
         "precision": precision,
         "inv_mode": inv_mode,
+        "silu_mode": eff_silu_mode,
+        "rmsnorm_mode": eff_rmsnorm_mode,
         "ftz_alpha": float(ftz_alpha),
         "eps_floor_fp16": FP16_MIN_NORMAL,
         "preserve_gdn_fp16": bool(preserve_gdn_fp16),
@@ -979,7 +1211,7 @@ def build_ane_bundle_suite(
         "num_layers": cfg.num_hidden_layers,
         "layers_per_stage": layers_per_stage,
         "num_stages": len(stage_ranges),
-        "buckets": {},
+        "buckets": dict(preserved_buckets),
     }
 
     for seq_len in seq_lens:
@@ -1010,6 +1242,8 @@ def build_ane_bundle_suite(
                 qdq_scales=stage_scales,
                 calib_stats=calib_stats,
                 swiglu_mode=swiglu_mode,
+                silu_mode=eff_silu_mode,
+                rmsnorm_mode=eff_rmsnorm_mode,
             )
 
             ml = ct.convert(
@@ -1042,7 +1276,15 @@ def build_ane_bundle_suite(
                 q_cfg = build_weight_quant_config(stage_preserved, weight_threshold=512, cto_module=cto)
                 ml_out = cto.linear_quantize_weights(ml, config=q_cfg)
 
-            stem = f"pplx_s{seq_len}_st{st_idx}_{precision}"
+            stem = make_ane_stage_stem(
+                seq_len,
+                st_idx,
+                precision,
+                ane_profile=eff_profile,
+                silu_mode=eff_silu_mode,
+                rmsnorm_mode=eff_rmsnorm_mode,
+                config_hash=config_hash,
+            )
             pkg_path = out_dir / f"{stem}.mlpackage"
             if pkg_path.exists():
                 shutil.rmtree(pkg_path)
@@ -1058,12 +1300,24 @@ def build_ane_bundle_suite(
 
         manifest["buckets"][str(seq_len)] = {
             "seq_len": int(seq_len),
+            "config_hash": config_hash,
             "stages": stage_entries,
             "build_s": round(time.perf_counter() - t_bucket, 2),
         }
 
+    # Sort buckets numerically for deterministic manifest.json output.
+    manifest["buckets"] = dict(sorted(manifest["buckets"].items(), key=lambda kv: int(kv[0])))
     manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    tmp_manifest = out_dir / "manifest.json.tmp"
+    tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    os.replace(tmp_manifest, manifest_path)
+
+    active_stage_names = {
+        name
+        for bkt in manifest["buckets"].values()
+        for name in bkt.get("stages", [])
+    }
+    _prune_stale_ane_bundles(out_dir, active_stage_names=active_stage_names, keep_mlpackage=keep_mlpackage)
     return manifest
 
 
@@ -1077,6 +1331,26 @@ def main() -> None:
     parser.add_argument("--layers-per-stage", type=int, default=DEFAULT_LAYERS_PER_STAGE)
     parser.add_argument("--precision", default="w8a16", choices=["fp16", "w8a16", "w8a8"])
     parser.add_argument("--inv-mode", default="block", choices=["block", "fwd_subst"])
+    parser.add_argument(
+        "--ane-profile",
+        default=None,
+        choices=list(VALID_ANE_PROFILES),
+        help="Preset ANE speed/parity profile: 'fast' (silu+prescale, default), 'balanced' (tanh_gdn+max_abs), "
+        "or 'parity' (tanh_all+max_abs). 'parity'/'balanced' is recommended for --dtype int8 or --dimensions 128 "
+        "(prescale 1/64 inflates 2^-14 to 0.25 unscaled eps). Explicit --silu-mode/--rmsnorm-mode override the preset.",
+    )
+    parser.add_argument(
+        "--silu-mode",
+        default=None,
+        choices=list(VALID_SILU_MODES),
+        help="ANE SiLU op variant: 'silu' (default speed), 'tanh_gdn', or 'tanh_all' (max parity).",
+    )
+    parser.add_argument(
+        "--rmsnorm-mode",
+        default=None,
+        choices=list(VALID_RMSNORM_MODES),
+        help="Channel RMSNorm scaling: 'prescale' (default) or 'max_abs' (overflow-safe dynamic scaling).",
+    )
     parser.add_argument("--ftz-alpha", type=float, default=DEFAULT_FTZ_ALPHA)
     parser.add_argument("--calib-stats", type=Path, default=None)
     parser.add_argument("--outlier-threshold", type=float, default=15.0)
@@ -1098,6 +1372,9 @@ def main() -> None:
         preserve_gdn_fp16=args.preserve_gdn_fp16,
         backend=args.backend,
         keep_mlpackage=args.keep_mlpackage,
+        ane_profile=args.ane_profile,
+        silu_mode=args.silu_mode,
+        rmsnorm_mode=args.rmsnorm_mode,
     )
     print(json.dumps(manifest, indent=2))
 

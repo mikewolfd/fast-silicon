@@ -41,7 +41,11 @@ _BENCH_MODES: tuple[str, ...] = ("auto", "gpu", "ane", "hetero", "hetero2", "all
 _VERIFY_MODES: tuple[str, ...] = ("gpu", "ane", "hetero", "hetero2", "all")
 
 
-def _add_common_engine_args(parser: argparse.ArgumentParser) -> None:
+def _add_common_engine_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_ane_profile: bool = True,
+) -> None:
     parser.add_argument("--home", default=None, help="Override FAST_PPLX_HOME directory")
     parser.add_argument(
         "--model-dtype",
@@ -60,6 +64,13 @@ def _add_common_engine_args(parser: argparse.ArgumentParser) -> None:
         default=512,
         help="MLX allocator cache limit in MiB (default: 512)",
     )
+    if include_ane_profile:
+        parser.add_argument(
+            "--ane-profile",
+            choices=("fast", "balanced", "parity", "custom"),
+            default=None,
+            help="Require staged ANE bundles matching this profile (default: accept any valid staged profile)",
+        )
 
 
 def _make_engine(args: argparse.Namespace, *, deterministic: bool = False) -> Any:
@@ -73,6 +84,7 @@ def _make_engine(args: argparse.Namespace, *, deterministic: bool = False) -> An
         dtype=getattr(args, "model_dtype", "float16"),
         use_mapped_embedding=not getattr(args, "no_mapped_embedding", False),
         cache_limit_mb=getattr(args, "cache_limit_mb", 512),
+        ane_profile=getattr(args, "ane_profile", None),
         deterministic=deterministic,
     )
 
@@ -147,6 +159,12 @@ def _cmd_setup_ane(args: argparse.Namespace) -> int:
         cmd.extend(["--layers-per-stage", str(args.layers_per_stage)])
     if getattr(args, "inv_mode", None):
         cmd.extend(["--inv-mode", str(args.inv_mode)])
+    if getattr(args, "ane_profile", None):
+        cmd.extend(["--ane-profile", str(args.ane_profile)])
+    if getattr(args, "silu_mode", None):
+        cmd.extend(["--silu-mode", str(args.silu_mode)])
+    if getattr(args, "rmsnorm_mode", None):
+        cmd.extend(["--rmsnorm-mode", str(args.rmsnorm_mode)])
     if getattr(args, "calib_stats", None):
         cmd.extend(["--calib-stats", str(args.calib_stats)])
     if getattr(args, "ftz_alpha", None) is not None:
@@ -222,18 +240,36 @@ def _cos_row_min(got: np.ndarray, exp: np.ndarray) -> float:
     return min(vals) if vals else 1.0
 
 
+def _ane_verify_min_cos_threshold(
+    ane_manifest: dict[str, Any] | None,
+    active_profile: str | None,
+) -> float:
+    """Return profile-aware ANE minimum cosine bar (`0.998` for parity/balanced, `0.980` for fast/custom)."""
+    if active_profile in ("parity", "balanced"):
+        return 0.998
+    if (
+        isinstance(ane_manifest, dict)
+        and ane_manifest.get("rmsnorm_mode") == "max_abs"
+        and ane_manifest.get("silu_mode") in ("tanh_gdn", "tanh_all")
+    ):
+        return 0.998
+    return 0.980
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     """Verify deterministic GPU parity separately from ANE/hetero2 drift tolerance + MLComputePlan."""
-    from .engine import _discover_ane_stage_paths, _load_coreml_lib
+    from .engine import _discover_ane_stage_paths, _load_coreml_lib, read_ane_manifest
 
     paths = resolve_paths(args.home)
     telemetry = get_mlx_runtime_telemetry()
     req_mode = args.mode
+    req_ane_profile = getattr(args, "ane_profile", None)
+    ane_manifest = read_ane_manifest(paths.ane_models_dir)
 
     # Check ANE MLComputePlan residency when ANE artifacts are present.
     ane_plans: dict[str, Any] = {}
     if paths.coreml_dylib.is_file() and paths.ane_models_dir.is_dir():
-        stage_map = _discover_ane_stage_paths(paths.ane_models_dir)
+        stage_map = _discover_ane_stage_paths(paths.ane_models_dir, expected_profile=req_ane_profile)
         if stage_map:
             lib = _load_coreml_lib(paths.coreml_dylib)
             buf = ctypes.create_string_buffer(512)
@@ -246,11 +282,17 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     eng = _make_engine(args, deterministic=(req_mode == "gpu"))
     try:
+        ane_init_broken = bool(
+            (not eng.ane_available)
+            and (req_ane_profile is not None or (ane_manifest is not None and bool(eng._ane_init_error)))
+        )
         modes_to_run: list[str]
         if req_mode == "all":
             modes_to_run = ["gpu"]
             if eng.ane_available:
                 modes_to_run.extend(["ane", "hetero", "hetero2"])
+            elif ane_init_broken:
+                modes_to_run.append("ane")
         else:
             modes_to_run = [req_mode]
 
@@ -261,6 +303,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         ]
         fix_dir = next((d for d in fix_candidates if (d / "cases.json").is_file() and (d / "reference.npz").is_file()), None)
 
+        ane_min_cos_bar = _ane_verify_min_cos_threshold(ane_manifest, eng.ane_profile)
         reports: list[dict[str, Any]] = []
         failed = False
 
@@ -269,7 +312,18 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             ref = np.load(fix_dir / "reference.npz")
             for m in modes_to_run:
                 if m in ("ane", "hetero", "hetero2") and not eng.ane_available:
-                    reports.append({"mode": m, "status": "skipped", "reason": eng._ane_init_error or "ANE unavailable"})
+                    if ane_init_broken:
+                        failed = True
+                        reports.append(
+                            {
+                                "mode": m,
+                                "parity_tier": "ane_drift_tolerant",
+                                "status": "failed",
+                                "reason": eng._ane_init_error or f"ANE profile {req_ane_profile!r} unavailable",
+                            }
+                        )
+                    else:
+                        reports.append({"mode": m, "status": "skipped", "reason": eng._ane_init_error or "ANE unavailable"})
                     continue
                 is_det_gpu = m == "gpu"
                 min_cos = 1.0
@@ -315,7 +369,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                             exact_fracs.append(float(np.mean(diff == 0)))
                         evaluated += 1
 
-                # Deterministic GPU uses strict parity bar; ANE/hetero/hetero2 uses separate drift tolerance.
+                # Deterministic GPU uses strict parity bar; ANE/hetero/hetero2 uses profile-aware drift tolerance.
                 if is_det_gpu:
                     strict_ok = min_cos >= 0.9998 and (max_i8_err <= 1 if args.model_dtype == "float16" else max_i8_err <= 3)
                     tier = "deterministic_gpu"
@@ -323,42 +377,73 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 else:
                     strict_ok = min_cos >= 0.9998
                     tier = "ane_drift_tolerant"
-                    passed = min_cos >= 0.985
+                    passed = min_cos >= ane_min_cos_bar
                 if not passed:
                     failed = True
-                reports.append(
-                    {
-                        "mode": m,
-                        "parity_tier": tier,
-                        "cases_evaluated": evaluated,
-                        "proj_min_cos": round(min_cos, 6),
-                        "int8_max_abs_err": max_i8_err,
-                        "int8_exact_fraction": round(sum(exact_fracs) / max(len(exact_fracs), 1), 4),
-                        "within_strict_parity": strict_ok,
-                        "ane_drift_warning": (not is_det_gpu) and (not strict_ok),
-                        "status": "ok" if passed else "failed",
-                    }
-                )
+                rep_entry: dict[str, Any] = {
+                    "mode": m,
+                    "parity_tier": tier,
+                    "cases_evaluated": evaluated,
+                    "proj_min_cos": round(min_cos, 6),
+                    "int8_max_abs_err": max_i8_err,
+                    "int8_exact_fraction": round(sum(exact_fracs) / max(len(exact_fracs), 1), 4),
+                    "within_strict_parity": strict_ok,
+                    "ane_drift_warning": (not is_det_gpu) and (not strict_ok),
+                    "status": "ok" if passed else "failed",
+                }
+                if not is_det_gpu:
+                    rep_entry["ane_min_cos_threshold"] = ane_min_cos_bar
+                reports.append(rep_entry)
         else:
             probe_text = "Apple Silicon unified memory enables low-latency contextual embeddings."
             v_gpu = eng.encode_documents([probe_text], mode="gpu", normalize=True)[0]
             reports.append({"mode": "gpu", "parity_tier": "deterministic_gpu", "smoke_norm": round(float(np.linalg.norm(v_gpu)), 6), "status": "ok"})
-            if eng.ane_available and req_mode != "gpu":
-                v_ane = eng.encode_documents([probe_text], mode="ane", normalize=True)[0]
-                cos = float(np.dot(v_gpu, v_ane))
-                reports.append(
-                    {
-                        "mode": "ane",
-                        "parity_tier": "ane_drift_tolerant",
-                        "smoke_cos_vs_gpu": round(cos, 6),
-                        "within_strict_parity": cos >= 0.9998,
-                        "status": "ok" if cos >= 0.985 else "failed",
-                    }
-                )
+            if req_mode != "gpu":
+                if eng.ane_available:
+                    v_ane = eng.encode_documents([probe_text], mode="ane", normalize=True)[0]
+                    cos = float(np.dot(v_gpu, v_ane))
+                    smoke_ok = cos >= ane_min_cos_bar
+                    if not smoke_ok:
+                        failed = True
+                    reports.append(
+                        {
+                            "mode": "ane",
+                            "parity_tier": "ane_drift_tolerant",
+                            "smoke_cos_vs_gpu": round(cos, 6),
+                            "ane_min_cos_threshold": ane_min_cos_bar,
+                            "within_strict_parity": cos >= 0.9998,
+                            "status": "ok" if smoke_ok else "failed",
+                        }
+                    )
+                elif ane_init_broken:
+                    failed = True
+                    reports.append(
+                        {
+                            "mode": "ane",
+                            "parity_tier": "ane_drift_tolerant",
+                            "status": "failed",
+                            "reason": eng._ane_init_error or f"ANE profile {req_ane_profile!r} unavailable",
+                        }
+                    )
 
         payload = {
             "home": str(paths.home),
             "ane_available": eng.ane_available,
+            "ane_profile": eng.ane_profile,
+            "staged_ane_profile": eng.staged_ane_profile,
+            "ane_manifest": (
+                {
+                    "schema_version": ane_manifest.get("schema_version"),
+                    "ane_profile": ane_manifest.get("ane_profile"),
+                    "silu_mode": ane_manifest.get("silu_mode"),
+                    "rmsnorm_mode": ane_manifest.get("rmsnorm_mode"),
+                    "precision": ane_manifest.get("precision"),
+                    "inv_mode": ane_manifest.get("inv_mode"),
+                    "config_hash": ane_manifest.get("config_hash"),
+                }
+                if ane_manifest is not None
+                else None
+            ),
             "telemetry": telemetry,
             "ane_compute_plans": ane_plans,
             "reports": reports,
@@ -366,8 +451,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
+            prof_txt = f" ane_profile={eng.ane_profile}" if eng.ane_profile else ""
             print(
-                f"home={paths.home} ane_available={eng.ane_available} "
+                f"home={paths.home} ane_available={eng.ane_available}{prof_txt} "
                 f"MLX_ENABLE_TF32={telemetry['mlx_enable_tf32']} "
                 f"chip={telemetry['device_name']} apple10={telemetry['is_apple10']} "
                 f"sdpa_slice={telemetry['sdpa_slice_len']}"
@@ -481,12 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_weights = sub.add_parser("setup-weights", help="Prepare local weights and tokenizer assets")
-    _add_common_engine_args(p_weights)
+    _add_common_engine_args(p_weights, include_ane_profile=False)
     p_weights.add_argument("--model-dir", default=None, help="Optional local HF snapshot directory")
     p_weights.add_argument("--local-files-only", action="store_true", help="Do not hit network")
 
     p_ane = sub.add_parser("setup-ane", help="Build CoreML ANE bundles via scripts/build_ane_models.py")
-    _add_common_engine_args(p_ane)
+    _add_common_engine_args(p_ane, include_ane_profile=False)
     p_ane.add_argument("--model-dir", default=None)
     p_ane.add_argument("--variant", default=None)
     p_ane.add_argument("--backend", choices=("coreml", "coreai"), default="coreml")
@@ -494,6 +580,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ane.add_argument("--precision", choices=("fp16", "w8a16", "w8a8"), default=None)
     p_ane.add_argument("--layers-per-stage", type=int, default=None)
     p_ane.add_argument("--inv-mode", choices=("block", "fwd_subst"), default=None)
+    p_ane.add_argument(
+        "--ane-profile",
+        choices=("fast", "balanced", "parity"),
+        default=None,
+        help="Preset ANE speed/parity profile: 'fast' (silu+prescale, default), 'balanced' (tanh_gdn+max_abs), "
+        "or 'parity' (tanh_all+max_abs). 'parity'/'balanced' is recommended for --dtype int8 or --dimensions 128 "
+        "(prescale 1/64 inflates 2^-14 to 0.25 unscaled eps). Explicit --silu-mode/--rmsnorm-mode override the preset.",
+    )
+    p_ane.add_argument("--silu-mode", choices=("silu", "tanh_gdn", "tanh_all"), default=None)
+    p_ane.add_argument("--rmsnorm-mode", choices=("prescale", "max_abs"), default=None)
     p_ane.add_argument("--calib-stats", default=None)
     p_ane.add_argument("--ftz-alpha", type=float, default=None)
     p_ane.add_argument("--preserve-gdn-fp16", action=argparse.BooleanOptionalAction, default=True)

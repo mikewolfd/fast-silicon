@@ -320,24 +320,82 @@ def _coreml_last_error(lib: ctypes.CDLL) -> str:
         return ""
 
 
-def _discover_ane_stage_paths(ane_dir: Path) -> dict[int, list[Path]]:
-    """Discover per-seq-len staged .mlmodelc bundle chains from manifest.json or glob fallback."""
+def read_ane_manifest(ane_dir: Path) -> dict[str, Any] | None:
+    """Read and normalize `ane_models/manifest.json` (including legacy schema v1 manifests)."""
+    manifest_path = ane_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        return None
+    silu_mode = str(raw.get("silu_mode") or "silu")
+    rmsnorm_mode = str(raw.get("rmsnorm_mode") or "prescale")
+    profile = raw.get("ane_profile")
+    if not profile:
+        if (silu_mode, rmsnorm_mode) == ("silu", "prescale"):
+            profile = "fast"
+        elif (silu_mode, rmsnorm_mode) == ("tanh_gdn", "max_abs"):
+            profile = "balanced"
+        elif (silu_mode, rmsnorm_mode) == ("tanh_all", "max_abs"):
+            profile = "parity"
+        else:
+            profile = "custom"
+    out = dict(raw)
+    out.setdefault("schema_version", 1)
+    out["silu_mode"] = silu_mode
+    out["rmsnorm_mode"] = rmsnorm_mode
+    out["ane_profile"] = str(profile)
+    out.setdefault("config_hash", None)
+    return out
+
+
+def _discover_ane_stage_paths(
+    ane_dir: Path,
+    *,
+    expected_profile: str | None = None,
+    expected_config_hash: str | None = None,
+) -> dict[int, list[Path]]:
+    """Discover per-seq-len staged .mlmodelc bundle chains from manifest.json or glob fallback.
+
+    When `manifest.json` is present, it is authoritative: buckets whose per-bucket `config_hash`
+    disagrees with the top-level `config_hash` or whose stage count disagrees with `num_stages`
+    are rejected, and no silent glob fallback is performed on profile/config mismatch.
+    """
     if not ane_dir.is_dir():
         return {}
     manifest_path = ane_dir / "manifest.json"
     discovered: dict[int, list[Path]] = {}
     if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = read_ane_manifest(ane_dir)
+        if manifest is None:
+            return {}
+        if expected_profile is not None and manifest.get("ane_profile") != expected_profile:
+            return {}
+        top_hash = manifest.get("config_hash")
+        if expected_config_hash is not None and top_hash != expected_config_hash:
+            return {}
+        expected_stages = manifest.get("num_stages")
         for k_str, entry in manifest.get("buckets", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            bucket_hash = entry.get("config_hash")
+            if top_hash is not None and bucket_hash is not None and bucket_hash != top_hash:
+                continue
             cap = int(entry.get("seq_len", k_str))
-            stages = [ane_dir / name for name in entry.get("stages", [])]
+            stage_names = entry.get("stages", [])
+            if expected_stages is not None and len(stage_names) != int(expected_stages):
+                continue
+            stages = [ane_dir / name for name in stage_names]
             if stages and all(p.exists() for p in stages):
                 discovered[cap] = stages
-        if discovered:
-            return dict(sorted(discovered.items()))
+        return dict(sorted(discovered.items()))
 
-    # Fallback: scan pplx_s{S}_st{idx}_*.mlmodelc
-    grouped: dict[int, list[tuple[int, Path]]] = {}
+    if expected_profile is not None or expected_config_hash is not None:
+        return {}
+
+    # Fallback when no manifest.json exists: scan pplx_s{S}_st{idx}_<variant>.mlmodelc,
+    # grouping by (cap, variant_suffix) so distinct modes/configs never mix or collide.
+    grouped: dict[int, dict[str, list[tuple[int, Path]]]] = {}
     for p in sorted(ane_dir.glob("pplx_s*_st*.mlmodelc")):
         parts = p.stem.split("_")
         try:
@@ -345,11 +403,17 @@ def _discover_ane_stage_paths(ane_dir: Path) -> dict[int, list[Path]]:
             st_idx = int(parts[2][2:])
         except (IndexError, ValueError):
             continue
-        grouped.setdefault(cap, []).append((st_idx, p))
-    for cap, pairs in sorted(grouped.items()):
-        pairs.sort(key=lambda t: t[0])
-        if [idx for idx, _ in pairs] == list(range(len(pairs))):
-            discovered[cap] = [p for _, p in pairs]
+        suffix = "_".join(parts[3:])
+        grouped.setdefault(cap, {}).setdefault(suffix, []).append((st_idx, p))
+    for cap, by_suffix in sorted(grouped.items()):
+        valid_groups: list[list[Path]] = []
+        for pairs in by_suffix.values():
+            pairs.sort(key=lambda t: t[0])
+            if [idx for idx, _ in pairs] == list(range(len(pairs))):
+                valid_groups.append([p for _, p in pairs])
+        # Only accept unambiguous single-variant stage chains in manifest-less fallback.
+        if len(valid_groups) == 1:
+            discovered[cap] = valid_groups[0]
     return discovered
 
 
@@ -391,6 +455,7 @@ class _ANERunnerBackend:
         embed_f16_mm: np.ndarray,
         pipe_depth: int = DEFAULT_PIPE_DEPTH,
         compute_units: int = 0,
+        expected_profile: str | None = None,
     ) -> None:
         self.io_lib = _load_io_lib(paths.io_dylib)
         self.coreml_lib = _load_coreml_lib(paths.coreml_dylib)
@@ -410,8 +475,15 @@ class _ANERunnerBackend:
             )
         )
 
-        stage_map = _discover_ane_stage_paths(paths.ane_models_dir)
+        self.manifest: dict[str, Any] | None = read_ane_manifest(paths.ane_models_dir)
+        stage_map = _discover_ane_stage_paths(paths.ane_models_dir, expected_profile=expected_profile)
         if not stage_map:
+            if expected_profile is not None and self.manifest is not None:
+                staged = self.manifest.get("ane_profile")
+                raise FileNotFoundError(
+                    f"Staged ANE bundle profile {staged!r} does not match requested ane_profile={expected_profile!r}; "
+                    f"rebuild with `fast-pplx setup-ane --ane-profile {expected_profile}`."
+                )
             raise FileNotFoundError(f"No compiled ANE .mlmodelc stages found in {paths.ane_models_dir}")
 
         self.runners: dict[int, int] = {}
@@ -731,6 +803,7 @@ class FastPplx:
         cache_limit_mb: int = 512,
         local_files_only: bool = True,
         enable_ane: bool = True,
+        ane_profile: str | None = None,
         deterministic: bool = False,
         dimensions: int | None = None,
         pipe_depth: int = DEFAULT_PIPE_DEPTH,
@@ -741,11 +814,16 @@ class FastPplx:
     ) -> None:
         if mode not in _VALID_MODES:
             raise ValueError(f"Unsupported mode {mode!r}; choose from {_VALID_MODES}")
+        if ane_profile is not None and ane_profile not in ("fast", "balanced", "parity", "custom"):
+            raise ValueError(
+                f"Unsupported ane_profile {ane_profile!r}; choose from ('fast', 'balanced', 'parity', 'custom')"
+            )
 
         self.paths: RepoPaths = resolve_paths(home)
         self.dtype_name = dtype
         self.pipe_depth = int(pipe_depth)
         self.deterministic = bool(deterministic)
+        self._requested_ane_profile: str | None = ane_profile
         self._local_stats = threading.local()
         self._stats_lock = threading.Lock()
         self._latest_stats: dict[str, Any] = {}
@@ -799,6 +877,15 @@ class FastPplx:
             raise RuntimeError("Neither GPU nor ANE backend is available.")
 
         self.ane_available: bool = self.ane is not None
+        self.ane_manifest: dict[str, Any] | None = (
+            getattr(self.ane, "manifest", None) if self.ane_available else read_ane_manifest(self.paths.ane_models_dir)
+        )
+        self.staged_ane_profile: str | None = (
+            str(self.ane_manifest["ane_profile"])
+            if isinstance(self.ane_manifest, dict) and self.ane_manifest.get("ane_profile")
+            else None
+        )
+        self.ane_profile: str | None = self.staged_ane_profile if self.ane_available else None
         self.ane_query_max_len: int = (
             int(getattr(self.ane, "max_cap", DEFAULT_ANE_MAX_SEQ_LEN))
             if self.ane_available
@@ -870,9 +957,30 @@ class FastPplx:
                     f"Missing native dylibs ({self.paths.io_dylib}, {self.paths.coreml_dylib}); run `make native`."
                 )
                 return None
-            stage_map = _discover_ane_stage_paths(self.paths.ane_models_dir)
+            manifest = read_ane_manifest(self.paths.ane_models_dir)
+            if (
+                self._requested_ane_profile is not None
+                and manifest is not None
+                and manifest.get("ane_profile") != self._requested_ane_profile
+            ):
+                self._ane_init_error = (
+                    f"Staged ANE bundle profile {manifest.get('ane_profile')!r} does not match requested "
+                    f"ane_profile={self._requested_ane_profile!r}; rebuild with "
+                    f"`fast-pplx setup-ane --ane-profile {self._requested_ane_profile}`."
+                )
+                return None
+            stage_map = _discover_ane_stage_paths(
+                self.paths.ane_models_dir,
+                expected_profile=self._requested_ane_profile,
+            )
             if not stage_map:
-                self._ane_init_error = f"No .mlmodelc stages in {self.paths.ane_models_dir}; run `setup-ane`."
+                if self._requested_ane_profile is not None:
+                    self._ane_init_error = (
+                        f"No .mlmodelc stages matching ane_profile={self._requested_ane_profile!r} in "
+                        f"{self.paths.ane_models_dir}; run `fast-pplx setup-ane --ane-profile {self._requested_ane_profile}`."
+                    )
+                else:
+                    self._ane_init_error = f"No .mlmodelc stages in {self.paths.ane_models_dir}; run `setup-ane`."
                 return None
             if not self.paths.embed_tokens_safetensors.is_file():
                 self._ane_init_error = (
@@ -889,6 +997,7 @@ class FastPplx:
                 embed_f16_mm=embed_mm,
                 pipe_depth=pipe_depth,
                 compute_units=compute_units,
+                expected_profile=self._requested_ane_profile,
             )
         except Exception as exc:
             self._ane_init_error = f"ANE initialization failed: {exc}"
