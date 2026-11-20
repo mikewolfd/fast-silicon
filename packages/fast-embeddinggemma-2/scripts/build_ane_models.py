@@ -141,7 +141,8 @@ def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path
             cur = mb.mul(x=mb.add(x=cur, y=pp, name=q + "res3"), y=w[q + "scalar"][0], name=q + "lsc")
 
         normed = _rmsnorm_ch(cur, w["final_norm"], "final_norm")
-        return mb.transpose(x=mb.reshape(x=normed, shape=[H, S], name="oh_r"), perm=[1, 0], name="out_h")
+        # Keep NCHW [1, H, 1, S] so H17 CoreML never schedules a trailing [H,S]->[S,H] transpose onto CPU.
+        return mb.identity(x=normed, name="out_h")
 
     ml = ct.convert(
         prog,

@@ -167,7 +167,7 @@ We cross-checked the compute-bound NAX architecture on a base **Apple M5 (`Mac17
 | `fast-decision-models` `laya_ane` (`W8A16` ANE `P=4`, `n=64`) | `42.03 q/s` (`23.80 ms/q`) | **44.4 q/s** (`22.52 ms/q`, `1.4413 s`) | **`1.06x`** pure ANE (`kev_08b` not staged on `24 GB` M5) |
 
 > [!NOTE]
-> **M5 Scope & Known `h17` CoreML Difference:** `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HuggingFace baseline tokenizers were not staged on the `24 GB` M5 test machine. On M5 `h17` (`macOS 27.2.1`), `emb2_pk_s{32,64,128}_w8` bundles compile with `CPU=1` (`ios18.transpose->out_h` falls back to CPU while `S=192..512` stay `CPU=0`), so `test_coreml_error_propagation_and_mlcomputeplan` flags that strict zero-CPU invariant (`38/39` pass in `fast-embeddinggemma-2` on M5).
+> **M5 Scope & `h17` CoreML Layout:** `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HuggingFace baseline tokenizers were not staged on the `24 GB` M5 test machine. On M5 `h17` (`macOS 27.2.1`), `emb2_pk_s{32,64,128}_w8` bundles fell back to `CPU=1` for a trailing `H↔S` transpose; returning ANE-native `[1, 512, 1, S]` NCHW `out_h` and untiling in NEON eliminates the CPU fallback (`ANE=2288, GPU=0, CPU=0` across all `9` buckets, `40/40` passing on M5 and M4 Pro).
 
 ## Hardware Suites, Weight Setup & Serialization
 
@@ -197,7 +197,7 @@ make sync-clean-check  # Also fail if any sibling ../fast-* checkout has uncommi
 make leak-check        # Fail on private domain tokens or local absolute user paths
 ```
 
-**Scope & not tested:** Full suite verified on Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`). Partial hardware verification on Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only) covers `fast-shared`, `fast-bge-small`, `fast-pplx`, and `fast-decision-models` (`laya_ane`) plus `38/39` of `fast-embeddinggemma-2` (`s32`/`s64`/`s128` trailing transpose falls back to `CPU=1` on `h17`), with `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HF public baselines un-staged. Untested on M1/M2/M3/M4 Max/Ultra/M5 Pro/Max Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
+**Scope & not tested:** Full suite verified on Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`). Partial hardware verification on Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only) covers `fast-shared`, `fast-bge-small`, `fast-embeddinggemma-2` (`40/40`, `CPU=0` across all `9` ANE buckets), `fast-pplx`, and `fast-decision-models` (`laya_ane`), with `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HF public baselines un-staged. Untested on M1/M2/M3/M4 Max/Ultra/M5 Pro/Max Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
 
 ## Acknowledgments
 

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "emb2_fast_io.h"
+#include "emb2_neon_transpose.hpp"
 #include "fast_shared_apple.hpp"
 
 extern "C" {
@@ -63,34 +64,11 @@ void emb2_prep_batch(
                     const uint16x8_t r6 = vld1q_u16(rp[6] + d);
                     const uint16x8_t r7 = vld1q_u16(rp[7] + d);
 
-                    const uint16x8x2_t a0 = vtrnq_u16(r0, r1);
-                    const uint16x8x2_t a1 = vtrnq_u16(r2, r3);
-                    const uint16x8x2_t a2 = vtrnq_u16(r4, r5);
-                    const uint16x8x2_t a3 = vtrnq_u16(r6, r7);
-
-                    const uint32x4x2_t b0 = vtrnq_u32(vreinterpretq_u32_u16(a0.val[0]), vreinterpretq_u32_u16(a1.val[0]));
-                    const uint32x4x2_t b1 = vtrnq_u32(vreinterpretq_u32_u16(a0.val[1]), vreinterpretq_u32_u16(a1.val[1]));
-                    const uint32x4x2_t b2 = vtrnq_u32(vreinterpretq_u32_u16(a2.val[0]), vreinterpretq_u32_u16(a3.val[0]));
-                    const uint32x4x2_t b3 = vtrnq_u32(vreinterpretq_u32_u16(a2.val[1]), vreinterpretq_u32_u16(a3.val[1]));
-
-                    const uint64x2_t col0 = vtrn1q_u64(vreinterpretq_u64_u32(b0.val[0]), vreinterpretq_u64_u32(b2.val[0]));
-                    const uint64x2_t col4 = vtrn2q_u64(vreinterpretq_u64_u32(b0.val[0]), vreinterpretq_u64_u32(b2.val[0]));
-                    const uint64x2_t col1 = vtrn1q_u64(vreinterpretq_u64_u32(b1.val[0]), vreinterpretq_u64_u32(b3.val[0]));
-                    const uint64x2_t col5 = vtrn2q_u64(vreinterpretq_u64_u32(b1.val[0]), vreinterpretq_u64_u32(b3.val[0]));
-                    const uint64x2_t col2 = vtrn1q_u64(vreinterpretq_u64_u32(b0.val[1]), vreinterpretq_u64_u32(b2.val[1]));
-                    const uint64x2_t col6 = vtrn2q_u64(vreinterpretq_u64_u32(b0.val[1]), vreinterpretq_u64_u32(b2.val[1]));
-                    const uint64x2_t col3 = vtrn1q_u64(vreinterpretq_u64_u32(b1.val[1]), vreinterpretq_u64_u32(b3.val[1]));
-                    const uint64x2_t col7 = vtrn2q_u64(vreinterpretq_u64_u32(b1.val[1]), vreinterpretq_u64_u32(b3.val[1]));
-
-                    uint16_t* dst = h_n + static_cast<size_t>(d) * S + l0;
-                    vst1q_u16(dst + 0 * static_cast<size_t>(S), vreinterpretq_u16_u64(col0));
-                    vst1q_u16(dst + 1 * static_cast<size_t>(S), vreinterpretq_u16_u64(col1));
-                    vst1q_u16(dst + 2 * static_cast<size_t>(S), vreinterpretq_u16_u64(col2));
-                    vst1q_u16(dst + 3 * static_cast<size_t>(S), vreinterpretq_u16_u64(col3));
-                    vst1q_u16(dst + 4 * static_cast<size_t>(S), vreinterpretq_u16_u64(col4));
-                    vst1q_u16(dst + 5 * static_cast<size_t>(S), vreinterpretq_u16_u64(col5));
-                    vst1q_u16(dst + 6 * static_cast<size_t>(S), vreinterpretq_u16_u64(col6));
-                    vst1q_u16(dst + 7 * static_cast<size_t>(S), vreinterpretq_u16_u64(col7));
+                    emb2::transpose_u16_8x8_store(
+                        r0, r1, r2, r3, r4, r5, r6, r7,
+                        h_n + static_cast<size_t>(d) * S + l0,
+                        static_cast<size_t>(S)
+                    );
                 }
             } else {
                 for (int k = 0; k < blk; ++k) {

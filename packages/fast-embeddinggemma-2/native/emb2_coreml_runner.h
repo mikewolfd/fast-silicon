@@ -56,6 +56,12 @@ double emb2_pk_exec_queue(
 
 void emb2_pk_free(void* handle);
 
+// Untile [512, S] NCHW CoreML output to row-major [S, 512] FP16 buffer.
+void emb2_transpose_512xS_to_Sx512(int S, const uint16_t* src, uint16_t* dst);
+
+// Return 1 if the loaded bundle outputs [1, 512, 1, S] NCHW, 0 if [S, 512], or -1 if invalid.
+int emb2_pk_output_is_nchw(void* handle);
+
 #ifdef __cplusplus
 }
 #endif

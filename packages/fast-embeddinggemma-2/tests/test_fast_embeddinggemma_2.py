@@ -861,3 +861,33 @@ def test_cli_alignment_rank_metrics_and_outlier_replay(engine: FastEmbeddingGemm
     assert rep["replay_fixed_gpu_min_cos"] >= 0.9998
     assert len(rep["outlier_idxs"]) == 8
 
+
+def test_nchw_output_transpose_and_build_ane_nchw_cpu() -> None:
+    """Verify CoreML ANE bundle builds keep NCHW out_h and NEON untiling is bit-exact for multiples and tails."""
+    import ast
+    import ctypes
+
+    pkg_root = Path(__file__).resolve().parents[1]
+    build_src = (pkg_root / "scripts" / "build_ane_models.py").read_text(encoding="utf-8")
+    tree = ast.parse(build_src)
+    ane_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "build_ane_packed_w8")
+    ane_seg = ast.get_source_segment(build_src, ane_fn) or ""
+    assert 'mb.identity(x=normed, name="out_h")' in ane_seg
+    assert "oh_r" not in ane_seg
+
+    dylib_path = pkg_root / "build" / "libemb2_coreml_runner.dylib"
+    if not dylib_path.is_file():
+        dylib_path = resolve_paths().coreml_dylib
+    if not dylib_path.is_file():
+        pytest.skip("Native dylib not built yet")
+    lib = ctypes.CDLL(str(dylib_path))
+    lib.emb2_transpose_512xS_to_Sx512.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+    lib.emb2_transpose_512xS_to_Sx512.restype = None
+
+    rng = np.random.default_rng(7)
+    for S in (19, 32, 64, 131):
+        src = rng.integers(0, 65536, size=(512, S), dtype=np.uint16)
+        dst = np.empty((S, 512), dtype=np.uint16)
+        lib.emb2_transpose_512xS_to_Sx512(S, src.ctypes.data, dst.ctypes.data)
+        np.testing.assert_array_equal(dst, src.T)
+

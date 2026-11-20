@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "emb2_coreml_runner.h"
+#include "emb2_neon_transpose.hpp"
 #include "fast_shared_apple.hpp"
 
 namespace {
@@ -44,11 +45,26 @@ struct Emb2PkHandle {
     int S = 0;
     int slots = 1;
     int compute_mode = 0;
+    bool output_is_nchw = false;
     std::vector<MLMultiArray*> ah, ab, acs, ass, acf, asf, ao;
     std::vector<MLDictionaryFeatureProvider*> feats;
     std::vector<MLPredictionOptions*> opts;
     std::vector<dispatch_semaphore_t> sems;
 };
+
+static inline void copy_out_buffer(
+    uint16_t* dst,
+    const void* src,
+    int S,
+    size_t o_bytes,
+    bool output_is_nchw
+) {
+    if (output_is_nchw) {
+        emb2::transpose_512xS_to_Sx512_u16(static_cast<const uint16_t*>(src), dst, S);
+    } else {
+        memcpy(dst, src, o_bytes);
+    }
+}
 
 }  // namespace
 
@@ -133,10 +149,31 @@ void* emb2_pk_load_units(const char* mlmodelc_path, int S, int pipe_depth, int c
             return nullptr;
         }
 
+        bool output_is_nchw = false;
+        MLFeatureDescription* out_desc = model.modelDescription.outputDescriptionsByName[@"out_h"];
+        NSArray<NSNumber*>* out_shape = out_desc.multiArrayConstraint.shape;
+        if (out_shape.count == 4) {
+            if (out_shape[0].intValue != 1 || out_shape[1].intValue != 512 ||
+                out_shape[2].intValue != 1 || out_shape[3].intValue != S) {
+                record_emb2_error("emb2_pk_load_units(shape)", nil, "unexpected 4D out_h shape");
+                return nullptr;
+            }
+            output_is_nchw = true;
+        } else if (out_shape.count == 2) {
+            if (out_shape[0].intValue != S || out_shape[1].intValue != 512) {
+                record_emb2_error("emb2_pk_load_units(shape)", nil, "unexpected 2D out_h shape");
+                return nullptr;
+            }
+        } else if (out_shape.count != 0) {
+            record_emb2_error("emb2_pk_load_units(shape)", nil, "unsupported out_h rank");
+            return nullptr;
+        }
+
         auto* h = new Emb2PkHandle();
         h->model = model;
         h->S = S;
         h->compute_mode = compute_mode;
+        h->output_is_nchw = output_is_nchw;
         int eff_slots = std::max(1, pipe_depth);
         // Cap CPU-SME concurrent slots to <= 2 (2 physical shared SME2 units on M4/M5).
         if (compute_mode == static_cast<int>(fast_shared::ComputeMode::kCpuOnly)) {
@@ -162,9 +199,22 @@ void* emb2_pk_load_units(const char* mlmodelc_path, int S, int pipe_depth, int c
             h->ass[i] = [[MLMultiArray alloc] initWithShape:@[@1, @1, @(S), @128] dataType:MLMultiArrayDataTypeFloat16 error:&e];
             h->acf[i] = [[MLMultiArray alloc] initWithShape:@[@1, @1, @(S), @256] dataType:MLMultiArrayDataTypeFloat16 error:&e];
             h->asf[i] = [[MLMultiArray alloc] initWithShape:@[@1, @1, @(S), @256] dataType:MLMultiArrayDataTypeFloat16 error:&e];
-            h->ao[i]  = [[MLMultiArray alloc] initWithShape:@[@(S), @512] dataType:MLMultiArrayDataTypeFloat16 error:&e];
+            NSArray<NSNumber*>* ao_shape = h->output_is_nchw ? @[@1, @512, @1, @(S)] : @[@(S), @512];
+            h->ao[i]  = [[MLMultiArray alloc] initWithShape:ao_shape dataType:MLMultiArrayDataTypeFloat16 error:&e];
             if (!h->ah[i] || !h->ab[i] || !h->acs[i] || !h->ass[i] || !h->acf[i] || !h->asf[i] || !h->ao[i] || e) {
                 record_emb2_error("emb2_pk_load_units(alloc)", e, mlmodelc_path);
+                delete h;
+                return nullptr;
+            }
+            NSArray<NSNumber*>* ao_strides = h->ao[i].strides;
+            const bool ao_contig =
+                (h->ao[i].count == static_cast<NSInteger>(512) * S) &&
+                (ao_strides.lastObject.integerValue == 1) &&
+                (h->output_is_nchw
+                     ? (ao_strides.count == 4 && ao_strides[1].integerValue == S)
+                     : (ao_strides.count == 2 && ao_strides[0].integerValue == 512));
+            if (!ao_contig) {
+                record_emb2_error("emb2_pk_load_units(strides)", nil, mlmodelc_path);
                 delete h;
                 return nullptr;
             }
@@ -232,6 +282,7 @@ void* emb2_pk_submit_queue(
         @autoreleasepool {
             const int S = h->S;
             const int slots = h->slots;
+            const bool out_nchw = h->output_is_nchw;
             const size_t h_bytes  = static_cast<size_t>(512) * S * 2;
             const size_t b_bytes  = static_cast<size_t>(S) * S * 2;
             const size_t cs_bytes = static_cast<size_t>(S) * 128 * 2;
@@ -255,7 +306,13 @@ void* emb2_pk_submit_queue(
                         break;
                     }
                     if (out_all) {
-                        memcpy(out_all + static_cast<size_t>(idx) * S * 512, h->ao[0].dataPointer, o_bytes);
+                        copy_out_buffer(
+                            out_all + static_cast<size_t>(idx) * S * 512,
+                            h->ao[0].dataPointer,
+                            S,
+                            o_bytes,
+                            out_nchw
+                        );
                     }
                 }
             } else {
@@ -285,7 +342,7 @@ void* emb2_pk_submit_queue(
                                 record_emb2_error("emb2_pk_submit_queue(async)", e);
                             }
                         } else if (fl->err_flag.load(std::memory_order_acquire) == 0 && dst) {
-                            memcpy(dst, src, o_bytes);
+                            copy_out_buffer(dst, src, S, o_bytes, out_nchw);
                         }
                         dispatch_semaphore_signal(sem);
                         dispatch_group_leave(grp);
@@ -326,6 +383,15 @@ double emb2_pk_exec_queue(
 
 void emb2_pk_free(void* handle) {
     if (handle) delete static_cast<Emb2PkHandle*>(handle);
+}
+
+void emb2_transpose_512xS_to_Sx512(int S, const uint16_t* src, uint16_t* dst) {
+    emb2::transpose_512xS_to_Sx512_u16(src, dst, S);
+}
+
+int emb2_pk_output_is_nchw(void* handle) {
+    if (!handle) return -1;
+    return static_cast<const Emb2PkHandle*>(handle)->output_is_nchw ? 1 : 0;
 }
 
 }  // extern "C"
