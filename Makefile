@@ -80,4 +80,4 @@ sync-clean-check:
 
 leak-check:
 	@! rg -n -i "/users/|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \
-		packages scripts tests pyproject.toml .agents LICENSE .gitignore uv.lock README.md
+		packages scripts tests docs pyproject.toml .agents LICENSE .gitignore uv.lock README.md
