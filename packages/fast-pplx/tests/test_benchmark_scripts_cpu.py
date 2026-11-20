@@ -41,6 +41,28 @@ def test_pplx_benchmark_dry_run_and_helpers(tmp_path: Path, capsys: pytest.Captu
     assert payload_all["suite"] == "all"
     assert payload_all["context_limits"] == [512, 2048, 8192, 16384, 32768]
 
+    rc_ap = mod.main(["ane-profiles", "--dry-run", "--profiles", "fast,balanced,parity", "--seq-lens", "128,256"])
+    assert rc_ap == 0
+    payload_ap = json.loads(capsys.readouterr().out)
+    assert payload_ap["suite"] == "ane-profiles"
+    assert payload_ap["profiles"] == ["fast", "balanced", "parity"]
+    assert payload_ap["seq_lens"] == [128, 256]
+
+    md_ap = mod.format_ane_profiles_markdown(
+        {"fast": 12.3, "parity": 14.1},
+        {
+            "fast": {"s256_f32_min_cos": 0.9965, "s256_d128_min_cos": 0.9971, "s256_int8_mae": 0.85},
+            "parity": {"s256_f32_min_cos": 0.9994, "s256_d128_min_cos": 0.9996, "s256_int8_mae": 0.12},
+        },
+        {
+            "S128_32docs": {"profiles": {"fast": {"tok_s": 14200.0}, "parity": {"tok_s": 11800.0}}},
+            "S256_32docs": {"profiles": {"fast": {"tok_s": 13900.0}, "parity": {"tok_s": 11500.0}}},
+        },
+        {"status": "ok", "harness": "pplx-context-mlx (zainmerchan-f16)", "S128_32docs": {"tok_s": 4100.0}, "S256_32docs": {"tok_s": 4600.0}},
+    )
+    assert "`ane:fast`" in md_ap
+    assert "zainmerchan-f16" in md_ap
+
     # 2. Vector & int8 parity computations
     ref = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
     vp = mod.compute_vector_parity(ref + 1e-4, ref)

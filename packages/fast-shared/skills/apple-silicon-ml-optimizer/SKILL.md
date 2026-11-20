@@ -13,6 +13,7 @@ Optimize complete ML workloads on Apple Silicon. M4 (`Apple9`) runs Metal tensor
 2. **Measure the target Mac.** Record the chip variant, running macOS version, SDK and MLX version. Measure bandwidth and matrix throughput at the shapes you use. Check which tensor formats and operations the OS exposes on that GPU family. [Metal features by macOS version](references/m4-vs-m5-architecture.md#metal-features-by-macos-version) · [Six-chip capability matrix](references/m4-m5-capability-matrix.md)
 3. **Eliminate tokens and calls before tuning shaders.** Zero-LLM deterministic bypasses, reasoning/CoT skipping, `llguidance` forced-token jumping + lazy GPU `argmax`, and lossless/asymmetric vocab pruning routinely yield `1.5×–4×+` before writing a line of Metal.
 4. **Separate micro-benchmarks from E2E execution.** Single-layer `1×` extrapolation misattributes launch overhead (`PLE`) and hides double-wide/heterogeneous layers. Measure full `N`-layer pipelined graphs inside `mx.eval`, then validate E2E under paired interleaved `A/B` runs.
+5. **Separate CoreAI-Opt build-time compression from Core AI runtime execution.** `coreai-opt` (`ExportBackend.CoreML` / `CoreAI`) is an offline host compression tool (`26.x+`), whereas Core AI runtime (`.aimodel` / `.aimodelc`, `AIModel` / `InferenceFunction`) requires macOS `27.0+` (`27.2+` for `FP4/FP8` presets & Gemma-4/Qwen3.5), Xcode `27.0+` (`Metal Toolchain` for AOT), verified OS delegate support (`USE_OS_COREAI=1`), and explicit cache keys and GPU stream synchronization. Never treat package importability or format acceptance as hardware delegation or parity.
 
 ---
 
@@ -30,7 +31,7 @@ Before modifying model code or writing custom kernels:
    ```bash
    python3 scripts/probe_silicon_ceilings.py          # or: fast-silicon-probe
    ```
-   On macOS 26.4 or later with a matching SDK, the native Metal probe measures FP16, BF16, INT8 and INT4. It builds those kernels in one library. On 26.2, use the MLX probe above for floating-point throughput and query `[device supportsFamily:MTLGPUFamilyApple10]` for the hardware family. For exact six-chip specs, macOS `15.0–27.2.1` gates, `MLX` version ceilings, Darwin `hw.optional.arm.*` keys, Metal/CoreML/CoreAI/BNNS SDK declarations, or A64 encodings without loading raw sheets into context, read [references/m4-m5-capability-matrix.md](references/m4-m5-capability-matrix.md) or query `python3 scripts/query_capability_matrix.py --search <term>`.
+   On macOS 26.4 or later with a matching SDK, the native Metal probe measures FP16, BF16, INT8 and INT4. It builds those kernels in one library. On 26.2, use the MLX probe above for floating-point throughput and query `[device supportsFamily:MTLGPUFamilyApple10]` for the hardware family. Check Core AI runtime delegate eligibility (`USE_OS_COREAI=1` + macOS `27.0+`/`27.2+`) separately from offline `coreai-torch` / `coreai-opt` export availability, and record 4-bucket physical footprint (`RUSAGE_INFO_V6` + active Metal/MLX + mapped `.safetensors`/`.aimodel` weight files). For exact six-chip specs, macOS `15.0–27.2.1` gates, `MLX` version ceilings, Darwin `hw.optional.arm.*` keys, Metal/CoreML/CoreAI/BNNS SDK declarations, or A64 encodings without loading raw sheets into context, read [references/m4-m5-capability-matrix.md](references/m4-m5-capability-matrix.md) or query `python3 scripts/query_capability_matrix.py --search <term>`.
    ```bash
    xcrun clang++ -O3 -std=c++20 -fobjc-arc -framework Foundation -framework Metal -framework MetalPerformancePrimitives scripts/probe_mpp_metal4.mm -o /tmp/probe_mpp_metal4 && /tmp/probe_mpp_metal4
    ```
@@ -42,7 +43,7 @@ Before modifying model code or writing custom kernels:
    - True per-tensor quantization bits (many `"4-bit"` releases keep MLPs in `8-bit` or `BF16`!).
    - Tied vs. untied `embed` / `lm_head` (determines whether output-only head pruning is lossless).
    - KV layout (`SWA` vs `Full`, GQA `n_q/n_kv`, `KV-shared` layers, `KiB/tok`) and activation outlier behavior (`FP16 < 65,504` vs `BF16` residual vs `w_pre_ff` variance).
-4. **Profile a full `N`-layer graph** (`attn`, `mlp/moe`, `head`, `norms`, `ple/misc`) inside a single `mx.eval` to attribute true millisecond shares. If native MLX/CoreML already achieves **`>= 90%`** of your measured ceiling on the bottleneck op, do **not** write a custom kernel unless fusing epilogues/reducing DRAM traffic.
+4. **Profile a full `N`-layer graph** (`attn`, `mlp/moe`, `head`, `norms`, `ple/misc`) inside a single `mx.eval` (or Core AI placement explanation reports + runtime profiling on `27.0+`) to attribute true millisecond shares and actual compute-unit placement. If native MLX/CoreML already achieves **`>= 90%`** of your measured ceiling on the bottleneck op, do **not** write a custom kernel unless fusing epilogues/reducing DRAM traffic.
 
 ---
 
@@ -77,14 +78,19 @@ Route workload stages strictly by arithmetic intensity (`AI = FLOPs / Bytes`), s
    - Measure concurrency headroom via [scripts/probe_ane_and_hetero.mm](scripts/probe_ane_and_hetero.mm).
    - Deploy **only** on compute-bound pools via explicit FFD work-stealing (`skip_ops_by_type` keeping elementwise/norms `FP32`), never alongside DRAM-bound `B=1` GPU decode (shared bus contention causes `2×+` slowdown).
 
+4. **Core AI (`.aimodel` / `.aimodelc` on macOS `27.0+`/`27.2+`) & `CoreAI-Opt` (`26.x+`):**
+   - *Build-time `CoreAI-Opt` (`ExportBackend.CoreML` across `26.x` & `27.x`):* Run offline calibration/sensitivity selection (with `ignored_ops` and block/channel divisibility checks) inside existing `conv1x1` `.mlmodelc` builders instead of maintaining brittle manual outlier blocklists, preserving `2^-14` clamping, `-40000.0` masks, and `fast-ir-guard --strict-bool-mask --coreml`. Treat `MXINT8`/`INT6`/`UINT6` (`coreai-opt 0.4.0`) as `ExportBackend.Torch`-only, not deployable to CoreML/Core AI.
+   - *High-fit Core AI runtime pilots (`27.2+`, `USE_OS_COREAI=1`):* Target pure-ANE scorers (`Laya-Typed-421M`), `Qwen3.5` hybrid GDN/linear-attention models (`fast-pplx`, `Kev-0.8B`), and low-batch (`B=1..4`) `Qwen3.5-4B` / `GPT-OSS` comparisons — promoting only after verified Two-Gate quality + 4-bucket RAM + EOT uplift (`>= 1.00×`, or `>= 1.03×` with custom `TorchMetalKernel` / stateful code). Note `.aimodel` specialization caches key on `(model_hash, toolchain_ver, min_os, arch, options)` and invalidate across OS updates.
+   - *Hard Core AI anti-targets:* Never replace packed `hetero2` ANE+GPU OCR encoders (stock padded `.aimodel` `blk_mx` wastes `~73%` positions and drops concurrent `18.56 TF` ANE work) or ragged continuous-batching `B=16..128` decoders (`B_slots=128`, pruned vocab, `llguidance` forced-token jump, `Hot-MPP/Cold-QMV`) with stock single-stream `.aimodel` exports.
+
 ---
 
 ### Phase 4: Zero-Sync Control & Verification Protocol
 
-1. **Overlap host & device:** Queue pure-FF / non-dependent decode steps with `mx.async_eval(...)`, run `decode + json.loads + schema_validate` on background P-core worker threads, and call `mx.clear_cache()` after large waves (`> 256 MiB` MLX arena).
+1. **Overlap host & device:** Queue pure-FF / non-dependent decode steps with `mx.async_eval(...)`, run `decode + json.loads + schema_validate` on background P-core worker threads, and call `mx.clear_cache()` after large waves (`> 256 MiB` MLX arena). When testing Core AI `NDArray.MutableRawView(metalBuffer:...)` / `InferenceFunction.encode(..., to:)`, enforce explicit MTLBuffer ownership and command-buffer sync, and verify it actually removes multi-MiB copies along the hot stream.
 2. **Check output parity before scaling up.** For a drop-in kernel, compare 4–8 representative inputs on the same processor. Check output count, shape and validity, embedding cosine (`>= 0.9998`), and exact integer codes where the model returns them. For GPU/ANE scheduling changes, repeat the baseline and re-encode the largest differences on each fixed processor. For retrieval, check source passage IDs and held-out passage ranks. Treat an intentional precision change as a separate quality experiment.
-3. **Control for warmup and thermal drift.** Warm both paths, reset peak memory with `mx.reset_peak_memory()`, and alternate runs in `ABBA` order. On sustained workloads, check whether repeated baseline times drift as the Mac heats up. Compare end-to-end time and task quality. [Benchmark harness](scripts/ab_bench_harness.py)
-4. **Audit [references/dead-ends-registry.md](references/dead-ends-registry.md)** before testing speculative decoding on MoE, `KV_i8` on `hd=64`, `SpinQuant` norm-folding, scalar `kv_sys_i8`, or tight batch-1 custom heads.
+3. **Control for warmup and thermal drift.** Warm both paths (separating cold first-load specialization from steady-state warm latency on Core AI), reset peak memory with `mx.reset_peak_memory()`, track 4-bucket `RUSAGE_INFO_V6` + mapped-weight footprint, and alternate runs in `ABBA` order. On sustained workloads, check whether repeated baseline times drift as the Mac heats up. Compare end-to-end time and task quality. [Benchmark harness](scripts/ab_bench_harness.py)
+4. **Audit [references/dead-ends-registry.md](references/dead-ends-registry.md)** before testing speculative decoding on MoE, `KV_i8` on `hd=64`, `SpinQuant` norm-folding, scalar `kv_sys_i8`, tight batch-1 custom heads, or replacing custom `hetero2`/ragged pipelines with stock `.aimodel` exports.
 
 ---
 

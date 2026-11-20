@@ -696,3 +696,54 @@ def build_causal_transformer_ane(mb, x, w_proj):
     assert rep.errors == []
     assert [f.rule_id for f in rep.warnings] == ["COREML_PY_MATMUL_ANE", "COREML_PY_MATMUL_ANE"]
     assert [f.line for f in rep.warnings] == [6, 7]
+
+
+def test_torch_only_quant_dtypes_rejected_and_cli_block_size(tmp_path: Path) -> None:
+    from fast_shared.ir_dtype_guard import validate_export_quant_dtypes
+
+    assert validate_export_quant_dtypes(["int8", "mxint8", "INT6", "DataType.UINT6"], export_backend="coreml") == [
+        "int6",
+        "mxint8",
+        "uint6",
+    ]
+    assert validate_export_quant_dtypes(["mxint8", "int4"], export_backend="coreai") == ["mxint8"]
+    assert validate_export_quant_dtypes(["mxint8", "int6", "uint6"], export_backend="ExportBackend.Torch") == []
+
+    src = """
+import coremltools.optimize.coreml as cto
+import coreai_opt
+
+def cfg():
+    a = cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="mxint8")
+    b = coreai_opt.OpPalettizerConfig(mode="kmeans", quant_dtype="int6")
+    c = coreai_opt.ModuleLinearQuantizerConfig(weight_dtype="uint6")
+    d = coreai_opt.OpLinearQuantizerConfig(dtype="mxint8", export_backend="ExportBackend.Torch")
+    e = cto.OpLinearQuantizerConfig(dtype="int8")
+    return a, b, c, d, e
+"""
+    rep = check_mlx_source(src, filename="calibrate.py", check_coreml_ast=True)
+    errs = [f for f in rep.errors if f.rule_id == "COREML_TORCH_ONLY_QUANT_DTYPE"]
+    assert [f.line for f in errs] == [6, 7, 8]
+
+    ct = pytest.importorskip("coremltools")
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+    import numpy as np
+
+    w_odd = np.ones((50, 32, 1, 1), dtype=np.float16)
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 32, 1, 8), dtype=types.fp16)], opset_version=ct.target.macOS15)
+    def odd_prog(x):
+        return mb.conv(x=x, weight=mb.const(val=w_odd, name="w_odd"), name="c_odd")
+
+    ml_odd = ct.convert(
+        odd_prog,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.macOS15,
+        skip_model_load=True,
+    )
+    pkg = tmp_path / "odd.mlpackage"
+    ml_odd.save(str(pkg))
+    assert ir_dtype_guard.main(["--coreml", "--check-block-size", "32", "--block-axis", "0", str(pkg)]) == 1
+    assert ir_dtype_guard.main(["--coreml", "--check-block-size", "25", "--block-axis", "0", str(pkg)]) == 0

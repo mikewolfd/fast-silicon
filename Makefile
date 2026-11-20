@@ -52,6 +52,7 @@ test-cpu: hw-check
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \
 		tests/test_setup_all_cpu.py \
+		tests/test_benchmark_suites_cpu.py \
 		-k "not mpp_matmul and not _gpu"
 	$(PYTHON) -m pytest -v \
 		packages/fast-bge-small/tests/test_fast_bge_small.py \
@@ -66,7 +67,7 @@ test-hw: hw-check
 		echo "==> Running full pytest suite for packages/$$pkg"; \
 		$(PYTHON) -m pytest -v packages/$$pkg/tests || exit 1; \
 	done
-	$(PYTHON) -m pytest -v tests/test_setup_all_cpu.py
+	$(PYTHON) -m pytest -v tests/test_setup_all_cpu.py tests/test_benchmark_suites_cpu.py
 
 sync:
 	$(PYTHON) scripts/sync_from_siblings.py

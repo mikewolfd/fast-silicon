@@ -1164,3 +1164,231 @@ def test_ane_profile_cli_forwarding_manifest_invalidation_and_discovery_cpu(
         ),
     )
     assert _cmd_verify(ns_par_fail) == 0
+
+
+def test_coreai_backend_status_decouples_export_vs_runtime() -> None:
+    bam = _load_script_module("fast_pplx_build_ane_models_coreai_status", _BUILD_ANE_PATH)
+    st_offline = bam.check_coreai_backend_status(
+        macos_version="26.4",
+        use_os_coreai=False,
+        pkg_versions={"coreai-torch": "0.4.4", "coreai-opt": "0.5.0", "coreai-core": "1.0.0", "coreai": "1.0.0"},
+        delegate_probe=lambda: False,
+    )
+    assert st_offline["export_ready"] is True
+    assert st_offline["runtime_ready"] is False
+    assert st_offline["eligible"] is False
+    assert "27.0+" in st_offline["reason"]
+
+    st_live = bam.check_coreai_backend_status(
+        macos_version="27.2",
+        use_os_coreai=True,
+        pkg_versions={"coreai-torch": "0.4.4", "coreai-opt": "0.5.0", "coreai-core": "1.0.0", "coreai": "1.0.0"},
+        delegate_probe=lambda: True,
+    )
+    assert st_live["export_ready"] is True
+    assert st_live["runtime_ready"] is True
+    assert st_live["eligible"] is True
+    assert st_live["fp4_fp8_preset_eligible"] is True
+
+    st_old_torch = bam.check_coreai_backend_status(
+        macos_version="27.2",
+        use_os_coreai=True,
+        pkg_versions={"coreai-torch": "0.4.0", "coreai-opt": "0.5.0", "coreai-core": "1.0.0", "coreai": "1.0.0"},
+        delegate_probe=lambda: True,
+    )
+    assert st_old_torch["export_ready"] is False
+    assert ">= 0.4.1" in st_old_torch["export_reason"]
+
+
+def test_pplx_coreai_export_calibration_and_guards(tmp_path: Path) -> None:
+    pytest.importorskip("coreai_opt")
+    pytest.importorskip("coreai_torch")
+    pytest.importorskip("coremltools")
+
+    from fast_pplx.config import PplxConfig
+    from fast_pplx.coreai_export import (
+        build_coreai_opt_pplx_config,
+        run_pplx_coreai_export,
+        run_pplx_coreai_sensitivity_sweep,
+    )
+
+    # 1. Pattern 7 divisibility + Torch-only dtype rejection
+    with pytest.raises(ValueError, match="ExportBackend.Torch"):
+        build_coreai_opt_pplx_config(preset="w8", export_backend="coreml", requested_dtypes=["mxint8"])
+    with pytest.raises(ValueError, match="ExportBackend.Torch"):
+        build_coreai_opt_pplx_config(preset="w4", export_backend="coreai", requested_dtypes=["int6"])
+    with pytest.raises(ValueError, match="requires export_backend='coreai'"):
+        build_coreai_opt_pplx_config(preset="fp4_fp8", export_backend="coreml")
+
+    _, qmeta = build_coreai_opt_pplx_config(
+        preset="w4_per_block",
+        block_size=32,
+        export_backend="coreml",
+        weight_shapes={"blocks.l0.conv1d": (96, 1, 1, 4), "blocks.l1.mlp_gu": (128, 64, 1, 1)},
+    )
+    assert "blocks.l0.conv1d" in qmeta["excluded_modules"]
+    assert qmeta["skipped_non_divisible"]["blocks.l0.conv1d"] == [1, 32]
+
+    # 2. End-to-end CoreAI (.aimodel) + CoreML (.mlpackage) export & sensitivity sweep on tiny config
+    tiny_cfg = PplxConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        partial_rotary_factor=0.25,
+        rope_dim=8,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        layer_types=("linear_attention", "full_attention"),
+    )
+
+    res_ai = run_pplx_coreai_export(
+        out_dir=tmp_path / "ai",
+        cfg=tiny_cfg,
+        layer_start=0,
+        layer_end=2,
+        seq_len=32,
+        chunk_size=16,
+        export_backend="coreai",
+        preset="w4_per_block",
+        stem="tiny_pplx_ai",
+    )
+    assert res_ai.asset_path.exists()
+    assert res_ai.asset_summary is not None and res_ai.asset_summary["asset_valid"] is True
+    assert res_ai.sensitivity_report is not None
+    assert res_ai.sensitivity_report["cosine_vs_teacher"] > 0.99
+    assert "blocks.l0.qkvzba" in res_ai.sensitivity_report["excluded_modules"]
+    assert res_ai.cache_key_parts["min_os"] == "27.0"
+
+    res_ml = run_pplx_coreai_export(
+        out_dir=tmp_path / "ml",
+        cfg=tiny_cfg,
+        layer_start=0,
+        layer_end=2,
+        seq_len=32,
+        chunk_size=16,
+        export_backend="coreml",
+        preset="w4_per_block",
+        stem="tiny_pplx_ml",
+    )
+    assert res_ml.asset_path.exists()
+    assert res_ml.guard_report is not None and res_ml.guard_report["ok"] is True
+
+    sweep_rows = run_pplx_coreai_sensitivity_sweep(
+        out_dir=tmp_path / "sweep",
+        cfg=tiny_cfg,
+        layer_start=0,
+        layer_end=2,
+        seq_len=32,
+        chunk_size=16,
+        export_backend="coreai",
+        presets=("fp16", "w8", "w4_per_block"),
+        stem_prefix="tiny_sweep",
+    )
+    assert [r["preset"] for r in sweep_rows] == ["fp16", "w8", "w4_per_block"]
+    assert sweep_rows[0]["analytical_bpw"] == 16.0
+    assert sweep_rows[2]["analytical_bpw"] < sweep_rows[1]["analytical_bpw"]
+
+
+def test_build_ane_bundle_suite_coreai_backend_cpu(tmp_path: Path) -> None:
+    pytest.importorskip("coreai_opt")
+    pytest.importorskip("coreai_torch")
+
+    bam = _load_script_module("fast_pplx_build_ane_suite_coreai", _BUILD_ANE_PATH)
+    paths = resolve_paths(tmp_path)
+    paths.tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    paths.weights_dir.mkdir(parents=True, exist_ok=True)
+    paths.ane_models_dir.mkdir(parents=True, exist_ok=True)
+
+    tiny_cfg = PplxConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        partial_rotary_factor=0.25,
+        rope_dim=8,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        layer_types=("linear_attention", "full_attention"),
+    )
+    (paths.tokenizer_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "hidden_size": tiny_cfg.hidden_size,
+                "num_hidden_layers": tiny_cfg.num_hidden_layers,
+                "intermediate_size": tiny_cfg.intermediate_size,
+                "num_attention_heads": tiny_cfg.num_attention_heads,
+                "num_key_value_heads": tiny_cfg.num_key_value_heads,
+                "head_dim": tiny_cfg.head_dim,
+                "partial_rotary_factor": tiny_cfg.partial_rotary_factor,
+                "linear_conv_kernel_dim": tiny_cfg.linear_conv_kernel_dim,
+                "linear_key_head_dim": tiny_cfg.linear_key_head_dim,
+                "linear_value_head_dim": tiny_cfg.linear_value_head_dim,
+                "linear_num_key_heads": tiny_cfg.linear_num_key_heads,
+                "linear_num_value_heads": tiny_cfg.linear_num_value_heads,
+                "layer_types": list(tiny_cfg.layer_types),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    h = tiny_cfg.hidden_size
+    inter = tiny_cfg.intermediate_size
+    gdn_h = tiny_cfg.linear_num_value_heads
+    gdn_d = tiny_cfg.linear_key_head_dim
+    gdn_p = gdn_h * gdn_d
+    q_tot = tiny_cfg.num_attention_heads * tiny_cfg.head_dim
+    kv_tot = tiny_cfg.num_key_value_heads * tiny_cfg.head_dim
+    synth_w: dict[str, np.ndarray] = {
+        "l0_in_ln": np.ones((1, h, 1, 1), dtype=np.float16),
+        "l0_post_ln": np.ones((1, h, 1, 1), dtype=np.float16),
+        "l0_qkvzba": np.full((4 * gdn_p + 2 * gdn_h, h, 1, 1), 0.02, dtype=np.float16),
+        "l0_conv1d": np.full((3 * gdn_p, 1, 1, 4), 0.05, dtype=np.float16),
+        "l0_neg_A": np.full((gdn_h,), -0.5, dtype=np.float16),
+        "l0_dt_bias": np.zeros((gdn_h,), dtype=np.float16),
+        "l0_gnorm_w": np.ones((gdn_d,), dtype=np.float16),
+        "l0_out_proj": np.full((h, gdn_p, 1, 1), 0.02, dtype=np.float16),
+        "l0_mlp_gu": np.full((2 * inter, h, 1, 1), 0.02, dtype=np.float16),
+        "l0_mlp_dn": np.full((h, inter, 1, 1), 0.02, dtype=np.float16),
+        "l1_in_ln": np.ones((1, h, 1, 1), dtype=np.float16),
+        "l1_post_ln": np.ones((1, h, 1, 1), dtype=np.float16),
+        "l1_qkvgate": np.full((2 * q_tot + 2 * kv_tot, h, 1, 1), 0.02, dtype=np.float16),
+        "l1_qn": np.ones((1, 1, 1, tiny_cfg.head_dim), dtype=np.float16),
+        "l1_kn": np.ones((1, 1, 1, tiny_cfg.head_dim), dtype=np.float16),
+        "l1_o_proj": np.full((h, q_tot, 1, 1), 0.02, dtype=np.float16),
+        "l1_mlp_gu": np.full((2 * inter, h, 1, 1), 0.02, dtype=np.float16),
+        "l1_mlp_dn": np.full((h, inter, 1, 1), 0.02, dtype=np.float16),
+        "final_norm": np.ones((1, h, 1, 1), dtype=np.float16),
+    }
+    np.savez(paths.weights_npz, **synth_w)
+    (paths.ane_models_dir / "pplx_s64_st0_stale.aimodel").mkdir()
+
+    manifest = bam.build_ane_bundle_suite(
+        home=tmp_path,
+        backend="coreai",
+        seq_lens=(32,),
+        layers_per_stage=2,
+        coreai_preset="w4_per_block",
+        block_size=32,
+        calib_batches=1,
+        guard_ir=True,
+    )
+    assert manifest["backend"] == "coreai"
+    assert manifest["coreai_preset"] == "w4_per_block"
+    assert (paths.ane_models_dir / "manifest.json").is_file()
+    stages = manifest["buckets"]["32"]["stages"]
+    assert len(stages) == 1 and stages[0].endswith(".aimodel")
+    assert (paths.ane_models_dir / stages[0]).exists()
+    assert manifest["buckets"]["32"]["coreai_stages"][0]["stage"] == stages[0]
+    assert not (paths.ane_models_dir / "pplx_s64_st0_stale.aimodel").exists()
+

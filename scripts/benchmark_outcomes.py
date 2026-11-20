@@ -111,7 +111,39 @@ PACKAGE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("fast-gemma4", 4, "FAST_GEMMA4_HOME", "Gemma-4 chat/IF/reasoning & structured JSON (Cat 3+4)"),
     OutcomePackageSpec("fast-gpt-oss", 4, "FAST_GPT_OSS_HOME", "GPT-OSS-20B chat/reasoning & structured JSON (Cat 3+4)"),
 )
-_SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {s.name: s for s in PACKAGE_SPECS}
+PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
+    OutcomePackageSpec("public-bge-small", 1, "FAST_BGE_SMALL_HOME", "Stock mlx-embeddings BGE-small 8-bit (Cat 1)"),
+    OutcomePackageSpec("public-embeddinggemma-2", 1, "FAST_EMBEDDINGGEMMA2_HOME", "Stock mlx-vlm EmbeddingGemma-2 8-bit (Cat 1)"),
+    OutcomePackageSpec("coreai-embeddinggemma-2", 1, "FAST_EMBEDDINGGEMMA2_HOME", "Apple CoreAI EmbeddingGemma-2 BF16 (Cat 1)"),
+    OutcomePackageSpec("public-pplx", 1, "FAST_PPLX_HOME", "Stock pplx-context-mlx zainmerchan FP16 (Cat 1)"),
+    OutcomePackageSpec("public-laya", 2, "FAST_DECISION_MODELS_HOME", "Stock mlx-embeddings Laya ModernBERT 8-bit (Cat 2)"),
+    OutcomePackageSpec("coreai-laya", 2, "FAST_DECISION_MODELS_HOME", "Apple CoreAI Laya Typed Decisions (Cat 2)"),
+    OutcomePackageSpec("public-kev-0.8b", 2, "FAST_DECISION_MODELS_HOME", "Stock mlx-lm Kev-0.8B 8-bit (Cat 2)"),
+    OutcomePackageSpec("public-gemma4", 4, "FAST_GEMMA4_HOME", "Stock mlx-vlm Gemma-4 E2B 4-bit (Cat 3+4)"),
+    OutcomePackageSpec("public-gpt-oss", 4, "FAST_GPT_OSS_HOME", "Stock mlx-lm GPT-OSS-20B MXFP4 (Cat 3+4)"),
+    OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
+)
+PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
+    "fast-bge-small": ("public-bge-small",),
+    "fast-embeddinggemma-2": ("public-embeddinggemma-2", "coreai-embeddinggemma-2"),
+    "fast-pplx": ("public-pplx",),
+    "fast-decision-models": ("public-laya", "coreai-laya", "public-kev-0.8b"),
+    "fast-gemma4": ("public-gemma4",),
+    "fast-gpt-oss": ("public-gpt-oss",),
+}
+_SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS)}
+_CANONICAL_HOME_PKG: dict[str, str] = {
+    "public-bge-small": "fast-bge-small",
+    "public-embeddinggemma-2": "fast-embeddinggemma-2",
+    "coreai-embeddinggemma-2": "fast-embeddinggemma-2",
+    "public-pplx": "fast-pplx",
+    "public-laya": "fast-decision-models",
+    "coreai-laya": "fast-decision-models",
+    "public-kev-0.8b": "fast-decision-models",
+    "public-gemma4": "fast-gemma4",
+    "public-gpt-oss": "fast-gpt-oss",
+    "coreai-qwen3.5-4b": "fast-gemma4",
+}
 
 
 def _has_staged_artifacts(home_dir: Path) -> bool:
@@ -139,8 +171,9 @@ def resolve_package_home(spec: OutcomePackageSpec, base_env: Mapping[str, str] |
     explicit = env.get(spec.home_env_var)
     if explicit:
         return Path(explicit).expanduser().resolve()
-    mono_home = _REPO_ROOT / "packages" / spec.name
-    sibling_home = _REPO_ROOT.parent / spec.name
+    base_pkg = _CANONICAL_HOME_PKG.get(spec.name, spec.name)
+    mono_home = _REPO_ROOT / "packages" / base_pkg
+    sibling_home = _REPO_ROOT.parent / base_pkg
     if not _has_strong_artifacts(mono_home) and _has_strong_artifacts(sibling_home):
         return sibling_home
     if not _has_staged_artifacts(mono_home) and _has_staged_artifacts(sibling_home):
@@ -220,6 +253,56 @@ def _memory_4bucket_dict(probe: FourBucketMemoryProbe) -> dict[str, float]:
     }
 
 
+def _merge_daemon_telemetry(
+    mem4: dict[str, Any],
+    diag: dict[str, Any],
+    telemetry: Mapping[str, Any] | None,
+    *,
+    fallback_peak_gb: float | None = None,
+) -> None:
+    """Merge subprocess daemon 4-bucket `RUSAGE_INFO_V6`, asset summary, and cold/warm latency."""
+    pk_val: float | None = None
+    if telemetry and telemetry.get("peak_gb") is not None:
+        pk_val = float(telemetry["peak_gb"])
+    elif fallback_peak_gb is not None:
+        pk_val = float(fallback_peak_gb)
+    if pk_val is not None and pk_val > 0:
+        mem4["peak_footprint_gb"] = round(max(float(mem4.get("peak_footprint_gb", 0.0)), pk_val), 4)
+        mem4["combined_with_model_mapped_gb"] = round(
+            max(float(mem4.get("combined_with_model_mapped_gb", 0.0)), pk_val), 4
+        )
+    if not telemetry:
+        return
+
+    mib_to_gb = (1024.0 * 1024.0) / 1e9
+    four = telemetry.get("four_bucket_metrics")
+    if isinstance(four, Mapping) and four:
+        comb_gb = float(four.get("combined_with_model_mapped_gb", 0.0) or 0.0)
+        if comb_gb > 0:
+            mem4["combined_with_model_mapped_gb"] = round(
+                max(float(mem4.get("combined_with_model_mapped_gb", 0.0)), comb_gb), 4
+            )
+        neural_gb = max(0.0, float(four.get("neural_nofootprint_mb", 0.0) or 0.0)) * mib_to_gb
+        mapped_gb = max(0.0, float(four.get("mapped_model_mb", 0.0) or 0.0)) * mib_to_gb
+        if neural_gb > 0:
+            mem4["neural_nofootprint_gb"] = round(max(float(mem4.get("neural_nofootprint_gb", 0.0)), neural_gb), 4)
+        if mapped_gb > 0:
+            mem4["model_mapped_gb"] = round(max(float(mem4.get("model_mapped_gb", 0.0)), mapped_gb), 4)
+        if "ane_daemon_footprint_delta_mb" in four:
+            mem4["ane_daemon_footprint_delta_mb"] = round(
+                float(four.get("ane_daemon_footprint_delta_mb", 0.0) or 0.0), 2
+            )
+        diag["daemon_four_bucket_metrics"] = dict(four)
+
+    lat = telemetry.get("cold_warm_latency")
+    if isinstance(lat, Mapping) and lat:
+        diag["cold_warm_latency"] = dict(lat)
+    if isinstance(telemetry.get("asset_summary"), Mapping):
+        diag["asset_summary"] = dict(telemetry["asset_summary"])
+    if "profiler_available" in telemetry:
+        diag["profiler_available"] = bool(telemetry["profiler_available"])
+
+
 def _host_mem_gb(env_meta: Mapping[str, Any]) -> float:
     val = env_meta.get("mem_gb")
     return float(val) if val else 0.0
@@ -278,6 +361,11 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--ane-profile", default=None)
     p.add_argument("--ane-variant", default="fp16")
     p.add_argument("--no-kv-i8", action="store_true")
+    p.add_argument("--model-dir", default=None)
+    p.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
+    p.add_argument("--mlp-dtype", choices=("bfloat16", "quantized"), default="bfloat16")
+    p.add_argument("--mtp-drafter", action="store_true")
+    p.add_argument("--mtp-drafter-path", default=None)
     p.add_argument("--backend", choices=("all", "laya-ane", "kev-0.8b"), default="all")
     p.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="w8")
     p.add_argument("--batch-docs", type=int, default=8)
@@ -285,6 +373,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--categories", default="all")
     p.add_argument("--no-llguidance", action="store_true")
     p.add_argument("--reasoning-effort", default=None)
+    p.add_argument("--coreai-variant", choices=("4bit", "fp4_fp8", "both"), default="both")
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -307,6 +396,8 @@ def _run_cat1_worker(
     smoke: bool,
     home: Path,
     host_mem_gb: float,
+    coreai_python: str | None = None,
+    pplx_mlx_path: str | None = None,
 ) -> list[dict[str, Any]]:
     probe = FourBucketMemoryProbe(model_directories=[home / "artifacts"])
     guard = DeviceMemoryGuard()
@@ -478,6 +569,27 @@ def _run_cat1_worker(
                 else:
                     out_mats.append(np.vstack(parts))
             return out_mats
+    elif pkg_name in ("public-bge-small", "public-embeddinggemma-2", "coreai-embeddinggemma-2", "public-pplx"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import build_public_cat1_adapter
+
+        pub_ad = build_public_cat1_adapter(
+            pkg_name,
+            tier=tier,
+            coreai_python=coreai_python,
+            pplx_mlx_path=pplx_mlx_path,
+        )
+        eng = pub_ad
+        eff_mode = pub_ad.harness_label
+        mrl_dims = pub_ad.mrl_dims
+        int8_mode = pub_ad.int8_mode
+        nb_pre_normalized = pub_ad.nb_pre_normalized
+        _enc_q_nb = pub_ad.enc_q_nb
+        _enc_d_nb = pub_ad.enc_d_nb
+        _enc_q = pub_ad.enc_q
+        _enc_d = pub_ad.enc_d
+        _enc_coarse_2k = pub_ad.enc_coarse_2k
+        _enc_ctx = pub_ad.enc_ctx
     else:
         raise ValueError(f"Unsupported Cat 1 package: {pkg_name}")
 
@@ -595,8 +707,8 @@ def _run_cat1_worker(
                 all_valid.extend(r_iso["per_query_valid"])
                 all_scores.extend(r_iso["per_query_span_ndcg"])
 
-        # 1C: Tier-2 LongEmbed (fast-pplx 4K-32K)
-        if tier == "tier2" and pkg_name == "fast-pplx" and not smoke:
+        # 1C: Tier-2 LongEmbed (fast-pplx / public-pplx 4K-32K)
+        if tier == "tier2" and pkg_name in ("fast-pplx", "public-pplx") and not smoke:
             le_cfg = lock["datasets"]["longembed"]["tier2"]
             for le_sub in le_cfg["subsets"]:
                 ctx_lens = le_cfg.get("passkey_context_lengths") if le_sub == "passkey" else None
@@ -634,6 +746,8 @@ def _run_cat1_worker(
             guard_tripped = True
 
         mem4 = _memory_4bucket_dict(probe)
+        daemon_pk = eng.close() if pkg_name.startswith(("public-", "coreai-")) else None
+        daemon_telem = eng.telemetry() if hasattr(eng, "telemetry") else None
         diag: dict[str, Any] = {
             "mode": eff_mode,
             "nanobeir_macro_ndcg10": round(float(np.mean(nb_ndcgs)) if nb_ndcgs else 0.0, 6),
@@ -643,6 +757,7 @@ def _run_cat1_worker(
             "device_guard_tripped": guard_tripped,
             "repeat_loop_count": 0,
         }
+        _merge_daemon_telemetry(mem4, diag, daemon_telem, fallback_peak_gb=daemon_pk)
         bench_name = f"NanoBEIR-en({len(subsets)})+LegalBench-RAG({','.join(lb_pack['subsets'])})"
         return [
             _build_record(
@@ -660,7 +775,8 @@ def _run_cat1_worker(
             )
         ]
     finally:
-        eng.close()
+        if not pkg_name.startswith(("public-", "coreai-")):
+            eng.close()
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +787,7 @@ def _run_cat1_worker(
 def _run_cat2_single_backend(
     backend_name: str,
     *,
+    pkg_name: str = "fast-decision-models",
     tier: str,
     config_label: str,
     extra: argparse.Namespace,
@@ -681,6 +798,7 @@ def _run_cat2_single_backend(
     smoke: bool,
     home: Path,
     host_mem_gb: float,
+    coreai_python: str | None = None,
 ) -> dict[str, Any]:
     from fast_decision_models.kev_mlx import Kev08bMlxBackend
     from fast_decision_models.laya_ane import LayaAneBackend
@@ -710,11 +828,30 @@ def _run_cat2_single_backend(
     cl_s2_qdefs = {dom: build_clinc_stage2_qdef(dom) for dom in CLINC150_DOMAINS}
     rb_qdef = build_rewardbench2_score_qdef()
 
-    is_laya = backend_name == "laya-ane"
-    if is_laya:
+    is_laya = backend_name in ("laya-ane", "public-laya", "coreai-laya")
+    if backend_name == "laya-ane":
         laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
         eng: Any = LayaAneBackend(laya_dir, ensure_laya_dylib(), pipe_depth=4)
         eff_label = config_label or "laya_ane"
+    elif backend_name == "public-laya":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import PublicLayaMlxBackend
+
+        eng = PublicLayaMlxBackend()
+        eff_label = config_label or "mlx_embeddings_modernbert_8bit"
+    elif backend_name == "coreai-laya":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import CoreAiLayaBackend
+
+        eng = CoreAiLayaBackend(coreai_python=coreai_python)
+        eff_label = config_label or "coreai_laya_decision"
+    elif backend_name == "public-kev-0.8b":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import PublicKev08bMlxBackend
+
+        kev_dir = resolve_kev_dir(None, artifacts_dir=art_dir)
+        eng = PublicKev08bMlxBackend(kev_dir, batch_docs=int(extra.batch_docs))
+        eff_label = config_label or "mlx_lm_kev_08b_8bit"
     else:
         kev_dir = resolve_kev_dir(None, artifacts_dir=art_dir)
         eng = Kev08bMlxBackend(kev_dir, quant_mode=extra.kev_quant, batch_docs=int(extra.batch_docs))
@@ -918,6 +1055,13 @@ def _run_cat2_single_backend(
         # Headline Cat 2 macro composite stored in diagnostics; EOT uses exact sum(v_i * s_i) / wall_sec.
         headline_s = float(np.mean([r_rt["auroc"], r_cl["end_to_end_151_acc"], r_rb["macro_best_of_4_acc"]]))
         mem4 = _memory_4bucket_dict(probe)
+        daemon_pk: float | None = None
+        daemon_telem: dict[str, Any] | None = None
+        if hasattr(eng, "telemetry") or hasattr(eng, "peak_gb"):
+            pk_ret = eng.close()
+            daemon_pk = float(pk_ret) if isinstance(pk_ret, (int, float)) else float(getattr(eng, "peak_gb", 0.0))
+            if hasattr(eng, "telemetry"):
+                daemon_telem = eng.telemetry()
         diag = {
             "backend": backend_name,
             "composite_macro_score": round(headline_s, 6),
@@ -932,8 +1076,9 @@ def _run_cat2_single_backend(
             "device_guard_tripped": guard_tripped,
             "repeat_loop_count": 0,
         }
+        _merge_daemon_telemetry(mem4, diag, daemon_telem, fallback_peak_gb=daemon_pk)
         return _build_record(
-            package="fast-decision-models",
+            package=pkg_name,
             category=2,
             config_label=eff_label,
             benchmark="RAGTruth+CLINC150+RewardBench2",
@@ -946,7 +1091,8 @@ def _run_cat2_single_backend(
             host_mem_gb=host_mem_gb,
         )
     finally:
-        eng.close()
+        if not (hasattr(eng, "telemetry") or hasattr(eng, "peak_gb")):
+            eng.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1153,8 @@ def _run_llm_worker(
     host_mem_gb: float,
     openai_url: str | None = None,
     openai_model: str | None = None,
+    coreai_python: str | None = None,
+    coreai_variant_override: str | None = None,
 ) -> list[dict[str, Any]]:
     want_cats = {3, 4} if extra.categories == "all" else {int(x.strip()) for x in extra.categories.split(",") if x.strip()}
     probe = FourBucketMemoryProbe(model_directories=[home / "artifacts"] if home.exists() else None)
@@ -1014,26 +1162,34 @@ def _run_llm_worker(
     guard_tripped = False
 
     eng: Any = None
+    pub_llm: Any = None
     ltok: Any = None
     eff_label = config_label
     batch_sz = int(extra.batch_size)
+    use_mtp = bool(extra.mtp_drafter or extra.mtp_drafter_path)
 
     if pkg_name == "fast-gemma4":
         from fast_gemma4.engine import FastGemma4Engine
 
         eff_mode = extra.mode or "gpu"
+        mtp_ref = extra.mtp_drafter_path or (True if extra.mtp_drafter else None)
         eng = FastGemma4Engine(
             home=home,
+            model_dir=extra.model_dir,
             default_mode=eff_mode,
             ane_variant=extra.ane_variant,
             ane_ring_variant=extra.ane_variant,
+            lm_head_mode=extra.lm_head_mode,
+            mlp_dtype=extra.mlp_dtype,
             kv_i8=not bool(extra.no_kv_i8),
+            mtp_drafter=mtp_ref,
             local_files_only=True,
             warmup=True,
             warmup_ane=(eff_mode == "hetero"),
         )
         ltok = eng.tokenizer.llguidance_tokenizer()
-        eff_label = config_label or f"{eff_mode}_{extra.ane_variant}_{'kvi8' if not extra.no_kv_i8 else 'kvbf16'}"
+        mtp_tag = "_mtp" if use_mtp else ""
+        eff_label = config_label or f"{eff_mode}_{extra.ane_variant}_{'kvi8' if not extra.no_kv_i8 else 'kvbf16'}{mtp_tag}"
     elif pkg_name == "fast-gpt-oss":
         from fast_gpt_oss.engine import FastGptOssEngine
 
@@ -1047,6 +1203,19 @@ def _run_llm_worker(
         )
         ltok = eng.tokenizer.llguidance_tokenizer()
         eff_label = config_label or f"gpt_oss_{eff_mode}"
+    elif pkg_name in ("public-gemma4", "public-gpt-oss", "coreai-qwen3.5-4b"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import build_public_llm_adapter
+
+        ca_var = coreai_variant_override or ("4bit" if extra.coreai_variant == "both" else extra.coreai_variant)
+        pub_llm = build_public_llm_adapter(
+            pkg_name,
+            batch_size=batch_sz,
+            host_mem_gb=host_mem_gb,
+            coreai_python=coreai_python,
+            coreai_variant=ca_var,
+        )
+        eff_label = config_label or pub_llm.default_label
     elif pkg_name == "openai-chat":
         if not openai_url:
             raise ValueError("openai-chat package requires --openai-url")
@@ -1064,6 +1233,14 @@ def _run_llm_worker(
     ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
         if not prompts:
             return [], [], [], {"completion_tokens": 0, "mask_fallbacks": 0}
+        if pub_llm is not None:
+            return pub_llm.generate_fn(
+                prompts,
+                system_prompt=system_prompt,
+                per_doc_schemas=per_doc_schemas,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            )
         if pkg_name == "openai-chat":
             texts: list[str] = []
             reasons: list[str] = []
@@ -1127,7 +1304,7 @@ def _run_llm_worker(
             kwargs["reasoning_effort"] = reasoning_effort
         elif pkg_name == "fast-gemma4":
             kwargs["enable_thinking"] = False
-            kwargs["speculative"] = False
+            kwargs["speculative"] = True if use_mtp else False
 
         res = eng.generate_batch(prompts, **kwargs)
         _mx_sync()
@@ -1263,6 +1440,8 @@ def _run_llm_worker(
                 "finish_length_count": tot_fin_len,
                 "device_guard_tripped": guard_tripped,
             }
+            if pub_llm is not None:
+                _merge_daemon_telemetry(mem3, diag3, pub_llm.telemetry())
             records.append(
                 _build_record(
                     package=pkg_name,
@@ -1291,9 +1470,12 @@ def _run_llm_worker(
             # Auxiliary JSONSchemaBench llguidance compiler diagnostic (< 5s CPU)
             jsb_diag = evaluate_jsonschemabench_compiler(jsb_items, llguidance_tokenizer=ltok)
 
-            llg_modes = [not bool(extra.no_llguidance)]
-            if include_unconstrained and True in llg_modes and False not in llg_modes:
-                llg_modes.append(False)
+            if pub_llm is not None:
+                llg_modes = [False]
+            else:
+                llg_modes = [not bool(extra.no_llguidance)]
+                if include_unconstrained and True in llg_modes and False not in llg_modes:
+                    llg_modes.append(False)
 
             for use_llg in llg_modes:
                 t0 = time.perf_counter()
@@ -1365,6 +1547,8 @@ def _run_llm_worker(
                     "finish_length_count": tot_len_4,
                     "device_guard_tripped": guard_tripped,
                 }
+                if pub_llm is not None:
+                    _merge_daemon_telemetry(mem4, diag4, pub_llm.telemetry())
                 records.append(
                     _build_record(
                         package=pkg_name,
@@ -1381,6 +1565,14 @@ def _run_llm_worker(
                     )
                 )
     finally:
+        if pub_llm is not None:
+            daemon_pk = pub_llm.close()
+            final_telem = pub_llm.telemetry()
+            for rec in records:
+                m4 = rec.get("memory_4bucket_gb")
+                dg = rec.get("diagnostics")
+                if isinstance(m4, dict) and isinstance(dg, dict):
+                    _merge_daemon_telemetry(m4, dg, final_telem, fallback_peak_gb=daemon_pk)
         if eng is not None and hasattr(eng, "close"):
             eng.close()
     return records
@@ -1404,28 +1596,58 @@ def _run_worker_main(args: argparse.Namespace) -> int:
     use_wl = not bool(args.no_wired_limit)
     ctx = wired_limit() if use_wl else _null_ctx()
     with ctx:
-        if pkg_name in ("fast-bge-small", "fast-embeddinggemma-2", "fast-pplx"):
-            recs = _run_cat1_worker(
-                pkg_name,
-                tier=args.tier,
-                config_label=args.worker_label or "",
-                extra=extra,
-                lock=lock,
-                cache_dir=cache_dir,
-                local_files_only=bool(args.local_files_only),
-                max_items=args.max_items,
-                smoke=bool(args.smoke),
-                home=home,
-                host_mem_gb=host_mem,
-            )
-        elif pkg_name == "fast-decision-models":
-            backends = ["laya-ane", "kev-0.8b"] if extra.backend == "all" else [extra.backend]
+        if pkg_name in (
+            "fast-bge-small",
+            "fast-embeddinggemma-2",
+            "fast-pplx",
+            "public-bge-small",
+            "public-embeddinggemma-2",
+            "coreai-embeddinggemma-2",
+            "public-pplx",
+        ):
+            try:
+                recs = _run_cat1_worker(
+                    pkg_name,
+                    tier=args.tier,
+                    config_label=args.worker_label or "",
+                    extra=extra,
+                    lock=lock,
+                    cache_dir=cache_dir,
+                    local_files_only=bool(args.local_files_only),
+                    max_items=args.max_items,
+                    smoke=bool(args.smoke),
+                    home=home,
+                    host_mem_gb=host_mem,
+                    coreai_python=args.coreai_python,
+                    pplx_mlx_path=args.pplx_mlx_path,
+                )
+            except FileNotFoundError as exc:
+                if pkg_name.startswith(("public-", "coreai-")):
+                    recs = [
+                        {
+                            "package": pkg_name,
+                            "category": 1,
+                            "config_label": args.worker_label or pkg_name,
+                            "benchmark": "NanoBEIR+Banking77+LongEmbed",
+                            "status": "skipped",
+                            "error": str(exc),
+                            "gate_verdict": "SKIP",
+                        }
+                    ]
+                else:
+                    raise
+        elif pkg_name in ("fast-decision-models", "public-laya", "coreai-laya", "public-kev-0.8b"):
+            if pkg_name == "fast-decision-models":
+                backends = ["laya-ane", "kev-0.8b"] if extra.backend == "all" else [extra.backend]
+            else:
+                backends = [pkg_name]
             recs = []
             for bname in backends:
                 try:
                     recs.append(
                         _run_cat2_single_backend(
                             bname,
+                            pkg_name=pkg_name,
                             tier=args.tier,
                             config_label=args.worker_label or "",
                             extra=extra,
@@ -1436,6 +1658,7 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                             smoke=bool(args.smoke),
                             home=home,
                             host_mem_gb=host_mem,
+                            coreai_python=args.coreai_python,
                         )
                     )
                 except FileNotFoundError as exc:
@@ -1450,23 +1673,74 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                             "gate_verdict": "SKIP",
                         }
                     )
+        elif pkg_name == "coreai-qwen3.5-4b" and extra.coreai_variant == "both":
+            recs = []
+            for ca_var in ("4bit", "fp4_fp8"):
+                try:
+                    recs.extend(
+                        _run_llm_worker(
+                            pkg_name,
+                            tier=args.tier,
+                            config_label=(f"{args.worker_label}_{ca_var}" if args.worker_label else f"coreai_qwen35_4b_{ca_var}"),
+                            extra=extra,
+                            lock=lock,
+                            cache_dir=cache_dir,
+                            local_files_only=bool(args.local_files_only),
+                            max_items=args.max_items,
+                            smoke=bool(args.smoke),
+                            include_unconstrained=False,
+                            home=home,
+                            host_mem_gb=host_mem,
+                            coreai_python=args.coreai_python,
+                            coreai_variant_override=ca_var,
+                        )
+                    )
+                except FileNotFoundError as exc:
+                    recs.append(
+                        {
+                            "package": pkg_name,
+                            "category": 3,
+                            "config_label": f"coreai_qwen35_4b_{ca_var}",
+                            "benchmark": "IFBench+MMLU-Redux+MATH-500",
+                            "status": "skipped",
+                            "error": str(exc),
+                            "gate_verdict": "SKIP",
+                        }
+                    )
         else:
-            recs = _run_llm_worker(
-                pkg_name,
-                tier=args.tier,
-                config_label=args.worker_label or "",
-                extra=extra,
-                lock=lock,
-                cache_dir=cache_dir,
-                local_files_only=bool(args.local_files_only),
-                max_items=args.max_items,
-                smoke=bool(args.smoke),
-                include_unconstrained=bool(args.include_unconstrained_baseline),
-                home=home,
-                host_mem_gb=host_mem,
-                openai_url=args.openai_url,
-                openai_model=args.openai_model,
-            )
+            try:
+                recs = _run_llm_worker(
+                    pkg_name,
+                    tier=args.tier,
+                    config_label=args.worker_label or "",
+                    extra=extra,
+                    lock=lock,
+                    cache_dir=cache_dir,
+                    local_files_only=bool(args.local_files_only),
+                    max_items=args.max_items,
+                    smoke=bool(args.smoke),
+                    include_unconstrained=bool(args.include_unconstrained_baseline),
+                    home=home,
+                    host_mem_gb=host_mem,
+                    openai_url=args.openai_url,
+                    openai_model=args.openai_model,
+                    coreai_python=args.coreai_python,
+                )
+            except FileNotFoundError as exc:
+                if pkg_name.startswith(("public-", "coreai-")):
+                    recs = [
+                        {
+                            "package": pkg_name,
+                            "category": _SPEC_BY_NAME[pkg_name].category if pkg_name in _SPEC_BY_NAME else 3,
+                            "config_label": args.worker_label or pkg_name,
+                            "benchmark": "IFBench+MMLU-Redux+MATH-500",
+                            "status": "skipped",
+                            "error": str(exc),
+                            "gate_verdict": "SKIP",
+                        }
+                    ]
+                else:
+                    raise
 
     print(_WORKER_MARKER + json.dumps({"records": recs}, ensure_ascii=False), flush=True)
     return 0
@@ -1521,23 +1795,51 @@ def _spawn_isolated_worker(
         cmd.extend(["--openai-url", str(args.openai_url)])
     if args.openai_model:
         cmd.extend(["--openai-model", str(args.openai_model)])
+    if getattr(args, "coreai_python", None):
+        cmd.extend(["--coreai-python", str(args.coreai_python)])
+    if getattr(args, "pplx_mlx_path", None):
+        cmd.extend(["--pplx-mlx-path", str(args.pplx_mlx_path)])
 
     env = dict(os.environ)
     env["M4_GPU_LOCK_HELD"] = "1"
+    py_paths = [
+        str(_REPO_ROOT / "scripts"),
+        str(_REPO_ROOT / "packages" / "fast-shared" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-decision-models" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-gemma4" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-bge-small" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-embeddinggemma-2" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-pplx" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-gpt-oss" / "src"),
+    ]
+    if getattr(args, "pplx_mlx_path", None):
+        py_paths.append(str(Path(args.pplx_mlx_path).expanduser()))
+    if env.get("PYTHONPATH"):
+        py_paths.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(py_paths)
     if pkg_name in _SPEC_BY_NAME:
         spec = _SPEC_BY_NAME[pkg_name]
         env.setdefault(spec.home_env_var, str(resolve_package_home(spec)))
 
+    import signal
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(_REPO_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=int(args.timeout_sec),
-        )
+        out_s, err_s = proc.communicate(timeout=int(args.timeout_sec))
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        proc.communicate()
         return [
             {
                 "package": pkg_name,
@@ -1549,14 +1851,14 @@ def _spawn_isolated_worker(
             }
         ]
 
-    for line in reversed(proc.stdout.splitlines()):
+    for line in reversed(out_s.splitlines()):
         if line.startswith(_WORKER_MARKER):
             payload = json.loads(line[len(_WORKER_MARKER) :])
             return list(payload.get("records", []))
 
-    err_tail = (proc.stderr or proc.stdout or f"exit={proc.returncode}").strip().splitlines()
+    err_tail = (err_s or out_s or f"exit={proc.returncode}").strip().splitlines()
     reason = err_tail[-1] if err_tail else f"exit={proc.returncode}"
-    low = (proc.stderr + "\n" + proc.stdout).lower()
+    low = (err_s + "\n" + out_s).lower()
     is_skip = any(tok in low for tok in ("filenotfounderror", "not found", "missing", "not staged"))
     return [
         {
@@ -1729,23 +2031,103 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     return 1 if any_fail else 0
 
 
+def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Pair completed `fast-*` outcome records against their matching stock `public-*` / `coreai-*` baselines."""
+    ok_rows = [r for r in results if r.get("status") == "ok"]
+    out: list[dict[str, Any]] = []
+    pair_map: tuple[tuple[str, str | None, str], ...] = (
+        ("fast-bge-small", None, "public-bge-small"),
+        ("fast-embeddinggemma-2", None, "public-embeddinggemma-2"),
+        ("fast-embeddinggemma-2", None, "coreai-embeddinggemma-2"),
+        ("fast-pplx", None, "public-pplx"),
+        ("fast-decision-models", "laya-ane", "public-laya"),
+        ("fast-decision-models", "laya-ane", "coreai-laya"),
+        ("fast-decision-models", "kev-0.8b", "public-kev-0.8b"),
+        ("fast-gemma4", None, "public-gemma4"),
+        ("fast-gpt-oss", None, "public-gpt-oss"),
+    )
+    for fast_pkg, backend_filter, pub_pkg in pair_map:
+        fast_cands = [
+            r
+            for r in ok_rows
+            if r.get("package") == fast_pkg
+            and (backend_filter is None or (r.get("diagnostics") or {}).get("backend") == backend_filter)
+        ]
+        pub_cands = [r for r in ok_rows if r.get("package") == pub_pkg]
+        for fr in fast_cands:
+            for pr in pub_cands:
+                if fr.get("category") != pr.get("category"):
+                    continue
+                if fr.get("category") == 4:
+                    # Pair both constrained (llg_on) and unconstrained (llg_off) against stock unconstrained.
+                    pass
+                f_eot = float(fr.get("effective_outcome_per_sec", 0.0))
+                p_eot = float(pr.get("effective_outcome_per_sec", 0.0))
+                f_sc = float(fr.get("objective_score_e2e", 0.0))
+                p_sc = float(pr.get("objective_score_e2e", 0.0))
+                fe = fr.get("per_item_effective_scores")
+                pe = pr.get("per_item_effective_scores")
+                se_val = None
+                if isinstance(fe, list) and isinstance(pe, list) and len(fe) == len(pe) and len(fe) > 0:
+                    se_val = round(float(compute_paired_se(pe, fe)["se_paired"]), 6)
+                out.append(
+                    {
+                        "fast_package": fast_pkg,
+                        "fast_config": fr.get("config_label"),
+                        "stock_package": pub_pkg,
+                        "stock_config": pr.get("config_label"),
+                        "category": fr.get("category"),
+                        "benchmark": fr.get("benchmark"),
+                        "fast_score_e2e": round(f_sc, 4),
+                        "stock_score_e2e": round(p_sc, 4),
+                        "delta_score_e2e": round(f_sc - p_sc, 4),
+                        "se_paired": se_val,
+                        "fast_eot": round(f_eot, 3),
+                        "stock_eot": round(p_eot, 3),
+                        "eot_speedup_vs_stock": round(f_eot / max(p_eot, 1e-6), 3),
+                    }
+                )
+    return out
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     lock, lock_sha = load_lockfile(args.lockfile)
     env_meta = collect_env_telemetry()
     host_mem = _host_mem_gb(env_meta)
     quiescence = check_system_quiescence()
 
-    raw_pkgs = args.packages.strip()
-    if raw_pkgs == "all":
-        pkg_names = [s.name for s in PACKAGE_SPECS]
-    else:
-        pkg_names = [p.strip() for p in raw_pkgs.split(",") if p.strip()]
-        for pn in pkg_names:
-            if pn not in _SPEC_BY_NAME and pn != "openai-chat":
-                raise ValueError(f"Unknown package {pn!r}; choose from all, {', '.join(_SPEC_BY_NAME)}, openai-chat")
+    raw_tokens = [p.strip() for p in args.packages.split(",") if p.strip()]
+    pkg_names: list[str] = []
+    saw_group_token = False
+    for tok_p in raw_tokens:
+        if tok_p == "all":
+            saw_group_token = True
+            for s in PACKAGE_SPECS:
+                if s.name not in pkg_names:
+                    pkg_names.append(s.name)
+        elif tok_p == "public":
+            saw_group_token = True
+            for s in PUBLIC_BASELINE_SPECS:
+                if s.name not in pkg_names:
+                    pkg_names.append(s.name)
+        elif tok_p in _SPEC_BY_NAME or tok_p == "openai-chat":
+            if tok_p not in pkg_names:
+                pkg_names.append(tok_p)
+        else:
+            raise ValueError(f"Unknown package {tok_p!r}; choose from all, public, {', '.join(_SPEC_BY_NAME)}, openai-chat")
 
-    if args.skip_gpt_oss or (0 < host_mem <= 24.5 and "fast-gpt-oss" in pkg_names and raw_pkgs == "all"):
-        pkg_names = [p for p in pkg_names if p != "fast-gpt-oss"]
+    if getattr(args, "include_public_baselines", False):
+        expanded: list[str] = []
+        for pn in pkg_names:
+            if pn not in expanded:
+                expanded.append(pn)
+            for pub_p in PUBLIC_FOR_FAST_PACKAGE.get(pn, ()):
+                if pub_p not in expanded:
+                    expanded.append(pub_p)
+        pkg_names = expanded
+
+    if args.skip_gpt_oss or (0 < host_mem <= 24.5 and saw_group_token):
+        pkg_names = [p for p in pkg_names if p not in ("fast-gpt-oss", "public-gpt-oss")]
 
     abba_arms = [parse_abba_arm(x) for x in (args.abba_compare or [])]
     if args.dry_run:
@@ -1833,10 +2215,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 results.extend(agg_b)
             else:
                 lbl, fl = abba_arms[0] if abba_arms else ("", args.extra_args or "")
+                pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or args.python
+                worker_py = pub_py if pkg.startswith(("public-", "coreai-")) else args.python
                 recs = _spawn_isolated_worker(
-                    python_exe=args.python, pkg_name=pkg, label=lbl, extra_flags=fl, args=args
+                    python_exe=worker_py, pkg_name=pkg, label=lbl, extra_flags=fl, args=args
                 )
                 results.extend(recs)
+
+    public_comparisons = compute_public_comparisons(results)
 
     # Strip verbose per-item score vectors only when requested; keep compact by default for `compare`.
     if args.omit_item_scores:
@@ -1859,6 +2245,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "dataset_lock_sha256": lock_sha,
         "results": results,
         "comparisons": comparisons,
+        "public_comparisons": public_comparisons,
     }
     md = format_outcomes_markdown(results)
 
@@ -1900,6 +2287,14 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--gate-profile", choices=("lossless", "quantized"), default="lossless")
     rn.add_argument("--min-eot-ratio", type=float, default=1.0)
     rn.add_argument("--include-unconstrained-baseline", action="store_true")
+    rn.add_argument(
+        "--include-public-baselines",
+        action="store_true",
+        help="Also run paired stock CoreAI/MLX baselines on identical datasets & evaluators",
+    )
+    rn.add_argument("--public-python", default=None, help="Python executable for stock MLX baseline workers")
+    rn.add_argument("--coreai-python", default=None, help="Python executable for Apple CoreAI (macOS 27.2+) workers")
+    rn.add_argument("--pplx-mlx-path", default=None, help="Optional repo path for public pplx-context-mlx")
     rn.add_argument("--extra-args", default="", help="Forwarded worker flags (e.g. '--mode hetero2')")
     rn.add_argument("--max-items", type=int, default=None, help="Optional per-sub-benchmark item cap")
     rn.add_argument("--smoke", action="store_true", help="Fast end-to-end smoke slice across selected packages")
@@ -1942,6 +2337,8 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--no-wired-limit", action="store_true")
     wk.add_argument("--openai-url", default=None)
     wk.add_argument("--openai-model", default=None)
+    wk.add_argument("--coreai-python", default=None)
+    wk.add_argument("--pplx-mlx-path", default=None)
     wk.set_defaults(func=_run_worker_main)
     return p
 

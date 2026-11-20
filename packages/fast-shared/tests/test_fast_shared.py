@@ -2113,3 +2113,216 @@ def test_no_clt_xcrun_gate_and_quiescence_self_pid_exclusion_cpu(monkeypatch: An
     monkeypatch.setattr(fs_bench.subprocess, "check_output", lambda *a, **kw: fake_ps)
     warnings = fs_bench.check_system_quiescence()
     assert len(warnings) == 1 and "PID=999999" in warnings[0], f"Unexpected quiescence warnings: {warnings}"
+
+
+def test_core_ai_preflight_decoupled_and_cache_key_cpu(monkeypatch: Any) -> None:
+    from fast_shared import hw_check as fs_hw
+
+    base_26 = {
+        "system": "Darwin",
+        "machine": "arm64",
+        "hw_model": "Mac16,8",
+        "brand": "Apple M4 Pro",
+        "mem_gb": 48,
+        "cpu_cores": 14,
+        "gpu_cores": 20,
+        "ane_cores": 16,
+        "gpu_family": "Apple9",
+        "supports_apple9": True,
+        "supports_apple10": False,
+        "supports_metal4": True,
+        "macos_version": "26.6",
+        "mlx_version": "0.32.4",
+        "mlx_enable_tf32": True,
+        "mlx_enable_tf32_env": None,
+        "mlx_metal_no_nax": False,
+    }
+    base_27 = {**base_26, "hw_model": "Mac17,2", "brand": "Apple M5", "mem_gb": 24, "cpu_cores": 10, "gpu_cores": 10, "gpu_family": "Apple10", "supports_apple10": True, "macos_version": "27.2.1"}
+
+    # 1. Offline exporter on macOS 26.6 (`coreai-torch 0.4.3`, `coreai-opt 0.4.0`): export ready, runtime ineligible
+    ca_26 = fs_hw.probe_core_ai_support(
+        base_26,
+        use_os_coreai=True,
+        pkg_versions={"coreai-torch": "0.4.3", "coreai-opt": "0.4.0", "coreai-core": "1.0.0b3", "coreai": "0.4.3"},
+        delegate_probe=lambda: True,
+        coreai_build_path="",
+        framework_exists=False,
+    )
+    assert ca_26["os_runtime_eligible"] is False
+    assert ca_26["fp4_fp8_preset_eligible"] is False
+    assert ca_26["coreai_torch_ge_041"] is True
+    assert ca_26["export_ready"] is True
+    assert ca_26["runtime_ready"] is False
+    assert ca_26["delegate_supported"] is False
+
+    # 2. Broken 0.4.0 export floor on macOS 27.2.1 -> export_ready False even though OS >= 27.2
+    ca_040 = fs_hw.probe_core_ai_support(
+        base_27,
+        use_os_coreai=True,
+        pkg_versions={"coreai-torch": "0.4.0", "coreai-opt": "0.3.0", "coreai-core": None, "coreai": None},
+        coreai_build_path="",
+        framework_exists=True,
+    )
+    assert ca_040["os_runtime_eligible"] is True
+    assert ca_040["fp4_fp8_preset_eligible"] is True
+    assert ca_040["coreai_torch_ge_041"] is False
+    assert ca_040["export_ready"] is False
+    assert ca_040["delegate_supported"] is None  # Missing != False
+    assert ca_040["runtime_ready"] is False
+
+    # 3. USE_OS_COREAI gate & live delegate gate on macOS 27.2.1
+    ca_no_flag = fs_hw.probe_core_ai_support(
+        base_27,
+        use_os_coreai=False,
+        pkg_versions={"coreai-torch": "0.4.3", "coreai-opt": "0.4.0", "coreai-core": "1.0.0b3", "coreai": "0.4.3"},
+        delegate_probe=lambda: True,
+    )
+    assert ca_no_flag["export_ready"] is True and ca_no_flag["runtime_ready"] is False
+
+    ca_full = fs_hw.probe_core_ai_support(
+        base_27,
+        use_os_coreai=True,
+        pkg_versions={"coreai-torch": "0.4.3", "coreai-opt": "0.4.0", "coreai-core": "1.0.0b3", "coreai": "0.4.3"},
+        delegate_probe=lambda: True,
+        coreai_build_path="/usr/bin/coreai-build",
+        framework_exists=True,
+    )
+    assert ca_full["export_ready"] is True and ca_full["runtime_ready"] is True
+    assert ca_full["coreai_build_available"] is True
+
+    # 4. preflight_silicon_env strict gates for TF32=0 & Core AI export/runtime
+    hw_full = {**base_27, "core_ai": ca_full}
+    pf_tf32_bad = fs_hw.preflight_silicon_env(hw=hw_full, check_tf32=True, require_tf32_off=True, strict=False)
+    assert pf_tf32_bad["ok"] is False
+    assert any("MLX_ENABLE_TF32=0" in e for e in pf_tf32_bad["errors"])
+
+    hw_ok = {**hw_full, "mlx_enable_tf32": False, "mlx_enable_tf32_env": "0"}
+    pf_ok = fs_hw.preflight_silicon_env(
+        hw=hw_ok,
+        require_tf32_off=True,
+        require_coreai_export=True,
+        require_coreai_runtime=True,
+        strict=True,
+    )
+    assert pf_ok["ok"] is True
+    assert pf_ok["coreai_export_ready"] is True
+    assert pf_ok["coreai_runtime_ready"] is True
+
+    hw_040 = {**base_27, "mlx_enable_tf32": False, "core_ai": ca_040}
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        fs_hw.preflight_silicon_env(hw=hw_040, require_coreai_export=True, strict=True)
+
+    # 5. Cache key sensitivity across model_hash, toolchain, min_os, arch, and spec_options
+    k0 = fs_hw.coreai_specialization_cache_key_parts(
+        model_hash="abc123",
+        coreai_toolchain_ver="0.4.3",
+        min_os="27.2",
+        arch="arm64e",
+        spec_options={"compute_units": "ALL"},
+    )
+    k_os = fs_hw.coreai_specialization_cache_key_parts(
+        model_hash="abc123",
+        coreai_toolchain_ver="0.4.3",
+        min_os="27.3",
+        arch="arm64e",
+        spec_options={"compute_units": "ALL"},
+    )
+    k_opt = fs_hw.coreai_specialization_cache_key_parts(
+        model_hash="abc123",
+        coreai_toolchain_ver="0.4.3",
+        min_os="27.2",
+        arch="arm64e",
+        spec_options={"compute_units": "CPU_ONLY"},
+    )
+    assert len({k0["cache_key_sha256"], k_os["cache_key_sha256"], k_opt["cache_key_sha256"]}) == 3
+
+
+def test_summarize_accelerator_placement_and_coreml_plan_cpu() -> None:
+    import fast_shared.hw_check as fs_hw
+
+    class MLNeuralEngineComputeDevice:
+        pass
+
+    class MLGPUComputeDevice:
+        pass
+
+    class MLCPUComputeDevice:
+        pass
+
+    class _FakeOut:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _FakeOp:
+        def __init__(self, op_type: str, out_name: str, blocks: list | None = None) -> None:
+            self.operator_name = op_type
+            self.outputs = [_FakeOut(out_name)]
+            self.blocks = blocks or []
+
+    class _FakeBlock:
+        def __init__(self, ops: list[_FakeOp]) -> None:
+            self.operations = ops
+
+    class _FakeFn:
+        def __init__(self, block: _FakeBlock) -> None:
+            self.block = block
+
+    class _FakeStruct:
+        def __init__(self, program: dict[str, _FakeFn]) -> None:
+            self.program = program
+
+    class _FakeUsage:
+        def __init__(self, pref: object, sup: list[object]) -> None:
+            self.preferred_compute_device = pref
+            self.supported_compute_devices = sup
+
+    class _FakeCost:
+        def __init__(self, weight: float) -> None:
+            self.weight = weight
+
+    op1 = _FakeOp("conv", "c1")
+    op2 = _FakeOp("softmax", "s1")
+    op3 = _FakeOp("cast", "k1")
+    nested = _FakeOp("while_loop", "w1", blocks=[_FakeBlock([op3])])
+    usages = {
+        id(op1): (_FakeUsage(MLNeuralEngineComputeDevice(), [MLNeuralEngineComputeDevice(), MLCPUComputeDevice()]), 0.7),
+        id(op2): (_FakeUsage(MLNeuralEngineComputeDevice(), [MLNeuralEngineComputeDevice()]), 0.2),
+        id(nested): (_FakeUsage(MLGPUComputeDevice(), [MLGPUComputeDevice(), MLCPUComputeDevice()]), 0.05),
+        id(op3): (_FakeUsage(MLCPUComputeDevice(), [MLCPUComputeDevice()]), 0.05),
+    }
+
+    class _FakePlan:
+        model_structure = _FakeStruct({"main": _FakeFn(_FakeBlock([op1, op2, nested]))})
+
+        def get_compute_device_usage_for_mlprogram_operation(self, op: object) -> object:
+            return usages[id(op)][0]
+
+        def get_estimated_cost_for_mlprogram_operation(self, op: object) -> object:
+            return _FakeCost(usages[id(op)][1])
+
+    extracted = fs_hw.extract_coreml_compute_plan_ops(_FakePlan())
+    assert [r["op_type"] for r in extracted] == ["conv", "softmax", "while_loop", "cast"]
+    assert [r["preferred_device"] for r in extracted] == ["ane", "ane", "gpu", "cpu"]
+
+    summary = fs_hw.summarize_accelerator_placement(extracted, target_device="ane", model_name="demo.mlmodelc")
+    assert summary["total_ops"] == 4
+    assert summary["target_ops"] == 2
+    assert summary["target_share_pct"] == 50.0
+    assert summary["target_cost_share_pct"] == 90.0
+    assert summary["all_on_target"] is False
+    assert summary["fallback_op_count"] == 2
+    assert summary["decline_reason_counts"] == {"placed_on_gpu": 1, "placed_on_cpu": 1}
+
+    coreai_records = [
+        {"op_name": "lin_0", "op_type": "linear", "preferred_device": "neuralEngine"},
+        {
+            "op_name": "top_0",
+            "op_type": "topk",
+            "preferred_device": "cpu",
+            "declined_placements": {"ane": "unsupported dynamic k"},
+        },
+    ]
+    coreai_summary = fs_hw.summarize_accelerator_placement(coreai_records, target_device="ane", include_ops=True)
+    assert coreai_summary["all_on_target"] is False
+    assert coreai_summary["decline_reason_counts"] == {"unsupported dynamic k": 1}
+    assert len(coreai_summary["operations"]) == 2

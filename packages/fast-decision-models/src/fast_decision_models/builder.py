@@ -167,11 +167,14 @@ def _compile_laya_seq_bundle(
     w: dict[str, np.ndarray],
     enc_cfg: dict[str, Any],
     out_dir: Path,
+    *,
+    guard_ir: bool = True,
 ) -> Path:
     """Convert `Laya-Typed-421M` ModernBERT + 2 head layers to `W8A16` Pure-ANE `.mlmodelc`."""
     import coremltools as ct
     from coremltools.converters.mil import Builder as mb
     import coremltools.optimize.coreml as cto
+    from fast_shared.ir_dtype_guard import check_coreml_model, validate_export_quant_dtypes
 
     H = int(enc_cfg["hidden_size"])
     n_layers = int(enc_cfg["num_hidden_layers"])
@@ -425,11 +428,24 @@ def _compile_laya_seq_bundle(
         pass_pipeline=pp,
         skip_model_load=True,
     )
+    disallowed = validate_export_quant_dtypes(["int8"], export_backend="coreml")
+    if disallowed:
+        raise ValueError(f"Disallowed export quantization dtypes for coreml: {disallowed}")
     ml = cto.linear_quantize_weights(
         ml,
         config=_build_laya_quant_config(cto),
     )
     tag = f"laya_typed_s{seq_len}_w8"
+    if guard_ir:
+        rep = check_coreml_model(
+            ml,
+            model_name=tag,
+            flag_add_fp16_cast=True,
+            warn_matmul_ane=True,
+        )
+        if not rep.ok:
+            errs = "; ".join(f.message for f in rep.errors[:5])
+            raise RuntimeError(f"ir_dtype_guard failed on {tag}: {errs}")
     pkg = out_dir / f"_{tag}.mlpackage"
     if pkg.exists():
         shutil.rmtree(pkg)
@@ -449,9 +465,18 @@ def build_laya_ane_artifacts(
     artifacts_dir: Path | None = None,
     laya_dir: str | None = None,
     copy_compiled_from: str | None = None,
+    backend: str = "coreml",
+    coreai_preset: str | None = None,
+    block_size: int = 32,
+    calib_batches: int = 2,
+    guard_ir: bool = True,
+    inspect_placement: bool = False,
 ) -> Path:
-    """Build & stage `Laya-Typed-421M` Pure-ANE (`W8A16`) `S=256` & `S=512` CoreML bundles."""
+    """Build & stage `Laya-Typed-421M` Pure-ANE (`W8A16` `.mlmodelc`) or Core AI (`.aimodel`) bundles."""
     import mlx.core as mx
+
+    if backend not in ("coreml", "coreai"):
+        raise ValueError(f"Unsupported backend={backend!r}; choose 'coreml' or 'coreai'")
 
     src_dir = _resolve_dir_or_hf(laya_dir, DEFAULT_LAYA_REPO)
     out_root = artifacts_dir if artifacts_dir is not None else resolve_artifacts_dir(home=repo_root)
@@ -474,6 +499,47 @@ def build_laya_ane_artifacts(
         type_f16=np.ascontiguousarray(type_f16),
     )
 
+    if backend == "coreai":
+        from fast_shared.hw_check import probe_core_ai_support
+        from .coreai_export import run_laya_coreai_export
+
+        probe = probe_core_ai_support()
+        if not probe.get("coreai_export_ready", False):
+            raise RuntimeError(
+                f"Core AI (.aimodel) offline export requires coreai-torch >= 0.4.1 (status: {probe})"
+            )
+        eff_preset = (coreai_preset or "w4_per_block").strip().lower()
+        enc_cfg = json.loads((src_dir / "encoder" / "config.json").read_text(encoding="utf-8"))
+        w_np = {k: np.asarray(v.astype(mx.float32)) for k, v in raw_mx.items()}
+        stages_meta: list[dict[str, Any]] = []
+        for s_len in (256, 512):
+            res = run_laya_coreai_export(
+                out_dir=out_dir,
+                weights=w_np,
+                enc_cfg=enc_cfg,
+                seq_len=s_len,
+                export_backend="coreai",
+                preset=eff_preset,
+                block_size=block_size,
+                calib_batches=calib_batches,
+                stem=f"laya_typed_s{s_len}_{eff_preset}",
+                inspect_placement=inspect_placement,
+            )
+            stages_meta.append(
+                {
+                    "seq_len": s_len,
+                    "asset": res.asset_path.name,
+                    "cache_key_sha256": res.cache_key_sha256,
+                    "sensitivity": res.sensitivity_report,
+                    "asset_summary": res.asset_summary,
+                }
+            )
+        (out_dir / "coreai_manifest.json").write_text(
+            json.dumps({"backend": "coreai", "preset": eff_preset, "probe": probe, "stages": stages_meta}, indent=2),
+            encoding="utf-8",
+        )
+        return out_dir
+
     dylib_p = ensure_laya_dylib(repo_root)
     if copy_compiled_from is not None:
         pre_dir = Path(copy_compiled_from).expanduser().resolve()
@@ -491,7 +557,7 @@ def build_laya_ane_artifacts(
         w_np = {k: np.asarray(v.astype(mx.float32)) for k, v in raw_mx.items()}
         with acquire_hw_lock("build_laya_ane_models"):
             for s_len in (256, 512):
-                _compile_laya_seq_bundle(s_len, w_np, enc_cfg, out_dir)
+                _compile_laya_seq_bundle(s_len, w_np, enc_cfg, out_dir, guard_ir=guard_ir)
 
     with acquire_hw_lock("verify_laya_ane_plan"):
         lib = ctypes.CDLL(str(dylib_p))
@@ -503,6 +569,11 @@ def build_laya_ane_artifacts(
             print(f"[LAYA-ANE] {mc.name}: MLComputePlan ANE/GPU/CPU = {list(counts)}")
             if int(counts[1]) != 0 or int(counts[2]) != 0 or int(counts[0]) < 1000:
                 raise RuntimeError(f"Unexpected non-pure-ANE compute plan on {mc}: {list(counts)}")
+            if inspect_placement:
+                from fast_shared.coreai_pipeline import inspect_coreml_bundle_placement
+
+                pl = inspect_coreml_bundle_placement(mc, target_device="ane", model_name=mc.stem)
+                print(f"[LAYA-ANE] {mc.name}: coreai_pipeline placement = {pl.get('placement')}")
     return out_dir
 
 
@@ -776,6 +847,12 @@ def run_build_args(args: argparse.Namespace) -> int:
             artifacts_dir=out_artifacts,
             laya_dir=args.laya_dir,
             copy_compiled_from=args.copy_compiled_laya_from,
+            backend=args.backend,
+            coreai_preset=args.coreai_preset,
+            block_size=args.block_size,
+            calib_batches=args.calib_batches,
+            guard_ir=args.guard_ir,
+            inspect_placement=args.inspect_placement,
         )
     if args.build_kev_mlx or run_all:
         build_kev_mlx_artifacts(
@@ -796,6 +873,12 @@ def add_setup_weights_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--build-laya-ane", action="store_true", help="Build & stage Laya-Typed-421M CoreML ANE W8A16 bundles")
     parser.add_argument("--laya-dir", default=None, help="Local Laya-Typed checkpoint dir (defaults to HF download)")
     parser.add_argument("--copy-compiled-laya-from", default=None, help="Dir containing precompiled laya_typed_s{256,512}_w8.mlmodelc")
+    parser.add_argument("--backend", choices=("coreml", "coreai"), default="coreml", help="Laya export backend (CoreML .mlmodelc or Core AI .aimodel)")
+    parser.add_argument("--coreai-preset", default=None, help="CoreAI-Opt preset (fp16, w8, w4, w4_per_block, fp4_fp8)")
+    parser.add_argument("--block-size", type=int, default=32, help="CoreAI-Opt block quantization size")
+    parser.add_argument("--calib-batches", type=int, default=2, help="Calibration batch count for CoreAI-Opt")
+    parser.add_argument("--guard-ir", action=argparse.BooleanOptionalAction, default=True, help="Run fast_shared.ir_dtype_guard checks")
+    parser.add_argument("--inspect-placement", action="store_true", help="Inspect MLComputePlan / Core AI asset statistics")
     parser.add_argument("--build-kev-mlx", action="store_true", help="Merge & stage Kev-0.8B r15 BF16 + W8 safetensors")
     parser.add_argument("--quantize-existing-kev-w8", action="store_true", help="Quantize staged Kev-0.8B model.safetensors -> model_w8.safetensors")
     parser.add_argument("--kev-adapter-dir", default=None, help="Local Kev-0.8B adapter dir")

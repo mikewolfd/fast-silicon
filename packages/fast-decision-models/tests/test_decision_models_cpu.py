@@ -652,3 +652,145 @@ def test_kev_vectorized_masks_cache_limits_and_zero_clone_gdn_gpu() -> None:
     mx.eval(y_zero_clone, dummy_st, y_cloned)
     assert dummy_st.shape == (1,)
     assert float(mx.max(mx.abs(y_zero_clone.astype(mx.float32) - y_cloned.astype(mx.float32)))) == 0.0
+
+
+def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -> None:
+    import argparse
+
+    pytest.importorskip("coreai_opt")
+    pytest.importorskip("coreai_torch")
+    pytest.importorskip("coremltools")
+
+    from fast_decision_models.builder import (
+        _compile_laya_seq_bundle,
+        add_setup_weights_arguments,
+    )
+    from fast_decision_models.coreai_export import (
+        build_coreai_opt_laya_config,
+        run_laya_coreai_export,
+        run_laya_coreai_sensitivity_sweep,
+    )
+
+    # 1. Torch-only dtype rejection & Pattern 7 divisibility check
+    with pytest.raises(ValueError, match="ExportBackend.Torch"):
+        build_coreai_opt_laya_config(preset="w8", export_backend="coreml", requested_dtypes=["mxint8"])
+    with pytest.raises(ValueError, match="ExportBackend.Torch"):
+        build_coreai_opt_laya_config(preset="w4", export_backend="coreai", requested_dtypes=["int6"])
+
+    _, qmeta = build_coreai_opt_laya_config(
+        preset="w4_per_block",
+        block_size=32,
+        export_backend="coreai",
+        weight_shapes={"tiny_proj": (64, 24, 1, 1), "ok_proj": (64, 64, 1, 1)},
+    )
+    assert "tiny_proj" in qmeta["excluded_modules"]
+    assert qmeta["skipped_non_divisible"]["tiny_proj"] == [24, 32]
+
+    # 2. Tiny ModernBERT + typed scoring head synthetic weights matching builder.py keys
+    h, inter, heads, n_layers, seq_len = 64, 128, 4, 4, 32
+    enc_cfg = {
+        "hidden_size": h,
+        "intermediate_size": inter,
+        "num_hidden_layers": n_layers,
+        "num_attention_heads": heads,
+        "local_attention": 16,
+        "norm_eps": 1e-5,
+        "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        "rope_parameters": {
+            "full_attention": {"rope_theta": 160000.0},
+            "sliding_attention": {"rope_theta": 10000.0},
+        },
+    }
+    rng = np.random.default_rng(13)
+    w_np: dict[str, np.ndarray] = {
+        "encoder.embeddings.norm.weight": np.ones((h,), dtype=np.float32),
+        "encoder.final_norm.weight": np.ones((h,), dtype=np.float32),
+        "scorer.0.weight": np.ones((h,), dtype=np.float32),
+        "scorer.0.bias": np.zeros((h,), dtype=np.float32),
+        "scorer.1.weight": (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32),
+        "scorer.1.bias": np.zeros((h,), dtype=np.float32),
+        "scorer.3.weight": (rng.normal(0.0, 0.02, size=(1, h))).astype(np.float32),
+        "scorer.3.bias": np.zeros((1,), dtype=np.float32),
+    }
+    for i in range(n_layers):
+        px = f"encoder.layers.{i}."
+        if i > 0:
+            w_np[px + "attn_norm.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[px + "mlp_norm.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[px + "attn.Wqkv.weight"] = (rng.normal(0.0, 0.02, size=(3 * h, h))).astype(np.float32)
+        w_np[px + "attn.Wo.weight"] = (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32)
+        w_np[px + "mlp.Wi.weight"] = (rng.normal(0.0, 0.02, size=(2 * inter, h))).astype(np.float32)
+        w_np[px + "mlp.Wo.weight"] = (rng.normal(0.0, 0.02, size=(h, inter))).astype(np.float32)
+    for hi in range(2):
+        hp = f"head.layers.{hi}."
+        w_np[hp + "norm1.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[hp + "norm1.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "norm2.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[hp + "norm2.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "self_attn.in_proj_weight"] = (rng.normal(0.0, 0.02, size=(3 * h, h))).astype(np.float32)
+        w_np[hp + "self_attn.in_proj_bias"] = np.zeros((3 * h,), dtype=np.float32)
+        w_np[hp + "self_attn.out_proj.weight"] = (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32)
+        w_np[hp + "self_attn.out_proj.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "linear1.weight"] = (rng.normal(0.0, 0.02, size=(inter, h))).astype(np.float32)
+        w_np[hp + "linear1.bias"] = np.zeros((inter,), dtype=np.float32)
+        w_np[hp + "linear2.weight"] = (rng.normal(0.0, 0.02, size=(h, inter))).astype(np.float32)
+        w_np[hp + "linear2.bias"] = np.zeros((h,), dtype=np.float32)
+
+    # 3. Core AI (.aimodel) + CoreML (.mlpackage) export & sensitivity sweep
+    res_ai = run_laya_coreai_export(
+        out_dir=tmp_path / "ai",
+        weights=w_np,
+        enc_cfg=enc_cfg,
+        seq_len=seq_len,
+        export_backend="coreai",
+        preset="w4_per_block",
+        calib_batches=1,
+        stem="tiny_laya_ai",
+    )
+    assert res_ai.asset_path.exists()
+    assert res_ai.asset_summary is not None and res_ai.asset_summary["asset_valid"] is True
+    assert res_ai.sensitivity_report is not None
+    assert "scorer_l2" in res_ai.sensitivity_report["excluded_modules"]
+    assert res_ai.sensitivity_report["cosine_vs_teacher"] > 0.99
+
+    res_ml = run_laya_coreai_export(
+        out_dir=tmp_path / "ml",
+        weights=w_np,
+        enc_cfg=enc_cfg,
+        seq_len=seq_len,
+        export_backend="coreml",
+        preset="w4_per_block",
+        calib_batches=1,
+        stem="tiny_laya_ml",
+    )
+    assert res_ml.asset_path.exists()
+    assert res_ml.guard_report is not None and res_ml.guard_report["ok"] is True
+
+    sweep = run_laya_coreai_sensitivity_sweep(
+        out_dir=tmp_path / "sweep",
+        weights=w_np,
+        enc_cfg=enc_cfg,
+        seq_len=seq_len,
+        export_backend="coreai",
+        presets=("fp16", "w8", "w4_per_block"),
+        calib_batches=1,
+        stem_prefix="tiny_laya_sweep",
+    )
+    assert [r["preset"] for r in sweep] == ["fp16", "w8", "w4_per_block"]
+    assert sweep[0]["analytical_bpw"] == 16.0
+    assert sweep[2]["analytical_bpw"] < sweep[1]["analytical_bpw"] < sweep[0]["analytical_bpw"]
+
+    # 4. Existing CoreML MIL _compile_laya_seq_bundle passes ir_dtype_guard with flag_add_fp16_cast=True
+    mc = _compile_laya_seq_bundle(seq_len, w_np, enc_cfg, tmp_path / "mil", guard_ir=True)
+    assert mc.is_dir()
+
+    # 5. CLI parser exposes Core AI + guard flags cleanly
+    parser = argparse.ArgumentParser()
+    add_setup_weights_arguments(parser)
+    ns = parser.parse_args(
+        ["--build-laya-ane", "--backend", "coreai", "--coreai-preset", "w4_per_block", "--guard-ir", "--inspect-placement"]
+    )
+    assert ns.backend == "coreai"
+    assert ns.coreai_preset == "w4_per_block"
+    assert ns.guard_ir is True
+    assert ns.inspect_placement is True

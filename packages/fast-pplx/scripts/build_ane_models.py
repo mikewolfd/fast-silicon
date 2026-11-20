@@ -39,7 +39,15 @@ from typing import Any, Sequence
 import numpy as np
 
 from fast_pplx.config import DEFAULT_PPLX_CONFIG, PplxConfig
+from fast_pplx.coreai_export import (
+    DEFAULT_BLOCK_SIZE,
+    VALID_COREAI_PRESETS,
+    run_pplx_coreai_export,
+)
 from fast_pplx.paths import resolve_paths
+from fast_shared.coreai_pipeline import inspect_coreml_bundle_placement
+from fast_shared.hw_check import probe_core_ai_support
+from fast_shared.ir_dtype_guard import check_coreml_model, validate_export_quant_dtypes
 
 HIDDEN = 1024
 MLP_INTER = 3584
@@ -246,7 +254,7 @@ def _prune_stale_ane_bundles(
     """Remove stale `pplx_s*_st*.mlmodelc` and `.mlpackage` dirs not referenced by the active manifest."""
     active_stems = {Path(name).stem for name in active_stage_names}
     removed: list[str] = []
-    for pat in ("pplx_s*_st*.mlmodelc", "pplx_s*_st*.mlpackage"):
+    for pat in ("pplx_s*_st*.mlmodelc", "pplx_s*_st*.mlpackage", "pplx_s*_st*.aimodel"):
         for cand in sorted(out_dir.glob(pat)):
             if cand.name in active_stage_names:
                 continue
@@ -370,27 +378,68 @@ def check_coreai_backend_status(
     *,
     macos_version: str | None = None,
     use_os_coreai: bool | None = None,
+    pkg_versions: dict[str, str | None] | None = None,
+    delegate_probe: Any = None,
 ) -> dict[str, Any]:
-    """Report readiness for optional macOS 27.0+ Core AI (`.aimodel` / Qwen3.5 dynamic linear-attn)."""
-    ver_str = platform.mac_ver()[0] if macos_version is None else str(macos_version)
-    parts = [int(p) for p in ver_str.split(".") if p.isdigit()]
-    major = parts[0] if parts else 0
-    flag = (os.environ.get("USE_OS_COREAI", "0") == "1") if use_os_coreai is None else bool(use_os_coreai)
-    has_coreai_torch = importlib.util.find_spec("coreai_torch") is not None
-    eligible = bool(flag and major >= 27 and has_coreai_torch)
-    reason = "ready"
-    if not flag:
-        reason = "USE_OS_COREAI=1 not enabled"
-    elif major < 27:
-        reason = f"requires macOS 27.0+ (detected {ver_str or 'unknown'})"
-    elif not has_coreai_torch:
-        reason = "coreai-torch package not installed"
+    """Report decoupled offline Core AI export readiness (`export_ready`) vs OS 27.0+ runtime (`runtime_ready`)."""
+    hw_override = (
+        {"system": "Darwin", "machine": "arm64", "macos_version": str(macos_version)}
+        if macos_version is not None
+        else None
+    )
+    probe = probe_core_ai_support(
+        hw=hw_override,
+        use_os_coreai=use_os_coreai,
+        pkg_versions=pkg_versions,
+        delegate_probe=delegate_probe,
+    )
+    ver_str = (
+        str(macos_version)
+        if macos_version is not None
+        else (platform.mac_ver()[0] or ("27.0" if probe["os_runtime_eligible"] else ""))
+    )
+    flag = bool(probe["use_os_coreai"])
+    has_coreai_torch = probe["coreai_torch_version"] is not None
+    export_ready = bool(probe["export_ready"])
+    runtime_ready = bool(probe["runtime_ready"])
+
+    if not probe["os_runtime_eligible"]:
+        runtime_reason = f"requires macOS 27.0+ (detected {ver_str or 'unknown'})"
+    elif not flag:
+        runtime_reason = "USE_OS_COREAI=1 not enabled"
+    elif probe["coreai_runtime_version"] is None:
+        runtime_reason = "coreai runtime package not installed"
+    elif probe["delegate_supported"] is False:
+        runtime_reason = "Core AI runtime delegate specialization unsupported"
+    else:
+        runtime_reason = "ready"
+
+    export_reason = (
+        "ready"
+        if export_ready
+        else (
+            "coreai-torch package not installed"
+            if not has_coreai_torch
+            else f"requires coreai-torch >= 0.4.1 (detected {probe['coreai_torch_version']})"
+        )
+    )
     return {
-        "eligible": eligible,
+        "eligible": runtime_ready,
+        "runtime_ready": runtime_ready,
+        "export_ready": export_ready,
         "macos_version": ver_str,
         "use_os_coreai": flag,
         "has_coreai_torch": has_coreai_torch,
-        "reason": reason,
+        "coreai_torch_version": probe["coreai_torch_version"],
+        "coreai_opt_version": probe["coreai_opt_version"],
+        "coreai_core_version": probe["coreai_core_version"],
+        "coreai_runtime_version": probe["coreai_runtime_version"],
+        "coreai_torch_ge_041": probe["coreai_torch_ge_041"],
+        "os_runtime_eligible": probe["os_runtime_eligible"],
+        "fp4_fp8_preset_eligible": probe["fp4_fp8_preset_eligible"],
+        "delegate_supported": probe["delegate_supported"],
+        "export_reason": export_reason,
+        "reason": runtime_reason,
     }
 
 
@@ -1087,6 +1136,15 @@ def _parse_seq_lens(raw: Sequence[str | int]) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _resolve_coreai_preset(precision: str, coreai_preset: str | None) -> str:
+    if coreai_preset is not None:
+        p = coreai_preset.strip().lower()
+        if p not in VALID_COREAI_PRESETS:
+            raise ValueError(f"Unsupported coreai_preset={coreai_preset!r}; choose from {VALID_COREAI_PRESETS}")
+        return p
+    return {"fp16": "fp16", "w8a16": "w8", "w8a8": "w8"}.get(precision, "w4_per_block")
+
+
 def build_ane_bundle_suite(
     *,
     home: str | Path | None = None,
@@ -1105,23 +1163,33 @@ def build_ane_bundle_suite(
     ane_profile: str | None = None,
     silu_mode: str | None = None,
     rmsnorm_mode: str | None = None,
+    coreai_preset: str | None = None,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    calib_batches: int = 2,
+    guard_ir: bool = False,
+    inspect_placement: bool = False,
 ) -> dict[str, Any]:
     eff_profile, eff_silu_mode, eff_rmsnorm_mode = resolve_ane_profile(
         ane_profile=ane_profile,
         silu_mode=silu_mode,
         rmsnorm_mode=rmsnorm_mode,
     )
-    if backend == "coreai":
-        status = check_coreai_backend_status()
-        raise RuntimeError(
-            "Core AI (.aimodel) backend export is gated on macOS 27.0+ with USE_OS_COREAI=1 and coreai-torch "
-            f"(status: {status['reason']}). Use --backend coreml on macOS 15/26."
-        )
-    if backend != "coreml":
+    if backend not in ("coreml", "coreai"):
         raise ValueError(f"Unsupported backend={backend!r}; choose 'coreml' or 'coreai'")
 
-    import coremltools as ct
-    import coremltools.optimize.coreml as cto
+    coreai_status: dict[str, Any] | None = None
+    eff_coreai_preset: str | None = None
+    if backend == "coreai":
+        coreai_status = check_coreai_backend_status()
+        if not coreai_status["export_ready"]:
+            raise RuntimeError(
+                "Core AI (.aimodel) offline export requires coreai-torch >= 0.4.1 "
+                f"(status: {coreai_status['export_reason']})."
+            )
+        eff_coreai_preset = _resolve_coreai_preset(precision, coreai_preset)
+    else:
+        import coremltools as ct
+        import coremltools.optimize.coreml as cto
 
     if variant:
         v_low = variant.strip().lower()
@@ -1129,6 +1197,16 @@ def build_ane_bundle_suite(
             precision = v_low
         elif v_low in ("block", "fwd_subst"):
             inv_mode = v_low
+
+    # Validate quantization dtype export compatibility early before heavy model tracing/conversion.
+    req_dtypes = (
+        ["int8"]
+        if backend == "coreml" and precision != "fp16"
+        else (["int4"] if eff_coreai_preset in ("w4", "w4_per_block") else ["float16"])
+    )
+    disallowed = validate_export_quant_dtypes(req_dtypes, export_backend=backend)
+    if disallowed:
+        raise ValueError(f"Disallowed export quantization dtypes for {backend}: {disallowed}")
 
     paths = resolve_paths(home)
     if not paths.weights_npz.exists():
@@ -1148,22 +1226,26 @@ def build_ane_bundle_suite(
     calib_stats: dict[str, Any] | None = None
     if calib_stats_path is not None:
         calib_stats = json.loads(Path(calib_stats_path).read_text(encoding="utf-8"))
-    if precision == "w8a8":
-        if calib_stats is None:
-            raise ValueError("--calib-stats is required for --precision w8a8")
-        swiglu_mode = "mul_sigmoid_reordered"
-    elif precision in ("w8a16", "fp16"):
-        swiglu_mode = "silu"
+    if backend == "coreml":
+        if precision == "w8a8":
+            if calib_stats is None:
+                raise ValueError("--calib-stats is required for --precision w8a8")
+            swiglu_mode = "mul_sigmoid_reordered"
+        elif precision in ("w8a16", "fp16"):
+            swiglu_mode = "silu"
+        else:
+            raise ValueError(f"Unsupported precision={precision!r}; choose fp16, w8a16, or w8a8")
     else:
-        raise ValueError(f"Unsupported precision={precision!r}; choose fp16, w8a16, or w8a8")
+        swiglu_mode = "silu"
 
     stage_ranges = plan_stage_ranges(cfg.num_hidden_layers, layers_per_stage=layers_per_stage)
     out_dir = paths.ane_models_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    eff_prec_tag = eff_coreai_preset if backend == "coreai" and eff_coreai_preset is not None else precision
     config_hash = compute_ane_config_hash(
         backend=backend,
-        precision=precision,
+        precision=eff_prec_tag,
         inv_mode=inv_mode,
         silu_mode=eff_silu_mode,
         rmsnorm_mode=eff_rmsnorm_mode,
@@ -1195,9 +1277,11 @@ def build_ane_bundle_suite(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "model_name": "perplexity-ai/pplx-embed-v2-context-0.6b",
         "backend": backend,
+        "coreai_preset": eff_coreai_preset,
+        "coreai_status": coreai_status,
         "ane_profile": eff_profile,
         "config_hash": config_hash,
-        "precision": precision,
+        "precision": eff_prec_tag,
         "inv_mode": inv_mode,
         "silu_mode": eff_silu_mode,
         "rmsnorm_mode": eff_rmsnorm_mode,
@@ -1206,8 +1290,8 @@ def build_ane_bundle_suite(
         "preserve_gdn_fp16": bool(preserve_gdn_fp16),
         "fp16_preserved_ops": all_preserved if precision != "fp16" else ["all"],
         "chunk_size": CHUNK_SIZE,
-        "hidden_size": HIDDEN,
-        "rope_half": ROPE_HALF,
+        "hidden_size": cfg.hidden_size,
+        "rope_half": cfg.rope_dim // 2,
         "num_layers": cfg.num_hidden_layers,
         "layers_per_stage": layers_per_stage,
         "num_stages": len(stage_ranges),
@@ -1217,9 +1301,50 @@ def build_ane_bundle_suite(
     for seq_len in seq_lens:
         n_c = seq_len // CHUNK_SIZE
         stage_entries: list[str] = []
+        stage_placements: list[dict[str, Any]] = []
+        stage_coreai_meta: list[dict[str, Any]] = []
         t_bucket = time.perf_counter()
 
         for st_idx, (l0, l1) in enumerate(stage_ranges):
+            stem = make_ane_stage_stem(
+                seq_len,
+                st_idx,
+                eff_prec_tag,
+                ane_profile=eff_profile,
+                silu_mode=eff_silu_mode,
+                rmsnorm_mode=eff_rmsnorm_mode,
+                config_hash=config_hash,
+            )
+            if backend == "coreai":
+                assert eff_coreai_preset is not None
+                res = run_pplx_coreai_export(
+                    out_dir=out_dir,
+                    ane_weights=ane_weights,
+                    cfg=cfg,
+                    layer_start=l0,
+                    layer_end=l1,
+                    apply_final_norm=(st_idx == len(stage_ranges) - 1),
+                    seq_len=seq_len,
+                    chunk_size=CHUNK_SIZE,
+                    export_backend="coreai",
+                    preset=eff_coreai_preset,
+                    block_size=block_size,
+                    preserve_gdn_fp16=preserve_gdn_fp16,
+                    calib_batches=calib_batches,
+                    ftz_alpha=ftz_alpha,
+                    stem=stem,
+                )
+                stage_entries.append(res.asset_path.name)
+                stage_coreai_meta.append(
+                    {
+                        "stage": res.asset_path.name,
+                        "cache_key_sha256": res.cache_key_sha256,
+                        "sensitivity": res.sensitivity_report,
+                        "asset_summary": res.asset_summary,
+                    }
+                )
+                continue
+
             stage_scales: dict[str, float | None] = {}
             if precision == "w8a8" and calib_stats is not None:
                 for li in range(l0, l1):
@@ -1276,15 +1401,16 @@ def build_ane_bundle_suite(
                 q_cfg = build_weight_quant_config(stage_preserved, weight_threshold=512, cto_module=cto)
                 ml_out = cto.linear_quantize_weights(ml, config=q_cfg)
 
-            stem = make_ane_stage_stem(
-                seq_len,
-                st_idx,
-                precision,
-                ane_profile=eff_profile,
-                silu_mode=eff_silu_mode,
-                rmsnorm_mode=eff_rmsnorm_mode,
-                config_hash=config_hash,
-            )
+            if guard_ir:
+                rep = check_coreml_model(
+                    ml_out,
+                    model_name=stem,
+                    warn_matmul_ane=True,
+                )
+                if not rep.ok:
+                    errs = "; ".join(f.message for f in rep.errors[:5])
+                    raise RuntimeError(f"ir_dtype_guard failed on {stem}: {errs}")
+
             pkg_path = out_dir / f"{stem}.mlpackage"
             if pkg_path.exists():
                 shutil.rmtree(pkg_path)
@@ -1294,16 +1420,25 @@ def build_ane_bundle_suite(
             if compiled_path.exists():
                 shutil.rmtree(compiled_path)
             _compile_mlpackage(pkg_path, out_dir)
+            if inspect_placement:
+                stage_placements.append(
+                    inspect_coreml_bundle_placement(compiled_path, target_device="ane", model_name=stem)
+                )
             if not keep_mlpackage:
                 shutil.rmtree(pkg_path)
             stage_entries.append(compiled_path.name)
 
-        manifest["buckets"][str(seq_len)] = {
+        bucket_entry: dict[str, Any] = {
             "seq_len": int(seq_len),
             "config_hash": config_hash,
             "stages": stage_entries,
             "build_s": round(time.perf_counter() - t_bucket, 2),
         }
+        if stage_placements:
+            bucket_entry["placements"] = stage_placements
+        if stage_coreai_meta:
+            bucket_entry["coreai_stages"] = stage_coreai_meta
+        manifest["buckets"][str(seq_len)] = bucket_entry
 
     # Sort buckets numerically for deterministic manifest.json output.
     manifest["buckets"] = dict(sorted(manifest["buckets"].items(), key=lambda kv: int(kv[0])))
@@ -1356,6 +1491,11 @@ def main() -> None:
     parser.add_argument("--outlier-threshold", type=float, default=15.0)
     parser.add_argument("--preserve-gdn-fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-mlpackage", action="store_true")
+    parser.add_argument("--coreai-preset", default=None, choices=list(VALID_COREAI_PRESETS))
+    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    parser.add_argument("--calib-batches", type=int, default=2)
+    parser.add_argument("--guard-ir", action="store_true", help="Run ir_dtype_guard static MIL check before saving")
+    parser.add_argument("--inspect-placement", action="store_true", help="Capture MLComputePlan ANE placement summary")
     args = parser.parse_args()
 
     manifest = build_ane_bundle_suite(
@@ -1375,6 +1515,11 @@ def main() -> None:
         ane_profile=args.ane_profile,
         silu_mode=args.silu_mode,
         rmsnorm_mode=args.rmsnorm_mode,
+        coreai_preset=args.coreai_preset,
+        block_size=args.block_size,
+        calib_batches=args.calib_batches,
+        guard_ir=args.guard_ir,
+        inspect_placement=args.inspect_placement,
     )
     print(json.dumps(manifest, indent=2))
 

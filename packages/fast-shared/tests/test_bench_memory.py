@@ -18,6 +18,7 @@ from fast_shared.bench import (
     DeviceMemorySnapshot,
     FourBucketMemoryProbe,
     check_metal_working_set_headroom,
+    collect_daemon_four_bucket_metrics,
     evict_mapped_files,
     get_unified_memory_footprint,
     measure_device_memory_snapshot,
@@ -25,6 +26,7 @@ from fast_shared.bench import (
     probe_mapped_files,
     probe_task_vm_info,
     read_process_rusage_v6,
+    summarize_cold_warm_latencies,
 )
 
 
@@ -273,3 +275,71 @@ def test_device_memory_guard_trip_past_arm_margin_and_recovery_cpu() -> None:
     live_snap = measure_device_memory_snapshot()
     assert live_snap.footprint_bytes >= 0
     assert live_snap.mapped_bytes >= 0
+
+
+def test_collect_daemon_four_bucket_metrics_and_cold_warm_split_cpu() -> None:
+    import subprocess
+    import sys
+
+    step = [0]
+
+    def _fake_reader(names: frozenset[str]):
+        step[0] += 1
+        base = 20 * 1024 * 1024
+        growth = 0 if step[0] == 1 else 64 * 1024 * 1024
+        return ([{"pid": 4242, "name": "aned", "footprint_bytes": base + growth, "rss_bytes": base + growth}], [])
+
+    probe = FourBucketMemoryProbe(daemon_reader=_fake_reader)
+    self_metrics = collect_daemon_four_bucket_metrics(probe)
+    assert self_metrics["in_process"] is True
+    assert self_metrics["ane_daemon_footprint_delta_mb"] == pytest.approx(64.0, abs=0.01)
+    assert self_metrics["ane_daemon_rss_delta_mb"] == pytest.approx(64.0, abs=0.01)
+    if platform.system() == "Darwin":
+        assert self_metrics["rusage_version"] == 6
+        assert self_metrics["phys_footprint_mb"] > 0.0
+        assert self_metrics["lifetime_max_phys_footprint_mb"] >= self_metrics["phys_footprint_mb"]
+
+    # Remote PID mode must never attribute parent self task_vm_info/mapped_files to the child.
+    remote_metrics = collect_daemon_four_bucket_metrics(probe, pid=-1)
+    assert remote_metrics["in_process"] is False
+    assert remote_metrics["neural_nofootprint_mb"] == 0.0
+    assert remote_metrics["mapped_model_mb"] == 0.0
+    assert remote_metrics["ane_daemon_footprint_delta_mb"] == pytest.approx(64.0, abs=0.01)
+
+    split = summarize_cold_warm_latencies(
+        cold_load_ms=420.0,
+        cold_first_infer_ms=45.0,
+        warm_latencies_ms=[10.0, 12.0, 20.0],
+    )
+    assert split["cold_load_ms"] == 420.0
+    assert split["cold_first_infer_ms"] == 45.0
+    assert split["cold_total_ms"] == 465.0
+    assert split["warm_count"] == 3
+    assert split["warm_median_ms"] == 12.0
+    assert split["cold_to_warm_ratio"] == pytest.approx(3.75, abs=0.001)
+
+    empty_split = summarize_cold_warm_latencies(cold_load_ms=100.0, warm_latencies_ms=[])
+    assert empty_split["warm_count"] == 0
+    assert empty_split["warm_median_ms"] is None
+    assert empty_split["cold_to_warm_ratio"] is None
+
+    # Verify fast_shared.bench / hw_check / ir_dtype_guard import cleanly without mlx or pyarrow.
+    env = dict(os.environ)
+    src_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = f"{src_root}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else src_root
+    code = (
+        "import sys\n"
+        "for m in ('mlx', 'mlx.core', 'pyarrow', 'pyarrow.compute', 'pyarrow.parquet'):\n"
+        "    sys.modules[m] = None\n"
+        "import fast_shared\n"
+        "from fast_shared.bench import collect_daemon_four_bucket_metrics, summarize_cold_warm_latencies\n"
+        "from fast_shared.hw_check import summarize_accelerator_placement\n"
+        "try:\n"
+        "    _ = fast_shared.make_mpp_matmul_kernel\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError('Expected ImportError when mlx missing')\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=False)
+    assert res.returncode == 0, f"stderr={res.stderr}"

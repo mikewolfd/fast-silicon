@@ -1076,6 +1076,125 @@ def _nullcontext() -> Iterator[None]:
     yield None
 
 
+def collect_daemon_four_bucket_metrics(
+    probe: FourBucketMemoryProbe | None = None,
+    *,
+    model_directories: Sequence[str | Path] | None = None,
+    pid: int | None = None,
+    evict_mapped: bool = False,
+) -> dict[str, Any]:
+    """Collect subprocess/daemon 4-bucket unified-memory and ``RUSAGE_INFO_V6`` metrics.
+
+    Intended for isolated Core ML / Core AI worker subprocesses (``pid is None`` or ``os.getpid()``)
+    or parent observers inspecting a running child ``pid`` before shutdown.
+    """
+    target_pid = os.getpid() if pid is None else int(pid)
+    in_process = target_pid == os.getpid()
+    rusage = read_process_rusage_v6(target_pid)
+
+    four_bucket_cur: dict[str, Any] | None = None
+    four_bucket_deltas: dict[str, Any] | None = None
+    if probe is not None:
+        d = probe.delta(evict_mapped=evict_mapped)
+        four_bucket_cur = d["current"]
+        four_bucket_deltas = d["deltas"]
+    elif in_process:
+        four_bucket_cur = probe_four_bucket_memory(
+            model_directories=model_directories,
+            evict_mapped=evict_mapped,
+        )
+
+    mib = 1024.0 * 1024.0
+    rss_bytes = int(rusage["rss_bytes"]) if rusage is not None else 0
+    phys_bytes = int(rusage["phys_footprint_bytes"]) if rusage is not None else 0
+    max_phys_bytes = int(rusage["lifetime_max_phys_footprint_bytes"]) if rusage is not None else 0
+    neural_rusage_bytes = int(rusage["neural_footprint_bytes"]) if rusage is not None else 0
+    max_neural_rusage_bytes = int(rusage["lifetime_max_neural_footprint_bytes"]) if rusage is not None else 0
+
+    vm_info = four_bucket_cur.get("task_vm_info", {}) if (four_bucket_cur and in_process) else {}
+    mapped_info = four_bucket_cur.get("mapped_files", {}) if (four_bucket_cur and in_process) else {}
+    daemon_info = four_bucket_cur.get("ane_daemons", {}) if four_bucket_cur else {}
+
+    if not in_process:
+        neural_nf_bytes = 0
+        mapped_model_bytes = 0
+        mapped_all_bytes = 0
+    else:
+        neural_nf_bytes = max(0, int(vm_info.get("ledger_tag_neural_nofootprint_bytes", 0)))
+        mapped_model_bytes = int(mapped_info.get("model_bytes", 0))
+        mapped_all_bytes = int(mapped_info.get("total_bytes", 0))
+
+    daemon_fp_delta_bytes = int(daemon_info.get("total_footprint_delta_bytes", 0))
+    daemon_rss_delta_bytes = int(daemon_info.get("total_rss_delta_bytes", 0))
+    combined_model_bytes = phys_bytes + neural_nf_bytes + mapped_model_bytes + daemon_fp_delta_bytes
+
+    return {
+        "pid": target_pid,
+        "in_process": in_process,
+        "rusage_version": 6 if rusage is not None else None,
+        "phys_footprint_mb": round(phys_bytes / mib, 2),
+        "lifetime_max_phys_footprint_mb": round(max_phys_bytes / mib, 2),
+        "resident_size_mb": round(rss_bytes / mib, 2),
+        "neural_footprint_mb": round(neural_rusage_bytes / mib, 2),
+        "lifetime_max_neural_footprint_mb": round(max_neural_rusage_bytes / mib, 2),
+        "neural_nofootprint_mb": round(neural_nf_bytes / mib, 2),
+        "mapped_model_mb": round(mapped_model_bytes / mib, 2),
+        "mapped_all_mb": round(mapped_all_bytes / mib, 2),
+        "ane_daemon_footprint_delta_mb": round(daemon_fp_delta_bytes / mib, 2),
+        "ane_daemon_rss_delta_mb": round(daemon_rss_delta_bytes / mib, 2),
+        "ane_daemon_permission_limited": bool(daemon_info.get("permission_limited", False)),
+        "combined_with_model_mapped_mb": round(combined_model_bytes / mib, 2),
+        "combined_with_model_mapped_gb": round(combined_model_bytes / 1e9, 4),
+        "four_bucket_deltas": four_bucket_deltas,
+        "ane_daemons": daemon_info if daemon_info else None,
+    }
+
+
+def summarize_cold_warm_latencies(
+    *,
+    cold_load_ms: float | None = None,
+    cold_first_infer_ms: float | None = None,
+    warm_latencies_ms: Sequence[float] = (),
+) -> dict[str, Any]:
+    """Summarize separate cold model-load/specialization cost vs. warm steady-state latencies."""
+    warm = [float(x) for x in warm_latencies_ms if float(x) >= 0.0]
+    cold_load = round(float(cold_load_ms), 3) if cold_load_ms is not None else None
+    cold_first = round(float(cold_first_infer_ms), 3) if cold_first_infer_ms is not None else None
+    cold_total: float | None = None
+    if cold_load is not None or cold_first is not None:
+        cold_total = round((cold_load or 0.0) + (cold_first or 0.0), 3)
+
+    if warm:
+        arr = np.asarray(warm, dtype=np.float64)
+        warm_med = round(float(np.median(arr)), 3)
+        warm_p95 = round(float(np.percentile(arr, 95)), 3)
+        warm_min = round(float(np.min(arr)), 3)
+        warm_max = round(float(np.max(arr)), 3)
+    else:
+        warm_med = None
+        warm_p95 = None
+        warm_min = None
+        warm_max = None
+
+    cold_to_warm_ratio: float | None = None
+    if warm_med is not None and warm_med > 0.0:
+        cold_ref = cold_first if cold_first is not None else cold_total
+        if cold_ref is not None:
+            cold_to_warm_ratio = round(cold_ref / warm_med, 3)
+
+    return {
+        "cold_load_ms": cold_load,
+        "cold_first_infer_ms": cold_first,
+        "cold_total_ms": cold_total,
+        "warm_count": len(warm),
+        "warm_median_ms": warm_med,
+        "warm_p95_ms": warm_p95,
+        "warm_min_ms": warm_min,
+        "warm_max_ms": warm_max,
+        "cold_to_warm_ratio": cold_to_warm_ratio,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint for `fast-bench-check` / `ab_bench_harness.py`."""
     p = argparse.ArgumentParser(description="Benchmark quiescence check & ABBA harness utilities.")
@@ -1110,6 +1229,7 @@ __all__ = [
     "check_system_quiescence",
     "check_tensor_dtypes",
     "clear_mlx_arena",
+    "collect_daemon_four_bucket_metrics",
     "collect_env_telemetry",
     "cos_sim",
     "evict_mapped_files",
@@ -1122,6 +1242,7 @@ __all__ = [
     "probe_mapped_files",
     "probe_task_vm_info",
     "read_process_rusage_v6",
+    "summarize_cold_warm_latencies",
     "wired_limit",
 ]
 

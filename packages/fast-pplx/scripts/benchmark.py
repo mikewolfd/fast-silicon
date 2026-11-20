@@ -1071,9 +1071,24 @@ print(json.dumps({"mode": "torch-mps", "status": "ok", "load_s": round(load_s, 3
 """
 
 
+def _resolve_hf_cached_repo(repo_id: str) -> Path | None:
+    hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    snaps = hub / f"models--{repo_id.replace('/', '--')}" / "snapshots"
+    if snaps.is_dir():
+        cands = sorted(snaps.iterdir())
+        if cands:
+            return cands[-1]
+    return None
+
+
 def _run_pplx_context_mlx_baseline(args: argparse.Namespace, *, dtype: str) -> dict[str, Any]:
     repo_path = getattr(args, "pplx_mlx_path", None) or os.environ.get("PPLX_CONTEXT_MLX_PATH")
-    model_dir = _resolve_model_dir(args.model_dir, args.home)
+    # Per pplx-context-mlx README, prefer pre-cast `zainmerchan/pplx-embed-v2-context-0.6b-mlx` for float16
+    model_dir = (
+        _resolve_hf_cached_repo("zainmerchan/pplx-embed-v2-context-0.6b-mlx")
+        if (dtype == "float16" and getattr(args, "model_dir", None) is None)
+        else None
+    ) or _resolve_model_dir(args.model_dir, args.home)
     label = "pplx-context-mlx-f16" if dtype == "float16" else "pplx-context-mlx-f32"
     cfg = {
         "repo_path": str(Path(repo_path).expanduser().resolve()) if repo_path else None,
@@ -1872,6 +1887,269 @@ def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
     return {"suite": "bit-identity", "action": "dump", "telemetry": telemetry, "manifest": str(manifest), "n_tensors": len(vectors)}
 
 
+def format_ane_profiles_markdown(
+    compile_sec: dict[str, float],
+    parity: dict[str, dict[str, Any]],
+    perf: dict[str, Any],
+    stock_mlx: dict[str, Any] | None = None,
+) -> str:
+    lines = [
+        "| Profile / Baseline | Compile (s) | S=128 tok/s | S=256 tok/s | S=256 f32 min cos | S=256 MRL-128 min cos | S=256 int8 MAE |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    s128_prof = (perf.get("S128_32docs") or {}).get("profiles") or {}
+    s256_prof = (perf.get("S256_32docs") or {}).get("profiles") or {}
+    for prof, p_metrics in parity.items():
+        t128 = s128_prof.get(prof, {}).get("tok_s")
+        t256 = s256_prof.get(prof, {}).get("tok_s")
+        lines.append(
+            f"| `ane:{prof}` | {compile_sec.get(prof, 0.0):.2f} | "
+            f"{f'{t128:,.1f}' if t128 is not None else '-'} | "
+            f"{f'{t256:,.1f}' if t256 is not None else '-'} | "
+            f"{p_metrics.get('s256_f32_min_cos', 0.0):.6f} | "
+            f"{p_metrics.get('s256_d128_min_cos', 0.0):.6f} | "
+            f"{p_metrics.get('s256_int8_mae', 0.0):.4f} |"
+        )
+    if isinstance(stock_mlx, dict) and stock_mlx.get("status") == "ok":
+        st128 = (stock_mlx.get("S128_32docs") or {}).get("tok_s")
+        st256 = (stock_mlx.get("S256_32docs") or {}).get("tok_s")
+        lines.append(
+            f"| `{stock_mlx.get('harness', 'pplx-context-mlx-f16')}` | - | "
+            f"{f'{st128:,.1f}' if st128 is not None else '-'} | "
+            f"{f'{st256:,.1f}' if st256 is not None else '-'} | "
+            "ref | ref | ref |"
+        )
+    return "\n".join(lines)
+
+
+def cmd_ane_profiles(args: argparse.Namespace) -> dict[str, Any]:
+    """Compile and ABBA-benchmark `fast`, `balanced`, and `parity` ANE profiles in isolated temp homes."""
+    import statistics
+    import tempfile
+
+    profiles = _parse_str_csv(args.profiles)
+    seq_lens = _parse_int_csv(args.seq_lens)
+    telemetry = _collect_telemetry()
+    quiescence = _sys_quiescence()
+
+    if args.dry_run:
+        return {
+            "dry_run": True,
+            "suite": "ane-profiles",
+            "profiles": profiles,
+            "seq_lens": seq_lens,
+            "repeats": int(args.repeats),
+            "telemetry": telemetry,
+            "quiescence_warnings": quiescence,
+            "ane_status": _check_ane_ready(args.home),
+        }
+
+    if quiescence and not args.allow_contended:
+        raise RuntimeError(f"Contention detected ({len(quiescence)} processes); pass --allow-contended to override.")
+
+    from fast_pplx.engine import FastPplx, read_ane_manifest
+    from fast_pplx.paths import resolve_paths
+
+    prod_paths = resolve_paths(args.home)
+    build_script = _PACKAGE_ROOT / "scripts" / "build_ane_models.py"
+    seq_csv = ",".join(str(x) for x in seq_lens)
+
+    with _gpu_lock():
+        with tempfile.TemporaryDirectory(prefix="pplx_ane_profiles_") as tmp_s:
+            tmp_root = Path(tmp_s)
+            homes: dict[str, Path] = {}
+            compile_sec: dict[str, float] = {}
+            manifests: dict[str, Any] = {}
+
+            for prof in profiles:
+                h = tmp_root / f"home_{prof}"
+                (h / "artifacts").mkdir(parents=True, exist_ok=True)
+                for sub in ("weights", "tokenizer"):
+                    src_sub = prod_paths.home / "artifacts" / sub
+                    if src_sub.exists():
+                        (h / "artifacts" / sub).symlink_to(src_sub)
+                if (prod_paths.home / "build").exists():
+                    (h / "build").symlink_to(prod_paths.home / "build")
+                t0 = time.perf_counter()
+                subprocess.check_call(
+                    [
+                        sys.executable,
+                        str(build_script),
+                        "--home",
+                        str(h),
+                        "--seq-lens",
+                        seq_csv,
+                        "--ane-profile",
+                        prof,
+                    ]
+                )
+                compile_sec[prof] = round(time.perf_counter() - t0, 2)
+                manifests[prof] = read_ane_manifest(h / "artifacts" / "ane_models")
+                homes[prof] = h
+
+            base_sent = (
+                "Apple Silicon Neural Engine hybrid GatedDeltaNet + partial-RoPE contextual embedding "
+                "evaluation under IEEE binary16 FTZ, Tanh-factored SiLU, and row-wise max_abs RMSNorm."
+            )
+            texts_128 = [
+                f"Record {i:02d}: {base_sent} Clause {i * 3 + 1} governs indemnification and liability caps."
+                for i in range(32)
+            ]
+            texts_256 = [
+                f"Record {i:02d}: " + " ".join([base_sent] * 4) + f" Section {i:02d} specifies arbitration venue."
+                for i in range(32)
+            ]
+
+            ref_home = homes[profiles[0]]
+            eng_gpu = FastPplx(home=ref_home, model_dir=args.model_dir, mode="gpu", local_files_only=True)
+            try:
+                ref_128_f32 = eng_gpu.encode_texts(texts_128[:16], mode="gpu", output_dtype="float32", normalize=True)
+                ref_256_f32 = eng_gpu.encode_texts(texts_256[:16], mode="gpu", output_dtype="float32", normalize=True)
+                ref_256_d128 = eng_gpu.encode_texts(
+                    texts_256[:16], mode="gpu", dimensions=128, output_dtype="float32", normalize=True
+                )
+                ref_256_i8 = eng_gpu.encode_texts(texts_256[:16], mode="gpu", output_dtype="int8", normalize=False)
+            finally:
+                eng_gpu.close()
+
+            engines = {
+                prof: FastPplx(
+                    home=homes[prof], model_dir=args.model_dir, mode="ane", ane_profile=prof, local_files_only=True
+                )
+                for prof in profiles
+            }
+            parity: dict[str, dict[str, Any]] = {}
+            perf: dict[str, Any] = {}
+            try:
+                for prof, eng in engines.items():
+                    if not eng.ane_available:
+                        raise RuntimeError(f"ANE unavailable for profile={prof}: {eng._ane_init_error}")
+                    v128 = eng.encode_texts(texts_128[:16], mode="ane", output_dtype="float32", normalize=True)
+                    v256 = eng.encode_texts(texts_256[:16], mode="ane", output_dtype="float32", normalize=True)
+                    vd128 = eng.encode_texts(
+                        texts_256[:16], mode="ane", dimensions=128, output_dtype="float32", normalize=True
+                    )
+                    vi8 = eng.encode_texts(texts_256[:16], mode="ane", output_dtype="int8", normalize=False)
+                    p128 = compute_vector_parity(v128, ref_128_f32)
+                    p256 = compute_vector_parity(v256, ref_256_f32)
+                    pd128 = compute_vector_parity(vd128, ref_256_d128)
+                    pi8 = compute_int8_parity(vi8, ref_256_i8)
+                    parity[prof] = {
+                        "s128_f32_min_cos": p128["min_cos"],
+                        "s128_f32_mean_cos": p128["mean_cos"],
+                        "s256_f32_min_cos": p256["min_cos"],
+                        "s256_f32_mean_cos": p256["mean_cos"],
+                        "s256_d128_min_cos": pd128["min_cos"],
+                        "s256_int8_min_cos": pi8["min_cos"],
+                        "s256_int8_mae": pi8["mean_abs_err"],
+                    }
+
+                for prof in profiles:
+                    _ = engines[prof].encode_texts(texts_128[:4], mode="ane")
+                    _ = engines[prof].encode_texts(texts_256[:4], mode="ane")
+
+                base_prof = "fast" if "fast" in profiles else profiles[0]
+                for label, corpus in (("S128_32docs", texts_128), ("S256_32docs", texts_256)):
+                    tot_toks = sum(len(engines[base_prof].tokenizer.encode(t)) + 2 for t in corpus)
+                    times: dict[str, list[float]] = {p: [] for p in profiles}
+                    for r in range(max(1, int(args.repeats))):
+                        order = profiles if r % 2 == 0 else list(reversed(profiles))
+                        for p in order:
+                            t0 = time.perf_counter()
+                            _ = engines[p].encode_texts(corpus, mode="ane", output_dtype="float32", normalize=True)
+                            times[p].append(time.perf_counter() - t0)
+                    med_base = statistics.median(times[base_prof])
+                    perf[label] = {
+                        "total_tokens": tot_toks,
+                        "profiles": {
+                            p: {
+                                "median_ms": round(statistics.median(times[p]) * 1000.0, 2),
+                                "tok_s": round(tot_toks / max(statistics.median(times[p]), 1e-9), 1),
+                                "docs_s": round(len(corpus) / max(statistics.median(times[p]), 1e-9), 2),
+                                "rel_vs_base": round(med_base / max(statistics.median(times[p]), 1e-9), 4),
+                            }
+                            for p in profiles
+                        },
+                    }
+            finally:
+                for eng in engines.values():
+                    eng.close()
+
+            stock_mlx: dict[str, Any] | None = None
+            pub_py = args.torch_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
+            pplx_dir = (
+                Path(args.pplx_mlx_path).expanduser()
+                if args.pplx_mlx_path
+                else Path(os.environ.get("PPLX_CONTEXT_MLX_PATH", str(Path.home() / "Work" / "forks" / "pplx-context-mlx")))
+            )
+            if Path(pub_py).is_file() and pplx_dir.is_dir():
+                mlx_snippet = r"""
+import json, os, statistics, sys, time
+from pathlib import Path
+import mlx.core as mx
+sys.path.insert(0, sys.argv[2])
+import pplx_context_mlx
+
+hub_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+snaps_z = sorted((hub_root / "models--zainmerchan--pplx-embed-v2-context-0.6b-mlx" / "snapshots").glob("*"))
+snaps = snaps_z or sorted((hub_root / "models--perplexity-ai--pplx-embed-v2-context-0.6b" / "snapshots").glob("*"))
+if not snaps:
+    print(json.dumps({"status": "skipped", "reason": "no pplx snapshot"}))
+    raise SystemExit(0)
+eng = pplx_context_mlx.load_model(str(snaps[-1]), dtype="float16")
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+out = {
+    "status": "ok",
+    "harness": "pplx-context-mlx (zainmerchan-f16)" if snaps_z else "pplx-context-mlx (f16)",
+}
+for lbl in ("S128_32docs", "S256_32docs"):
+    txts = data[lbl]
+    docs_nested = [[t] for t in txts]
+    tot_toks = sum(len(eng.tokenizer._tokenizer.encode(t, add_special_tokens=False)) + 2 for t in txts)
+    _ = eng.encode(docs_nested[:4], batch_size=32, normalize_embeddings=True)
+    mx.synchronize()
+    ts = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        _ = eng.encode(docs_nested, batch_size=32, normalize_embeddings=True)
+        mx.synchronize()
+        ts.append(time.perf_counter() - t0)
+    med = statistics.median(ts)
+    out[lbl] = {
+        "median_ms": round(med * 1000.0, 2),
+        "tok_s": round(tot_toks / max(med, 1e-9), 1),
+        "docs_s": round(len(txts) / max(med, 1e-9), 2),
+    }
+print(json.dumps(out))
+"""
+                corp_f = tmp_root / "pplx_corp.json"
+                corp_f.write_text(json.dumps({"S128_32docs": texts_128, "S256_32docs": texts_256}), encoding="utf-8")
+                proc_p = subprocess.run(
+                    [str(pub_py), "-c", mlx_snippet, str(corp_f), str(pplx_dir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                    check=False,
+                )
+                if proc_p.returncode == 0 and proc_p.stdout.strip():
+                    stock_mlx = json.loads(proc_p.stdout.strip().splitlines()[-1])
+
+    md = format_ane_profiles_markdown(compile_sec, parity, perf, stock_mlx)
+    return {
+        "suite": "ane-profiles",
+        "telemetry": telemetry,
+        "profiles": profiles,
+        "seq_lens": seq_lens,
+        "compile_sec": compile_sec,
+        "manifests": manifests,
+        "parity_vs_gpu": parity,
+        "throughput": perf,
+        "stock_mlx_baseline": stock_mlx,
+        "footprint": _footprint_snapshot(),
+        "markdown": md,
+    }
+
+
 def cmd_all(args: argparse.Namespace) -> dict[str, Any]:
     plan = {
         "suite": "all",
@@ -1964,6 +2242,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_bit.add_argument("--baseline-dir", default=None)
     p_bit.add_argument("--candidate-dir", default=None)
 
+    p_aprof = sub.add_parser(
+        "ane-profiles",
+        help="Compile and ABBA-benchmark fast, balanced, and parity ANE profiles in isolated temp homes",
+    )
+    _add_shared_flags(p_aprof)
+    p_aprof.add_argument("--profiles", default="fast,balanced,parity")
+    p_aprof.add_argument("--seq-lens", default="128,256")
+    p_aprof.add_argument("--repeats", type=int, default=3)
+    p_aprof.add_argument("--torch-python", default=None, help="Optional Python binary with stock pplx-context-mlx")
+    p_aprof.add_argument("--pplx-mlx-path", default=None, help="Optional checkout path for public pplx-context-mlx")
+
     p_all = sub.add_parser("all", help="Run speed + parity + context-limit + context-windows suites")
     _add_shared_flags(p_all)
     p_all.add_argument("--modes", default="gpu-no-mmap,gpu-bf16,gpu,hetero2,pplx-context-mlx-f16,torch-mps,torch-cpu")
@@ -2008,6 +2297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "context-limit": cmd_context_limit,
         "context-windows": cmd_context_windows,
         "bit-identity": cmd_bit_identity,
+        "ane-profiles": cmd_ane_profiles,
         "all": cmd_all,
     }
     res = handlers[args.suite](args)

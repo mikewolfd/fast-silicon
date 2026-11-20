@@ -20,6 +20,56 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FAST_SHARED_SRC = _REPO_ROOT / "packages" / "fast-shared" / "src"
 
+
+def resolve_hf_snapshot(repo_id: str) -> Path | None:
+    """Resolve a locally cached HuggingFace Hub snapshot directory without network access."""
+    hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    repo_dir = hub / f"models--{repo_id.replace('/', '--')}"
+    refs_main = repo_dir / "refs" / "main"
+    if refs_main.is_file():
+        rev = refs_main.read_text(encoding="utf-8").strip()
+        cand = repo_dir / "snapshots" / rev
+        if cand.is_dir():
+            return cand
+    snaps = sorted((repo_dir / "snapshots").glob("*")) if (repo_dir / "snapshots").is_dir() else []
+    return snaps[-1] if snaps else None
+
+
+def resolve_pplx_mlx_path(explicit: str | Path | None = None) -> Path | None:
+    """Resolve local checkout of `pplx-context-mlx` when available."""
+    raw = explicit or os.environ.get("PPLX_CONTEXT_MLX_PATH")
+    candidates = [Path(raw).expanduser()] if raw else [
+        _REPO_ROOT.parent / "forks" / "pplx-context-mlx",
+        Path.home() / "Work" / "forks" / "pplx-context-mlx",
+    ]
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def resolve_coreai_python(explicit: str | Path | None = None) -> Path | None:
+    """Resolve Python interpreter with Apple `coreai.runtime` (`macOS 27.2+`) if installed."""
+    raw = explicit or os.environ.get("FAST_SILICON_COREAI_PYTHON")
+    candidates = [Path(raw).expanduser().absolute()] if raw else [
+        Path.home() / "Work" / "coreai-bench" / "coreai-models" / ".venv" / "bin" / "python",
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def resolve_coreai_bundle(subpath: str, explicit_root: str | Path | None = None) -> Path | None:
+    """Resolve an exported Apple CoreAI `.aimodel` parent bundle directory if present."""
+    raw = explicit_root or os.environ.get("FAST_SILICON_COREAI_EXPORTS")
+    roots = [Path(raw).expanduser()] if raw else [Path.home() / "Work" / "coreai-bench" / "exports"]
+    for root in roots:
+        cand = root / subpath
+        if cand.is_dir():
+            return cand
+    return None
+
 # Child snippet executed cleanly in `--public-python` (or current Python).
 _PUBLIC_RUNNER_SNIPPET = r"""
 from contextlib import contextmanager
@@ -214,8 +264,20 @@ def skip(reason):
     raise SystemExit(0)
 
 if pkg in ("fast-bge-small", "fast-embeddinggemma-2"):
-    repo_id = "mlx-community/bge-small-en-v1.5-bf16" if pkg == "fast-bge-small" else "mlx-community/embeddinggemma-2-bf16"
-    snap = resolve_hf_snapshot(repo_id) or resolve_hf_snapshot("BAAI/bge-small-en-v1.5" if pkg == "fast-bge-small" else "google/embeddinggemma-2")
+    if pkg == "fast-bge-small":
+        snap = (
+            resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-8bit")
+            or resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-bf16")
+            or resolve_hf_snapshot("BAAI/bge-small-en-v1.5")
+        )
+        repo_id = "mlx-community/bge-small-en-v1.5-8bit"
+    else:
+        snap = (
+            resolve_hf_snapshot("mlx-community/embeddinggemma-2-8bit")
+            or resolve_hf_snapshot("mlx-community/embeddinggemma-2-bf16")
+            or resolve_hf_snapshot("google/embeddinggemma-2")
+        )
+        repo_id = "mlx-community/embeddinggemma-2-8bit"
     if snap is None:
         skip(f"no local HF snapshot for {repo_id}")
     n_docs = 1000 if pkg == "fast-bge-small" else 512
@@ -240,25 +302,27 @@ if pkg in ("fast-bge-small", "fast-embeddinggemma-2"):
             def _sync_mlx(val):
                 if val is not None:
                     try:
-                        mx.eval(val)
+                        mx.eval(getattr(val, "text_embeds", val))
                     except Exception:
                         pass
                 if hasattr(mx, "synchronize"):
                     mx.synchronize()
 
             def _run_b1():
-                out = None
+                te = None
                 for _ in range(8):
-                    out = mlx_embeddings.utils.generate(model, tokenizer, q_txt)
-                    mx.eval(out)
-                return out
+                    out = mlx_embeddings.utils.generate(model, tokenizer, q_txt, max_length=512)
+                    te = getattr(out, "text_embeds", out)
+                    mx.eval(te)
+                return te
 
             def _run_corpus():
-                last = None
+                te = None
                 for i in range(0, len(texts), b_corpus):
-                    last = mlx_embeddings.utils.generate(model, tokenizer, texts[i : i + b_corpus])
-                    mx.eval(last)
-                return last
+                    out = mlx_embeddings.utils.generate(model, tokenizer, texts[i : i + b_corpus], max_length=512)
+                    te = getattr(out, "text_embeds", out)
+                    mx.eval(te)
+                return te
 
             abba = run_abba_pair(_run_b1, _run_corpus, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_mlx, use_mlx_abba=True)
             b1_dt = abba["a_median_s"] / 8.0
@@ -281,8 +345,73 @@ if pkg in ("fast-bge-small", "fast-embeddinggemma-2"):
                 "highlight": f"mlx-embeddings: {tok_s:,.0f} tok/s (B=1 {b1_dt * 1000.0:.2f}ms)",
             }), flush=True)
             raise SystemExit(0)
-    except ImportError:
+    except (ImportError, ValueError):
         pass
+
+    # For `fast-embeddinggemma-2` (`mlx-community/embeddinggemma-2-bf16`), stock MLX support lives in `mlx_vlm.embedding_loader`.
+    if pkg == "fast-embeddinggemma-2":
+        try:
+            import mlx.core as mx
+            from mlx_vlm.embedding_loader import load_embedding_model
+            from transformers import AutoTokenizer
+
+            with mlx_wired_scope(use_wired):
+                t0 = time.perf_counter()
+                model = load_embedding_model(Path(snap))
+                tokenizer = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
+                load_s = time.perf_counter() - t0
+                q_inp = tokenizer(["task: search result | query: What drives oceanic heat transport?"], padding=True, return_tensors="np")
+                q_mx = {k: mx.array(v) for k, v in q_inp.items()}
+                texts = [f"title: none | text: Record {i}. " + ("Ocean currents transfer heat across hemispheres. " * max(1, int(l) // 10)) for i, l in enumerate(lens)]
+                pre_batches = []
+                for i in range(0, len(texts), b_corpus):
+                    bi = tokenizer(texts[i : i + b_corpus], padding=True, truncation=True, max_length=512, return_tensors="np")
+                    pre_batches.append({k: mx.array(v) for k, v in bi.items()})
+                mx.reset_peak_memory()
+
+                def _sync_vlm(val):
+                    if val is not None:
+                        mx.eval(val)
+                    if hasattr(mx, "synchronize"):
+                        mx.synchronize()
+
+                def _run_b1():
+                    out = None
+                    for _ in range(8):
+                        out = model(**q_mx).text_embeds
+                        mx.eval(out)
+                    return out
+
+                def _run_corpus():
+                    last = None
+                    for b_mx in pre_batches:
+                        last = model(**b_mx).text_embeds
+                        mx.eval(last)
+                    return last
+
+                abba = run_abba_pair(_run_b1, _run_corpus, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_vlm, use_mlx_abba=True)
+                b1_dt = abba["a_median_s"] / 8.0
+                c_dt = abba["b_median_s"]
+                fp_gb, rss_gb = footprint_gb()
+                tok_s = tot_toks / max(c_dt, 1e-9)
+                print(json.dumps({
+                    "status": "ok",
+                    "runtime": "stock-mlx_vlm-embedding",
+                    "timing_order": abba["order"],
+                    "b1_drift": abba["a_drift"],
+                    "corpus_drift": abba["b_drift"],
+                    "b1_ms": round(b1_dt * 1000.0, 3),
+                    "tok_s": round(tok_s, 1),
+                    "docs_per_sec": round(n_docs / max(c_dt, 1e-9), 2),
+                    "peak_active_gb": round(float(mx.get_peak_memory()) / 1e9, 4),
+                    "peak_footprint_gb": fp_gb,
+                    "rss_gb": rss_gb,
+                    "load_s": round(load_s, 3),
+                    "highlight": f"mlx_vlm-embedding: {tok_s:,.0f} tok/s (B=1 {b1_dt * 1000.0:.2f}ms)",
+                }), flush=True)
+                raise SystemExit(0)
+        except Exception:
+            pass
 
     try:
         import torch
@@ -395,6 +524,7 @@ elif pkg == "fast-gemma4":
 
         b_sz = 64
         batch_fmts = [fmts[i % len(fmts)] for i in range(b_sz)]
+        batch4_fmts = [fmts[i % len(fmts)] for i in range(4)]
 
         def _sync_mlx(_):
             if hasattr(mx, "synchronize"):
@@ -403,17 +533,29 @@ elif pkg == "fast-gemma4":
         def _run_b1():
             return mlx_vlm.generate(model, processor, fmts[0], max_tokens=512, verbose=False)
 
+        def _run_b4():
+            return mlx_vlm.batch_generate(model, processor, prompts=batch4_fmts, max_tokens=512, verbose=False)
+
         def _run_b64():
             return mlx_vlm.batch_generate(model, processor, prompts=batch_fmts, max_tokens=512, verbose=False)
 
         abba = run_abba_pair(_run_b1, _run_b64, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_mlx, use_mlx_abba=True)
+        abba_b4 = run_abba_pair(_run_b1, _run_b4, rounds=1, cooldown_sec=cooldown_sec, sync_fn=_sync_mlx, use_mlx_abba=True)
         dt_b1 = abba["a_median_s"]
+        dt_b4 = abba_b4["b_median_s"]
         dt_batch = abba["b_median_s"]
         r_b1 = abba["a_runs"][-1]["payload"]
+        r_b4 = abba_b4["b_runs"][-1]["payload"]
         r_batch = abba["b_runs"][-1]["payload"]
 
         b1_out_toks = int(getattr(r_b1, "generation_tokens", 0) or max(1, len(tok.encode(getattr(r_b1, "text", str(r_b1))))))
         b1_e2e_tps = b1_out_toks / max(dt_b1, 1e-9)
+
+        b4_stats = getattr(r_b4, "stats", None)
+        b4_texts = list(getattr(r_b4, "texts", []) or [])
+        b4_tot_gen = int(getattr(b4_stats, "generation_tokens", 0) or sum(len(tok.encode(tx)) for tx in b4_texts))
+        b4_dec_tps = float(getattr(b4_stats, "generation_tps", 0.0) or (b4_tot_gen / max(dt_b4, 1e-9)))
+        b4_docs_s = 4.0 / max(dt_b4, 1e-9)
 
         batch_stats = getattr(r_batch, "stats", None)
         texts = list(getattr(r_batch, "texts", []) or [])
@@ -450,6 +592,8 @@ elif pkg == "fast-gemma4":
             "batch_drift": abba["b_drift"],
             "b1_e2e_out_tok_s": round(b1_e2e_tps, 1),
             "b1_docs_per_sec": round(1.0 / max(dt_b1, 1e-9), 2),
+            "b4_decode_tok_s": round(b4_dec_tps, 1),
+            "b4_docs_per_sec": round(b4_docs_s, 2),
             "batch_size": b_sz,
             "e2e_out_tok_s": round(batch_e2e_tps, 1),
             "docs_per_sec": round(docs_s, 3),
@@ -534,9 +678,83 @@ elif pkg == "fast-gpt-oss":
         }), flush=True)
 
 elif pkg == "fast-decision-models":
+    kev_8bit_snap = resolve_hf_snapshot("AbstractFramework/kev-0.8b-mlx-8bit")
     kev_dir = resolved_home / "artifacts" / "kev_08b"
-    if not (kev_dir / "model.safetensors").is_file():
-        skip(f"missing BF16 kev_08b weights at {kev_dir}")
+    if kev_8bit_snap is None and not (kev_dir / "model.safetensors").is_file():
+        skip(f"missing AbstractFramework/kev-0.8b-mlx-8bit and BF16 kev_08b weights at {kev_dir}")
+    try:
+        import mlx.core as mx
+        import mlx_lm
+        from mlx_lm.models import qwen3_5
+
+        with mlx_wired_scope(use_wired):
+            t0 = time.perf_counter()
+            if kev_8bit_snap is not None:
+                mdl, _ = mlx_lm.load(str(kev_8bit_snap))
+                rt_lbl = "stock-mlx_lm-kev-8bit"
+            else:
+                meta = json.loads((kev_dir / "kev_meta.json").read_text(encoding="utf-8"))
+                raw = mx.load(str(kev_dir / "model.safetensors"))
+                margs = qwen3_5.ModelArgs.from_dict({"text_config": meta["text_config"]})
+                lm_w = {(k if k.startswith("language_model.") else f"language_model.{k}"): v for k, v in raw.items() if not k.startswith("pointer_head.")}
+                mdl = qwen3_5.Model(margs)
+                if hasattr(mdl, "sanitize"):
+                    lm_w = mdl.sanitize(lm_w)
+                mdl.load_weights(list(lm_w.items()), strict=False)
+                mx.eval(mdl.parameters())
+                mdl.eval()
+                del raw, lm_w
+                rt_lbl = "stock-mlx_lm-qwen3_5-bf16"
+            load_s = time.perf_counter() - t0
+
+            backbone = mdl.language_model.model if hasattr(mdl, "language_model") else mdl.model
+            seq_len = 96
+            x_b1 = mx.random.randint(10, 2000, (1, seq_len), dtype=mx.int32)
+            x_b8 = mx.random.randint(10, 2000, (8, seq_len), dtype=mx.int32)
+            mx.reset_peak_memory()
+
+            def _sync_q(_):
+                if hasattr(mx, "synchronize"):
+                    mx.synchronize()
+
+            def _run_b1():
+                out = None
+                for _ in range(4):
+                    out = backbone(x_b1)
+                    mx.eval(out)
+                return out
+
+            def _run_b8():
+                out = None
+                for _ in range(4):
+                    out = backbone(x_b8)
+                    mx.eval(out)
+                return out
+
+            abba = run_abba_pair(_run_b1, _run_b8, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_q, use_mlx_abba=True)
+            dt_b1 = abba["a_median_s"] / 4.0
+            dt_b8 = abba["b_median_s"] / 4.0
+            b1_qs = 1.0 / max(dt_b1, 1e-9)
+            b8_qs = 8.0 / max(dt_b8, 1e-9)
+            fp_gb, rss_gb = footprint_gb()
+            print(json.dumps({
+                "status": "ok",
+                "runtime": rt_lbl,
+                "timing_order": abba["order"],
+                "b1_drift": abba["a_drift"],
+                "b8_drift": abba["b_drift"],
+                "b1_q_per_sec": round(b1_qs, 2),
+                "q_per_sec": round(b8_qs, 2),
+                "ms_per_question": round((dt_b8 * 1000.0) / 8.0, 2),
+                "peak_active_gb": round(float(mx.get_peak_memory()) / 1e9, 4),
+                "peak_footprint_gb": fp_gb,
+                "rss_gb": rss_gb,
+                "load_s": round(load_s, 3),
+                "highlight": f"{rt_lbl} B=8: {b8_qs:.2f} q/s ({(dt_b8 * 1000.0) / 8.0:.2f} ms/q; B=1 {b1_qs:.2f} q/s)",
+            }), flush=True)
+            raise SystemExit(0)
+    except Exception:
+        pass
     meta_path = kev_dir / "kev_meta.json"
     if not meta_path.is_file():
         skip(f"missing kev_meta.json at {kev_dir}")

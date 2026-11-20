@@ -32,6 +32,13 @@ Severity = Literal["error", "warning"]
 # IEEE-754 binary16 smallest positive normal (2^-14 = 6.103515625e-5) and max finite magnitude.
 _FP16_MIN_NORMAL: float = float(2.0**-14)
 _FP16_MAX_FINITE: float = 65504.0
+_TORCH_ONLY_QUANT_DTYPES: frozenset[str] = frozenset({"mxint8", "int6", "uint6"})
+_COREML_QUANT_CONFIG_SUFFIXES: tuple[str, ...] = (
+    "OpLinearQuantizerConfig",
+    "OpPalettizerConfig",
+    "ModuleLinearQuantizerConfig",
+    "ModulePalettizerConfig",
+)
 
 _NON_ANE_FP32_SCOPE_RE = re.compile(
     r"(?:^|_)(?:cpu|fp32|f32|mm32)(?:_|$)|(?:rmsnorm|layernorm|lin|rope|norm|matmul|conv|attn|mlp)32$",
@@ -955,9 +962,7 @@ class _MlxAstChecker(ast.NodeVisitor):
                             node.lineno,
                             f"`mx.quantize` last dimension {last_dim} (shape={w_shape}) is not divisible by `group_size={gs_int}`; pad or override to a dividing group size.",
                         )
-            elif chain and (
-                chain.endswith("OpLinearQuantizerConfig") or chain.endswith("OpPalettizerConfig")
-            ):
+            elif chain and chain.endswith(_COREML_QUANT_CONFIG_SUFFIXES):
                 gran_str = _extract_const_str(_kw_arg(node, "granularity") or ast.Constant(value=""), self.str_consts)
                 if gran_str in ("per_block", "per_grouped_channel"):
                     bs_node = _kw_arg(node, "block_size") or _kw_arg(node, "group_size")
@@ -969,6 +974,30 @@ class _MlxAstChecker(ast.NodeVisitor):
                             node.lineno,
                             f"`{chain}` with `granularity={gran_str!r}` requires a positive `block_size`/`group_size` (got {bs_val:g}).",
                         )
+
+        # F. Reject ExportBackend.Torch-only quantization formats (`MXINT8`, `INT6`, `UINT6`) on CoreML/Core AI paths
+        if chain and chain.endswith(_COREML_QUANT_CONFIG_SUFFIXES) and not self._line_has_ignore(node.lineno, "coreml-quant-dtype"):
+            backend_arg = _kw_arg(node, "export_backend")
+            backend_str = (
+                (_extract_const_str(backend_arg, self.str_consts) or _attr_chain(backend_arg) or "")
+                if backend_arg is not None
+                else ""
+            ).lower()
+            if "torch" not in backend_str.split("."):
+                for kw_name in ("dtype", "quant_dtype", "weight_dtype"):
+                    dt_node = _kw_arg(node, kw_name)
+                    if dt_node is None:
+                        continue
+                    dt_raw = _extract_const_str(dt_node, self.str_consts) or _attr_chain(dt_node) or ""
+                    bad_dts = validate_export_quant_dtypes([dt_raw], export_backend="coreml")
+                    if bad_dts:
+                        self._emit_coreml_once(
+                            "COREML_TORCH_ONLY_QUANT_DTYPE",
+                            "error",
+                            node.lineno,
+                            f"`{chain}` specifies ExportBackend.Torch-only format `{bad_dts[0]}` (`MXINT8`/`INT6`/`UINT6` are unsupported on CoreML/Core AI export paths).",
+                        )
+                        break
 
     def _infer_expr_dtype(self, node: ast.AST | None) -> str | None:
         if node is None:
@@ -1978,6 +2007,27 @@ def check_divisibility(
     return incompatible
 
 
+def _normalize_quant_format_token(fmt: Any) -> str:
+    raw = getattr(fmt, "value", fmt)
+    s = str(raw or "").strip().lower()
+    if "." in s:
+        s = s.rsplit(".", 1)[-1].strip()
+    return s
+
+
+def validate_export_quant_dtypes(
+    quant_dtypes: Iterable[Any],
+    *,
+    export_backend: Any = "coreml",
+) -> list[str]:
+    """Return any ``ExportBackend.Torch``-only formats (``MXINT8``, ``INT6``, ``UINT6``) disallowed on ``export_backend``."""
+    backend_tok = _normalize_quant_format_token(export_backend) or "coreml"
+    if "torch" in backend_tok:
+        return []
+    disallowed = sorted({_normalize_quant_format_token(dt) for dt in quant_dtypes} & _TORCH_ONLY_QUANT_DTYPES)
+    return disallowed
+
+
 # ---------------------------------------------------------------------------
 # CoreML MIL Program Static IR Inspector
 # ---------------------------------------------------------------------------
@@ -2201,20 +2251,42 @@ def _walk_mil_block(
             w_key = "weight" if "weight" in op.inputs else ("y" if "y" in op.inputs else None)
             w_var = op.inputs.get(w_key) if w_key is not None else None
             w_val = getattr(w_var, "val", None) if w_var is not None else None
-            if w_val is not None and hasattr(w_val, "shape"):
-                shp = tuple(int(d) for d in w_val.shape)
-                eff_ax = block_axis if block_axis >= 0 else len(shp) + block_axis
-                if 0 <= eff_ax < len(shp) and (shp[eff_ax] % int(check_block_size) != 0):
-                    findings.append(
-                        GuardFinding(
-                            rule_id="COREML_QUANT_BLOCK_NOT_DIVISIBLE",
-                            severity="error",
-                            file=model_name,
-                            line=idx,
-                            symbol=f"{fn_name}.{op_name}",
-                            message=f"MIL `{op_type}` (`{op_name}`) weight shape {shp} axis {block_axis} (dim={shp[eff_ax]}) is not divisible by block_size={check_block_size} (CoreAI Pattern 7 silent compression skip).",
+            w_op_type = str(getattr(getattr(w_var, "op", None), "op_type", ""))
+            is_static_weight = w_val is not None or w_op_type == "const" or w_op_type.startswith("constexpr")
+            w_shape = getattr(w_val, "shape", None) if w_val is not None else (getattr(w_var, "shape", None) if is_static_weight else None)
+            if w_shape is not None:
+                try:
+                    shp = tuple(int(d) for d in w_shape)
+                except (TypeError, ValueError):
+                    shp = ()
+                is_depthwise_conv = False
+                if op_type == "conv" and len(shp) >= 2 and shp[1] == 1:
+                    grp_var = op.inputs.get("groups")
+                    grp_val = getattr(grp_var, "val", None) if grp_var is not None else None
+                    try:
+                        is_depthwise_conv = grp_val is not None and int(grp_val) > 1
+                    except (TypeError, ValueError):
+                        is_depthwise_conv = False
+                if shp and not is_depthwise_conv:
+                    if op_type == "matmul" and len(shp) > 2 and w_op_type == "const":
+                        # 3D/4D `matmul(..., const)` leading dims are batch/head broadcast dims (e.g. causal tril masks),
+                        # not weight channels; only flag if compressed (`constexpr*`) or 2D weight matrix.
+                        eff_ax = -1
+                        skip_matmul_const_mask = True
+                    else:
+                        eff_ax = block_axis if block_axis >= 0 else len(shp) + block_axis
+                        skip_matmul_const_mask = False
+                    if not skip_matmul_const_mask and 0 <= eff_ax < len(shp) and (shp[eff_ax] % int(check_block_size) != 0):
+                        findings.append(
+                            GuardFinding(
+                                rule_id="COREML_QUANT_BLOCK_NOT_DIVISIBLE",
+                                severity="error",
+                                file=model_name,
+                                line=idx,
+                                symbol=f"{fn_name}.{op_name}",
+                                message=f"MIL `{op_type}` (`{op_name}`) weight shape {shp} axis {block_axis} (dim={shp[eff_ax]}) is not divisible by block_size={check_block_size} (CoreAI Pattern 7 silent compression skip).",
+                            )
                         )
-                    )
 
 
 def check_coreml_mil_program(
@@ -2276,6 +2348,26 @@ def check_coreml_mil_program(
     return GuardReport(findings=findings)
 
 
+def _resolve_mil_program(mlmodel: Any) -> Any:
+    """Return `mlmodel._mil_program`, or reconstruct PyMIL from a saved `mlProgram` `.mlpackage`."""
+    prog = getattr(mlmodel, "_mil_program", None)
+    if prog is not None:
+        return prog
+    get_spec = getattr(mlmodel, "get_spec", None)
+    if callable(get_spec):
+        spec = get_spec()
+        if spec is not None and spec.WhichOneof("Type") == "mlProgram":
+            from coremltools.converters.mil.frontend.milproto import load as milproto_load
+
+            weights_dir = getattr(mlmodel, "weights_dir", None) or ""
+            return milproto_load.load(
+                spec,
+                specification_version=int(spec.specificationVersion),
+                file_weights_dir=str(weights_dir),
+            )
+    return None
+
+
 def check_coreml_model(
     mlmodel: Any,
     *,
@@ -2287,10 +2379,10 @@ def check_coreml_model(
     check_block_size: int | None = None,
     block_axis: int = 0,
 ) -> GuardReport:
-    """Inspect a converted `ct.models.MLModel` (`_mil_program`) statically without loading onto ANE/GPU."""
-    prog = getattr(mlmodel, "_mil_program", None)
+    """Inspect a converted or loaded `ct.models.MLModel` statically without loading onto ANE/GPU."""
+    prog = _resolve_mil_program(mlmodel)
     if prog is None:
-        raise ValueError("MLModel has no `_mil_program`; convert with `convert_to='mlprogram'` and `skip_model_load=True`.")
+        raise ValueError("MLModel has no MIL program; convert with `convert_to='mlprogram'` and `skip_model_load=True`.")
     return check_coreml_mil_program(
         prog,
         model_name=model_name,
@@ -2310,6 +2402,8 @@ def check_coreml_paths(
     allow_fp32_ops: Iterable[str] = (),
     flag_add_fp16_cast: bool = True,
     warn_matmul_ane: bool = True,
+    check_block_size: int | None = None,
+    block_axis: int = 0,
 ) -> GuardReport:
     """Scan `.mlpackage` files (or directories containing them) with `check_coreml_model`."""
     report = GuardReport()
@@ -2342,15 +2436,18 @@ def check_coreml_paths(
     for pkg in mlpackages:
         try:
             mlmodel = ct.models.MLModel(str(pkg), skip_model_load=True)
-            if getattr(mlmodel, "_mil_program", None) is not None:
+            prog = _resolve_mil_program(mlmodel)
+            if prog is not None:
                 report.extend(
-                    check_coreml_model(
-                        mlmodel,
+                    check_coreml_mil_program(
+                        prog,
                         model_name=str(pkg),
                         require_fp16_io=require_fp16_io,
                         allow_fp32_ops=allow_fp32_ops,
                         flag_add_fp16_cast=flag_add_fp16_cast,
                         warn_matmul_ane=warn_matmul_ane,
+                        check_block_size=check_block_size,
+                        block_axis=block_axis,
                     )
                 )
         except Exception as exc:
@@ -2377,6 +2474,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Enable CoreML MIL inspection on `.mlpackage` paths and ANE FP16 AST checks (`mb.matmul`, `<2^-14` eps, `<-65504` masks, uncast float literals)",
     )
+    parser.add_argument(
+        "--check-block-size",
+        type=int,
+        default=None,
+        help="Require static MIL conv/linear/matmul weights to be divisible by N (Pattern 7 guard).",
+    )
+    parser.add_argument(
+        "--block-axis",
+        type=int,
+        default=0,
+        help="Axis index checked by --check-block-size (default: 0).",
+    )
     args = parser.parse_args(argv)
 
     rep = check_mlx_paths(
@@ -2386,7 +2495,13 @@ def main(argv: list[str] | None = None) -> int:
         check_coreml_ast=args.coreml,
     )
     if args.coreml:
-        rep.extend(check_coreml_paths(args.paths))
+        rep.extend(
+            check_coreml_paths(
+                args.paths,
+                check_block_size=args.check_block_size,
+                block_axis=args.block_axis,
+            )
+        )
 
     for f in rep.findings:
         print(f.format())

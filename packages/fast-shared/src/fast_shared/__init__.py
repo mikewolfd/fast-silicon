@@ -8,11 +8,13 @@ from .bench import (
     check_system_quiescence,
     check_tensor_dtypes,
     clear_mlx_arena,
+    collect_daemon_four_bucket_metrics,
     collect_env_telemetry,
     cos_sim,
     get_unified_memory_footprint,
     interleaved_abba,
     peak_footprint_gb,
+    summarize_cold_warm_latencies,
     wired_limit,
 )
 from .embeddings import (
@@ -33,13 +35,17 @@ from .hf import DEFAULT_TOKENIZER_FILES, copy_tokenizer_files, resolve_hf_model_
 from .hw_check import (
     SUPPORTED_APPLE_SILICON_PROFILES,
     TESTED_REFERENCE_HARDWARE,
+    coreai_specialization_cache_key_parts,
     default_roofline_ceilings,
     evaluate_hardware_support,
+    extract_coreml_compute_plan_ops,
     format_hardware_summary,
     format_hardware_warning,
     parse_version_tuple,
     preflight_silicon_env,
+    probe_core_ai_support,
     probe_host_hardware,
+    summarize_accelerator_placement,
     supports_apple10_nax,
     supports_metal4_bf16,
     supports_metal4_fp16,
@@ -51,35 +57,79 @@ from .ir_dtype_guard import (
     check_coreml_mil_program,
     check_coreml_model,
     check_coreml_paths,
+    check_divisibility,
     check_mlx_file,
     check_mlx_paths,
     check_mlx_source,
+    validate_export_quant_dtypes,
 )
-from .metal_mpp import HEADER_MPP, HEADER_SIMDGROUP, HEADER_STD, make_mpp_matmul_kernel
-from .metal_mpp_bf16 import (
-    fused_geglu_split,
-    make_mpp_bf16_geglu_kernel,
-    make_mpp_bf16_linear_kernel,
-    mpp_fused_geglu_bf16,
-    mpp_linear_bf16,
-)
-from .parquet_pipeline import (
-    DEFAULT_TEXT_COLUMNS,
-    ParquetEmbedSummary,
-    embed_parquet,
-    resolve_input_files,
-    resolve_text_column,
-    slice_ocr_pages_utf8,
-)
-from .paths import resolve_home_dir
-from .pipeline_llm import (
-    ParquetExtractSummary,
-    extract_jsonl,
-    extract_parquet,
-    next_shard_index,
-    resolve_llm_text_column,
-    slice_first_pages_utf8,
-)
+_OPTIONAL_IMPORT_ERRORS: dict[str, ImportError] = {}
+
+try:
+    from .metal_mpp import HEADER_MPP, HEADER_SIMDGROUP, HEADER_STD, make_mpp_matmul_kernel
+    from .metal_mpp_bf16 import (
+        fused_geglu_split,
+        make_mpp_bf16_geglu_kernel,
+        make_mpp_bf16_linear_kernel,
+        mpp_fused_geglu_bf16,
+        mpp_linear_bf16,
+    )
+except ImportError as _exc:
+    _err_name = getattr(_exc, "name", None) or ""
+    if _err_name != "mlx" and not _err_name.startswith("mlx.") and "mlx" not in str(_exc):
+        raise
+    for _sym in (
+        "HEADER_MPP",
+        "HEADER_SIMDGROUP",
+        "HEADER_STD",
+        "make_mpp_matmul_kernel",
+        "fused_geglu_split",
+        "make_mpp_bf16_geglu_kernel",
+        "make_mpp_bf16_linear_kernel",
+        "mpp_fused_geglu_bf16",
+        "mpp_linear_bf16",
+    ):
+        _OPTIONAL_IMPORT_ERRORS[_sym] = _exc
+
+try:
+    from .parquet_pipeline import (
+        DEFAULT_TEXT_COLUMNS,
+        ParquetEmbedSummary,
+        embed_parquet,
+        resolve_input_files,
+        resolve_text_column,
+        slice_ocr_pages_utf8,
+    )
+    from .paths import resolve_home_dir
+    from .pipeline_llm import (
+        ParquetExtractSummary,
+        extract_jsonl,
+        extract_parquet,
+        next_shard_index,
+        resolve_llm_text_column,
+        slice_first_pages_utf8,
+    )
+except ImportError as _exc:
+    _err_name = getattr(_exc, "name", None) or ""
+    if _err_name != "pyarrow" and not _err_name.startswith("pyarrow.") and "pyarrow" not in str(_exc):
+        raise
+    from .paths import resolve_home_dir
+
+    for _sym in (
+        "DEFAULT_TEXT_COLUMNS",
+        "ParquetEmbedSummary",
+        "embed_parquet",
+        "resolve_input_files",
+        "resolve_text_column",
+        "slice_ocr_pages_utf8",
+        "ParquetExtractSummary",
+        "extract_jsonl",
+        "extract_parquet",
+        "next_shard_index",
+        "resolve_llm_text_column",
+        "slice_first_pages_utf8",
+    ):
+        _OPTIONAL_IMPORT_ERRORS[_sym] = _exc
 from .roofline import (
     audit_safetensors_weights,
     compute_model_roofline,
@@ -150,15 +200,18 @@ __all__ = [
     "check_coreml_mil_program",
     "check_coreml_model",
     "check_coreml_paths",
+    "check_divisibility",
     "check_mlx_file",
     "check_mlx_paths",
     "check_mlx_source",
     "check_system_quiescence",
     "check_tensor_dtypes",
     "clear_mlx_arena",
+    "collect_daemon_four_bucket_metrics",
     "collect_env_telemetry",
     "compute_model_roofline",
     "copy_tokenizer_files",
+    "coreai_specialization_cache_key_parts",
     "cos_sim",
     "default_roofline_ceilings",
     "dispatch_chat_completion",
@@ -166,6 +219,7 @@ __all__ = [
     "embed_parquet",
     "embedding_health_payload",
     "evaluate_hardware_support",
+    "extract_coreml_compute_plan_ops",
     "extract_json_schema",
     "extract_jsonl",
     "extract_parquet",
@@ -194,8 +248,10 @@ __all__ = [
     "parse_version_tuple",
     "peak_footprint_gb",
     "preflight_silicon_env",
+    "probe_core_ai_support",
     "probe_hardware_identity",
     "probe_host_hardware",
+    "validate_export_quant_dtypes",
     "read_safetensors_headers",
     "resolve_embedding_dim",
     "resolve_hf_model_dir",
@@ -210,6 +266,8 @@ __all__ = [
     "set_mlx_cache_limit",
     "slice_first_pages_utf8",
     "slice_ocr_pages_utf8",
+    "summarize_accelerator_placement",
+    "summarize_cold_warm_latencies",
     "supports_apple10_nax",
     "supports_metal4_bf16",
     "supports_metal4_fp16",
@@ -219,5 +277,15 @@ __all__ = [
     "warn_if_untested_hardware",
     "wired_limit",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name in _OPTIONAL_IMPORT_ERRORS:
+        exc = _OPTIONAL_IMPORT_ERRORS[name]
+        raise ImportError(
+            f"fast_shared.{name} requires an optional dependency that is not installed ({exc})."
+        ) from exc
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __version__ = "0.1.0"
