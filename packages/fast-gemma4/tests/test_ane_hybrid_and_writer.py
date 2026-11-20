@@ -182,6 +182,63 @@ def test_build_ane_models_linear_w8_awq_and_e4b_arch_cpu(tmp_path: Path) -> None
         _parse_use_ane_ring("bogus")
 
 
+def test_build_ane_compile_mlpackage_in_process_without_xcrun_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify CoreML .mlpackage compilation works in-process on CLT-only Macs without `xcrun coremlcompiler`."""
+    ct = pytest.importorskip("coremltools")
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+    import ast
+    import subprocess as sp
+
+    tree = ast.parse((REPO_ROOT / "scripts" / "build_ane_models.py").read_text(encoding="utf-8"))
+    call_consts = {
+        sub.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+    }
+    assert not (call_consts & {"xcrun", "coremlc", "coremlcompiler"})
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
+    def _tiny_prog(x):
+        return mb.add(x=x, y=np.float32(1.0), name="y")
+
+    ml = ct.convert(
+        _tiny_prog,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.macOS15,
+    )
+    pkg = tmp_path / "tiny_gemma4.mlpackage"
+    ml.save(str(pkg))
+    dst = tmp_path / "compiled" / "tiny_gemma4.mlmodelc"
+    dst.mkdir(parents=True)
+    (dst / "stale.txt").write_text("stale", encoding="utf-8")
+
+    orig_run = sp.run
+    orig_check_call = sp.check_call
+
+    def _forbid_xcrun(orig_fn):
+        def _wrapper(cmd, *args, **kwargs):
+            head = Path(str(cmd[0])).name if isinstance(cmd, (list, tuple)) and cmd else str(cmd)
+            assert head not in {"xcrun", "coremlc", "coremlcompiler"}, f"Forbidden Xcode CLI call: {cmd}"
+            return orig_fn(cmd, *args, **kwargs)
+        return _wrapper
+
+    monkeypatch.setattr(sp, "run", _forbid_xcrun(orig_run))
+    monkeypatch.setattr(sp, "check_call", _forbid_xcrun(orig_check_call))
+
+    mod = _load_build_ane_script()
+    got = mod.compile_mlpackage_in_process(pkg, dst)
+    assert got == dst
+    assert dst.is_dir()
+    assert not (dst / "stale.txt").exists()
+    assert (dst / "model.mil").is_file() or (dst / "coremldata.bin").is_file()
+
+
 def test_linear_w8_bundle_compute_plan_and_kv_fidelity(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:
     """Verify Pillar 1: 1,326/1,326 ANE ops (`0` CPU runtime ops) and `cos >= 0.9983` on Linear-W8 ANE KV."""
     w8_bundle = paths.resolve_ane_bundle("w8", model_dir=None)

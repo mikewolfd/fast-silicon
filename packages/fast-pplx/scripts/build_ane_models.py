@@ -32,7 +32,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import subprocess
 import time
 from typing import Any, Sequence
 
@@ -856,9 +855,22 @@ def build_stage_mil_program(
 
 
 def _compile_mlpackage(pkg_path: Path, out_dir: Path) -> Path:
-    cmd = ["xcrun", "coremlc", "compile", str(pkg_path), str(out_dir)]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    return out_dir / (pkg_path.stem + ".mlmodelc")
+    """Compile a saved `.mlpackage` into `out_dir/<stem>.mlmodelc` without Xcode's `coremlc` CLI."""
+    import coremltools as ct
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    compiled_tmp = Path(ct.utils.compile_model(str(pkg_path)))
+    dst = out_dir / (pkg_path.stem + ".mlmodelc")
+    if compiled_tmp.resolve() == dst.resolve():
+        return dst
+    if dst.exists():
+        shutil.rmtree(dst)
+    try:
+        shutil.move(str(compiled_tmp), str(dst))
+    except Exception:
+        shutil.rmtree(compiled_tmp, ignore_errors=True)
+        raise
+    return dst
 
 
 def _parse_seq_lens(raw: Sequence[str | int]) -> tuple[int, ...]:

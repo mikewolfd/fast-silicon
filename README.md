@@ -5,7 +5,7 @@
 `fast-silicon` is a `uv` workspace of focused inference engines, CLI tools, OpenAI-compatible HTTP servers, and resumable Parquet pipelines built on Apple MLX, CoreML (16-core Neural Engine), and Metal 4. By scheduling work across GPU and ANE without heavy PyTorch runtime bloat, the suite embeds at **183K tok/s** (**0.51 ms** single query; **215K tok/s** standalone OCR), holds **32K**-context embeddings in **2.69 GB** (**1.61x–2.16x** vs `pplx-context-mlx-f16`), extracts strict JSON with **Gemma-4 E2B** (**2.45x** raw / **4.90x** schema-valid vs `mlx_vlm`), and serves **GPT-OSS-20B** at **431.0 tok/s** across `128` parallel documents (**2.73x** vs `mlx_lm`). It also ships a unified monorepo benchmark and `RUSAGE_INFO_V4` memory-footprint harness ([`scripts/benchmark_monorepo.py`](scripts/benchmark_monorepo.py)).
 
 > [!NOTE]
-> **Tested Hardware Baseline (`Mac16,8` — `48 GB` Apple M4 Pro):** Built and verified on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` unified RAM, `14` CPU `[10P + 4E]`, `20` GPU, `16` ANE `h16g` cores, macOS 26.6 / Metal 4). Other Apple Silicon chips and memory sizes are untested and emit a non-fatal startup note (`FAST_SILICON_NO_HW_WARN=1` to mute).
+> **Tested Hardware Baseline (`Mac16,8` — `48 GB` Apple M4 Pro):** Built and verified on a **14-inch MacBook Pro (`Mac16,8`)** with **Apple M4 Pro** (`48 GB` unified RAM, `14` CPU `[10P + 4E]`, `20` GPU, `16` ANE `h16g` cores, macOS 26.6 / Metal 4), plus a partial hardware cross-check on **Apple M5 (`Mac17,2`, `24 GB`, macOS 27.2.1)** ([comparison below](#cross-chip-comparison-apple-m5-mac172-24-gb-macos-2721)). Other Apple Silicon chips and memory sizes emit a non-fatal startup note (`FAST_SILICON_NO_HW_WARN=1` to mute).
 
 ## Quick start
 
@@ -141,6 +141,34 @@ Full 6-package showcase on M4 Pro (`Mac16,8`, `48 GB`, post-remediation sweep re
 | `transformers-mps-bf16` (Public) | `BF16` | `8` | — | — | `9.42 q/s` | `106.12 ms/q` | `1.505 GB` | `5.308 GB` | `1.00x` | Public MPS (`load=10.934 s`) |
 | `transformers-mps-bf16` (Public) | `BF16` | `1` | — | — | `8.87 q/s` | — | — | — | `0.94x` | Public single-stream baseline |
 
+### Cross-Chip Comparison: Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`)
+
+We cross-checked the compute-bound NAX architecture on a base **Apple M5 (`Mac17,2`, `24 GB`, `10` GPU `Apple10` w/ NAX, `16` ANE `h17`, `macOS 27.2.1`, Xcode CLT-only)** against the M4 Pro baseline:
+
+| `fast-silicon-probe` Metric | M4 Pro (`Mac16,8`, `48 GB`, `20` GPU) | Base M5 (`Mac17,2`, `24 GB`, `10` GPU NAX) | M5 vs M4 Pro |
+|---|---:|---:|---|
+| Peak GPU TFLOPS (`BF16`/`FP16`/`Q4` `M=512..2048`) | **7.42 TF** (`BF16 M=512 6.87`, `FP16 M=2048 6.76`, `Q4 M=512 6.40`) | **12.25 TF** `FP16 M=512` (`BF16 M=2048 12.15`, `Q8 13.48`, `Q4 14.49`) | **`1.65x`** peak FP16 (`2.26x` Q4 `M=512`; `mpp_bf M=128 11.24 TF`) |
+| Effective DRAM Bandwidth | **210.2 GB/s** (`182.9 GB/s` copy) | **137.3 GB/s** (`129.0 GB/s` copy) | **`0.65x`** (`1.53x` higher on M4 Pro) |
+| Empirical Roofline Ridge | **35.3 FLOP/B** | **89.2 FLOP/B** | **`2.53x`** higher arithmetic intensity needed on M5 |
+| Single-Token Matmul (`M=1`) | **1.21 TF** @ `0.028 ms` (`Q4`) / `0.19 TF` @ `0.173 ms` (`BF16`) | `0.46 TF` @ `0.072 ms` (`Q4`) / `0.12 TF` @ `0.283 ms` (`BF16`) | **`2.63x`** `Q4` / **`1.58x`** `BF16` faster on M4 Pro (bandwidth-bound) |
+
+- **Why each chip wins where it does:** M5's NAX matrix engines double GPU dense/batched throughput despite half the GPU cores (`+80%` `emb2` GPU, `+45%` `pplx doc_s256` GPU, `+35%` `doc_s4096` GPU, `+32%` `pplx mixed`), while M4 Pro's `1.53x` higher memory bandwidth and lower ANE dispatch overhead win single-token (`M=1`) matmuls and `B=1` single-query ANE latency. Because M5 `s4096` GPU reaches `9,652 tok/s` vs `ANE` scaling up with chunk parallelism, `gpu-bf16`/`gpu-no-mmap` lead pure `doc_s4096` on M5 while `hetero2` still leads mixed workloads (`1.331x` vs `gpu-bf16`).
+
+| Package / Workload | M4 Pro (`Mac16,8`) | Base M5 (`Mac17,2`) | M5 Speedup / Notes |
+|---|---:|---:|---|
+| `fast-bge-small` (`hetero` / `gpu` / `ane`) | `183,015` / `115,632` / `59,209 tok/s` | **197,452** / `145,936` / `63,873 tok/s` | **`1.08x`** `hetero` (`1.26x` `gpu`, `1.08x` `ane`); `0.993 GB` Metal / `1.844 GB` OS |
+| `fast-bge-small` `B=1` (`ane` / `gpu`) | **0.506 ms** / `1.985 ms` | `0.79 ms` / **1.62 ms** (`2.07x` ANE vs GPU) | M4 Pro **`1.56x`** lower `B=1` ANE latency; M5 GPU `1.23x` faster |
+| `fast-embeddinggemma-2` (`hetero` / `gpu` / `ane`) | `35,717` / `17,105` / `21,321 tok/s` | **49,475** / `30,847` / `21,890 tok/s` | **`1.39x`** `hetero` (`1.80x` `gpu`, `1.03x` `ane`); `1.341 GB` Metal / `2.761 GB` OS |
+| `fast-embeddinggemma-2` `B=1` (`ane` / `gpu`) | **2.171 ms** / `7.806 ms` | `2.58 ms` / **5.09 ms** (`1.97x` ANE vs GPU) | M4 Pro `1.19x` lower ANE `B=1`; M5 GPU `1.53x` faster |
+| `fast-pplx` `query_b1` (`ane` / `gpu` / `gpu-bf16`) | **4.18** / `7.70` / `9.91 ms` | `5.52` (`0.245 GB`) / **5.57** (`0.762 GB`) / `6.10 ms` | M4 Pro `1.32x` lower ANE; M5 GPU `1.38x` faster (`-0.509 GB` `mmap`) |
+| `fast-pplx` `doc_s256` (`hetero2` / `ane` / `gpu`) | `14,620.6` / `14,883.7` / `9,772.6 tok/s` | **15,234.7** (`16.80 ms`) / `15,101.0` / `14,144.6 tok/s` | **`1.45x`** `gpu`, `1.04x` `hetero2`; `0.245 GB` OS (`ane`) |
+| `fast-pplx` `doc_s4096` (`gpu-no-mmap` / `gpu` / `hetero2`) | `~7,160–7,531 tok/s` | **9,697.4** (`422.38 ms`) / `9,652.0` (`3.073 GB`) / `9,637.1 tok/s` | M5 NAX **`+28%–35%`** at `4K` (`-0.465 GB` `mmap`; `gpu-bf16 9,673.0`) |
+| `fast-pplx` `mixed` (`24x~128 + 4x2048`) | `12,624.1 tok/s` (`961.81 ms`) | **16,720.7 tok/s** (`726.16 ms`) | **`1.32x`** vs M4 Pro (`1.331x` vs M5 `gpu-bf16`) |
+| `fast-decision-models` `laya_ane` (`W8A16` ANE `P=4`, `n=64`) | `42.03 q/s` (`23.80 ms/q`) | **44.4 q/s** (`22.52 ms/q`, `1.4413 s`) | **`1.06x`** pure ANE (`kev_08b` not staged on `24 GB` M5) |
+
+> [!NOTE]
+> **M5 Scope & Known `h17` CoreML Difference:** `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HuggingFace baseline tokenizers were not staged on the `24 GB` M5 test machine. On M5 `h17` (`macOS 27.2.1`), `emb2_pk_s{32,64,128}_w8` bundles compile with `CPU=1` (`ios18.transpose->out_h` falls back to CPU while `S=192..512` stay `CPU=0`), so `test_coreml_error_propagation_and_mlcomputeplan` flags that strict zero-CPU invariant (`38/39` pass in `fast-embeddinggemma-2` on M5).
+
 ## Hardware Suites, Weight Setup & Serialization
 
 Model weights and compiled `.mlmodelc` bundles live outside git. Stage artifacts per package (`<cli> setup-weights` / `setup-ane`), then run serialized hardware validation:
@@ -169,7 +197,7 @@ make sync-clean-check  # Also fail if any sibling ../fast-* checkout has uncommi
 make leak-check        # Fail on private domain tokens or local absolute user paths
 ```
 
-**Scope & not tested:** Verified on Apple M4 Pro (`Mac16,8`, `48 GB`, macOS 26.6). Untested on M1/M2/M3/M4 Max/M5 Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
+**Scope & not tested:** Full suite verified on Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`). Partial hardware verification on Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, Xcode CLT-only) covers `fast-shared`, `fast-bge-small`, `fast-pplx`, and `fast-decision-models` (`laya_ane`) plus `38/39` of `fast-embeddinggemma-2` (`s32`/`s64`/`s128` trailing transpose falls back to `CPU=1` on `h17`), with `kev_08b`, `fast-gemma4` E2B, `gpt-oss-20b`, and HF public baselines un-staged. Untested on M1/M2/M3/M4 Max/Ultra/M5 Pro/Max Macs, Linux, x86/CUDA, or concurrent unserialized hardware workloads.
 
 ## Acknowledgments
 

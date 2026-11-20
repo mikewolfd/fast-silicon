@@ -175,6 +175,14 @@ def _run_cmd(argv: list[str], *, timeout: float = 2.0) -> str:
         return ""
 
 
+def _has_apple_developer_tools() -> bool:
+    """Return True when Xcode or Command Line Tools are configured (avoids `xcrun` GUI popups)."""
+    if platform.system() != "Darwin":
+        return False
+    dev_dir = os.environ.get("DEVELOPER_DIR") or _run_cmd(["xcode-select", "-p"])
+    return bool(dev_dir)
+
+
 def _sysctl(key: str) -> str:
     if platform.system() != "Darwin":
         return ""
@@ -398,7 +406,7 @@ def probe_host_hardware() -> dict[str, Any]:
     if not macos_version and sys_name == "Darwin":
         macos_version = platform.mac_ver()[0] or ""
     macos_build = _run_cmd(["sw_vers", "-buildVersion"]) if sys_name == "Darwin" else ""
-    xcode_sdk_version = _run_cmd(["xcrun", "--show-sdk-version"]) if sys_name == "Darwin" else ""
+    xcode_sdk_version = _run_cmd(["xcrun", "--show-sdk-version"]) if _has_apple_developer_tools() else ""
 
     metal_caps = _probe_metal_device_caps()
     mlx_info = _probe_mlx_runtime()

@@ -836,6 +836,24 @@ def _inspect_compiled_bundle(
     }
 
 
+def compile_mlpackage_in_process(pkg_path: Path, dst_mc: Path) -> Path:
+    """Compile a saved `.mlpackage` to `dst_mc` via `coremltools.utils.compile_model` (no Xcode `coremlcompiler` CLI)."""
+    import coremltools as ct
+
+    dst_mc.parent.mkdir(parents=True, exist_ok=True)
+    compiled_tmp = Path(ct.utils.compile_model(str(pkg_path)))
+    if compiled_tmp.resolve() == dst_mc.resolve():
+        return dst_mc
+    if dst_mc.exists():
+        shutil.rmtree(dst_mc)
+    try:
+        shutil.move(str(compiled_tmp), str(dst_mc))
+    except Exception:
+        shutil.rmtree(compiled_tmp, ignore_errors=True)
+        raise
+    return dst_mc
+
+
 def compile_ane_bundles_from_npz(
     *,
     fp16_npz_path: Path,
@@ -879,7 +897,7 @@ def compile_ane_bundles_from_npz(
         if mc.exists():
             shutil.rmtree(mc)
         model_obj.save(str(pkg))
-        subprocess.check_call(["xcrun", "coremlcompiler", "compile", str(pkg), str(out_ane_dir)])
+        compile_mlpackage_in_process(pkg, mc)
         if not keep_mlpackage and pkg.exists():
             shutil.rmtree(pkg)
         if lib_ane_prefix is not None and compute_precision_mode == "fp16_safe":

@@ -350,13 +350,15 @@ def test_mlp_dispatch_16_to_64_and_64x64_prefill_cpu() -> None:
     assert fg4_kernels.mpp_fused_geglu_bf16_v4 is fs_mpp_bf16.mpp_fused_geglu_bf16
     with (
         patch.object(fs_mpp_bf16, "mx", fake_mx),
+        patch.object(fs_mpp_bf16, "_mpp_bf16_supported", return_value=True),
+        patch.object(fs_mpp_bf16, "_is_apple10_nax", return_value=False),
         patch.object(fs_mpp_bf16, "make_mpp_bf16_geglu_kernel", side_effect=_fake_make_geglu_kern),
         patch.object(fs_mpp_bf16, "fused_geglu_split", side_effect=_fake_fused_geglu_split),
         patch.object(fg4_kernels, "mx", fake_mx),
         patch.object(fg4_kernels, "mpp_linear_bf16", side_effect=_fake_mpp_linear),
         patch.object(fg4_kernels, "fused_geglu_split", side_effect=_fake_fused_geglu_split),
     ):
-        # 1. Direct mpp_fused_geglu_bf16_v4 sweeps
+        # 1. Direct mpp_fused_geglu_bf16_v4 sweeps (Apple9 min_m=16 + Apple10 min_m=64 thresholds)
         for M in (0, 1, 8, 15, 16, 20, 24, 32, 48, 64, 80, 96, 97, 128, 512):
             geglu_calls.clear()
             mpp_lin_calls.clear()
@@ -380,6 +382,20 @@ def test_mlp_dispatch_16_to_64_and_64x64_prefill_cpu() -> None:
             if M > 0:
                 ref = _cpu_geglu(x.data @ w_g.data.T, x.data @ w_u.data.T)
                 assert np.allclose(got.data, ref, atol=1e-5)
+
+        # Apple10 (NAX) default min_m=64: M=32 uses fused_geglu_split, M=64 enters 32x32 MPP
+        with patch.object(fs_mpp_bf16, "_is_apple10_nax", return_value=True):
+            for M_nax, use_mpp in ((32, False), (64, True)):
+                geglu_calls.clear()
+                fused_split_calls.clear()
+                x_nax = _FakeArray(rng.standard_normal((M_nax, K)).astype(np.float32) * 0.2, dtype=fake_mx.bfloat16)
+                got_nax = fg4_kernels.mpp_fused_geglu_bf16_v4(x_nax, w_g, w_u, w_gu, m32_cutoff=96)
+                ref_nax = _cpu_geglu(x_nax.data @ w_g.data.T, x_nax.data @ w_u.data.T)
+                assert np.allclose(got_nax.data, ref_nax, atol=1e-5)
+                if use_mpp:
+                    assert geglu_calls == [(32, 32, 64, H)] and not fused_split_calls
+                else:
+                    assert not geglu_calls and fused_split_calls == [32]
 
         # Divisibility guard: H not divisible by 32 falls back to MLX
         geglu_calls.clear()

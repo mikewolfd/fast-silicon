@@ -66,7 +66,7 @@ def test_stdlib_only_top_level_import() -> None:
         "print('OK')"
     )
     proc = subprocess.run(
-        ["/usr/bin/python3", "-B", "-I", "-S", "-c", code],
+        [sys.executable, "-B", "-I", "-S", "-c", code],
         capture_output=True,
         text=True,
         check=True,

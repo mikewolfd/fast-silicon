@@ -2071,3 +2071,45 @@ def test_parquet_resume_manifest_and_skill_scripts_cpu(tmp_path: Path) -> None:
     ab_spec.loader.exec_module(ab)
     for sym in ("get_unified_memory_footprint", "peak_footprint_gb", "wired_limit", "collect_env_telemetry"):
         assert hasattr(ab, sym)
+
+
+def test_no_clt_xcrun_gate_and_quiescence_self_pid_exclusion_cpu(monkeypatch: Any) -> None:
+    import os
+    import subprocess
+    from fast_shared import bench as fs_bench
+    from fast_shared import hw_check as fs_hw
+
+    calls: list[list[str]] = []
+
+    def _fake_run_cmd(argv: list[str], *, timeout: float = 2.0) -> str:
+        calls.append(list(argv))
+        if argv[:2] == ["xcode-select", "-p"]:
+            return ""
+        if argv[:2] == ["sw_vers", "-productVersion"]:
+            return "27.2.1"
+        if argv[:2] == ["sw_vers", "-buildVersion"]:
+            return "26B131"
+        return ""
+
+    monkeypatch.delenv("DEVELOPER_DIR", raising=False)
+    monkeypatch.setattr(fs_hw.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(fs_hw, "_run_cmd", _fake_run_cmd)
+    assert fs_hw._has_apple_developer_tools() is False
+    host = fs_hw.probe_host_hardware()
+    assert host["xcode_sdk_version"] is None
+    assert not any(c and c[0] == "xcrun" for c in calls), f"Unexpected xcrun call without CLT: {calls}"
+
+    monkeypatch.setenv("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
+    assert fs_hw._has_apple_developer_tools() is True
+
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
+    fake_ps = "\n".join([
+        "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND",
+        f"user {self_pid} 85.0 1.0 100 200 ?? R 10:00 0:10 /venv/bin/python -c import mlx.core as mx",
+        f"user {parent_pid} 45.0 0.5 100 200 ?? R 10:00 0:10 /venv/bin/python scripts/benchmark_monorepo.py",
+        "user 999999 42.0 1.0 100 200 ?? R 10:00 0:10 /venv/bin/python -c import mlx.core as mx",
+    ])
+    monkeypatch.setattr(fs_bench.subprocess, "check_output", lambda *a, **kw: fake_ps)
+    warnings = fs_bench.check_system_quiescence()
+    assert len(warnings) == 1 and "PID=999999" in warnings[0], f"Unexpected quiescence warnings: {warnings}"

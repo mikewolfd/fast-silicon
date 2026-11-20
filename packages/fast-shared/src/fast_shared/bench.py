@@ -149,11 +149,21 @@ def collect_env_telemetry() -> dict[str, Any]:
     }
 
 
-def _classify_quiescence_line(line: str) -> str | None:
+def _classify_quiescence_line(
+    line: str,
+    *,
+    ignore_pids: frozenset[int] | set[int] = frozenset(),
+) -> str | None:
     """Return a formatted warning if a `ps aux` line indicates active GPU/CPU contention."""
     parts = line.split(None, 10)
     if len(parts) < 11:
         return None
+    if ignore_pids:
+        try:
+            if int(parts[1]) in ignore_pids:
+                return None
+        except ValueError:
+            pass
     try:
         cpu = float(parts[2])
     except ValueError:
@@ -184,9 +194,10 @@ def _classify_quiescence_line(line: str) -> str | None:
 def check_system_quiescence() -> list[str]:
     """Return active GPU/CPU contention warning lines from `ps aux` (empty if clear)."""
     out = subprocess.check_output(["ps", "aux"], text=True, stderr=subprocess.DEVNULL)
+    self_pids = frozenset({os.getpid(), os.getppid()})
     warnings: list[str] = []
     for line in out.splitlines()[1:]:
-        warn = _classify_quiescence_line(line)
+        warn = _classify_quiescence_line(line, ignore_pids=self_pids)
         if warn is not None:
             warnings.append(warn)
     return warnings

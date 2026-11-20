@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -35,7 +36,7 @@ def test_stdlib_only_modules_import_without_third_party_packages() -> None:
         "for banned in ('mlx', 'numpy', 'pyarrow', 'tokenizers', 'llguidance', 'torch'):\n"
         "    assert banned not in sys.modules, f'Unexpected import: {banned}'\n"
     )
-    proc = subprocess.run(["/usr/bin/python3", "-B", "-I", "-S", "-c", code], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, "-B", "-I", "-S", "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
 
 
@@ -49,7 +50,10 @@ def test_rolling_doc_order_matches_admission() -> None:
 
 def test_helper_hands_each_document_its_own_matcher_in_admission_order() -> None:
     paths = resolve_paths()
-    tok_json = paths.resolve_tokenizer_json()
+    try:
+        tok_json = paths.resolve_tokenizer_json(local_files_only=True)
+    except (FileNotFoundError, OSError) as exc:
+        pytest.skip(f"Missing tokenizer.json: {exc}")
     if not Path(tok_json).exists():
         pytest.skip(f"Missing {tok_json}")
     tok = FastGemma4Tokenizer(tok_json)

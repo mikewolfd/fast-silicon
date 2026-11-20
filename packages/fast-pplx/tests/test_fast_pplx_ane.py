@@ -622,6 +622,63 @@ def test_build_ane_coreml_mil_emits_normal_fp16_eps_when_coremltools_installed()
     assert bam.FP16_MIN_NORMAL >= 6.1e-5
 
 
+def test_build_ane_compile_mlpackage_uses_in_process_compiler_without_xcrun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ct = pytest.importorskip("coremltools")
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+    import ast
+    import subprocess as sp
+
+    tree = ast.parse(_BUILD_ANE_PATH.read_text(encoding="utf-8"))
+    call_consts = {
+        sub.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+    }
+    assert not (call_consts & {"xcrun", "coremlc", "coremlcompiler"})
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
+    def _tiny_prog(x):
+        return mb.add(x=x, y=np.float32(1.0), name="y")
+
+    ml = ct.convert(
+        _tiny_prog,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.macOS15,
+    )
+    pkg = tmp_path / "tiny_stage.mlpackage"
+    ml.save(str(pkg))
+    out_dir = tmp_path / "compiled"
+    stale = out_dir / "tiny_stage.mlmodelc"
+    stale.mkdir(parents=True)
+    (stale / "stale.txt").write_text("stale", encoding="utf-8")
+
+    orig_run = sp.run
+    orig_check_call = sp.check_call
+
+    def _forbid_xcrun(orig_fn):
+        def _wrapper(cmd, *args, **kwargs):
+            head = Path(str(cmd[0])).name if isinstance(cmd, (list, tuple)) and cmd else str(cmd)
+            assert head not in {"xcrun", "coremlc", "coremlcompiler"}, f"Forbidden Xcode CLI call: {cmd}"
+            return orig_fn(cmd, *args, **kwargs)
+        return _wrapper
+
+    monkeypatch.setattr(sp, "run", _forbid_xcrun(orig_run))
+    monkeypatch.setattr(sp, "check_call", _forbid_xcrun(orig_check_call))
+
+    bam = _load_script_module("fast_pplx_build_ane_models_compile", _BUILD_ANE_PATH)
+    dst = bam._compile_mlpackage(pkg, out_dir)
+    assert dst == stale
+    assert dst.is_dir()
+    assert not (dst / "stale.txt").exists()
+    assert (dst / "model.mil").is_file() or (dst / "coremldata.bin").is_file()
+
+
 def test_native_ane_cli_zip_bit3_and_alignment_and_error_propagation(tmp_path: Path) -> None:
     import io
     import subprocess

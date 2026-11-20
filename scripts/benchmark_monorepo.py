@@ -407,9 +407,17 @@ def _cmd_out_quiet(cmd: Sequence[str], *, timeout: float = 2.5) -> str:
         return ""
 
 
+def _has_apple_developer_tools() -> bool:
+    if platform.system() != "Darwin":
+        return False
+    dev_dir = os.environ.get("DEVELOPER_DIR") or _cmd_out_quiet(["xcode-select", "-p"])
+    return bool(dev_dir)
+
+
 def collect_environment_metadata(python_exe: str | None = None) -> dict[str, Any]:
     """Capture host OS, Xcode SDK, chip/RAM, Python, MLX version, and NAX/TF32 env flags."""
     is_darwin = platform.system() == "Darwin"
+    has_dev_tools = _has_apple_developer_tools()
     py = python_exe or sys.executable
     mlx_ver = _cmd_out_quiet(
         [py, "-c", "import mlx.core as mx; print(getattr(mx, '__version__', ''))"],
@@ -422,8 +430,8 @@ def collect_environment_metadata(python_exe: str | None = None) -> dict[str, Any
         "machine": platform.machine(),
         "macos_version": _cmd_out_quiet(["sw_vers", "-productVersion"]) if is_darwin else None,
         "macos_build": _cmd_out_quiet(["sw_vers", "-buildVersion"]) if is_darwin else None,
-        "xcode_sdk_version": _cmd_out_quiet(["xcrun", "--show-sdk-version"]) if is_darwin else None,
-        "xcode_sdk_build": _cmd_out_quiet(["xcrun", "--show-sdk-build-version"]) if is_darwin else None,
+        "xcode_sdk_version": (_cmd_out_quiet(["xcrun", "--show-sdk-version"]) or None) if has_dev_tools else None,
+        "xcode_sdk_build": (_cmd_out_quiet(["xcrun", "--show-sdk-build-version"]) or None) if has_dev_tools else None,
         "chip": _cmd_out_quiet(["sysctl", "-n", "machdep.cpu.brand_string"]) if is_darwin else platform.processor(),
         "hw_model": _cmd_out_quiet(["sysctl", "-n", "hw.model"]) if is_darwin else platform.machine(),
         "mem_gb": mem_gb,
