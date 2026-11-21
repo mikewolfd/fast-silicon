@@ -37,6 +37,16 @@ from fast_shared import (
     resolve_dynamic_execution_plan,
     select_speculative_policy,
     validate_grpo_ane_offload,
+    HostMemorySnapshot,
+    LiveMemoryGovernor,
+    MemoryAdaptation,
+    advise_nocache_paths,
+    compute_memory_adaptation,
+    estimate_host_memory_bytes,
+    nocache_open,
+    read_file_nocache,
+    sample_host_memory,
+    set_fd_nocache,
 )
 
 _HW_APPLE9_48GB_266 = {
@@ -729,3 +739,223 @@ def test_dynamic_policy_default_probe_host_hardware_called_once_cpu(monkeypatch:
     assert one_shot.mtp_enabled is False
     assert one_shot.memory_limit_gb == pytest.approx(19.2)
     assert math.isfinite(one_shot.hetero2_gpu_share)
+
+
+def test_mach_host_memory_sampling_and_estimate_arithmetic_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    snap = sample_host_memory()
+    assert isinstance(snap, HostMemorySnapshot)
+    assert snap.page_size_bytes > 0
+    if sys.platform == "darwin":
+        assert snap.source == "mach_host_statistics64"
+        assert snap.host_mem_bytes > 0
+        assert snap.available_bytes > 0
+        assert snap.healthy_bytes > 0
+        assert snap.phys_footprint_bytes > 0
+        assert snap.compression_credit_bytes >= 0
+        assert snap.pressure_level in {"normal", "warning", "critical"}
+        assert math.isfinite(snap.uma_fraction) and 0.0 <= snap.uma_fraction <= 1.0
+        assert math.isfinite(snap.host_headroom_fraction) and 0.0 <= snap.host_headroom_fraction <= 1.0
+
+    # Exact Splash estimateHostMemory arithmetic checks
+    ps = 16384
+    avail_no_comp, healthy_no_comp, cred0 = estimate_host_memory_bytes(
+        free_pages=100,
+        speculative_pages=10,
+        external_pages=20,
+        purgeable_pages=5,
+        internal_pages=80,
+        compressor_pages=0,
+        compressed_pages=0,
+        page_size_bytes=ps,
+        enable_compression_credit=True,
+    )
+    # reclaimable = (100 - 10) + 20 + 5 = 115; comp_occ == 0 -> credit = 80 // 2 = 40
+    assert cred0 == 40 * ps
+    assert avail_no_comp == (115 + 40) * ps
+    assert healthy_no_comp == (115 + 20) * ps
+
+    # High compression (comp_stored // 2 >= comp_occ) -> half anonymous pages credited
+    avail_hi, _, cred_hi = estimate_host_memory_bytes(
+        free_pages=50,
+        speculative_pages=5,
+        external_pages=10,
+        purgeable_pages=0,
+        internal_pages=60,
+        compressor_pages=10,
+        compressed_pages=24,
+        page_size_bytes=ps,
+        enable_compression_credit=True,
+    )
+    assert cred_hi == 30 * ps
+    assert avail_hi == (55 + 30) * ps
+
+    # Low/no savings (comp_stored <= comp_occ) -> 0 credit
+    avail_low, healthy_low, cred_low = estimate_host_memory_bytes(
+        free_pages=50,
+        speculative_pages=5,
+        external_pages=10,
+        purgeable_pages=0,
+        internal_pages=60,
+        compressor_pages=10,
+        compressed_pages=10,
+        page_size_bytes=ps,
+        enable_compression_credit=True,
+    )
+    assert cred_low == 0 and avail_low == 55 * ps and healthy_low == 55 * ps
+
+    # Critical disables compression credit when called with enable_compression_credit=False
+    avail_off, _, cred_off = estimate_host_memory_bytes(
+        free_pages=100,
+        speculative_pages=0,
+        external_pages=0,
+        purgeable_pages=0,
+        internal_pages=80,
+        compressor_pages=10,
+        compressed_pages=40,
+        page_size_bytes=ps,
+        enable_compression_credit=False,
+    )
+    assert cred_off == 0 and avail_off == 100 * ps
+
+    # Non-Darwin fallback path
+    monkeypatch.setattr(rl.sys, "platform", "linux")
+    fb = sample_host_memory()
+    assert fb.source == "fallback" and fb.pressure_level == "unknown" and fb.host_mem_bytes == 0
+
+
+def _fake_snap(
+    *,
+    host_mem_gb: float = 24.0,
+    available_gb: float = 12.0,
+    healthy_gb: float = 10.0,
+    phys_gb: float = 4.0,
+    file_backed_gb: float = 4.0,
+    file_cache_min_gb: float = 0.5,
+    pressure: str = "normal",
+) -> HostMemorySnapshot:
+    host_b = int(host_mem_gb * (1 << 30))
+    avail_b = int(available_gb * (1 << 30))
+    phys_b = int(phys_gb * (1 << 30))
+    return HostMemorySnapshot(
+        platform="darwin",
+        page_size_bytes=16384,
+        host_mem_bytes=host_b,
+        available_bytes=avail_b,
+        healthy_bytes=int(healthy_gb * (1 << 30)),
+        phys_footprint_bytes=phys_b,
+        compressed_bytes=0,
+        file_backed_bytes=int(file_backed_gb * (1 << 30)),
+        inactive_bytes=0,
+        file_cache_minimum_bytes=int(file_cache_min_gb * (1 << 30)),
+        free_pages=100,
+        speculative_pages=0,
+        external_pages=100,
+        purgeable_pages=0,
+        internal_pages=100,
+        compressor_pages=0,
+        compressed_pages=0,
+        compression_credit_bytes=0,
+        pressure_level=pressure,  # type: ignore[arg-type]
+        pressure_code={"normal": 1, "warning": 2, "critical": 4}.get(pressure, 0),
+        uma_fraction=phys_b / float(host_b),
+        host_headroom_fraction=avail_b / float(host_b),
+        source="synthetic",
+    )
+
+
+def test_live_memory_governor_adaptation_hysteresis_and_mlx_hooks_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1. Healthy headroom preserves full B_slots and cache limit
+    ad_ok = compute_memory_adaptation(
+        base_b_slots=128,
+        base_cache_limit_mb=256,
+        snapshot=_fake_snap(host_mem_gb=24.0, available_gb=14.0, healthy_gb=12.0, phys_gb=4.0),
+    )
+    assert isinstance(ad_ok, MemoryAdaptation)
+    assert ad_ok.b_slots == 128 and ad_ok.cache_limit_mb == 256
+    assert ad_ok.throttle_tier == "none" and ad_ok.should_clear_cache is False
+
+    # 2. OS background warning with ample headroom trims cache only (preserves B_slots)
+    ad_bg_warn = compute_memory_adaptation(
+        base_b_slots=256,
+        base_cache_limit_mb=256,
+        snapshot=_fake_snap(host_mem_gb=48.0, available_gb=9.0, healthy_gb=6.5, phys_gb=0.2, pressure="warning"),
+    )
+    assert ad_bg_warn.b_slots == 256 and ad_bg_warn.cache_limit_mb == 128
+    assert ad_bg_warn.throttle_tier == "mild" and ad_bg_warn.should_clear_cache is True
+
+    # 3. Approaching 80% UMA (mild at >=65% = 15.6 GB on 24 GB) narrows slots to 3/4
+    ad_mild = compute_memory_adaptation(
+        base_b_slots=128,
+        base_cache_limit_mb=256,
+        snapshot=_fake_snap(host_mem_gb=24.0, available_gb=6.0, healthy_gb=5.0, phys_gb=16.0),
+    )
+    assert ad_mild.throttle_tier == "mild" and ad_mild.b_slots == 96 and ad_mild.cache_limit_mb == 128
+
+    # 4. Warn (>=72% UMA or healthy < warn headroom or active OS warning) halves B_slots & clears cache
+    ad_warn = compute_memory_adaptation(
+        base_b_slots=128,
+        base_cache_limit_mb=256,
+        snapshot=_fake_snap(host_mem_gb=24.0, available_gb=4.0, healthy_gb=2.0, phys_gb=17.5, pressure="warning"),
+    )
+    assert ad_warn.throttle_tier == "warn" and ad_warn.b_slots == 64
+    assert ad_warn.cache_limit_mb == 128 and ad_warn.should_clear_cache is True
+
+    # 5. Critical (>=80% UMA cliff on 24 GB = 19.2 GB, or OS critical) quarters B_slots & caps cache <= 64 MB
+    ad_crit = compute_memory_adaptation(
+        base_b_slots=128,
+        base_cache_limit_mb=256,
+        min_b_slots=4,
+        snapshot=_fake_snap(host_mem_gb=24.0, available_gb=2.5, healthy_gb=1.8, phys_gb=19.4, pressure="normal"),
+    )
+    assert ad_crit.throttle_tier == "critical" and ad_crit.b_slots == 32
+    assert ad_crit.cache_limit_mb == 64 and ad_crit.should_clear_cache is True
+
+    # 6. Stateful hysteresis: critical -> 1 healthy poll stays throttled -> 2nd healthy poll relaxes!
+    cache_calls: list[int] = []
+    clear_calls: list[int] = []
+    monkeypatch.setattr("fast_shared.embeddings.set_mlx_cache_limit", lambda mb: cache_calls.append(int(mb)))
+    monkeypatch.setattr("fast_shared.bench.clear_mlx_arena", lambda mb: clear_calls.append(int(mb)))
+
+    gov = LiveMemoryGovernor(poll_interval_sec=0.0, clean_polls_to_relax=2)
+    ad_crit_snap = _fake_snap(phys_gb=19.5)
+    step1 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=ad_crit_snap)
+    assert step1.throttle_tier == "critical" and step1.b_slots == 32
+    assert cache_calls[-1] == 64 and clear_calls == [0]
+
+    healthy_snap = _fake_snap(host_mem_gb=24.0, available_gb=14.0, healthy_gb=12.0, phys_gb=4.0)
+    step2 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=healthy_snap)
+    assert step2.throttle_tier == "critical" and step2.reason.startswith("hysteresis_hold")
+    step3 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=healthy_snap)
+    assert step3.throttle_tier == "none" and step3.b_slots == 128 and cache_calls[-1] == 256
+    assert gov.stats()["adaptations_triggered"] >= 1 and gov.stats()["pressure_events"] >= 1 and gov.stats()["cache_clears"] >= 1
+    assert ad_crit_snap.uma_fraction >= 0.80
+
+    # 7. DynamicSiliconPolicy convenience wrappers propagate snapshot cleanly
+    pol = DynamicSiliconPolicy(hw=_HW_APPLE10_24GB_2721)
+    assert isinstance(pol.sample_host_memory(), HostMemorySnapshot)
+    pol_ad = pol.adapt_runtime_limits(base_b_slots=64, snapshot=_fake_snap(phys_gb=19.5))
+    assert pol_ad.b_slots == 16 and pol_ad.throttle_tier == "critical"
+
+
+def test_nocache_io_helpers_parity_and_guards_cpu(tmp_path) -> None:
+    payload = (b"FastSiliconNoCacheShardHeader\n" + bytes(range(256)) * 2048)[: 600 * 1024]
+    p = tmp_path / "shard.bin"
+    p.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="unbuffered"):
+        with nocache_open(p, "r", buffering=0):
+            pass
+
+    got_read = read_file_nocache(p, chunk_size=65536)
+    assert got_read == payload
+
+    with nocache_open(p, "rb") as fh:
+        assert fh.read() == payload
+
+    with nocache_open(p, "r", encoding="utf-8", errors="ignore") as tfh:
+        assert len(tfh.read()) > 0
+
+    assert advise_nocache_paths([p, tmp_path / "missing.bin"]) == 1
+    assert set_fd_nocache(-1, True) is False

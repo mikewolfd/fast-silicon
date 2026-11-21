@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 import copy
 from dataclasses import dataclass
@@ -13,6 +13,7 @@ from pathlib import Path
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -27,7 +28,13 @@ from .parquet_pipeline import (
     resolve_text_column,
     slice_ocr_pages_utf8,
 )
-from .runtime_lessons import DEFAULT_MLX_CACHE_LIMIT_MB, DynamicSiliconPolicy
+from .runtime_lessons import (
+    DEFAULT_MLX_CACHE_LIMIT_MB,
+    WIRED_MEMORY_CEILING_FRACTION,
+    DynamicSiliconPolicy,
+    LiveMemoryGovernor,
+    nocache_open,
+)
 
 
 @dataclass
@@ -237,6 +244,377 @@ def _resolve_effective_schema(
     return json.dumps(pruned, ensure_ascii=False) if isinstance(json_schema, str) else pruned
 
 
+class _SchemaResolver:
+    """Cache normalized JSON schemas and parsed dicts across multi-schema batches."""
+
+    def __init__(
+        self,
+        engine: Any,
+        default_schema: str | dict[str, Any] | None,
+        *,
+        compact_optional_schema: bool,
+        emit_extractconf: bool,
+    ) -> None:
+        self._compact = _resolve_compact_optional_schema(engine, compact_optional_schema)
+        self._emit_extractconf = bool(emit_extractconf)
+        self._cache: dict[tuple[str, str], tuple[str | dict[str, Any], Mapping[str, Any] | None, str]] = {}
+        self.default_raw = default_schema
+        self.default_spec, self.default_dict, self.default_key = self._resolve_uncached(default_schema)
+
+    def _resolve_uncached(
+        self, raw_spec: str | Mapping[str, Any] | None
+    ) -> tuple[str | dict[str, Any] | None, Mapping[str, Any] | None, str | None]:
+        if raw_spec is None:
+            return None, None, None
+        eff: str | dict[str, Any]
+        if isinstance(raw_spec, str):
+            raw_key = ("str", raw_spec)
+            cached = self._cache.get(raw_key)
+            if cached is not None:
+                return cached
+            if self._compact:
+                pruned = prune_optional_nullable_fields(raw_spec)
+                eff = json.dumps(pruned, ensure_ascii=False)
+                parsed_dict: Mapping[str, Any] | None = pruned if self._emit_extractconf else None
+            else:
+                eff = raw_spec
+                parsed_dict = parse_json_schema_dict(eff) if self._emit_extractconf else None
+            canon_key = eff
+        else:
+            raw_dict = dict(raw_spec)
+            raw_str = json.dumps(raw_dict, sort_keys=True, ensure_ascii=False)
+            raw_key = ("dict", raw_str)
+            cached = self._cache.get(raw_key)
+            if cached is not None:
+                return cached
+            if self._compact:
+                eff = prune_optional_nullable_fields(raw_dict)
+                canon_key = json.dumps(eff, sort_keys=True, ensure_ascii=False)
+            else:
+                eff = raw_dict
+                canon_key = raw_str
+            parsed_dict = eff if self._emit_extractconf else None
+        out = (eff, parsed_dict, canon_key)
+        self._cache[raw_key] = out
+        return out
+
+    def resolve(
+        self, raw_spec: str | Mapping[str, Any] | None
+    ) -> tuple[str | dict[str, Any] | None, Mapping[str, Any] | None, str | None]:
+        if raw_spec is None:
+            return self.default_spec, self.default_dict, self.default_key
+        if raw_spec is self.default_raw:
+            return self.default_spec, self.default_dict, self.default_key
+        return self._resolve_uncached(raw_spec)
+
+
+def _resolve_memory_governor(
+    memory_governor: LiveMemoryGovernor | bool | None,
+    uma_ceiling_fraction: float,
+    *,
+    engine: Any = None,
+) -> LiveMemoryGovernor | None:
+    if isinstance(memory_governor, LiveMemoryGovernor):
+        return memory_governor
+    if not memory_governor:
+        return None
+    if engine is not None and not (
+        _engine_supports_rolling(engine)
+        or hasattr(engine, "tokenizer")
+        or hasattr(engine, "model")
+        or hasattr(engine, "engine")
+    ):
+        return None
+    return LiveMemoryGovernor(uma_ceiling_fraction=uma_ceiling_fraction)
+
+
+def _engine_supports_rolling(engine: Any) -> bool:
+    return (
+        callable(getattr(engine, "run_rolling", None))
+        and callable(getattr(engine, "encode_prompts", None))
+        and callable(getattr(engine, "get_grammar", None))
+        and callable(getattr(getattr(engine, "tokenizer", None), "decode", None))
+    )
+
+
+def _resolve_effective_thinking(
+    *,
+    enable_thinking: bool,
+    has_schema: bool,
+    clean_extra: Mapping[str, Any],
+) -> bool:
+    eff_thinking = bool(enable_thinking)
+    if not eff_thinking and not has_schema:
+        effort = clean_extra.get("reasoning_effort")
+        budget = clean_extra.get("reasoning_budget")
+        if effort is not None and str(effort).strip().lower() not in ("", "none", "skip", "off", "0"):
+            return True
+        if budget is not None and int(budget) > 0:
+            return True
+    return eff_thinking
+
+
+def _execute_rolling_batch(
+    engine: Any,
+    prompts: Sequence[str],
+    *,
+    pre_encoded_ids: list[list[int]] | None,
+    system_prompt: str,
+    entry_schemas: Sequence[str | dict[str, Any] | None],
+    grammar_cache: dict[tuple[Any, ...], Any],
+    max_tokens: int,
+    temperature: float,
+    whitespace_flexible: bool | None,
+    max_whitespace_run: int | None,
+    b_slots: int,
+    sort_by_length: bool,
+    clean_extra: Mapping[str, Any],
+    use_chat_template: bool,
+    enable_thinking: bool,
+) -> tuple[Any, list[int]]:
+    """Run pre-tokenized, per-doc-schema rolling decode directly via `engine.run_rolling`."""
+    n_docs = len(prompts)
+    if n_docs == 0:
+        return SimpleNamespace(items=[], stats={"docs": 0, "decode_sec": 0.0}), []
+
+    def _get_gh(spec: str | dict[str, Any]) -> Any:
+        s_key = spec if isinstance(spec, str) else json.dumps(spec, sort_keys=True, ensure_ascii=False)
+        ck = (id(engine), s_key, whitespace_flexible, max_whitespace_run)
+        hit = grammar_cache.get(ck)
+        if hit is not None:
+            return hit
+        try:
+            gh_obj = engine.get_grammar(
+                spec,
+                whitespace_flexible=whitespace_flexible,
+                max_whitespace_run=max_whitespace_run,
+            )
+        except TypeError:
+            gh_obj = engine.get_grammar(spec, whitespace_flexible=whitespace_flexible)
+        grammar_cache[ck] = gh_obj
+        return gh_obj
+
+    prompt_ids_list = (
+        [list(ids) for ids in pre_encoded_ids]
+        if pre_encoded_ids is not None
+        else [
+            list(ids)
+            for ids in engine.encode_prompts(
+                prompts,
+                system_prompt=system_prompt,
+                use_chat_template=use_chat_template,
+                enable_thinking=enable_thinking,
+            )
+        ]
+    )
+
+    non_none = [s for s in entry_schemas if s is not None]
+    if not non_none:
+        single_gh = None
+        resolved_grammars: list[Any] | None = None
+        upfront_by_doc: list[list[int]] = [[] for _ in range(n_docs)]
+    elif len(non_none) == n_docs and len(
+        {s if isinstance(s, str) else json.dumps(s, sort_keys=True, ensure_ascii=False) for s in non_none}
+    ) == 1:
+        single_gh = _get_gh(non_none[0])
+        resolved_grammars = None
+        up_list = list(getattr(single_gh, "upfront_ff", ()))
+        upfront_by_doc = [list(up_list) for _ in range(n_docs)]
+    else:
+        single_gh = None
+        resolved_grammars = [None if s is None else _get_gh(s) for s in entry_schemas]
+        upfront_by_doc = [
+            [] if g is None else list(getattr(g, "upfront_ff", ()))
+            for g in resolved_grammars
+        ]
+
+    if sort_by_length and n_docs > 1:
+        order = sorted(
+            range(n_docs),
+            key=lambda i: (-(len(prompt_ids_list[i]) + len(upfront_by_doc[i])), i),
+        )
+    else:
+        order = list(range(n_docs))
+
+    prompt_ids_ord = [prompt_ids_list[i] for i in order]
+    upfront_ord = [upfront_by_doc[i] for i in order]
+    grammars_ord = [resolved_grammars[i] for i in order] if resolved_grammars is not None else None
+
+    bos_id = int(getattr(engine.tokenizer, "bos_token_id", 2))
+    prompt_ids_ord = [
+        x if (x or upfront_ord[i]) else [bos_id]
+        for i, x in enumerate(prompt_ids_ord)
+    ]
+
+    lcp = min(len(x) for x in prompt_ids_ord)
+    for k in range(lcp):
+        t0_k = prompt_ids_ord[0][k]
+        if any(x[k] != t0_k for x in prompt_ids_ord[1:]):
+            lcp = k
+            break
+    min_raw_len = min(len(x) for x in prompt_ids_ord)
+    if any(not u for u in upfront_ord) and lcp >= min_raw_len:
+        lcp = max(0, min_raw_len - 1)
+
+    sys_ids = prompt_ids_ord[0][:lcp]
+    suf_all = [x[lcp:] + upfront_ord[i] for i, x in enumerate(prompt_ids_ord)]
+    max_suf = max(len(s) for s in suf_all)
+    win_sz = int(getattr(getattr(engine, "model", None), "window_size", 512))
+    roll_swa = 1024 if (clean_extra.get("enable_ff_jump", True) and n_docs <= 4 and (max_suf + max_tokens + 64) > win_sz) else 512
+
+    roll_kw: dict[str, Any] = {
+        "sys_ids": sys_ids,
+        "suf_ids_list": suf_all,
+        "max_tokens": max_tokens,
+        "B_slots": max(1, min(int(b_slots), n_docs)),
+        "swa_ring_cap": roll_swa,
+        "temperature": temperature,
+        "gh": single_gh,
+        "per_doc_grammars": grammars_ord,
+        "sort_by_length": False,
+        "use_ane_ring": clean_extra.get("use_ane_ring", "auto"),
+    }
+    for k in (
+        "top_p",
+        "seed",
+        "kv_i8",
+        "ane_cohort_size",
+        "enable_ff_jump",
+        "collect_telemetry",
+        "collect_valid_lse",
+        "override_memory_cap",
+    ):
+        if k in clean_extra:
+            roll_kw[k] = clean_extra[k]
+
+    roll_res = engine.run_rolling(**roll_kw)
+    gen_toks_all = roll_res["gen_toks"]
+    roll_telem = roll_res.get("telemetry")
+    roll_valid_schemas = roll_res.get("valid_schemas")
+
+    items: list[Any] = []
+    valid_json_cnt = 0
+    valid_schema_cnt = 0
+    for idx in range(n_docs):
+        g_toks = gen_toks_all[idx]
+        doc_g = grammars_ord[idx] if grammars_ord is not None else single_gh
+        full_out_ids = upfront_ord[idx] + g_toks
+        txt = engine.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+        parsed = None
+        is_json = False
+        is_schema = doc_g is None
+        try:
+            parsed = json.loads(txt)
+            is_json = True
+            valid_json_cnt += 1
+        except Exception:
+            pass
+        if doc_g is not None:
+            if roll_valid_schemas is not None:
+                is_schema = bool(roll_valid_schemas[idx])
+            else:
+                is_schema = bool(doc_g.validate_token_sequence(full_out_ids))
+        if is_schema:
+            valid_schema_cnt += 1
+        finish_reason = (
+            "length"
+            if len(g_toks) >= max_tokens and not (doc_g is not None and is_schema)
+            else "stop"
+        )
+        telem_i = roll_telem[idx] if (roll_telem is not None and idx < len(roll_telem)) else None
+        items.append(
+            SimpleNamespace(
+                text=txt,
+                parsed=parsed,
+                token_ids=full_out_ids,
+                prompt_tokens=len(prompt_ids_ord[idx]),
+                completion_tokens=len(full_out_ids),
+                valid_json=is_json,
+                valid_schema=is_schema,
+                finish_reason=finish_reason,
+                telemetry=telem_i,
+            )
+        )
+
+    stats = {
+        "docs": n_docs,
+        "valid_json_count": valid_json_cnt,
+        "valid_schema_count": valid_schema_cnt,
+        "prompt_tokens": sum(len(x) for x in prompt_ids_ord),
+        "completion_tokens": int(roll_res.get("tot_out_tok", sum(len(it.token_ids) for it in items))),
+        "decode_sec": float(roll_res.get("decode_sec", 0.0)),
+    }
+    return SimpleNamespace(items=items, stats=stats), order
+
+
+def _generate_batch_with_schema_fallback(
+    engine: Any,
+    prompts: Sequence[str],
+    *,
+    entry_schemas: Sequence[str | dict[str, Any] | None],
+    fallback_schema: str | dict[str, Any] | None,
+    base_gen_kw: Mapping[str, Any],
+    accepts_per_doc: bool,
+    eff_b_slots: int,
+) -> Any:
+    """Route multi-schema batches natively via `per_doc_grammars` or group cleanly by schema."""
+    distinct_specs = {
+        (
+            s
+            if isinstance(s, str)
+            else (json.dumps(s, sort_keys=True, ensure_ascii=False) if s is not None else None)
+        ): s
+        for s in entry_schemas
+    }
+    single_schema = next(iter(distinct_specs.values())) if len(distinct_specs) == 1 else fallback_schema
+    kw = dict(base_gen_kw)
+    if len(distinct_specs) <= 1:
+        kw["json_schema"] = single_schema
+        return engine.generate_batch(prompts, **kw)
+    if accepts_per_doc:
+        kw["json_schema"] = single_schema
+        kw["per_doc_grammars"] = list(entry_schemas)
+        return engine.generate_batch(prompts, **kw)
+
+    grouped: dict[str | None, list[int]] = {}
+    for idx_e, sc in enumerate(entry_schemas):
+        sk = sc if isinstance(sc, str) else (json.dumps(sc, sort_keys=True, ensure_ascii=False) if sc is not None else None)
+        grouped.setdefault(sk, []).append(idx_e)
+
+    combined_items: list[Any] = [None] * len(prompts)
+    combined_stats: dict[str, float] = {
+        "docs": 0,
+        "valid_json_count": 0,
+        "valid_schema_count": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "decode_sec": 0.0,
+    }
+    for idx_list in grouped.values():
+        g_kw = dict(kw)
+        g_kw["json_schema"] = entry_schemas[idx_list[0]]
+        g_kw["batch_size"] = min(len(idx_list), eff_b_slots)
+        sub_res = engine.generate_batch([prompts[k] for k in idx_list], **g_kw)
+        for pos_sub, orig_e in enumerate(idx_list):
+            combined_items[orig_e] = sub_res.items[pos_sub]
+        sub_stats = getattr(sub_res, "stats", {}) or {}
+        combined_stats["docs"] += int(sub_stats.get("docs", len(sub_res.items)))
+        combined_stats["valid_json_count"] += int(
+            sub_stats.get("valid_json_count", sum(1 for it in sub_res.items if it.valid_json))
+        )
+        combined_stats["valid_schema_count"] += int(
+            sub_stats.get("valid_schema_count", sum(1 for it in sub_res.items if it.valid_schema))
+        )
+        combined_stats["prompt_tokens"] += int(
+            sub_stats.get("prompt_tokens", sum(it.prompt_tokens for it in sub_res.items))
+        )
+        combined_stats["completion_tokens"] += int(
+            sub_stats.get("completion_tokens", sum(it.completion_tokens for it in sub_res.items))
+        )
+        combined_stats["decode_sec"] += float(sub_stats.get("decode_sec", 0.0))
+    return SimpleNamespace(items=combined_items, stats=combined_stats)
+
+
 def _resolve_default_b_slots(engine: Any) -> int:
     for attr in ("default_max_b_slots", "max_b_slots"):
         val = getattr(engine, attr, None)
@@ -419,6 +797,13 @@ def extract_parquet(
     json_schema: str | dict[str, Any] | None = None,
     compact_optional_schema: bool = False,
     text_col: str | None = None,
+    schema_col: str | None = None,
+    per_doc_grammars: (
+        Callable[[Mapping[str, Any]], str | dict[str, Any] | None]
+        | Mapping[Any, str | dict[str, Any] | None]
+        | Sequence[str | dict[str, Any] | None]
+        | None
+    ) = None,
     keep_cols: list[str] | None = None,
     drop_text_col: bool = False,
     mode: str | None = None,
@@ -432,6 +817,7 @@ def extract_parquet(
     max_tokens: int = 512,
     temperature: float = 0.0,
     whitespace_flexible: bool | None = None,
+    max_whitespace_run: int | None = None,
     max_chars: int | None = None,
     max_pages: int = 0,
     filter_ocr: bool = False,
@@ -442,6 +828,11 @@ def extract_parquet(
     extractconf_calibrator: ExtractConfCalibrator | None = None,
     mlx_cache_limit_mb: int | None = DEFAULT_MLX_CACHE_LIMIT_MB,
     use_wired_limit: bool = True,
+    use_rolling: bool | str = "auto",
+    lookahead_batches: int | None = None,
+    memory_governor: LiveMemoryGovernor | bool | None = True,
+    uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
+    use_nocache: bool = False,
     **extra_gen_kwargs: Any,
 ) -> ParquetExtractSummary:
     """Stream-extract structured JSON from Parquet input(s) with overlapped reader/GPU/writer threads."""
@@ -485,11 +876,17 @@ def extract_parquet(
         done_ids = {k for k, ok in status_by_id.items() if ok}
 
     eff_ws = resolve_engine_whitespace_flexible(engine, whitespace_flexible)
-    eff_schema = _resolve_effective_schema(engine, json_schema, compact_optional_schema)
-    eff_schema_dict: Mapping[str, Any] | None = (
-        parse_json_schema_dict(eff_schema) if emit_extractconf else None
+    schema_resolver = _SchemaResolver(
+        engine,
+        json_schema,
+        compact_optional_schema=compact_optional_schema,
+        emit_extractconf=emit_extractconf,
     )
+    eff_schema = schema_resolver.default_spec
+    eff_schema_dict = schema_resolver.default_dict
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
+    if max_whitespace_run is not None:
+        clean_extra.setdefault("max_whitespace_run", int(max_whitespace_run))
     if emit_extractconf and "collect_telemetry" not in clean_extra and _engine_accepts_explicit_kwarg(engine, "collect_telemetry"):
         clean_extra["collect_telemetry"] = True
     roll_kw = clean_extra.get("roll_slots")
@@ -507,21 +904,39 @@ def extract_parquet(
         if gpu_batch_size is not None
         else (bs_extra if bs_extra is not None else roll_default)
     )
-    eff_window_rows = (
-        int(batch_rows)
-        if batch_rows is not None
-        else max(int(macro_window_rows), eff_gpu_batch_size)
+    eff_lookahead = (
+        max(1, int(lookahead_batches))
+        if lookahead_batches is not None
+        else (8 if (batch_rows is not None and int(batch_rows) >= 16) else 1)
     )
+    if batch_rows is not None:
+        if int(batch_rows) < 1:
+            raise ValueError(f"Macro-window / batch_rows size must be >= 1, got {batch_rows}")
+        if eff_lookahead > 1:
+            eff_window_rows = min(max(int(macro_window_rows), eff_gpu_batch_size), int(batch_rows) * eff_lookahead)
+        else:
+            eff_window_rows = int(batch_rows)
+    else:
+        eff_window_rows = max(int(macro_window_rows), eff_gpu_batch_size)
     if eff_window_rows < 1:
         raise ValueError(f"Macro-window / batch_rows size must be >= 1, got {eff_window_rows}")
 
-    prep_queue: queue.Queue[tuple[pa.Table, list[str | None]] | None | BaseException] = queue.Queue(maxsize=2)
+    governor = _resolve_memory_governor(memory_governor, uma_ceiling_fraction, engine=engine)
+    eff_cache_mb = DEFAULT_MLX_CACHE_LIMIT_MB if mlx_cache_limit_mb is None else int(mlx_cache_limit_mb)
+    engine_can_roll = _engine_supports_rolling(engine)
+    eff_use_chat = bool(clean_extra.get("use_chat_template", True))
+    eff_mode = str(mode or getattr(engine, "default_mode", "auto") or "auto").lower()
+    accepts_per_doc = _engine_accepts_explicit_kwarg(engine, "per_doc_grammars")
+
+    prep_queue: queue.Queue[tuple[pa.Table, list[str | None], list[Any] | None] | None | BaseException] = queue.Queue(maxsize=2)
+    ready_queue: queue.Queue[dict[str, Any] | None | BaseException] = queue.Queue(maxsize=2)
     write_queue: queue.Queue[pa.Table | None] = queue.Queue(maxsize=2)
     reader_stop = threading.Event()
+    tok_stop = threading.Event()
     writer_abort = threading.Event()
     writer_err: list[BaseException] = []
 
-    def _put_prep(item: tuple[pa.Table, list[str | None]] | None | BaseException) -> bool:
+    def _put_prep(item: tuple[pa.Table, list[str | None], list[Any] | None] | None | BaseException) -> bool:
         while not reader_stop.is_set():
             try:
                 prep_queue.put(item, timeout=0.05)
@@ -534,101 +949,113 @@ def extract_parquet(
         try:
             acc_tables: list[pa.Table] = []
             acc_prompts: list[str | None] = []
+            acc_schemas: list[Any] | None = [] if schema_col is not None else None
             acc_rows = 0
 
             def _flush_window() -> bool:
-                nonlocal acc_tables, acc_prompts, acc_rows
+                nonlocal acc_tables, acc_prompts, acc_schemas, acc_rows
                 if not acc_tables:
                     return True
                 merged = acc_tables[0] if len(acc_tables) == 1 else pa.concat_tables(acc_tables)
                 prompts_out = acc_prompts
+                schemas_out = acc_schemas
                 acc_tables = []
                 acc_prompts = []
+                acc_schemas = [] if schema_col is not None else None
                 acc_rows = 0
-                return _put_prep((merged, prompts_out))
+                return _put_prep((merged, prompts_out, schemas_out))
 
+            read_batch_sz = int(batch_rows) if batch_rows is not None else eff_window_rows
             for fpath in in_files:
                 if reader_stop.is_set():
                     return
-                pf = pq.ParquetFile(fpath)
-                schema = pf.schema_arrow
-                tcol = resolve_llm_text_column(schema, text_col)
-                avail = set(schema.names)
-                meta_cols = (
-                    [c for c in keep_cols if c in avail]
-                    if keep_cols is not None
-                    else [c for c in schema.names if not (drop_text_col and c == tcol)]
-                )
-                meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
-                read_cols = list(dict.fromkeys(meta_cols + [tcol]))
-                for extra in ("is_ocr", "ocr_pages", "page_offsets"):
-                    if extra in avail and extra not in read_cols:
-                        read_cols.append(extra)
+                with ExitStack() as fstack:
+                    if use_nocache:
+                        fh = fstack.enter_context(nocache_open(fpath, "rb", buffering=0))
+                        pf = pq.ParquetFile(fh)
+                    else:
+                        pf = pq.ParquetFile(fpath)
+                    schema = pf.schema_arrow
+                    tcol = resolve_llm_text_column(schema, text_col)
+                    avail = set(schema.names)
+                    if schema_col is not None and schema_col not in avail:
+                        raise KeyError(f"Schema column {schema_col!r} not found in {fpath}; available={schema.names}")
+                    meta_cols = (
+                        [c for c in keep_cols if c in avail]
+                        if keep_cols is not None
+                        else [c for c in schema.names if not (drop_text_col and c == tcol)]
+                    )
+                    meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
+                    read_cols = list(dict.fromkeys(meta_cols + [tcol] + ([schema_col] if schema_col is not None else [])))
+                    for extra in ("is_ocr", "ocr_pages", "page_offsets"):
+                        if extra in avail and extra not in read_cols:
+                            read_cols.append(extra)
 
-                for rb in _iter_filtered_batches(
-                    pf,
-                    read_cols=read_cols,
-                    batch_size=eff_window_rows,
-                    done_ids=done_ids,
-                    resume_key_col=resume_key_col,
-                    filter_ocr=filter_ocr,
-                ):
-                    if reader_stop.is_set():
-                        return
+                    for rb in _iter_filtered_batches(
+                        pf,
+                        read_cols=read_cols,
+                        batch_size=read_batch_sz,
+                        done_ids=done_ids,
+                        resume_key_col=resume_key_col,
+                        filter_ocr=filter_ocr,
+                    ):
+                        if reader_stop.is_set():
+                            return
 
-                    texts_raw = rb.column(tcol).to_pylist()
-                    offsets_col = rb.column("page_offsets").to_pylist() if "page_offsets" in rb.schema.names else None
-                    ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in rb.schema.names else None
+                        texts_raw = rb.column(tcol).to_pylist()
+                        sch_col_vals = rb.column(schema_col).to_pylist() if schema_col is not None else None
+                        offsets_col = rb.column("page_offsets").to_pylist() if "page_offsets" in rb.schema.names else None
+                        ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in rb.schema.names else None
 
-                    kept_indices: list[int] = []
-                    prompts: list[str | None] = []
-                    for i in range(rb.num_rows):
-                        t = texts_raw[i] if isinstance(texts_raw[i], str) else ""
-                        if ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
-                            t = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
-                        elif max_pages > 0 and offsets_col is not None:
-                            t = slice_first_pages_utf8(t, offsets_col[i], max_pages)
-                        if max_chars is not None and int(max_chars) > 0 and len(t) > int(max_chars):
-                            t = t[: int(max_chars)]
-                        if not t.strip():
-                            if skip_empty:
-                                continue
-                            kept_indices.append(i)
-                            prompts.append(None)
-                        else:
-                            kept_indices.append(i)
-                            prompts.append(t)
+                        kept_indices: list[int] = []
+                        prompts: list[str | None] = []
+                        kept_schemas: list[Any] | None = [] if sch_col_vals is not None else None
+                        for i in range(rb.num_rows):
+                            t = texts_raw[i] if isinstance(texts_raw[i], str) else ""
+                            if ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
+                                t = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
+                            elif max_pages > 0 and offsets_col is not None:
+                                t = slice_first_pages_utf8(t, offsets_col[i], max_pages)
+                            if max_chars is not None and int(max_chars) > 0 and len(t) > int(max_chars):
+                                t = t[: int(max_chars)]
+                            if not t.strip():
+                                if skip_empty:
+                                    continue
+                                kept_indices.append(i)
+                                prompts.append(None)
+                                if kept_schemas is not None and sch_col_vals is not None:
+                                    kept_schemas.append(sch_col_vals[i])
+                            else:
+                                kept_indices.append(i)
+                                prompts.append(t)
+                                if kept_schemas is not None and sch_col_vals is not None:
+                                    kept_schemas.append(sch_col_vals[i])
 
-                    if not kept_indices:
-                        continue
+                        if not kept_indices:
+                            continue
 
-                    meta_tbl = pa.Table.from_batches([rb.take(kept_indices)]).select(meta_only_cols)
-                    # Emit bounded macro-windows of up to `eff_window_rows`
-                    cursor = 0
-                    total_rb = meta_tbl.num_rows
-                    while cursor < total_rb:
-                        space = eff_window_rows - acc_rows
-                        take_n = min(space, total_rb - cursor)
-                        acc_tables.append(meta_tbl.slice(cursor, take_n))
-                        acc_prompts.extend(prompts[cursor : cursor + take_n])
-                        acc_rows += take_n
-                        cursor += take_n
-                        if acc_rows >= eff_window_rows:
-                            if not _flush_window():
-                                return
+                        meta_tbl = pa.Table.from_batches([rb.take(kept_indices)]).select(meta_only_cols)
+                        cursor = 0
+                        total_rb = meta_tbl.num_rows
+                        while cursor < total_rb:
+                            space = eff_window_rows - acc_rows
+                            take_n = min(space, total_rb - cursor)
+                            acc_tables.append(meta_tbl.slice(cursor, take_n))
+                            acc_prompts.extend(prompts[cursor : cursor + take_n])
+                            if acc_schemas is not None and kept_schemas is not None:
+                                acc_schemas.extend(kept_schemas[cursor : cursor + take_n])
+                            acc_rows += take_n
+                            cursor += take_n
+                            if acc_rows >= eff_window_rows:
+                                if not _flush_window():
+                                    return
 
             if acc_rows > 0:
                 _flush_window()
         except BaseException as exc:
-            try:
-                prep_queue.put(exc, timeout=1.0)
-            except queue.Full:
-                pass
+            _put_prep(exc)
         finally:
-            try:
-                prep_queue.put(None, timeout=1.0)
-            except queue.Full:
-                pass
+            _put_prep(None)
 
     shard_idx = next_shard_index(out) if sharded else 0
 
@@ -703,69 +1130,147 @@ def extract_parquet(
             except queue.Full:
                 continue
 
-    docs_processed = 0
-    valid_json_tot = 0
-    valid_schema_tot = 0
-    prompt_toks_tot = 0
-    comp_toks_tot = 0
-    tot_dec_sec = 0.0
-    t0 = time.perf_counter()
+    def _put_ready(item: dict[str, Any] | None | BaseException) -> bool:
+        while not tok_stop.is_set():
+            try:
+                ready_queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
 
-    reader_thread = threading.Thread(target=_reader_worker, daemon=True)
-    writer_thread = threading.Thread(target=_writer_worker, daemon=True)
+    def _resolve_active_schemas(
+        meta_tbl: pa.Table,
+        raw_schemas: list[Any] | None,
+        active_indices: list[int],
+        win_row_offset: int,
+    ) -> tuple[list[str | dict[str, Any] | None], list[Mapping[str, Any] | None], list[str | None], bool]:
+        specs: list[str | dict[str, Any] | None] = []
+        dicts: list[Mapping[str, Any] | None] = []
+        keys: list[str | None] = []
+        is_callable_g = callable(per_doc_grammars)
+        is_mapping_g = isinstance(per_doc_grammars, Mapping)
+        is_seq_g = isinstance(per_doc_grammars, Sequence) and not isinstance(per_doc_grammars, (str, bytes))
+        col_cache: dict[str, list[Any]] | None = None
+        if is_callable_g and active_indices:
+            col_cache = {name: meta_tbl.column(name).to_pylist() for name in meta_tbl.schema.names}
 
-    with ExitStack() as stack:
-        _enter_mlx_limits(
-            stack,
-            mlx_cache_limit_mb=mlx_cache_limit_mb,
-            use_wired_limit=use_wired_limit,
-        )
-        reader_thread.start()
-        writer_thread.start()
+        for idx in active_indices:
+            g_idx = win_row_offset + idx
+            raw_spec: Any = None
+            raw_col_val = raw_schemas[idx] if raw_schemas is not None else None
+            if is_callable_g:
+                assert col_cache is not None
+                row_dict = {name: vals[idx] for name, vals in col_cache.items()}
+                row_dict["_row_index"] = g_idx
+                raw_spec = per_doc_grammars(row_dict)  # type: ignore[operator]
+            elif is_mapping_g:
+                if raw_col_val is not None and raw_col_val in per_doc_grammars:
+                    raw_spec = per_doc_grammars[raw_col_val]
+                elif g_idx in per_doc_grammars:
+                    raw_spec = per_doc_grammars[g_idx]
+                else:
+                    raw_spec = raw_col_val
+            elif is_seq_g:
+                raw_spec = per_doc_grammars[g_idx] if g_idx < len(per_doc_grammars) else raw_col_val
+            else:
+                raw_spec = raw_col_val
+
+            eff_s, eff_d, eff_k = schema_resolver.resolve(raw_spec)
+            specs.append(eff_s)
+            dicts.append(eff_d)
+            keys.append(eff_k)
+
+        distinct_keys = set(keys)
+        has_mixed = len(distinct_keys) > 1 or (len(distinct_keys) == 1 and next(iter(distinct_keys)) != schema_resolver.default_key)
+        return specs, dicts, keys, has_mixed
+
+    def _tok_worker() -> None:
         try:
-            while True:
-                if writer_err:
-                    raise writer_err[0]
-                item = prep_queue.get()
-                if item is None:
+            win_row_offset = 0
+            while not tok_stop.is_set():
+                try:
+                    raw_item = prep_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if raw_item is None:
                     break
-                if isinstance(item, BaseException):
-                    raise item
+                if isinstance(raw_item, BaseException):
+                    _put_ready(raw_item)
+                    return
 
-                meta_tbl, raw_prompts = item
+                meta_tbl, raw_prompts, raw_schemas = raw_item
                 n_win = len(raw_prompts)
-                resp_texts: list[str] = [""] * n_win
-                valid_jsons: list[bool] = [False] * n_win
-                valid_schemas: list[bool] = [False] * n_win
-                finish_reasons: list[str] = ["skipped_empty"] * n_win
-                prompt_toks_col: list[int] = [0] * n_win
-                comp_toks_col: list[int] = [0] * n_win
-                risk_col: list[float] = [0.0] * n_win
-
                 active_indices = [idx for idx, p in enumerate(raw_prompts) if p is not None]
+                prepared: dict[str, Any] = {
+                    "meta_tbl": meta_tbl,
+                    "raw_prompts": raw_prompts,
+                    "active_indices": active_indices,
+                    "unique_entries": [],
+                    "entry_schemas": [],
+                    "entry_schema_dicts": [],
+                    "pre_encoded_ids": None,
+                    "use_roll": False,
+                    "eff_thinking": False,
+                }
                 if active_indices:
+                    act_specs, act_dicts, act_keys, has_mixed_schemas = _resolve_active_schemas(
+                        meta_tbl, raw_schemas, active_indices, win_row_offset
+                    )
                     can_dedup = (
                         bool(dedup_within_window)
                         and float(temperature) == 0.0
                         and len(active_indices) > 1
                     )
                     if can_dedup:
-                        groups_by_prompt: dict[str, list[int]] = {}
-                        for idx in active_indices:
+                        groups: dict[Any, tuple[int, str, str | dict[str, Any] | None, Mapping[str, Any] | None, list[int]]] = {}
+                        for pos, idx in enumerate(active_indices):
                             p_str = str(raw_prompts[idx])
-                            pos_list = groups_by_prompt.get(p_str)
-                            if pos_list is None:
-                                groups_by_prompt[p_str] = [idx]
+                            d_key = (act_keys[pos], p_str) if has_mixed_schemas else p_str
+                            existing = groups.get(d_key)
+                            if existing is None:
+                                groups[d_key] = (idx, p_str, act_specs[pos], act_dicts[pos], [idx])
                             else:
-                                pos_list.append(idx)
-                        unique_entries: list[tuple[int, str, list[int]]] = [
-                            (pos_list[0], p_str, pos_list)
-                            for p_str, pos_list in groups_by_prompt.items()
-                        ]
+                                existing[4].append(idx)
+                        unique_items = list(groups.values())
                     else:
-                        unique_entries = [(idx, str(raw_prompts[idx]), [idx]) for idx in active_indices]
+                        unique_items = [
+                            (idx, str(raw_prompts[idx]), act_specs[pos], act_dicts[pos], [idx])
+                            for pos, idx in enumerate(active_indices)
+                        ]
 
-                    if sort_by_length and len(unique_entries) > 1:
+                    unique_entries = [(it[0], it[1], it[4]) for it in unique_items]
+                    entry_schemas = [it[2] for it in unique_items]
+                    entry_schema_dicts = [it[3] for it in unique_items]
+                    has_any_schema = any(s is not None for s in entry_schemas)
+                    eff_thinking = _resolve_effective_thinking(
+                        enable_thinking=bool(clean_extra.get("enable_thinking", False)),
+                        has_schema=has_any_schema,
+                        clean_extra=clean_extra,
+                    )
+                    use_roll = False
+                    if engine_can_roll:
+                        if use_rolling is True:
+                            use_roll = True
+                        elif str(use_rolling).strip().lower() == "auto":
+                            use_roll = (
+                                not eff_thinking
+                                and (has_any_schema or len(unique_entries) > 4 or speculative is False)
+                                and eff_mode != "hetero"
+                            )
+
+                    pre_encoded_ids: list[list[int]] | None = None
+                    if use_roll:
+                        pre_encoded_ids = [
+                            list(ids)
+                            for ids in engine.encode_prompts(
+                                [e[1] for e in unique_entries],
+                                system_prompt=system_prompt,
+                                use_chat_template=eff_use_chat,
+                                enable_thinking=eff_thinking,
+                            )
+                        ]
+                    elif sort_by_length and len(unique_entries) > 1:
                         count_fn = getattr(engine, "count_tokens_batch", None)
                         tok_counts: list[int] | None = None
                         if callable(count_fn):
@@ -782,30 +1287,144 @@ def extract_parquet(
                                 range(len(unique_entries)),
                                 key=lambda i: (-len(unique_entries[i][1].encode("utf-8")), unique_entries[i][0]),
                             )
+                        unique_entries = [unique_entries[i] for i in order]
+                        entry_schemas = [entry_schemas[i] for i in order]
+                        entry_schema_dicts = [entry_schema_dicts[i] for i in order]
+
+                    prepared["unique_entries"] = unique_entries
+                    prepared["entry_schemas"] = entry_schemas
+                    prepared["entry_schema_dicts"] = entry_schema_dicts
+                    prepared["pre_encoded_ids"] = pre_encoded_ids
+                    prepared["use_roll"] = use_roll
+                    prepared["eff_thinking"] = eff_thinking
+                    prepared["has_mixed_schemas"] = has_mixed_schemas
+
+                win_row_offset += n_win
+                if not _put_ready(prepared):
+                    return
+        except BaseException as exc:
+            _put_ready(exc)
+        finally:
+            _put_ready(None)
+
+    docs_processed = 0
+    valid_json_tot = 0
+    valid_schema_tot = 0
+    prompt_toks_tot = 0
+    comp_toks_tot = 0
+    tot_dec_sec = 0.0
+    grammar_cache: dict[tuple[Any, ...], Any] = {}
+    t0 = time.perf_counter()
+
+    reader_thread = threading.Thread(target=_reader_worker, daemon=True)
+    tok_thread = threading.Thread(target=_tok_worker, daemon=True)
+    writer_thread = threading.Thread(target=_writer_worker, daemon=True)
+
+    with ExitStack() as stack:
+        _enter_mlx_limits(
+            stack,
+            mlx_cache_limit_mb=mlx_cache_limit_mb,
+            use_wired_limit=use_wired_limit,
+        )
+        reader_thread.start()
+        tok_thread.start()
+        writer_thread.start()
+        try:
+            while True:
+                if writer_err:
+                    raise writer_err[0]
+                item = ready_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+
+                meta_tbl = item["meta_tbl"]
+                raw_prompts = item["raw_prompts"]
+                active_indices = item["active_indices"]
+                n_win = len(raw_prompts)
+                resp_texts: list[str] = [""] * n_win
+                valid_jsons: list[bool] = [False] * n_win
+                valid_schemas: list[bool] = [False] * n_win
+                finish_reasons: list[str] = ["skipped_empty"] * n_win
+                prompt_toks_col: list[int] = [0] * n_win
+                comp_toks_col: list[int] = [0] * n_win
+                risk_col: list[float] = [0.0] * n_win
+
+                if active_indices:
+                    unique_entries = item["unique_entries"]
+                    entry_schemas = item["entry_schemas"]
+                    entry_schema_dicts = item["entry_schema_dicts"]
+                    pre_encoded_ids = item["pre_encoded_ids"]
+                    use_roll = bool(item["use_roll"])
+                    eff_thinking = bool(item["eff_thinking"])
+
+                    eff_b_slots = eff_gpu_batch_size
+                    clear_thresh_mb = 256
+                    if governor is not None:
+                        adaptation = governor.adapt(
+                            base_b_slots=eff_gpu_batch_size,
+                            base_cache_limit_mb=eff_cache_mb,
+                            apply_mlx=True,
+                        )
+                        eff_b_slots = adaptation.b_slots
+                        clear_thresh_mb = max(0, adaptation.cache_limit_mb)
+
+                    if use_roll:
+                        sorted_prompts = [entry[1] for entry in unique_entries]
+                        res, order = _execute_rolling_batch(
+                            engine,
+                            sorted_prompts,
+                            pre_encoded_ids=pre_encoded_ids,
+                            system_prompt=system_prompt,
+                            entry_schemas=entry_schemas,
+                            grammar_cache=grammar_cache,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            whitespace_flexible=eff_ws,
+                            max_whitespace_run=max_whitespace_run,
+                            b_slots=eff_b_slots,
+                            sort_by_length=sort_by_length,
+                            clean_extra=clean_extra,
+                            use_chat_template=eff_use_chat,
+                            enable_thinking=eff_thinking,
+                        )
                         sorted_entries = [unique_entries[i] for i in order]
+                        sorted_schema_dicts = [entry_schema_dicts[i] for i in order]
                     else:
                         sorted_entries = unique_entries
-                    sorted_prompts = [entry[1] for entry in sorted_entries]
+                        sorted_schema_dicts = entry_schema_dicts
+                        sorted_prompts = [entry[1] for entry in sorted_entries]
+                        base_gen_kw: dict[str, Any] = {
+                            "system_prompt": system_prompt,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                            "whitespace_flexible": eff_ws,
+                            "batch_size": min(len(sorted_prompts), eff_b_slots),
+                            **clean_extra,
+                        }
+                        if max_whitespace_run is not None and not _engine_accepts_explicit_kwarg(engine, "max_whitespace_run"):
+                            base_gen_kw.pop("max_whitespace_run", None)
+                        if mode is not None:
+                            base_gen_kw["mode"] = mode
+                        if speculative is not None:
+                            base_gen_kw["speculative"] = speculative
 
-                    gen_kw: dict[str, Any] = {
-                        "system_prompt": system_prompt,
-                        "json_schema": eff_schema,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "whitespace_flexible": eff_ws,
-                        "batch_size": min(len(sorted_prompts), eff_gpu_batch_size),
-                        **clean_extra,
-                    }
-                    if mode is not None:
-                        gen_kw["mode"] = mode
-                    if speculative is not None:
-                        gen_kw["speculative"] = speculative
-
-                    res = engine.generate_batch(sorted_prompts, **gen_kw)
-                    clear_mlx_arena(256)
+                        res = _generate_batch_with_schema_fallback(
+                            engine,
+                            sorted_prompts,
+                            entry_schemas=entry_schemas,
+                            fallback_schema=eff_schema,
+                            base_gen_kw=base_gen_kw,
+                            accepts_per_doc=accepts_per_doc,
+                            eff_b_slots=eff_b_slots,
+                        )
+                    clear_mlx_arena(clear_thresh_mb)
 
                     dedup_had_repeats = len(sorted_entries) < len(active_indices)
-                    for out_it, (_first_idx, _p_str, orig_positions) in zip(res.items, sorted_entries):
+                    for out_it, (_first_idx, _p_str, orig_positions), item_schema_dict in zip(
+                        res.items, sorted_entries, sorted_schema_dicts
+                    ):
                         r_text = str(out_it.text)
                         v_json = bool(out_it.valid_json)
                         v_schema = bool(out_it.valid_schema)
@@ -823,7 +1442,7 @@ def extract_parquet(
                                 out_it,
                                 parsed=it_parsed,
                                 valid_json=v_json,
-                                json_schema=eff_schema_dict,
+                                json_schema=item_schema_dict,
                                 max_tokens=max_tokens,
                                 calibrator=extractconf_calibrator,
                             )
@@ -880,16 +1499,32 @@ def extract_parquet(
                 raise writer_err[0]
         except BaseException:
             reader_stop.set()
+            tok_stop.set()
             writer_abort.set()
+            for q in (prep_queue, ready_queue):
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
             try:
                 write_queue.put_nowait(None)
             except queue.Full:
                 pass
             writer_thread.join(timeout=5.0)
+            tok_thread.join(timeout=2.0)
             reader_thread.join(timeout=2.0)
             raise
         finally:
             reader_stop.set()
+            tok_stop.set()
+            for q in (prep_queue, ready_queue):
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+            tok_thread.join(timeout=2.0)
             reader_thread.join(timeout=2.0)
             writer_thread.join(timeout=2.0)
             clear_mlx_arena(256)
@@ -918,18 +1553,29 @@ def extract_jsonl(
     json_schema: str | dict[str, Any] | None = None,
     compact_optional_schema: bool = False,
     text_key: str = "text",
+    schema_key: str | None = None,
+    per_doc_grammars: (
+        Callable[[Mapping[str, Any]], str | dict[str, Any] | None]
+        | Mapping[Any, str | dict[str, Any] | None]
+        | Sequence[str | dict[str, Any] | None]
+        | None
+    ) = None,
     mode: str | None = None,
     speculative: bool | None = None,
     batch_size: int | None = None,
     max_tokens: int = 512,
     temperature: float = 0.0,
     whitespace_flexible: bool | None = None,
+    max_whitespace_run: int | None = None,
     response_text_key: str = "output_text",
     response_json_key: str = "parsed",
     emit_extractconf: bool = True,
     extractconf_calibrator: ExtractConfCalibrator | None = None,
     mlx_cache_limit_mb: int | None = DEFAULT_MLX_CACHE_LIMIT_MB,
     use_wired_limit: bool = True,
+    use_rolling: bool | str = "auto",
+    memory_governor: LiveMemoryGovernor | bool | None = True,
+    uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
     **extra_gen_kwargs: Any,
 ) -> dict[str, Any]:
     """Batch-extract structured JSON from a JSON or JSONL file into JSONL."""
@@ -947,11 +1593,42 @@ def extract_jsonl(
 
     prompts = [str(r.get(text_key, "")) for r in records]
     eff_ws = resolve_engine_whitespace_flexible(engine, whitespace_flexible)
-    eff_schema = _resolve_effective_schema(engine, json_schema, compact_optional_schema)
-    eff_schema_dict: Mapping[str, Any] | None = (
-        parse_json_schema_dict(eff_schema) if emit_extractconf else None
+    schema_resolver = _SchemaResolver(
+        engine,
+        json_schema,
+        compact_optional_schema=compact_optional_schema,
+        emit_extractconf=emit_extractconf,
     )
+    eff_schema = schema_resolver.default_spec
+    is_callable_g = callable(per_doc_grammars)
+    is_mapping_g = isinstance(per_doc_grammars, Mapping)
+    is_seq_g = isinstance(per_doc_grammars, Sequence) and not isinstance(per_doc_grammars, (str, bytes))
+    entry_schemas: list[str | dict[str, Any] | None] = []
+    entry_schema_dicts: list[Mapping[str, Any] | None] = []
+    entry_keys: list[str | None] = []
+    for idx, rec in enumerate(records):
+        raw_col = rec.get(schema_key) if schema_key is not None else None
+        if is_callable_g:
+            raw_spec = per_doc_grammars(rec)  # type: ignore[operator]
+        elif is_mapping_g:
+            if raw_col is not None and raw_col in per_doc_grammars:
+                raw_spec = per_doc_grammars[raw_col]
+            elif idx in per_doc_grammars:
+                raw_spec = per_doc_grammars[idx]
+            else:
+                raw_spec = raw_col
+        elif is_seq_g:
+            raw_spec = per_doc_grammars[idx] if idx < len(per_doc_grammars) else raw_col
+        else:
+            raw_spec = raw_col
+        es, ed, ek = schema_resolver.resolve(raw_spec)
+        entry_schemas.append(es)
+        entry_schema_dicts.append(ed)
+        entry_keys.append(ek)
+
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
+    if max_whitespace_run is not None and _engine_accepts_explicit_kwarg(engine, "max_whitespace_run"):
+        clean_extra.setdefault("max_whitespace_run", int(max_whitespace_run))
     if emit_extractconf and "collect_telemetry" not in clean_extra and _engine_accepts_explicit_kwarg(engine, "collect_telemetry"):
         clean_extra["collect_telemetry"] = True
     roll_kw = clean_extra.get("roll_slots")
@@ -964,19 +1641,29 @@ def extract_jsonl(
             else _resolve_default_b_slots(engine)
         )
     )
-    gen_kw: dict[str, Any] = {
-        "system_prompt": system_prompt,
-        "json_schema": eff_schema,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "whitespace_flexible": eff_ws,
-        "batch_size": eff_bs,
-        **clean_extra,
-    }
-    if mode is not None:
-        gen_kw["mode"] = mode
-    if speculative is not None:
-        gen_kw["speculative"] = speculative
+    governor = _resolve_memory_governor(memory_governor, uma_ceiling_fraction, engine=engine)
+    eff_cache_mb = DEFAULT_MLX_CACHE_LIMIT_MB if mlx_cache_limit_mb is None else int(mlx_cache_limit_mb)
+    distinct_keys = set(entry_keys)
+    has_mixed_schemas = len(distinct_keys) > 1 or (
+        len(distinct_keys) == 1 and next(iter(distinct_keys)) != schema_resolver.default_key
+    )
+    has_any_schema = any(s is not None for s in entry_schemas)
+    eff_mode = str(mode or getattr(engine, "default_mode", "auto") or "auto").lower()
+    eff_thinking = _resolve_effective_thinking(
+        enable_thinking=bool(clean_extra.get("enable_thinking", False)),
+        has_schema=has_any_schema,
+        clean_extra=clean_extra,
+    )
+    use_roll = False
+    if _engine_supports_rolling(engine) and records:
+        if use_rolling is True:
+            use_roll = True
+        elif str(use_rolling).strip().lower() == "auto":
+            use_roll = (
+                not eff_thinking
+                and (has_any_schema or len(records) > 4 or speculative is False)
+                and eff_mode != "hetero"
+            )
 
     with ExitStack() as stack:
         _enter_mlx_limits(
@@ -984,13 +1671,68 @@ def extract_jsonl(
             mlx_cache_limit_mb=mlx_cache_limit_mb,
             use_wired_limit=use_wired_limit,
         )
-        res = engine.generate_batch(prompts, **gen_kw)
-        clear_mlx_arena(256)
+        eff_b_slots = eff_bs
+        clear_thresh_mb = 256
+        if governor is not None:
+            adaptation = governor.adapt(
+                base_b_slots=eff_bs,
+                base_cache_limit_mb=eff_cache_mb,
+                apply_mlx=True,
+            )
+            eff_b_slots = adaptation.b_slots
+            clear_thresh_mb = max(0, adaptation.cache_limit_mb)
+
+        if use_roll:
+            grammar_cache: dict[tuple[Any, ...], Any] = {}
+            res_roll, order_roll = _execute_rolling_batch(
+                engine,
+                prompts,
+                pre_encoded_ids=None,
+                system_prompt=system_prompt,
+                entry_schemas=entry_schemas,
+                grammar_cache=grammar_cache,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                whitespace_flexible=eff_ws,
+                max_whitespace_run=max_whitespace_run,
+                b_slots=eff_b_slots,
+                sort_by_length=True,
+                clean_extra=clean_extra,
+                use_chat_template=bool(clean_extra.get("use_chat_template", True)),
+                enable_thinking=eff_thinking,
+            )
+            restored_items: list[Any] = [None] * len(records)
+            for pos_r, orig_r in enumerate(order_roll):
+                restored_items[orig_r] = res_roll.items[pos_r]
+            res = SimpleNamespace(items=restored_items, stats=res_roll.stats)
+        else:
+            gen_kw: dict[str, Any] = {
+                "system_prompt": system_prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "whitespace_flexible": eff_ws,
+                "batch_size": eff_b_slots,
+                **clean_extra,
+            }
+            if mode is not None:
+                gen_kw["mode"] = mode
+            if speculative is not None:
+                gen_kw["speculative"] = speculative
+            res = _generate_batch_with_schema_fallback(
+                engine,
+                prompts,
+                entry_schemas=entry_schemas,
+                fallback_schema=eff_schema,
+                base_gen_kw=gen_kw,
+                accepts_per_doc=_engine_accepts_explicit_kwarg(engine, "per_doc_grammars"),
+                eff_b_slots=eff_b_slots,
+            )
+        clear_mlx_arena(clear_thresh_mb)
 
     tmp_out = out_p.with_name(f".{out_p.name}.tmp.{os.getpid()}")
     try:
         with tmp_out.open("w", encoding="utf-8") as fp:
-            for rec, item in zip(records, res.items):
+            for rec, item, item_schema_dict in zip(records, res.items, entry_schema_dicts):
                 out_row: dict[str, Any] = {
                     **rec,
                     response_text_key: item.text,
@@ -1005,7 +1747,7 @@ def extract_jsonl(
                     out_row["extractconf_risk"] = round(
                         _score_item_extractconf(
                             item,
-                            json_schema=eff_schema_dict,
+                            json_schema=item_schema_dict,
                             max_tokens=max_tokens,
                             calibrator=extractconf_calibrator,
                         ),

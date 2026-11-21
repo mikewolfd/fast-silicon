@@ -29,15 +29,22 @@ training, and RLVR workflows (100% pure Python + NumPy, zero GPU/ANE execution o
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import ctypes
 from dataclasses import dataclass
+import fcntl
 import math
+import os
+from pathlib import Path
 import platform
 import re
+import struct
 import subprocess
+import sys
 import threading
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -46,11 +53,18 @@ from .hw_check import parse_version_tuple, probe_host_hardware, supports_apple10
 
 ProfileMode = Literal["backfill", "interactive"]
 ThermalLevel = Literal["nominal", "fair", "serious", "critical"]
+MemoryPressureLevel = Literal["normal", "warning", "critical", "unknown"]
+ThrottleTier = Literal["none", "mild", "warn", "critical"]
 
 WIRED_MEMORY_CEILING_FRACTION: float = 0.80
 MIN_SHARED_PREFIX_TOKENS: int = 32
 MASK_NEG_VAL_FP16: float = -65504.0
 DEFAULT_MLX_CACHE_LIMIT_MB: int = 256
+MACOS_F_NOCACHE: int = 48
+MACOS_F_RDAHEAD: int = 45
+DISPATCH_MEMORYPRESSURE_NORMAL: int = 1
+DISPATCH_MEMORYPRESSURE_WARN: int = 2
+DISPATCH_MEMORYPRESSURE_CRITICAL: int = 4
 VALID_WORKLOADS: tuple[str, ...] = ("extraction", "qlora", "encoder_train", "grpo")
 VALID_MTP_MODES: tuple[str, ...] = ("auto", "on", "off")
 VALID_PROFILES: tuple[str, ...] = ("backfill", "interactive")
@@ -1566,6 +1580,36 @@ class DynamicSiliconPolicy:
         """Poll host macOS thermal state for sustained multi-hour backfill pacing."""
         return poll_macos_thermal_state()
 
+    def sample_host_memory(self) -> "HostMemorySnapshot":
+        """Sample live Darwin Mach VM headroom, footprint, and memory pressure."""
+        return sample_host_memory()
+
+    def adapt_runtime_limits(
+        self,
+        *,
+        base_b_slots: int,
+        base_cache_limit_mb: int | None = None,
+        min_b_slots: int = 1,
+        uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
+        apply_mlx: bool = False,
+        force_poll: bool = False,
+        snapshot: "HostMemorySnapshot | None" = None,
+    ) -> "MemoryAdaptation":
+        """Adapt active batch slots and MLX cache ceiling before crossing the macOS swap cliff."""
+        gov = getattr(self, "_memory_governor", None)
+        if gov is None:
+            gov = LiveMemoryGovernor(uma_ceiling_fraction=uma_ceiling_fraction, min_b_slots=min_b_slots)
+            self._memory_governor = gov
+        eff_cache = self.mlx_cache_limit_mb if base_cache_limit_mb is None else int(base_cache_limit_mb)
+        return gov.adapt(
+            base_b_slots=base_b_slots,
+            base_cache_limit_mb=eff_cache,
+            min_b_slots=min_b_slots,
+            force_poll=force_poll,
+            apply_mlx=apply_mlx,
+            snapshot=snapshot,
+        )
+
     @property
     def promoted_coreai_targets(self) -> frozenset[tuple[str, int]]:
         """Return immutable view of ``(model_name, batch_size)`` pairs promoted to Core AI."""
@@ -2141,17 +2185,730 @@ def poll_macos_thermal_state() -> ThermalStateSnapshot:
     return _snapshot_from_raw_thermal(0, "fallback")
 
 
+# --- Live Darwin Mach MemoryGovernor & F_NOCACHE Helpers ---
+
+_MACH_HOST_VM_INFO64 = 4
+_MACH_HOST_VM_INFO64_COUNT = 104
+_MACH_TASK_VM_INFO = 22
+_MACH_TASK_VM_INFO_COUNT = 93
+_VM_STAT64_BYTES = _MACH_HOST_VM_INFO64_COUNT * 4  # 416 bytes
+_TASK_VM_INFO_BYTES = _MACH_TASK_VM_INFO_COUNT * 4  # 372 bytes
+
+_LIBSYSTEM_LOCK = threading.Lock()
+_LIBSYSTEM_MOD: Any = None
+_LIBSYSTEM_LOADED: bool = False
+
+
+def _load_libsystem_mach() -> Any | None:
+    """Lazily load and configure Darwin `/usr/lib/libSystem.B.dylib` Mach & sysctl symbols."""
+    global _LIBSYSTEM_MOD, _LIBSYSTEM_LOADED
+    if _LIBSYSTEM_LOADED:
+        return _LIBSYSTEM_MOD
+    with _LIBSYSTEM_LOCK:
+        if _LIBSYSTEM_LOADED:
+            return _LIBSYSTEM_MOD
+        if sys.platform != "darwin":
+            _LIBSYSTEM_LOADED = True
+            return None
+        try:
+            lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            lib.mach_host_self.argtypes = []
+            lib.mach_host_self.restype = ctypes.c_uint32
+            lib.mach_task_self.argtypes = []
+            lib.mach_task_self.restype = ctypes.c_uint32
+            lib.mach_port_deallocate.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            lib.mach_port_deallocate.restype = ctypes.c_int
+            lib.host_page_size.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint)]
+            lib.host_page_size.restype = ctypes.c_int
+            lib.host_statistics64.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.host_statistics64.restype = ctypes.c_int
+            lib.task_info.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.task_info.restype = ctypes.c_int
+            lib.sysctlbyname.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            lib.sysctlbyname.restype = ctypes.c_int
+            _LIBSYSTEM_MOD = lib
+        except Exception:
+            _LIBSYSTEM_MOD = None
+        _LIBSYSTEM_LOADED = True
+        return _LIBSYSTEM_MOD
+
+
+def _sysctl_int(lib: Any, name: bytes) -> int | None:
+    """Read an integer `sysctlbyname` value (`uint32` or `uint64`) cleanly."""
+    buf = ctypes.create_string_buffer(8)
+    size = ctypes.c_size_t(8)
+    if lib.sysctlbyname(name, ctypes.byref(buf), ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value == 4:
+        return int(struct.unpack_from("<I", buf.raw, 0)[0])
+    if size.value == 8:
+        return int(struct.unpack_from("<Q", buf.raw, 0)[0])
+    return None
+
+
+@dataclass(frozen=True)
+class HostMemorySnapshot:
+    """Live Darwin Mach VM headroom, compression credit, task footprint, and OS pressure snapshot."""
+
+    platform: str
+    page_size_bytes: int
+    host_mem_bytes: int
+    available_bytes: int
+    healthy_bytes: int
+    phys_footprint_bytes: int
+    compressed_bytes: int
+    file_backed_bytes: int
+    inactive_bytes: int
+    file_cache_minimum_bytes: int
+    free_pages: int
+    speculative_pages: int
+    external_pages: int
+    purgeable_pages: int
+    internal_pages: int
+    compressor_pages: int
+    compressed_pages: int
+    compression_credit_bytes: int
+    pressure_level: MemoryPressureLevel
+    pressure_code: int
+    uma_fraction: float
+    host_headroom_fraction: float
+    source: str
+
+    @property
+    def host_mem_gb(self) -> float:
+        return float(self.host_mem_bytes) / float(1 << 30)
+
+    @property
+    def available_gb(self) -> float:
+        return float(self.available_bytes) / float(1 << 30)
+
+    @property
+    def healthy_gb(self) -> float:
+        return float(self.healthy_bytes) / float(1 << 30)
+
+    @property
+    def phys_footprint_gb(self) -> float:
+        return float(self.phys_footprint_bytes) / float(1 << 30)
+
+    @property
+    def file_backed_gb(self) -> float:
+        return float(self.file_backed_bytes) / float(1 << 30)
+
+
+@dataclass(frozen=True)
+class MemoryAdaptation:
+    """Adaptive runtime slot/cache limits emitted by `LiveMemoryGovernor`."""
+
+    b_slots: int
+    cache_limit_mb: int
+    should_clear_cache: bool
+    throttle_tier: ThrottleTier
+    uma_fraction: float
+    headroom_fraction: float
+    pressure_level: MemoryPressureLevel
+    reason: str
+
+
+def estimate_host_memory_bytes(
+    *,
+    free_pages: int,
+    speculative_pages: int,
+    external_pages: int,
+    purgeable_pages: int,
+    internal_pages: int,
+    compressor_pages: int,
+    compressed_pages: int,
+    page_size_bytes: int,
+    enable_compression_credit: bool = True,
+) -> tuple[int, int, int]:
+    """Compute `(available_bytes, healthy_bytes, compression_credit_bytes)` from Mach VM page counts."""
+    ps = int(page_size_bytes)
+    free_p = max(0, int(free_pages))
+    spec_p = max(0, int(speculative_pages))
+    if ps <= 0 or spec_p > free_p:
+        return 0, 0, 0
+
+    reclaimable_pages = (free_p - spec_p) + max(0, int(external_pages)) + max(0, int(purgeable_pages))
+    credit_pages = 0
+    if enable_compression_credit:
+        anon_p = max(0, int(internal_pages))
+        comp_occ = max(0, int(compressor_pages))
+        comp_stored = max(0, int(compressed_pages))
+        if comp_occ == 0 or (comp_stored // 2) >= comp_occ:
+            credit_pages = anon_p // 2
+        elif comp_stored <= comp_occ:
+            credit_pages = 0
+        else:
+            credit_pages = max(0, anon_p - (anon_p * comp_occ) // comp_stored)
+
+    available_bytes = (reclaimable_pages + credit_pages) * ps
+    healthy_bytes = (reclaimable_pages + (credit_pages // 2)) * ps
+    return int(available_bytes), int(healthy_bytes), int(credit_pages * ps)
+
+
+def sample_host_memory() -> HostMemorySnapshot:
+    """Query Darwin Mach `host_statistics64(HOST_VM_INFO64)`, `task_info(TASK_VM_INFO)`, and pressure."""
+    plat = sys.platform
+    if plat != "darwin":
+        return HostMemorySnapshot(
+            platform=plat,
+            page_size_bytes=4096,
+            host_mem_bytes=0,
+            available_bytes=0,
+            healthy_bytes=0,
+            phys_footprint_bytes=0,
+            compressed_bytes=0,
+            file_backed_bytes=0,
+            inactive_bytes=0,
+            file_cache_minimum_bytes=0,
+            free_pages=0,
+            speculative_pages=0,
+            external_pages=0,
+            purgeable_pages=0,
+            internal_pages=0,
+            compressor_pages=0,
+            compressed_pages=0,
+            compression_credit_bytes=0,
+            pressure_level="unknown",
+            pressure_code=0,
+            uma_fraction=0.0,
+            host_headroom_fraction=1.0,
+            source="fallback",
+        )
+
+    lib = _load_libsystem_mach()
+    if lib is None:
+        return HostMemorySnapshot(
+            platform=plat,
+            page_size_bytes=16384,
+            host_mem_bytes=0,
+            available_bytes=0,
+            healthy_bytes=0,
+            phys_footprint_bytes=0,
+            compressed_bytes=0,
+            file_backed_bytes=0,
+            inactive_bytes=0,
+            file_cache_minimum_bytes=0,
+            free_pages=0,
+            speculative_pages=0,
+            external_pages=0,
+            purgeable_pages=0,
+            internal_pages=0,
+            compressor_pages=0,
+            compressed_pages=0,
+            compression_credit_bytes=0,
+            pressure_level="unknown",
+            pressure_code=0,
+            uma_fraction=0.0,
+            host_headroom_fraction=1.0,
+            source="fallback",
+        )
+
+    host = lib.mach_host_self()
+    task = lib.mach_task_self()
+    try:
+        ps_c = ctypes.c_uint(0)
+        page_kr = lib.host_page_size(host, ctypes.byref(ps_c))
+        vm_buf = (ctypes.c_uint32 * _MACH_HOST_VM_INFO64_COUNT)()
+        vm_cnt = ctypes.c_uint32(_MACH_HOST_VM_INFO64_COUNT)
+        vm_kr = lib.host_statistics64(host, _MACH_HOST_VM_INFO64, vm_buf, ctypes.byref(vm_cnt))
+
+        task_buf = (ctypes.c_uint32 * _MACH_TASK_VM_INFO_COUNT)()
+        task_cnt = ctypes.c_uint32(_MACH_TASK_VM_INFO_COUNT)
+        task_kr = lib.task_info(task, _MACH_TASK_VM_INFO, task_buf, ctypes.byref(task_cnt))
+    finally:
+        lib.mach_port_deallocate(task, host)
+
+    page_size = int(ps_c.value) if page_kr == 0 and int(ps_c.value) > 0 else 16384
+    if vm_kr == 0:
+        vm_raw = bytes(vm_buf)
+        free_p = int(struct.unpack_from("<I", vm_raw, 0)[0])
+        inactive_p = int(struct.unpack_from("<I", vm_raw, 8)[0])
+        purgeable_p = int(struct.unpack_from("<I", vm_raw, 88)[0])
+        speculative_p = int(struct.unpack_from("<I", vm_raw, 92)[0])
+        compressor_p = int(struct.unpack_from("<I", vm_raw, 128)[0])
+        external_p = int(struct.unpack_from("<I", vm_raw, 136)[0])
+        internal_p = int(struct.unpack_from("<I", vm_raw, 140)[0])
+        compressed_p = int(struct.unpack_from("<Q", vm_raw, 144)[0])
+    else:
+        free_p = inactive_p = purgeable_p = speculative_p = 0
+        compressor_p = external_p = internal_p = compressed_p = 0
+
+    if task_kr == 0:
+        t_raw = bytes(task_buf)
+        compressed_bytes = int(struct.unpack_from("<Q", t_raw, 120)[0])
+        phys_footprint_bytes = int(struct.unpack_from("<Q", t_raw, 144)[0])
+    else:
+        compressed_bytes = 0
+        phys_footprint_bytes = 0
+
+    host_mem_bytes = _sysctl_int(lib, b"hw.memsize") or 0
+    file_cache_min_pages = _sysctl_int(lib, b"vm.vm_page_filecache_min") or 0
+    pressure_raw = _sysctl_int(lib, b"kern.memorystatus_vm_pressure_level")
+    if pressure_raw == DISPATCH_MEMORYPRESSURE_NORMAL:
+        pressure_level: MemoryPressureLevel = "normal"
+    elif pressure_raw == DISPATCH_MEMORYPRESSURE_WARN:
+        pressure_level = "warning"
+    elif pressure_raw == DISPATCH_MEMORYPRESSURE_CRITICAL:
+        pressure_level = "critical"
+    else:
+        pressure_level = "unknown"
+
+    available_bytes, healthy_bytes, credit_bytes = estimate_host_memory_bytes(
+        free_pages=free_p,
+        speculative_pages=speculative_p,
+        external_pages=external_p,
+        purgeable_pages=purgeable_p,
+        internal_pages=internal_p,
+        compressor_pages=compressor_p,
+        compressed_pages=compressed_p,
+        page_size_bytes=page_size,
+        enable_compression_credit=(pressure_level != "critical"),
+    )
+    uma_frac = (
+        float(phys_footprint_bytes) / float(host_mem_bytes)
+        if host_mem_bytes > 0
+        else 0.0
+    )
+    headroom_frac = (
+        min(1.0, float(available_bytes) / float(host_mem_bytes))
+        if host_mem_bytes > 0
+        else 1.0
+    )
+    return HostMemorySnapshot(
+        platform=plat,
+        page_size_bytes=page_size,
+        host_mem_bytes=int(host_mem_bytes),
+        available_bytes=int(available_bytes),
+        healthy_bytes=int(healthy_bytes),
+        phys_footprint_bytes=int(phys_footprint_bytes),
+        compressed_bytes=int(compressed_bytes),
+        file_backed_bytes=int(external_p * page_size),
+        inactive_bytes=int((inactive_p + speculative_p) * page_size),
+        file_cache_minimum_bytes=int(file_cache_min_pages * page_size),
+        free_pages=free_p,
+        speculative_pages=speculative_p,
+        external_pages=external_p,
+        purgeable_pages=purgeable_p,
+        internal_pages=internal_p,
+        compressor_pages=compressor_p,
+        compressed_pages=compressed_p,
+        compression_credit_bytes=int(credit_bytes),
+        pressure_level=pressure_level,
+        pressure_code=int(pressure_raw or 0),
+        uma_fraction=uma_frac,
+        host_headroom_fraction=headroom_frac,
+        source="mach_host_statistics64" if (vm_kr == 0 and task_kr == 0) else "mach_partial",
+    )
+
+
+def compute_memory_adaptation(
+    *,
+    base_b_slots: int,
+    base_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB,
+    min_b_slots: int = 1,
+    uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
+    snapshot: HostMemorySnapshot | None = None,
+) -> MemoryAdaptation:
+    """Compute stepped slot/cache limits from live or injected host memory pressure."""
+    b0 = max(1, int(base_b_slots))
+    min_b = max(1, min(b0, int(min_b_slots)))
+    c0 = max(0, int(base_cache_limit_mb))
+    ceil_frac = max(0.25, min(0.95, float(uma_ceiling_fraction)))
+    snap = snapshot if snapshot is not None else sample_host_memory()
+
+    if snap.host_mem_bytes <= 0 and snap.pressure_level == "unknown":
+        return MemoryAdaptation(
+            b_slots=b0,
+            cache_limit_mb=c0,
+            should_clear_cache=False,
+            throttle_tier="none",
+            uma_fraction=float(snap.uma_fraction),
+            headroom_fraction=float(snap.host_headroom_fraction),
+            pressure_level=snap.pressure_level,
+            reason="unavailable_fallback",
+        )
+
+    uma_warn = max(0.60, ceil_frac - 0.08)
+    uma_mild = max(0.50, ceil_frac - 0.15)
+    crit_headroom_bytes = max(512 << 20, min(2 << 30, int(0.06 * snap.host_mem_bytes))) if snap.host_mem_bytes > 0 else (512 << 20)
+    warn_headroom_bytes = max(1536 << 20, min(3 << 30, int(0.10 * snap.host_mem_bytes))) if snap.host_mem_bytes > 0 else (1536 << 20)
+
+    if (
+        snap.pressure_level == "critical"
+        or snap.uma_fraction >= ceil_frac
+        or (snap.host_mem_bytes > 0 and snap.available_bytes < crit_headroom_bytes)
+    ):
+        return MemoryAdaptation(
+            b_slots=max(min_b, min(b0, max(1, b0 // 4))),
+            cache_limit_mb=min(c0, 64),
+            should_clear_cache=True,
+            throttle_tier="critical",
+            uma_fraction=float(snap.uma_fraction),
+            headroom_fraction=float(snap.host_headroom_fraction),
+            pressure_level=snap.pressure_level,
+            reason="critical_pressure_or_uma_ceiling",
+        )
+
+    if (
+        snap.uma_fraction >= uma_warn
+        or (snap.host_mem_bytes > 0 and snap.healthy_bytes < warn_headroom_bytes)
+        or (snap.pressure_level == "warning" and snap.uma_fraction >= 0.25)
+    ):
+        return MemoryAdaptation(
+            b_slots=max(min_b, min(b0, max(1, b0 // 2))),
+            cache_limit_mb=min(c0, 128),
+            should_clear_cache=True,
+            throttle_tier="warn",
+            uma_fraction=float(snap.uma_fraction),
+            headroom_fraction=float(snap.host_headroom_fraction),
+            pressure_level=snap.pressure_level,
+            reason="warning_pressure_or_low_healthy_headroom",
+        )
+
+    if snap.pressure_level == "warning":
+        return MemoryAdaptation(
+            b_slots=b0,
+            cache_limit_mb=min(c0, 128),
+            should_clear_cache=True,
+            throttle_tier="mild",
+            uma_fraction=float(snap.uma_fraction),
+            headroom_fraction=float(snap.host_headroom_fraction),
+            pressure_level=snap.pressure_level,
+            reason="os_warning_trim_cache_preserve_slots",
+        )
+
+    filecache_tight = (
+        snap.file_cache_minimum_bytes > 0
+        and snap.file_backed_bytes <= int(snap.file_cache_minimum_bytes * 1.10)
+        and snap.host_headroom_fraction < 0.25
+    )
+    if snap.uma_fraction >= uma_mild or filecache_tight:
+        return MemoryAdaptation(
+            b_slots=max(min_b, min(b0, max(1, (b0 * 3) // 4))),
+            cache_limit_mb=min(c0, max(128, c0 // 2)) if c0 > 0 else 0,
+            should_clear_cache=False,
+            throttle_tier="mild",
+            uma_fraction=float(snap.uma_fraction),
+            headroom_fraction=float(snap.host_headroom_fraction),
+            pressure_level=snap.pressure_level,
+            reason="approaching_uma_or_filecache_min",
+        )
+
+    return MemoryAdaptation(
+        b_slots=b0,
+        cache_limit_mb=c0,
+        should_clear_cache=False,
+        throttle_tier="none",
+        uma_fraction=float(snap.uma_fraction),
+        headroom_fraction=float(snap.host_headroom_fraction),
+        pressure_level=snap.pressure_level,
+        reason="healthy",
+    )
+
+
+_TIER_SEVERITY: dict[ThrottleTier, int] = {"none": 0, "mild": 1, "warn": 2, "critical": 3}
+
+
+class LiveMemoryGovernor:
+    """Stateful Darwin Mach governor that throttles slots & MLX cache ahead of the swap cliff."""
+
+    def __init__(
+        self,
+        *,
+        uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
+        min_b_slots: int = 1,
+        poll_interval_sec: float = 0.25,
+        clean_polls_to_relax: int = 2,
+    ) -> None:
+        self.uma_ceiling_fraction = float(uma_ceiling_fraction)
+        self.min_b_slots = max(1, int(min_b_slots))
+        self.poll_interval_sec = max(0.0, float(poll_interval_sec))
+        self.clean_polls_to_relax = max(1, int(clean_polls_to_relax))
+        self._lock = threading.Lock()
+        self._last_poll_mono: float = -1e9
+        self._last_snapshot: HostMemorySnapshot | None = None
+        self._active_tier: ThrottleTier = "none"
+        self._last_adaptation: MemoryAdaptation | None = None
+        self._clean_streak: int = 0
+        self._last_applied_cache_mb: int | None = None
+        self.polls: int = 0
+        self.adaptations_triggered: int = 0
+        self.cache_clears: int = 0
+        self.pressure_events: int = 0
+        self.peak_phys_footprint_bytes: int = 0
+        self.min_available_bytes: int | None = None
+        self.min_b_slots_observed: int | None = None
+
+    def _apply_mlx_limits(self, adaptation: MemoryAdaptation) -> None:
+        changed_cache = self._last_applied_cache_mb != adaptation.cache_limit_mb
+        if not (changed_cache or adaptation.should_clear_cache):
+            return
+        if changed_cache:
+            try:
+                from .embeddings import set_mlx_cache_limit
+
+                set_mlx_cache_limit(adaptation.cache_limit_mb)
+                self._last_applied_cache_mb = adaptation.cache_limit_mb
+            except Exception:
+                pass
+        if adaptation.should_clear_cache:
+            try:
+                from .bench import clear_mlx_arena
+
+                clear_mlx_arena(0)
+                self.cache_clears += 1
+            except Exception:
+                pass
+
+    def adapt(
+        self,
+        base_b_slots: int,
+        base_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB,
+        *,
+        min_b_slots: int | None = None,
+        force_poll: bool = False,
+        apply_mlx: bool = False,
+        snapshot: HostMemorySnapshot | None = None,
+    ) -> MemoryAdaptation:
+        eff_min_b = self.min_b_slots if min_b_slots is None else max(1, int(min_b_slots))
+        now = time.monotonic()
+        with self._lock:
+            if snapshot is not None:
+                snap = snapshot
+                did_poll = True
+            elif not force_poll and self._last_snapshot is not None and (now - self._last_poll_mono) < self.poll_interval_sec:
+                assert self._last_adaptation is not None
+                cached = self._last_adaptation
+                b_scaled = compute_memory_adaptation(
+                    base_b_slots=base_b_slots,
+                    base_cache_limit_mb=base_cache_limit_mb,
+                    min_b_slots=eff_min_b,
+                    uma_ceiling_fraction=self.uma_ceiling_fraction,
+                    snapshot=self._last_snapshot,
+                )
+                return MemoryAdaptation(
+                    b_slots=b_scaled.b_slots if self._active_tier != "none" else max(1, int(base_b_slots)),
+                    cache_limit_mb=b_scaled.cache_limit_mb if self._active_tier != "none" else max(0, int(base_cache_limit_mb)),
+                    should_clear_cache=False,
+                    throttle_tier=self._active_tier,
+                    uma_fraction=cached.uma_fraction,
+                    headroom_fraction=cached.headroom_fraction,
+                    pressure_level=cached.pressure_level,
+                    reason=cached.reason,
+                )
+            else:
+                snap = sample_host_memory()
+                self._last_poll_mono = now
+                did_poll = True
+
+            if did_poll:
+                self._last_snapshot = snap
+                self.polls += 1
+                self.peak_phys_footprint_bytes = max(self.peak_phys_footprint_bytes, int(snap.phys_footprint_bytes))
+                if snap.available_bytes > 0 and (
+                    self.min_available_bytes is None or snap.available_bytes < self.min_available_bytes
+                ):
+                    self.min_available_bytes = int(snap.available_bytes)
+
+            raw = compute_memory_adaptation(
+                base_b_slots=base_b_slots,
+                base_cache_limit_mb=base_cache_limit_mb,
+                min_b_slots=eff_min_b,
+                uma_ceiling_fraction=self.uma_ceiling_fraction,
+                snapshot=snap,
+            )
+
+            prev_sev = _TIER_SEVERITY[self._active_tier]
+            raw_sev = _TIER_SEVERITY[raw.throttle_tier]
+            if raw_sev >= prev_sev:
+                self._active_tier = raw.throttle_tier
+                self._clean_streak = 0
+                eff = raw
+            else:
+                self._clean_streak += 1
+                if self._clean_streak >= self.clean_polls_to_relax:
+                    self._active_tier = raw.throttle_tier
+                    self._clean_streak = 0
+                    eff = raw
+                else:
+                    # Hold prior tighter limits until hysteresis streak finishes
+                    held = self._last_adaptation or raw
+                    eff = MemoryAdaptation(
+                        b_slots=max(eff_min_b, min(int(base_b_slots), held.b_slots)),
+                        cache_limit_mb=min(max(0, int(base_cache_limit_mb)), held.cache_limit_mb),
+                        should_clear_cache=False,
+                        throttle_tier=self._active_tier,
+                        uma_fraction=raw.uma_fraction,
+                        headroom_fraction=raw.headroom_fraction,
+                        pressure_level=raw.pressure_level,
+                        reason=f"hysteresis_hold:{held.reason}",
+                    )
+
+            if eff.throttle_tier != "none":
+                self.pressure_events += 1
+            if eff.b_slots < max(1, int(base_b_slots)) or eff.should_clear_cache:
+                self.adaptations_triggered += 1
+            if self.min_b_slots_observed is None or eff.b_slots < self.min_b_slots_observed:
+                self.min_b_slots_observed = eff.b_slots
+            self._last_adaptation = eff
+
+        if apply_mlx:
+            self._apply_mlx_limits(eff)
+        return eff
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "polls": self.polls,
+                "adaptations_triggered": self.adaptations_triggered,
+                "cache_clears": self.cache_clears,
+                "pressure_events": self.pressure_events,
+                "active_tier": self._active_tier,
+                "min_b_slots_observed": self.min_b_slots_observed,
+                "peak_phys_footprint_gb": round(self.peak_phys_footprint_bytes / float(1 << 30), 4),
+                "min_available_gb": (
+                    round(self.min_available_bytes / float(1 << 30), 4)
+                    if self.min_available_bytes is not None
+                    else None
+                ),
+            }
+
+
+def set_fd_nocache(fd: int, enabled: bool = True, *, disable_readahead: bool = True) -> bool:
+    """Toggle Darwin `F_NOCACHE` (and optionally `F_RDAHEAD=0`) on an open file descriptor."""
+    if sys.platform != "darwin" or int(fd) < 0:
+        return False
+    try:
+        fcntl.fcntl(int(fd), MACOS_F_NOCACHE, 1 if enabled else 0)
+        if enabled and disable_readahead:
+            try:
+                fcntl.fcntl(int(fd), MACOS_F_RDAHEAD, 0)
+            except (OSError, ValueError):
+                pass
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@contextmanager
+def nocache_open(
+    path: str | Path,
+    mode: str = "rb",
+    *,
+    buffering: int | None = None,
+    disable_readahead: bool = True,
+    encoding: str | None = None,
+    errors: str | None = None,
+    newline: str | None = None,
+) -> Iterator[Any]:
+    """Open a file with Darwin `F_NOCACHE` enabled so large reads/writes spare unified memory."""
+    eff_buf = 0 if (buffering is None and "b" in mode) else (-1 if buffering is None else int(buffering))
+    kw: dict[str, Any] = {"buffering": eff_buf}
+    if "b" not in mode:
+        if encoding is not None:
+            kw["encoding"] = encoding
+        if errors is not None:
+            kw["errors"] = errors
+        if newline is not None:
+            kw["newline"] = newline
+    handle = open(path, mode, **kw)
+    try:
+        set_fd_nocache(handle.fileno(), True, disable_readahead=disable_readahead)
+        yield handle
+    finally:
+        handle.close()
+
+
+def read_file_nocache(
+    path: str | Path,
+    *,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> bytes:
+    """Read an entire file in uncached `4 MiB` staged chunks via Darwin `F_NOCACHE`."""
+    c_sz = max(4096, int(chunk_size))
+    p = Path(path)
+    with nocache_open(p, "rb", buffering=0) as fh:
+        fd = fh.fileno()
+        try:
+            fsize = os.fstat(fd).st_size
+        except OSError:
+            fsize = 0
+        if fsize <= 0:
+            chunks: list[bytes] = []
+            while True:
+                blk = os.read(fd, c_sz)
+                if not blk:
+                    break
+                chunks.append(blk)
+            return b"".join(chunks)
+        out = bytearray(fsize)
+        mv = memoryview(out)
+        pos = 0
+        while pos < fsize:
+            blk = os.read(fd, min(c_sz, fsize - pos))
+            if not blk:
+                return bytes(out[:pos])
+            mv[pos : pos + len(blk)] = blk
+            pos += len(blk)
+        return bytes(out)
+
+
+def advise_nocache_paths(paths: Iterable[str | Path], *, enabled: bool = True) -> int:
+    """Best-effort apply `F_NOCACHE` on open descriptors for existing files; returns count advised."""
+    advised = 0
+    for item in paths:
+        p = Path(item)
+        if not p.is_file():
+            continue
+        try:
+            fd = os.open(p, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if set_fd_nocache(fd, enabled, disable_readahead=enabled):
+                advised += 1
+        finally:
+            os.close(fd)
+    return advised
+
+
 __all__ = [
     "APPLE10_FUSED_SWA_SDPA_SEQ_LENS",
     "DEFAULT_MLX_CACHE_LIMIT_MB",
+    "DISPATCH_MEMORYPRESSURE_CRITICAL",
+    "DISPATCH_MEMORYPRESSURE_NORMAL",
+    "DISPATCH_MEMORYPRESSURE_WARN",
     "DisaggregatedCriticBudget",
     "DynamicExecutionPlan",
     "DynamicSiliconPolicy",
     "Hetero2WorkStealingQueue",
     "HeteroWorkItem",
+    "HostMemorySnapshot",
     "HostSiliconProfile",
+    "LiveMemoryGovernor",
+    "MACOS_F_NOCACHE",
+    "MACOS_F_RDAHEAD",
     "MASK_NEG_VAL_FP16",
     "MIN_SHARED_PREFIX_TOKENS",
+    "MemoryAdaptation",
+    "MemoryPressureLevel",
     "PackedEncoderBatch",
     "PackedSegmentSpan",
     "PackedSequenceBin",
@@ -2161,17 +2918,25 @@ __all__ = [
     "SpeculativePolicy",
     "ThermalLevel",
     "ThermalStateSnapshot",
+    "ThrottleTier",
     "VALID_MTP_MODES",
     "VALID_PROFILES",
     "VALID_WORKLOADS",
     "WIRED_MEMORY_CEILING_FRACTION",
+    "advise_nocache_paths",
     "build_block_diagonal_mask",
+    "compute_memory_adaptation",
+    "estimate_host_memory_bytes",
     "find_common_prefix_len",
+    "nocache_open",
     "pack_encoder_batches",
     "pack_sequences_ffd",
     "poll_macos_thermal_state",
+    "read_file_nocache",
     "recommend_silicon_budget",
     "resolve_dynamic_execution_plan",
+    "sample_host_memory",
     "select_speculative_policy",
+    "set_fd_nocache",
     "validate_grpo_ane_offload",
 ]

@@ -23,6 +23,12 @@ import pyarrow.parquet as pq
 from .bench import clear_mlx_arena, wired_limit
 from .embeddings import accepts_kwarg, resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
 from .hw_check import probe_host_hardware
+from .runtime_lessons import (
+    DEFAULT_MLX_CACHE_LIMIT_MB,
+    WIRED_MEMORY_CEILING_FRACTION,
+    LiveMemoryGovernor,
+    nocache_open,
+)
 
 DEFAULT_TEXT_COLUMNS = ("body", "page_text", "text", "content")
 _SUPPORTED_DTYPES = ("float32", "float16", "int8")
@@ -152,29 +158,35 @@ def _iter_source_batches(
     *,
     filter_ocr: bool,
     limit: int | None,
+    use_nocache: bool = False,
 ) -> Iterable[pa.RecordBatch]:
     emitted = 0
     for fpath in files:
-        pf = pq.ParquetFile(fpath)
-        names = set(pf.schema_arrow.names)
-        read_cols = [c for c in columns if c in names]
-        for rb in pf.iter_batches(batch_size=batch_rows, columns=read_cols):
-            if filter_ocr:
-                if "is_ocr" in names:
-                    mask = pc.equal(rb.column("is_ocr"), True)
-                    rb = rb.filter(mask)
-                elif "ocr_pages" in names:
-                    mask = pc.greater(pc.list_value_length(rb.column("ocr_pages")), 0)
-                    rb = rb.filter(mask)
-            if rb.num_rows == 0:
-                continue
-            if limit is not None and emitted + rb.num_rows > limit:
-                rb = rb.slice(0, max(0, limit - emitted))
-            if rb.num_rows > 0:
-                emitted += rb.num_rows
-                yield rb
-            if limit is not None and emitted >= limit:
-                return
+        with ExitStack() as fstack:
+            if use_nocache:
+                fh = fstack.enter_context(nocache_open(fpath, "rb", buffering=0))
+                pf = pq.ParquetFile(fh)
+            else:
+                pf = pq.ParquetFile(fpath)
+            names = set(pf.schema_arrow.names)
+            read_cols = [c for c in columns if c in names]
+            for rb in pf.iter_batches(batch_size=batch_rows, columns=read_cols):
+                if filter_ocr:
+                    if "is_ocr" in names:
+                        mask = pc.equal(rb.column("is_ocr"), True)
+                        rb = rb.filter(mask)
+                    elif "ocr_pages" in names:
+                        mask = pc.greater(pc.list_value_length(rb.column("ocr_pages")), 0)
+                        rb = rb.filter(mask)
+                if rb.num_rows == 0:
+                    continue
+                if limit is not None and emitted + rb.num_rows > limit:
+                    rb = rb.slice(0, max(0, limit - emitted))
+                if rb.num_rows > 0:
+                    emitted += rb.num_rows
+                    yield rb
+                if limit is not None and emitted >= limit:
+                    return
 
 
 def _quantize_symmetric_int8(vecs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -688,6 +700,12 @@ def embed_parquet(
     use_wired_limit: bool = True,
     sort_macro_window: bool = True,
     macro_window_tokens: int | None = None,
+    lookahead_batches: int | None = None,
+    lookahead_shard_multiplier: int | None = None,
+    lookahead_max_tokens: int | None = None,
+    use_nocache: bool = False,
+    memory_governor: LiveMemoryGovernor | bool | None = True,
+    uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
     sink_format: str | None = None,
     _clamp_mrl_dim: bool = False,
 ) -> ParquetEmbedSummary:
@@ -696,6 +714,13 @@ def embed_parquet(
         raise ValueError(f"Unsupported vector dtype {dtype!r}; expected one of {_SUPPORTED_DTYPES}")
     for name, value in (("batch_rows", batch_rows), ("encode_batch_rows", encode_batch_rows), ("shard_rows", shard_rows)):
         if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    for name, opt_val in (
+        ("lookahead_batches", lookahead_batches),
+        ("lookahead_shard_multiplier", lookahead_shard_multiplier),
+        ("lookahead_max_tokens", lookahead_max_tokens),
+    ):
+        if opt_val is not None and int(opt_val) <= 0:
             raise ValueError(f"{name} must be positive")
 
     dim_candidates = [d for d in (dimensions, mrl_dim, truncate_dim) if d is not None]
@@ -797,8 +822,49 @@ def embed_parquet(
         if aux in first_schema.names and aux not in needed:
             needed.append(aux)
 
-    prep_queue: queue.Queue[tuple[int, pa.Table, list[list[int]]] | None | BaseException] = queue.Queue(maxsize=2)
+    if isinstance(memory_governor, LiveMemoryGovernor):
+        governor: LiveMemoryGovernor | None = memory_governor
+    elif memory_governor:
+        governor = LiveMemoryGovernor(uma_ceiling_fraction=uma_ceiling_fraction)
+    else:
+        governor = None
+
+    eff_cache_mb = DEFAULT_MLX_CACHE_LIMIT_MB if mlx_cache_limit_mb is None else int(mlx_cache_limit_mb)
+    if not sort_macro_window:
+        eff_lookahead_batches = 1
+        eff_shard_mult = 1
+    else:
+        eff_lookahead_batches = (
+            int(lookahead_batches)
+            if lookahead_batches is not None
+            else (4 if batch_rows >= 64 else 1)
+        )
+        if lookahead_shard_multiplier is not None:
+            eff_shard_mult = int(lookahead_shard_multiplier)
+        elif lookahead_batches is not None:
+            eff_shard_mult = max(1, int(lookahead_batches))
+        else:
+            eff_shard_mult = 4 if (shard_rows >= 64 and batch_rows >= 64) else 1
+    eff_lookahead_toks = (
+        min(eff_macro_tokens, int(lookahead_max_tokens))
+        if lookahead_max_tokens is not None
+        else eff_macro_tokens
+    )
+
+    prep_queue: queue.Queue[tuple[int, pa.Table, list[list[int]]] | None | BaseException] = queue.Queue(
+        maxsize=max(2, min(8, max(eff_lookahead_batches, eff_shard_mult)))
+    )
+    prod_stop = threading.Event()
     rows_read_box = [0]
+
+    def _put_prep(item: tuple[int, pa.Table, list[list[int]]] | None | BaseException) -> bool:
+        while not prod_stop.is_set():
+            try:
+                prep_queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def producer() -> None:
         try:
@@ -808,7 +874,10 @@ def embed_parquet(
                 batch_rows,
                 filter_ocr=filter_ocr,
                 limit=limit,
+                use_nocache=use_nocache,
             ):
+                if prod_stop.is_set():
+                    break
                 rows_read_box[0] += rb.num_rows
                 meta_tbl, tok_lists = _prepare_batch_rows(
                     rb,
@@ -830,12 +899,12 @@ def embed_parquet(
                     add_query_prefix=add_query_prefix,
                     add_document_prefix=add_document_prefix,
                 )
-                if len(tok_lists) > 0:
-                    prep_queue.put((rb.num_rows, meta_tbl, tok_lists))
+                if len(tok_lists) > 0 and not _put_prep((rb.num_rows, meta_tbl, tok_lists)):
+                    break
         except BaseException as exc:
-            prep_queue.put(exc)
+            _put_prep(exc)
         finally:
-            prep_queue.put(None)
+            _put_prep(None)
 
     t0 = time.perf_counter()
     prod_thread = threading.Thread(target=producer, daemon=True)
@@ -847,6 +916,10 @@ def embed_parquet(
     pending_meta_parts: list[pa.Table] = []
     pending_meta_rows = 0
     pending_toks: list[list[int]] = []
+    pending_tok_sum = 0
+    sl_meta_parts: list[pa.Table] = []
+    sl_toks: list[list[int]] = []
+    sl_tok_sum = 0
 
     rows_emitted = 0
     total_tokens = 0
@@ -956,33 +1029,51 @@ def embed_parquet(
         assert out_all is not None
         return out_all
 
-    def write_shard_slice(meta_slice: pa.Table, tok_slice: list[list[int]]) -> None:
-        nonlocal shard_idx, rows_emitted, total_tokens
-        shard_path = out_p / f"part-{shard_idx:05d}.parquet"
-        tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
-        shard_idx += 1
-        if resume and _shard_matches_expected(
-            shard_path,
-            expected_rows=len(tok_slice),
-            expected_meta_cols=list(meta_slice.schema.names),
-            expected_dim=dim,
-            expected_dtype=dtype,
-            manifest=manifest,
-            run_config=run_config,
-        ):
+    def _govern_lookahead(base_mult: int) -> tuple[int, int]:
+        if governor is None or base_mult <= 1:
+            return base_mult, eff_lookahead_toks
+        ad = governor.adapt(
+            base_b_slots=base_mult,
+            base_cache_limit_mb=eff_cache_mb,
+            apply_mlx=True,
+        )
+        eff_mult = max(1, min(base_mult, int(ad.b_slots)))
+        eff_toks = max(1, (eff_lookahead_toks * eff_mult) // max(1, base_mult))
+        return eff_mult, eff_toks
+
+    def drain_stream(final: bool = False) -> None:
+        nonlocal sl_meta_parts, sl_toks, sl_tok_sum, rows_emitted, total_tokens
+        if not sl_toks:
             return
-        n_shard_toks = sum(len(x) for x in tok_slice)
-        vecs = encode_rows(tok_slice)
-        rows_emitted += len(tok_slice)
-        total_tokens += n_shard_toks
-        _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard, n_shard_toks))
+        cur_mult, cur_toks_cap = _govern_lookahead(eff_lookahead_batches)
+        if not final and len(sl_toks) < (batch_rows * cur_mult) and sl_tok_sum < cur_toks_cap:
+            return
+        combined_meta = (
+            sl_meta_parts[0]
+            if len(sl_meta_parts) == 1
+            else pa.concat_tables(_align_dict_meta_parts(sl_meta_parts), promote_options="default")
+        )
+        toks_out = sl_toks
+        tok_cnt = sl_tok_sum
+        sl_meta_parts = []
+        sl_toks = []
+        sl_tok_sum = 0
+        vecs = encode_rows(toks_out)
+        rows_emitted += len(toks_out)
+        total_tokens += tok_cnt
+        _enqueue_write(("lance" if lance_mode else "single", combined_meta, vecs))
 
     def drain_shards(final: bool = False) -> None:
-        nonlocal pending_meta_parts, pending_meta_rows, pending_toks
+        nonlocal pending_meta_parts, pending_meta_rows, pending_toks, pending_tok_sum, shard_idx, rows_emitted, total_tokens
         if not pending_meta_parts:
             return
-        if not final and pending_meta_rows < shard_rows:
-            return
+        cur_mult, cur_toks_cap = _govern_lookahead(eff_shard_mult)
+        if not final:
+            if pending_meta_rows < shard_rows:
+                return
+            if cur_mult > 1 and pending_meta_rows < (shard_rows * cur_mult) and pending_tok_sum < cur_toks_cap:
+                return
+
         combined = (
             pending_meta_parts[0]
             if len(pending_meta_parts) == 1
@@ -991,23 +1082,66 @@ def embed_parquet(
         pending_meta_parts = []
         offset = 0
         total_avail = len(pending_toks)
+        slices_to_process: list[tuple[pa.Table, list[list[int]]]] = []
         while (total_avail - offset) >= shard_rows:
-            slice_meta = combined.slice(offset, shard_rows)
-            slice_toks = pending_toks[offset : offset + shard_rows]
+            slices_to_process.append(
+                (combined.slice(offset, shard_rows), pending_toks[offset : offset + shard_rows])
+            )
             offset += shard_rows
-            write_shard_slice(slice_meta, slice_toks)
         rem = total_avail - offset
         if final and rem > 0:
-            write_shard_slice(combined.slice(offset, rem), pending_toks[offset:])
+            slices_to_process.append((combined.slice(offset, rem), pending_toks[offset:]))
             pending_meta_rows = 0
             pending_toks = []
+            pending_tok_sum = 0
         elif rem > 0:
             pending_meta_parts = [combined.slice(offset, rem)]
             pending_meta_rows = rem
             pending_toks = pending_toks[offset:]
+            pending_tok_sum = sum(len(x) for x in pending_toks)
         else:
             pending_meta_rows = 0
             pending_toks = []
+            pending_tok_sum = 0
+
+        undone_slices: list[tuple[pa.Table, list[list[int]], Path, Path, int]] = []
+        for meta_slice, tok_slice in slices_to_process:
+            shard_path = out_p / f"part-{shard_idx:05d}.parquet"
+            tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
+            shard_idx += 1
+            if resume and _shard_matches_expected(
+                shard_path,
+                expected_rows=len(tok_slice),
+                expected_meta_cols=list(meta_slice.schema.names),
+                expected_dim=dim,
+                expected_dtype=dtype,
+                manifest=manifest,
+                run_config=run_config,
+            ):
+                continue
+            undone_slices.append((meta_slice, tok_slice, shard_path, tmp_shard, sum(len(x) for x in tok_slice)))
+
+        if not undone_slices:
+            return
+        if cur_mult <= 1 or len(undone_slices) == 1 or not sort_macro_window:
+            for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks in undone_slices:
+                vecs = encode_rows(tok_slice)
+                rows_emitted += len(tok_slice)
+                total_tokens += n_shard_toks
+                _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard, n_shard_toks))
+            return
+
+        # Cross-shard lookahead length sort: pack and sort across all undone slices once, then slice exact shards
+        combined_toks = [t for _, tok_slice, *_ in undone_slices for t in tok_slice]
+        vecs_all = encode_rows(combined_toks)
+        vec_pos = 0
+        for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks in undone_slices:
+            n_slice = len(tok_slice)
+            vecs_i = vecs_all[vec_pos : vec_pos + n_slice]
+            vec_pos += n_slice
+            rows_emitted += n_slice
+            total_tokens += n_shard_toks
+            _enqueue_write(("shard", meta_slice, vecs_i, shard_path, tmp_shard, n_shard_toks))
 
     with ExitStack() as stack:
         _enter_mlx_limits(
@@ -1030,20 +1164,16 @@ def embed_parquet(
                 _, meta_tbl, tok_lists = item
                 batch_num += 1
 
-                if lance_mode:
-                    vecs = encode_rows(tok_lists)
-                    rows_emitted += len(tok_lists)
-                    total_tokens += sum(len(x) for x in tok_lists)
-                    _enqueue_write(("lance", meta_tbl, vecs))
-                elif single_file_mode:
-                    vecs = encode_rows(tok_lists)
-                    rows_emitted += len(tok_lists)
-                    total_tokens += sum(len(x) for x in tok_lists)
-                    _enqueue_write(("single", meta_tbl, vecs))
+                if lance_mode or single_file_mode:
+                    sl_meta_parts.append(meta_tbl)
+                    sl_toks.extend(tok_lists)
+                    sl_tok_sum += sum(len(x) for x in tok_lists)
+                    drain_stream(final=False)
                 else:
                     pending_meta_parts.append(meta_tbl)
                     pending_meta_rows += meta_tbl.num_rows
                     pending_toks.extend(tok_lists)
+                    pending_tok_sum += sum(len(x) for x in tok_lists)
                     drain_shards(final=False)
 
                 if progress_every > 0 and (batch_num % progress_every == 0):
@@ -1054,7 +1184,9 @@ def embed_parquet(
                         flush=True,
                     )
 
-            if not single_file_mode and not lance_mode:
+            if lance_mode or single_file_mode:
+                drain_stream(final=True)
+            else:
                 drain_shards(final=True)
 
             _enqueue_write(None)
@@ -1083,7 +1215,14 @@ def embed_parquet(
                 )
                 lance_mod.write_dataset(pa.Table.from_pylist([], schema=empty_schema), str(out_p), mode="create")
         finally:
+            prod_stop.set()
             writer_stop.set()
+            for q in (prep_queue, write_queue):
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
             try:
                 write_queue.put_nowait(None)
             except queue.Full:

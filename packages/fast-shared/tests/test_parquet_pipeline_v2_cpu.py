@@ -609,3 +609,354 @@ def test_multichunk_drop_text_col_preproject_and_dict_encode_decode_schema_parit
     assert t_single.column("doc_id").to_pylist()[-2:] == ["d-2", "d-3"]
 
 
+def test_extract_parquet_and_jsonl_per_doc_grammars_and_fallback_cpu(tmp_path: Path) -> None:
+    import json
+    from types import SimpleNamespace
+    from fast_shared.pipeline_llm import extract_jsonl, extract_parquet
+
+    schema_a = {
+        "type": "object",
+        "properties": {"kind": {"type": "string"}, "a_val": {"type": "integer"}},
+        "required": ["kind", "a_val"],
+    }
+    schema_b = {
+        "type": "object",
+        "properties": {"kind": {"type": "string"}, "b_flag": {"type": "boolean"}},
+        "required": ["kind", "b_flag"],
+    }
+
+    # Intentionally reuse identical prompt text ("shared text") across schema_a and schema_b to verify
+    # dedup key separation prevents wrong-schema cross-contamination!
+    tbl = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "schema_kind": ["A", "B", "A", "B"],
+            "body_text": ["shared text", "shared text", "other a", "shared text"],
+        }
+    )
+    in_pq = tmp_path / "multi_schema.parquet"
+    pq.write_table(tbl, in_pq)
+
+    class _FallbackSingleSchemaEngine:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_batch(self, prompts, *, json_schema=None, **kwargs):
+            self.calls.append({"n": len(prompts), "json_schema": json_schema, **kwargs})
+            assert isinstance(json_schema, dict)
+            is_a = "a_val" in json_schema["properties"]
+            items = []
+            for idx, _p in enumerate(prompts):
+                payload = {"kind": "A" if is_a else "B", **({"a_val": idx + 1} if is_a else {"b_flag": True})}
+                items.append(
+                    SimpleNamespace(
+                        text=json.dumps(payload),
+                        parsed=payload,
+                        valid_json=True,
+                        valid_schema=True,
+                        finish_reason="stop",
+                        prompt_tokens=6,
+                        completion_tokens=4,
+                    )
+                )
+            return SimpleNamespace(items=items, stats={"valid_json_count": len(items), "valid_schema_count": len(items)})
+
+    eng = _FallbackSingleSchemaEngine()
+    out_pq = tmp_path / "out_multi.parquet"
+    mapping = {"A": schema_a, "B": schema_b}
+    res = extract_parquet(
+        eng,
+        in_pq,
+        out_pq,
+        system_prompt="sys",
+        schema_col="schema_kind",
+        per_doc_grammars=mapping,
+        progress_every=0,
+    )
+    assert res.docs_processed == 4
+    # Two unique groups (schema A and schema B); row 3 dedups ONLY with row 1 (schema B)
+    assert len(eng.calls) == 2
+    out_tbl = pq.read_table(out_pq)
+    parsed_out = [json.loads(s) for s in out_tbl.column("response_text").to_pylist()]
+    assert [p["kind"] for p in parsed_out] == ["A", "B", "A", "B"]
+    assert "a_val" in parsed_out[0] and "b_flag" in parsed_out[1] and "b_flag" in parsed_out[3]
+    assert all(r < 0.5 for r in out_tbl.column("extractconf_risk").to_pylist())
+
+    # Test JSONL with callable per_doc_grammars + sequence routing
+    in_jl = tmp_path / "multi.jsonl"
+    out_jl = tmp_path / "out_multi.jsonl"
+    in_jl.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": 0, "kind": "A", "text": "same"}),
+                json.dumps({"id": 1, "kind": "B", "text": "same"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    res_jl = extract_jsonl(
+        _FallbackSingleSchemaEngine(),
+        in_jl,
+        out_jl,
+        system_prompt="sys",
+        per_doc_grammars=lambda rec: schema_a if rec["kind"] == "A" else schema_b,
+    )
+    assert res_jl["docs"] == 2
+    recs = [json.loads(line) for line in out_jl.read_text(encoding="utf-8").splitlines()]
+    assert json.loads(recs[0]["output_text"])["kind"] == "A"
+    assert json.loads(recs[1]["output_text"])["kind"] == "B"
+
+
+def test_extract_parquet_rolling_lookahead_upfront_and_governor_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import fast_shared.runtime_lessons as rl
+    from fast_shared.pipeline_llm import extract_parquet
+    from fast_shared.runtime_lessons import HostMemorySnapshot, LiveMemoryGovernor
+
+    schema_a = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
+    schema_b = {"type": "object", "properties": {"y": {"type": "integer"}}, "required": ["y"]}
+
+    # 36 rows of varying lengths so length-sorting permutes row order and LCP finds shared system prefix [90, 91]
+    n_docs = 36
+    tbl = pa.table(
+        {
+            "id": list(range(n_docs)),
+            "schema_kind": ["A" if i % 2 == 0 else "B" for i in range(n_docs)],
+            "body_text": [f"row-{i} " + ("pad " * ((i % 7) + 1)) for i in range(n_docs)],
+        }
+    )
+    in_pq = tmp_path / "roll_in.parquet"
+    pq.write_table(tbl, in_pq, row_group_size=12)
+
+    class _MockGrammar:
+        def __init__(self, key_byte: int, key_name: str) -> None:
+            self.upfront_ff = [100 + key_byte]
+            self.key_byte = key_byte
+            self.key_name = key_name
+            self.validated: list[list[int]] = []
+
+        def validate_token_sequence(self, toks: list[int]) -> bool:
+            self.validated.append(list(toks))
+            return len(toks) == 2 and toks[0] == self.upfront_ff[0]
+
+    class _MockTok:
+        bos_token_id = 2
+
+        @staticmethod
+        def decode(toks: list[int], skip_special_tokens: bool = True) -> str:
+            del skip_special_tokens
+            # First token is upfront_ff (101 -> "x", 102 -> "y"), second token carries doc_id (>= 200)
+            key = "x" if toks[0] == 101 else "y"
+            val = int(toks[1]) - 200
+            return json.dumps({key: val})
+
+    class _MockRollingEngine:
+        def __init__(self) -> None:
+            self.tokenizer = _MockTok()
+            self.encode_calls: list[int] = []
+            self.roll_calls: list[dict[str, object]] = []
+            self.grammars = {
+                json.dumps(schema_a, sort_keys=True, ensure_ascii=False): _MockGrammar(1, "x"),
+                json.dumps(schema_b, sort_keys=True, ensure_ascii=False): _MockGrammar(2, "y"),
+            }
+
+        def encode_prompts(self, prompts, **kwargs):
+            del kwargs
+            self.encode_calls.append(len(prompts))
+            out = []
+            for p in prompts:
+                doc_id = int(p.split("-")[1].split()[0])
+                pad_toks = [10] * ((doc_id % 7) + 1)
+                out.append([90, 91, 200 + doc_id, *pad_toks])
+            return out
+
+        def get_grammar(self, spec, **kwargs):
+            del kwargs
+            k = spec if isinstance(spec, str) else json.dumps(spec, sort_keys=True, ensure_ascii=False)
+            return self.grammars[k]
+
+        def run_rolling(self, *, sys_ids, suf_ids_list, B_slots, per_doc_grammars=None, **kwargs):
+            del kwargs
+            self.roll_calls.append(
+                {
+                    "sys_ids": list(sys_ids),
+                    "n": len(suf_ids_list),
+                    "B_slots": B_slots,
+                    "has_per_doc": per_doc_grammars is not None,
+                    "first_len": len(suf_ids_list[0]),
+                    "last_len": len(suf_ids_list[-1]),
+                }
+            )
+            # suf_ids_list ends with upfront_ff ([101] or [102]), preceded by padding and doc marker (>=200)
+            gen_toks = []
+            for s in suf_ids_list:
+                doc_tok = next(t for t in s if t >= 200)
+                gen_toks.append([doc_tok])
+            return {"gen_toks": gen_toks, "decode_sec": 0.02, "tot_out_tok": len(gen_toks)}
+
+    crit_snap = HostMemorySnapshot(
+        platform="darwin",
+        page_size_bytes=16384,
+        host_mem_bytes=24 << 30,
+        available_bytes=2 << 30,
+        healthy_bytes=1 << 30,
+        phys_footprint_bytes=20 << 30,
+        compressed_bytes=0,
+        file_backed_bytes=1 << 30,
+        inactive_bytes=0,
+        file_cache_minimum_bytes=512 << 20,
+        free_pages=10,
+        speculative_pages=0,
+        external_pages=10,
+        purgeable_pages=0,
+        internal_pages=10,
+        compressor_pages=0,
+        compressed_pages=0,
+        compression_credit_bytes=0,
+        pressure_level="critical",
+        pressure_code=4,
+        uma_fraction=0.833,
+        host_headroom_fraction=0.083,
+        source="synthetic",
+    )
+
+    monkeypatch.setattr(rl, "sample_host_memory", lambda: crit_snap)
+
+    eng = _MockRollingEngine()
+    out_pq = tmp_path / "roll_out.parquet"
+    summary = extract_parquet(
+        eng,
+        in_pq,
+        out_pq,
+        system_prompt="sys",
+        schema_col="schema_kind",
+        per_doc_grammars={"A": schema_a, "B": schema_b},
+        batch_rows=16,
+        lookahead_batches=4,
+        gpu_batch_size=16,
+        max_tokens=16,
+        memory_governor=LiveMemoryGovernor(poll_interval_sec=0.0),
+        progress_every=0,
+    )
+    assert summary.docs_processed == n_docs
+    assert summary.valid_schema == n_docs
+    # Lookahead coalesced all 3 batches (16 * 4 >= 36) into a single rolling call, tokenized once
+    assert len(eng.roll_calls) == 1 and eng.encode_calls == [n_docs]
+    rc = eng.roll_calls[0]
+    assert rc["sys_ids"] == [90, 91]
+    assert rc["B_slots"] == 4  # Clamped from 16 -> 4 under 83.3% UMA critical pressure
+    assert rc["has_per_doc"] is True
+    assert int(rc["first_len"]) >= int(rc["last_len"])
+
+    out_tbl = pq.read_table(out_pq)
+    assert out_tbl.column("id").to_pylist() == list(range(n_docs))
+    parsed = [json.loads(r) for r in out_tbl.column("response_text").to_pylist()]
+    for i, obj in enumerate(parsed):
+        expected_key = "x" if i % 2 == 0 else "y"
+        assert obj == {expected_key: i}
+
+
+def test_embed_parquet_cross_shard_lookahead_resume_and_nocache_cpu(tmp_path: Path) -> None:
+    tok = _make_bpe_tokenizer(tmp_path)
+    n_rows = 192
+    texts = [
+        ("alpha beta gamma delta alpha beta " * 4) if (i % 2 == 0) else "alpha beta"
+        for i in range(n_rows)
+    ]
+    in_pq = tmp_path / "lookahead_in.parquet"
+    pq.write_table(pa.table({"id": list(range(n_rows)), "body": texts}), in_pq, row_group_size=64)
+
+    class _CountingLengthEngine(_LengthSensitiveEngine):
+        def __init__(self, tokenizer) -> None:
+            super().__init__(tokenizer)
+            self.call_count = 0
+
+        def encode_corpus(self, tok_lists, mode=None):
+            self.call_count += 1
+            return super().encode_corpus(tok_lists, mode=mode)
+
+    # 1. Baseline per-shard (lookahead_shard_multiplier=1) vs cross-shard lookahead (3 shards -> 1 encode call)
+    eng_base = _CountingLengthEngine(tok)
+    out_base = tmp_path / "shards_base"
+    sum_base = embed_parquet(
+        eng_base,
+        in_pq,
+        out_base,
+        batch_rows=64,
+        shard_rows=64,
+        encode_batch_rows=512,
+        lookahead_shard_multiplier=1,
+        progress_every=0,
+    )
+
+    eng_la = _CountingLengthEngine(tok)
+    out_la = tmp_path / "shards_la"
+    sum_la = embed_parquet(
+        eng_la,
+        in_pq,
+        out_la,
+        batch_rows=64,
+        shard_rows=64,
+        encode_batch_rows=512,
+        lookahead_batches=3,
+        lookahead_shard_multiplier=3,
+        use_nocache=True,
+        progress_every=0,
+    )
+    assert sum_base.rows_emitted == n_rows and sum_la.rows_emitted == n_rows
+    assert eng_base.call_count == 3 and eng_la.call_count == 1
+
+    parts_base = sorted(out_base.glob("part-*.parquet"))
+    parts_la = sorted(out_la.glob("part-*.parquet"))
+    assert len(parts_base) == 3 and len(parts_la) == 3
+    tbl_base = pa.concat_tables([pq.read_table(p) for p in parts_base])
+    tbl_la = pa.concat_tables([pq.read_table(p) for p in parts_la])
+    assert tbl_la.column("id").to_pylist() == list(range(n_rows))
+    vec_base = np.asarray(tbl_base.column("vector").to_pylist(), dtype=np.float32)
+    vec_la = np.asarray(tbl_la.column("vector").to_pylist(), dtype=np.float32)
+    assert np.allclose(vec_la, vec_base, atol=1e-6)
+
+    # 2. Resume after removing shards 1 and 2 skips shard 0 before cross-shard merge of remaining 2 shards
+    (out_la / "part-00001.parquet").unlink()
+    (out_la / "part-00002.parquet").unlink()
+    eng_res = _CountingLengthEngine(tok)
+    sum_res = embed_parquet(
+        eng_res,
+        in_pq,
+        out_la,
+        batch_rows=64,
+        shard_rows=64,
+        encode_batch_rows=512,
+        lookahead_batches=3,
+        lookahead_shard_multiplier=3,
+        resume=True,
+        progress_every=0,
+    )
+    assert sum_res.rows_emitted == 128 and eng_res.call_count == 1
+    tbl_res = pa.concat_tables([pq.read_table(p) for p in sorted(out_la.glob("part-*.parquet"))])
+    assert tbl_res.column("id").to_pylist() == list(range(n_rows))
+    assert np.allclose(np.asarray(tbl_res.column("vector").to_pylist(), dtype=np.float32), vec_base, atol=1e-6)
+
+    # 3. Single-file lookahead + F_NOCACHE matches exact order & vectors
+    eng_single = _CountingLengthEngine(tok)
+    out_single = tmp_path / "single_la.parquet"
+    sum_single = embed_parquet(
+        eng_single,
+        in_pq,
+        out_single,
+        batch_rows=64,
+        encode_batch_rows=512,
+        lookahead_batches=3,
+        use_nocache=True,
+        progress_every=0,
+    )
+    assert sum_single.rows_emitted == n_rows and eng_single.call_count == 1
+    tbl_single = pq.read_table(out_single)
+    assert tbl_single.column("id").to_pylist() == list(range(n_rows))
+    assert np.allclose(np.asarray(tbl_single.column("vector").to_pylist(), dtype=np.float32), vec_base, atol=1e-6)
+
+
+
