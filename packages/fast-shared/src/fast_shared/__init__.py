@@ -87,7 +87,13 @@ from .ir_dtype_guard import (
 _OPTIONAL_IMPORT_ERRORS: dict[str, ImportError] = {}
 
 try:
-    from .metal_mpp import HEADER_MPP, HEADER_SIMDGROUP, HEADER_STD, make_mpp_matmul_kernel
+    from .metal_mpp import (
+        HEADER_MPP,
+        HEADER_SIMDGROUP,
+        HEADER_STD,
+        make_mpp_gemm_source,
+        make_mpp_matmul_kernel,
+    )
     from .metal_mpp_bf16 import (
         fused_geglu_split,
         make_mpp_bf16_geglu_kernel,
@@ -103,6 +109,7 @@ except ImportError as _exc:
         "HEADER_MPP",
         "HEADER_SIMDGROUP",
         "HEADER_STD",
+        "make_mpp_gemm_source",
         "make_mpp_matmul_kernel",
         "fused_geglu_split",
         "make_mpp_bf16_geglu_kernel",
@@ -335,6 +342,7 @@ __all__ = [
     "make_embedding_handler",
     "make_mpp_bf16_geglu_kernel",
     "make_mpp_bf16_linear_kernel",
+    "make_mpp_gemm_source",
     "make_mpp_matmul_kernel",
     "make_unified_handler",
     "measure_dram_bw",

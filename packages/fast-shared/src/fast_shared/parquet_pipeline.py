@@ -410,7 +410,30 @@ def _prepare_batch_rows(
         empty = pa.Table.from_batches([rb.slice(0, 0)]).select(meta_only_cols)
         return empty, []
 
-    meta_table = pa.Table.from_batches([rb.take(expanded_row_idx)]).select(meta_only_cols)
+    rb_meta = rb.select(meta_only_cols)
+    idx_arr = pa.array(expanded_row_idx, type=pa.int32())
+    if rb_meta.num_columns == 0:
+        meta_table = pa.Table.from_batches([rb_meta.take(idx_arr)])
+    elif len(expanded_row_idx) > rb.num_rows:
+        taken_cols: list[pa.Array] = []
+        taken_fields: list[pa.Field] = []
+        for field, col in zip(rb_meta.schema, rb_meta.columns):
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+                orig_tag = b"large_string" if pa.types.is_large_string(field.type) else b"string"
+                d_col = col.dictionary_encode().take(idx_arr)
+                new_meta = dict(field.metadata or {})
+                new_meta[_FAST_DICT_ORIG_META_KEY] = orig_tag
+                taken_cols.append(d_col)
+                taken_fields.append(field.with_type(d_col.type).with_metadata(new_meta))
+            else:
+                taken_cols.append(col.take(idx_arr))
+                taken_fields.append(field)
+        meta_table = pa.Table.from_arrays(
+            taken_cols,
+            schema=pa.schema(taken_fields, metadata=rb_meta.schema.metadata),
+        )
+    else:
+        meta_table = pa.Table.from_batches([rb_meta.take(idx_arr)])
     if per_ocr_page:
         meta_table = meta_table.append_column("ocr_page_number", pa.array(page_numbers, type=pa.int32()))
     if chunk:
@@ -421,6 +444,70 @@ def _prepare_batch_rows(
     if include_chunk_text:
         meta_table = meta_table.append_column("chunk_text", pa.array(chunk_texts, type=pa.string()))
     return meta_table, expanded_tok_lists
+
+
+_FAST_DICT_ORIG_META_KEY = b"_fast_dict_orig"
+
+
+def _decode_temp_dict_columns(tbl: pa.Table) -> pa.Table:
+    """Decode temporary dictionary-encoded string metadata columns back to exact original `string`/`large_string` types."""
+    if not any(f.metadata and _FAST_DICT_ORIG_META_KEY in f.metadata for f in tbl.schema):
+        return tbl
+    out_cols: list[pa.ChunkedArray] = []
+    out_fields: list[pa.Field] = []
+    for field, col in zip(tbl.schema, tbl.columns):
+        if field.metadata and _FAST_DICT_ORIG_META_KEY in field.metadata:
+            orig_kind = field.metadata[_FAST_DICT_ORIG_META_KEY]
+            target_type = pa.large_string() if orig_kind == b"large_string" else pa.string()
+            rem_meta = {k: v for k, v in field.metadata.items() if k != _FAST_DICT_ORIG_META_KEY}
+            clean_field = field.with_type(target_type).with_metadata(rem_meta if rem_meta else None)
+            decoded_chunks = [
+                ch.dictionary_decode() if pa.types.is_dictionary(ch.type) else ch.cast(target_type)
+                for ch in col.chunks
+            ]
+            out_cols.append(pa.chunked_array(decoded_chunks, type=target_type))
+            out_fields.append(clean_field)
+        else:
+            out_cols.append(col)
+            out_fields.append(field)
+    return pa.Table.from_arrays(out_cols, schema=pa.schema(out_fields, metadata=tbl.schema.metadata))
+
+
+def _align_dict_meta_parts(parts: list[pa.Table]) -> list[pa.Table]:
+    """Ensure multi-batch `pending_meta_parts` agree on temporary dictionary encoding before `pa.concat_tables`."""
+    if len(parts) <= 1:
+        return parts
+    dict_orig_by_col: dict[str, bytes] = {}
+    for pt in parts:
+        for f in pt.schema:
+            if f.metadata and _FAST_DICT_ORIG_META_KEY in f.metadata:
+                dict_orig_by_col[f.name] = f.metadata[_FAST_DICT_ORIG_META_KEY]
+    if not dict_orig_by_col:
+        return parts
+    aligned: list[pa.Table] = []
+    for pt in parts:
+        needs_fix = any(
+            f.name in dict_orig_by_col and not pa.types.is_dictionary(f.type)
+            for f in pt.schema
+        )
+        if not needs_fix:
+            aligned.append(pt)
+            continue
+        cols: list[pa.ChunkedArray] = []
+        fields: list[pa.Field] = []
+        for f, col in zip(pt.schema, pt.columns):
+            if f.name in dict_orig_by_col and not pa.types.is_dictionary(f.type):
+                enc_chunks = [ch.dictionary_encode() for ch in col.chunks]
+                d_col = pa.chunked_array(enc_chunks) if enc_chunks else pa.chunked_array([], type=pa.dictionary(pa.int32(), f.type))
+                new_meta = dict(f.metadata or {})
+                new_meta[_FAST_DICT_ORIG_META_KEY] = dict_orig_by_col[f.name]
+                cols.append(d_col)
+                fields.append(f.with_type(d_col.type).with_metadata(new_meta))
+            else:
+                cols.append(col)
+                fields.append(f)
+        aligned.append(pa.Table.from_arrays(cols, schema=pa.schema(fields, metadata=pt.schema.metadata)))
+    return aligned
 
 
 def _enter_mlx_limits(
@@ -782,21 +869,21 @@ def embed_parquet(
                 kind = w_item[0]
                 if kind == "lance":
                     _, m_tbl, vecs = w_item
-                    out_tbl = _append_vector_columns(m_tbl, vecs, dim=dim, dtype=dtype)
+                    out_tbl = _append_vector_columns(_decode_temp_dict_columns(m_tbl), vecs, dim=dim, dtype=dtype)
                     assert lance_mod is not None
                     w_mode = "append" if lance_created else "create"
                     lance_mod.write_dataset(out_tbl, str(out_p), mode=w_mode)
                     lance_created = True
                 elif kind == "single":
                     _, m_tbl, vecs = w_item
-                    out_tbl = _append_vector_columns(m_tbl, vecs, dim=dim, dtype=dtype)
+                    out_tbl = _append_vector_columns(_decode_temp_dict_columns(m_tbl), vecs, dim=dim, dtype=dtype)
                     if single_writer is None:
                         col_comp = _resolve_parquet_compression(out_tbl.schema, compression)
                         single_writer = pq.ParquetWriter(tmp_single_path, out_tbl.schema, compression=col_comp)
                     single_writer.write_table(out_tbl)
                 else:
                     _, m_slice, vecs, shard_path, tmp_shard, n_shard_toks = w_item
-                    out_tbl = _append_vector_columns(m_slice, vecs, dim=dim, dtype=dtype)
+                    out_tbl = _append_vector_columns(_decode_temp_dict_columns(m_slice), vecs, dim=dim, dtype=dtype)
                     col_comp = _resolve_parquet_compression(out_tbl.schema, compression)
                     try:
                         pq.write_table(out_tbl, tmp_shard, compression=col_comp)
@@ -899,7 +986,7 @@ def embed_parquet(
         combined = (
             pending_meta_parts[0]
             if len(pending_meta_parts) == 1
-            else pa.concat_tables(pending_meta_parts, promote_options="default")
+            else pa.concat_tables(_align_dict_meta_parts(pending_meta_parts), promote_options="default")
         )
         pending_meta_parts = []
         offset = 0

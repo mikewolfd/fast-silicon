@@ -337,3 +337,104 @@ def test_extractconf_calibrator_fit_predict_and_serialization_cpu(
         preds[0],
         atol=1e-6,
     )
+
+
+def test_extractconf_preparsed_schema_dict_parity_and_single_json_loads_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import fast_shared.extractconf as ec
+    import fast_shared.pipeline_llm as pllm
+
+    schema_dict = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "tag": {"type": ["string", "null"]},
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title", "tag", "items"],
+    }
+    schema_str = json.dumps(schema_dict)
+    assert ec.parse_json_schema_dict(schema_str) == schema_dict
+    assert ec.parse_json_schema_dict(schema_dict) is schema_dict
+    assert ec.parse_json_schema_dict("not-valid-json") is None
+
+    sample_text = json.dumps({"title": "Telemetry Node", "tag": None, "items": []})
+    f_str = extract_extractconf_features(response_text=sample_text, json_schema=schema_str, prompt_tokens=64, completion_tokens=16)
+    f_dict = extract_extractconf_features(
+        parsed=json.loads(sample_text),
+        response_text=sample_text,
+        json_schema=schema_dict,
+        prompt_tokens=64,
+        completion_tokens=16,
+    )
+    assert f_str == f_dict
+    assert compute_extractconf_risk(response_text=sample_text, json_schema=schema_str, prompt_tokens=64, completion_tokens=16) == pytest.approx(
+        compute_extractconf_risk(
+            parsed=json.loads(sample_text),
+            response_text=sample_text,
+            json_schema=schema_dict,
+            prompt_tokens=64,
+            completion_tokens=16,
+        )
+    )
+
+    # Verify extract_parquet parses json_schema string ONCE per call and parses each item.text ONCE when item.parsed is None!
+    loads_inputs: list[str] = []
+    real_loads = json.loads
+
+    def _spy_loads(s: str | bytes, *args, **kwargs):
+        if isinstance(s, str):
+            loads_inputs.append(s)
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(ec.json, "loads", _spy_loads)
+    monkeypatch.setattr(pllm.json, "loads", _spy_loads)
+
+    class _UnparsedItemEngine:
+        default_max_b_slots = 16
+        seen_telemetry_flags: list[bool] = []
+
+        def generate_batch(self, prompts: list[str], *, collect_telemetry: bool = False, **_kwargs):
+            self.seen_telemetry_flags.append(bool(collect_telemetry))
+            items = [
+                SimpleNamespace(
+                    text='{"title": "' + p + '", "tag": null, "items": ["ok"]}',
+                    parsed=None,
+                    valid_json=True,
+                    valid_schema=True,
+                    finish_reason="stop",
+                    prompt_tokens=20,
+                    completion_tokens=10,
+                    telemetry={"mean_h_pre": 0.1, "mean_neg_log_z_valid": 0.01, "mean_top2_margin": 4.5},
+                )
+                for p in prompts
+            ]
+            return SimpleNamespace(items=items, stats={"decode_sec": 0.01})
+
+    in_pq = tmp_path / "single_parse_in.parquet"
+    out_pq = tmp_path / "single_parse_out.parquet"
+    pq.write_table(
+        pa.Table.from_pylist([{"id": i, "body_text": f"doc_{i}"} for i in range(6)]),
+        in_pq,
+    )
+    loads_inputs.clear()
+    eng_spy = _UnparsedItemEngine()
+    eng_spy.seen_telemetry_flags = []
+    pllm.extract_parquet(
+        eng_spy,
+        in_pq,
+        out_pq,
+        system_prompt="sys",
+        json_schema=schema_str,
+        emit_extractconf=True,
+    )
+    # Schema string parsed exactly once across all 6 rows, each unique item text parsed once, and collect_telemetry=True auto-forwarded!
+    assert eng_spy.seen_telemetry_flags == [True]
+    assert loads_inputs.count(schema_str) == 1
+    assert len(loads_inputs) == 1 + 6
+

@@ -273,6 +273,22 @@ def _compute_length_outlier_score(
     return float(max(0.0, min(1.0, score)))
 
 
+def parse_json_schema_dict(
+    json_schema: Mapping[str, Any] | str | None,
+) -> Mapping[str, Any] | None:
+    """Pre-parse a JSON Schema string into a `Mapping` once, or pass through an existing `Mapping`."""
+    if isinstance(json_schema, Mapping):
+        return json_schema
+    if isinstance(json_schema, str) and json_schema.strip():
+        try:
+            loaded_s = json.loads(json_schema)
+            if isinstance(loaded_s, Mapping):
+                return loaded_s
+        except Exception:
+            return None
+    return None
+
+
 def extract_extractconf_features(
     *,
     parsed: Any = None,
@@ -287,26 +303,24 @@ def extract_extractconf_features(
     repaired: bool = False,
     fallback_used: bool = False,
     telemetry: Any = None,
+    _already_parsed: bool = False,
 ) -> list[float]:
     """Extract canonical 18-feature `ExtractConf` vector in ~0 ms pure Python."""
     eff_parsed = parsed
     eff_valid_json = bool(valid_json)
-    if eff_parsed is None and isinstance(response_text, str) and response_text.strip():
+    if (
+        not _already_parsed
+        and eff_parsed is None
+        and eff_valid_json
+        and isinstance(response_text, str)
+        and response_text.strip()
+    ):
         try:
             eff_parsed = json.loads(response_text)
         except Exception:
             eff_valid_json = False
 
-    schema_obj: Mapping[str, Any] | None = None
-    if isinstance(json_schema, Mapping):
-        schema_obj = json_schema
-    elif isinstance(json_schema, str) and json_schema.strip():
-        try:
-            loaded_s = json.loads(json_schema)
-            if isinstance(loaded_s, Mapping):
-                schema_obj = loaded_s
-        except Exception:
-            schema_obj = None
+    schema_obj = parse_json_schema_dict(json_schema)
 
     has_tel, tel = normalize_extraction_telemetry(telemetry)
     denom_steps = max(1, tel.steps, int(completion_tokens))
@@ -724,6 +738,7 @@ def compute_extractconf_risk(
     fallback_used: bool = False,
     telemetry: Any = None,
     calibrator: ExtractConfCalibrator | None = None,
+    _already_parsed: bool = False,
 ) -> float:
     """Compute `ExtractConf` extraction defect risk in `[0, 1]` at ~0 ms CPU overhead."""
     feats = extract_extractconf_features(
@@ -739,6 +754,7 @@ def compute_extractconf_risk(
         repaired=repaired,
         fallback_used=fallback_used,
         telemetry=telemetry,
+        _already_parsed=_already_parsed,
     )
     if calibrator is not None:
         return float(calibrator.predict_risk(feats))
@@ -754,4 +770,5 @@ __all__ = [
     "compute_extractconf_risk",
     "extract_extractconf_features",
     "normalize_extraction_telemetry",
+    "parse_json_schema_dict",
 ]

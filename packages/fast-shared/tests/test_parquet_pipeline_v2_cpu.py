@@ -351,3 +351,261 @@ def test_optional_lance_sink_graceful_and_streaming(tmp_path: Path, monkeypatch:
     joined = pa.concat_tables(written_tables)
     assert joined["id"].to_pylist() == [1, 2, 3, 4]
     assert joined.schema.field("vector").type == pa.list_(pa.int8(), 16)
+
+
+def test_extract_parquet_dedup_within_window_and_utf8_token_sort_cpu(tmp_path: Path) -> None:
+    import json
+    from types import SimpleNamespace
+    import fast_shared.pipeline_llm as pllm
+
+    schema = {
+        "type": "object",
+        "properties": {"tag": {"type": "string"}, "byte_len": {"type": "integer"}},
+        "required": ["tag", "byte_len"],
+    }
+
+    class _RecordingLlmEngine:
+        default_max_b_slots = 32
+
+        def __init__(self, *, with_token_counter: bool = False) -> None:
+            self.seen_batches: list[list[str]] = []
+            self.with_token_counter = with_token_counter
+            if with_token_counter:
+                self.count_tokens_batch = self._count_tokens_batch  # type: ignore[attr-defined]
+
+        def _count_tokens_batch(self, prompts: list[str]) -> list[int]:
+            # Custom deterministic token count distinct from byte/char length
+            return [1000 if p.startswith("TOK_FIRST:") else len(p) for p in prompts]
+
+        def generate_batch(self, prompts: list[str], **_kwargs):
+            self.seen_batches.append(list(prompts))
+            items = []
+            for p in prompts:
+                b_len = len(p.encode("utf-8"))
+                txt = json.dumps({"tag": p[:12], "byte_len": b_len})
+                items.append(
+                    SimpleNamespace(
+                        text=txt,
+                        parsed=None,
+                        valid_json=True,
+                        valid_schema=True,
+                        finish_reason="stop",
+                        prompt_tokens=max(1, b_len // 3),
+                        completion_tokens=8,
+                        telemetry={
+                            "mean_h_pre": 0.25 if "dup_a" in p else 0.05,
+                            "mean_neg_log_z_valid": 0.40 if "dup_a" in p else 0.01,
+                            "mean_top2_margin": 1.2 if "dup_a" in p else 5.5,
+                        },
+                    )
+                )
+            return SimpleNamespace(
+                items=items,
+                stats={
+                    "valid_json_count": len(items),
+                    "valid_schema_count": len(items),
+                    "prompt_tokens": sum(it.prompt_tokens for it in items),
+                    "completion_tokens": sum(it.completion_tokens for it in items),
+                    "decode_sec": 0.02,
+                },
+            )
+
+    # 8 rows: 1 empty + 7 active with exact duplicates ("dup_a" x3, "漢字漢字漢字漢字" x2, "ascii_10ch" x1, "TOK_FIRST:z" x1)
+    # Note: "漢字漢字漢字漢字" is 8 chars (24 UTF-8 bytes), longer in UTF-8 bytes than 10-char ASCII "ascii_10ch" (10 bytes)!
+    rows = [
+        {"id": 0, "body_text": "ascii_10ch"},
+        {"id": 1, "body_text": "dup_a_record_payload"},
+        {"id": 2, "body_text": "   "},
+        {"id": 3, "body_text": "漢字漢字漢字漢字"},
+        {"id": 4, "body_text": "dup_a_record_payload"},
+        {"id": 5, "body_text": "TOK_FIRST:z"},
+        {"id": 6, "body_text": "漢字漢字漢字漢字"},
+        {"id": 7, "body_text": "dup_a_record_payload"},
+    ]
+    in_pq = tmp_path / "dedup_in.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), in_pq)
+
+    eng_dedup = _RecordingLlmEngine(with_token_counter=False)
+    out_dedup = tmp_path / "out_dedup.parquet"
+    sum_dedup = pllm.extract_parquet(
+        eng_dedup,
+        in_pq,
+        out_dedup,
+        system_prompt="sys",
+        json_schema=schema,
+        temperature=0.0,
+        dedup_within_window=True,
+        emit_extractconf=True,
+    )
+
+    eng_nodedup = _RecordingLlmEngine(with_token_counter=False)
+    out_nodedup = tmp_path / "out_nodedup.parquet"
+    sum_nodedup = pllm.extract_parquet(
+        eng_nodedup,
+        in_pq,
+        out_nodedup,
+        system_prompt="sys",
+        json_schema=schema,
+        temperature=0.0,
+        dedup_within_window=False,
+        emit_extractconf=True,
+    )
+
+    # 1. Dedup runs only the 4 unique non-empty prompts, sorted by UTF-8 byte length descending ("漢字..." 24B > "dup_a..." 20B > "TOK_FIRST:z" 11B > "ascii_10ch" 10B)!
+    assert len(eng_dedup.seen_batches) == 1
+    sent_dedup = eng_dedup.seen_batches[0]
+    assert len(sent_dedup) == 4
+    assert [len(s.encode("utf-8")) for s in sent_dedup] == sorted(
+        [len(s.encode("utf-8")) for s in sent_dedup], reverse=True
+    )
+    assert sent_dedup[0] == "漢字漢字漢字漢字"
+
+    # 2. Non-dedup sends all 7 active prompts
+    assert len(eng_nodedup.seen_batches[0]) == 7
+
+    # 3. Exact 100% parity on row order, counts, metrics, response texts, and ExtractConf risk scores!
+    assert sum_dedup.docs_processed == sum_nodedup.docs_processed == 8
+    assert sum_dedup.valid_json == sum_nodedup.valid_json == 7
+    assert sum_dedup.valid_schema == sum_nodedup.valid_schema == 7
+    assert sum_dedup.prompt_tokens == sum_nodedup.prompt_tokens
+    assert sum_dedup.completion_tokens == sum_nodedup.completion_tokens
+
+    tbl_d = pq.read_table(out_dedup)
+    tbl_n = pq.read_table(out_nodedup)
+    for col in ("id", "response_text", "valid_json", "valid_schema", "finish_reason", "prompt_tokens", "completion_tokens"):
+        assert tbl_d.column(col).to_pylist() == tbl_n.column(col).to_pylist()
+    assert np.allclose(tbl_d.column("extractconf_risk").to_numpy(), tbl_n.column("extractconf_risk").to_numpy(), atol=1e-7)
+
+    # 4. Does NOT dedup when temperature > 0.0!
+    eng_temp = _RecordingLlmEngine(with_token_counter=False)
+    pllm.extract_parquet(
+        eng_temp,
+        in_pq,
+        tmp_path / "out_temp.parquet",
+        system_prompt="sys",
+        json_schema=schema,
+        temperature=0.2,
+        dedup_within_window=True,
+    )
+    assert len(eng_temp.seen_batches[0]) == 7
+
+    # 5. Uses `engine.count_tokens_batch` when callable!
+    eng_toksort = _RecordingLlmEngine(with_token_counter=True)
+    pllm.extract_parquet(
+        eng_toksort,
+        in_pq,
+        tmp_path / "out_toksort.parquet",
+        system_prompt="sys",
+        json_schema=schema,
+        temperature=0.0,
+        dedup_within_window=True,
+    )
+    assert eng_toksort.seen_batches[0][0] == "TOK_FIRST:z"
+
+
+def test_multichunk_drop_text_col_preproject_and_dict_encode_decode_schema_parity_cpu(tmp_path: Path) -> None:
+    import fast_shared.parquet_pipeline as pp
+
+    tok = _make_bpe_tokenizer(tmp_path)
+    eng = _LengthSensitiveEngine(tok)
+
+    # Batch 1 expands (K > 1 chunks per row -> dictionary-encoded in RAM); batch 2 does NOT expand (1 chunk/row -> tests _align_dict_meta_parts!)
+    long_body = ("alpha beta " * 120).strip()
+    short_body = "alpha beta"
+    in_schema = pa.schema(
+        [
+            pa.field("doc_id", pa.string()),
+            pa.field("source_uri", pa.large_string()),
+            pa.field("page_offsets", pa.list_(pa.int32())),
+            pa.field("body", pa.string()),
+        ]
+    )
+    in_tbl = pa.Table.from_arrays(
+        [
+            pa.array(["d-0", "d-1", "d-2", "d-3"], type=pa.string()),
+            pa.array(["uri://long-0", "uri://long-1", "uri://short-2", "uri://short-3"], type=pa.large_string()),
+            pa.array([[0, 50], [0, 50], [0], [0]], type=pa.list_(pa.int32())),
+            pa.array([long_body, long_body, short_body, short_body], type=pa.string()),
+        ],
+        schema=in_schema,
+    )
+    in_pq = tmp_path / "multichunk_in.parquet"
+    pq.write_table(in_tbl, in_pq, row_group_size=2)
+
+    # 1. Direct _prepare_batch_rows inspection: drops `body` and `page_offsets` BEFORE .take, and dictionary-encodes strings in RAM!
+    rb0 = next(pq.ParquetFile(in_pq).iter_batches(batch_size=2))
+    prep_meta, prep_toks = pp._prepare_batch_rows(
+        rb0,
+        tokenizer=tok,
+        text_col="body",
+        keep_cols=None,
+        drop_text_col=True,
+        ocr_pages_only=False,
+        per_ocr_page=False,
+        chunk=True,
+        max_body_tokens=None,
+        overlap=2,
+        max_encode_length=24,
+        max_chunk_tokens=24,
+        skip_empty=False,
+        include_chunk_text=False,
+        prefix=None,
+        prompt_name=None,
+        add_query_prefix=False,
+        add_document_prefix=True,
+    )
+    assert len(prep_toks) > rb0.num_rows
+    assert "body" not in prep_meta.schema.names
+    assert "page_offsets" not in prep_meta.schema.names
+    assert pa.types.is_dictionary(prep_meta.schema.field("doc_id").type)
+    assert pa.types.is_dictionary(prep_meta.schema.field("source_uri").type)
+
+    # 2. End-to-end single-file AND sharded outputs decode back to exact `pa.string()` / `pa.large_string()` with 0 leaked internal metadata!
+    out_single = tmp_path / "multichunk_single.parquet"
+    out_shards = tmp_path / "multichunk_shards"
+    sum_single = embed_parquet(
+        eng,
+        in_pq,
+        out_single,
+        text_col="body",
+        drop_text_col=True,
+        chunk=True,
+        max_chunk_tokens=24,
+        overlap=2,
+        batch_rows=2,
+        dtype="int8",
+        mrl_dim=16,
+        progress_every=0,
+    )
+    sum_shards = embed_parquet(
+        eng,
+        in_pq,
+        out_shards,
+        text_col="body",
+        drop_text_col=True,
+        chunk=True,
+        max_chunk_tokens=24,
+        overlap=2,
+        batch_rows=2,
+        shard_rows=5,
+        dtype="int8",
+        mrl_dim=16,
+        progress_every=0,
+    )
+    assert sum_single.rows_emitted == sum_shards.rows_emitted
+    assert sum_single.rows_emitted > 4
+
+    t_single = pq.read_table(out_single)
+    t_shards = pa.concat_tables([pq.read_table(p) for p in sorted(out_shards.glob("part-*.parquet"))])
+    for tbl_out in (t_single, t_shards):
+        assert "body" not in tbl_out.schema.names
+        assert "page_offsets" not in tbl_out.schema.names
+        assert tbl_out.schema.field("doc_id").type == pa.string()
+        assert tbl_out.schema.field("source_uri").type == pa.large_string()
+        assert not (tbl_out.schema.field("doc_id").metadata and b"_fast_dict_orig" in tbl_out.schema.field("doc_id").metadata)
+        assert not (tbl_out.schema.field("source_uri").metadata and b"_fast_dict_orig" in tbl_out.schema.field("source_uri").metadata)
+    assert t_single.column("doc_id").to_pylist() == t_shards.column("doc_id").to_pylist()
+    assert t_single.column("source_uri").to_pylist() == t_shards.column("source_uri").to_pylist()
+    assert t_single.column("doc_id").to_pylist()[-2:] == ["d-2", "d-3"]
+
+

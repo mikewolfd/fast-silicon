@@ -34,28 +34,34 @@ inline float gelu_pytorch_tanh(float x) {
 """
 
 
-def make_mpp_matmul_kernel(
-    name: str,
+def _mpp_epilogue_inputs(epilogue: str) -> list[str]:
+    if epilogue in ("none", "geglu", "geglu_tanh"):
+        return ["A", "B"]
+    if epilogue in ("bias", "bias_gelu"):
+        return ["A", "B", "Bias"]
+    if epilogue == "bias_res":
+        return ["A", "B", "Bias", "Res"]
+    if epilogue in ("gelu_mul_pli", "gelu_tanh_mul_pli"):
+        return ["A", "B", "PLI"]
+    raise ValueError(f"Unknown MPP epilogue {epilogue!r}")
+
+
+def make_mpp_gemm_source(
     *,
     epilogue: str = "none",
     tm: int = 64,
     tn: int = 64,
     sgs: int = 4,
     relaxed: bool = False,
-):
-    """Build an `mx.fast.metal_kernel` backed by Metal 4 `MPP::matmul2d` (`A[M,K] @ B[N,K]^T -> C[M,N]`).
-
-    Uses `relaxed=false` by default per the Metal 4 MPP precision playbook; callers may opt into
-    `relaxed=True` only when explicitly benchmarked and parity-verified on the target chip.
-    """
+) -> str:
+    """Return Metal 4 `MPP::matmul2d` kernel body source (`A[M,K] @ B[N,K]^T -> C[M,N]`)."""
+    _ = _mpp_epilogue_inputs(epilogue)
     relaxed_str = "true" if relaxed else "false"
     if epilogue == "none":
-        inputs = ["A", "B"]
         n_expr = "N"
         b_cols_expr = "N"
         ep_body = "op.run(mA, mB, mC);"
     elif epilogue == "bias":
-        inputs = ["A", "B", "Bias"]
         n_expr = "N"
         b_cols_expr = "N"
         ep_body = """
@@ -80,7 +86,6 @@ def make_mpp_matmul_kernel(
         cO.store(mC);
         """
     elif epilogue == "bias_res":
-        inputs = ["A", "B", "Bias", "Res"]
         n_expr = "N"
         b_cols_expr = "N"
         ep_body = """
@@ -105,7 +110,6 @@ def make_mpp_matmul_kernel(
         cO.store(mC);
         """
     elif epilogue == "bias_gelu":
-        inputs = ["A", "B", "Bias"]
         n_expr = "N"
         b_cols_expr = "N"
         ep_body = """
@@ -132,9 +136,8 @@ def make_mpp_matmul_kernel(
         cO.store(mC);
         """
     elif epilogue in ("geglu", "geglu_tanh"):
-        inputs = ["A", "B"]
         gelu_expr = "gelu_pytorch_tanh(g)" if epilogue == "geglu_tanh" else "0.5f * g * (1.0f + exact_erf(g * 0.7071067811865475f))"
-        src = f"""
+        return f"""
         int M = (int)A_shape[0], K = (int)A_shape[1], N_tot = (int)B_shape[0];
         int N_half = N_tot >> 1;
         int tg_y = (int)(threadgroup_position_in_grid.y * {tm});
@@ -174,9 +177,7 @@ def make_mpp_matmul_kernel(
         }}
         cO.store(mC);
         """
-        return mx.fast.metal_kernel(name=name, input_names=inputs, output_names=["C"], header=HEADER_MPP, source=src)
     elif epilogue in ("gelu_mul_pli", "gelu_tanh_mul_pli"):
-        inputs = ["A", "B", "PLI"]
         n_expr = "N"
         b_cols_expr = "N"
         gelu_expr = "gelu_pytorch_tanh(g)" if epilogue == "gelu_tanh_mul_pli" else "0.5f * g * (1.0f + exact_erf(g * 0.7071067811865475f))"
@@ -203,10 +204,10 @@ def make_mpp_matmul_kernel(
         }}
         cO.store(mC);
         """
-    else:
+    else:  # pragma: no cover - guarded by _mpp_epilogue_inputs
         raise ValueError(f"Unknown MPP epilogue {epilogue!r}")
 
-    src = f"""
+    return f"""
     int M = (int)A_shape[0], K = (int)A_shape[1], N = (int)B_shape[0];
     int tg_y = (int)(threadgroup_position_in_grid.y * {tm});
     int tg_x = (int)(threadgroup_position_in_grid.x * {tn});
@@ -221,4 +222,22 @@ def make_mpp_matmul_kernel(
     auto mC = tC.slice(tg_x, tg_y);
     {ep_body}
     """
+
+
+def make_mpp_matmul_kernel(
+    name: str,
+    *,
+    epilogue: str = "none",
+    tm: int = 64,
+    tn: int = 64,
+    sgs: int = 4,
+    relaxed: bool = False,
+):
+    """Build an `mx.fast.metal_kernel` backed by Metal 4 `MPP::matmul2d` (`A[M,K] @ B[N,K]^T -> C[M,N]`).
+
+    Uses `relaxed=false` by default per the Metal 4 MPP precision playbook; callers may opt into
+    `relaxed=True` only when explicitly benchmarked and parity-verified on the target chip.
+    """
+    inputs = _mpp_epilogue_inputs(epilogue)
+    src = make_mpp_gemm_source(epilogue=epilogue, tm=tm, tn=tn, sgs=sgs, relaxed=relaxed)
     return mx.fast.metal_kernel(name=name, input_names=inputs, output_names=["C"], header=HEADER_MPP, source=src)

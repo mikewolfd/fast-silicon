@@ -1154,3 +1154,44 @@ def test_multifunction_symlinks_and_native_guards_cpu() -> None:
         assert cap in cli_src
 
 
+def test_probe_tanh_mpp_kernels_uses_shared_gemm_source_and_fallback_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `_probe_tanh_mpp_kernels` uses `make_mpp_gemm_source(..., epilogue='geglu_tanh')` and skips non-Metal4 cleanly."""
+    from fast_embeddinggemma_2 import gpu as emb2_gpu
+    from fast_shared import metal_mpp as shared_mpp
+
+    assert hasattr(shared_mpp, "make_mpp_gemm_source")
+    src_geglu = shared_mpp.make_mpp_gemm_source(tm=64, tn=64, sgs=4, epilogue="geglu_tanh")
+    src_pg = shared_mpp.make_mpp_gemm_source(tm=64, tn=64, sgs=4, epilogue="gelu_tanh_mul_pli")
+    assert "gelu_pytorch_tanh(g)" in src_geglu
+    assert "gelu_pytorch_tanh(g)" in src_pg
+
+    # Non-Metal-4 / pre-macOS-26 skip must return (None, None, False) without instantiating kernels
+    assert emb2_gpu._probe_tanh_mpp_kernels({"metal4": False, "apple9": True, "apple10": False, "macos_version": (26, 6)}) == (
+        None,
+        None,
+        False,
+    )
+    assert emb2_gpu._probe_tanh_mpp_kernels({"metal4": True, "macos_version": (15, 5)}) == (None, None, False)
+
+    seen_epilogues: list[str] = []
+    real_gemm_src = shared_mpp.make_mpp_gemm_source
+
+    def _spy_gemm_src(*, epilogue: str = "none", tm: int = 64, tn: int = 64, sgs: int = 4, relaxed: bool = False) -> str:
+        seen_epilogues.append(epilogue)
+        return real_gemm_src(epilogue=epilogue, tm=tm, tn=tn, sgs=sgs, relaxed=relaxed)
+
+    monkeypatch.setattr(emb2_gpu, "make_mpp_gemm_source", _spy_gemm_src)
+    monkeypatch.setattr(emb2_gpu.mx.fast, "metal_kernel", lambda **kw: kw)
+    k_g, k_p, ok = emb2_gpu._probe_tanh_mpp_kernels({"metal4": True, "macos_version": (26, 2)})
+    assert ok is True
+    assert seen_epilogues == ["geglu_tanh", "gelu_tanh_mul_pli"]
+    assert k_g["input_names"] == ["A", "B"] and k_p["input_names"] == ["A", "B", "PLI"]
+
+    # Clean fallback if `make_mpp_gemm_source` is absent AND `make_mpp_matmul_kernel` rejects `geglu_tanh`
+    monkeypatch.setattr(emb2_gpu, "make_mpp_gemm_source", None)
+    monkeypatch.setattr(emb2_gpu, "make_mpp_matmul_kernel", lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("absent")))
+    k_fb_g, k_fb_p, ok_fb = emb2_gpu._probe_tanh_mpp_kernels({"metal4": True, "macos_version": (26, 2)})
+    assert ok_fb is True and k_fb_g["name"] == "emb2_geglu_tanh64" and k_fb_p["name"] == "emb2_pg_tanh64"
+
+
+

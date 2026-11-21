@@ -13,7 +13,10 @@ from typing import Any, Sequence
 import mlx.core as mx
 import numpy as np
 
+import fast_shared.metal_mpp as _shared_metal_mpp
 from fast_shared.metal_mpp import HEADER_MPP, HEADER_STD, make_mpp_matmul_kernel
+
+make_mpp_gemm_source = getattr(_shared_metal_mpp, "make_mpp_gemm_source", None)
 
 from .paths import MmapTokenTable, load_or_mmap_token_table
 
@@ -186,10 +189,24 @@ def should_use_fused_mpp(
 
 
 def _probe_tanh_mpp_kernels(caps: dict[str, Any] | None = None):
-    """Instantiate tanh-GELU MPP epilogues on Metal 4 (using `fast_shared` or inline `HEADER_MPP`)."""
+    """Instantiate tanh-GELU MPP epilogues on Metal 4 via `fast_shared.metal_mpp` (falling back cleanly if absent)."""
     c = caps if caps is not None else probe_metal_capabilities()
     if not (bool(c.get("metal4", False)) and tuple(c.get("macos_version", (0,))) >= (26, 0)):
         return None, None, False
+    gemm_src_fn = make_mpp_gemm_source
+    if callable(gemm_src_fn):
+        try:
+            geglu_src = gemm_src_fn(tm=64, tn=64, sgs=4, epilogue="geglu_tanh")
+            pg_src = gemm_src_fn(tm=64, tn=64, sgs=4, epilogue="gelu_tanh_mul_pli")
+            k_geglu = mx.fast.metal_kernel(
+                name="emb2_geglu64", input_names=["A", "B"], output_names=["C"], header=HEADER_MPP, source=geglu_src
+            )
+            k_pg = mx.fast.metal_kernel(
+                name="emb2_pg64", input_names=["A", "B", "PLI"], output_names=["C"], header=HEADER_MPP, source=pg_src
+            )
+            return k_geglu, k_pg, True
+        except ValueError:
+            pass
     try:
         k_geglu = make_mpp_matmul_kernel("emb2_geglu64", tm=64, tn=64, sgs=4, epilogue="geglu_tanh")
         k_pg = make_mpp_matmul_kernel("emb2_pg64", tm=64, tn=64, sgs=4, epilogue="gelu_tanh_mul_pli")

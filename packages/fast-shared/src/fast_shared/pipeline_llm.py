@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack
 import copy
 from dataclasses import dataclass
+import inspect
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ import pyarrow.parquet as pq
 
 from .bench import clear_mlx_arena, wired_limit
 from .embeddings import set_mlx_cache_limit
-from .extractconf import ExtractConfCalibrator, compute_extractconf_risk
+from .extractconf import ExtractConfCalibrator, compute_extractconf_risk, parse_json_schema_dict
 from .parquet_pipeline import (
     DEFAULT_TEXT_COLUMNS,
     resolve_input_files,
@@ -247,27 +248,58 @@ def _resolve_default_b_slots(engine: Any) -> int:
         return 128
 
 
+_UNSET_PARSED = object()
+
+
+def _engine_accepts_explicit_kwarg(engine: Any, kwarg_name: str) -> bool:
+    fn = getattr(engine, "generate_batch", None)
+    if not callable(fn):
+        return False
+    try:
+        param = inspect.signature(fn).parameters.get(kwarg_name)
+    except (TypeError, ValueError):
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 def _score_item_extractconf(
     item: Any,
     *,
-    json_schema: str | dict[str, Any] | None,
+    json_schema: Mapping[str, Any] | str | None,
     max_tokens: int,
     calibrator: ExtractConfCalibrator | None,
+    parsed: Any = _UNSET_PARSED,
+    valid_json: bool | None = None,
 ) -> float:
+    eff_valid_json = bool(getattr(item, "valid_json", True)) if valid_json is None else bool(valid_json)
+    resp_text = getattr(item, "text", None)
+    if parsed is _UNSET_PARSED:
+        eff_parsed = getattr(item, "parsed", None)
+        if eff_parsed is None and eff_valid_json and isinstance(resp_text, str) and resp_text.strip():
+            try:
+                eff_parsed = json.loads(resp_text)
+            except Exception:
+                eff_valid_json = False
+    else:
+        eff_parsed = parsed
     return compute_extractconf_risk(
-        parsed=getattr(item, "parsed", None),
-        response_text=getattr(item, "text", None),
+        parsed=eff_parsed,
+        response_text=resp_text,
         json_schema=json_schema,
         prompt_tokens=int(getattr(item, "prompt_tokens", 0) or 0),
         completion_tokens=int(getattr(item, "completion_tokens", 0) or 0),
         max_tokens=max_tokens,
-        valid_json=bool(getattr(item, "valid_json", True)),
+        valid_json=eff_valid_json,
         valid_schema=bool(getattr(item, "valid_schema", True)),
         finish_reason=str(getattr(item, "finish_reason", "stop")),
         repaired=bool(getattr(item, "repaired", False)),
         fallback_used=bool(getattr(item, "fallback_used", False)),
         telemetry=getattr(item, "telemetry", None),
         calibrator=calibrator,
+        _already_parsed=True,
     )
 
 
@@ -394,6 +426,7 @@ def extract_parquet(
     batch_rows: int | None = None,
     macro_window_rows: int = 4096,
     sort_by_length: bool = True,
+    dedup_within_window: bool = True,
     gpu_batch_size: int | None = None,
     shard_rows: int = 4096,
     max_tokens: int = 512,
@@ -453,7 +486,12 @@ def extract_parquet(
 
     eff_ws = resolve_engine_whitespace_flexible(engine, whitespace_flexible)
     eff_schema = _resolve_effective_schema(engine, json_schema, compact_optional_schema)
+    eff_schema_dict: Mapping[str, Any] | None = (
+        parse_json_schema_dict(eff_schema) if emit_extractconf else None
+    )
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
+    if emit_extractconf and "collect_telemetry" not in clean_extra and _engine_accepts_explicit_kwarg(engine, "collect_telemetry"):
+        clean_extra["collect_telemetry"] = True
     roll_kw = clean_extra.get("roll_slots")
     bs_kw = clean_extra.pop("batch_size", None)
     policy_b_slots = _resolve_default_b_slots(engine)
@@ -706,14 +744,48 @@ def extract_parquet(
 
                 active_indices = [idx for idx, p in enumerate(raw_prompts) if p is not None]
                 if active_indices:
-                    if sort_by_length and len(active_indices) > 1:
-                        sorted_active = sorted(
-                            active_indices,
-                            key=lambda idx: (-len(raw_prompts[idx] or ""), idx),
-                        )
+                    can_dedup = (
+                        bool(dedup_within_window)
+                        and float(temperature) == 0.0
+                        and len(active_indices) > 1
+                    )
+                    if can_dedup:
+                        groups_by_prompt: dict[str, list[int]] = {}
+                        for idx in active_indices:
+                            p_str = str(raw_prompts[idx])
+                            pos_list = groups_by_prompt.get(p_str)
+                            if pos_list is None:
+                                groups_by_prompt[p_str] = [idx]
+                            else:
+                                pos_list.append(idx)
+                        unique_entries: list[tuple[int, str, list[int]]] = [
+                            (pos_list[0], p_str, pos_list)
+                            for p_str, pos_list in groups_by_prompt.items()
+                        ]
                     else:
-                        sorted_active = active_indices
-                    sorted_prompts = [str(raw_prompts[idx]) for idx in sorted_active]
+                        unique_entries = [(idx, str(raw_prompts[idx]), [idx]) for idx in active_indices]
+
+                    if sort_by_length and len(unique_entries) > 1:
+                        count_fn = getattr(engine, "count_tokens_batch", None)
+                        tok_counts: list[int] | None = None
+                        if callable(count_fn):
+                            raw_counts = count_fn([entry[1] for entry in unique_entries])
+                            if isinstance(raw_counts, Sequence) and len(raw_counts) == len(unique_entries):
+                                tok_counts = [int(c) for c in raw_counts]
+                        if tok_counts is not None:
+                            order = sorted(
+                                range(len(unique_entries)),
+                                key=lambda i: (-tok_counts[i], unique_entries[i][0]),
+                            )
+                        else:
+                            order = sorted(
+                                range(len(unique_entries)),
+                                key=lambda i: (-len(unique_entries[i][1].encode("utf-8")), unique_entries[i][0]),
+                            )
+                        sorted_entries = [unique_entries[i] for i in order]
+                    else:
+                        sorted_entries = unique_entries
+                    sorted_prompts = [entry[1] for entry in sorted_entries]
 
                     gen_kw: dict[str, Any] = {
                         "system_prompt": system_prompt,
@@ -732,27 +804,60 @@ def extract_parquet(
                     res = engine.generate_batch(sorted_prompts, **gen_kw)
                     clear_mlx_arena(256)
 
-                    for out_it, orig_idx in zip(res.items, sorted_active):
-                        resp_texts[orig_idx] = str(out_it.text)
-                        valid_jsons[orig_idx] = bool(out_it.valid_json)
-                        valid_schemas[orig_idx] = bool(out_it.valid_schema)
-                        finish_reasons[orig_idx] = str(getattr(out_it, "finish_reason", "stop"))
-                        prompt_toks_col[orig_idx] = int(out_it.prompt_tokens)
-                        comp_toks_col[orig_idx] = int(out_it.completion_tokens)
+                    dedup_had_repeats = len(sorted_entries) < len(active_indices)
+                    for out_it, (_first_idx, _p_str, orig_positions) in zip(res.items, sorted_entries):
+                        r_text = str(out_it.text)
+                        v_json = bool(out_it.valid_json)
+                        v_schema = bool(out_it.valid_schema)
+                        f_reason = str(getattr(out_it, "finish_reason", "stop"))
+                        p_toks = int(out_it.prompt_tokens)
+                        c_toks = int(out_it.completion_tokens)
                         if emit_extractconf:
-                            risk_col[orig_idx] = _score_item_extractconf(
+                            it_parsed = getattr(out_it, "parsed", None)
+                            if it_parsed is None and v_json and r_text.strip():
+                                try:
+                                    it_parsed = json.loads(r_text)
+                                except Exception:
+                                    v_json = False
+                            it_risk = _score_item_extractconf(
                                 out_it,
-                                json_schema=eff_schema,
+                                parsed=it_parsed,
+                                valid_json=v_json,
+                                json_schema=eff_schema_dict,
                                 max_tokens=max_tokens,
                                 calibrator=extractconf_calibrator,
                             )
+                        else:
+                            it_risk = 0.0
 
-                    valid_json_tot += int(res.stats.get("valid_json_count", sum(1 for it in res.items if it.valid_json)))
-                    valid_schema_tot += int(
-                        res.stats.get("valid_schema_count", sum(1 for it in res.items if it.valid_schema))
-                    )
-                    prompt_toks_tot += int(res.stats.get("prompt_tokens", sum(it.prompt_tokens for it in res.items)))
-                    comp_toks_tot += int(res.stats.get("completion_tokens", sum(it.completion_tokens for it in res.items)))
+                        for orig_idx in orig_positions:
+                            resp_texts[orig_idx] = r_text
+                            valid_jsons[orig_idx] = bool(out_it.valid_json)
+                            valid_schemas[orig_idx] = v_schema
+                            finish_reasons[orig_idx] = f_reason
+                            prompt_toks_col[orig_idx] = p_toks
+                            comp_toks_col[orig_idx] = c_toks
+                            if emit_extractconf:
+                                risk_col[orig_idx] = it_risk
+
+                    if dedup_had_repeats:
+                        valid_json_tot += sum(1 for idx in active_indices if valid_jsons[idx])
+                        valid_schema_tot += sum(1 for idx in active_indices if valid_schemas[idx])
+                        prompt_toks_tot += sum(prompt_toks_col[idx] for idx in active_indices)
+                        comp_toks_tot += sum(comp_toks_col[idx] for idx in active_indices)
+                    else:
+                        valid_json_tot += int(
+                            res.stats.get("valid_json_count", sum(1 for it in res.items if it.valid_json))
+                        )
+                        valid_schema_tot += int(
+                            res.stats.get("valid_schema_count", sum(1 for it in res.items if it.valid_schema))
+                        )
+                        prompt_toks_tot += int(
+                            res.stats.get("prompt_tokens", sum(it.prompt_tokens for it in res.items))
+                        )
+                        comp_toks_tot += int(
+                            res.stats.get("completion_tokens", sum(it.completion_tokens for it in res.items))
+                        )
                     tot_dec_sec += float(res.stats.get("decode_sec", 0.0))
 
                 out_table = (
@@ -843,7 +948,12 @@ def extract_jsonl(
     prompts = [str(r.get(text_key, "")) for r in records]
     eff_ws = resolve_engine_whitespace_flexible(engine, whitespace_flexible)
     eff_schema = _resolve_effective_schema(engine, json_schema, compact_optional_schema)
+    eff_schema_dict: Mapping[str, Any] | None = (
+        parse_json_schema_dict(eff_schema) if emit_extractconf else None
+    )
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
+    if emit_extractconf and "collect_telemetry" not in clean_extra and _engine_accepts_explicit_kwarg(engine, "collect_telemetry"):
+        clean_extra["collect_telemetry"] = True
     roll_kw = clean_extra.get("roll_slots")
     eff_bs = (
         int(batch_size)
@@ -895,7 +1005,7 @@ def extract_jsonl(
                     out_row["extractconf_risk"] = round(
                         _score_item_extractconf(
                             item,
-                            json_schema=eff_schema,
+                            json_schema=eff_schema_dict,
                             max_tokens=max_tokens,
                             calibrator=extractconf_calibrator,
                         ),

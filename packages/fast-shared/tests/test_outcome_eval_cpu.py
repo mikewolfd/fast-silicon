@@ -1206,3 +1206,88 @@ def test_hungarian_nonfinite_guard_large_nested_lists_and_bfcl_nested_dicts() ->
     ]
     assert check_bfcl_ast_match([("a.find_closest", {"location": "Boston"})], gt_rest, fn_ambig) is False
 
+
+def test_compiled_jsonschema_cache_parity_and_fallback_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from fast_shared.outcome_eval.structured import (
+        _compile_jsonschema_validator,
+        _validate_jsonschema,
+        _validate_jsonschema_fallback,
+        validate_against_jsonschema,
+    )
+
+    schema_2020 = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+            "Metric": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z_]+$"},
+                    "count": {"type": "integer", "minimum": 0, "maximum": 100},
+                },
+                "required": ["name", "count"],
+                "additionalProperties": False,
+            }
+        },
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "minLength": 2},
+            "metrics": {"type": "array", "items": {"$ref": "#/$defs/Metric"}, "minItems": 1},
+            "status": {"anyOf": [{"const": "ok"}, {"const": "warn"}]},
+        },
+        "required": ["title", "metrics", "status"],
+        "additionalProperties": False,
+    }
+    # Reordered key copy must hit the exact same canonical cache entry!
+    schema_reordered = {
+        "additionalProperties": False,
+        "required": ["title", "metrics", "status"],
+        "properties": dict(reversed(list(schema_2020["properties"].items()))),
+        "type": "object",
+        "$defs": schema_2020["$defs"],
+        "$schema": schema_2020["$schema"],
+    }
+
+    cases = [
+        ({"title": "ok_doc", "metrics": [{"name": "lat_ms", "count": 0}], "status": "ok"}, True),
+        ({"title": "ok_doc", "metrics": [{"name": "lat_ms", "count": True}], "status": "ok"}, False),  # bool != integer
+        ({"title": "ok_doc", "metrics": [{"name": "BAD-UPPER", "count": 5}], "status": "ok"}, False),
+        ({"title": "ok_doc", "metrics": [{"name": "lat_ms", "count": 5, "extra": 1}], "status": "ok"}, False),
+        ({"title": "ok_doc", "metrics": [], "status": "ok"}, False),
+        ({"title": "ok_doc", "metrics": [{"name": "lat_ms", "count": 5}], "status": "bad"}, False),
+    ]
+
+    _compile_jsonschema_validator.cache_clear()
+    for obj, expected in cases:
+        got = validate_against_jsonschema(obj, schema_2020)
+        got_reord = _validate_jsonschema(obj, schema_reordered)
+        fb = _validate_jsonschema_fallback(obj, schema_2020, schema_2020)
+        assert got is expected
+        assert got_reord is expected
+        assert fb is expected
+
+    try:
+        import jsonschema as _js_mod
+    except ImportError:
+        _js_mod = None
+
+    if _js_mod is not None:
+        info = _compile_jsonschema_validator.cache_info()
+        assert info.currsize == 1
+        assert info.hits >= len(cases) * 2 - 1
+        for obj, expected in cases:
+            try:
+                _js_mod.validate(instance=obj, schema=schema_2020)
+                ref_ok = True
+            except Exception:
+                ref_ok = False
+            assert ref_ok is expected
+        # Invalid meta-schema (`type: "not_a_type"`) must return False cleanly
+        assert validate_against_jsonschema({"a": 1}, {"type": "not_a_json_type"}) is False
+
+    # Even after caching, absent `jsonschema` module routes cleanly to `_validate_jsonschema_fallback`
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    for obj, expected in cases:
+        assert validate_against_jsonschema(obj, schema_2020) is expected
+
+
