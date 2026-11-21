@@ -1477,21 +1477,34 @@ class FastPplxGPU:
         output_dtype: str = "float32",
         normalize: bool = True,
     ) -> list[np.ndarray]:
-        if not documents:
-            return []
         eff_max = min(int(max_length), self.max_seq_len) if max_length else self.max_seq_len
         encoded_docs = [
             self.tokenizer.encode_contextual_document(chunks, return_spans=True, max_length=eff_max)
             for chunks in documents
         ]
+        return self.encode_contextual_tokens(
+            encoded_docs, batch_size=batch_size, dimensions=dimensions, output_dtype=output_dtype, normalize=normalize
+        )
+
+    def encode_contextual_tokens(
+        self,
+        encoded_docs: Sequence[tuple[Sequence[int], Sequence[tuple[int, int]]]],
+        *,
+        batch_size: int = 8,
+        dimensions: int | None = None,
+        output_dtype: str = "float32",
+        normalize: bool = True,
+    ) -> list[np.ndarray]:
+        """Pool one vector per supplied span, preserving document and chunk order."""
+        if not encoded_docs:
+            return []
         lengths = np.array([len(item[0]) for item in encoded_docs], dtype=np.int64)
         order = np.argsort(lengths, kind="stable")
         bs = max(1, min(int(batch_size), self.max_batch_size))
-        results: list[np.ndarray | None] = [None] * len(documents)
+        results: list[np.ndarray | None] = [None] * len(encoded_docs)
 
-        for start in range(0, len(documents), bs):
+        for start in range(0, len(encoded_docs), bs):
             idxs = order[start : start + bs]
-            sub_docs = [documents[int(i)] for i in idxs]
             rows = [encoded_docs[int(i)][0] for i in idxs]
             spans_list = [encoded_docs[int(i)][1] for i in idxs]
             input_ids, attention_mask = self.tokenizer.pad(rows)
@@ -1504,7 +1517,7 @@ class FastPplxGPU:
             hidden = self.forward_hidden(input_ids, attention_mask)
             proj = self._project_span_pool(hidden, span_arr)
             for row_i, orig_idx in enumerate(idxs):
-                n_chunks = len(sub_docs[row_i])
+                n_chunks = len(spans_list[row_i])
                 doc_proj = proj[row_i, :n_chunks]
                 results[int(orig_idx)] = self._format_output(
                     doc_proj,

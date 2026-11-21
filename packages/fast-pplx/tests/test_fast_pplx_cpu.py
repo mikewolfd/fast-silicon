@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 import threading
+from types import SimpleNamespace
 import urllib.request
 
 import mlx.core as mx
@@ -371,9 +372,9 @@ def test_context_window_packing_and_hetero2_cli_cpu(tmp_path: Path) -> None:
             dim = dimensions or 1024
             return np.ones((len(token_lists), dim), dtype=np.float32) * 0.125
 
-        def encode_contextual_chunks(self, docs, *, batch_size=8, max_length=32768, dimensions=None, output_dtype="float32", normalize=True):
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
             dim = dimensions or 1024
-            return [np.ones((len(d), dim), dtype=np.float32) * 0.5 for d in docs]
+            return [np.ones((len(spans), dim), dtype=np.float32) * 0.5 for _, spans in docs]
 
         def close(self):
             pass
@@ -397,6 +398,67 @@ def test_context_window_packing_and_hetero2_cli_cpu(tmp_path: Path) -> None:
     assert ns.mode == "hetero2"
     assert ns.context_tokens == 2048
     assert ns.chunk_tokens == 256
+
+
+@pytest.mark.parametrize("mode", ["gpu", "ane", "hetero", "hetero2"])
+def test_public_contextual_limit_and_chunk_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.gpu import FastPplxGPU
+
+    tok = ContextualTokenizer(_write_synthetic_tokenizer(tmp_path), DEFAULT_PPLX_CONFIG)
+    encode = tok.encode_contextual_document
+    calls = []
+
+    def count_tokenizations(chunks, **kwargs):
+        calls.append(kwargs["max_length"])
+        return encode(chunks, **kwargs)
+
+    monkeypatch.setattr(tok, "encode_contextual_document", count_tokenizations)
+
+    # Use the GPU's batching, padding, span pooling and result ordering on the MLX CPU stream.
+    class IdentityGPU(FastPplxGPU):
+        def __init__(self):
+            self.tokenizer = tok
+            self.max_seq_len = 32768
+            self.max_batch_size = 2
+            self.dim = 1
+            self.model = SimpleNamespace(contextual_projection=lambda x: x)
+
+        def forward_hidden(self, input_ids, attention_mask):
+            assert input_ids.shape[1] <= 10
+            return mx.array(input_ids[..., None], dtype=mx.float32)
+
+        def _project_span_pool(self, hidden, spans):
+            with mx.stream(mx.cpu):
+                return super()._project_span_pool(hidden, spans)
+
+    # The bucket stand-in returns the mean token ID of each live span.
+    class MeanANE:
+        caps = (10,) if mode == "ane" else (7,)
+
+        def run_buckets(self, buckets, **kwargs):
+            return [
+                (bucket, np.array([[bucket.token_ids[t.start:t.end].mean()]
+                                   for t in bucket.targets if t.end > t.start], dtype=np.float32))
+                for bucket in buckets
+            ]
+
+        def close(self):
+            pass
+
+    docs = [
+        ["hello world one", "two one hello chunk world one", "two"],
+        ["two"], [], ["chunk", "", "world"],
+    ]
+    # Cut the second span after three tokens. Its successor and each empty chunk keep their zero row.
+    expected = [[16 / 3, 19 / 3, 0], [8], [], [6, 0, 5]]
+    with FastPplx(home=tmp_path, mode=mode, _gpu_backend=IdentityGPU(), _ane_backend=MeanANE(), _tokenizer=tok) as eng:
+        actual = eng.encode_contextual_chunks(docs, max_length=10, batch_size=2, mode=mode, dimensions=1, normalize=False)
+        assert calls == [10] * len(docs)
+        for vectors, means in zip(actual, expected, strict=True):
+            np.testing.assert_allclose(vectors[:, 0], means, rtol=1e-6)
+        if mode.startswith("hetero"):
+            assert eng.last_stats["gpu_items"] == 1 and eng.last_stats["ane_items"] == 3
 
 
 def test_streamed_gdn_sdpa_whole_in_proj_parity_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

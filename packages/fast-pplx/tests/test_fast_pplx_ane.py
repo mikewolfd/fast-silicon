@@ -336,9 +336,9 @@ def test_hetero2_scheduler_routing_and_cli_contract(tmp_path: Path) -> None:
                 out /= np.maximum(np.linalg.norm(out, axis=-1, keepdims=True), 1e-12)
             return out
 
-        def encode_contextual_chunks(self, docs, *, batch_size=8, max_length=32768, dimensions=None, output_dtype="float32", normalize=True):
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
             dim = dimensions or 1024
-            return [np.ones((len(d), dim), dtype=np.float32) * 0.25 for d in docs]
+            return [np.ones((len(spans), dim), dtype=np.float32) * 0.25 for _, spans in docs]
 
         def close(self):
             pass
@@ -515,6 +515,39 @@ def _hw_lock() -> Iterator[None]:
             __import__("fcntl").flock(fd, __import__("fcntl").LOCK_UN)
         finally:
             os.close(fd)
+
+
+@pytest.mark.gpu_ane
+def test_contextual_token_limit_on_staged_processors() -> None:
+    paths = resolve_paths()
+    if not (paths.weights_npz.is_file() and any(paths.ane_models_dir.glob("*.mlmodelc"))):
+        pytest.skip("Requires staged PPLX weights and compiled ANE models")
+
+    short = ["Tenant address", "Effective date"]
+    with _hw_lock(), FastPplx(home=paths.home, mode="hetero2", local_files_only=True) as eng:
+        assert eng.ane_available
+        for mode, limit in (("gpu", 512), ("ane", 512), ("hetero", 544), ("hetero2", 544)):
+            # This tokenizer emits one ID per additional " clause". Build a physically cut
+            # reference document that fits exactly, then cross the limit inside its second chunk.
+            prefix = ["Payment is due.", "Payment applies"]
+            base_ids, _ = eng.tokenizer.encode_contextual_document(prefix)
+            clipped = [prefix[0], prefix[1] + " clause" * (limit - len(base_ids))]
+            longer = [clipped[0], clipped[1] + " outside the budget" * 30, "A later amendment."]
+            ids, spans = eng.tokenizer.encode_contextual_document(clipped)
+            assert len(ids) == limit
+            assert eng.tokenizer.encode_contextual_document(longer, max_length=limit) == (ids, [*spans, (0, 0)])
+            long_mode = "ane" if mode == "ane" else "gpu"
+            short_mode = "gpu" if mode == "gpu" else "ane"
+            long_ref = eng.encode_contextual_chunks([clipped], mode=long_mode)[0]
+            short_ref = eng.encode_contextual_chunks([short], mode=short_mode)[0]
+
+            actual = eng.encode_contextual_chunks([longer, [], short], max_length=limit, batch_size=1, mode=mode)
+            assert [matrix.shape for matrix in actual] == [(3, eng.dim), (0, eng.dim), (2, eng.dim)]
+            np.testing.assert_array_equal(actual[0][-1], np.zeros(eng.dim))
+            for got, ref in ((actual[0][:2], long_ref), (actual[2], short_ref)):
+                assert np.all(np.sum(got * ref, axis=1) >= 0.9998)
+            if mode.startswith("hetero"):
+                assert eng.last_stats["gpu_items"] == 1 and eng.last_stats["ane_items"] == 2
 
 
 @pytest.mark.gpu_ane

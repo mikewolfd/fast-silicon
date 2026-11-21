@@ -1067,7 +1067,7 @@ class FastPplx:
         dimensions: int | None,
         output_dtype: str,
         normalize: bool,
-        contextual_docs: Sequence[Sequence[str]] | None = None,
+        contextual: bool = False,
     ) -> np.ndarray | list[np.ndarray]:
         eff_mode = self._resolve_mode(mode)
         if output_dtype not in ("float32", "float16", "int8"):
@@ -1080,30 +1080,33 @@ class FastPplx:
             self._set_call_stats(
                 {"mode": eff_mode, "ane_items": 0, "gpu_items": 0, "deterministic": eff_mode in ("gpu", "ane", "hetero"), "elapsed_s": 0.0}
             )
-            return [] if contextual_docs is not None else self._format_empty(0, target_dim, output_dtype)
+            return [] if contextual else self._format_empty(0, target_dim, output_dtype)
 
         ane_caps = tuple(getattr(self.ane, "caps", ())) if self.ane is not None else ()
         max_ane_cap = ane_caps[-1] if ane_caps else 0
 
-        if eff_mode == "gpu":
+        def _encode_gpu(
+            sub_items: Sequence[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]],
+        ) -> np.ndarray | list[np.ndarray]:
             with self._gpu_lock:
-                if contextual_docs is not None:
-                    res = self.gpu.encode_contextual_chunks(
-                        contextual_docs,
-                        batch_size=batch_size,
-                        max_length=self.max_seq_len,
-                        dimensions=target_dim,
-                        output_dtype=output_dtype,
-                        normalize=normalize,
-                    )
-                else:
-                    res = self.gpu.encode_tokens(
-                        [it[1] for it in items],
+                if contextual:
+                    return self.gpu.encode_contextual_tokens(
+                        [(ids, spans or ()) for _, ids, spans in sub_items],
                         batch_size=batch_size,
                         dimensions=target_dim,
                         output_dtype=output_dtype,
                         normalize=normalize,
                     )
+                return self.gpu.encode_tokens(
+                    [it[1] for it in sub_items],
+                    batch_size=batch_size,
+                    dimensions=target_dim,
+                    output_dtype=output_dtype,
+                    normalize=normalize,
+                )
+
+        if eff_mode == "gpu":
+            res = _encode_gpu(items)
             self._set_call_stats(
                 {
                     "mode": "gpu",
@@ -1122,7 +1125,7 @@ class FastPplx:
             if len(it[1]) <= max_ane_cap:
                 short_items.append(it)
             else:
-                if eff_mode == "ane":
+                if eff_mode == "ane" or self.gpu is None:
                     raise ValueError(
                         f"Item {it[0]} length ({len(it[1])}) exceeds max ANE bucket ({max_ane_cap}); use mode='hetero2' or 'gpu'"
                     )
@@ -1130,8 +1133,8 @@ class FastPplx:
 
         # Prepare result containers.
         np_dt = {"float32": np.float32, "float16": np.float16, "int8": np.int8}[output_dtype]
-        if contextual_docs is not None:
-            ctx_out: list[np.ndarray] = [np.zeros((len(contextual_docs[i]), target_dim), dtype=np_dt) for i in range(n_items)]
+        if contextual:
+            ctx_out = [np.zeros((len(spans or ()), target_dim), dtype=np_dt) for _, _, spans in items]
         else:
             flat_out = np.zeros((n_items, target_dim), dtype=np_dt)
 
@@ -1148,39 +1151,17 @@ class FastPplx:
                         live_pos += 1
                     else:
                         vec = np.zeros((target_dim,), dtype=np_dt)
-                    if contextual_docs is not None:
+                    if contextual:
                         ctx_out[tgt.item_index][tgt.chunk_index] = vec
                     else:
                         flat_out[tgt.item_index] = vec
 
-        def _run_gpu_subset(sub_items: Sequence[tuple[int, Sequence[int], Any]]) -> None:
-            if not sub_items:
-                return
-            idxs = [it[0] for it in sub_items]
-            with self._gpu_lock:
-                if contextual_docs is not None:
-                    sub_docs = [contextual_docs[i] for i in idxs]
-                    vecs_list = self.gpu.encode_contextual_chunks(
-                        sub_docs,
-                        batch_size=batch_size,
-                        max_length=self.max_seq_len,
-                        dimensions=target_dim,
-                        output_dtype=output_dtype,
-                        normalize=normalize,
-                    )
-                    for orig_i, v_mat in zip(idxs, vecs_list, strict=True):
-                        ctx_out[orig_i] = v_mat
+        def _run_gpu_subset(sub_items: Sequence[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]]) -> None:
+            for (orig_i, _, _), vec in zip(sub_items, _encode_gpu(sub_items), strict=True):
+                if contextual:
+                    ctx_out[orig_i] = vec
                 else:
-                    toks = [it[1] for it in sub_items]
-                    vecs = self.gpu.encode_tokens(
-                        toks,
-                        batch_size=batch_size,
-                        dimensions=target_dim,
-                        output_dtype=output_dtype,
-                        normalize=normalize,
-                    )
-                    for pos, orig_i in enumerate(idxs):
-                        flat_out[orig_i] = vecs[pos]
+                    flat_out[orig_i] = vec
 
         if eff_mode == "ane" or self.gpu is None:
             buckets = pack_ane_buckets(short_items, supported_caps=ane_caps)
@@ -1201,7 +1182,7 @@ class FastPplx:
                     "elapsed_s": round(time.perf_counter() - t0, 4),
                 }
             )
-            return ctx_out if contextual_docs is not None else flat_out
+            return ctx_out if contextual else flat_out
 
         # Concurrent hetero (deterministic static split) vs hetero2 (dynamic work-stealing):
         # - `hetero`: ANE owns all short <= max_ane_cap items deterministically; GPU owns > max_ane_cap items.
@@ -1273,7 +1254,7 @@ class FastPplx:
                 "elapsed_s": round(time.perf_counter() - t0, 4),
             }
         )
-        return ctx_out if contextual_docs is not None else flat_out
+        return ctx_out if contextual else flat_out
 
     def encode_tokens(
         self,
@@ -1393,7 +1374,7 @@ class FastPplx:
             dimensions=dimensions,
             output_dtype=output_dtype,
             normalize=normalize,
-            contextual_docs=documents,
+            contextual=True,
         )
         assert isinstance(res, list)
         return res
