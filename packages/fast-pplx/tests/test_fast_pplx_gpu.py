@@ -279,3 +279,68 @@ def test_gpu_real_model_s4096_streamed_vs_whole_parity(
             i8_max_err = int(np.max(np.abs(whole_i.astype(np.int32) - stream_i.astype(np.int32))))
             assert cos >= 0.99995, f"Real model S=4096 ({dtype_name}) streamed vs whole cos={cos}"
             assert i8_max_err <= 1, f"Real model S=4096 ({dtype_name}) streamed vs whole i8_max_err={i8_max_err}"
+
+
+@pytest.mark.gpu_ane
+def test_gpu_varlen_packed_btree_gdn_and_mx_fast_parity() -> None:
+    """M-P1.1: 1D varlen multi-doc GPU packing + btree segment-reset GDN + mx.fast.gated_delta_update parity."""
+    from fast_pplx.gpu import gated_delta_ops, gated_delta_update, normalize_qk
+
+    snap = _require_cached_weights()
+    with _gpu_validation_lock():
+        # 1. Direct mx.fast.gated_delta_update / packed btree parity >= 0.9998 across float16 & bfloat16
+        mx.random.seed(314)
+        for act_dt in (mx.float16, mx.bfloat16):
+            q = mx.random.normal((2, 96, 16, 128)).astype(act_dt)
+            k = mx.random.normal((2, 96, 16, 128)).astype(act_dt)
+            v = (mx.random.normal((2, 96, 16, 128)) * 0.25).astype(act_dt)
+            a = (mx.random.normal((2, 96, 16)) * 0.2).astype(act_dt)
+            b = (mx.random.normal((2, 96, 16)) * 0.2).astype(act_dt)
+            A_log = mx.full((16,), -2.0, dtype=mx.float32)
+            dt_bias = mx.full((16,), -1.0, dtype=mx.float32)
+            q, k = normalize_qk(q, k, inv_scale=128.0 ** -0.5, eps=1e-6)
+            y_fast, st_fast = gated_delta_update(q, k, v, a, b, A_log, dt_bias, use_kernel=True)
+            y_ref, st_ref = gated_delta_update(q, k, v, a, b, A_log, dt_bias, use_kernel=False)
+            mx.eval(y_fast, st_fast, y_ref, st_ref)
+            assert st_fast.dtype == mx.float32
+            yf = np.array(y_fast.astype(mx.float32)).ravel()
+            yr = np.array(y_ref.astype(mx.float32)).ravel()
+            cos = float(np.dot(yf, yr) / (np.linalg.norm(yf) * np.linalg.norm(yr)))
+            assert cos >= 0.9998, f"GDN fast vs ref cos={cos} for {act_dt}"
+
+        # 2. Multi-doc unequal-length varlen GPU batch matches standalone B=1 calls >= 0.9998 (zero cross-doc leakage)
+        with FastPplxGPU(model_dir=snap, dtype="float16", use_mapped_embedding=True, local_files_only=True) as gpu:
+            assert hasattr(gpu, "_pack_varlen_token_bins")
+            texts = [
+                "Short query on ocean thermohaline circulation.",
+                "Medium passage detailing solid-state lithium garnet separators and interfacial impedance. " * 4,
+                "Brief note.",
+                "Extended technical section analyzing bidirectional gated delta linear attention and grouped query RoPE. " * 7,
+                "Another concise passage about glacial firn core oxygen isotopes.",
+            ]
+            toks = [gpu.tokenizer.encode_document(t) for t in texts]
+            bins = gpu._pack_varlen_token_bins(toks, max_packed_tokens=1024)
+            assert len(bins) < len(toks), "Expected multi-doc 1D varlen packing into fewer bins"
+
+            batched = gpu.encode_tokens(toks, batch_size=8, output_dtype="float32", normalize=True)
+            singles = np.concatenate(
+                [gpu.encode_tokens([t], batch_size=1, output_dtype="float32", normalize=True) for t in toks],
+                axis=0,
+            )
+            cos_per_doc = np.sum(batched * singles, axis=-1)
+            assert float(np.min(cos_per_doc)) >= 0.9998, f"Varlen packed doc parity drift: {cos_per_doc}"
+
+            ctx_docs = [
+                ["Introduction to thermal arrays.", "Deep mooring results at 1400 meters."],
+                ["Single chunk summary."],
+                ["Part one of ceramic sintering.", "", "Part three after empty chunk.", "Final cycle metrics."],
+            ]
+            ctx_batched = gpu.encode_contextual_chunks(ctx_docs, batch_size=8, output_dtype="float32", normalize=True)
+            for di, doc in enumerate(ctx_docs):
+                ctx_single = gpu.encode_contextual_chunks([doc], batch_size=1, output_dtype="float32", normalize=True)[0]
+                for ci, ch in enumerate(doc):
+                    if not ch:
+                        assert np.all(ctx_batched[di][ci] == 0.0)
+                    else:
+                        c_val = float(np.dot(ctx_batched[di][ci], ctx_single[ci]))
+                        assert c_val >= 0.9998, f"Varlen contextual doc {di} chunk {ci} cos={c_val}"

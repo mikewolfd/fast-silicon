@@ -48,6 +48,7 @@ from fast_pplx.paths import resolve_paths
 from fast_shared.coreai_pipeline import inspect_coreml_bundle_placement
 from fast_shared.hw_check import probe_core_ai_support
 from fast_shared.ir_dtype_guard import check_coreml_model, validate_export_quant_dtypes
+from fast_shared.parallel_coreml import compile_buckets_parallel
 
 HIDDEN = 1024
 MLP_INTER = 3584
@@ -69,9 +70,10 @@ ANE_PROFILES: dict[str, tuple[str, str]] = {
     "parity": ("tanh_all", "max_abs"),
 }
 VALID_ANE_PROFILES = ("fast", "balanced", "parity")
+DEFAULT_ANE_PROFILE = "balanced"
 CHUNK_SIZE = 32
 DEFAULT_FTZ_ALPHA = 128.0
-DEFAULT_SEQ_LENS: tuple[int, ...] = (64, 128, 256, 512)
+DEFAULT_SEQ_LENS: tuple[int, ...] = (32, 64, 128, 256, 384, 512)
 DEFAULT_LAYERS_PER_STAGE = 3
 
 # Projections whose calibration absmax >= 50 stay in FP16 (excluded from naive global INT8 quantization).
@@ -131,7 +133,7 @@ def resolve_ane_profile(
     """
     if ane_profile is not None and ane_profile not in VALID_ANE_PROFILES:
         raise ValueError(f"Unsupported ane_profile={ane_profile!r}; choose from {VALID_ANE_PROFILES}")
-    base_silu, base_rms = ANE_PROFILES[ane_profile or "fast"]
+    base_silu, base_rms = ANE_PROFILES[ane_profile or DEFAULT_ANE_PROFILE]
     eff_silu = base_silu if silu_mode is None else str(silu_mode)
     eff_rms = base_rms if rmsnorm_mode is None else str(rmsnorm_mode)
     if eff_silu not in VALID_SILU_MODES:
@@ -188,6 +190,11 @@ def compute_ane_config_hash(
     return hashlib.sha256(raw).hexdigest()[:12]
 
 
+def pplx_stage_function_name(seq_len: int) -> str:
+    """Canonical CoreML multifunction entry name for a sequence-length bucket."""
+    return f"pplx_s{int(seq_len)}"
+
+
 def make_ane_stage_stem(
     seq_len: int,
     stage_idx: int,
@@ -201,6 +208,20 @@ def make_ane_stage_stem(
     """Build a mode- and config-distinguishing `.mlmodelc` filename stem for a compiled stage."""
     mode_tag = ane_profile if ane_profile in VALID_ANE_PROFILES else f"{silu_mode}_{rmsnorm_mode}"
     return f"pplx_s{int(seq_len)}_st{int(stage_idx)}_{precision}_{mode_tag}_{config_hash[:8]}"
+
+
+def make_ane_multifunction_stage_stem(
+    stage_idx: int,
+    precision: str,
+    *,
+    ane_profile: str,
+    silu_mode: str,
+    rmsnorm_mode: str,
+    config_hash: str,
+) -> str:
+    """Build a multifunction `.mlmodelc` filename stem sharing stage weights across all `seq_lens`."""
+    mode_tag = ane_profile if ane_profile in VALID_ANE_PROFILES else f"{silu_mode}_{rmsnorm_mode}"
+    return f"pplx_mf_st{int(stage_idx)}_{precision}_{mode_tag}_{config_hash[:8]}"
 
 
 def _load_preserved_buckets_for_hash(
@@ -254,7 +275,13 @@ def _prune_stale_ane_bundles(
     """Remove stale `pplx_s*_st*.mlmodelc` and `.mlpackage` dirs not referenced by the active manifest."""
     active_stems = {Path(name).stem for name in active_stage_names}
     removed: list[str] = []
-    for pat in ("pplx_s*_st*.mlmodelc", "pplx_s*_st*.mlpackage", "pplx_s*_st*.aimodel"):
+    for pat in (
+        "pplx_s*_st*.mlmodelc",
+        "pplx_s*_st*.mlpackage",
+        "pplx_s*_st*.aimodel",
+        "pplx_mf_st*.mlmodelc",
+        "pplx_mf_st*.mlpackage",
+    ):
         for cand in sorted(out_dir.glob(pat)):
             if cand.name in active_stage_names:
                 continue
@@ -522,11 +549,15 @@ def convert_weights_to_ane_layout(
         )[None, :, None, None]
 
         if layer_type == "linear_attention":
-            w_qkv = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_qkv.weight"], dtype=np.float16)
-            w_z = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_z.weight"], dtype=np.float16)
-            w_b = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_b.weight"], dtype=np.float16)
-            w_a = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_a.weight"], dtype=np.float16)
-            out[f"l{i}_qkvzba"] = np.concatenate([w_qkv, w_z, w_b, w_a], axis=0)[:, :, None, None]
+            in_all_key = f"{mp}linear_attn.in_proj_all.weight"
+            if in_all_key in npz_weights:
+                out[f"l{i}_qkvzba"] = np.asarray(npz_weights[in_all_key], dtype=np.float16)[:, :, None, None]
+            else:
+                w_qkv = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_qkv.weight"], dtype=np.float16)
+                w_z = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_z.weight"], dtype=np.float16)
+                w_b = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_b.weight"], dtype=np.float16)
+                w_a = np.asarray(npz_weights[f"{mp}linear_attn.in_proj_a.weight"], dtype=np.float16)
+                out[f"l{i}_qkvzba"] = np.concatenate([w_qkv, w_z, w_b, w_a], axis=0)[:, :, None, None]
 
             conv_raw = np.asarray(npz_weights[f"{mp}linear_attn.conv1d.weight"], dtype=np.float16)
             if conv_raw.ndim == 3 and conv_raw.shape[1] == 4 and conv_raw.shape[2] == 1:
@@ -780,7 +811,9 @@ def build_stage_mil_program(
         k_4d = _to_b1_chunks(k_ch, "k")
         v_4d = _to_b1_chunks(v_ch, "v")
 
-        q_norm = _l2norm_last(q_4d, dim=GDN_DIM, extra_scale=GDN_DIM ** -0.5, name=f"{prefix}_ql2")
+        # Keep q_norm unit-L2 inside the chunked WY recurrence (+3.5 bits FP16 mantissa headroom)
+        # and apply the exact 1-homogeneous 1/sqrt(GDN_DIM) scaling post-chunk.
+        q_norm = _l2norm_last(q_4d, dim=GDN_DIM, extra_scale=1.0, name=f"{prefix}_ql2")
         k_norm = _l2norm_last(k_4d, dim=GDN_DIM, extra_scale=1.0, name=f"{prefix}_kl2")
 
         b_sig = mb.sigmoid(x=b_ch, name=f"{prefix}_beta_sig")
@@ -926,7 +959,8 @@ def build_stage_mil_program(
         out_t1 = mb.transpose(x=out_chunks, perm=[0, 1, 3, 2], name=f"{prefix}_out_t1")
         out_r1 = mb.reshape(x=out_t1, shape=[1, n_c, GDN_HEADS * GDN_DIM, chunk_size], name=f"{prefix}_out_r1")
         out_t2 = mb.transpose(x=out_r1, perm=[0, 2, 1, 3], name=f"{prefix}_out_t2")
-        return mb.reshape(x=out_t2, shape=[1, GDN_HEADS * GDN_DIM, 1, seq_len], name=f"{prefix}_out_nchw")
+        out_nchw = mb.reshape(x=out_t2, shape=[1, GDN_HEADS * GDN_DIM, 1, seq_len], name=f"{prefix}_out_nchw")
+        return mb.mul(x=out_nchw, y=_f16(GDN_DIM ** -0.5), name=f"{prefix}_post_qscale")
 
     def _mlp_swiglu(x, prefix: str):
         gu = _conv_or_qdq(x, ane_weights[f"{prefix}_mlp_gu"], name=f"{prefix}_mlp_gu")
@@ -1168,6 +1202,8 @@ def build_ane_bundle_suite(
     calib_batches: int = 2,
     guard_ir: bool = False,
     inspect_placement: bool = False,
+    multifunction: bool = True,
+    max_compile_workers: int | None = None,
 ) -> dict[str, Any]:
     eff_profile, eff_silu_mode, eff_rmsnorm_mode = resolve_ane_profile(
         ane_profile=ane_profile,
@@ -1298,11 +1334,141 @@ def build_ane_bundle_suite(
         "buckets": dict(preserved_buckets),
     }
 
-    for seq_len in seq_lens:
+    use_multifunction = bool(
+        backend == "coreml"
+        and multifunction
+        and len(seq_lens) > 1
+        and hasattr(ct.utils, "MultiFunctionDescriptor")
+        and hasattr(ct.utils, "save_multifunction")
+    )
+    if use_multifunction:
+        manifest["multifunction"] = True
+        # Build per-stage multifunction .mlpackage bundles sharing weights across all seq_lens (1.30 -> 0.33 GB).
+        t_mf = time.perf_counter()
+        staging_dir = out_dir / f".mf_staging_{os.getpid()}"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        mf_pkg_paths: list[Path] = []
+        mf_stage_names: list[str] = []
+        try:
+            for st_idx, (l0, l1) in enumerate(stage_ranges):
+                mf_stem = make_ane_multifunction_stage_stem(
+                    st_idx,
+                    eff_prec_tag,
+                    ane_profile=eff_profile,
+                    silu_mode=eff_silu_mode,
+                    rmsnorm_mode=eff_rmsnorm_mode,
+                    config_hash=config_hash,
+                )
+                stage_scales: dict[str, float | None] = {}
+                if precision == "w8a8" and calib_stats is not None:
+                    for li in range(l0, l1):
+                        stage_scales.update(
+                            select_qdq_scales(
+                                li, cfg.layer_types[li], calib_stats, outlier_threshold=outlier_threshold
+                            )
+                        )
+                desc = ct.utils.MultiFunctionDescriptor()
+                for seq_len in seq_lens:
+                    n_c = seq_len // CHUNK_SIZE
+                    fn_name = pplx_stage_function_name(seq_len)
+                    prog = build_stage_mil_program(
+                        ane_weights,
+                        seq_len=seq_len,
+                        layer_start=l0,
+                        layer_end=l1,
+                        layer_types=cfg.layer_types,
+                        apply_final_norm=(st_idx == len(stage_ranges) - 1),
+                        chunk_size=CHUNK_SIZE,
+                        inv_mode=inv_mode,
+                        ftz_alpha=ftz_alpha,
+                        qdq_scales=stage_scales,
+                        calib_stats=calib_stats,
+                        swiglu_mode=swiglu_mode,
+                        silu_mode=eff_silu_mode,
+                        rmsnorm_mode=eff_rmsnorm_mode,
+                    )
+                    ml = ct.convert(
+                        prog,
+                        inputs=[
+                            ct.TensorType(name="h_in", shape=(1, HIDDEN, 1, seq_len), dtype=np.float16),
+                            ct.TensorType(name="attn_bias", shape=(1, 1, seq_len, seq_len), dtype=np.float16),
+                            ct.TensorType(name="cos32", shape=(1, 1, seq_len, ROPE_HALF), dtype=np.float16),
+                            ct.TensorType(name="sin32", shape=(1, 1, seq_len, ROPE_HALF), dtype=np.float16),
+                            ct.TensorType(name="tok_valid", shape=(1, 1, 1, seq_len), dtype=np.float16),
+                            ct.TensorType(name="gdn_carry", shape=(1, n_c, 1, 1), dtype=np.float16),
+                        ],
+                        outputs=[ct.TensorType(name="h_out", dtype=np.float16)],
+                        minimum_deployment_target=ct.target.macOS15,
+                        compute_precision=ct.precision.FLOAT16,
+                        skip_model_load=True,
+                    )
+                    if precision == "fp16":
+                        ml_out = ml
+                    else:
+                        stage_preserved = select_fp16_preserved_ops(
+                            l0,
+                            l1,
+                            cfg.layer_types,
+                            calib_stats=calib_stats,
+                            outlier_threshold=outlier_threshold,
+                            preserve_gdn_fp16=preserve_gdn_fp16,
+                        )
+                        q_cfg = build_weight_quant_config(stage_preserved, weight_threshold=512, cto_module=cto)
+                        ml_out = cto.linear_quantize_weights(ml, config=q_cfg)
+                    if guard_ir:
+                        rep = check_coreml_model(ml_out, model_name=f"{mf_stem}:{fn_name}", warn_matmul_ane=True)
+                        if not rep.ok:
+                            errs = "; ".join(f.message for f in rep.errors[:5])
+                            raise RuntimeError(f"ir_dtype_guard failed on {mf_stem}:{fn_name}: {errs}")
+                    tmp_pkg = staging_dir / f"{mf_stem}_{fn_name}.mlpackage"
+                    ml_out.save(str(tmp_pkg))
+                    desc.add_function(str(tmp_pkg), "main", fn_name)
+                desc.default_function_name = pplx_stage_function_name(seq_lens[0])
+                mf_pkg = out_dir / f"{mf_stem}.mlpackage"
+                if mf_pkg.exists():
+                    shutil.rmtree(mf_pkg)
+                ct.utils.save_multifunction(desc, str(mf_pkg))
+                mf_pkg_paths.append(mf_pkg)
+                mf_stage_names.append(f"{mf_stem}.mlmodelc")
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        compile_jobs = [
+            (pkg_p.stem, lambda p=pkg_p: _compile_mlpackage(p, out_dir))
+            for pkg_p in mf_pkg_paths
+        ]
+        compile_buckets_parallel(compile_jobs, max_workers=max_compile_workers)
+        if not keep_mlpackage:
+            for pkg_p in mf_pkg_paths:
+                shutil.rmtree(pkg_p, ignore_errors=True)
+
+        stage_placements_mf: list[dict[str, Any]] = []
+        if inspect_placement and not use_multifunction:
+            for mf_name in mf_stage_names:
+                stage_placements_mf.append(
+                    inspect_coreml_bundle_placement(out_dir / mf_name, target_device="ane", model_name=mf_name)
+                )
+        per_bkt_s = round((time.perf_counter() - t_mf) / max(1, len(seq_lens)), 2)
+        for seq_len in seq_lens:
+            bkt_entry: dict[str, Any] = {
+                "seq_len": int(seq_len),
+                "config_hash": config_hash,
+                "stages": list(mf_stage_names),
+                "function_name": pplx_stage_function_name(seq_len),
+                "build_s": per_bkt_s,
+            }
+            if stage_placements_mf:
+                bkt_entry["placements"] = stage_placements_mf
+            manifest["buckets"][str(seq_len)] = bkt_entry
+
+    for seq_len in (() if use_multifunction else seq_lens):
         n_c = seq_len // CHUNK_SIZE
         stage_entries: list[str] = []
         stage_placements: list[dict[str, Any]] = []
         stage_coreai_meta: list[dict[str, Any]] = []
+        stage_pkg_paths: list[Path] = []
         t_bucket = time.perf_counter()
 
         for st_idx, (l0, l1) in enumerate(stage_ranges):
@@ -1345,7 +1511,7 @@ def build_ane_bundle_suite(
                 )
                 continue
 
-            stage_scales: dict[str, float | None] = {}
+            stage_scales = {}
             if precision == "w8a8" and calib_stats is not None:
                 for li in range(l0, l1):
                     stage_scales.update(
@@ -1415,18 +1581,23 @@ def build_ane_bundle_suite(
             if pkg_path.exists():
                 shutil.rmtree(pkg_path)
             ml_out.save(str(pkg_path))
+            stage_pkg_paths.append(pkg_path)
+            stage_entries.append(f"{stem}.mlmodelc")
 
-            compiled_path = out_dir / f"{stem}.mlmodelc"
-            if compiled_path.exists():
-                shutil.rmtree(compiled_path)
-            _compile_mlpackage(pkg_path, out_dir)
-            if inspect_placement:
-                stage_placements.append(
-                    inspect_coreml_bundle_placement(compiled_path, target_device="ane", model_name=stem)
-                )
-            if not keep_mlpackage:
-                shutil.rmtree(pkg_path)
-            stage_entries.append(compiled_path.name)
+        if stage_pkg_paths:
+            compile_jobs = [
+                (pkg_p.stem, lambda p=pkg_p: _compile_mlpackage(p, out_dir))
+                for pkg_p in stage_pkg_paths
+            ]
+            compile_buckets_parallel(compile_jobs, max_workers=max_compile_workers)
+            for pkg_p in stage_pkg_paths:
+                compiled_path = out_dir / f"{pkg_p.stem}.mlmodelc"
+                if inspect_placement:
+                    stage_placements.append(
+                        inspect_coreml_bundle_placement(compiled_path, target_device="ane", model_name=pkg_p.stem)
+                    )
+                if not keep_mlpackage:
+                    shutil.rmtree(pkg_p, ignore_errors=True)
 
         bucket_entry: dict[str, Any] = {
             "seq_len": int(seq_len),
@@ -1496,6 +1667,13 @@ def main() -> None:
     parser.add_argument("--calib-batches", type=int, default=2)
     parser.add_argument("--guard-ir", action="store_true", help="Run ir_dtype_guard static MIL check before saving")
     parser.add_argument("--inspect-placement", action="store_true", help="Capture MLComputePlan ANE placement summary")
+    parser.add_argument(
+        "--multifunction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Merge all seq_len functions per stage into shared-weight multifunction .mlmodelc bundles (default: True)",
+    )
+    parser.add_argument("--compile-workers", type=int, default=None, help="Max parallel CoreML compile workers")
     args = parser.parse_args()
 
     manifest = build_ane_bundle_suite(
@@ -1520,6 +1698,8 @@ def main() -> None:
         calib_batches=args.calib_batches,
         guard_ir=args.guard_ir,
         inspect_placement=args.inspect_placement,
+        multifunction=args.multifunction,
+        max_compile_workers=args.compile_workers,
     )
     print(json.dumps(manifest, indent=2))
 

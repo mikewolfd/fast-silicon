@@ -13,7 +13,7 @@ The caller owns the task: what the prompts say, what the answers are, which exam
 JSON file `{"train": [[ids, prompt_len], ...], "valid": [[ids, prompt_len], ...], "stats": {...}}`, tokenized
 with the base snapshot's tokenizer and chat template by your downstream task pipeline.
 
-Run with a Python that has `mlx_lm` with Gemma-4 support (`~/.venv-vllm-metal/bin/python`).
+Run with a Python environment that has `mlx_lm` with Gemma-4 support installed.
 """
 
 from __future__ import annotations
@@ -44,10 +44,23 @@ _SRC_DIR = REPO_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-DEFAULT_BF16_BASE_DIR = (
-    Path.home()
-    / ".cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-bf16/snapshots/fb0b166bbb9a0eb4b37915bfc515a197c9122f39"
-)
+def _resolve_hf_bf16_base_dir() -> Path:
+    hub_snaps = (
+        Path.home()
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / "models--mlx-community--gemma-4-e2b-it-bf16"
+        / "snapshots"
+    )
+    if hub_snaps.is_dir():
+        snaps = sorted(p for p in hub_snaps.iterdir() if p.is_dir() and any(p.glob("*.safetensors")))
+        if snaps:
+            return snaps[-1]
+    return hub_snaps / "latest"
+
+
+DEFAULT_BF16_BASE_DIR = _resolve_hf_bf16_base_dir()
 _VENV_PY = REPO_ROOT / ".venv/bin/python"
 DEFAULT_FG4_PYTHON = _VENV_PY if _VENV_PY.exists() else Path(shutil.which("python3") or "python3")
 HW_LOCK_PATH = Path("/tmp/m4_gpu_validation.lock")
@@ -135,9 +148,35 @@ def compute_safe_memory_limit_gb(
     return round(min(float(requested_gb), safe_cap), 2)
 
 
+def _resolve_default_base_snap(*, qlora_8bit: bool, host_ram_gib: float) -> Path:
+    """Prefer a local pre-stripped / pre-quantized text-only checkpoint on <36 GiB hosts so 10.24 GB multimodal BF16 is never loaded."""
+    if qlora_8bit or (0.0 < host_ram_gib < 36.0):
+        try:
+            from fast_gemma4.paths import resolve_paths
+
+            p_fused = resolve_paths().fused_model_dir
+            if p_fused.is_dir() and any(p_fused.glob("*.safetensors")):
+                return p_fused
+        except Exception:
+            pass
+        hub_root = Path.home() / ".cache" / "huggingface" / "hub"
+        for repo_dir_name in (
+            "models--mlx-community--gemma-4-e2b-it-8bit",
+            "models--mlx-community--gemma-4-E2B-it-8bit",
+            "models--mlx-community--gemma-4-e2b-it-4bit",
+            "models--mlx-community--gemma-4-E2B-it-MLX-4bit",
+        ):
+            snaps_dir = hub_root / repo_dir_name / "snapshots"
+            if snaps_dir.is_dir():
+                snaps = sorted(p for p in snaps_dir.iterdir() if p.is_dir() and any(p.glob("*.safetensors")))
+                if snaps:
+                    return snaps[-1]
+    return DEFAULT_BF16_BASE_DIR
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Train a Gemma-4 E2B/E4B LoRA on token pairs, then fuse and pack BF16->8bit")
-    ap.add_argument("--base-snap", type=Path, default=DEFAULT_BF16_BASE_DIR)
+    ap.add_argument("--base-snap", type=Path, default=None, help="Base checkpoint directory (defaults to text-only pre-quantized on <36 GiB / --qlora-8bit, else BF16)")
     ap.add_argument("--pairs", type=Path, default=None, help="JSON of tokenized train/valid pairs; required unless --fuse-only")
     ap.add_argument("--checkpoint-config", type=Path, action="append", default=[],
                     help="a JSON file to copy into the fused checkpoint under its own name (repeatable)")
@@ -155,7 +194,7 @@ def main() -> int:
         "--ckpt-tokens",
         type=int,
         default=None,
-        help="activation-checkpoint batches above this size (default: 2200 for BF16, 4096 for --qlora-8bit)",
+        help="activation-checkpoint batches above this size (default: 2200 for BF16, 512 on <=24 GB / 1280 on >=36 GB for --qlora-8bit)",
     )
     ap.add_argument(
         "--pack-tokens",
@@ -177,13 +216,22 @@ def main() -> int:
     ap.add_argument(
         "--qlora-8bit",
         action="store_true",
-        help="quantize frozen trunk to 8-bit g64 with BF16 LoRA adapters and auto-raise --ckpt-tokens to 4096",
+        help="quantize frozen trunk (including embed_tokens & PLE) to 8-bit g64 with BF16 LoRA adapters",
     )
-    ap.add_argument(
+    emb_q_grp = ap.add_mutually_exclusive_group()
+    emb_q_grp.add_argument(
         "--qlora-quantize-lm-head",
+        dest="qlora_quantize_lm_head",
         action="store_true",
-        help="also quantize tied embed_tokens/lm_head to 8-bit g64 under --qlora-8bit",
+        help="quantize tied embed_tokens/lm_head to 8-bit g64 under --qlora-8bit (enabled by default)",
     )
+    emb_q_grp.add_argument(
+        "--no-qlora-quantize-lm-head",
+        dest="qlora_quantize_lm_head",
+        action="store_false",
+        help="keep tied embed_tokens/lm_head in BF16 under --qlora-8bit",
+    )
+    ap.set_defaults(qlora_quantize_lm_head=True)
     ap.add_argument(
         "--bf16-lora",
         action="store_true",
@@ -248,20 +296,28 @@ def main() -> int:
         chunked_softcap_ce_loss,
         compute_effective_ckpt_tokens,
         compute_packed_tail_ce_loss,
+        dequantize_prequantized_shard_tensors,
         find_shared_prefix_len,
+        load_text_only_lora_base_model,
         pack_examples_to_bin,
         pack_suffixes_for_shared_prefix,
         quantize_frozen_trunk_8bit,
         run_frozen_prefix_packed,
         run_shared_prefix_grad_accum_step,
+        strip_quantization_from_config_dict,
         unwrap_kv_shared_lora_modules,
     )
 
-    use_compile = not args.no_compile
-    eff_ckpt_tokens = compute_effective_ckpt_tokens(args.ckpt_tokens, qlora_8bit=args.qlora_8bit)
-
     # GPU memory is wired and cannot be paged out, so clamp cleanly to host RAM & Metal recommended working set.
     host_ram = _host_ram_gib()
+    if args.base_snap is None:
+        args.base_snap = _resolve_default_base_snap(qlora_8bit=args.qlora_8bit, host_ram_gib=host_ram)
+
+    use_compile = not args.no_compile
+    eff_ckpt_tokens = compute_effective_ckpt_tokens(
+        args.ckpt_tokens, qlora_8bit=args.qlora_8bit, host_ram_gib=host_ram
+    )
+
     dev_info_fn = getattr(mx, "device_info", None)
     max_rec_ws = int(dev_info_fn().get("max_recommended_working_set_size", 0)) if callable(dev_info_fn) else 0
     eff_mem_limit_gb = compute_safe_memory_limit_gb(
@@ -274,7 +330,7 @@ def main() -> int:
             flush=True,
         )
     mx.set_memory_limit(int(eff_mem_limit_gb * 1024**3))
-    mx.set_cache_limit(512 * 1024 * 1024)
+    mx.set_cache_limit(256 * 1024 * 1024)
     prev_wired_limit: int | None = None
     set_wl = getattr(mx, "set_wired_limit", None)
     if callable(set_wl) and max_rec_ws > 0:
@@ -430,11 +486,10 @@ def main() -> int:
 
     with _restore_wired_limit(), (contextlib.nullcontext() if args.no_hw_lock else acquire_hw_lock("train_lora")):
         t_start = time.perf_counter()
-        print(f"1. Loading native BF16 Gemma-4 base from {args.base_snap}...", flush=True)
-        model, _ = load_model(args.base_snap, strict=False)
-        for mm_attr in ("vision_tower", "audio_tower", "embed_vision", "embed_audio", "multi_modal_projector"):
-            if hasattr(model, mm_attr):
-                setattr(model, mm_attr, None)
+        print(f"1. Loading text-only Gemma-4 base from {args.base_snap}...", flush=True)
+        model, base_info = load_text_only_lora_base_model(
+            args.base_snap, strict=False, load_model_fn=load_model
+        )
         gc.collect()
         mx.clear_cache()
 
@@ -455,14 +510,19 @@ def main() -> int:
         lora_cfg = {"rank": args.rank, "scale": args.scale, "dropout": args.dropout}
         linear_to_lora_layers(model, num_layers=args.num_layers, config=lora_cfg)
         n_bf16_cast = 0
-        if args.qlora_8bit or args.bf16_lora:
+        if args.qlora_8bit or args.bf16_lora or base_info["is_prequantized"]:
             n_bf16_cast = cast_lora_adapters_dtype(model, mx.bfloat16)
         n_unwrapped = unwrap_kv_shared_lora(model)
         expected_lora_modules = sum(1 for _, m in model.named_modules() if isinstance(m, LoRALinear))
         first_lora_layer = len(model.layers) - args.num_layers
-        mode_tag = "QLoRA-8bit-g64" if args.qlora_8bit else "BF16"
+        mode_tag = (
+            "PreQuant+QLoRA"
+            if (base_info["is_prequantized"] and args.qlora_8bit)
+            else ("PreQuant" if base_info["is_prequantized"] else ("QLoRA-8bit-g64" if args.qlora_8bit else "BF16"))
+        )
         q_desc = (
             f" | q8_linears={q_stats['linear_quantized']} q8_embs={q_stats['embedding_quantized']}"
+            f" skipped_preq={q_stats.get('skipped_quantized', 0)}"
             if q_stats is not None
             else ""
         )
@@ -803,10 +863,14 @@ def main() -> int:
         mx.eval(model.parameters())
 
         lora_by_key: dict[str, Any] = {}
+        quant_mod_by_key: dict[str, Any] = {}
         for mod_path, mod in model.named_modules():
             if isinstance(mod, LoRALinear):
                 lora_by_key[f"{mod_path}.weight"] = mod
                 lora_by_key[f"language_model.{mod_path}.weight"] = mod
+            elif isinstance(mod, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+                quant_mod_by_key[f"{mod_path}.weight"] = mod
+                quant_mod_by_key[f"language_model.{mod_path}.weight"] = mod
 
         tmp_bf16_dir = args.out_model_dir.parent / f".tmp_fused_bf16_{os.getpid()}"
         if tmp_bf16_dir.exists():
@@ -815,30 +879,24 @@ def main() -> int:
 
         try:
             fused_count = 0
+            base_cfg_p = args.base_snap / "config.json"
+            base_cfg: dict[str, Any] = (
+                json.loads(base_cfg_p.read_text(encoding="utf-8")) if base_cfg_p.is_file() else {}
+            )
             idx_json_p = args.base_snap / "model.safetensors.index.json"
             shard_files = sorted(args.base_snap.glob("model*.safetensors"))
             new_weight_map: dict[str, str] = {}
 
             for sf in shard_files:
                 shard_tensors = dict(mx.load(str(sf)))
-                out_shard: dict[str, Any] = {}
-                for k, t_val in shard_tensors.items():
-                    if any(
-                        k.startswith(pfx) or f".{pfx}" in k
-                        for pfx in ("vision_tower", "audio_tower", "embed_vision", "embed_audio", "multi_modal_projector")
-                    ):
-                        continue
-                    if k in lora_by_key:
-                        mod = lora_by_key[k]
-                        delta_f32 = float(mod.scale) * (
-                            mod.lora_b.astype(mx.float32).T @ mod.lora_a.astype(mx.float32).T
-                        )
-                        merged_bf16 = (t_val.astype(mx.float32) + delta_f32).astype(mx.bfloat16)
-                        mx.eval(merged_bf16)
-                        out_shard[k] = merged_bf16
-                        fused_count += 1
-                    else:
-                        out_shard[k] = t_val
+                out_shard, shard_fused = dequantize_prequantized_shard_tensors(
+                    shard_tensors,
+                    base_cfg,
+                    lora_by_key=lora_by_key,
+                    quant_mod_by_key=quant_mod_by_key,
+                )
+                fused_count += shard_fused
+                for k in out_shard:
                     new_weight_map[k] = sf.name
                 if out_shard:
                     mx.save_safetensors(str(tmp_bf16_dir / sf.name), out_shard)
@@ -856,7 +914,13 @@ def main() -> int:
                     json.dumps(orig_idx, indent=2) + "\n", encoding="utf-8"
                 )
 
-            for extra_name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
+            if base_cfg_p.is_file():
+                clean_cfg = strip_quantization_from_config_dict(base_cfg)
+                (tmp_bf16_dir / "config.json").write_text(
+                    json.dumps(clean_cfg, indent=2) + "\n", encoding="utf-8"
+                )
+
+            for extra_name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
                 src_p = args.base_snap / extra_name
                 if src_p.is_file():
                     shutil.copy2(src_p, tmp_bf16_dir / extra_name)

@@ -244,6 +244,20 @@ def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
     ]
     lib.pplx_ane_load_stages.restype = ctypes.c_void_p
 
+    if hasattr(lib, "pplx_ane_load_stages_fn"):
+        lib.pplx_ane_load_stages_fn.argtypes = [
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.pplx_ane_load_stages_fn.restype = ctypes.c_void_p
+
     lib.pplx_ane_submit.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -273,6 +287,16 @@ def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
 
     lib.pplx_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
     lib.pplx_ane_inspect_plan.restype = ctypes.c_int
+
+    if hasattr(lib, "pplx_ane_inspect_plan_fn"):
+        lib.pplx_ane_inspect_plan_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        lib.pplx_ane_inspect_plan_fn.restype = ctypes.c_int
 
     lib.pplx_ane_free.argtypes = [ctypes.c_void_p]
     lib.pplx_ane_free.restype = None
@@ -349,22 +373,21 @@ def read_ane_manifest(ane_dir: Path) -> dict[str, Any] | None:
     return out
 
 
-def _discover_ane_stage_paths(
+def _discover_ane_stage_specs(
     ane_dir: Path,
     *,
     expected_profile: str | None = None,
     expected_config_hash: str | None = None,
-) -> dict[int, list[Path]]:
-    """Discover per-seq-len staged .mlmodelc bundle chains from manifest.json or glob fallback.
+) -> dict[int, tuple[list[Path], str | None]]:
+    """Discover per-seq-len `(stage_paths, optional_function_name)` chains from `manifest.json` or glob fallback.
 
-    When `manifest.json` is present, it is authoritative: buckets whose per-bucket `config_hash`
-    disagrees with the top-level `config_hash` or whose stage count disagrees with `num_stages`
-    are rejected, and no silent glob fallback is performed on profile/config mismatch.
+    Supports both multifunction stage bundles (`function_name="pplx_s32"`, sharing 4 stage `.mlmodelc`
+    bundles across all buckets) and legacy per-bucket `.mlmodelc` stage dirs (`function_name=None`).
     """
     if not ane_dir.is_dir():
         return {}
     manifest_path = ane_dir / "manifest.json"
-    discovered: dict[int, list[Path]] = {}
+    discovered: dict[int, tuple[list[Path], str | None]] = {}
     if manifest_path.is_file():
         manifest = read_ane_manifest(ane_dir)
         if manifest is None:
@@ -386,8 +409,10 @@ def _discover_ane_stage_paths(
             if expected_stages is not None and len(stage_names) != int(expected_stages):
                 continue
             stages = [ane_dir / name for name in stage_names]
+            fn_raw = entry.get("function_name")
+            fn_name = str(fn_raw) if fn_raw else None
             if stages and all(p.exists() for p in stages):
-                discovered[cap] = stages
+                discovered[cap] = (stages, fn_name)
         return dict(sorted(discovered.items()))
 
     if expected_profile is not None or expected_config_hash is not None:
@@ -413,8 +438,23 @@ def _discover_ane_stage_paths(
                 valid_groups.append([p for _, p in pairs])
         # Only accept unambiguous single-variant stage chains in manifest-less fallback.
         if len(valid_groups) == 1:
-            discovered[cap] = valid_groups[0]
+            discovered[cap] = (valid_groups[0], None)
     return discovered
+
+
+def _discover_ane_stage_paths(
+    ane_dir: Path,
+    *,
+    expected_profile: str | None = None,
+    expected_config_hash: str | None = None,
+) -> dict[int, list[Path]]:
+    """Discover per-seq-len staged .mlmodelc bundle chains from manifest.json or glob fallback."""
+    specs = _discover_ane_stage_specs(
+        ane_dir,
+        expected_profile=expected_profile,
+        expected_config_hash=expected_config_hash,
+    )
+    return {cap: stages for cap, (stages, _) in specs.items()}
 
 
 def _load_f16_memmap_from_safetensors(sf_path: Path) -> tuple[np.ndarray, int, int]:
@@ -476,8 +516,8 @@ class _ANERunnerBackend:
         )
 
         self.manifest: dict[str, Any] | None = read_ane_manifest(paths.ane_models_dir)
-        stage_map = _discover_ane_stage_paths(paths.ane_models_dir, expected_profile=expected_profile)
-        if not stage_map:
+        stage_specs = _discover_ane_stage_specs(paths.ane_models_dir, expected_profile=expected_profile)
+        if not stage_specs:
             if expected_profile is not None and self.manifest is not None:
                 staged = self.manifest.get("ane_profile")
                 raise FileNotFoundError(
@@ -487,21 +527,35 @@ class _ANERunnerBackend:
             raise FileNotFoundError(f"No compiled ANE .mlmodelc stages found in {paths.ane_models_dir}")
 
         self.runners: dict[int, int] = {}
+        has_load_fn = hasattr(self.coreml_lib, "pplx_ane_load_stages_fn")
         try:
-            for cap, stage_paths in stage_map.items():
+            for cap, (stage_paths, fn_name) in stage_specs.items():
                 arr = (ctypes.c_char_p * len(stage_paths))(
                     *(str(p).encode("utf-8") for p in stage_paths)
                 )
-                handle = self.coreml_lib.pplx_ane_load_stages(
-                    arr,
-                    len(stage_paths),
-                    cap,
-                    config.hidden_size,
-                    DEFAULT_CHUNK_SIZE,
-                    DEFAULT_ROPE_HALF,
-                    self.pipe_depth,
-                    compute_units,
-                )
+                if fn_name and has_load_fn:
+                    handle = self.coreml_lib.pplx_ane_load_stages_fn(
+                        arr,
+                        fn_name.encode("utf-8"),
+                        len(stage_paths),
+                        cap,
+                        config.hidden_size,
+                        DEFAULT_CHUNK_SIZE,
+                        DEFAULT_ROPE_HALF,
+                        self.pipe_depth,
+                        compute_units,
+                    )
+                else:
+                    handle = self.coreml_lib.pplx_ane_load_stages(
+                        arr,
+                        len(stage_paths),
+                        cap,
+                        config.hidden_size,
+                        DEFAULT_CHUNK_SIZE,
+                        DEFAULT_ROPE_HALF,
+                        self.pipe_depth,
+                        compute_units,
+                    )
                 if not handle:
                     detail = _coreml_last_error(self.coreml_lib)
                     suffix = f": {detail}" if detail else ""
@@ -1367,6 +1421,33 @@ class FastPplx:
                 chunks, return_spans=True, max_length=eff_max
             )
             items.append((idx, tok_ids, spans))
+        res = self._dispatch_token_items(
+            items,
+            mode=mode,
+            batch_size=batch_size,
+            dimensions=dimensions,
+            output_dtype=output_dtype,
+            normalize=normalize,
+            contextual=True,
+        )
+        assert isinstance(res, list)
+        return res
+
+    def encode_contextual_tokens(
+        self,
+        encoded_docs: Sequence[tuple[Sequence[int], Sequence[tuple[int, int]]]],
+        *,
+        batch_size: int = 8,
+        dimensions: int | None = None,
+        output_dtype: str = "float32",
+        normalize: bool = True,
+        mode: str | None = None,
+    ) -> list[np.ndarray]:
+        """Encode pre-tokenized `(token_ids, chunk_spans)` contextual documents without re-tokenization."""
+        items = [
+            (idx, list(tok_ids), [(int(s0), int(s1)) for s0, s1 in spans])
+            for idx, (tok_ids, spans) in enumerate(encoded_docs)
+        ]
         res = self._dispatch_token_items(
             items,
             mode=mode,

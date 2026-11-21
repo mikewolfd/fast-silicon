@@ -35,6 +35,17 @@ void* pplx_ane_load_stages(
     int pipe_depth,
     int compute_units);
 
+void* pplx_ane_load_stages_fn(
+    const char* const* model_paths,
+    const char* function_name,
+    int num_stages,
+    int seq_len,
+    int hidden_dim,
+    int chunk_size,
+    int rope_half,
+    int pipe_depth,
+    int compute_units);
+
 // Acquire an available ring slot for zero-copy input packing directly into
 // MLMultiArray backing storage. Returns slot_idx >= 0 on success, or -1 if the
 // slot's MLMultiArrays are non-dense (caller should fall back to pplx_ane_submit).
@@ -88,6 +99,13 @@ double pplx_ane_exec(
 // an error JSON object when buf_len allows).
 int pplx_ane_inspect_plan(
     const char* model_path,
+    int compute_units,
+    char* out_json_buf,
+    int buf_len);
+
+int pplx_ane_inspect_plan_fn(
+    const char* model_path,
+    const char* function_name,
     int compute_units,
     char* out_json_buf,
     int buf_len);

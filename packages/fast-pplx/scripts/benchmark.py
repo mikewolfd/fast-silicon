@@ -25,10 +25,6 @@ import sys
 import time
 from typing import Any, Iterator, Sequence
 
-# Default MLX_ENABLE_TF32=0 before importing MLX so FP32 paths remain exact IEEE FP32
-# across M4 (Apple9) and M5 (Apple10 NAX) unless explicitly overridden.
-os.environ.setdefault("MLX_ENABLE_TF32", "0")
-
 import numpy as np
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]

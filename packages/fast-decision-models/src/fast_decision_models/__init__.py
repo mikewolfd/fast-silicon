@@ -1,4 +1,4 @@
-"""fast-decision-models: Apple Silicon ANE (`Laya-Typed-421M`) & MLX (`Kev-0.8B`) decision runners."""
+"""fast-decision-models: Apple Silicon ANE/Hetero (`Laya-Typed-421M`) & MLX (`Kev-0.8B` / `Kev-4B`) decision runners."""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ from importlib import import_module
 from typing import Any
 
 from .paths import (
+    DEFAULT_KEV_08B_MLX_REPO,
+    DEFAULT_KEV_4B_ADAPTER_REPO,
+    DEFAULT_KEV_4B_BASE_REPO,
+    DEFAULT_KEV_4B_MLX_REPO,
     DEFAULT_KEV_ADAPTER_REPO,
     DEFAULT_KEV_BASE_REPO,
+    DEFAULT_LAYA_NMTZ_COREML_REPO,
     DEFAULT_LAYA_REPO,
     DecisionModelPaths,
     ensure_laya_dylib,
     resolve_artifacts_dir,
     resolve_home,
+    resolve_kev_4b_dir,
     resolve_kev_dir,
     resolve_laya_dir,
     resolve_paths,
@@ -21,7 +27,11 @@ from .paths import (
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "KEV_SPECIAL_TOKENS": (".kev_mlx", "KEV_SPECIAL_TOKENS"),
     "Kev08bMlxBackend": (".kev_mlx", "Kev08bMlxBackend"),
+    "Kev4bMlxBackend": (".kev_mlx", "Kev4bMlxBackend"),
+    "KevMlxBackend": (".kev_mlx", "KevMlxBackend"),
     "LayaAneBackend": (".laya_ane", "LayaAneBackend"),
+    "LayaHeteroEngine": (".laya_hetero", "LayaHeteroEngine"),
+    "LayaMlxGpuBackend": (".laya_hetero", "LayaMlxGpuBackend"),
     "LayaTokenizerHelper": (".laya_ane", "LayaTokenizerHelper"),
     "PrefixMatch": (".prefix_tree", "PrefixMatch"),
     "PrefixTree": (".prefix_tree", "PrefixTree"),
@@ -47,13 +57,22 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "DEFAULT_KEV_08B_MLX_REPO",
+    "DEFAULT_KEV_4B_ADAPTER_REPO",
+    "DEFAULT_KEV_4B_BASE_REPO",
+    "DEFAULT_KEV_4B_MLX_REPO",
     "DEFAULT_KEV_ADAPTER_REPO",
     "DEFAULT_KEV_BASE_REPO",
+    "DEFAULT_LAYA_NMTZ_COREML_REPO",
     "DEFAULT_LAYA_REPO",
     "DecisionModelPaths",
     "KEV_SPECIAL_TOKENS",
     "Kev08bMlxBackend",
+    "Kev4bMlxBackend",
+    "KevMlxBackend",
     "LayaAneBackend",
+    "LayaHeteroEngine",
+    "LayaMlxGpuBackend",
     "LayaTokenizerHelper",
     "PrefixMatch",
     "PrefixTree",
@@ -67,6 +86,7 @@ __all__ = [
     "recommended_prefix_budget_bytes",
     "resolve_artifacts_dir",
     "resolve_home",
+    "resolve_kev_4b_dir",
     "resolve_kev_dir",
     "resolve_kev_special_ids",
     "resolve_laya_dir",

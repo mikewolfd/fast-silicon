@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -11,6 +12,7 @@ from tokenizers import Tokenizer
 
 DEFAULT_KEPT_VOCAB_SIZE = 131072
 FULL_VOCAB_SIZE = 201088
+DEFAULT_MODEL_IDENTITY = "You are ChatGPT, a large language model trained by OpenAI."
 
 
 def build_o200k_kept_vocab(tokenizer_json_path: str | Path, target_size: int = DEFAULT_KEPT_VOCAB_SIZE) -> np.ndarray:
@@ -124,13 +126,30 @@ class O200kVocabRemapper:
         return inst
 
 
+def _extract_msg_text(content: Any) -> str:
+    if isinstance(content, Sequence) and not isinstance(content, str):
+        return "".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return str(content)
+
+
 def format_harmony_chat(
     messages: Sequence[dict[str, Any]],
     *,
     add_generation_prompt: bool = True,
     reasoning_effort: str = "low",
+    model_identity: str = DEFAULT_MODEL_IDENTITY,
+    current_date: str | None = None,
 ) -> str:
-    """Format chat messages into OpenAI Harmony token framing (`<|start|>...<|message|>...<|end|>`)."""
+    """Format chat messages into OpenAI's official Harmony framing.
+
+    `<|start|>system<|message|>` carries model identity, cutoff/date, `Reasoning: {effort}`,
+    and `# Valid channels: analysis, commentary, final.`, while caller `system` / `developer`
+    instructions go inside `<|start|>developer<|message|># Instructions\\n\\n...<|end|>`.
+    """
     if not messages:
         raise ValueError("messages must be non-empty")
 
@@ -138,37 +157,36 @@ def format_harmony_chat(
     if eff not in ("skip", "none", "low", "medium", "high"):
         raise ValueError(f"Unsupported reasoning_effort={reasoning_effort!r}; expected skip|none|low|medium|high")
 
-    parts: list[str] = []
+    sys_effort = "low" if eff in ("skip", "none") else eff
+    eff_date = current_date if current_date is not None else datetime.date.today().isoformat()
+    sys_header = (
+        f"{model_identity}\n"
+        f"Knowledge cutoff: 2024-06\n"
+        f"Current date: {eff_date}\n\n"
+        f"Reasoning: {sys_effort}\n\n"
+        f"# Valid channels: analysis, commentary, final. Channel must be included for every message."
+    )
+    parts: list[str] = [f"<|start|>system<|message|>{sys_header}<|end|>"]
+
     loop_msgs = list(messages)
-
-    if loop_msgs[0].get("role") == "system":
-        sys_txt = str(loop_msgs[0].get("content", "")).strip()
-        parts.append(f"<|start|>system<|message|>{sys_txt}<|end|>")
+    dev_sections: list[str] = []
+    while loop_msgs and str(loop_msgs[0].get("role", "")) in ("system", "developer"):
+        txt = _extract_msg_text(loop_msgs[0].get("content", "")).strip()
+        if txt:
+            dev_sections.append(txt)
         loop_msgs = loop_msgs[1:]
 
-    has_dev = bool(loop_msgs and loop_msgs[0].get("role") == "developer")
-    if has_dev:
-        dev_txt = str(loop_msgs[0].get("content", "")).strip()
-        if eff in ("low", "medium", "high") and not dev_txt.lower().startswith("reasoning:"):
-            dev_txt = f"Reasoning: {eff}\n{dev_txt}" if dev_txt else f"Reasoning: {eff}"
-        parts.append(f"<|start|>developer<|message|>{dev_txt}<|end|>")
-        loop_msgs = loop_msgs[1:]
-    elif eff in ("low", "medium", "high"):
-        parts.append(f"<|start|>developer<|message|>Reasoning: {eff}\n<|end|>")
+    if dev_sections:
+        dev_body = "\n\n".join(dev_sections)
+        if not dev_body.startswith("# Instructions"):
+            dev_body = f"# Instructions\n\n{dev_body}"
+        parts.append(f"<|start|>developer<|message|>{dev_body}<|end|>")
 
     for msg in loop_msgs:
         role = str(msg.get("role", "user"))
-        content = msg.get("content", "")
-        if isinstance(content, Sequence) and not isinstance(content, str):
-            text = "".join(
-                str(item.get("text", ""))
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            )
-        else:
-            text = str(content)
+        text = _extract_msg_text(msg.get("content", ""))
         if role == "assistant":
-            text, _ = parse_harmony_output(text)
+            text, _ = parse_harmony_output(text, started_in_analysis=False)
             parts.append(f"<|start|>assistant<|channel|>final<|message|>{text}<|end|>")
         else:
             parts.append(f"<|start|>{role}<|message|>{text}<|end|>")
@@ -181,36 +199,48 @@ def format_harmony_chat(
     return "".join(parts)
 
 
-_HARMONY_CTRL_TOKENS = (
+_STOP_MARKERS = (
     "<|return|>",
+    "<|call|>",
     "<|end|>",
     "<|endoftext|>",
-    "<|start|>assistant",
-    "<|channel|>analysis<|message|>",
-    "<|channel|>final<|message|>",
 )
 
 
-def parse_harmony_output(raw_text: str) -> tuple[str, str | None]:
-    """Split Harmony output into `(final_text, reasoning_text)` cleanly."""
+def parse_harmony_output(
+    raw_text: str,
+    *,
+    started_in_analysis: bool = False,
+    allow_analysis_fallback: bool = False,
+) -> tuple[str, str | None]:
+    """Split Harmony output into `(final_text, reasoning_text)` without leaking truncated analysis."""
     final_marker = "<|channel|>final<|message|>"
+    ana_marker = "<|channel|>analysis<|message|>"
     reasoning: str | None = None
     body = raw_text
+
     if final_marker in raw_text:
         pre, body = raw_text.split(final_marker, 1)
         ana = pre
-        for tok in ("<|start|>assistant", "<|channel|>analysis<|message|>", "<|end|>"):
+        for tok in ("<|start|>assistant", ana_marker, "<|end|>"):
             ana = ana.replace(tok, "")
         ana = ana.strip()
         reasoning = ana if ana else None
-    elif "<|channel|>analysis<|message|>" in raw_text:
-        ana = raw_text.split("<|channel|>analysis<|message|>", 1)[-1]
-        for tok in ("<|end|>", "<|return|>", "<|endoftext|>"):
+        for stop_tok in (*_STOP_MARKERS, "<|start|>"):
+            if stop_tok in body:
+                body = body.split(stop_tok, 1)[0]
+        return body, reasoning
+
+    if ana_marker in raw_text or started_in_analysis:
+        ana = raw_text.split(ana_marker, 1)[-1] if ana_marker in raw_text else raw_text
+        for tok in ("<|start|>assistant", *_STOP_MARKERS):
             ana = ana.replace(tok, "")
         ana = ana.strip()
+        if allow_analysis_fallback:
+            return ana, (ana or None)
         return "", (ana or None)
 
-    for tok in ("<|return|>", "<|end|>", "<|endoftext|>"):
+    for tok in _STOP_MARKERS:
         body = body.replace(tok, "")
     return body, reasoning
 
@@ -232,12 +262,20 @@ class FastGptOssTokenizer:
         self.endoftext_id = _tid("<|endoftext|>", 199999)
         self.return_token_id = _tid("<|return|>", self.endoftext_id)
         self.end_token_id = _tid("<|end|>", self.return_token_id)
+        self.call_token_id = _tid("<|call|>", self.return_token_id)
         self.start_token_id = _tid("<|start|>", 0)
         self.channel_token_id = _tid("<|channel|>", 0)
         self.message_token_id = _tid("<|message|>", 0)
         self.eos_token_id = self.return_token_id
-        self.final_stop_token_ids = frozenset({self.return_token_id, self.end_token_id, self.endoftext_id})
-        self.analysis_stop_token_ids = frozenset({self.return_token_id, self.endoftext_id})
+        self.final_stop_token_ids = frozenset(
+            {self.return_token_id, self.end_token_id, self.call_token_id, self.endoftext_id}
+        )
+        self.analysis_stop_token_ids = frozenset(
+            {self.return_token_id, self.call_token_id, self.endoftext_id}
+        )
+        self.final_channel_seq: tuple[int, ...] = tuple(
+            self.encode("<|channel|>final<|message|>", add_special_tokens=False)
+        )
         self._lltok = None
 
     @property
@@ -290,6 +328,7 @@ class FastGptOssTokenizer:
 
 __all__ = [
     "DEFAULT_KEPT_VOCAB_SIZE",
+    "DEFAULT_MODEL_IDENTITY",
     "FULL_VOCAB_SIZE",
     "FastGptOssTokenizer",
     "O200kVocabRemapper",

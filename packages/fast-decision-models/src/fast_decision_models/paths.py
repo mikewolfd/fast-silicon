@@ -9,8 +9,13 @@ import subprocess
 from typing import Sequence
 
 DEFAULT_LAYA_REPO = "convaiinnovations/laya-typed-decisions"
+DEFAULT_LAYA_NMTZ_COREML_REPO = "NMTZ/laya-typed-decisions-421m-coreml-ane"
 DEFAULT_KEV_ADAPTER_REPO = "jaredpalmer/kev-0.8b"
 DEFAULT_KEV_BASE_REPO = "Qwen/Qwen3.5-0.8B-Base"
+DEFAULT_KEV_08B_MLX_REPO = "AbstractFramework/kev-0.8b-mlx-8bit"
+DEFAULT_KEV_4B_ADAPTER_REPO = "jaredpalmer/kev-4b"
+DEFAULT_KEV_4B_BASE_REPO = "Qwen/Qwen3.5-4B-Base"
+DEFAULT_KEV_4B_MLX_REPO = "AbstractFramework/kev-4b-mlx-4bit"
 DEFAULT_MACOSX_DEPLOYMENT_TARGET = "15.0"
 
 
@@ -23,10 +28,11 @@ class DecisionModelPaths:
     laya_dir: Path
     kev_dir: Path
     dylib_path: Path
+    kev_4b_dir: Path | None = None
 
 
 def resolve_home(home: str | Path | None = None) -> Path:
-    """Resolve `fast-decision-models` home directory (`explicit > env > checkout w/ artifacts > FAST_ARTIFACTS_ROOT > sibling > ~/.cache`)."""
+    """Resolve `fast-decision-models` home directory (`explicit > env > checkout w/ artifacts > FAST_ARTIFACTS_ROOT > sibling > cache`)."""
     if home is not None:
         return Path(home).expanduser().resolve()
     env_home = os.environ.get("FAST_DECISION_MODELS_HOME")
@@ -46,7 +52,7 @@ def resolve_home(home: str | Path | None = None) -> Path:
         sib = cand.parent.parent.parent / "fast-decision-models"
         if (sib / "artifacts").is_dir():
             return sib.resolve()
-    return (Path("~/.cache") / "fast-decision-models").expanduser().resolve()
+    return (Path.home() / ".cache" / "fast-decision-models").resolve()
 
 
 def resolve_artifacts_dir(
@@ -84,14 +90,31 @@ def resolve_kev_dir(
     *,
     artifacts_dir: str | Path | None = None,
     home: str | Path | None = None,
+    variant: str = "0.8b",
 ) -> Path:
-    """Resolve directory containing `kev_08b` merged BF16/W8 MLX safetensors and tokenizer."""
+    """Resolve directory containing `kev_08b` or `kev_4b` MLX safetensors and tokenizer."""
     if kev_dir is not None:
         return Path(kev_dir).expanduser().resolve()
+    norm_var = str(variant).strip().lower()
+    if norm_var in ("4b", "kev-4b", "kev_4b"):
+        env_4b = os.environ.get("FAST_DECISION_MODELS_KEV_4B_DIR")
+        if env_4b:
+            return Path(env_4b).expanduser().resolve()
+        return resolve_artifacts_dir(artifacts_dir, home=home) / "kev_4b"
     env_dir = os.environ.get("FAST_DECISION_MODELS_KEV_DIR")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
     return resolve_artifacts_dir(artifacts_dir, home=home) / "kev_08b"
+
+
+def resolve_kev_4b_dir(
+    kev_dir: str | Path | None = None,
+    *,
+    artifacts_dir: str | Path | None = None,
+    home: str | Path | None = None,
+) -> Path:
+    """Resolve directory containing `kev_4b` merged/quantized MLX safetensors and tokenizer."""
+    return resolve_kev_dir(kev_dir, artifacts_dir=artifacts_dir, home=home, variant="4b")
 
 
 def resolve_paths(
@@ -118,6 +141,7 @@ def resolve_paths(
         laya_dir=art / "laya_typed",
         kev_dir=art / "kev_08b",
         dylib_path=build_root / "build" / "liblaya_ane_runner.dylib",
+        kev_4b_dir=art / "kev_4b",
     )
 
 
@@ -142,7 +166,16 @@ def ensure_laya_dylib(
     pkg_home = resolve_home(home_dir)
     pkg_checkout = Path(__file__).resolve().parents[2]
 
-    src_root = pkg_home if (pkg_home / "native" / "laya_ane_runner.mm").is_file() else pkg_checkout
+    if (
+        home_dir is None
+        and not os.environ.get("FAST_DECISION_MODELS_HOME")
+        and (pkg_checkout / "native" / "laya_ane_runner.mm").is_file()
+    ):
+        src_root = pkg_checkout
+    elif (pkg_home / "native" / "laya_ane_runner.mm").is_file():
+        src_root = pkg_home
+    else:
+        src_root = pkg_checkout
     src_mm = src_root / "native" / "laya_ane_runner.mm"
     src_h = src_root / "native" / "laya_ane_runner.h"
     dylib = src_root / "build" / "liblaya_ane_runner.dylib"
@@ -209,14 +242,20 @@ def ensure_laya_dylib(
 
 
 __all__ = [
+    "DEFAULT_KEV_08B_MLX_REPO",
+    "DEFAULT_KEV_4B_ADAPTER_REPO",
+    "DEFAULT_KEV_4B_BASE_REPO",
+    "DEFAULT_KEV_4B_MLX_REPO",
     "DEFAULT_KEV_ADAPTER_REPO",
     "DEFAULT_KEV_BASE_REPO",
+    "DEFAULT_LAYA_NMTZ_COREML_REPO",
     "DEFAULT_LAYA_REPO",
     "DEFAULT_MACOSX_DEPLOYMENT_TARGET",
     "DecisionModelPaths",
     "ensure_laya_dylib",
     "resolve_artifacts_dir",
     "resolve_home",
+    "resolve_kev_4b_dir",
     "resolve_kev_dir",
     "resolve_laya_dir",
     "resolve_paths",

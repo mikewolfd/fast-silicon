@@ -1,10 +1,13 @@
-"""Standalone Gemma-4 E2B/E4B MLX + Metal 4 MPP model loader and ragged prefix-shared runner."""
+"""Standalone Gemma-4 E2B/E4B/12B/26B-A4B/31B MLX + Metal 4 MPP model loader and ragged runner."""
 
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
 import platform
+import re
 from typing import Any, Sequence
 import warnings
 
@@ -28,11 +31,14 @@ from .kernels import (
     mpp_linear_bf16,
     mqa8_sdpa_prefix_ragged,
     mqa8_sdpa_prefix_ragged_slot,
+    multi_row_gemv_exact_bf16,
+    multi_row_qmv_exact_bf16,
     quantize_kv_pair_i8,
     scatter_kv_i8_slot_precomputed,
     scatter_kv_ragged,
     scatter_kv_slot_precomputed,
 )
+from .packager import is_ple_gate_or_proj_key, quantize_q4_0_sym_u32
 from .paths import Gemma4Paths, resolve_paths
 from .tokenizer import DEFAULT_KEPT_VOCAB_SIZE, FULL_VOCAB_SIZE, VocabRemapper
 
@@ -71,6 +77,153 @@ def _detect_gpu_family() -> str:
     except Exception:
         pass
     return "unknown"
+
+
+def _detect_host_ram_gib() -> float:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_sz = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_sz, int) and pages > 0 and page_sz > 0:
+            return float(pages * page_sz) / float(1024**3)
+    except Exception:
+        pass
+    try:
+        dev_info_fn = getattr(mx, "device_info", None)
+        if callable(dev_info_fn):
+            mem = int(dev_info_fn().get("memory_size", 0) or 0)
+            if mem > 0:
+                return float(mem) / float(1024**3)
+    except Exception:
+        pass
+    return 48.0
+
+
+def should_use_bf16_mpp_for_mlp(
+    *,
+    mlp_dtype: str,
+    gpu_family: str,
+    host_ram_gib: float,
+    batch_size: int,
+    mlp_bits: int | None,
+) -> bool:
+    """Hardware- and checkpoint-aware policy deciding whether MLPs should promote to BF16 MPP.
+
+    Under `mlp_dtype="auto"`:
+      - `Apple10` (`NAX`, M5+): NEVER promote (`QuantizedLinear` wins across `B=1..128`).
+      - `Apple9` (M4): keep `QuantizedLinear` whenever `B < 64`, `RAM < 48 GB`, or `mlp_bits <= 4`
+        (`q4_0` / `qat-mobile` / `mxfp4`); promote ONLY when `B >= 64` on `>= 48 GB` `Apple9`
+        and weights are `8-bit` or BF16-backed (`mlp_bits is None or mlp_bits >= 8`).
+    """
+    mode = str(mlp_dtype or "auto").strip().lower()
+    fam = str(gpu_family or "unknown").strip().lower()
+    if mode == "quantized":
+        return False
+    if mode == "bfloat16":
+        return fam != "apple10"
+    if mode != "auto":
+        raise ValueError(f"Unsupported mlp_dtype={mlp_dtype!r}")
+    if fam != "apple9":
+        return False
+    if int(batch_size) < 64:
+        return False
+    if float(host_ram_gib) < 46.0:
+        return False
+    if mlp_bits is not None and int(mlp_bits) <= 4:
+        return False
+    return True
+
+
+def singleton_quantized_linear(linear: nn.Module, x: mx.array) -> mx.array | None:
+    """Execute single-pass weight-reusing per-token `qmv` across `[B, L_q, D]` (`0.0` ULP vs `L_q=1`)."""
+    if not isinstance(linear, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        return None
+    if x.ndim != 3:
+        return None
+    bsz, seq_len, in_dim = (int(d) for d in x.shape)
+    m_rows = bsz * seq_len
+    if m_rows == 1:
+        if isinstance(linear, nn.QuantizedLinear):
+            return linear(x)
+        out_1 = mx.quantized_matmul(
+            x,
+            linear.weight,
+            scales=linear.scales,
+            biases=linear.biases,
+            transpose=True,
+            group_size=linear.group_size,
+            bits=linear.bits,
+            mode=linear.mode,
+        )
+        bias = getattr(linear, "bias", None)
+        return (out_1 + bias) if bias is not None else out_1
+
+    if mx.default_device() == mx.gpu and linear.mode == "affine" and linear.biases is not None:
+        fast_out = multi_row_qmv_exact_bf16(
+            x,
+            linear.weight,
+            linear.scales,
+            linear.biases,
+            group_size=int(linear.group_size),
+            bits=int(linear.bits),
+        )
+        if fast_out is not None:
+            bias = getattr(linear, "bias", None)
+            return (fast_out + bias) if bias is not None else fast_out
+
+    lhs_idx = mx.arange(m_rows, dtype=mx.uint32)
+    rhs_idx = mx.zeros((m_rows,), dtype=mx.uint32)
+    projected = mx.contiguous(x).reshape((m_rows, 1, 1, in_dim))
+    out = mx.gather_qmm(  # guard: allow-unsorted-qmm
+        projected,
+        linear.weight[None],
+        linear.scales[None],
+        None if linear.biases is None else linear.biases[None],
+        lhs_indices=lhs_idx,
+        rhs_indices=rhs_idx,
+        transpose=True,
+        group_size=linear.group_size,
+        bits=linear.bits,
+        mode=linear.mode,
+        sorted_indices=False,
+    )
+    out = out.reshape((bsz, seq_len, -1))
+    bias = getattr(linear, "bias", None)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def _singleton_verify_linear(mod: nn.Module, x: mx.array) -> mx.array:
+    """Apply `mod` to `[B, L_q, D]` using single-pass weight-reusing reduction matching `L_q=1` bit-for-bit."""
+    q_out = singleton_quantized_linear(mod, x)
+    if q_out is not None:
+        return q_out
+    if isinstance(mod, nn.Linear) and x.ndim == 3:
+        m_rows = int(x.shape[0]) * int(x.shape[1])
+        if m_rows == 1:
+            return mod(x)
+        if mx.default_device() == mx.gpu:
+            fast_lin = multi_row_gemv_exact_bf16(x, mod.weight)
+            if fast_lin is not None:
+                if "bias" in mod and mod.bias is not None:
+                    return fast_lin + mod.bias
+                return fast_lin
+        out = mx.matmul(mx.expand_dims(mx.contiguous(x), -2), mod.weight.T).squeeze(-2)
+        if "bias" in mod and mod.bias is not None:
+            out = out + mod.bias
+        return out
+    if isinstance(mod, nn.Embedding) and x.ndim == 3:
+        if mx.default_device() == mx.gpu and int(x.shape[0]) * int(x.shape[1]) > 1:
+            fast_emb = multi_row_gemv_exact_bf16(x, mod.weight)
+            if fast_emb is not None:
+                return fast_emb
+        return mx.matmul(mx.expand_dims(mx.contiguous(x), -2), mod.weight.T).squeeze(-2)
+    return mod(x)
+
+
+def _next_pow2(n: int) -> int:
+    v = max(1, int(n))
+    return 1 << (v - 1).bit_length()
 
 
 def create_causal_mask(
@@ -153,23 +306,136 @@ def logit_softcap(softcap: float, x: mx.array) -> mx.array:
     return mx.tanh(x / softcap) * softcap
 
 
-def _qmeta_for(qcfg: dict[str, Any], prefix: str) -> dict[str, Any]:
-    meta = qcfg.get(prefix)
-    return meta if isinstance(meta, dict) else {}
+def _candidate_quant_names(prefix: str) -> tuple[str, ...]:
+    cands = [prefix]
+    if prefix.startswith("language_model.model."):
+        tail = prefix[len("language_model.model.") :]
+        cands.extend((f"language_model.{tail}", f"model.{tail}", tail))
+    elif prefix.startswith("model."):
+        tail = prefix[len("model.") :]
+        cands.extend((f"language_model.model.{tail}", f"language_model.{tail}", tail))
+    elif prefix.startswith("language_model."):
+        tail = prefix[len("language_model.") :]
+        cands.extend((f"language_model.model.{tail}", tail))
+    return tuple(dict.fromkeys(cands))
 
 
-def _dequantize_linear(raw: dict[str, mx.array], prefix: str, qcfg: dict[str, Any], dtype: mx.Dtype) -> mx.array:
+def _resolve_quant_spec(
+    raw: dict[str, mx.array],
+    prefix: str,
+    qcfg: dict[str, Any],
+    *,
+    expected_in_f: int | None = None,
+) -> tuple[int, int, str]:
+    """Resolve `(bits, group_size, mode)` from explicit per-module overrides, regexes (`qat-mobile`), and tensor shapes."""
+    w = raw[f"{prefix}.weight"]
+    s = raw[f"{prefix}.scales"]
+    has_biases = f"{prefix}.biases" in raw
+
+    meta: dict[str, Any] = {}
+    for cand in _candidate_quant_names(prefix):
+        v = qcfg.get(cand)
+        if isinstance(v, dict):
+            meta = v
+            break
+
+    if not meta and isinstance(qcfg.get("module_quant_configs"), dict):
+        mqc: dict[str, Any] = qcfg["module_quant_configs"]
+        for pat, pat_cfg in mqc.items():
+            if not isinstance(pat_cfg, dict):
+                continue
+            if any(re.search(pat, cand) for cand in _candidate_quant_names(prefix)):
+                meta = pat_cfg
+                break
+
+    u8_dt = getattr(mx, "uint8", "uint8")
+    raw_mode = meta.get("mode", qcfg.get("mode"))
+    if raw_mode in ("affine", "mxfp4", "mxfp8", "nvfp4"):
+        mode = str(raw_mode)
+    elif s.dtype == u8_dt and not has_biases:
+        mode = "mxfp4"
+    else:
+        mode = "affine"
+
+    default_gs = 32 if mode in ("mxfp4", "mxfp8") else (16 if mode == "nvfp4" else 64)
+    gs = int(meta.get("group_size", qcfg.get("group_size", default_gs)))
+    bits = int(meta.get("bits", meta.get("num_bits", qcfg.get("bits", qcfg.get("num_bits", 4)))))
+
+    w_cols = int(w.shape[-1])
+    s_cols = int(s.shape[-1])
+    if expected_in_f is not None and expected_in_f > 0 and s_cols > 0 and w_cols > 0:
+        if expected_in_f % s_cols == 0 and (w_cols * 32) % expected_in_f == 0:
+            cand_gs = expected_in_f // s_cols
+            cand_bits = (w_cols * 32) // expected_in_f
+            if cand_bits in (2, 3, 4, 5, 6, 8) and cand_gs in (16, 32, 64, 128, 256):
+                gs = cand_gs
+                bits = cand_bits
+    elif s_cols > 0 and w_cols > 0:
+        # Even without `expected_in_f`, `in_f = s_cols * gs = w_cols * (32 / bits)` -> `bits * gs = (32 * w_cols) / s_cols`.
+        if (32 * w_cols) % s_cols == 0:
+            prod = (32 * w_cols) // s_cols
+            if bits * gs != prod:
+                if prod % gs == 0 and (prod // gs) in (2, 3, 4, 6, 8):
+                    bits = prod // gs
+                elif prod % bits == 0 and (prod // bits) in (16, 32, 64, 128, 256):
+                    gs = prod // bits
+
+    if s.dtype == u8_dt and not has_biases and mode == "affine":
+        mode = "mxfp8" if bits == 8 else ("nvfp4" if gs == 16 else "mxfp4")
+    return bits, gs, mode
+
+
+def _cast_quant_scales(scales: mx.array, mode: str, dtype: mx.Dtype) -> mx.array:
+    if mode in ("mxfp4", "mxfp8", "nvfp4") or scales.dtype == getattr(mx, "uint8", "uint8"):
+        return scales
+    return scales.astype(dtype)
+
+
+def _quantize_unpacked_qat_linear(w: mx.array, prefix: str, dtype: mx.Dtype) -> nn.QuantizedLinear:
+    """Quantize unpacked `*-qat-q4_0-unquantized` 2D linear onto symmetric `q4_0 g32` (or `8-bit` PLE gate/proj)."""
+    out_f, in_f = int(w.shape[0]), int(w.shape[1])
+    if is_ple_gate_or_proj_key(f"{prefix}.weight") and in_f % 32 == 0:
+        lin = nn.Linear(in_f, out_f, bias=False)
+        lin.weight = w.astype(dtype)
+        return nn.QuantizedLinear.from_linear(lin, group_size=32, bits=8, mode="affine")
+    w_np = np.asarray(w.astype(mx.float32), dtype=np.float32)
+    qw, qs, qb = quantize_q4_0_sym_u32(w_np, group_size=32)
+    qlin = nn.QuantizedLinear(in_f, out_f, bias=False, group_size=32, bits=4, mode="affine")
+    qlin.weight = mx.array(qw.array, dtype=mx.uint32)
+    qlin.scales = mx.array(qs.to_float32(), dtype=dtype)
+    qlin.biases = mx.array(qb.to_float32(), dtype=dtype)
+    return qlin
+
+
+def _quantize_unpacked_qat_embedding(w: mx.array, dtype: mx.Dtype) -> nn.QuantizedEmbedding:
+    num_emb, dims = int(w.shape[0]), int(w.shape[1])
+    w_np = np.asarray(w.astype(mx.float32), dtype=np.float32)
+    qw, qs, qb = quantize_q4_0_sym_u32(w_np, group_size=32)
+    qemb = nn.QuantizedEmbedding(num_emb, dims, group_size=32, bits=4, mode="affine")
+    qemb.weight = mx.array(qw.array, dtype=mx.uint32)
+    qemb.scales = mx.array(qs.to_float32(), dtype=dtype)
+    qemb.biases = mx.array(qb.to_float32(), dtype=dtype)
+    return qemb
+
+
+def _dequantize_linear(
+    raw: dict[str, mx.array],
+    prefix: str,
+    qcfg: dict[str, Any],
+    dtype: mx.Dtype,
+    *,
+    expected_in_f: int | None = None,
+) -> mx.array:
     w_key = f"{prefix}.weight"
     if f"{prefix}.scales" not in raw:
         return raw[w_key].astype(dtype)
-    meta = _qmeta_for(qcfg, prefix)
-    bits = int(meta.get("bits", qcfg.get("bits", 4)))
-    gs = int(meta.get("group_size", qcfg.get("group_size", 64)))
-    mode = str(meta.get("mode", qcfg.get("mode", "affine")))
+    bits, gs, mode = _resolve_quant_spec(raw, prefix, qcfg, expected_in_f=expected_in_f)
+    scales = _cast_quant_scales(raw[f"{prefix}.scales"], mode, dtype)
+    biases = raw[f"{prefix}.biases"].astype(dtype) if f"{prefix}.biases" in raw else None
     return mx.dequantize(
         raw[w_key],
-        raw[f"{prefix}.scales"],
-        raw.get(f"{prefix}.biases"),
+        scales,
+        biases,
         group_size=gs,
         bits=bits,
         mode=mode,
@@ -183,21 +449,29 @@ def _load_linear(
     dtype: mx.Dtype,
     *,
     promote_bf16: bool = False,
+    expected_in_f: int | None = None,
+    auto_qat_q4_0: bool = False,
 ) -> nn.Module:
     w_key = f"{prefix}.weight"
     s_key = f"{prefix}.scales"
-    if s_key not in raw or promote_bf16:
-        w = _dequantize_linear(raw, prefix, qcfg, dtype)
+    if s_key not in raw:
+        w = raw[w_key].astype(dtype)
+        out_f, in_f = int(w.shape[0]), int(w.shape[1])
+        if auto_qat_q4_0 and not promote_bf16 and in_f % 32 == 0:
+            return _quantize_unpacked_qat_linear(w, prefix, dtype)
+        lin = nn.Linear(in_f, out_f, bias=False)
+        lin.weight = w
+        return lin
+
+    if promote_bf16:
+        w = _dequantize_linear(raw, prefix, qcfg, dtype, expected_in_f=expected_in_f)
         out_f, in_f = int(w.shape[0]), int(w.shape[1])
         lin = nn.Linear(in_f, out_f, bias=False)
         lin.weight = w
         return lin
 
-    meta = _qmeta_for(qcfg, prefix)
-    bits = int(meta.get("bits", qcfg.get("bits", 4)))
-    gs = int(meta.get("group_size", qcfg.get("group_size", 64)))
-    mode = str(meta.get("mode", qcfg.get("mode", "affine")))
-    scales = raw[s_key].astype(dtype)
+    bits, gs, mode = _resolve_quant_spec(raw, prefix, qcfg, expected_in_f=expected_in_f)
+    scales = _cast_quant_scales(raw[s_key], mode, dtype)
     biases = raw[f"{prefix}.biases"].astype(dtype) if f"{prefix}.biases" in raw else None
     out_f = int(scales.shape[0])
     in_f = int(scales.shape[1]) * gs
@@ -208,19 +482,26 @@ def _load_linear(
     return qlin
 
 
-def _load_qembedding(raw: dict[str, mx.array], prefix: str, qcfg: dict[str, Any], dtype: mx.Dtype) -> nn.Module:
+def _load_qembedding(
+    raw: dict[str, mx.array],
+    prefix: str,
+    qcfg: dict[str, Any],
+    dtype: mx.Dtype,
+    *,
+    expected_in_f: int | None = None,
+    auto_qat_q4_0: bool = False,
+) -> nn.Module:
     w_key = f"{prefix}.weight"
     s_key = f"{prefix}.scales"
     if s_key not in raw:
         w = raw[w_key].astype(dtype)
+        if auto_qat_q4_0 and int(w.shape[1]) % 32 == 0:
+            return _quantize_unpacked_qat_embedding(w, dtype)
         emb = nn.Embedding(int(w.shape[0]), int(w.shape[1]))
         emb.weight = w
         return emb
-    meta = _qmeta_for(qcfg, prefix)
-    bits = int(meta.get("bits", qcfg.get("bits", 4)))
-    gs = int(meta.get("group_size", qcfg.get("group_size", 64)))
-    mode = str(meta.get("mode", qcfg.get("mode", "affine")))
-    scales = raw[s_key].astype(dtype)
+    bits, gs, mode = _resolve_quant_spec(raw, prefix, qcfg, expected_in_f=expected_in_f)
+    scales = _cast_quant_scales(raw[s_key], mode, dtype)
     biases = raw[f"{prefix}.biases"].astype(dtype) if f"{prefix}.biases" in raw else None
     num_emb = int(scales.shape[0])
     dims = int(scales.shape[1]) * gs
@@ -229,6 +510,242 @@ def _load_qembedding(raw: dict[str, mx.array], prefix: str, qcfg: dict[str, Any]
     qemb.scales = scales
     qemb.biases = biases
     return qemb
+
+
+class _SwitchProj:
+    """3D expert projection (`[num_experts, out_f, in_f]`), supporting quantized (`affine`/`mxfp4`) and dense BF16."""
+
+    def __init__(
+        self,
+        weight: mx.array,
+        scales: mx.array | None = None,
+        biases: mx.array | None = None,
+        *,
+        group_size: int = 32,
+        bits: int = 4,
+        mode: str = "affine",
+    ) -> None:
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = int(group_size)
+        self.bits = int(bits)
+        self.mode = str(mode)
+        self.is_quantized = scales is not None
+
+    def parameters(self) -> list[mx.array]:
+        arrs = [self.weight]
+        if self.scales is not None:
+            arrs.append(self.scales)
+        if self.biases is not None:
+            arrs.append(self.biases)
+        return arrs
+
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        lhs_indices: mx.array,
+        rhs_indices: mx.array,
+        sorted_indices: bool = True,
+    ) -> mx.array:
+        if self.is_quantized:
+            return mx.gather_qmm(
+                x,
+                self.weight,
+                self.scales,
+                self.biases,
+                lhs_indices=lhs_indices,
+                rhs_indices=rhs_indices,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                sorted_indices=sorted_indices,
+            )
+        return mx.gather_mm(
+            x,
+            self.weight.swapaxes(-1, -2),
+            lhs_indices=lhs_indices,
+            rhs_indices=rhs_indices,
+            sorted_indices=sorted_indices,
+        )
+
+
+def _load_3d_switch_proj(
+    raw: dict[str, mx.array],
+    prefix: str,
+    qcfg: dict[str, Any],
+    dtype: mx.Dtype,
+    *,
+    expected_in_f: int,
+) -> _SwitchProj:
+    w_key = f"{prefix}.weight"
+    s_key = f"{prefix}.scales"
+    if s_key not in raw:
+        return _SwitchProj(raw[w_key].astype(dtype))
+    bits, gs, mode = _resolve_quant_spec(raw, prefix, qcfg, expected_in_f=expected_in_f)
+    scales = _cast_quant_scales(raw[s_key], mode, dtype)
+    biases = raw[f"{prefix}.biases"].astype(dtype) if f"{prefix}.biases" in raw else None
+    return _SwitchProj(raw[w_key], scales, biases, group_size=gs, bits=bits, mode=mode)
+
+
+def _concat_switch_projs(p_a: _SwitchProj, p_b: _SwitchProj) -> _SwitchProj:
+    return _SwitchProj(
+        mx.contiguous(mx.concatenate([p_a.weight, p_b.weight], axis=1)),
+        mx.contiguous(mx.concatenate([p_a.scales, p_b.scales], axis=1)) if p_a.scales is not None else None,
+        mx.contiguous(mx.concatenate([p_a.biases, p_b.biases], axis=1)) if p_a.biases is not None else None,
+        group_size=p_a.group_size,
+        bits=p_a.bits,
+        mode=p_a.mode,
+    )
+
+
+class Gemma4Router:
+    """Gemma-4 MoE expert router (`rms_norm(x, scale * H^-0.5) -> proj -> top-k -> softmax * per_expert_scale`)."""
+
+    def __init__(
+        self,
+        proj: nn.Module,
+        scale: mx.array,
+        per_expert_scale: mx.array,
+        *,
+        hidden_size: int,
+        top_k: int,
+        eps: float,
+        dtype: mx.Dtype,
+    ) -> None:
+        self.proj = proj
+        self.scale = scale.astype(dtype)
+        self.per_expert_scale = per_expert_scale.astype(dtype)
+        self.scaled_norm_w = (scale.astype(mx.float32) * (float(hidden_size) ** -0.5)).astype(dtype)
+        self.top_k = int(top_k)
+        self.eps = float(eps)
+
+    def parameters(self) -> list[Any]:
+        return [self.proj.parameters(), self.scale, self.per_expert_scale, self.scaled_norm_w]
+
+    def __call__(self, x: mx.array, *, singleton: bool = False) -> tuple[mx.array, mx.array]:
+        x_norm = mx.fast.rms_norm(x, self.scaled_norm_w, self.eps)
+        scores = _singleton_verify_linear(self.proj, x_norm) if singleton else self.proj(x_norm)
+        top_k_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        top_k_w = mx.softmax(mx.take_along_axis(scores, top_k_idx, axis=-1), axis=-1, precise=True).astype(x.dtype)
+        top_k_w = top_k_w * self.per_expert_scale[top_k_idx]
+        return top_k_idx, top_k_w
+
+
+class Gemma4SwitchGLU:
+    """Sparse MoE SwitchGLU using fused `gate_up_proj` + `fused_geglu_split` + sorted `lhs_indices`/`rhs_indices` `gather_qmm`."""
+
+    def __init__(self, gate_up_proj: _SwitchProj, down_proj: _SwitchProj) -> None:
+        self.gate_up_proj = gate_up_proj
+        self.down_proj = down_proj
+
+    def parameters(self) -> list[Any]:
+        return [self.gate_up_proj.parameters(), self.down_proj.parameters()]
+
+    def _forward_tokens(self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array) -> mx.array:
+        orig_idx_shape = top_k_indices.shape
+        k_top = int(orig_idx_shape[-1])
+        in_dim = int(x.shape[-1])
+        m_tokens = int(x.size // in_dim)
+        x_flat = mx.contiguous(x).reshape((m_tokens, 1, 1, in_dim))
+
+        flat_experts = top_k_indices.reshape((-1,))
+        order = mx.argsort(flat_experts)
+        inv_order = mx.argsort(order)
+        rhs_indices = flat_experts[order]
+        lhs_indices = order // k_top
+
+        gu = self.gate_up_proj(
+            x_flat,
+            lhs_indices=lhs_indices,
+            rhs_indices=rhs_indices,
+            sorted_indices=True,
+        )
+        act = fused_geglu_split(gu)
+        down_lhs = mx.arange(int(rhs_indices.size), dtype=order.dtype)
+        y_sorted = self.down_proj(
+            act,
+            lhs_indices=down_lhs,
+            rhs_indices=rhs_indices,
+            sorted_indices=True,
+        )
+        y = y_sorted[inv_order].reshape((*orig_idx_shape, -1))
+        return (mx.expand_dims(top_k_weights, -1) * y).sum(axis=-2)
+
+    def __call__(
+        self,
+        x: mx.array,
+        top_k_indices: mx.array,
+        top_k_weights: mx.array,
+        *,
+        singleton: bool = False,
+    ) -> mx.array:
+        if singleton and x.ndim == 3 and int(x.shape[1]) > 1:
+            cols = [
+                self._forward_tokens(x[:, t : t + 1], top_k_indices[:, t : t + 1], top_k_weights[:, t : t + 1])
+                for t in range(int(x.shape[1]))
+            ]
+            return mx.concatenate(cols, axis=1)
+        return self._forward_tokens(x, top_k_indices, top_k_weights)
+
+
+def _load_moe_experts(
+    raw: dict[str, mx.array],
+    lp: str,
+    qcfg: dict[str, Any],
+    dtype: mx.Dtype,
+    *,
+    hidden_size: int,
+    moe_interm: int,
+    num_experts: int,
+) -> Gemma4SwitchGLU:
+    sg_gate = f"{lp}.experts.switch_glu.gate_proj"
+    sg_up = f"{lp}.experts.switch_glu.up_proj"
+    sg_down = f"{lp}.experts.switch_glu.down_proj"
+    if f"{sg_gate}.weight" in raw:
+        p_g = _load_3d_switch_proj(raw, sg_gate, qcfg, dtype, expected_in_f=hidden_size)
+        p_u = _load_3d_switch_proj(raw, sg_up, qcfg, dtype, expected_in_f=hidden_size)
+        p_d = _load_3d_switch_proj(raw, sg_down, qcfg, dtype, expected_in_f=moe_interm)
+        return Gemma4SwitchGLU(_concat_switch_projs(p_g, p_u), p_d)
+
+    fused_gu = f"{lp}.experts.gate_up_proj"
+    fused_dn = f"{lp}.experts.down_proj"
+    if f"{fused_gu}.weight" in raw:
+        p_gu = _load_3d_switch_proj(raw, fused_gu, qcfg, dtype, expected_in_f=hidden_size)
+        p_d = _load_3d_switch_proj(raw, fused_dn, qcfg, dtype, expected_in_f=moe_interm)
+        return Gemma4SwitchGLU(p_gu, p_d)
+
+    # Per-expert keys (`experts.0.gate_proj`, ..., `experts.{E-1}.down_proj`, including REAP pruned counts)
+    e_cnt = 0
+    while f"{lp}.experts.{e_cnt}.gate_proj.weight" in raw and e_cnt < max(num_experts, 1024):
+        e_cnt += 1
+    if e_cnt == 0:
+        raise KeyError(f"Missing MoE expert weights under {lp}.experts")
+
+    def _stack_expert(proj_name: str, exp_in: int) -> _SwitchProj:
+        p0 = f"{lp}.experts.0.{proj_name}"
+        has_sc = f"{p0}.scales" in raw
+        has_bi = f"{p0}.biases" in raw
+        w_st = mx.stack([raw[f"{lp}.experts.{e}.{proj_name}.weight"] for e in range(e_cnt)], axis=0)
+        if not has_sc:
+            return _SwitchProj(w_st.astype(dtype))
+        bits, gs, mode = _resolve_quant_spec(raw, p0, qcfg, expected_in_f=exp_in)
+        s_st = _cast_quant_scales(
+            mx.stack([raw[f"{lp}.experts.{e}.{proj_name}.scales"] for e in range(e_cnt)], axis=0), mode, dtype
+        )
+        b_st = (
+            mx.stack([raw[f"{lp}.experts.{e}.{proj_name}.biases"] for e in range(e_cnt)], axis=0).astype(dtype)
+            if has_bi
+            else None
+        )
+        return _SwitchProj(w_st, s_st, b_st, group_size=gs, bits=bits, mode=mode)
+
+    p_g = _stack_expert("gate_proj", hidden_size)
+    p_u = _stack_expert("up_proj", hidden_size)
+    p_d = _stack_expert("down_proj", moe_interm)
+    return Gemma4SwitchGLU(_concat_switch_projs(p_g, p_u), p_d)
 
 
 def _fuse_linears(mods: Sequence[nn.Module], dtype: mx.Dtype) -> nn.Module:
@@ -345,13 +862,13 @@ def _compute_previous_kvs(layer_types: Sequence[str], num_kv_shared: int) -> lis
 
 class FastGemma4Model:
     """
-    Standalone hardware-limit Gemma-4 E2B/E4B runner for Apple Silicon (M4 / M5+):
+    Standalone hardware-limit Gemma-4 E2B/E4B/12B/26B-A4B/31B runner for Apple Silicon (M4 / M5+):
       - Zero `transformers`/`torch`/`mlx_vlm` runtime dependencies
       - Shared `KV_sys` prefix broadcast across KV-owning layers + ragged per-doc `KV_doc` `[B, Cap, n_kv, D]`
-      - Exact power-of-2 bitmask SWA ring buffer (`512`) + Full KV linear buffer
+      - Exact power-of-2 bitmask SWA ring buffer + Full KV linear buffer
       - `EarlyExit` prefill with final KV-owning layer `kv_proj_only`
-      - Apple Metal 4 `MPP::matmul2d` BF16 GeGLU (`16<=M<=64` + MLX down; `M>=2048` prefill gated on `>=26.1`)
-      - Full checkpoint `262,144` LM head by default, with optional domain/ASCII-focused pruned LM heads (`vocab_remap.npz` / `vocab_out`) while keeping full `262,144` input embeddings + PLE
+      - Hardware- & checkpoint-aware `mlp_dtype="auto"` (`QuantizedLinear` across `B=1..128` on M5 NAX and `<48GB` / `<=4-bit` / `B<64` on M4; lazy BF16 MPP promotion only on `>=48GB` M4 `B>=64` with `8-bit`/BF16 MLPs)
+      - Full checkpoint `262,144` LM head by default, with optional domain/SFT `vocab_remap.npz` or explicit `allow_english_vocab_prune=True`
     """
 
     def __init__(
@@ -359,62 +876,83 @@ class FastGemma4Model:
         *,
         paths: Gemma4Paths | None = None,
         model_dir: str | Path | None = None,
-        mlp_dtype: str = "bfloat16",
+        mlp_dtype: str = "auto",
         vocab_out: int | None = None,
+        allow_english_vocab_prune: bool = False,
         use_mpp: bool = True,
         lm_head_mode: str = "q4",
         local_files_only: bool = True,
-        kv_i8: bool = True,
+        kv_i8: bool | str = "auto",
         vec4_reduce: bool = True,
         mpp_m32_cutoff: int = 96,
         use_fused_softcap_argmax: bool = True,
         allow_mpp_on_apple10: bool = False,
     ) -> None:
-        if mlp_dtype not in ("bfloat16", "quantized"):
+        if mlp_dtype not in ("auto", "bfloat16", "quantized"):
             raise ValueError(f"Unsupported mlp_dtype={mlp_dtype!r}")
         if lm_head_mode not in ("q4", "bf16_mpp"):
             raise ValueError(f"Unsupported lm_head_mode={lm_head_mode!r}")
+        if not isinstance(kv_i8, bool) and str(kv_i8).strip().lower() != "auto":
+            raise ValueError(f"Unsupported kv_i8={kv_i8!r}; expected bool or 'auto'")
         if vocab_out is not None and int(vocab_out) <= 0:
             raise ValueError(f"vocab_out must be a positive integer (or None), got {vocab_out!r}")
 
         self.paths = paths or resolve_paths()
         self.model_dir = self.paths.resolve_model_dir(model_dir, local_files_only=local_files_only)
         self.tokenizer_json = self.paths.resolve_tokenizer_json(self.model_dir, local_files_only=local_files_only)
-        self.mlp_dtype_name = mlp_dtype
+        self.mlp_dtype_name = str(mlp_dtype)
+        self.allow_english_vocab_prune = bool(allow_english_vocab_prune)
         self.act_dtype = mx.bfloat16
         self._macos_version = _macos_version_tuple()
         self._mpp_bf16_supported = _supports_mpp_bf16()
         self._gpu_family = _detect_gpu_family()
+        self._host_ram_gib = _detect_host_ram_gib()
         self._mpp_apple10_enabled = bool(allow_mpp_on_apple10)
         self._mpp_prefill_min_m = 2048
         self._lm_head_mpp_min_m = 64
-        self.use_mpp = bool(use_mpp and (mlp_dtype == "bfloat16") and self._mpp_bf16_supported)
+        self._use_mpp_requested = bool(use_mpp)
+        self.use_mpp = bool(use_mpp and (mlp_dtype in ("bfloat16", "auto")) and self._mpp_bf16_supported)
         self.lm_head_mode = lm_head_mode
-        self.kv_i8 = bool(kv_i8)
+        if isinstance(kv_i8, bool):
+            self.kv_i8_mode = "explicit"
+            self.kv_i8 = kv_i8
+        else:
+            self.kv_i8_mode = "auto"
+            self.kv_i8 = False
         self.vec4_reduce = bool(vec4_reduce)
         self.mpp_m32_cutoff = int(mpp_m32_cutoff)
         self.use_fused_softcap_argmax = bool(use_fused_softcap_argmax)
 
         cfg = json.loads((self.model_dir / "config.json").read_text(encoding="utf-8"))
         tcfg = cfg.get("text_config", cfg)
-        qcfg = cfg.get("quantization") or cfg.get("quantization_config") or {}
+        qcfg: dict[str, Any] = {}
+        if isinstance(cfg.get("quantization_config"), dict):
+            qcfg.update(cfg["quantization_config"])
+        if isinstance(cfg.get("quantization"), dict):
+            qcfg.update(cfg["quantization"])
 
         self.num_layers = int(tcfg["num_hidden_layers"])
         self.hidden_size = int(tcfg["hidden_size"])
-        self.num_kv_shared = int(tcfg.get("num_kv_shared_layers", 20))
+        self.intermediate_size = int(tcfg.get("intermediate_size", self.hidden_size * 4))
+        self.use_double_wide_mlp = bool(tcfg.get("use_double_wide_mlp", False))
+        self.num_kv_shared = int(tcfg.get("num_kv_shared_layers", 0))
         self.first_kv_shared = self.num_layers - self.num_kv_shared
         self.layer_types = list(tcfg["layer_types"])
         self.previous_kvs = _compute_previous_kvs(self.layer_types, self.num_kv_shared)
         self.window_size = int(tcfg.get("sliding_window", 512))
-        self.softcap = float(tcfg.get("final_logit_softcapping", 30.0))
+        self.softcap = float(tcfg.get("final_logit_softcapping") or 30.0)
         self.eps = float(tcfg.get("rms_norm_eps", 1e-6))
-        self.ple_dim = int(tcfg.get("hidden_size_per_layer_input", 256))
+        self.ple_dim = int(tcfg.get("hidden_size_per_layer_input") or 0)
+        self.enable_moe = bool(tcfg.get("enable_moe_block", False))
+        self.num_experts = int(tcfg.get("num_experts") or 0)
+        self.top_k_experts = int(tcfg.get("top_k_experts") or 8)
+        self.moe_intermediate_size = int(tcfg.get("moe_intermediate_size") or 704)
         self.n_q_heads = int(tcfg.get("num_attention_heads", 8))
         self.n_kv_heads = int(tcfg.get("num_key_value_heads", 1))
         self.n_global_kv_heads = int(tcfg.get("num_global_key_value_heads") or self.n_kv_heads)
         self.attention_k_eq_v = bool(tcfg.get("attention_k_eq_v", False))
         self.swa_head_dim = int(tcfg.get("head_dim", 256))
-        self.full_head_dim = int(tcfg.get("global_head_dim", 512))
+        self.full_head_dim = int(tcfg.get("global_head_dim") or self.swa_head_dim)
         self.tie_word_embeddings = bool(tcfg.get("tie_word_embeddings", cfg.get("tie_word_embeddings", True)))
 
         sf_files = sorted(self.model_dir.glob("model*.safetensors"))
@@ -433,45 +971,115 @@ class FastGemma4Model:
                     raw[k] = v
             del raw_all
 
+        has_any_scales = any(k.endswith(".scales") for k in raw)
+        dir_lower = str(self.model_dir).lower()
+        prov_qmode = ""
+        prov_file = self.model_dir / "provenance.json"
+        if prov_file.is_file():
+            try:
+                prov_obj = json.loads(prov_file.read_text(encoding="utf-8"))
+                prov_qmode = str((prov_obj.get("quantization_policy") or {}).get("quant_mode", ""))
+            except Exception:
+                prov_qmode = ""
+        auto_qat_q4_0 = (not has_any_scales) and ("qat-q4_0" in dir_lower or "qat_q4_0" in dir_lower)
+        self.is_qat_checkpoint = bool(
+            auto_qat_q4_0
+            or "qat" in dir_lower
+            or prov_qmode == "qat_q4_0"
+            or qcfg.get("quant_method") == "gemma"
+        )
+
         base_p = "language_model.model" if any(k.startswith("language_model.model.") for k in raw) else "model"
-        self.embed_tokens = _load_qembedding(raw, f"{base_p}.embed_tokens", qcfg, self.act_dtype)
+        self.embed_tokens = _load_qembedding(
+            raw,
+            f"{base_p}.embed_tokens",
+            qcfg,
+            self.act_dtype,
+            expected_in_f=self.hidden_size,
+            auto_qat_q4_0=auto_qat_q4_0,
+        )
         self.embed_scale = mx.array(self.hidden_size**0.5, dtype=self.act_dtype)
-        self.embed_tokens_per_layer = _load_qembedding(raw, f"{base_p}.embed_tokens_per_layer", qcfg, self.act_dtype)
-        self.embed_tokens_per_layer_scale = mx.array(self.ple_dim**0.5, dtype=self.act_dtype)
-        self.per_layer_model_projection = _load_linear(raw, f"{base_p}.per_layer_model_projection", qcfg, self.act_dtype)
-        self.per_layer_projection_scale = mx.array(self.hidden_size**-0.5, dtype=self.act_dtype)
-        self.per_layer_projection_norm_w = raw[f"{base_p}.per_layer_projection_norm.weight"].astype(self.act_dtype)
-        self.per_layer_input_scale = mx.array(2.0**-0.5, dtype=self.act_dtype)
         self.norm_w = raw[f"{base_p}.norm.weight"].astype(self.act_dtype)
 
-        # Sliced EarlyExit PLI projection (cuts L0..first_kv_shared-2 prefill & FF-drain PLI projection)
-        self._n_early_pli_layers = self.first_kv_shared - 1
-        n_early_pli_dim = self._n_early_pli_layers * self.ple_dim
-        pmp = self.per_layer_model_projection
-        if isinstance(pmp, nn.QuantizedLinear):
-            pli_proj_14 = nn.QuantizedLinear(
-                int(pmp.scales.shape[1]) * int(pmp.group_size),
-                n_early_pli_dim,
-                bias=False,
-                group_size=pmp.group_size,
-                bits=pmp.bits,
-                mode=pmp.mode,
-            )
-            pli_proj_14.weight = pmp.weight[:n_early_pli_dim]
-            pli_proj_14.scales = pmp.scales[:n_early_pli_dim]
-            pli_proj_14.biases = pmp.biases[:n_early_pli_dim] if pmp.biases is not None else None
-        else:
-            pli_proj_14 = nn.Linear(int(pmp.weight.shape[1]), n_early_pli_dim, bias=False)
-            pli_proj_14.weight = pmp.weight[:n_early_pli_dim]
-        self.pli_proj_14 = pli_proj_14
+        self._ple_mmap_i8: np.memmap | None = None
+        self._ple_mmap_scales: np.memmap | None = None
+        self.embed_tokens_per_layer: nn.Module | None = None
+        self.per_layer_model_projection: nn.Module | None = None
+        self.pli_proj_14: nn.Module | None = None
+        self._etpl_14_groups = 0
+        self._etpl_14_wcols = 0
+        self._n_early_pli_layers = max(0, self.first_kv_shared - 1)
 
-        etpl = self.embed_tokens_per_layer
-        if isinstance(etpl, nn.QuantizedEmbedding) and n_early_pli_dim % int(etpl.group_size) == 0:
-            self._etpl_14_groups = n_early_pli_dim // int(etpl.group_size)
-            self._etpl_14_wcols = (int(etpl.weight.shape[1]) * self._etpl_14_groups) // int(etpl.scales.shape[1])
+        if self.ple_dim > 0:
+            self.embed_tokens_per_layer_scale = mx.array(self.ple_dim**0.5, dtype=self.act_dtype)
+            self.per_layer_projection_scale = mx.array(self.hidden_size**-0.5, dtype=self.act_dtype)
+            self.per_layer_projection_norm_w = raw[f"{base_p}.per_layer_projection_norm.weight"].astype(self.act_dtype)
+            self.per_layer_input_scale = mx.array(2.0**-0.5, dtype=self.act_dtype)
+            self.per_layer_model_projection = _load_linear(
+                raw,
+                f"{base_p}.per_layer_model_projection",
+                qcfg,
+                self.act_dtype,
+                expected_in_f=self.hidden_size,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
+
+            sidecar_name = cfg.get("ple_sidecar") or "embed_tokens_per_layer_i8.json"
+            sidecar_json = self.model_dir / str(sidecar_name)
+            if sidecar_json.is_file() and f"{base_p}.embed_tokens_per_layer.weight" not in raw:
+                sc_meta = json.loads(sidecar_json.read_text(encoding="utf-8"))
+                sc_shape = tuple(int(x) for x in sc_meta["shape"])
+                self._ple_mmap_i8 = np.memmap(
+                    self.model_dir / str(sc_meta["data_file"]),
+                    dtype=np.int8,
+                    mode="r",
+                    shape=sc_shape,
+                )
+                self._ple_mmap_scales = np.memmap(
+                    self.model_dir / str(sc_meta["scales_file"]),
+                    dtype=np.float16,
+                    mode="r",
+                    shape=(sc_shape[0],),
+                )
+            else:
+                self.embed_tokens_per_layer = _load_qembedding(
+                    raw,
+                    f"{base_p}.embed_tokens_per_layer",
+                    qcfg,
+                    self.act_dtype,
+                    expected_in_f=self.num_layers * self.ple_dim,
+                    auto_qat_q4_0=auto_qat_q4_0,
+                )
+
+            n_early_pli_dim = self._n_early_pli_layers * self.ple_dim
+            pmp = self.per_layer_model_projection
+            if n_early_pli_dim > 0 and pmp is not None:
+                if isinstance(pmp, nn.QuantizedLinear):
+                    pli_proj_14 = nn.QuantizedLinear(
+                        int(pmp.scales.shape[1]) * int(pmp.group_size),
+                        n_early_pli_dim,
+                        bias=False,
+                        group_size=pmp.group_size,
+                        bits=pmp.bits,
+                        mode=pmp.mode,
+                    )
+                    pli_proj_14.weight = pmp.weight[:n_early_pli_dim]
+                    pli_proj_14.scales = pmp.scales[:n_early_pli_dim]
+                    pli_proj_14.biases = pmp.biases[:n_early_pli_dim] if pmp.biases is not None else None
+                else:
+                    pli_proj_14 = nn.Linear(int(pmp.weight.shape[1]), n_early_pli_dim, bias=False)
+                    pli_proj_14.weight = pmp.weight[:n_early_pli_dim]
+                self.pli_proj_14 = pli_proj_14
+
+            etpl = self.embed_tokens_per_layer
+            if isinstance(etpl, nn.QuantizedEmbedding) and n_early_pli_dim > 0 and n_early_pli_dim % int(etpl.group_size) == 0:
+                self._etpl_14_groups = n_early_pli_dim // int(etpl.group_size)
+                self._etpl_14_wcols = (int(etpl.weight.shape[1]) * self._etpl_14_groups) // int(etpl.scales.shape[1])
         else:
-            self._etpl_14_groups = 0
-            self._etpl_14_wcols = 0
+            self.embed_tokens_per_layer_scale = None
+            self.per_layer_projection_scale = None
+            self.per_layer_projection_norm_w = None
+            self.per_layer_input_scale = None
 
         self._layer_idx_mx = [mx.array([i], dtype=mx.int32) for i in range(self.num_layers)]
 
@@ -485,7 +1093,16 @@ class FastGemma4Model:
         full_vocab_rows = int(self.embed_tokens.weight.shape[0])
         ckpt_remap = self.model_dir / "vocab_remap.npz"
         explicit_lm_mod: nn.Module | None = (
-            _load_linear(raw, lm_prefix, qcfg, self.act_dtype) if lm_prefix is not None else None
+            _load_linear(
+                raw,
+                lm_prefix,
+                qcfg,
+                self.act_dtype,
+                expected_in_f=self.hidden_size,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
+            if lm_prefix is not None
+            else None
         )
         self._full_lm_head: nn.Module = self.embed_tokens
 
@@ -511,7 +1128,6 @@ class FastGemma4Model:
             return head
 
         if explicit_lm_mod is not None and int(explicit_lm_mod.weight.shape[0]) < full_vocab_rows:
-            # Materialized pruned `lm_head` saved directly in checkpoint (e.g., `materialize_pruned_lm_head=True`).
             lm_rows = int(explicit_lm_mod.weight.shape[0])
             if not ckpt_remap.is_file():
                 raise FileNotFoundError(
@@ -579,9 +1195,16 @@ class FastGemma4Model:
                 self.new_to_old = self.remapper.kept_old_ids
                 self.old_to_new = self.remapper.old_to_new
             elif vocab_out is None and ckpt_remap.is_file():
-                # Packed tied-weight checkpoints shipping `vocab_remap.npz` auto-apply their pruned head
-                # unless the caller explicitly requests `vocab_out >= full_vocab_rows`.
+                # Domain-packed SFT checkpoint shipping checkpoint-local `vocab_remap.npz`.
                 self.remapper = VocabRemapper.load_or_build(self.tokenizer_json, ckpt_remap, target_size=None)
+                kept = mx.array(self.remapper.kept_old_ids, dtype=mx.int32)
+                self.lm_head = _slice_linear_or_emb(head_source, kept)
+                self.new_to_old = self.remapper.kept_old_ids
+                self.old_to_new = self.remapper.old_to_new
+            elif vocab_out is None and self.allow_english_vocab_prune and self.paths.vocab_remap_npz.is_file():
+                self.remapper = VocabRemapper.load_or_build(
+                    self.tokenizer_json, self.paths.vocab_remap_npz, target_size=None
+                )
                 kept = mx.array(self.remapper.kept_old_ids, dtype=mx.int32)
                 self.lm_head = _slice_linear_or_emb(head_source, kept)
                 self.new_to_old = self.remapper.kept_old_ids
@@ -598,6 +1221,7 @@ class FastGemma4Model:
         else:
             self.w_lm_bf16_pad = None
 
+        # Under `mlp_dtype="auto"`, keep quantized MLPs intact at load time (never unconditionally dequantize!).
         promote_mlp = self.mlp_dtype_name == "bfloat16"
         inv_swa = _build_rope_inv_freq(tcfg, is_full=False)
         inv_full = _build_rope_inv_freq(tcfg, is_full=True)
@@ -606,39 +1230,166 @@ class FastGemma4Model:
         for i in range(self.num_layers):
             lp = f"{base_p}.layers.{i}"
             is_full = self.layer_types[i] == "full_attention"
-            head_dim = int(tcfg["global_head_dim"] if is_full else tcfg["head_dim"])
+            head_dim = int(self.full_head_dim if is_full else self.swa_head_dim)
             is_shared = i >= self.first_kv_shared
             layer_k_eq_v = self.attention_k_eq_v and is_full
             layer_n_kv = self.n_global_kv_heads if layer_k_eq_v else self.n_kv_heads
+            eff_interm = self.intermediate_size * (2 if (self.use_double_wide_mlp and is_shared) else 1)
 
-            q_proj_raw = _load_linear(raw, f"{lp}.self_attn.q_proj", qcfg, self.act_dtype)
+            q_proj_raw = _load_linear(
+                raw,
+                f"{lp}.self_attn.q_proj",
+                qcfg,
+                self.act_dtype,
+                expected_in_f=self.hidden_size,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
             if not is_shared:
-                k_proj_raw = _load_linear(raw, f"{lp}.self_attn.k_proj", qcfg, self.act_dtype)
+                k_proj_raw = _load_linear(
+                    raw,
+                    f"{lp}.self_attn.k_proj",
+                    qcfg,
+                    self.act_dtype,
+                    expected_in_f=self.hidden_size,
+                    auto_qat_q4_0=auto_qat_q4_0,
+                )
                 if layer_k_eq_v and f"{lp}.self_attn.v_proj.weight" not in raw:
-                    v_proj_raw = k_proj_raw
+                    # Fuse ONLY [q_proj, k_proj] (`(n_q + n_kv)*D`) — zero wk duplication!
+                    qkv_proj = _fuse_linears([q_proj_raw, k_proj_raw], self.act_dtype)
+                    eff_k_eq_v = True
                 else:
-                    v_proj_raw = _load_linear(raw, f"{lp}.self_attn.v_proj", qcfg, self.act_dtype)
-                qkv_proj = _fuse_linears([q_proj_raw, k_proj_raw, v_proj_raw], self.act_dtype)
+                    v_proj_raw = _load_linear(
+                        raw,
+                        f"{lp}.self_attn.v_proj",
+                        qcfg,
+                        self.act_dtype,
+                        expected_in_f=self.hidden_size,
+                        auto_qat_q4_0=auto_qat_q4_0,
+                    )
+                    qkv_proj = _fuse_linears([q_proj_raw, k_proj_raw, v_proj_raw], self.act_dtype)
+                    eff_k_eq_v = False
                 q_proj = None
                 w_kn = raw[f"{lp}.self_attn.k_norm.weight"].astype(self.act_dtype)
             else:
                 qkv_proj = None
                 q_proj = q_proj_raw
                 w_kn = None
+                eff_k_eq_v = False
 
-            o_proj = _load_linear(raw, f"{lp}.self_attn.o_proj", qcfg, self.act_dtype)
-            gate_p = _load_linear(raw, f"{lp}.mlp.gate_proj", qcfg, self.act_dtype, promote_bf16=promote_mlp)
-            up_p = _load_linear(raw, f"{lp}.mlp.up_proj", qcfg, self.act_dtype, promote_bf16=promote_mlp)
-            down_p = _load_linear(raw, f"{lp}.mlp.down_proj", qcfg, self.act_dtype, promote_bf16=promote_mlp)
+            o_proj = _load_linear(
+                raw,
+                f"{lp}.self_attn.o_proj",
+                qcfg,
+                self.act_dtype,
+                expected_in_f=self.n_q_heads * head_dim,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
+            gate_p = _load_linear(
+                raw,
+                f"{lp}.mlp.gate_proj",
+                qcfg,
+                self.act_dtype,
+                promote_bf16=promote_mlp,
+                expected_in_f=self.hidden_size,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
+            up_p = _load_linear(
+                raw,
+                f"{lp}.mlp.up_proj",
+                qcfg,
+                self.act_dtype,
+                promote_bf16=promote_mlp,
+                expected_in_f=self.hidden_size,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
+            down_p = _load_linear(
+                raw,
+                f"{lp}.mlp.down_proj",
+                qcfg,
+                self.act_dtype,
+                promote_bf16=promote_mlp,
+                expected_in_f=eff_interm,
+                auto_qat_q4_0=auto_qat_q4_0,
+            )
             gate_up_proj = _fuse_linears([gate_p, up_p], self.act_dtype)
+            mlp_bits: int | None = None
+            if isinstance(gate_up_proj, nn.QuantizedLinear):
+                mlp_bits = int(gate_up_proj.bits)
+                if isinstance(down_p, nn.QuantizedLinear):
+                    mlp_bits = min(mlp_bits, int(down_p.bits))
 
-            ple_gate = _load_linear(raw, f"{lp}.per_layer_input_gate", qcfg, self.act_dtype)
-            ple_proj = _load_linear(raw, f"{lp}.per_layer_projection", qcfg, self.act_dtype)
+            if self.ple_dim > 0:
+                ple_gate: nn.Module | None = _load_linear(
+                    raw,
+                    f"{lp}.per_layer_input_gate",
+                    qcfg,
+                    self.act_dtype,
+                    expected_in_f=self.hidden_size,
+                    auto_qat_q4_0=auto_qat_q4_0,
+                )
+                ple_proj: nn.Module | None = _load_linear(
+                    raw,
+                    f"{lp}.per_layer_projection",
+                    qcfg,
+                    self.act_dtype,
+                    expected_in_f=self.ple_dim,
+                    auto_qat_q4_0=auto_qat_q4_0,
+                )
+                w_post_ple: mx.array | None = raw[f"{lp}.post_per_layer_input_norm.weight"].astype(self.act_dtype)
+            else:
+                ple_gate = None
+                ple_proj = None
+                w_post_ple = None
+
+            if self.enable_moe and f"{lp}.router.proj.weight" in raw:
+                r_proj = _load_linear(
+                    raw,
+                    f"{lp}.router.proj",
+                    qcfg,
+                    self.act_dtype,
+                    expected_in_f=self.hidden_size,
+                    auto_qat_q4_0=auto_qat_q4_0,
+                )
+                layer_experts = int(r_proj.weight.shape[0])
+                moe_router: Gemma4Router | None = Gemma4Router(
+                    r_proj,
+                    raw[f"{lp}.router.scale"],
+                    raw[f"{lp}.router.per_expert_scale"],
+                    hidden_size=self.hidden_size,
+                    top_k=self.top_k_experts,
+                    eps=self.eps,
+                    dtype=self.act_dtype,
+                )
+                moe_experts: Gemma4SwitchGLU | None = _load_moe_experts(
+                    raw,
+                    lp,
+                    qcfg,
+                    self.act_dtype,
+                    hidden_size=self.hidden_size,
+                    moe_interm=self.moe_intermediate_size,
+                    num_experts=layer_experts,
+                )
+                w_post_ff_1: mx.array | None = raw[f"{lp}.post_feedforward_layernorm_1.weight"].astype(self.act_dtype)
+                w_pre_ff_2: mx.array | None = raw[f"{lp}.pre_feedforward_layernorm_2.weight"].astype(self.act_dtype)
+                w_post_ff_2: mx.array | None = raw[f"{lp}.post_feedforward_layernorm_2.weight"].astype(self.act_dtype)
+            else:
+                moe_router = None
+                moe_experts = None
+                w_post_ff_1 = None
+                w_pre_ff_2 = None
+                w_post_ff_2 = None
 
             if i + 1 < self.num_layers:
                 next_norm_w = raw[f"{base_p}.layers.{i + 1}.input_layernorm.weight"].astype(self.act_dtype)
             else:
                 next_norm_w = self.norm_w
+
+            layer_scalar_raw = raw.get(f"{lp}.layer_scalar")
+            layer_scalar = (
+                layer_scalar_raw.astype(self.act_dtype).reshape((1,))
+                if layer_scalar_raw is not None
+                else mx.ones((1,), dtype=self.act_dtype)
+            )
 
             ld: dict[str, Any] = {
                 "idx": i,
@@ -648,15 +1399,19 @@ class FastGemma4Model:
                 "head_dim": head_dim,
                 "n_q_heads": self.n_q_heads,
                 "n_kv_heads": layer_n_kv,
-                "k_eq_v": layer_k_eq_v,
+                "k_eq_v": eff_k_eq_v,
+                "mlp_bits": mlp_bits,
                 "inv_freq": inv_full if is_full else inv_swa,
                 "w_in": raw[f"{lp}.input_layernorm.weight"].astype(self.act_dtype),
                 "w_post_attn": raw[f"{lp}.post_attention_layernorm.weight"].astype(self.act_dtype),
                 "w_pre_ff": raw[f"{lp}.pre_feedforward_layernorm.weight"].astype(self.act_dtype),
                 "w_post_ff": raw[f"{lp}.post_feedforward_layernorm.weight"].astype(self.act_dtype),
-                "w_post_ple": raw[f"{lp}.post_per_layer_input_norm.weight"].astype(self.act_dtype),
+                "w_post_ff_1": w_post_ff_1,
+                "w_pre_ff_2": w_pre_ff_2,
+                "w_post_ff_2": w_post_ff_2,
+                "w_post_ple": w_post_ple,
                 "w_next_norm": next_norm_w,
-                "layer_scalar": raw[f"{lp}.layer_scalar"].astype(self.act_dtype).reshape((1,)),
+                "layer_scalar": layer_scalar,
                 "w_qn": raw[f"{lp}.self_attn.q_norm.weight"].astype(self.act_dtype),
                 "w_kn": w_kn,
                 "qkv_proj": qkv_proj,
@@ -666,15 +1421,17 @@ class FastGemma4Model:
                 "down_proj": down_p,
                 "ple_gate": ple_gate,
                 "ple_proj": ple_proj,
+                "moe_router": moe_router,
+                "moe_experts": moe_experts,
             }
-            if self.use_mpp and hasattr(gate_up_proj, "weight"):
+            if self.use_mpp and isinstance(gate_up_proj, nn.Linear) and isinstance(down_p, nn.Linear):
                 w_gu = gate_up_proj.weight
                 h_mid = int(w_gu.shape[0]) // 2
                 ld["w_gu"] = w_gu
                 ld["w_g"] = w_gu[:h_mid]
                 ld["w_u"] = w_gu[h_mid:]
                 ld["w_dn"] = down_p.weight
-            if i == self.first_kv_shared - 1:
+            if i == self.first_kv_shared - 1 and qkv_proj is not None:
                 q_dim = self.n_q_heads * head_dim
                 ld["kv_proj_only"] = _slice_kv_from_qkv(qkv_proj, q_dim)
                 ld["q_proj_split"] = _slice_q_from_qkv(qkv_proj, q_dim)
@@ -693,17 +1450,25 @@ class FastGemma4Model:
         arrs: list[Any] = [
             self.embed_tokens.parameters(),
             self.embed_scale,
-            self.embed_tokens_per_layer.parameters(),
-            self.embed_tokens_per_layer_scale,
-            self.per_layer_model_projection.parameters(),
-            self.pli_proj_14.parameters(),
-            self.per_layer_projection_scale,
-            self.per_layer_projection_norm_w,
-            self.per_layer_input_scale,
             self.norm_w,
             self.lm_head.parameters(),
             self._layer_idx_mx,
         ]
+        if self.embed_tokens_per_layer is not None:
+            arrs.append(self.embed_tokens_per_layer.parameters())
+        if self.per_layer_model_projection is not None:
+            arrs.append(self.per_layer_model_projection.parameters())
+        if self.pli_proj_14 is not None:
+            arrs.append(self.pli_proj_14.parameters())
+        for sc_attr in (
+            "embed_tokens_per_layer_scale",
+            "per_layer_projection_scale",
+            "per_layer_projection_norm_w",
+            "per_layer_input_scale",
+        ):
+            val = getattr(self, sc_attr, None)
+            if val is not None:
+                arrs.append(val)
         if self.w_lm_bf16_pad is not None:
             arrs.append(self.w_lm_bf16_pad)
         for ld in self.layers:
@@ -713,14 +1478,17 @@ class FastGemma4Model:
                 "w_post_attn",
                 "w_pre_ff",
                 "w_post_ff",
+                "w_post_ff_1",
+                "w_pre_ff_2",
+                "w_post_ff_2",
                 "w_post_ple",
                 "w_next_norm",
                 "layer_scalar",
                 "w_qn",
+                "w_kn",
             ):
-                arrs.append(ld[k])
-            if ld["w_kn"] is not None:
-                arrs.append(ld["w_kn"])
+                if ld.get(k) is not None:
+                    arrs.append(ld[k])
             for k in (
                 "qkv_proj",
                 "q_proj",
@@ -731,6 +1499,8 @@ class FastGemma4Model:
                 "ple_proj",
                 "kv_proj_only",
                 "q_proj_split",
+                "moe_router",
+                "moe_experts",
             ):
                 m = ld.get(k)
                 if m is not None:
@@ -740,42 +1510,71 @@ class FastGemma4Model:
                     arrs.append(ld[k])
         return arrs
 
-    def _compute_embed_and_pli(self, toks: mx.array) -> tuple[mx.array, mx.array]:
+    def _gather_mmap_ple_rows(self, toks: mx.array, n_cols: int) -> mx.array:
+        assert self._ple_mmap_i8 is not None and self._ple_mmap_scales is not None
+        mx.eval(toks)
+        toks_np = np.asarray(toks, dtype=np.int32)
+        rows_i8 = np.ascontiguousarray(self._ple_mmap_i8[toks_np][..., :n_cols])
+        rows_sc = np.ascontiguousarray(self._ple_mmap_scales[toks_np])
+        return (
+            mx.array(rows_i8).astype(self.act_dtype) * mx.array(rows_sc).astype(self.act_dtype)[..., None]
+        ) * self.embed_tokens_per_layer_scale
+
+    def _compute_embed_and_pli(self, toks: mx.array, *, singleton: bool = False) -> tuple[mx.array, mx.array | None]:
         h = self.embed_tokens(toks) * self.embed_scale
-        pli_raw = (self.embed_tokens_per_layer(toks) * self.embed_tokens_per_layer_scale).reshape(
-            *toks.shape, self.num_layers, self.ple_dim
+        if getattr(self, "ple_dim", 256) <= 0:
+            return h, None
+        tot_cols = self.num_layers * self.ple_dim
+        if getattr(self, "_ple_mmap_i8", None) is not None:
+            pli_raw = self._gather_mmap_ple_rows(toks, tot_cols).reshape(*toks.shape, self.num_layers, self.ple_dim)
+        else:
+            assert self.embed_tokens_per_layer is not None
+            pli_raw = (self.embed_tokens_per_layer(toks) * self.embed_tokens_per_layer_scale).reshape(
+                *toks.shape, self.num_layers, self.ple_dim
+            )
+        assert self.per_layer_model_projection is not None
+        pmp_out = (
+            _singleton_verify_linear(self.per_layer_model_projection, h)
+            if singleton
+            else self.per_layer_model_projection(h)
         )
-        proj = (self.per_layer_model_projection(h) * self.per_layer_projection_scale).reshape(
-            *toks.shape, self.num_layers, self.ple_dim
-        )
+        proj = (pmp_out * self.per_layer_projection_scale).reshape(*toks.shape, self.num_layers, self.ple_dim)
         proj = mx.fast.rms_norm(proj, self.per_layer_projection_norm_w, self.eps)
         pli = (proj + pli_raw) * self.per_layer_input_scale
         return h, pli
 
-    def _compute_embed_and_pli_early14(self, toks: mx.array) -> tuple[mx.array, mx.array]:
+    def _compute_embed_and_pli_early14(self, toks: mx.array) -> tuple[mx.array, mx.array | None]:
         """Compute token embeddings + PLI strictly for Layers `0..first_kv_shared-2` (`EarlyExit14`)."""
         B, L = toks.shape
-        n_l = self._n_early_pli_layers
         h = self.embed_tokens(toks) * self.embed_scale
-        etpl = self.embed_tokens_per_layer
-        if self._etpl_14_groups > 0:
-            w_sub = etpl.weight[toks][..., : self._etpl_14_wcols]
-            s_sub = etpl.scales[toks][..., : self._etpl_14_groups]
-            b_sub = etpl.biases[toks][..., : self._etpl_14_groups] if etpl.biases is not None else None
-            pli_tok = mx.dequantize(
-                w_sub,
-                scales=s_sub,
-                biases=b_sub,
-                group_size=etpl.group_size,
-                bits=etpl.bits,
-                mode=etpl.mode,
-            ) * self.embed_tokens_per_layer_scale
+        if getattr(self, "ple_dim", 256) <= 0 or self._n_early_pli_layers <= 0:
+            return h, None
+        n_l = self._n_early_pli_layers
+        n_cols = n_l * self.ple_dim
+        if getattr(self, "_ple_mmap_i8", None) is not None:
+            pli_tok = self._gather_mmap_ple_rows(toks, n_cols)
         else:
-            pli_tok = (
-                etpl.weight[toks][..., : n_l * self.ple_dim].astype(self.act_dtype)
-                * self.embed_tokens_per_layer_scale
-            )
+            etpl = self.embed_tokens_per_layer
+            assert etpl is not None
+            if self._etpl_14_groups > 0:
+                w_sub = etpl.weight[toks][..., : self._etpl_14_wcols]
+                s_sub = etpl.scales[toks][..., : self._etpl_14_groups]
+                b_sub = etpl.biases[toks][..., : self._etpl_14_groups] if etpl.biases is not None else None
+                pli_tok = mx.dequantize(
+                    w_sub,
+                    scales=s_sub,
+                    biases=b_sub,
+                    group_size=etpl.group_size,
+                    bits=etpl.bits,
+                    mode=etpl.mode,
+                ) * self.embed_tokens_per_layer_scale
+            else:
+                pli_tok = (
+                    etpl.weight[toks][..., :n_cols].astype(self.act_dtype)
+                    * self.embed_tokens_per_layer_scale
+                )
         pli_tok = pli_tok.reshape(B, L, n_l, self.ple_dim)
+        assert self.pli_proj_14 is not None
         pli_mod = (self.pli_proj_14(h) * self.per_layer_projection_scale).reshape(B, L, n_l, self.ple_dim)
         pli_mod = mx.fast.rms_norm(pli_mod, self.per_layer_projection_norm_w, self.eps)
         pli = (pli_mod + pli_tok) * self.per_layer_input_scale
@@ -825,18 +1624,53 @@ class FastGemma4Model:
         mx.eval(lg_f32)
         return np.asarray(lg_f32)
 
-    def _apply_lm_head_argmax(self, x_in: mx.array) -> mx.array:
-        """Compute greedy argmax over logits without allocating `[B, 1, V]` float32 softcapped buffer (NaN -> -1)."""
+    def _apply_lm_head_argmax(
+        self,
+        x_in: mx.array,
+        *,
+        collect_telemetry: bool = False,
+        valid_mask_u32: mx.array | None = None,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        """Compute greedy argmax (+ optional zero-copy GPU telemetry) without allocating `[B, 1, V]` FP32 buffer."""
+        want_telem = bool(collect_telemetry or valid_mask_u32 is not None)
         if self.use_fused_softcap_argmax and x_in.dtype == mx.bfloat16:
             if self._can_use_lm_head_mpp(x_in):
                 assert self.w_lm_bf16_pad is not None
                 raw_lg = mpp_linear_bf16(x_in, self.w_lm_bf16_pad, tm=64, tn=64)
-                return fused_softcap_argmax_bf16(raw_lg, self.softcap, vocab_limit=self.vocab_size)
+                return fused_softcap_argmax_bf16(
+                    raw_lg,
+                    self.softcap,
+                    vocab_limit=self.vocab_size,
+                    collect_telemetry=want_telem,
+                    valid_mask_u32=valid_mask_u32,
+                )
             raw_lg = self.lm_head(x_in)
             if raw_lg.dtype == mx.bfloat16:
-                return fused_softcap_argmax_bf16(raw_lg, self.softcap)
+                return fused_softcap_argmax_bf16(
+                    raw_lg,
+                    self.softcap,
+                    collect_telemetry=want_telem,
+                    valid_mask_u32=valid_mask_u32,
+                )
         lg = self._apply_lm_head(x_in, apply_softcap=True)
-        return safe_argmax_with_nan_guard(lg[:, 0, :], axis=-1)
+        am = safe_argmax_with_nan_guard(lg[:, 0, :], axis=-1)
+        if not want_telem:
+            return am
+        z = lg[:, 0, :].astype(mx.float32)
+        lse = mx.logsumexp(z, axis=-1)
+        p = mx.softmax(z, axis=-1, precise=True)
+        h_pre = -mx.sum(p * (z - lse[:, None]), axis=-1)
+        top2 = mx.sort(z, axis=-1)[:, -2:]
+        margin = top2[:, 1] - top2[:, 0]
+        cols = [lse, h_pre, margin]
+        if valid_mask_u32 is not None:
+            B_cur, V_cur = int(z.shape[0]), int(z.shape[1])
+            m_np = np.asarray(valid_mask_u32, dtype=np.uint32).reshape(B_cur, -1)
+            j_idx = np.arange(V_cur, dtype=np.uint32)
+            vis_np = ((m_np[:, j_idx >> 5] >> (j_idx & 31)) & 1) != 0
+            z_masked = mx.where(mx.array(vis_np), z, mx.array(-float("inf"), dtype=mx.float32))
+            cols.append(mx.logsumexp(z_masked, axis=-1))
+        return am, mx.stack(cols, axis=-1)
 
     def attach_dual_mlp_q4(self, *, q4_max_m: int = 32, skip_layers: frozenset[int] = frozenset()) -> int:
         """Lazily quantize missing MLPs to Q4 (~1.07 GB max) for auto B>=48 M<=q4_max_m decode tails."""
@@ -856,33 +1690,264 @@ class FastGemma4Model:
             attached += 1
         return attached
 
-    def _run_mlp(self, mlp_in: mx.array, ld: dict[str, Any], allow_mpp: bool = True) -> mx.array:
+    def _ensure_lazy_bf16_mlp_weights(self, ld: dict[str, Any]) -> bool:
+        if "w_g" in ld and "w_dn" in ld:
+            return True
+        gu, dn = ld["gate_up_proj"], ld["down_proj"]
+        if isinstance(gu, nn.QuantizedLinear):
+            w_gu = mx.dequantize(
+                gu.weight, gu.scales, gu.biases, group_size=gu.group_size, bits=gu.bits, mode=gu.mode
+            ).astype(self.act_dtype)
+        else:
+            w_gu = gu.weight.astype(self.act_dtype)
+        if isinstance(dn, nn.QuantizedLinear):
+            w_dn = mx.dequantize(
+                dn.weight, dn.scales, dn.biases, group_size=dn.group_size, bits=dn.bits, mode=dn.mode
+            ).astype(self.act_dtype)
+        else:
+            w_dn = dn.weight.astype(self.act_dtype)
+        mx.eval(w_gu, w_dn)
+        h_mid = int(w_gu.shape[0]) // 2
+        ld["w_gu"] = w_gu
+        ld["w_g"] = w_gu[:h_mid]
+        ld["w_u"] = w_gu[h_mid:]
+        ld["w_dn"] = w_dn
+        ld["_lazy_bf16_promoted"] = True
+        return True
+
+    def release_lazy_bf16_mlp_weights(self) -> int:
+        """Release lazily promoted BF16 MLP mirrors (`w_gu`/`w_g`/`w_u`/`w_dn`) on quantized layers."""
+        released = 0
+        for ld in getattr(self, "layers", ()):
+            if ld.pop("_lazy_bf16_promoted", False) or isinstance(ld.get("gate_up_proj"), nn.QuantizedLinear):
+                had_any = False
+                for k in ("w_gu", "w_g", "w_u", "w_dn"):
+                    if k in ld:
+                        ld.pop(k, None)
+                        had_any = True
+                if had_any:
+                    released += 1
+        return released
+
+    def _run_mlp(
+        self,
+        mlp_in: mx.array,
+        ld: dict[str, Any],
+        allow_mpp: bool = True,
+        *,
+        singleton: bool = False,
+        batch_size: int | None = None,
+    ) -> mx.array:
+        if singleton:
+            gu_out = _singleton_verify_linear(ld["gate_up_proj"], mlp_in)
+            return _singleton_verify_linear(ld["down_proj"], fused_geglu_split(gu_out))
         M = mlp_in.size // mlp_in.shape[-1] if mlp_in.size > 0 else 0
+        eff_b = int(batch_size) if batch_size is not None else (int(mlp_in.shape[0]) if mlp_in.ndim >= 3 else 1)
         if getattr(self, "_dual_q4_active", False) and "q4_gate_up" in ld:
             q4_cap = getattr(self, "dual_q4_max_m", 32)
             if M <= q4_cap:
                 mlp_act = fused_geglu_split(ld["q4_gate_up"](mlp_in))
                 return ld["q4_down"](mlp_act)
         mpp_os_ok = getattr(self, "_mpp_bf16_supported", True)
-        gpu_ok = getattr(self, "_gpu_family", "apple9") != "apple10" or getattr(self, "_mpp_apple10_enabled", False)
+        gpu_fam = getattr(self, "_gpu_family", "apple9")
+        gpu_ok = gpu_fam != "apple10" or getattr(self, "_mpp_apple10_enabled", False)
         prefill_min_m = int(getattr(self, "_mpp_prefill_min_m", 2048))
-        # Skill crossover (`m4-vs-m5-architecture.md:117`):
-        #   - 16 <= M <= 64: `MPP_pad32` `gate_up` + native MLX `down_proj`
-        #   - 65 <= M < 2048: native MLX (`steel_gemm` / NAX)
-        #   - M >= 2048: `MPP` `gate_up` + `MPP 64x64` `down_proj` (gated on macOS >= 26.1 & GPU family)
-        if self.use_mpp and allow_mpp and mpp_os_ok and gpu_ok and "w_g" in ld:
-            if 16 <= M <= 64:
-                mlp_act = mpp_fused_geglu_bf16(
-                    mlp_in, ld["w_g"], ld["w_u"], ld["w_gu"], m32_cutoff=self.mpp_m32_cutoff
-                )
-                return ld["down_proj"](mlp_act)
-            if M >= prefill_min_m:
-                mlp_act = mpp_fused_geglu_bf16(
-                    mlp_in, ld["w_g"], ld["w_u"], ld["w_gu"], m32_cutoff=self.mpp_m32_cutoff
-                )
-                return mpp_linear_bf16(mlp_act, ld["w_dn"], 64, 64)
+        mlp_mode = getattr(self, "mlp_dtype_name", "bfloat16")
+        if self.use_mpp and allow_mpp and mpp_os_ok and gpu_ok:
+            use_bf16_mpp = False
+            if mlp_mode == "bfloat16":
+                use_bf16_mpp = "w_g" in ld
+            elif mlp_mode == "auto" and eff_b >= 64:
+                if should_use_bf16_mpp_for_mlp(
+                    mlp_dtype="auto",
+                    gpu_family=gpu_fam,
+                    host_ram_gib=float(getattr(self, "_host_ram_gib", 48.0)),
+                    batch_size=eff_b,
+                    mlp_bits=ld.get("mlp_bits"),
+                ):
+                    use_bf16_mpp = self._ensure_lazy_bf16_mlp_weights(ld)
+            if use_bf16_mpp and "w_g" in ld:
+                if 16 <= M <= 64:
+                    mlp_act = mpp_fused_geglu_bf16(
+                        mlp_in, ld["w_g"], ld["w_u"], ld["w_gu"], m32_cutoff=self.mpp_m32_cutoff
+                    )
+                    if isinstance(ld["down_proj"], nn.QuantizedLinear):
+                        return mlp_act @ ld["w_dn"].T
+                    return ld["down_proj"](mlp_act)
+                if M >= prefill_min_m:
+                    mlp_act = mpp_fused_geglu_bf16(
+                        mlp_in, ld["w_g"], ld["w_u"], ld["w_gu"], m32_cutoff=self.mpp_m32_cutoff
+                    )
+                    return mpp_linear_bf16(mlp_act, ld["w_dn"], 64, 64)
+                if mlp_mode == "auto" and isinstance(ld["gate_up_proj"], nn.QuantizedLinear):
+                    mlp_act = fused_geglu_split(mlp_in @ ld["w_gu"].T)
+                    return mlp_act @ ld["w_dn"].T
         mlp_act = fused_geglu_split(ld["gate_up_proj"](mlp_in))
         return ld["down_proj"](mlp_act)
+
+    def _run_ffn_and_ple(
+        self,
+        h: mx.array,
+        attn_out: mx.array,
+        pli: mx.array | None,
+        i: int,
+        l: dict[str, Any],
+        *,
+        singleton: bool = False,
+        batch_size: int | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
+        if singleton:
+            mlp_out = self._run_mlp(mlp_in, l, singleton=True)
+        elif batch_size is not None:
+            mlp_out = self._run_mlp(mlp_in, l, batch_size=batch_size)
+        else:
+            mlp_out = self._run_mlp(mlp_in, l)
+        moe_router = l.get("moe_router")
+        if moe_router is not None:
+            moe_experts = l["moe_experts"]
+            h1 = mx.fast.rms_norm(mlp_out, l["w_post_ff_1"], self.eps)
+            top_k_idx, top_k_w = moe_router(h_mid, singleton=singleton)
+            h2_in = mx.fast.rms_norm(h_mid, l["w_pre_ff_2"], self.eps)
+            h2 = mx.fast.rms_norm(
+                moe_experts(h2_in, top_k_idx, top_k_w, singleton=singleton),
+                l["w_post_ff_2"],
+                self.eps,
+            )
+            ff_out = h1 + h2
+        else:
+            ff_out = mlp_out
+
+        if pli is not None and l.get("ple_gate") is not None:
+            h_ff = fused_res_rms_norm(h_mid, ff_out, l["w_post_ff"], self.eps)
+            pg_raw = _singleton_verify_linear(l["ple_gate"], h_ff) if singleton else l["ple_gate"](h_ff)
+            ple_g = fused_ple_geglu_indexed(pg_raw, pli, self._layer_idx_mx[i])
+            ple_out = _singleton_verify_linear(l["ple_proj"], ple_g) if singleton else l["ple_proj"](ple_g)
+            return fused_norm_add_norm(
+                h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"]
+            )
+        return fused_norm_add_norm(
+            h_mid, ff_out, l["w_post_ff"], l["w_next_norm"], self.eps, l["layer_scalar"]
+        )
+
+    def _sdpa_multi_query_prefix_cache(
+        self,
+        q_rot: mx.array,
+        k_sys: mx.array,
+        v_sys: mx.array,
+        c: dict[str, Any],
+        off_b: mx.array,
+        l_sys: int,
+        *,
+        is_full: bool,
+        slot_idx: mx.array | None = None,
+        use_kv_i8: bool = False,
+    ) -> mx.array:
+        """Delegate `L_q > 1` SDPA to `mx.fast.scaled_dot_product_attention` (`NAX` on M5 + `steel_attention` `WN=2` on M4)."""
+        B, L_q, n_q, D = (int(x) for x in q_rot.shape)
+        n_kv = int(c["k"].shape[2]) if c["k"].ndim == 4 else 1
+        cap = int(c["cap"])
+        is_4d = c["k"].ndim == 4
+        mx.eval(off_b)
+        offs = [int(x) for x in off_b.tolist()]
+
+        def _run_uniform(rows_b: list[int], off_val: int) -> mx.array:
+            Bg = len(rows_b)
+            if Bg == B and rows_b == list(range(B)):
+                q_sub = q_rot.transpose(0, 2, 1, 3)
+                s_sub = slot_idx if slot_idx is not None else mx.arange(B, dtype=mx.int32)
+                use_slice_all = slot_idx is None
+            else:
+                r_mx = mx.array(rows_b, dtype=mx.int32)
+                q_sub = q_rot[r_mx].transpose(0, 2, 1, 3)
+                s_sub = slot_idx[r_mx] if slot_idx is not None else r_mx
+                use_slice_all = False
+
+            parts_k: list[mx.array] = []
+            parts_v: list[mx.array] = []
+            if is_full:
+                if l_sys > 0:
+                    ks = k_sys[:l_sys].transpose(1, 0, 2)[None] if k_sys.ndim == 3 else k_sys[:l_sys][None, None]
+                    vs = v_sys[:l_sys].transpose(1, 0, 2)[None] if v_sys.ndim == 3 else v_sys[:l_sys][None, None]
+                    parts_k.append(mx.broadcast_to(ks, (Bg, n_kv, l_sys, D)))
+                    parts_v.append(mx.broadcast_to(vs, (Bg, n_kv, l_sys, D)))
+                priv_end = off_val + L_q - l_sys
+                if priv_end > 0:
+                    if use_kv_i8 and "k_s" in c:
+                        p_pos = mx.arange(0, priv_end, dtype=mx.int32)
+                        kd, vd = gather_dequant_kv_pair_i8_bf16(
+                            c["k"], c["k_s"], c["v"], c["v_s"], s_sub, p_pos
+                        )
+                    elif use_slice_all:
+                        kp = c["k"][:, :priv_end]
+                        vp = c["v"][:, :priv_end]
+                        kd = kp.transpose(0, 2, 1, 3) if is_4d else kp[:, None, :, :]
+                        vd = vp.transpose(0, 2, 1, 3) if is_4d else vp[:, None, :, :]
+                    else:
+                        kp = c["k"][s_sub, :priv_end]
+                        vp = c["v"][s_sub, :priv_end]
+                        kd = kp.transpose(0, 2, 1, 3) if is_4d else kp[:, None, :, :]
+                        vd = vp.transpose(0, 2, 1, 3) if is_4d else vp[:, None, :, :]
+                    parts_k.append(kd)
+                    parts_v.append(vd)
+                mask = _select_sdpa_mask(L_q, off_val, is_full=True, window_size=None, dtype=self.act_dtype)
+            else:
+                t_start = max(0, off_val - self.window_size + 1)
+                t_end = off_val + L_q
+                if t_start < l_sys:
+                    ks_sl = k_sys[t_start:l_sys]
+                    vs_sl = v_sys[t_start:l_sys]
+                    ks = ks_sl.transpose(1, 0, 2)[None] if ks_sl.ndim == 3 else ks_sl[None, None]
+                    vs = vs_sl.transpose(1, 0, 2)[None] if vs_sl.ndim == 3 else vs_sl[None, None]
+                    parts_k.append(mx.broadcast_to(ks, (Bg, n_kv, l_sys - t_start, D)))
+                    parts_v.append(mx.broadcast_to(vs, (Bg, n_kv, l_sys - t_start, D)))
+                priv_lo = max(0, t_start - l_sys)
+                priv_hi = t_end - l_sys
+                if priv_hi > priv_lo:
+                    p_slots = mx.arange(priv_lo, priv_hi, dtype=mx.int32) & (cap - 1)
+                    if use_kv_i8 and "k_s" in c:
+                        kd, vd = gather_dequant_kv_pair_i8_bf16(
+                            c["k"], c["k_s"], c["v"], c["v_s"], s_sub, p_slots
+                        )
+                    elif use_slice_all:
+                        kp = c["k"][:, p_slots]
+                        vp = c["v"][:, p_slots]
+                        kd = kp.transpose(0, 2, 1, 3) if is_4d else kp[:, None, :, :]
+                        vd = vp.transpose(0, 2, 1, 3) if is_4d else vp[:, None, :, :]
+                    else:
+                        kp = c["k"][s_sub[:, None], p_slots[None, :]]
+                        vp = c["v"][s_sub[:, None], p_slots[None, :]]
+                        kd = kp.transpose(0, 2, 1, 3) if is_4d else kp[:, None, :, :]
+                        vd = vp.transpose(0, 2, 1, 3) if is_4d else vp[:, None, :, :]
+                    parts_k.append(kd)
+                    parts_v.append(vd)
+                mask = _select_sdpa_mask(
+                    L_q, off_val - t_start, is_full=False, window_size=self.window_size, dtype=self.act_dtype
+                )
+
+            kf = parts_k[0] if len(parts_k) == 1 else mx.concatenate(parts_k, axis=2)
+            vf = parts_v[0] if len(parts_v) == 1 else mx.concatenate(parts_v, axis=2)
+            return (
+                mx.fast.scaled_dot_product_attention(q_sub, kf, vf, scale=1.0, mask=mask)
+                .transpose(0, 2, 1, 3)
+                .reshape(Bg, L_q, n_q * D)
+            )
+
+        if len(set(offs)) == 1:
+            return _run_uniform(list(range(B)), offs[0])
+
+        by_off: dict[int, list[int]] = {}
+        for idx_b, ov in enumerate(offs):
+            by_off.setdefault(ov, []).append(idx_b)
+        if len(by_off) == B:
+            return mx.concatenate([_run_uniform([b], offs[b]) for b in range(B)], axis=0)
+        out_rows: list[tuple[int, mx.array]] = []
+        for ov, grp in by_off.items():
+            sub_att = _run_uniform(grp, ov)
+            for pos_g, orig_b in enumerate(grp):
+                out_rows.append((orig_b, sub_att[pos_g : pos_g + 1]))
+        out_rows.sort(key=lambda item: item[0])
+        return mx.concatenate([item[1] for item in out_rows], axis=0)
 
     # ------------------------------------------------------------------
     # Shared Prefix KV_sys Prefill (runs ONCE per system prompt)
@@ -892,7 +1957,6 @@ class FastGemma4Model:
         default_n_q = getattr(self, "n_q_heads", 8)
         default_n_kv = getattr(self, "n_kv_heads", 1)
         if not sys_ids:
-            # Allocate non-empty device buffers so Metal kernels bind `k_sys`/`v_sys` as `device` (`l_sys=0` keeps them unread).
             empty_k = [
                 mx.zeros((16, self.layers[i].get("n_kv_heads", default_n_kv), self.layers[i]["head_dim"]), dtype=self.act_dtype)
                 for i in range(self.first_kv_shared)
@@ -906,7 +1970,6 @@ class FastGemma4Model:
 
         ids = mx.array(sys_ids, dtype=mx.int32)[None, :]
         l_sys = int(ids.shape[1])
-        # Unlock MLX 0.32.3 D256 NAX and 0.32.4 pre-M5 D512 causal fast paths (`Q >= 1024`) when l_sys >= 1024.
         eff_chunk_sz = int(chunk_sz) if chunk_sz is not None else (1024 if l_sys >= 1024 else max(256, l_sys))
         k_sys_list = [
             mx.zeros((l_sys, self.layers[i].get("n_kv_heads", default_n_kv), self.layers[i]["head_dim"]), dtype=self.act_dtype)
@@ -975,13 +2038,10 @@ class FastGemma4Model:
                     .reshape(1, lc, n_q * D)
                 )
                 attn_out = l["o_proj"](att)
-                h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-                mlp_out = self._run_mlp(mlp_in, l)
-                h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-                ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-                ple_out = l["ple_proj"](ple_g)
-                h, x_in = fused_norm_add_norm(h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"])
+                h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             mx.eval(*k_sys_list, *v_sys_list)
+        if l_sys > eff_chunk_sz and callable(getattr(mx, "clear_cache", None)):
+            mx.clear_cache()
 
         return {"l_sys": l_sys, "k_sys": k_sys_list, "v_sys": v_sys_list}
 
@@ -1040,7 +2100,7 @@ class FastGemma4Model:
         apply_softcap: bool = True,
         keep_from_col: int = 0,
     ) -> mx.array:
-        """Full 35-layer ragged batched step for `L_q >= 1` (`1` decode, `K` verify, or `keep_from_col` causal slice jump)."""
+        """Full multi-layer ragged batched step for `L_q >= 1` (`1` decode, `L_q > 1` MLX SDPA, or `keep_from_col` slice jump)."""
         B, L_q = int(toks.shape[0]), int(toks.shape[1])
         if keep_from_col < 0 or keep_from_col >= L_q:
             raise ValueError(f"Expected 0 <= keep_from_col < L_q ({L_q}), got {keep_from_col}")
@@ -1072,7 +2132,8 @@ class FastGemma4Model:
                     scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
                     x_in = mx.contiguous(x_in[:, keep_from_col:, :])
                     h = mx.contiguous(h[:, keep_from_col:, :])
-                    pli = mx.contiguous(pli[:, keep_from_col:, :, :])
+                    if pli is not None:
+                        pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
                     q_raw = l["q_proj_split"](x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
@@ -1086,7 +2147,11 @@ class FastGemma4Model:
                 q_raw = l["q_proj"](x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
-            if l["is_full"]:
+            if int(q_rot.shape[1]) > 1:
+                att = self._sdpa_multi_query_prefix_cache(
+                    q_rot, k_sys_l[kv_idx], v_sys_l[kv_idx], c, off_b, l_sys, is_full=bool(l["is_full"])
+                )
+            elif l["is_full"]:
                 att = mqa8_sdpa_prefix_ragged(
                     q_rot,
                     k_sys_l[kv_idx],
@@ -1116,14 +2181,7 @@ class FastGemma4Model:
                 )
 
             attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(
-                h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"]
-            )
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
         return self._apply_lm_head(x_in, apply_softcap=apply_softcap)
@@ -1269,12 +2327,7 @@ class FastGemma4Model:
                     .reshape(Bg, lc, n_q * D)
                 )
                 attn_out = l["o_proj"](att)
-                h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-                mlp_out = self._run_mlp(mlp_in, l)
-                h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-                ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-                ple_out = l["ple_proj"](ple_g)
-                h, x_in = fused_norm_add_norm(h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"])
+                h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             mx.eval(*[(c["k"], c["v"]) for c in doc_layers])
 
     def prefill_suffix_batch(
@@ -1302,6 +2355,8 @@ class FastGemma4Model:
             sub_toks = [suf_ids_list[b] for b in idxs]
             self._prefill_early14_group(sub_toks, idxs, cache, chunk_sz=256)
             g0 = g1
+        if callable(getattr(mx, "clear_cache", None)):
+            mx.clear_cache()
 
         last_toks = mx.array([suf_ids_list[b][-1] for b in range(B)], dtype=mx.int32)[:, None]
         last_off = mx.array([l_sys + len(suf_ids_list[b]) - 1 for b in range(B)], dtype=mx.int32)
@@ -1330,7 +2385,6 @@ class FastGemma4Model:
         use_kv_i8 = bool(cache.get("kv_i8", False))
         doc_layers = cache["layers"]
 
-        # Accept both 4D `[B, n_layers, S, D]` (E2B `n_kv=1`) and 5D `[B, n_layers, n_kv, S, D]` (E4B `n_kv>=1`).
         ks_is_5d = len(k_swa_f16.shape) == 5
         kf_is_5d = len(k_full_f16.shape) == 5
         ks_mx = (
@@ -1356,7 +2410,6 @@ class FastGemma4Model:
 
         def _align_layer_kv(k_sl: mx.array, v_sl: mx.array, is_5d: bool, dst_is_4d: bool) -> tuple[mx.array, mx.array]:
             if is_5d:
-                # `[B, n_kv, valid_len, D]` -> `[B, valid_len, n_kv, D]`
                 k_sl = k_sl.transpose(0, 2, 1, 3)
                 v_sl = v_sl.transpose(0, 2, 1, 3)
                 if not dst_is_4d:
@@ -1454,7 +2507,11 @@ class FastGemma4Model:
                 qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
             )
             scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
-            if l["is_full"]:
+            if int(q_rot.shape[1]) > 1:
+                att = self._sdpa_multi_query_prefix_cache(
+                    q_rot, k_sys_l[i], v_sys_l[i], c, off_b, l_sys, is_full=bool(l["is_full"])
+                )
+            elif l["is_full"]:
                 att = mqa8_sdpa_prefix_ragged(
                     q_rot,
                     k_sys_l[i],
@@ -1483,12 +2540,7 @@ class FastGemma4Model:
                     vec4_reduce=self.vec4_reduce,
                 )
             attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"])
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
     # ------------------------------------------------------------------
     # Slot-Indexed Continuous Cache (BF16 or INT8) + EarlyExit14 & Prefix Split
@@ -1521,7 +2573,6 @@ class FastGemma4Model:
             raise ValueError(f"drain_slack must be >= 0, got {slack}")
         use_kv_i8 = self.kv_i8 if kv_i8 is None else bool(kv_i8)
         default_n_kv = getattr(self, "n_kv_heads", 1)
-        # `+drain_slack` (default 16) allows padded EarlyExit FF drains / jump spans up to doc_cap_full without OOB scatter.
         full_cap_alloc = doc_cap_full + slack
         layers: list[dict[str, Any]] = []
         eval_arrs: list[mx.array] = []
@@ -1567,7 +2618,6 @@ class FastGemma4Model:
         }
 
     def _get_sdpa_meta(self, cache: dict[str, Any], rows_cur: int) -> tuple[int, int, mx.array, mx.array]:
-        # Single-pass (`n_splits=1`) fast path at high occupancy (`rows_cur >= 128`) skips `o_part`/`ml_part` & reduce!
         ns_swa = 1 if rows_cur >= 128 else (2 if rows_cur >= 96 else 4)
         ns_full = 1 if rows_cur >= 128 else (4 if rows_cur >= 96 else 8)
         key = (ns_swa, ns_full)
@@ -1610,19 +2660,24 @@ class FastGemma4Model:
                 "pass a larger `drain_slack` to `make_slot_cache`."
             )
         rows = B * L_q
+        use_singleton = B <= 8 and L_q > 1
         l_sys = cache["l_sys"]
         swa_cap = cache["swa_cap"]
         use_kv_i8 = bool(cache.get("kv_i8", self.kv_i8))
         k_sys_l = cache["k_sys"]
         v_sys_l = cache["v_sys"]
         doc_layers = cache["layers"]
-        ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, rows)
+        ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B if use_singleton else rows)
         swa_slot, full_slot = self._precompute_scatter_pos(off_b, l_sys, swa_cap, L_q)
         s_idx_sc = slot_idx if L_q == 1 else slot_idx[:, None]
         default_n_q = getattr(self, "n_q_heads", 8)
         default_n_kv = getattr(self, "n_kv_heads", 1)
 
-        h, pli = self._compute_embed_and_pli_early14(toks)
+        h, pli = (
+            self._compute_embed_and_pli(toks, singleton=True)
+            if use_singleton
+            else self._compute_embed_and_pli_early14(toks)
+        )
         x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
 
         for i in range(self.first_kv_shared):
@@ -1633,7 +2688,11 @@ class FastGemma4Model:
             pos_slot = swa_slot if c["ring"] else full_slot
 
             if i == self.first_kv_shared - 1:
-                kv = l["kv_proj_only"](x_in)
+                kv = (
+                    _singleton_verify_linear(l["kv_proj_only"], x_in)
+                    if use_singleton
+                    else l["kv_proj_only"](x_in)
+                )
                 k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                     kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                 )
@@ -1647,7 +2706,11 @@ class FastGemma4Model:
                     )
                 break
 
-            qkv = l["qkv_proj"](x_in)
+            qkv = (
+                _singleton_verify_linear(l["qkv_proj"], x_in)
+                if use_singleton
+                else l["qkv_proj"](x_in)
+            )
             q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                 qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
             )
@@ -1674,13 +2737,12 @@ class FastGemma4Model:
                 v_s_doc=c.get("v_s"),
                 vec4_reduce=self.vec4_reduce,
             )
-            attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"])
+            attn_out = (
+                _singleton_verify_linear(l["o_proj"], att)
+                if use_singleton
+                else l["o_proj"](att)
+            )
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=use_singleton)
 
         self._eval_doc_layers(doc_layers, use_kv_i8)
 
@@ -1738,7 +2800,8 @@ class FastGemma4Model:
                         )
                     x_in = mx.contiguous(x_in[:, keep_from_col:, :])
                     h = mx.contiguous(h[:, keep_from_col:, :])
-                    pli = mx.contiguous(pli[:, keep_from_col:, :, :])
+                    if pli is not None:
+                        pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
                     q_raw = l["q_proj_split"](x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
@@ -1776,14 +2839,7 @@ class FastGemma4Model:
             )
 
             attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(
-                h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"]
-            )
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
         return self._apply_lm_head(x_in, apply_softcap=apply_softcap)
@@ -1796,13 +2852,10 @@ class FastGemma4Model:
         slot_idx: mx.array,
         *,
         return_logits: bool = False,
+        collect_telemetry: bool = False,
+        valid_mask_u32: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Single-launch causal slice jump over `k >= 1` forced `llguidance` tokens (`[B, k]`).
-
-        Advances KV cache across all `k` tokens on layers `0..first_kv_shared-1`, slices to the final
-        token `[:, -1:, :]` at `first_kv_shared - 1`, and evaluates `q_proj_split` + KV-shared layers + `lm_head`
-        ONLY on the final token (`[B, 1]`).
-        """
+        """Single-launch causal slice jump over `k >= 1` forced `llguidance` tokens (`[B, k]`)."""
         B, L_q = int(toks.shape[0]), int(toks.shape[1])
         drain_slack = int(cache.get("drain_slack", 16))
         if L_q > 1 and drain_slack > 0 and L_q > drain_slack:
@@ -1812,22 +2865,30 @@ class FastGemma4Model:
             )
         if L_q == 1:
             return self.forward_decode_step_slot(
-                toks, cache, off_b, slot_idx, n_keep=B, return_logits=return_logits
+                toks,
+                cache,
+                off_b,
+                slot_idx,
+                n_keep=B,
+                return_logits=return_logits,
+                collect_telemetry=collect_telemetry,
+                valid_mask_u32=valid_mask_u32,
             )
         rows = B * L_q
+        use_singleton = B <= 8
         l_sys = cache["l_sys"]
         swa_cap = cache["swa_cap"]
         use_kv_i8 = bool(cache.get("kv_i8", self.kv_i8))
         k_sys_l = cache["k_sys"]
         v_sys_l = cache["v_sys"]
         doc_layers = cache["layers"]
-        ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, rows)
+        ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B if use_singleton else rows)
         swa_slot, full_slot = self._precompute_scatter_pos(off_b, l_sys, swa_cap, L_q)
         s_idx_sc = slot_idx[:, None]
         default_n_q = getattr(self, "n_q_heads", 8)
         default_n_kv = getattr(self, "n_kv_heads", 1)
 
-        h, pli = self._compute_embed_and_pli(toks)
+        h, pli = self._compute_embed_and_pli(toks, singleton=use_singleton)
         x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
         split_idx = self.first_kv_shared - 1
         keep_from_col = L_q - 1
@@ -1837,11 +2898,17 @@ class FastGemma4Model:
             c = doc_layers[kv_idx]
             n_q = l.get("n_q_heads", default_n_q)
             n_kv = l.get("n_kv_heads", default_n_kv)
+            still_multi = int(x_in.shape[1]) > 1
+            step_single = use_singleton and still_multi
 
             if not l["is_shared"]:
                 pos_slot = swa_slot if c["ring"] else full_slot
                 if i == split_idx:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = (
+                        _singleton_verify_linear(l["kv_proj_only"], x_in)
+                        if step_single
+                        else l["kv_proj_only"](x_in)
+                    )
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                     )
@@ -1855,13 +2922,19 @@ class FastGemma4Model:
                         )
                     x_in = mx.contiguous(x_in[:, keep_from_col:, :])
                     h = mx.contiguous(h[:, keep_from_col:, :])
-                    pli = mx.contiguous(pli[:, keep_from_col:, :, :])
+                    if pli is not None:
+                        pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
                     q_raw = l["q_proj_split"](x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
                     ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B)
+                    step_single = False
                 else:
-                    qkv = l["qkv_proj"](x_in)
+                    qkv = (
+                        _singleton_verify_linear(l["qkv_proj"], x_in)
+                        if step_single
+                        else l["qkv_proj"](x_in)
+                    )
                     q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                         qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
                     )
@@ -1892,22 +2965,32 @@ class FastGemma4Model:
                 vec4_reduce=self.vec4_reduce,
             )
 
-            attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(
-                h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"]
+            attn_out = (
+                _singleton_verify_linear(l["o_proj"], att)
+                if step_single
+                else l["o_proj"](att)
             )
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=step_single)
 
         cache["_last_x_in"] = x_in
+        want_telem = bool(collect_telemetry or valid_mask_u32 is not None)
         if return_logits:
             lg = self._apply_lm_head(x_in, apply_softcap=True)
+            if want_telem:
+                _, telem_mx = self._apply_lm_head_argmax(
+                    x_in, collect_telemetry=True, valid_mask_u32=valid_mask_u32
+                )
+                cache["_last_telemetry"] = telem_mx
             am_mx = safe_argmax_with_nan_guard(lg[:, 0, :], axis=-1)
             return lg, am_mx
+        if want_telem:
+            am_mx, telem_mx = self._apply_lm_head_argmax(
+                x_in, collect_telemetry=True, valid_mask_u32=valid_mask_u32
+            )
+            cache["_last_telemetry"] = telem_mx
+            return x_in, am_mx
         am_mx = self._apply_lm_head_argmax(x_in)
+        assert isinstance(am_mx, mx.array)
         return x_in, am_mx
 
     def forward_decode_step_slot(
@@ -1919,11 +3002,15 @@ class FastGemma4Model:
         *,
         n_keep: int,
         return_logits: bool = False,
+        collect_telemetry: bool = False,
+        valid_mask_u32: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         """
         Run `L_q=1` slot-indexed decode step with Layer-15 Prefix Split (`n_keep <= B`) & lazy logits.
         When `return_logits=False`, returns `(x_samp [n_keep, 1, D], am_mx [n_keep])`.
         When `return_logits=True`, returns `(logits [n_keep, 1, V], am_mx [n_keep])`.
+        When `collect_telemetry=True` (or `valid_mask_u32` is provided), populates `cache['_last_telemetry']`
+        in the same fused kernel pass with zero extra `[B, V]` reads.
         """
         B = int(toks.shape[0])
         if not (0 < n_keep <= B):
@@ -1966,7 +3053,8 @@ class FastGemma4Model:
                 if i == split_idx and n_keep < B:
                     q_rot = q_rot[:n_keep]
                     h = h[:n_keep]
-                    pli = pli[:n_keep]
+                    if pli is not None:
+                        pli = pli[:n_keep]
                     off_b = off_b[:n_keep]
                     slot_idx = slot_idx[:n_keep]
                     B = n_keep
@@ -1991,22 +3079,172 @@ class FastGemma4Model:
             )
 
             attn_out = l["o_proj"](att)
-            h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-            mlp_out = self._run_mlp(mlp_in, l)
-            h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-            ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-            ple_out = l["ple_proj"](ple_g)
-            h, x_in = fused_norm_add_norm(
-                h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"]
-            )
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
+        want_telem = bool(collect_telemetry or valid_mask_u32 is not None)
         if return_logits:
             lg = self._apply_lm_head(x_in, apply_softcap=True)
+            if want_telem:
+                _, telem_mx = self._apply_lm_head_argmax(
+                    x_in, collect_telemetry=True, valid_mask_u32=valid_mask_u32
+                )
+                cache["_last_telemetry"] = telem_mx
             am_mx = safe_argmax_with_nan_guard(lg[:, 0, :], axis=-1)
             return lg, am_mx
+        if want_telem:
+            am_mx, telem_mx = self._apply_lm_head_argmax(
+                x_in, collect_telemetry=True, valid_mask_u32=valid_mask_u32
+            )
+            cache["_last_telemetry"] = telem_mx
+            return x_in, am_mx
         am_mx = self._apply_lm_head_argmax(x_in)
+        assert isinstance(am_mx, mx.array)
         return x_in, am_mx
+
+    def forward_verify_mtp_slot(
+        self,
+        toks: mx.array,
+        cache: dict[str, Any],
+        off_b: mx.array,
+        slot_idx: mx.array | None = None,
+        *,
+        return_logits: bool = False,
+        keep_from_col: int = 0,
+    ) -> tuple[mx.array, mx.array]:
+        """Exact `K+1` MTP verification (+ optional `keep_from_col` FF jump) matching `L_q=1` `0.0` ULP."""
+        B, L_q = int(toks.shape[0]), int(toks.shape[1])
+        if keep_from_col < 0 or keep_from_col >= L_q:
+            raise ValueError(f"Expected 0 <= keep_from_col < L_q ({L_q}), got {keep_from_col}")
+        is_slot_cache = "swa_cap" in cache
+        l_sys = cache["l_sys"]
+        k_sys_l = cache["k_sys"]
+        v_sys_l = cache["v_sys"]
+        doc_layers = cache["layers"]
+        default_n_q = getattr(self, "n_q_heads", 8)
+        default_n_kv = getattr(self, "n_kv_heads", 1)
+        split_idx = self.first_kv_shared - 1
+
+        if is_slot_cache:
+            swa_cap = cache["swa_cap"]
+            use_kv_i8 = bool(cache.get("kv_i8", self.kv_i8))
+            eff_slot_idx = mx.arange(B, dtype=mx.int32) if slot_idx is None else slot_idx
+            # Key split count on `B` (matching `L_q=1` `forward_decode_step_slot` reduction tree!).
+            ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B)
+            swa_slot, full_slot = self._precompute_scatter_pos(off_b, l_sys, swa_cap, L_q)
+            s_idx_sc = eff_slot_idx if L_q == 1 else eff_slot_idx[:, None]
+        else:
+            use_kv_i8 = False
+            eff_slot_idx = mx.arange(B, dtype=mx.int32)
+            ns_swa = cache["ns_swa"]
+            ns_full = cache["ns_full"]
+            meta_swa = cache["meta_swa"]
+            meta_full = cache["meta_full"]
+
+        h, pli = self._compute_embed_and_pli(toks, singleton=True)
+        x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
+
+        for i, l in enumerate(self.layers):
+            kv_idx = l["prev_kv"]
+            c = doc_layers[kv_idx]
+            n_q = l.get("n_q_heads", default_n_q)
+            n_kv = l.get("n_kv_heads", default_n_kv)
+
+            if not l["is_shared"]:
+                if i == split_idx and keep_from_col > 0 and "kv_proj_only" in l:
+                    kv = _singleton_verify_linear(l["kv_proj_only"], x_in)
+                    k_rot, v_norm = fused_kv_only_norm_rope_ragged(
+                        kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
+                    )
+                    if is_slot_cache:
+                        pos_slot = swa_slot if c["ring"] else full_slot
+                        if use_kv_i8:
+                            scatter_kv_i8_slot_precomputed(
+                                c["k"], c["k_s"], c["v"], c["v_s"], k_rot, v_norm, s_idx_sc, pos_slot
+                            )
+                        else:
+                            scatter_kv_slot_precomputed(
+                                c["k"], c["v"], k_rot, v_norm, s_idx_sc, pos_slot
+                            )
+                    else:
+                        ring_cap = c["cap"] if c["ring"] else 0
+                        scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
+                    x_in = mx.contiguous(x_in[:, keep_from_col:, :])
+                    h = mx.contiguous(h[:, keep_from_col:, :])
+                    if pli is not None:
+                        pli = mx.contiguous(pli[:, keep_from_col:, :, :])
+                    off_b = off_b + int(keep_from_col)
+                    q_raw = _singleton_verify_linear(l["q_proj_split"], x_in)
+                    q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
+                else:
+                    qkv = _singleton_verify_linear(l["qkv_proj"], x_in)
+                    q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
+                        qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
+                    )
+                    if is_slot_cache:
+                        pos_slot = swa_slot if c["ring"] else full_slot
+                        if use_kv_i8:
+                            scatter_kv_i8_slot_precomputed(
+                                c["k"], c["k_s"], c["v"], c["v_s"], k_rot, v_norm, s_idx_sc, pos_slot
+                            )
+                        else:
+                            scatter_kv_slot_precomputed(
+                                c["k"], c["v"], k_rot, v_norm, s_idx_sc, pos_slot
+                            )
+                    else:
+                        ring_cap = c["cap"] if c["ring"] else 0
+                        scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
+            else:
+                q_raw = _singleton_verify_linear(l["q_proj"], x_in)
+                q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
+
+            if is_slot_cache:
+                att = mqa8_sdpa_prefix_ragged_slot(
+                    q_rot,
+                    k_sys_l[kv_idx],
+                    v_sys_l[kv_idx],
+                    c["k"],
+                    c["v"],
+                    off_b,
+                    eff_slot_idx,
+                    ns_full if l["is_full"] else ns_swa,
+                    meta_full if l["is_full"] else meta_swa,
+                    k_s_doc=c.get("k_s"),
+                    v_s_doc=c.get("v_s"),
+                    vec4_reduce=self.vec4_reduce,
+                )
+            else:
+                att = mqa8_sdpa_prefix_ragged(
+                    q_rot,
+                    k_sys_l[kv_idx],
+                    v_sys_l[kv_idx],
+                    c["k"],
+                    c["v"],
+                    off_b,
+                    window_size=0 if l["is_full"] else self.window_size,
+                    doc_ring_cap=0 if l["is_full"] else c["cap"],
+                    n_splits=ns_full if l["is_full"] else ns_swa,
+                    meta=meta_full if l["is_full"] else meta_swa,
+                    vec4_reduce=self.vec4_reduce,
+                )
+
+            attn_out = _singleton_verify_linear(l["o_proj"], att)
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=True)
+
+        L_out = int(x_in.shape[1])
+        cache["_last_x_in"] = x_in
+        raw_lg = _singleton_verify_linear(self.lm_head, x_in)
+        if return_logits:
+            lg = logit_softcap(self.softcap, raw_lg)
+            am_flat = safe_argmax_with_nan_guard(lg.reshape(B * L_out, -1), axis=-1).reshape(B, L_out)
+            return lg, am_flat
+        if self.use_fused_softcap_argmax and raw_lg.dtype == mx.bfloat16:
+            am_flat = fused_softcap_argmax_bf16(raw_lg, self.softcap)
+            assert isinstance(am_flat, mx.array)
+            return x_in, am_flat.reshape(B, L_out)
+        lg = logit_softcap(self.softcap, raw_lg)
+        am_flat = safe_argmax_with_nan_guard(lg.reshape(B * L_out, -1), axis=-1).reshape(B, L_out)
+        return x_in, am_flat
 
     @staticmethod
     def _real_token_pairs(pre_lens: Sequence[int], s0: int, s1: int) -> tuple[np.ndarray, np.ndarray] | None:
@@ -2018,12 +3256,6 @@ class FastGemma4Model:
 
     @staticmethod
     def _scatter_ring_chunk(c: dict[str, Any], b_idx: Any, slots: Any, values: dict[str, Any], real: Any) -> None:
-        """Write one prefill chunk into a sliding-window ring layer, real tokens only.
-
-        A group is right-padded to its longest doc. A pad position `g` of a shorter doc wraps to the slot of
-        position `g - cap`, which that doc's next queries still attend when `cap` equals the window, so pads are
-        never written (`real` from `_real_token_pairs`; None when the chunk has no pads).
-        """
         if real is None:
             for key, val in values.items():
                 c[key][b_idx[:, None], slots[None, :]] = val
@@ -2211,12 +3443,7 @@ class FastGemma4Model:
                     .reshape(Bg, lc, n_q * D)
                 )
                 attn_out = l["o_proj"](att)
-                h_mid, mlp_in = fused_norm_add_norm(h, attn_out, l["w_post_attn"], l["w_pre_ff"], self.eps, None)
-                mlp_out = self._run_mlp(mlp_in, l)
-                h_ff = fused_res_rms_norm(h_mid, mlp_out, l["w_post_ff"], self.eps)
-                ple_g = fused_ple_geglu_indexed(l["ple_gate"](h_ff), pli, self._layer_idx_mx[i])
-                ple_out = l["ple_proj"](ple_g)
-                h, x_in = fused_norm_add_norm(h_ff, ple_out, l["w_post_ple"], l["w_next_norm"], self.eps, l["layer_scalar"])
+                h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             self._eval_doc_layers(doc_layers, use_kv_i8)
 
     def _prefill_early14_slot_groups(
@@ -2227,12 +3454,7 @@ class FastGemma4Model:
         group_size: int = 16,
         start_s0: int = 0,
     ) -> None:
-        """Prefill in length-sorted groups whose suffixes differ by at most 48 tokens.
-
-        A group is right-padded to its longest member, so a small spread keeps wasted pad compute low. Pads are
-        not written to the sliding-window ring layers (`_scatter_ring_chunk`), where they would wrap onto a
-        shorter doc's real recent context.
-        """
+        """Prefill in length-sorted groups whose suffixes differ by at most 48 tokens."""
         K = len(suf_ids_list)
         if K != len(slot_indices):
             raise ValueError(f"Mismatched K={K} vs slot_indices={len(slot_indices)}")
@@ -2252,6 +3474,8 @@ class FastGemma4Model:
                 start_s0=start_s0,
             )
             g0 = g1
+        if K > 0 and callable(getattr(mx, "clear_cache", None)):
+            mx.clear_cache()
 
     def prefill_slots_lazy_lg(
         self,
@@ -2262,6 +3486,8 @@ class FastGemma4Model:
         group_size: int = 16,
         return_logits: bool = False,
         async_eval: bool = False,
+        collect_telemetry: bool = False,
+        valid_mask_u32: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, list[int]]:
         """Prefill `K` docs into `slot_indices` and run batched `LastTok` (`return_logits=False` skips `[K, 1, V]`)."""
         K = len(suf_ids_list)
@@ -2270,20 +3496,38 @@ class FastGemma4Model:
         last_toks = mx.array([suf_ids_list[b][-1] for b in range(K)], dtype=mx.int32)[:, None]
         last_off = mx.array([l_sys + len(suf_ids_list[b]) - 1 for b in range(K)], dtype=mx.int32)
         slot_mx = mx.array(slot_indices, dtype=mx.int32)
-        x_or_lg, am = self.forward_decode_step_slot(
-            last_toks, cache, last_off, slot_mx, n_keep=K, return_logits=return_logits
-        )
-        next_off = [l_sys + len(suf_ids_list[b]) for b in range(K)]
-        if async_eval:
-            mx.async_eval(x_or_lg, am)
+        want_telem = bool(collect_telemetry or valid_mask_u32 is not None)
+        if want_telem:
+            x_or_lg, am = self.forward_decode_step_slot(
+                last_toks,
+                cache,
+                last_off,
+                slot_mx,
+                n_keep=K,
+                return_logits=return_logits,
+                collect_telemetry=collect_telemetry,
+                valid_mask_u32=valid_mask_u32,
+            )
         else:
-            mx.eval(x_or_lg, am)
+            x_or_lg, am = self.forward_decode_step_slot(
+                last_toks, cache, last_off, slot_mx, n_keep=K, return_logits=return_logits
+            )
+        next_off = [l_sys + len(suf_ids_list[b]) for b in range(K)]
+        telem_mx = cache.get("_last_telemetry") if want_telem else None
+        if async_eval:
+            if telem_mx is not None:
+                mx.async_eval(x_or_lg, am, telem_mx)
+            else:
+                mx.async_eval(x_or_lg, am)
+        else:
+            if telem_mx is not None:
+                mx.eval(x_or_lg, am, telem_mx)
+            else:
+                mx.eval(x_or_lg, am)
         return x_or_lg, am, next_off
 
     def build_cpu_ane_embed_tables(self):
         """One-time dequantization of `embed_tokens` + PLI layers `0..13` to CPU FP16 tables (~2.68 GB)."""
-        import numpy as np
-
         emb = self.embed_tokens
         pli = self.embed_tokens_per_layer
         if isinstance(emb, nn.QuantizedEmbedding):
@@ -2293,8 +3537,20 @@ class FastGemma4Model:
             ).astype(mx.float16)
         else:
             w_emb = (emb.weight * self.embed_scale).astype(mx.float16)
+        mx.eval(w_emb)
 
-        n_pli_cols = (self.first_kv_shared - 1) * self.ple_dim  # 14 * 256 = 3584
+        n_pli_cols = max(0, (self.first_kv_shared - 1) * self.ple_dim)
+        if n_pli_cols == 0:
+            return np.array(w_emb, copy=True), np.zeros((int(w_emb.shape[0]), 0), dtype=np.float16)
+        if getattr(self, "_ple_mmap_i8", None) is not None and getattr(self, "_ple_mmap_scales", None) is not None:
+            sc = float(self.embed_tokens_per_layer_scale.item())
+            w_pli14_np = (
+                self._ple_mmap_i8[:, :n_pli_cols].astype(np.float32)
+                * self._ple_mmap_scales[:, None].astype(np.float32)
+                * sc
+            ).astype(np.float16)
+            return np.array(w_emb, copy=True), np.ascontiguousarray(w_pli14_np)
+        assert pli is not None
         if isinstance(pli, nn.QuantizedEmbedding):
             pack_div = 32 // pli.bits
             w_words = n_pli_cols // pack_div
@@ -2313,7 +3569,7 @@ class FastGemma4Model:
         else:
             w_pli14 = (pli.weight[:, :n_pli_cols] * self.embed_tokens_per_layer_scale).astype(mx.float16)
 
-        mx.eval(w_emb, w_pli14)
+        mx.eval(w_pli14)
         return np.array(w_emb, copy=True), np.array(w_pli14, copy=True)
 
     # ------------------------------------------------------------------
@@ -2333,6 +3589,11 @@ class FastGemma4Model:
         `L13` residuals (`~215K`) stay safely within FP16 range (`<= 65,504`) without breaking ANE placement.
         """
         import numpy as np
+
+        if int(getattr(self, "ple_dim", 0)) <= 0 or self.per_layer_model_projection is None:
+            raise ValueError(
+                "export_early14_f16 requires ple_dim > 0 (Early14 ANE offload is only supported on PLE-enabled Gemma-4 models)."
+            )
 
         def _lin_w_f32(mod: nn.Module) -> np.ndarray:
             if isinstance(mod, nn.QuantizedLinear):

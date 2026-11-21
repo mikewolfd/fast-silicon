@@ -117,6 +117,7 @@ def _write_synthetic_o200k_tokenizer(path: Path) -> Path:
         "<|channel|>",
         "<|message|>",
         "<|constrain|>",
+        "<|call|>",
     ]
     base_special = next_id
     added_tokens = []
@@ -171,13 +172,19 @@ def test_harmony_formatting_and_output_parsing_cpu(tmp_path: Path) -> None:
         {"role": "user", "content": "Next"},
     ]
     fmt_low = format_harmony_chat(msgs, reasoning_effort="low")
-    assert fmt_low.startswith("<|start|>system<|message|>Be concise.<|end|><|start|>developer<|message|>Reasoning: low")
+    assert fmt_low.startswith("<|start|>system<|message|>You are ChatGPT")
+    sys_blk, rest_low = fmt_low.split("<|end|>", 1)
+    assert "Reasoning: low" in sys_blk
+    assert "# Valid channels: analysis, commentary, final." in sys_blk
+    assert rest_low.startswith("<|start|>developer<|message|># Instructions\n\nBe concise.<|end|>")
     assert "secret scratch" not in fmt_low
     assert "<|start|>assistant<|channel|>final<|message|>Hello!<|end|>" in fmt_low
     assert fmt_low.endswith("<|start|>assistant<|channel|>analysis<|message|>")
 
     fmt_skip = format_harmony_chat([{"role": "user", "content": "Go"}], reasoning_effort="skip")
-    assert "Reasoning:" not in fmt_skip
+    assert fmt_skip.startswith("<|start|>system<|message|>You are ChatGPT")
+    assert "Reasoning: low" in fmt_skip
+    assert "<|start|>developer<|message|>" not in fmt_skip
     assert fmt_skip.endswith(
         "<|start|>assistant<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
     )
@@ -200,11 +207,25 @@ def test_harmony_formatting_and_output_parsing_cpu(tmp_path: Path) -> None:
     assert final_3 == ""
     assert r3 == "incomplete thought"
 
+    # When prompt prefilled `<|channel|>analysis<|message|>` (`started_in_analysis=True`),
+    # truncated unclosed reasoning must NEVER leak as `final_text` unless fallback is explicitly requested!
+    final_trunc, r_trunc = parse_harmony_output("step 1 unfinished CoT", started_in_analysis=True)
+    assert final_trunc == ""
+    assert r_trunc == "step 1 unfinished CoT"
+
+    final_fb, r_fb = parse_harmony_output(
+        "step 1 unfinished CoT", started_in_analysis=True, allow_analysis_fallback=True
+    )
+    assert final_fb == "step 1 unfinished CoT"
+    assert r_fb == "step 1 unfinished CoT"
+
     tok_path = _write_synthetic_o200k_tokenizer(tmp_path)
     tok = FastGptOssTokenizer(tok_path)
     assert tok.end_token_id not in tok.analysis_stop_token_ids
     assert tok.end_token_id in tok.final_stop_token_ids
     assert tok.return_token_id in tok.analysis_stop_token_ids
+    assert tok.call_token_id in tok.analysis_stop_token_ids
+    assert tok.call_token_id in tok.final_stop_token_ids
     assert tok.decode(tok.encode("{\"ok\":true}"), skip_special_tokens=True) == '{"ok":true}'
 
 
@@ -858,7 +879,7 @@ def _build_synthetic_mxfp4_model_dir(model_dir: Path, tok_dir: Path) -> Path:
     HD = 64
     SWA = 16
     E = 16
-    V = 272  # fits cleanly around synthetic tokenizer IDs
+    V = 304  # fits cleanly above all synthetic tokenizer IDs (including <|call|>)
 
     model_dir.mkdir(parents=True, exist_ok=True)
     tok_dir.mkdir(parents=True, exist_ok=True)
@@ -1566,7 +1587,7 @@ def test_memory_clamp_wave_sorting_wired_restore_and_paths_cpu(tmp_path: Path, m
     (fake_pkg / "pyproject.toml").write_text("", encoding="utf-8")
     monkeypatch.delenv("FAST_GPT_OSS_HOME", raising=False)
     monkeypatch.setattr(gpt_paths, "__file__", str(fake_file))
-    assert gpt_paths.resolve_paths().home == (Path("~/.cache") / "fast-gpt-oss").expanduser().resolve()
+    assert gpt_paths.resolve_paths().home == (Path.home() / ".cache" / "fast-gpt-oss").resolve()
     (fake_pkg / "artifacts").mkdir()
     assert gpt_paths.resolve_paths().home == fake_pkg.resolve()
 
@@ -1754,4 +1775,907 @@ def test_hot_mpp_extreme_e8m0_scale_chunked_moe_and_swa8q1kv_gpu(tmp_path: Path)
         ref_att[hq] = probs @ v_np[hkv]
     got_np = np.asarray(att_got.astype(mx.float32))[0]
     assert float(np.max(np.abs(got_np - ref_att))) < 5e-3
+
+
+def test_paths_mxfp4_q8_default_and_offline_q4_fallback_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify `DEFAULT_HF_REPO` is `MXFP4-Q8` and `local_files_only=True` falls back to `MXFP4-Q4` when `Q8` is uncached or header-only."""
+    import fast_gpt_oss.paths as gpt_paths
+
+    assert gpt_paths.DEFAULT_HF_REPO == "mlx-community/gpt-oss-20b-MXFP4-Q8"
+
+    q8_incomplete = tmp_path / "q8_readme_only"
+    q8_incomplete.mkdir(parents=True)
+    (q8_incomplete / "README.md").write_text("# header only", encoding="utf-8")
+
+    q4_complete = tmp_path / "q4_cached"
+    q4_complete.mkdir(parents=True)
+    (q4_complete / "config.json").write_text("{}", encoding="utf-8")
+    (q4_complete / "model.safetensors").write_bytes(b"st")
+
+    q8_complete = tmp_path / "q8_cached"
+    q8_complete.mkdir(parents=True)
+    (q8_complete / "config.json").write_text("{}", encoding="utf-8")
+    (q8_complete / "model-00001-of-00003.safetensors").write_bytes(b"st")
+
+    paths = gpt_paths.GptOssPaths(
+        home=tmp_path / "home",
+        tokenizer_dir=tmp_path / "home" / "artifacts" / "tokenizer",
+        vocab_remap_npz=tmp_path / "home" / "artifacts" / "vocab" / "remap.npz",
+        local_hf_dir=tmp_path / "home" / "artifacts" / "hf_model",
+    )
+
+    # Case 1: Q8 returns incomplete README-only snapshot under local_files_only=True -> falls back to Q4!
+    def _mock_hf_incomplete(model_dir, repo_id, *, local_files_only=False):
+        if repo_id == "mlx-community/gpt-oss-20b-MXFP4-Q8":
+            return q8_incomplete
+        if repo_id == "mlx-community/gpt-oss-20b-MXFP4-Q4":
+            return q4_complete
+        raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(gpt_paths, "resolve_hf_model_dir", _mock_hf_incomplete)
+    assert paths.resolve_model_dir(local_files_only=True) == q4_complete
+
+    # Case 2: Q8 raises FileNotFoundError under local_files_only=True -> falls back to Q4!
+    def _mock_hf_missing_q8(model_dir, repo_id, *, local_files_only=False):
+        if repo_id == "mlx-community/gpt-oss-20b-MXFP4-Q8" and local_files_only:
+            raise FileNotFoundError("Q8 not in local HF cache")
+        if repo_id == "mlx-community/gpt-oss-20b-MXFP4-Q8" and not local_files_only:
+            return q8_complete
+        if repo_id == "mlx-community/gpt-oss-20b-MXFP4-Q4":
+            return q4_complete
+        raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(gpt_paths, "resolve_hf_model_dir", _mock_hf_missing_q8)
+    assert paths.resolve_model_dir(local_files_only=True) == q4_complete
+    # When local_files_only=False, pulls Q8 directly without downgrading to Q4!
+    assert paths.resolve_model_dir(local_files_only=False) == q8_complete
+
+    # Case 3: Q8 is complete locally -> selects Q8 directly!
+    monkeypatch.setattr(
+        gpt_paths,
+        "resolve_hf_model_dir",
+        lambda model_dir, repo_id, *, local_files_only=False: q8_complete if "Q8" in repo_id else q4_complete,
+    )
+    assert paths.resolve_model_dir(local_files_only=True) == q8_complete
+
+
+def test_persistent_in_final_channel_long_answer_and_call_stop_cpu(tmp_path: Path) -> None:
+    """Verify `>32`-token final answers stop immediately on `<|end|>` (`200007`), `<|return|>`, and `<|call|>`."""
+    from collections import OrderedDict
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    tok_path = _write_synthetic_o200k_tokenizer(tmp_path)
+    tok = FastGptOssTokenizer(tok_path)
+
+    eng = FastGptOssEngine.__new__(FastGptOssEngine)
+    eng.tokenizer = tok
+    eng._final_channel_seq = tok.final_channel_seq
+    eng._prefix_cache = OrderedDict()
+    eng._grammar_cache = OrderedDict()
+    eng._lock = threading.RLock()
+
+    # Simulate unconstrained chat starting in `analysis` channel (`in_final = False`),
+    # transitioning to `<|channel|>final<|message|>`, emitting 60 body tokens (> 32!), and closing with `<|end|>`.
+    ana_toks = tok.encode("short plan", add_special_tokens=False)
+    trans_toks = tok.encode("<|end|><|start|>assistant<|channel|>final<|message|>", add_special_tokens=False)
+    long_body_toks = tok.encode(" ".join(["word"] * 24), add_special_tokens=False)
+    assert len(long_body_toks) > 45, f"Expected >45 body tokens to exceed old 32-token window, got {len(long_body_toks)}"
+
+    stream = ana_toks + trans_toks + long_body_toks + [tok.end_token_id, ord("X"), ord("Y")]
+    out_ids: list[int] = []
+    in_final = False
+    stopped_at: int | None = None
+    for step_idx, tid in enumerate(stream):
+        out_ids.append(tid)
+        in_final, should_stop = eng._advance_channel_and_check_stop(tid, out_ids, in_final)
+        if should_stop:
+            stopped_at = step_idx
+            break
+
+    assert in_final is True
+    # Must NOT stop at the `<|end|>` closing `analysis`, and MUST stop at `<|end|>` closing the >45-token `final` body!
+    assert stopped_at == len(ana_toks) + len(trans_toks) + len(long_body_toks)
+    assert out_ids[-1] == tok.end_token_id
+
+    # Stateless `_is_unconstrained_stop` must also catch `<|channel|>final<|message|>` > 32 tokens back!
+    assert eng._is_unconstrained_stop(tok.end_token_id, out_ids, False) is True
+    assert eng._is_unconstrained_stop(tok.end_token_id, ana_toks + [tok.end_token_id], False) is False
+    assert eng._is_unconstrained_stop(tok.call_token_id, ana_toks + [tok.call_token_id], False) is True
+    assert eng._is_unconstrained_stop(tok.return_token_id, ana_toks + [tok.return_token_id], False) is True
+
+
+def test_spaced_json_defaults_whitespace_guard_and_4gram_loop_breaker_cpu(tmp_path: Path) -> None:
+    """Verify default `whitespace_flexible=None` (`separators=(',', ': ')`), `WhitespaceGuard`, and `-5.0` 4-gram loop penalty."""
+    from collections import OrderedDict
+    import inspect
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+    from fast_gpt_oss.grammar import GrammarHelper as GptOssGrammarHelper, WhitespaceGuard, WhitespaceGuardedMatcher
+
+    # 1. Verify default `whitespace_flexible=None` across engine, pipeline, and CLI
+    assert inspect.signature(FastGptOssEngine.generate).parameters["whitespace_flexible"].default is None
+    assert inspect.signature(FastGptOssEngine.generate_batch).parameters["whitespace_flexible"].default is None
+    assert inspect.signature(extract_jsonl).parameters["whitespace_flexible"].default is None
+    assert inspect.signature(extract_parquet).parameters["whitespace_flexible"].default is None
+
+    parser = build_parser()
+    ns_ex = parser.parse_args(["extract", "in.jsonl", "out.jsonl"])
+    ns_pq = parser.parse_args(["parquet", "in.parquet", "out_dir"])
+    assert ns_ex.whitespace_flexible is None
+    assert ns_pq.whitespace_flexible is None
+
+    tok_path = _write_synthetic_o200k_tokenizer(tmp_path)
+    tok = FastGptOssTokenizer(tok_path)
+    vocab_n = tok.vocab_size
+
+    eng = FastGptOssEngine.__new__(FastGptOssEngine)
+    eng.tokenizer = tok
+    eng._final_channel_seq = tok.final_channel_seq
+    eng.model = SimpleNamespace(
+        new_to_old=np.arange(vocab_n, dtype=np.int32),
+        old_to_new=np.arange(vocab_n, dtype=np.int32),
+        vocab_n=vocab_n,
+        full_vocab_size=vocab_n,
+        _cold_lm_head=None,
+    )
+    eng.default_mode = "b1"
+    eng.default_reasoning_effort = "skip"
+    eng.min_prefix_cache_tokens = 1
+    eng._max_prefix_cache = 8
+    eng._max_grammar_cache = 8
+    eng._prefix_cache = OrderedDict()
+    eng._grammar_cache = OrderedDict()
+    eng._lock = threading.RLock()
+    eng._dummy_pad_id = 0
+
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    gh_spaced = eng._get_grammar(schema, whitespace_flexible=None)
+    gh_compact = eng._get_grammar(schema, whitespace_flexible=False)
+    gh_flex = eng._get_grammar(schema, whitespace_flexible=True)
+    assert isinstance(gh_spaced, GptOssGrammarHelper)
+    assert gh_spaced.separators == (",", ": ") and gh_spaced.whitespace_flexible is False
+    assert gh_compact.separators == (",", ":") and gh_compact.whitespace_flexible is False
+    assert gh_flex.separators == (",", ":") and gh_flex.whitespace_flexible is True
+    assert gh_spaced is not gh_compact and gh_spaced is not gh_flex
+
+    # 2. Verify WhitespaceGuard caps runaway whitespace in flexible JSON mode while allowing whitespace inside strings
+    assert fast_gpt_oss.WhitespaceGuard is WhitespaceGuard
+    m_flex = gh_flex.new_matcher()
+    assert isinstance(m_flex, WhitespaceGuardedMatcher)
+    sp_tid = tok.encode(" ")[0]
+    blocked_ws = False
+    for _ in range(40):
+        if not m_flex.validate_tokens([sp_tid]):
+            blocked_ws = True
+            break
+        assert m_flex.consume_token(sp_tid)
+    assert blocked_ws, "WhitespaceGuard failed to block runaway inter-token spaces!"
+
+    # 3. Verify trailing 4-gram repeat-loop penalty (-5.0 logit bias before masked argmax)
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        tok_a = tok.encode("alpha")[0]
+        tok_b = tok.encode("beta")[0]
+        tok_c = tok.encode("world")[0]
+        tok_loop = tok.encode("hello")[0]
+        tok_alt = tok.encode("summary")[0]
+
+        # Pattern `(a, b, c, loop)` has already appeared twice, and tail ends with `(a, b, c)`:
+        history_loop = [tok_a, tok_b, tok_c, tok_loop, tok_a, tok_b, tok_c, tok_loop, tok_a, tok_b, tok_c]
+        lg_np = np.full((1, vocab_n), -20.0, dtype=np.float32)
+        lg_np[0, tok_loop] = 8.0   # +3.0 above alternative, so -5.0 bias drops it to 3.0 < 5.0!
+        lg_np[0, tok_alt] = 5.0
+        lg_mx = mx.array(lg_np, dtype=mx.float32)
+        pack = eng._eval_logits_for_sampling(lg_mx, temperature=0.0, top_p=1.0)
+
+        # Single prior occurrence (e.g. legitimate 2nd parallel tool call) is NOT penalized:
+        history_once = [tok_a, tok_b, tok_c, tok_loop, tok_a, tok_b, tok_c]
+        picked_once, _ = eng._sample_row_from_eval(
+            pack, 0, grammar=None, matcher=None, temperature=0.0, top_p=1.0, rng=np.random.default_rng(0), recent_ids=history_once
+        )
+        assert picked_once == tok_loop
+
+        # 3rd repeat occurrence IS penalized by -5.0 -> breaks loop cleanly in both unconstrained and grammar-masked modes!
+        picked_unconstrained, _ = eng._sample_row_from_eval(
+            pack, 0, grammar=None, matcher=None, temperature=0.0, top_p=1.0, rng=np.random.default_rng(0), recent_ids=history_loop
+        )
+        assert picked_unconstrained == tok_alt
+
+        enum_schema = {
+            "type": "object",
+            "properties": {"w": {"type": "string", "enum": ["hello", "summary"]}},
+            "required": ["w"],
+            "additionalProperties": False,
+        }
+        gh_enum = eng._get_grammar(enum_schema, whitespace_flexible=False)
+        m_enum = gh_enum.new_matcher()
+        for tid in tok.encode('":"'):
+            if not m_enum.is_stopped() and m_enum.validate_tokens([tid]):
+                m_enum.consume_token(tid)
+        picked_masked, _ = eng._sample_row_from_eval(
+            pack, 0, grammar=gh_enum, matcher=m_enum, temperature=0.0, top_p=1.0, rng=np.random.default_rng(0), recent_ids=history_loop
+        )
+        assert picked_masked == tok_alt
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_streamed_shard_load_and_cold_lm_head_fallback_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify `_load` streams safetensors shard-by-shard with `mx.clear_cache()` and `_cold_lm_head` resolves non-ASCII mask misses."""
+    from collections import OrderedDict
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    mdir = _build_synthetic_mxfp4_model_dir(tmp_path / "ckpt_sharded", tmp_path / "tok_sharded")
+    single_sf = mdir / "model.safetensors"
+    all_tensors = mx.load(str(single_sf))
+    single_sf.unlink()
+
+    # Split across 3 safetensors shards with `model.layers.0` straddling shard 1 and shard 2!
+    s1, s2, s3 = {}, {}, {}
+    for k, v in all_tensors.items():
+        if k.startswith("model.embed_tokens.") or (k.startswith("model.layers.0.") and "self_attn" in k):
+            s1[k] = v
+        elif k.startswith("model.layers.0.") or k.startswith("model.layers.1."):
+            s2[k] = v
+        else:
+            s3[k] = v
+    p1 = mdir / "model-00001-of-00003.safetensors"
+    p2 = mdir / "model-00002-of-00003.safetensors"
+    p3 = mdir / "model-00003-of-00003.safetensors"
+    mx.save_safetensors(str(p1), s1)
+    mx.save_safetensors(str(p2), s2)
+    mx.save_safetensors(str(p3), s3)
+    weight_map = {
+        **{k: p1.name for k in s1},
+        **{k: p2.name for k in s2},
+        **{k: p3.name for k in s3},
+    }
+    (mdir / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}), encoding="utf-8"
+    )
+    del all_tensors, s1, s2, s3
+
+    load_calls: list[str] = []
+    clear_calls: list[int] = []
+    orig_load = mx.load
+    orig_clear = mx.clear_cache
+
+    def _spy_load(path_arg, *args, **kwargs):
+        load_calls.append(Path(str(path_arg)).name)
+        return orig_load(path_arg, *args, **kwargs)
+
+    def _spy_clear():
+        clear_calls.append(len(load_calls))
+        return orig_clear()
+
+    monkeypatch.setattr(mx, "load", _spy_load)
+    monkeypatch.setattr(mx, "clear_cache", _spy_clear)
+
+    tok = FastGptOssTokenizer(mdir / "tokenizer.json")
+    cjk_tid = tok._tok.token_to_id("\u4e2d")
+    assert cjk_tid is not None
+
+    # Build a pruned remap that intentionally EXCLUDES `cjk_tid` so `cjk_tid` lives ONLY in `_cold_lm_head`!
+    hot_ids = np.array([i for i in range(280) if i != int(cjk_tid)][:264], dtype=np.int32)
+    remap_npz = tmp_path / "remap_no_cjk.npz"
+    np.savez(remap_npz, kept_old_ids=hot_ids)
+
+    m = FastGptOssModel(mdir, vocab_out=len(hot_ids), vocab_remap_npz=remap_npz, compile_kernels=False)
+    assert load_calls == [
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+    ]
+    assert len(clear_calls) >= 3
+    assert m._cold_lm_head is not None
+    assert int(cjk_tid) not in set(m.new_to_old.tolist())
+    assert int(cjk_tid) in set(m._cold_lm_head["ids"].tolist())
+    assert int(m.lm_w.shape[0]) + int(m._cold_lm_head["w"].shape[0]) == m.full_vocab_size
+
+    # Verify `fallback_to_full_vocab=True` cleanly scores `_cold_lm_head` on a non-ASCII CJK `const` schema without raising ValueError!
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        hf_sample = mx.ones((1, m.H), dtype=mx.float16)
+        pruned_lg = m._linear(hf_sample, m.lm_w, m.lm_s, m.lm_b, is_quant=m.lm_quant, bits=m.lm_bits, group_size=m.lm_gs)
+        mx.eval(pruned_lg)
+        m._last_hf_2d = hf_sample
+
+        eng = FastGptOssEngine.__new__(FastGptOssEngine)
+        eng.tokenizer = tok
+        eng._final_channel_seq = tok.final_channel_seq
+        eng.model = m
+        eng.default_mode = "b1"
+        eng.default_reasoning_effort = "skip"
+        eng.min_prefix_cache_tokens = 1
+        eng._max_prefix_cache = 8
+        eng._max_grammar_cache = 8
+        eng._prefix_cache = OrderedDict()
+        eng._grammar_cache = OrderedDict()
+        eng._lock = threading.RLock()
+        eng._dummy_pad_id = 0
+
+        cjk_schema = {
+            "type": "object",
+            "properties": {"s": {"const": "\u4e2d"}},
+            "required": ["s"],
+            "additionalProperties": False,
+        }
+        # Construct synthetic matcher whose ONLY allowed token is `cjk_tid` (outside `hot_ids`!):
+        class _ColdOnlyMatcher:
+            def validate_tokens(self, toks):
+                return list(toks) == [int(cjk_tid)]
+
+            def unsafe_compute_mask_ptr(self, ptr: int, nbytes: int) -> None:
+                import ctypes
+                n_w = nbytes // 4
+                arr = np.ctypeslib.as_array((ctypes.c_uint32 * n_w).from_address(ptr))
+                arr[:] = 0
+                arr[int(cjk_tid) >> 5] |= np.uint32(1 << (int(cjk_tid) & 31))
+
+        gh_cjk = eng._get_grammar(cjk_schema, whitespace_flexible=None)
+        eval_pack = eng._eval_logits_for_sampling(pruned_lg, temperature=0.0, top_p=1.0, has_grammar=True)
+        picked_cold, was_masked = eng._sample_row_from_eval(
+            eval_pack,
+            0,
+            grammar=gh_cjk,
+            matcher=_ColdOnlyMatcher(),
+            temperature=0.0,
+            top_p=1.0,
+            rng=np.random.default_rng(0),
+        )
+        assert picked_cold == int(cjk_tid)
+        assert was_masked is True
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_two_phase_batched_budgeted_reasoning_and_nax_routing_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify two-phase batched budgeted reasoning keeps `wave_bs > 1` and M5 NAX routes `n_tok >= 2` with `lhs_indices`."""
+    from collections import OrderedDict
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mdir = _build_synthetic_mxfp4_model_dir(tmp_path / "ckpt_nax", tmp_path / "tok_nax")
+        m = FastGptOssModel(mdir, vocab_out=None, compile_kernels=False)
+
+        # 1. Verify M5 Apple10 NAX MoE gate triggers at `n_tok >= 2` (`B=2..16`) and passes `lhs_indices = ord_i // 4, sorted_indices=True`!
+        m._is_m5_nax_moe = True
+        ld0 = m.layers[0]
+        gather_calls: list[dict[str, object]] = []
+        orig_gather_qmm = mx.gather_qmm
+
+        def _spy_gather_qmm(x, w, s, b=None, lhs_indices=None, rhs_indices=None, **kw):
+            gather_calls.append(
+                {
+                    "x_shape": tuple(x.shape),
+                    "has_lhs": lhs_indices is not None,
+                    "sorted_indices": kw.get("sorted_indices", False),
+                }
+            )
+            return orig_gather_qmm(x, w, s, b, lhs_indices=lhs_indices, rhs_indices=rhs_indices, **kw)
+
+        monkeypatch.setattr(mx, "gather_qmm", _spy_gather_qmm)
+        for b_test in (2, 8):
+            gather_calls.clear()
+            pn_t = mx.ones((b_test, m.H), dtype=mx.float16) * 0.1
+            h_t = mx.zeros((b_test, m.H), dtype=mx.bfloat16)
+            inds_t = mx.array([[i % 8, (i + 1) % 8, (i + 2) % 8, (i + 3) % 8] for i in range(b_test)], dtype=mx.int32)
+            sc_t = mx.full((b_test, 4), 0.25, dtype=mx.float16)
+            out_h = m._moe_forward(pn_t, h_t, inds_t, sc_t, ld0)
+            mx.eval(out_h)
+            assert len(gather_calls) == 2
+            # Gate+Up call MUST keep `x` unexpanded `(b_test, 1, H)` (NOT `(4*b_test, 1, H)`) and pass `lhs_indices` + `sorted_indices=True`!
+            assert gather_calls[0]["x_shape"] == (b_test, 1, m.H)
+            assert gather_calls[0]["has_lhs"] is True
+            assert gather_calls[0]["sorted_indices"] is True
+            assert gather_calls[1]["sorted_indices"] is True
+
+        # 2. Verify Apple10 SWA-128 & Hydragen prefill route through `mx.fast.scaled_dot_product_attention(..., sinks=...)`
+        sdpa_sinks_calls = [0]
+        orig_sdpa = mx.fast.scaled_dot_product_attention
+
+        def _spy_sdpa(q, k, v, *, scale, mask=None, sinks=None, **kw):
+            if sinks is not None:
+                sdpa_sinks_calls[0] += 1
+            return orig_sdpa(q, k, v, scale=scale, mask=mask, sinks=sinks, **kw)
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _spy_sdpa)
+        sp_m5 = m.compute_shared_prefix([10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+        bc_m5 = m.alloc_batch_cache(sp_m5, B=2, suf_max=16, max_dec=8)
+        lg_m5 = m.prefill_batch_suffixes([[21, 22, 23], [24, 25, 26, 27]], bc_m5, chunk_docs=2)
+        mx.eval(lg_m5)
+        # 2 layers (1 SWA + 1 Full) in compute_shared_prefix + 2 docs * 2 layers in prefill_batch_suffixes >= 6 SDPA calls with sinks!
+        assert sdpa_sinks_calls[0] >= 6
+
+        # 3. Verify Two-Phase Batched Budgeted Reasoning (`has_any_schema` and `ana_budget > 0` stays `mode_used="batched"`, `waves=1`!)
+        tok = FastGptOssTokenizer(mdir / "tokenizer.json")
+        vocab_n = tok.vocab_size
+        alpha_tid = tok._tok.token_to_id("alpha")
+        assert alpha_tid is not None
+        true_tid = tok._tok.token_to_id("true")
+
+        class _TwoPhaseFakeModel:
+            def __init__(self) -> None:
+                self.new_to_old = np.arange(vocab_n, dtype=np.int32)
+                self.old_to_new = np.arange(vocab_n, dtype=np.int32)
+                self.vocab_n = vocab_n
+                self.full_vocab_size = vocab_n
+                self._cold_lm_head = None
+                self.p1_steps = 0
+                self.transition_called = 0
+
+            def compute_shared_prefix(self, prefix_ids):
+                return {"L_sys": len(prefix_ids), "layers": []}
+
+            def alloc_batch_cache(self, sp, B: int, suf_max: int, max_dec: int):
+                return {"B": B, "L_sys": sp["L_sys"], "suf_max": suf_max, "cap_full": suf_max + max_dec, "dec_cnt": 0, "swa_write": 0, "layers": []}
+
+            def prefill_batch_suffixes(self, suf_lists, bc, chunk_docs: int = 8):
+                bc["suf_lens_arr"] = mx.array([len(s) for s in suf_lists], dtype=mx.uint32)
+                lg = np.full((len(suf_lists), vocab_n), -20.0, dtype=np.float32)
+                lg[:, alpha_tid] = 10.0
+                return mx.array(lg)
+
+            def append_batch_suffixes(self, extra_lists, bc, p1_done_steps=None, saved_swa=None, chunk_docs: int = 8):
+                self.transition_called += 1
+                lg = np.full((len(extra_lists), vocab_n), -20.0, dtype=np.float32)
+                lg[:, true_tid] = 10.0
+                return mx.array(lg)
+
+            def decode_step_batch(self, tok_mx, bc, samp_indices=None, skip_lm_head: bool = False):
+                bc["dec_cnt"] = int(bc["dec_cnt"]) + 1
+                bc["swa_write"] = int(bc["swa_write"]) + 1
+                if skip_lm_head:
+                    return None
+                n_rows = int(samp_indices.shape[0]) if samp_indices is not None else int(tok_mx.shape[0])
+                lg = np.full((n_rows, vocab_n), -20.0, dtype=np.float32)
+                if self.transition_called == 0:
+                    self.p1_steps += 1
+                    # Slot 0 emits `<|end|>` early on step 1; remaining slots continue until `ana_budget=4`!
+                    lg[0, tok.end_token_id] = 12.0
+                    if n_rows > 1:
+                        lg[1:, alpha_tid] = 10.0
+                else:
+                    lg[:, true_tid] = 10.0
+                return mx.array(lg)
+
+            def compact_batch_cache(self, bc, keep_local):
+                bc["B"] = len(keep_local)
+
+            def extract_b1_cache(self, bc, local_idx: int, max_rem: int):
+                return [{"slot": local_idx, "max_rem": max_rem}]
+
+            def forward_b1(self, tok_mx, b1_cache, last_only: bool = True):
+                lg = np.full((1, 1, vocab_n), -20.0, dtype=np.float32)
+                lg[:, :, true_tid] = 10.0
+                return mx.array(lg)
+
+        eng = FastGptOssEngine.__new__(FastGptOssEngine)
+        eng.tokenizer = tok
+        eng._final_channel_seq = tok.final_channel_seq
+        eng.model = _TwoPhaseFakeModel()
+        eng.default_mode = "batched"
+        eng.default_reasoning_effort = "low"
+        eng.min_prefix_cache_tokens = 1
+        eng._max_prefix_cache = 8
+        eng._max_grammar_cache = 8
+        eng._prefix_cache = OrderedDict()
+        eng._grammar_cache = OrderedDict()
+        eng._lock = threading.RLock()
+        eng._trans_ids = tok.encode("<|end|><|start|>assistant<|channel|>final<|message|>")
+        eng._dummy_pad_id = 0
+        eng._host_memory_bytes = 48 << 30
+
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        res = eng.generate_batch(
+            ["doc 0", "doc 1", "doc 2", "doc 3"],
+            system_prompt="Extract boolean.",
+            json_schema=schema,
+            reasoning_effort="low",
+            reasoning_budget=4,
+            mode="batched",
+            batch_size=4,
+            max_tokens=32,
+        )
+        assert res.stats["mode_used"] == "batched"
+        assert res.stats["waves"] == 1
+        assert eng.model.transition_called == 1
+        assert res.stats["valid_schema_count"] == 4
+        for item in res.items:
+            assert item.parsed == {"ok": True}
+            assert item.text == '{"ok": true}'
+            assert item.reasoning is not None and "alpha" in item.reasoning
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_two_phase_batched_parity_and_m5_swa_sdpa_gpu(tmp_path: Path) -> None:
+    """Live Metal GPU parity for Two-Phase Batched Budgeted Reasoning vs `B=1` and Apple10 SWA SDPA vs `swa128_prefill_mma`."""
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    mdir = _build_synthetic_mxfp4_model_dir(tmp_path / "ckpt_2p_gpu", tmp_path / "tok_2p_gpu")
+    with FastGptOssEngine(home=tmp_path / "home_2p", model_dir=mdir, vocab_out=276, warmup=False) as eng:
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}, "n": {"type": "integer", "enum": [1, 2]}},
+            "required": ["ok", "n"],
+            "additionalProperties": False,
+        }
+        prompts = ["hello world", "hello alpha beta", "hello true", "hello summary"]
+        r_b1 = eng.generate_batch(
+            prompts,
+            system_prompt="Extract fields.",
+            json_schema=schema,
+            reasoning_effort="low",
+            reasoning_budget=5,
+            mode="b1",
+            max_tokens=32,
+            temperature=0.0,
+        )
+        r_bat = eng.generate_batch(
+            prompts,
+            system_prompt="Extract fields.",
+            json_schema=schema,
+            reasoning_effort="low",
+            reasoning_budget=5,
+            mode="batched",
+            batch_size=4,
+            max_tokens=32,
+            temperature=0.0,
+        )
+        assert r_bat.stats["mode_used"] == "batched"
+        assert r_bat.stats["waves"] == 1
+        assert r_b1.stats["valid_schema_count"] == 4
+        assert r_bat.stats["valid_schema_count"] == 4
+        for a, b in zip(r_b1.items, r_bat.items):
+            assert a.parsed == b.parsed
+            assert a.text == b.text
+            assert a.text.startswith('{"ok": ')
+
+        # Unconstrained Cat-3 (`json_schema=None`, `reasoning_effort="low"`, `reasoning_budget=6`) must ALSO
+        # run two-phase budgeted transition in both `b1` and `batched` with greedy parity!
+        u_b1 = eng.generate_batch(
+            prompts[:2],
+            system_prompt="Answer concisely.",
+            json_schema=None,
+            reasoning_effort="low",
+            reasoning_budget=6,
+            mode="b1",
+            max_tokens=16,
+            temperature=0.0,
+        )
+        u_bat = eng.generate_batch(
+            prompts[:2],
+            system_prompt="Answer concisely.",
+            json_schema=None,
+            reasoning_effort="low",
+            reasoning_budget=6,
+            mode="batched",
+            batch_size=2,
+            max_tokens=16,
+            temperature=0.0,
+        )
+        assert u_bat.stats["mode_used"] == "batched"
+        for a, b in zip(u_b1.items, u_bat.items):
+            assert a.token_ids == b.token_ids
+            assert a.text == b.text
+            assert a.reasoning == b.reasoning
+            assert not hasattr(eng, "_trans_after_end_ids")
+
+        # Verify Apple10 (`_is_m5_nax_moe=True`) forward_b1 & prefill_batch_suffixes match Apple9 within FP16 tolerance!
+        m = eng.model
+        prefix = [10 + i for i in range(20)]  # > SWA=16 to exercise sliding-window mask clipping!
+        sufs = [[41, 42, 43, 44], [51, 52, 53, 54, 55, 56]]
+        m._is_m5_nax_moe = False
+        sp_a9 = m.compute_shared_prefix(prefix)
+        bc_a9 = m.alloc_batch_cache(sp_a9, B=2, suf_max=8, max_dec=4)
+        lg_a9 = m.prefill_batch_suffixes(sufs, bc_a9, chunk_docs=2)
+        mx.eval(lg_a9)
+
+        m._is_m5_nax_moe = True
+        sp_a10 = m.compute_shared_prefix(prefix)
+        bc_a10 = m.alloc_batch_cache(sp_a10, B=2, suf_max=8, max_dec=4)
+        lg_a10 = m.prefill_batch_suffixes(sufs, bc_a10, chunk_docs=2)
+        mx.eval(lg_a10)
+
+        diff = float(mx.max(mx.abs(lg_a9.astype(mx.float32) - lg_a10.astype(mx.float32))).item())
+        assert diff < 0.15, f"Apple10 NAX vs Apple9 prefill max logit diff={diff}"
+
+
+def test_unconstrained_two_phase_reasoning_budget_and_seam_polish_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify unconstrained `reasoning_budget=16` two-phase parity (`b1` & `batched`), explicit Q8 header-only fallback, and seam polish."""
+    from collections import OrderedDict
+    import mlx.core as mx
+    import fast_gpt_oss.paths as gpt_paths
+    from fast_gpt_oss.engine import FastGptOssEngine
+    from fast_gpt_oss.tokenizer import FastGptOssTokenizer
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        # 1. Explicit incomplete `gpt-oss-20b-MXFP4-Q8` snapshot dir falls back to Q4 when `local_files_only=True`.
+        q8_snap = tmp_path / "models--mlx-community--gpt-oss-20b-MXFP4-Q8" / "snapshots" / "rev0"
+        q8_snap.mkdir(parents=True)
+        (q8_snap / "README.md").write_text("# header only", encoding="utf-8")
+
+        q4_snap = _build_synthetic_mxfp4_model_dir(tmp_path / "q4_full", tmp_path / "tok_q4")
+        other_incomplete = tmp_path / "unrelated_incomplete"
+        other_incomplete.mkdir(parents=True)
+        (other_incomplete / "README.md").write_text("# missing weights", encoding="utf-8")
+
+        paths = gpt_paths.GptOssPaths(
+            home=tmp_path / "home_p",
+            tokenizer_dir=tmp_path / "home_p" / "artifacts" / "tokenizer",
+            vocab_remap_npz=tmp_path / "home_p" / "artifacts" / "vocab" / "remap.npz",
+            local_hf_dir=tmp_path / "home_p" / "artifacts" / "hf_model",
+        )
+        monkeypatch.setattr(
+            gpt_paths,
+            "resolve_hf_model_dir",
+            lambda _mdir, repo_id, *, local_files_only=False: (
+                q4_snap if repo_id == gpt_paths.FALLBACK_HF_REPO else q8_snap
+            ),
+        )
+        assert paths.resolve_model_dir(q8_snap, local_files_only=True) == q4_snap
+        with pytest.raises(FileNotFoundError):
+            paths.resolve_model_dir(other_incomplete, local_files_only=True)
+
+        # 2. Cache limit save/restore, `default_max_b_slots`, telemetry kwargs, and dead attr removal.
+        cache_calls: list[int] = []
+        orig_set_cl = getattr(mx, "set_cache_limit", None)
+        sentinel_prev = 512 * 1024 * 1024
+
+        def _spy_set_cl(limit: int) -> int:
+            prev_val = sentinel_prev if not cache_calls else cache_calls[-1]
+            cache_calls.append(int(limit))
+            if callable(orig_set_cl):
+                orig_set_cl(int(limit))
+            return prev_val
+
+        monkeypatch.setattr(mx, "set_cache_limit", _spy_set_cl)
+        with FastGptOssEngine(home=tmp_path / "home_eng", model_dir=q4_snap, vocab_out=276, warmup=False) as eng_real:
+            assert cache_calls[0] == 256 * 1024 * 1024
+            assert not hasattr(eng_real, "_trans_after_end_ids")
+            assert eng_real.default_max_b_slots >= 8
+            one_item = eng_real.generate(
+                "hello",
+                max_tokens=2,
+                reasoning_effort="skip",
+                collect_telemetry=True,
+                collect_valid_lse=True,
+            )
+            assert hasattr(one_item, "telemetry")
+            assert one_item.telemetry is None
+        assert cache_calls[-1] == sentinel_prev
+
+        # 3. Unconstrained `json_schema=None, reasoning_effort="low", reasoning_budget=16` across 3 Phase-1 trajectories.
+        tok = FastGptOssTokenizer(q4_snap / "tokenizer.json")
+        vocab_n = tok.vocab_size
+        alpha_tid = tok._tok.token_to_id("alpha")
+        summary_tid = tok._tok.token_to_id("summary")
+        assert alpha_tid is not None and summary_tid is not None
+        fseq = list(tok.final_channel_seq)
+        assert len(fseq) >= 2
+        trans_seq = list(tok.encode("<|end|><|start|>assistant<|channel|>final<|message|>"))
+
+        class _UnconstrainedTwoPhaseModel:
+            """Deterministic mock verifying exact KV sequences across budget-cap, early `<|end|>`, and natural `final`."""
+
+            def __init__(self) -> None:
+                self.new_to_old = np.arange(vocab_n, dtype=np.int32)
+                self.old_to_new = np.arange(vocab_n, dtype=np.int32)
+                self.vocab_n = vocab_n
+                self.full_vocab_size = vocab_n
+                self._cold_lm_head = None
+                self.observed_transitions: list[list[int]] = []
+
+            def _case_from_tokens(self, seq: list[int]) -> int:
+                txt = tok.decode(seq, skip_special_tokens=True)
+                if "case1" in txt:
+                    return 1
+                if "case2" in txt:
+                    return 2
+                return 0
+
+            def _next_tok_for_seq(self, case_id: int, gen_after_prompt: list[int], in_p2: bool) -> int:
+                if not in_p2:
+                    step_k = len(gen_after_prompt)
+                    if case_id == 0:
+                        return alpha_tid
+                    if case_id == 1:
+                        return alpha_tid if step_k < 2 else tok.end_token_id
+                    # case 2: 1 alpha token, then natural `<|channel|>final<|message|>` inside Phase 1!
+                    if step_k == 0:
+                        return alpha_tid
+                    f_idx = step_k - 1
+                    if f_idx < len(fseq):
+                        return fseq[f_idx]
+                    return summary_tid
+                # Phase 2: emit `"summary"` then `<|end|>`!
+                return summary_tid if (not gen_after_prompt or gen_after_prompt[-1] != summary_tid) else tok.end_token_id
+
+            def make_b1_cache(self, max_len: int):
+                return [{"seq": [], "in_p2": False, "p2_gen": [], "prompt_done": False}]
+
+            def clone_b1_cache_from_prefix(self, sp, max_len: int):
+                return [{"seq": list(sp["prefix_ids"]), "in_p2": False, "p2_gen": [], "prompt_done": False}]
+
+            def compute_shared_prefix(self, prefix_ids):
+                return {"L_sys": len(prefix_ids), "prefix_ids": list(prefix_ids), "layers": []}
+
+            def forward_b1(self, tok_mx, c1, last_only: bool = True):
+                st = c1[0]
+                arr = [int(x) for x in tok_mx[0].tolist()]
+                if not st["prompt_done"]:
+                    st["seq"].extend(arr)
+                    st["prompt_done"] = True
+                    st["p1_gen"] = []
+                elif not st["in_p2"] and len(arr) == 1 and arr[0] != fseq[-1] and arr != trans_seq[:1]:
+                    st["p1_gen"].extend(arr)
+                else:
+                    if not st["in_p2"]:
+                        st["in_p2"] = True
+                        self.observed_transitions.append(list(arr))
+                    else:
+                        st["p2_gen"].extend(arr)
+                cid = self._case_from_tokens(st["seq"])
+                nt = self._next_tok_for_seq(cid, st["p2_gen"] if st["in_p2"] else st["p1_gen"], st["in_p2"])
+                lg = np.full((1, 1, vocab_n), -20.0, dtype=np.float32)
+                lg[0, 0, nt] = 12.0
+                return mx.array(lg)
+
+            def alloc_batch_cache(self, sp, B: int, suf_max: int, max_dec: int):
+                return {
+                    "B": B,
+                    "L_sys": sp["L_sys"],
+                    "prefix_ids": list(sp["prefix_ids"]),
+                    "suf_max": suf_max,
+                    "cap_full": suf_max + max_dec,
+                    "dec_cnt": 0,
+                    "swa_write": 0,
+                    "layers": [],
+                    "slots": [{"seq": list(sp["prefix_ids"]), "p1_gen": [], "p2_gen": [], "in_p2": False} for _ in range(B)],
+                }
+
+            def prefill_batch_suffixes(self, suf_lists, bc, chunk_docs: int = 8):
+                bc["suf_lens_arr"] = mx.array([len(s) for s in suf_lists], dtype=mx.uint32)
+                lg = np.full((len(suf_lists), vocab_n), -20.0, dtype=np.float32)
+                for i, s in enumerate(suf_lists):
+                    bc["slots"][i]["seq"].extend(s)
+                    cid = self._case_from_tokens(bc["slots"][i]["seq"])
+                    nt = self._next_tok_for_seq(cid, [], False)
+                    lg[i, nt] = 12.0
+                return mx.array(lg)
+
+            def decode_step_batch(self, tok_mx, bc, samp_indices=None, skip_lm_head: bool = False):
+                bc["dec_cnt"] = int(bc["dec_cnt"]) + 1
+                bc["swa_write"] = int(bc["swa_write"]) + 1
+                arr = [int(x) for x in tok_mx.tolist()]
+                rows = [int(x) for x in samp_indices.tolist()] if samp_indices is not None else list(range(len(arr)))
+                for slot_i, t_val in enumerate(arr):
+                    st = bc["slots"][slot_i]
+                    if st["in_p2"]:
+                        if slot_i in rows:
+                            st["p2_gen"].append(t_val)
+                    else:
+                        if slot_i in rows:
+                            st["p1_gen"].append(t_val)
+                if skip_lm_head:
+                    return None
+                lg = np.full((len(rows), vocab_n), -20.0, dtype=np.float32)
+                for out_r, slot_i in enumerate(rows):
+                    st = bc["slots"][slot_i]
+                    cid = self._case_from_tokens(st["seq"])
+                    nt = self._next_tok_for_seq(cid, st["p2_gen"] if st["in_p2"] else st["p1_gen"], st["in_p2"])
+                    lg[out_r, nt] = 12.0
+                return mx.array(lg)
+
+            def append_batch_suffixes(self, extra_lists, bc, p1_done_steps=None, saved_swa=None, chunk_docs: int = 8):
+                lg = np.full((len(extra_lists), vocab_n), -20.0, dtype=np.float32)
+                for i, ext in enumerate(extra_lists):
+                    st = bc["slots"][i]
+                    st["in_p2"] = True
+                    self.observed_transitions.append(list(ext))
+                    cid = self._case_from_tokens(st["seq"])
+                    nt = self._next_tok_for_seq(cid, st["p2_gen"], True)
+                    lg[i, nt] = 12.0
+                return mx.array(lg)
+
+            def compact_batch_cache(self, bc, keep_local):
+                bc["slots"] = [bc["slots"][i] for i in keep_local]
+                bc["B"] = len(keep_local)
+
+            def extract_b1_cache(self, bc, local_idx: int, max_rem: int):
+                st = bc["slots"][local_idx]
+                return [{"seq": list(st["seq"]), "p1_gen": list(st["p1_gen"]), "p2_gen": list(st["p2_gen"]), "in_p2": st["in_p2"], "prompt_done": True}]
+
+        fake_m = _UnconstrainedTwoPhaseModel()
+        eng = FastGptOssEngine.__new__(FastGptOssEngine)
+        eng.tokenizer = tok
+        eng._final_channel_seq = tok.final_channel_seq
+        eng.model = fake_m
+        eng.default_mode = "batched"
+        eng.default_reasoning_effort = "low"
+        eng.min_prefix_cache_tokens = 1
+        eng._max_prefix_cache = 8
+        eng._max_grammar_cache = 8
+        eng._prefix_cache = OrderedDict()
+        eng._grammar_cache = OrderedDict()
+        eng._lock = threading.RLock()
+        eng._trans_ids = trans_seq
+        eng._dummy_pad_id = 0
+        eng._host_memory_bytes = 48 << 30
+
+        prompts_u = ["case0", "case1", "case2"]
+        res_bat = eng.generate_batch(
+            prompts_u,
+            system_prompt="Answer concisely.",
+            json_schema=None,
+            reasoning_effort="low",
+            reasoning_budget=16,
+            mode="batched",
+            batch_size=3,
+            max_tokens=8,
+            collect_telemetry=True,
+            collect_valid_lse=True,
+        )
+        bat_transitions = list(fake_m.observed_transitions)
+        fake_m.observed_transitions.clear()
+
+        res_b1 = eng.generate_batch(
+            prompts_u,
+            system_prompt="Answer concisely.",
+            json_schema=None,
+            reasoning_effort="low",
+            reasoning_budget=16,
+            mode="b1",
+            max_tokens=8,
+            collect_telemetry=True,
+            collect_valid_lse=True,
+        )
+        b1_transitions = list(fake_m.observed_transitions)
+
+        assert res_bat.stats["mode_used"] == "batched"
+        assert res_bat.stats["reasoning_budget"] == 16
+        assert len(bat_transitions) == 3 and len(b1_transitions) == 3
+        # Case 2 transitioned naturally into `<|channel|>final<|message|>` inside Phase 1 -> must NOT re-inject `_trans_ids`!
+        assert any(tr == [fseq[-1]] for tr in bat_transitions)
+        assert b1_transitions[2] == [fseq[-1]]
+        assert b1_transitions[0] == [alpha_tid] + trans_seq
+        assert b1_transitions[1] == trans_seq
+
+        for idx in range(3):
+            it_bat = res_bat.items[idx]
+            it_b1 = res_b1.items[idx]
+            assert it_bat.text == "summary"
+            assert it_b1.text == "summary"
+            assert it_bat.finish_reason == "stop"
+            assert it_b1.finish_reason == "stop"
+            assert it_bat.reasoning is not None and "alpha" in it_bat.reasoning
+            assert "final" not in it_bat.reasoning
+            assert it_bat.reasoning == it_b1.reasoning
+            assert it_bat.token_ids == it_b1.token_ids
+    finally:
+        mx.set_default_device(prev_dev)
+
+
 

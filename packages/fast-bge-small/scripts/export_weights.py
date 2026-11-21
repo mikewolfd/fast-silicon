@@ -43,6 +43,14 @@ def export_from_dir(model_dir: Path, home_dir: Path) -> Path:
 
     out_npz = weights_dir / "bge_small_f16.npz"
     np.savez(out_npz, **np_f16)
+    from fast_bge_small.paths import write_host_table_sidecars
+
+    wt0_f16 = np.ascontiguousarray(
+        np_f16["embeddings.word_embeddings.weight"].astype(np.float16)
+        + np_f16["embeddings.token_type_embeddings.weight"][0:1].astype(np.float16)
+    )
+    pos_f16 = np.ascontiguousarray(np_f16["embeddings.position_embeddings.weight"].astype(np.float16))
+    write_host_table_sidecars(weights_dir, wt0_f16, pos_f16)
     copy_tokenizer_files(model_dir, tok_dir, TOKENIZER_FILES)
 
     print(f"Exported {len(np_f16)} tensors to {out_npz} ({out_npz.stat().st_size / 1e6:.2f} MB)")

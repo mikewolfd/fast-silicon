@@ -13,6 +13,7 @@ from tokenizers import Tokenizer
 DEFAULT_KEPT_VOCAB_SIZE = 150786
 LATIN_EXTENDED_KEPT_VOCAB_SIZE = 162304
 FULL_VOCAB_SIZE = 262144
+GEMMA4_EOS_TOKEN_IDS: frozenset[int] = frozenset({1, 106, 50})
 
 _THOUGHT_RE = re.compile(r"<\|thought>.*?<thought\|>", flags=re.DOTALL)
 
@@ -305,7 +306,15 @@ class FastGemma4Tokenizer:
         self.eos_token_id = int(self._tok.token_to_id("<eos>") or 1)
         self.bos_token_id = int(self._tok.token_to_id("<bos>") or 2)
         self.eot_token_id = int(self._tok.token_to_id("<turn|>") or 106)
-        self.stop_token_ids = frozenset({self.eos_token_id, self.eot_token_id, 50})
+        self.tool_response_token_id = int(self._tok.token_to_id("<|tool_response>") or 50)
+        self.stop_token_ids = frozenset(
+            {
+                *GEMMA4_EOS_TOKEN_IDS,
+                self.eos_token_id,
+                self.eot_token_id,
+                self.tool_response_token_id,
+            }
+        )
         self._lltok = None
 
     @property

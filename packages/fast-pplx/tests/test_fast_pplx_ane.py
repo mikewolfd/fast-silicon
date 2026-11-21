@@ -558,21 +558,29 @@ def test_real_staged_ane_vs_gpu_parity_and_hetero2_speed() -> None:
     if not (paths.weights_npz.is_file() and paths.embed_tokens_safetensors.is_file()):
         pytest.skip("Exported F16 weights not staged yet (run scripts/export_weights.py)")
 
-    from fast_pplx.engine import _discover_ane_stage_paths, _load_coreml_lib
+    from fast_pplx.engine import _discover_ane_stage_specs, _load_coreml_lib
 
-    stage_map = _discover_ane_stage_paths(paths.ane_models_dir)
-    assert stage_map, "No ANE stages discovered"
+    stage_specs = _discover_ane_stage_specs(paths.ane_models_dir)
+    assert stage_specs, "No ANE stages discovered"
 
     coreml_lib = _load_coreml_lib(paths.coreml_dylib)
+    has_fn_inspect = hasattr(coreml_lib, "pplx_ane_inspect_plan_fn")
     buf = ctypes.create_string_buffer(512)
     with _hw_lock():
-        for cap, stages in stage_map.items():
+        for _cap, (stages, fn_name) in stage_specs.items():
             for st_path in stages:
-                rc = coreml_lib.pplx_ane_inspect_plan(str(st_path).encode("utf-8"), 0, buf, 512)
+                if fn_name and has_fn_inspect:
+                    rc = coreml_lib.pplx_ane_inspect_plan_fn(
+                        str(st_path).encode("utf-8"), fn_name.encode("utf-8"), 0, buf, 512
+                    )
+                else:
+                    rc = coreml_lib.pplx_ane_inspect_plan(str(st_path).encode("utf-8"), 0, buf, 512)
                 assert rc > 0
                 plan = json.loads(buf.value.decode("utf-8"))
-                assert plan.get("ane_ops", 0) > 0, f"{st_path} has 0 ANE ops: {plan}"
-                assert plan.get("gpu_ops", 0) == 0 and plan.get("cpu_ops", 0) == 0, f"Fallback ops in {st_path}: {plan}"
+                assert plan.get("ane_ops", 0) > 0, f"{st_path} (fn={fn_name}) has 0 ANE ops: {plan}"
+                assert plan.get("gpu_ops", 0) == 0 and plan.get("cpu_ops", 0) == 0, (
+                    f"Fallback ops in {st_path} (fn={fn_name}): {plan}"
+                )
 
         docs = [
             "Apple Silicon unified memory enables high-bandwidth tensor streaming.",
@@ -911,8 +919,8 @@ def test_build_ane_silu_and_max_abs_rmsnorm_modes_cpu() -> None:
         ns_eng = build_parser().parse_args([cmd, *extra])
         assert ns_eng.ane_profile in ("fast", "balanced", "parity", "custom")
 
-    # Profile resolution & explicit override semantics
-    assert bam.resolve_ane_profile() == ("fast", "silu", "prescale")
+    # Profile resolution & explicit override semantics (default is now 'balanced')
+    assert bam.resolve_ane_profile() == ("balanced", "tanh_gdn", "max_abs")
     assert bam.resolve_ane_profile("fast") == ("fast", "silu", "prescale")
     assert bam.resolve_ane_profile("balanced") == ("balanced", "tanh_gdn", "max_abs")
     assert bam.resolve_ane_profile("parity") == ("parity", "tanh_all", "max_abs")
@@ -1431,4 +1439,61 @@ def test_build_ane_bundle_suite_coreai_backend_cpu(tmp_path: Path) -> None:
     assert (paths.ane_models_dir / stages[0]).exists()
     assert manifest["buckets"]["32"]["coreai_stages"][0]["stage"] == stages[0]
     assert not (paths.ane_models_dir / "pplx_s64_st0_stale.aimodel").exists()
+
+
+def test_ane_balanced_default_seq_lens_post_chunk_scale_and_multifunction_cpu(tmp_path: Path) -> None:
+    """M-P1.1: balanced default profile, S=(32,64,128,256,384,512), post-chunk 1/sqrt(128), multifunction."""
+    import ast
+    from fast_pplx.engine import _discover_ane_stage_paths, _discover_ane_stage_specs
+
+    bam = _load_script_module("fast_pplx_build_ane_mp11", _BUILD_ANE_PATH)
+    assert bam.DEFAULT_SEQ_LENS == (32, 64, 128, 256, 384, 512)
+    assert bam.resolve_ane_profile() == ("balanced", "tanh_gdn", "max_abs")
+    assert hasattr(bam, "pplx_stage_function_name")
+    assert bam.pplx_stage_function_name(32) == "pplx_s32"
+    assert hasattr(bam, "make_ane_multifunction_stage_stem")
+
+    src = _BUILD_ANE_PATH.read_text(encoding="utf-8")
+    assert "save_multifunction" in src
+    assert "compile_buckets_parallel" in src
+    # Verify q_norm inside _gated_delta_chunked_b1 stays unscaled (extra_scale=1.0) and 1/sqrt(128) is applied post-chunk
+    tree = ast.parse(src)
+    gdn_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_gated_delta_chunked_b1")
+    gdn_src = ast.get_source_segment(src, gdn_fn) or ""
+    assert "extra_scale=1.0" in gdn_src
+    assert "extra_scale=GDN_DIM ** -0.5" not in gdn_src
+    assert "post_qscale" in gdn_src
+
+    # Verify multifunction manifest discovery + backward-compat legacy per-bucket manifest discovery
+    mf_dir = tmp_path / "mf_ane"
+    mf_dir.mkdir()
+    mf_stages = [f"pplx_mf_st{i}_w8a16_balanced_abcd1234.mlmodelc" for i in range(4)]
+    for s in mf_stages:
+        (mf_dir / s).mkdir()
+    mf_manifest = {
+        "schema_version": 2,
+        "ane_profile": "balanced",
+        "config_hash": "abcd1234ef56",
+        "silu_mode": "tanh_gdn",
+        "rmsnorm_mode": "max_abs",
+        "precision": "w8a16",
+        "multifunction": True,
+        "num_stages": 4,
+        "buckets": {
+            str(cap): {
+                "seq_len": cap,
+                "config_hash": "abcd1234ef56",
+                "stages": mf_stages,
+                "function_name": f"pplx_s{cap}",
+            }
+            for cap in (32, 64, 128, 256, 384, 512)
+        },
+    }
+    (mf_dir / "manifest.json").write_text(json.dumps(mf_manifest), encoding="utf-8")
+    specs = _discover_ane_stage_specs(mf_dir, expected_profile="balanced")
+    assert list(specs.keys()) == [32, 64, 128, 256, 384, 512]
+    assert specs[32][1] == "pplx_s32"
+    assert specs[384][1] == "pplx_s384"
+    path_map = _discover_ane_stage_paths(mf_dir, expected_profile="balanced")
+    assert list(path_map.keys()) == [32, 64, 128, 256, 384, 512]
 

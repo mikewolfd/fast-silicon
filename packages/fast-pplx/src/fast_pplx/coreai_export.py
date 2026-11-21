@@ -207,7 +207,7 @@ def build_pplx_torch_stage_module(
                 )
 
             q_4d, k_4d, v_4d = _to_b1(q_ch), _to_b1(k_ch), _to_b1(v_ch)
-            q_norm = q_4d * torch.rsqrt((q_4d * q_4d).sum(dim=-1, keepdim=True) + FP16_MIN_NORMAL) * (gdn_dim**-0.5)
+            q_norm = q_4d * torch.rsqrt((q_4d * q_4d).sum(dim=-1, keepdim=True) + FP16_MIN_NORMAL)
             k_norm = k_4d * torch.rsqrt((k_4d * k_4d).sum(dim=-1, keepdim=True) + FP16_MIN_NORMAL)
 
             beta = torch.sigmoid(b_ch).reshape(1, gdn_heads, n_c, chunk_size).permute(0, 2, 1, 3).reshape(
@@ -273,7 +273,7 @@ def build_pplx_torch_stage_module(
                 .reshape(1, n_c, gdn_proj_dim, chunk_size)
                 .permute(0, 2, 1, 3)
                 .reshape(1, gdn_proj_dim, 1, seq_len)
-            )
+            ) * float(gdn_dim**-0.5)
             normed_hd = _rms_ch(delta_nchw.reshape(1, gdn_heads, gdn_dim, seq_len), self.gnorm_w, axis=2, eps=gnorm_eps)
             gated_nchw = (normed_hd * F.silu(z.reshape(1, gdn_heads, gdn_dim, seq_len))).reshape(
                 1, gdn_proj_dim, 1, seq_len

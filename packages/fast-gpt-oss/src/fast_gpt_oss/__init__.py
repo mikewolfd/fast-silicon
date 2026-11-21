@@ -7,6 +7,7 @@ from typing import Any
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_HF_REPO": (".paths", "DEFAULT_HF_REPO"),
+    "FALLBACK_HF_REPO": (".paths", "FALLBACK_HF_REPO"),
     "FastGptOssEngine": (".engine", "FastGptOssEngine"),
     "FastGptOssModel": (".model", "FastGptOssModel"),
     "FastGptOssOpenAIAdapter": (".server", "FastGptOssOpenAIAdapter"),
@@ -16,10 +17,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GenerationItem": (".engine", "GenerationItem"),
     "GptOssConfig": (".model", "GptOssConfig"),
     "GptOssPaths": (".paths", "GptOssPaths"),
-    "GrammarHelper": ("fast_shared.grammar", "GrammarHelper"),
+    "GrammarHelper": (".grammar", "GrammarHelper"),
     "KernelSpec": (".kernels", "KernelSpec"),
     "O200kVocabRemapper": (".tokenizer", "O200kVocabRemapper"),
     "ParquetExtractSummary": (".pipeline", "ParquetExtractSummary"),
+    "WhitespaceGuard": (".grammar", "WhitespaceGuard"),
+    "WhitespaceGuardedMatcher": (".grammar", "WhitespaceGuardedMatcher"),
+    "WhitespaceProfile": (".grammar", "WhitespaceProfile"),
     "build_kernels": (".kernels", "build_kernels"),
     "extract_jsonl": (".pipeline", "extract_jsonl"),
     "extract_parquet": (".pipeline", "extract_parquet"),

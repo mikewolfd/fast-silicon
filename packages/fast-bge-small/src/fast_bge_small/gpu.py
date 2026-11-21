@@ -18,7 +18,7 @@ from fast_shared.metal_mpp import (
     make_mpp_matmul_kernel,
 )
 
-from .paths import resolve_paths
+from .paths import load_or_mmap_host_tables, resolve_paths
 
 _METAL_CAP_CACHE: dict[str, Any] | None = None
 
@@ -121,9 +121,12 @@ _EMBED_LN_SRC = """
     uint row = threadgroup_position_in_grid.x * 8 + sg;
     if (row >= (uint)tok_ids_shape[0]) return;
     int tid_tok = tok_ids[row];
+    if (tid_tok < 0 || tid_tok >= (int)W_wt0_shape[0]) tid_tok = 100;
     int pid_tok = pos_ids[row];
-    const device half* wt = W_wt0 + tid_tok * 384;
-    const device half* wp = W_pos + pid_tok * 384;
+    if (pid_tok < 0) pid_tok = 0;
+    else if (pid_tok >= (int)W_pos_shape[0]) pid_tok = (int)W_pos_shape[0] - 1;
+    const device half* wt = W_wt0 + (size_t)tid_tok * 384;
+    const device half* wp = W_pos + (size_t)pid_tok * 384;
 
     float4 f0 = float4(*(const device half4*)(wt + lane * 4))       + float4(*(const device half4*)(wp + lane * 4));
     float4 f1 = float4(*(const device half4*)(wt + 128 + lane * 4)) + float4(*(const device half4*)(wp + 128 + lane * 4));
@@ -459,37 +462,63 @@ _CLS_ATTN_KERNEL = mx.fast.metal_kernel(
 )
 
 
-# Fused FP16 MPP kernels with tn=128 output columns (all BGE widths 384/768/1152/1536
-# are exact multiples of 128): -10.64% E2E on Base M5 (Apple10) and bit-identical on M4 Pro (Apple9).
-_MPP_QKV = make_mpp_matmul_kernel("bge_mpp_bias_128x128_8", epilogue="bias", tm=128, tn=128, sgs=8)
-_MPP_BIAS_RES = make_mpp_matmul_kernel("bge_mpp_bias_res_64x128_4", epilogue="bias_res", tm=64, tn=128, sgs=4)
-_MPP_BIAS_GELU = make_mpp_matmul_kernel("bge_mpp_bias_gelu_64x128_4", epilogue="bias_gelu", tm=64, tn=128, sgs=4)
+def should_use_fused_mpp(caps: dict[str, Any] | None = None) -> bool:
+    """Gate Metal 4 MPP tensor_ops strictly behind Metal 4 hardware + macOS 26.0+ runtime."""
+    c = caps if caps is not None else probe_metal_capabilities()
+    return bool(c.get("metal4", False)) and tuple(c.get("macos_version", (0,))) >= (26, 0)
 
 
-def pack_sequences(token_lists, max_tokens=8192):
-    """Greedy pack variable-length token ID lists into >=128-aligned batches without padding tokens inside attention."""
+def _build_mpp_kernels(caps: dict[str, Any] | None = None):
+    """Instantiate fused FP16 MPP kernels only when Metal 4 is supported on the current host."""
+    if not should_use_fused_mpp(caps):
+        return (None, None, None)
+    # Fused FP16 MPP kernels with tn=128 output columns (all BGE widths 384/768/1152/1536
+    # are exact multiples of 128): -10.64% E2E on Base M5 (Apple10) and bit-identical on M4 Pro (Apple9).
+    mpp_qkv = make_mpp_matmul_kernel("bge_mpp_bias_128x128_8", epilogue="bias", tm=128, tn=128, sgs=8)
+    mpp_bias_res = make_mpp_matmul_kernel("bge_mpp_bias_res_64x128_4", epilogue="bias_res", tm=64, tn=128, sgs=4)
+    mpp_bias_gelu = make_mpp_matmul_kernel("bge_mpp_bias_gelu_64x128_4", epilogue="bias_gelu", tm=64, tn=128, sgs=4)
+    return (mpp_qkv, mpp_bias_res, mpp_bias_gelu)
+
+
+_MPP_QKV, _MPP_BIAS_RES, _MPP_BIAS_GELU = _build_mpp_kernels()
+
+
+def _plan_packed_batches(token_lists, max_tokens: int = 8192) -> list[list[tuple[int, Any]]]:
+    """Length-sort sequences descending and pack via First-Fit Decreasing (FFD) within `max_tokens`."""
     if not token_lists:
         return []
-    batches = []
-    cur_seqs = []
-    cur_tok = 0
+    norm_seqs: list[tuple[int, Any]] = []
     for idx, ids in enumerate(token_lists):
         sl = len(ids)
         if sl == 0:
             ids = [101, 102]
-            sl = 2
         elif sl > 512:
             ids = ids[:512]
-            sl = 512
-        if cur_seqs and cur_tok + sl > max_tokens:
-            batches.append(cur_seqs)
-            cur_seqs = [(idx, ids)]
-            cur_tok = sl
-        else:
-            cur_seqs.append((idx, ids))
-            cur_tok += sl
-    if cur_seqs:
-        batches.append(cur_seqs)
+        norm_seqs.append((idx, ids))
+
+    ordered = sorted(norm_seqs, key=lambda item: len(item[1]), reverse=True)
+    batches: list[list[tuple[int, Any]]] = []
+    batch_loads: list[int] = []
+    for idx, ids in ordered:
+        sl = len(ids)
+        placed = False
+        for bi, load in enumerate(batch_loads):
+            if load + sl <= max_tokens:
+                batches[bi].append((idx, ids))
+                batch_loads[bi] = load + sl
+                placed = True
+                break
+        if not placed:
+            batches.append([(idx, ids)])
+            batch_loads.append(sl)
+    return batches
+
+
+def pack_sequences(token_lists, max_tokens=8192):
+    """FFD-pack variable-length token ID lists into >=128-aligned batches without padding tokens inside attention."""
+    batches = _plan_packed_batches(token_lists, max_tokens=max_tokens)
+    if not batches:
+        return []
 
     packed = []
     for seqs in batches:
@@ -528,88 +557,100 @@ def pack_sequences(token_lists, max_tokens=8192):
 
 
 class FastBgeSmallGPU:
-    def __init__(self, weights_npz: str | Path | None = None, home: str | Path | None = None):
+    def __init__(
+        self,
+        weights_npz: str | Path | None = None,
+        home: str | Path | None = None,
+        *,
+        wt0_f16: np.ndarray | None = None,
+        pos_f16: np.ndarray | None = None,
+    ):
         mx.set_default_device(mx.gpu)
         if weights_npz is None:
             weights_npz = resolve_paths(home).weights_npz
-        raw = dict(np.load(weights_npz))
-        self.w_wt0 = mx.array(raw["embeddings.word_embeddings.weight"] + raw["embeddings.token_type_embeddings.weight"][0:1], dtype=mx.float16)
-        self.w_pos = mx.array(raw["embeddings.position_embeddings.weight"], dtype=mx.float16)
-        self.emb_ln_w = mx.array(raw["embeddings.LayerNorm.weight"], dtype=mx.float16)
-        self.emb_ln_b = mx.array(raw["embeddings.LayerNorm.bias"], dtype=mx.float16)
+        if wt0_f16 is None or pos_f16 is None:
+            wt0_f16, pos_f16 = load_or_mmap_host_tables(weights_npz)
+        self.w_wt0 = mx.array(np.asarray(wt0_f16, dtype=np.float16), dtype=mx.float16)
+        self.w_pos = mx.array(np.asarray(pos_f16, dtype=np.float16), dtype=mx.float16)
 
-        self.layers = []
-        for l in range(12):
-            p = f"encoder.layer.{l}."
-            wq = raw[p + "attention.self.query.weight"]
-            wk = raw[p + "attention.self.key.weight"]
-            wv = raw[p + "attention.self.value.weight"]
-            bq = raw[p + "attention.self.query.bias"]
-            bk = raw[p + "attention.self.key.bias"]
-            bv = raw[p + "attention.self.value.bias"]
-            layer_d = {
-                "w_o": mx.array(raw[p + "attention.output.dense.weight"], dtype=mx.float16),
-                "b_o": mx.array(raw[p + "attention.output.dense.bias"], dtype=mx.float16),
-                "ln1_w": mx.array(raw[p + "attention.output.LayerNorm.weight"], dtype=mx.float16),
-                "ln1_b": mx.array(raw[p + "attention.output.LayerNorm.bias"], dtype=mx.float16),
-                "w_up": mx.array(raw[p + "intermediate.dense.weight"], dtype=mx.float16),
-                "b_up": mx.array(raw[p + "intermediate.dense.bias"], dtype=mx.float16),
-                "w_dn": mx.array(raw[p + "output.dense.weight"], dtype=mx.float16),
-                "b_dn": mx.array(raw[p + "output.dense.bias"], dtype=mx.float16),
-                "ln2_w": mx.array(raw[p + "output.LayerNorm.weight"], dtype=mx.float16),
-                "ln2_b": mx.array(raw[p + "output.LayerNorm.bias"], dtype=mx.float16),
-            }
-            if l < 11:
-                layer_d["w_qkv"] = mx.array(np.concatenate([wq, wk, wv], axis=0), dtype=mx.float16)
-                layer_d["b_qkv"] = mx.array(np.concatenate([bq, bk, bv], axis=0), dtype=mx.float16)
-            else:
-                layer_d["w_q"] = mx.array(wq, dtype=mx.float16)
-                layer_d["b_q"] = mx.array(bq, dtype=mx.float16)
-                layer_d["w_kv"] = mx.array(np.concatenate([wk, wv], axis=0), dtype=mx.float16)
-                layer_d["b_kv"] = mx.array(np.concatenate([bk, bv], axis=0), dtype=mx.float16)
-            self.layers.append(layer_d)
+        with np.load(weights_npz) as raw:
+            self.emb_ln_w = mx.array(raw["embeddings.LayerNorm.weight"], dtype=mx.float16)
+            self.emb_ln_b = mx.array(raw["embeddings.LayerNorm.bias"], dtype=mx.float16)
 
-        # Single-query compiled FP16 path + pre-transposed contiguous weights once at load time
-        # (benchmarked ~23% faster than non-contiguous `.T` views for BGE mx.addmm shapes,
-        # and reused by Layer-11 packed CLS path to eliminate per-call `.T` view creation).
-        self._single_layers = []
-        for l in range(12):
-            ld = self.layers[l]
-            d = {
-                "w_oT": mx.contiguous(ld["w_o"].T), "b_o": ld["b_o"], "ln1_w": ld["ln1_w"], "ln1_b": ld["ln1_b"],
-                "w_upT": mx.contiguous(ld["w_up"].T), "b_up": ld["b_up"], "w_dnT": mx.contiguous(ld["w_dn"].T), "b_dn": ld["b_dn"],
-                "ln2_w": ld["ln2_w"], "ln2_b": ld["ln2_b"],
+            self.layers = []
+            for l in range(12):
+                p = f"encoder.layer.{l}."
+                wq = raw[p + "attention.self.query.weight"]
+                wk = raw[p + "attention.self.key.weight"]
+                wv = raw[p + "attention.self.value.weight"]
+                bq = raw[p + "attention.self.query.bias"]
+                bk = raw[p + "attention.self.key.bias"]
+                bv = raw[p + "attention.self.value.bias"]
+                layer_d = {
+                    "w_o": mx.array(raw[p + "attention.output.dense.weight"], dtype=mx.float16),
+                    "b_o": mx.array(raw[p + "attention.output.dense.bias"], dtype=mx.float16),
+                    "ln1_w": mx.array(raw[p + "attention.output.LayerNorm.weight"], dtype=mx.float16),
+                    "ln1_b": mx.array(raw[p + "attention.output.LayerNorm.bias"], dtype=mx.float16),
+                    "w_up": mx.array(raw[p + "intermediate.dense.weight"], dtype=mx.float16),
+                    "b_up": mx.array(raw[p + "intermediate.dense.bias"], dtype=mx.float16),
+                    "w_dn": mx.array(raw[p + "output.dense.weight"], dtype=mx.float16),
+                    "b_dn": mx.array(raw[p + "output.dense.bias"], dtype=mx.float16),
+                    "ln2_w": mx.array(raw[p + "output.LayerNorm.weight"], dtype=mx.float16),
+                    "ln2_b": mx.array(raw[p + "output.LayerNorm.bias"], dtype=mx.float16),
+                }
+                if l < 11:
+                    layer_d["w_qkv"] = mx.array(np.concatenate([wq, wk, wv], axis=0), dtype=mx.float16)
+                    layer_d["b_qkv"] = mx.array(np.concatenate([bq, bk, bv], axis=0), dtype=mx.float16)
+                else:
+                    layer_d["w_q"] = mx.array(wq, dtype=mx.float16)
+                    layer_d["b_q"] = mx.array(bq, dtype=mx.float16)
+                    layer_d["w_kv"] = mx.array(np.concatenate([wk, wv], axis=0), dtype=mx.float16)
+                    layer_d["b_kv"] = mx.array(np.concatenate([bk, bv], axis=0), dtype=mx.float16)
+                self.layers.append(layer_d)
+
+        # Retain pre-transposed contiguous weights strictly for Layer-11 CLS path (~1.5 MB),
+        # eliminating ~42 MB of duplicate transposed weights across layers 0..10.
+        ld11 = self.layers[11]
+        self._single_layers = {
+            11: {
+                "w_oT": mx.contiguous(ld11["w_o"].T),
+                "b_o": ld11["b_o"],
+                "ln1_w": ld11["ln1_w"],
+                "ln1_b": ld11["ln1_b"],
+                "w_upT": mx.contiguous(ld11["w_up"].T),
+                "b_up": ld11["b_up"],
+                "w_dnT": mx.contiguous(ld11["w_dn"].T),
+                "b_dn": ld11["b_dn"],
+                "ln2_w": ld11["ln2_w"],
+                "ln2_b": ld11["ln2_b"],
+                "w_qT": mx.contiguous(ld11["w_q"].T),
+                "b_q": ld11["b_q"],
+                "w_kvT": mx.contiguous(ld11["w_kv"].T),
+                "b_kv": ld11["b_kv"],
             }
-            if l < 11:
-                d["w_qkvT"] = mx.contiguous(ld["w_qkv"].T)
-                d["b_qkv"] = ld["b_qkv"]
-            else:
-                d["w_qT"] = mx.contiguous(ld["w_q"].T)
-                d["b_q"] = ld["b_q"]
-                d["w_kvT"] = mx.contiguous(ld["w_kv"].T)
-                d["b_kv"] = ld["b_kv"]
-            self._single_layers.append(d)
+        }
 
         # Single-query fallback path (note: hd=32 misses MLX 0.32.4 M5 fast SDPA widths
-        # {64, 96, 128, 256, 512}, so prefer ANE single-query buckets whenever available).
+        # {64, 96, 128, 256, 512}, so prefer ANE / CPU-SME single-query paths whenever available).
         @mx.compile
         def _single_fn(ids_1d):
             S = ids_1d.shape[0]
-            h = self.w_wt0[ids_1d] + self.w_pos[:S]
+            safe_ids = mx.where((ids_1d >= 0) & (ids_1d < self.w_wt0.shape[0]), ids_1d, 100)
+            h = self.w_wt0[safe_ids] + self.w_pos[:S]
             h = mx.fast.layer_norm(h, self.emb_ln_w, self.emb_ln_b, 1e-12)
             inv_s2 = mx.array(math.sqrt(0.5), dtype=mx.float16)
             scale = math.sqrt(1.0 / 32.0)
             for l in range(11):
-                ld = self._single_layers[l]
-                qkv = mx.addmm(ld["b_qkv"], h, ld["w_qkvT"])
+                ld = self.layers[l]
+                qkv = mx.matmul(h, ld["w_qkv"].T) + ld["b_qkv"]
                 q = qkv[:, :384].reshape(1, S, 12, 32).transpose(0, 2, 1, 3)
                 k = qkv[:, 384:768].reshape(1, S, 12, 32).transpose(0, 2, 1, 3)
                 v = qkv[:, 768:].reshape(1, S, 12, 32).transpose(0, 2, 1, 3)
                 ctx = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)[0].transpose(1, 0, 2).reshape(S, 384)
-                h = mx.fast.layer_norm(mx.addmm(ld["b_o"], ctx, ld["w_oT"]) + h, ld["ln1_w"], ld["ln1_b"], 1e-12)
-                up = mx.addmm(ld["b_up"], h, ld["w_upT"])
+                h = mx.fast.layer_norm((mx.matmul(ctx, ld["w_o"].T) + ld["b_o"]) + h, ld["ln1_w"], ld["ln1_b"], 1e-12)
+                up = mx.matmul(h, ld["w_up"].T) + ld["b_up"]
                 act = up * (mx.array(0.5, dtype=mx.float16) * (mx.array(1.0, dtype=mx.float16) + mx.erf(up * inv_s2)))
-                h = mx.fast.layer_norm(mx.addmm(ld["b_dn"], act, ld["w_dnT"]) + h, ld["ln2_w"], ld["ln2_b"], 1e-12)
+                h = mx.fast.layer_norm((mx.matmul(act, ld["w_dn"].T) + ld["b_dn"]) + h, ld["ln2_w"], ld["ln2_b"], 1e-12)
             ld = self._single_layers[11]
             h_cls = h[:1]
             q11 = mx.addmm(ld["b_q"], h_cls, ld["w_qT"]).reshape(1, 1, 12, 32).transpose(0, 2, 1, 3)
@@ -628,7 +669,7 @@ class FastBgeSmallGPU:
         mx.eval(self.w_wt0, self.w_pos, self.emb_ln_w, self.emb_ln_b)
         for ld in self.layers:
             mx.eval(*ld.values())
-        for ld in self._single_layers:
+        for ld in self._single_layers.values():
             mx.eval(*ld.values())
 
     def encode_single(self, ids_1d):
@@ -642,9 +683,83 @@ class FastBgeSmallGPU:
         mx.eval(out)
         return np.array(out[0], dtype=np.float32)
 
+    def _forward_packed_mlx(self, tok_mx, pos_mx, tiles_mx, bounds_mx, cls_mx, M_tok, M_pad):
+        """Non-Metal-4 MLX fallback for `forward_packed` using native `mx.matmul`."""
+        nt = tiles_mx.shape[0]
+        nd = bounds_mx.shape[0]
+        h = _EMBED_LN_KERNEL(
+            inputs=[tok_mx, pos_mx, self.w_wt0, self.w_pos, self.emb_ln_w, self.emb_ln_b],
+            grid=(M_pad * 32, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(M_pad, 384)],
+            output_dtypes=[mx.float16],
+        )[0]
+        inv_s2 = mx.array(math.sqrt(0.5), dtype=mx.float16)
+        c_half = mx.array(0.5, dtype=mx.float16)
+        c_one = mx.array(1.0, dtype=mx.float16)
+        for l in range(11):
+            ld = self.layers[l]
+            qkv = mx.matmul(h, ld["w_qkv"].T) + ld["b_qkv"]
+            attn_out = _FA32_KERNEL(
+                inputs=[qkv, tiles_mx],
+                grid=(128, nt, 12),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(M_pad, 384)],
+                output_dtypes=[mx.float16],
+            )[0]
+            h_res = (mx.matmul(attn_out, ld["w_o"].T) + ld["b_o"]) + h
+            h = _LN_KERNEL(
+                inputs=[h_res, ld["ln1_w"], ld["ln1_b"]],
+                grid=(M_pad * 32, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(M_pad, 384)],
+                output_dtypes=[mx.float16],
+            )[0]
+            up = mx.matmul(h, ld["w_up"].T) + ld["b_up"]
+            act = up * (c_half * (c_one + mx.erf(up * inv_s2)))
+            h_res2 = (mx.matmul(act, ld["w_dn"].T) + ld["b_dn"]) + h
+            h = _LN_KERNEL(
+                inputs=[h_res2, ld["ln2_w"], ld["ln2_b"]],
+                grid=(M_pad * 32, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(M_pad, 384)],
+                output_dtypes=[mx.float16],
+            )[0]
+        ld = self.layers[11]
+        ld_t = self._single_layers[11]
+        kv11 = mx.addmm(ld_t["b_kv"], h, ld_t["w_kvT"])
+        h_cls = h[cls_mx]
+        q11 = mx.addmm(ld_t["b_q"], h_cls, ld_t["w_qT"])
+        attn11 = _CLS_ATTN_KERNEL(
+            inputs=[q11, kv11, bounds_mx],
+            grid=(128, nd, 12),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(nd, 384)],
+            output_dtypes=[mx.float16],
+        )[0]
+        hc_mid = _LN_KERNEL(
+            inputs=[mx.addmm(ld_t["b_o"], attn11, ld_t["w_oT"]) + h_cls, ld["ln1_w"], ld["ln1_b"]],
+            grid=(((nd + 7) // 8) * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(nd, 384)],
+            output_dtypes=[mx.float16],
+        )[0]
+        up11 = mx.addmm(ld_t["b_up"], hc_mid, ld_t["w_upT"])
+        act11 = up11 * (c_half * (c_one + mx.erf(up11 * inv_s2)))
+        hc_fin = mx.addmm(ld_t["b_dn"], act11, ld_t["w_dnT"]) + hc_mid
+        return _FINAL_LN_L2_KERNEL(  # guard: allow-fp32
+            inputs=[hc_fin, ld["ln2_w"], ld["ln2_b"]],
+            grid=(nd * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(nd, 384)],
+            output_dtypes=[mx.float32],
+        )[0]
+
     def forward_packed(self, tok_mx, pos_mx, tiles_mx, bounds_mx, cls_mx, M_tok, M_pad):
         if M_pad <= 0 or (M_pad % 128) != 0:
             raise ValueError(f"forward_packed requires M_pad > 0 and multiple of 128, got {M_pad}")
+        if _MPP_QKV is None or _MPP_BIAS_RES is None or _MPP_BIAS_GELU is None:
+            return self._forward_packed_mlx(tok_mx, pos_mx, tiles_mx, bounds_mx, cls_mx, M_tok, M_pad)
         nt = tiles_mx.shape[0]
         nd = bounds_mx.shape[0]
 

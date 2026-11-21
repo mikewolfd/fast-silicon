@@ -9,6 +9,8 @@ import subprocess
 import sys
 import time
 
+from typing import Any
+
 import numpy as np
 
 from fast_shared.hf import copy_tokenizer_files, resolve_hf_model_dir
@@ -19,22 +21,57 @@ from .pipeline import extract_jsonl, extract_parquet
 from .server import FastGemma4Server
 
 
+class _ExplicitSetAction(argparse.Action):
+    """Record when an optional flag was explicitly supplied on the command line."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
+
+
+def _resolve_cli_kv_i8(args: argparse.Namespace) -> bool | str:
+    if getattr(args, "no_kv_i8", False):
+        return False
+    val = getattr(args, "kv_i8", "auto")
+    return val if isinstance(val, bool) else str(val)
+
+
+def _resolve_cli_ane_ring_variant(args: argparse.Namespace) -> str:
+    ring_var = getattr(args, "ane_ring_variant", None)
+    if ring_var:
+        return str(ring_var)
+    if getattr(args, "_ane_variant_explicit", False):
+        return str(getattr(args, "ane_variant", "auto"))
+    return "auto"
+
+
 def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
     ane_var = getattr(args, "ane_variant", "fp16")
+    ane_ring_var = _resolve_cli_ane_ring_variant(args)
     mtp_ref = getattr(args, "mtp_drafter_path", None) or (True if getattr(args, "mtp_drafter", False) else None)
+    extra_kw: dict[str, Any] = {}
+    if getattr(args, "allow_english_vocab_prune", False):
+        extra_kw["allow_english_vocab_prune"] = True
     return FastGemma4Engine(
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
         default_mode=getattr(args, "mode", "auto"),
         vocab_out=getattr(args, "vocab_out", None),
         ane_variant=ane_var,
-        ane_ring_variant=ane_var,
+        ane_ring_variant=ane_ring_var,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
-        mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
-        kv_i8=not getattr(args, "no_kv_i8", False),
+        mlp_dtype=getattr(args, "mlp_dtype", "auto"),
+        kv_i8=_resolve_cli_kv_i8(args),
         mtp_drafter=mtp_ref,
         warmup=not getattr(args, "no_warmup", False),
         warmup_ane=bool(getattr(args, "mode", "auto") == "hetero"),
+        **extra_kw,
     )
 
 
@@ -261,8 +298,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         default_mode="gpu",
         vocab_out=args.vocab_out,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
-        mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
-        kv_i8=not getattr(args, "no_kv_i8", False),
+        mlp_dtype=getattr(args, "mlp_dtype", "auto"),
+        kv_i8=_resolve_cli_kv_i8(args),
+        allow_english_vocab_prune=bool(getattr(args, "allow_english_vocab_prune", False)),
         warmup=True,
         warmup_ane=False,
     )
@@ -330,10 +368,11 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         default_mode="auto",
         vocab_out=args.vocab_out,
         ane_variant=args.ane_variant,
-        ane_ring_variant=args.ane_variant,
+        ane_ring_variant=_resolve_cli_ane_ring_variant(args),
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
-        mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
-        kv_i8=not getattr(args, "no_kv_i8", False),
+        mlp_dtype=getattr(args, "mlp_dtype", "auto"),
+        kv_i8=_resolve_cli_kv_i8(args),
+        allow_english_vocab_prune=bool(getattr(args, "allow_english_vocab_prune", False)),
         warmup=True,
         warmup_ane=(not args.skip_ane),
     )
@@ -436,11 +475,19 @@ def _positive_int(raw: str) -> int:
 
 
 def _add_model_args(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument("--vocab-out", type=_positive_int, help="Limit allowed output tokens, e.g. 150786 for the English-oriented profile (default: checkpoint vocabulary)")
+    subparser.add_argument("--vocab-out", type=_positive_int, help="Limit allowed output tokens, e.g. 150786 for the English-oriented profile (default: full 262,144 checkpoint vocabulary)")
+    subparser.add_argument(
+        "--allow-english-vocab-prune",
+        action="store_true",
+        help="Opt in to loading global vocab_remap_150786.npz when --vocab-out is omitted",
+    )
     subparser.add_argument("--model-dir", default=None, help="Override local HuggingFace/fused checkpoint directory")
-    subparser.add_argument("--no-kv-i8", action="store_true", help="Disable INT8 rolling KV cache compression")
+    kv_grp = subparser.add_mutually_exclusive_group()
+    kv_grp.add_argument("--kv-i8", dest="kv_i8", action="store_true", help="Force INT8 rolling KV cache compression")
+    kv_grp.add_argument("--no-kv-i8", dest="no_kv_i8", action="store_true", help="Disable INT8 rolling KV cache compression")
+    subparser.set_defaults(kv_i8="auto")
     subparser.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
-    subparser.add_argument("--mlp-dtype", choices=("bfloat16", "quantized"), default="bfloat16")
+    subparser.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
     subparser.add_argument(
         "--mtp-drafter",
         action="store_true",
@@ -479,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--max-tokens", type=int, default=512)
     gn.add_argument("--temperature", type=float, default=0.0)
     gn.add_argument("--mode", choices=("auto", "gpu", "hetero"), default="auto")
-    gn.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
+    gn.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     gn.add_argument("--speculative", action="store_true")
     gn.add_argument("--no-speculative", action="store_true")
     _add_json_layout_args(gn)
@@ -508,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--max-tokens", type=int, default=512)
     ex.add_argument("--temperature", type=float, default=0.0)
     ex.add_argument("--mode", choices=("auto", "gpu", "hetero"), default="auto")
-    ex.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
+    ex.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     ex.add_argument("--speculative", action="store_true")
     ex.add_argument("--no-speculative", action="store_true")
     _add_json_layout_args(ex)
@@ -535,7 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     pq_p.add_argument("--max-pages", type=int, default=0, help="If >0, slice each doc to its first N pages via page_offsets")
     pq_p.add_argument("--temperature", type=float, default=0.0)
     pq_p.add_argument("--mode", choices=("auto", "gpu", "hetero"), default="auto")
-    pq_p.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
+    pq_p.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     pq_p.add_argument("--speculative", action="store_true")
     pq_p.add_argument("--no-speculative", action="store_true")
     _add_json_layout_args(pq_p)
@@ -553,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--coalesce-ms", type=float, default=0.0, help="Concurrent chat batch coalesce wait in ms (default: 0)")
     sv.add_argument("--max-batch", type=int, default=128, help="Max coalesced concurrent chat batch size (default: 128)")
     sv.add_argument("--mode", choices=("auto", "gpu", "hetero"), default="auto")
-    sv.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
+    sv.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     sv.add_argument("--no-warmup", action="store_true")
     sv.set_defaults(func=_cmd_serve)
 
@@ -567,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     bn.add_argument("--batch-spec", type=int, default=32)
     bn.add_argument("--waves", type=int, default=2)
     bn.add_argument("--max-tokens", type=int, default=512)
-    bn.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
+    bn.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     bn.add_argument("--skip-ane", action="store_true")
     bn.set_defaults(func=_cmd_bench)
 

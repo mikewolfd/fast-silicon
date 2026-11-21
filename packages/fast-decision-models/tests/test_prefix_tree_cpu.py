@@ -558,3 +558,86 @@ def test_kev_hit_and_share_aware_routing_cpu() -> None:
     _ = kev_g.score_multi_states([(partial_no_snap, q1), (cold_1[:8], q1)])
     assert pt_calls_g == []
     assert bb_g.prefill_waves == [(2, 8)]
+
+
+def test_prefix_tree_rolling_hit_rate_circuit_breaker_cpu() -> None:
+    """Verify rolling `< 15%` hit-rate circuit breaker skips snapshot writes on unshared corpora while preserving hits."""
+    tree = PrefixTree(
+        chunk_tokens=4,
+        byte_budget=1 << 20,
+        rolling_window=20,
+        min_hit_rate=0.15,
+        circuit_breaker_min_lookups=16,
+    )
+    assert tree.circuit_breaker_open is False
+    assert tree.should_write_snapshots(profile="backfill") is True
+
+    # Seed 1 cached prefix first so we can verify warm hits still work even after circuit breaker opens.
+    seed_toks = [901, 902, 903, 904]
+    k_seed = tree.insert(parent=None, tokens=seed_toks, depth=1, chunk=b"kv_s")
+    assert k_seed is not None
+    assert tree.attach_snapshot(k_seed, b"snap_s") is True
+
+    # Feed 16 consecutive misses -> rolling hit rate 0/16 = 0.0 < 0.15 -> circuit breaker opens!
+    for idx in range(16):
+        miss_m = tree.match([idx * 10 + 1, idx * 10 + 2, idx * 10 + 3, idx * 10 + 4], needs_snapshot=True)
+        assert miss_m.is_empty
+        tree.record(miss_m, restored=False)
+
+    st = tree.stats()
+    assert st["rolling_hit_rate"] == 0.0
+    assert st["circuit_breaker_open"] is True
+    assert tree.circuit_breaker_open is True
+    # Backfill / auto skips cold snapshot writes once tripped, while interactive keeps warm session caching on.
+    assert tree.should_write_snapshots(profile="backfill") is False
+    assert tree.should_write_snapshots(profile="auto") is False
+    assert tree.should_write_snapshots(profile="interactive") is True
+
+    # Warm lookup on already-cached seed_toks STILL hits even while circuit breaker is open!
+    hit_m = tree.match(seed_toks + [99], needs_snapshot=True)
+    assert hit_m.reused_tokens == 4
+    tree.record(hit_m, restored=True)
+
+    # Sustained hits (>= 15% of window) automatically close the circuit breaker again.
+    for _ in range(4):
+        hm = tree.match(seed_toks + [99], needs_snapshot=True)
+        tree.record(hm, restored=True)
+    assert tree.circuit_breaker_open is False
+    assert tree.should_write_snapshots(profile="backfill") is True
+
+
+def test_kev_exact_lcp_grouping_and_batched_shared_prefix_waves_cpu() -> None:
+    """Verify `(prefix_32, len)` grouping + batched B=8 prefix waves + B=8..16 candidate tails without serial B=1 drop."""
+    tree = PrefixTree(chunk_tokens=32, byte_budget=1 << 20)
+    kev, bb, _ = _make_fake_kev(prefix_tree=tree, batch_docs=8)
+    kev._batched_lcp_enabled = True
+    kev.profile = "backfill"
+
+    kev_ref, _, _ = _make_fake_kev(prefix_tree=None, batch_docs=8)
+
+    # Create 3 distinct shared prefixes of length >= 32 (40, 44, 48 tokens), each with 4 candidate tails,
+    # interleaved in scrambled order so naive length-sorting would separate siblings and legacy PrefixTree
+    # would serialize all 12 items down to B=1.
+    p_a = [100 + i for i in range(40)]
+    p_b = [200 + i for i in range(44)]
+    p_c = [300 + i for i in range(48)]
+    q1 = [{"id": 1}]
+
+    scrambled_items = []
+    for cand_idx in range(4):
+        scrambled_items.append((p_a + [10 + cand_idx] * (cand_idx + 2), q1))
+        scrambled_items.append((p_b + [20 + cand_idx] * (cand_idx + 3), q1))
+        scrambled_items.append((p_c + [30 + cand_idx] * (cand_idx + 1), q1))
+
+    got = kev.score_multi_states(scrambled_items, batch_docs=8)
+    ref = kev_ref.score_multi_states(scrambled_items, batch_docs=8)
+
+    # All 3 unique prefixes must be prefilled together in ONE batched wave (B=3), NOT 12 serial B=1 waves!
+    assert any(bsz == 3 for bsz, _ in bb.prefill_waves), f"Expected batched prefix wave B=3, got {bb.prefill_waves}"
+    assert not all(bsz == 1 for bsz, _ in bb.prefill_waves)
+    # PrefixTree recorded 3 cold prefix misses and 9 sibling hits!
+    assert tree.misses == 3 and tree.hits == 9
+    for got_doc, ref_doc in zip(got, ref):
+        np.testing.assert_allclose(got_doc[0][0], ref_doc[0][0], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(got_doc[0][1], ref_doc[0][1], rtol=1e-5, atol=1e-3)
+

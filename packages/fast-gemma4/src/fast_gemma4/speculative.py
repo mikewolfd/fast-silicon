@@ -913,6 +913,8 @@ def run_decode_rolling(
     ane_cohort_size: int = 16,
     enable_ff_jump: bool = True,
     ane_ring_variant: str = "fp16",
+    collect_telemetry: bool = False,
+    collect_valid_lse: bool = False,
 ) -> dict[str, Any]:
     """
     Continuous length-sorted slot-refill rolling GPU (+ optional Async Hybrid ANE+GPU) scheduler:
@@ -922,9 +924,11 @@ def run_decode_rolling(
       - exits forced llguidance FF slots after Layer 14 KV scatter (`layer15_prefix_split`)
       - batch-drains pure FF runs (`max_ff_drain`) via 14-layer `forward_early14_slot`
       - avoids `[B, 1, V]` logit writes on greedy steps via `fused_softcap_argmax_bf16` (with NaN `-1` guard)
+      - optional zero-copy GPU pre-mask telemetry (`lse_all`, `H_pre`, `top2_margin`, + `lse_valid` via `uint32` bitmask)
       - propagates `valid_schemas` directly from live matchers without re-parsing from token 0
     """
     N = len(suf_ids_list)
+    want_telem = bool(collect_telemetry or collect_valid_lse)
     if per_doc_grammars is not None and len(per_doc_grammars) != N:
         raise ValueError(f"Mismatched per_doc_grammars={len(per_doc_grammars)} vs N={N}")
 
@@ -949,7 +953,7 @@ def run_decode_rolling(
         return g.new_matcher()
 
     if N == 0:
-        return {
+        empty_res: dict[str, Any] = {
             "prefill_sec": 0.0,
             "decode_sec": 0.0,
             "gen_toks": [],
@@ -969,6 +973,9 @@ def run_decode_rolling(
             "ane_nan_fallbacks": 0,
             "gpu_boot_cohorts": 0,
         }
+        if want_telem:
+            empty_res["telemetry"] = []
+        return empty_res
 
     suf_list = [list(s) for s in suf_ids_list]
     if max_tokens <= 0:
@@ -981,7 +988,7 @@ def run_decode_rolling(
             else:
                 m0 = _new_doc_matcher(d, g_d)
                 valid_zero.append(bool(m0.is_stopped() and m0.is_accepting()))
-        return {
+        zero_res: dict[str, Any] = {
             "prefill_sec": 0.0,
             "decode_sec": 0.0,
             "gen_toks": [[] for _ in range(N)],
@@ -1001,16 +1008,22 @@ def run_decode_rolling(
             "ane_nan_fallbacks": 0,
             "gpu_boot_cohorts": 0,
         }
+        if want_telem:
+            zero_res["telemetry"] = [[] for _ in range(N)]
+        return zero_res
 
     B_slots = max(1, min(int(b_slots), N))
     eff_refill_min = min(32, max(1, B_slots // 4)) if refill_min is None else max(1, min(B_slots, int(refill_min)))
     eff_group_size = min(group_size, 8 if B_slots <= 32 else 16)
     max_suf = max(len(s) for s in suf_list)
     eff_doc_cap_full = max(int(doc_cap_full), max_suf + max_tokens + 64, 128)
+    win_sz = int(getattr(model, "window_size", 512) or 512)
+    min_swa = 1 << (max(512, win_sz) - 1).bit_length()
+    eff_swa_ring_cap = max(int(swa_ring_cap), min_swa)
     slot_cache_kwargs: dict[str, Any] = {
         "batch_size": B_slots,
         "doc_cap_full": eff_doc_cap_full,
-        "swa_ring_cap": swa_ring_cap,
+        "swa_ring_cap": eff_swa_ring_cap,
         "kv_i8": kv_i8,
     }
     if int(max_ff_drain) > 16:
@@ -1119,9 +1132,63 @@ def run_decode_rolling(
             valid_schemas[d] = bool(m.is_stopped() and m.is_accepting())
             _free_slot(slot_s)
 
+    doc_telemetry: list[list[dict[str, float]]] = [[] for _ in range(N)] if want_telem else []
+    model_vocab_size = int(getattr(model, "vocab_size", len(new_to_old)))
+    head_mask_words = (model_vocab_size + 31) // 32
+    new_to_old_u32 = np.asarray(new_to_old, dtype=np.uint32) if want_telem else None
+
+    def _build_valid_mask_for_slots(slots_seq: Sequence[int], n_rows: int) -> mx.array | None:
+        if not collect_valid_lse or n_rows <= 0:
+            return None
+        mask_mat = np.full((n_rows, head_mask_words), np.uint32(0xFFFFFFFF), dtype=np.uint32)
+        for ri in range(n_rows):
+            s_i = int(slots_seq[ri]) if ri < len(slots_seq) else -1
+            if s_i < 0 or slot_grammar[s_i] is None or slot_matcher[s_i] is None:
+                continue
+            g_i = slot_grammar[s_i]
+            m_i = slot_matcher[s_i]
+            full_v = int(getattr(getattr(g_i, "ltok", None), "vocab_size", model_vocab_size))
+            full_words = (full_v + 31) // 32
+            raw_u32 = np.zeros(full_words, dtype=np.uint32)
+            m_i.unsafe_compute_mask_ptr(raw_u32.ctypes.data, raw_u32.nbytes)
+            if full_v == model_vocab_size and new_to_old_u32 is not None and len(new_to_old_u32) == full_v and int(new_to_old_u32[-1]) == full_v - 1:
+                mask_mat[ri, : min(head_mask_words, full_words)] = raw_u32[: min(head_mask_words, full_words)]
+            elif new_to_old_u32 is not None:
+                bits_1d = (raw_u32[new_to_old_u32 >> np.uint32(5)] >> (new_to_old_u32 & np.uint32(31))) & np.uint32(1)
+                row_u32 = np.zeros(head_mask_words, dtype=np.uint32)
+                nz = np.flatnonzero(bits_1d != 0).astype(np.uint32)
+                if nz.size > 0:
+                    np.bitwise_or.at(row_u32, nz >> np.uint32(5), np.uint32(1) << (nz & np.uint32(31)))
+                mask_mat[ri] = row_u32
+        return mx.array(mask_mat, dtype=mx.uint32)
+
+    def _record_step_telemetry(target_slots: Sequence[int], telem_mx: mx.array | None) -> None:
+        if telem_mx is None or not want_telem:
+            return
+        t_np = np.asarray(telem_mx, dtype=np.float32)
+        has_v = t_np.ndim == 2 and t_np.shape[1] >= 4
+        for r, s in enumerate(target_slots):
+            d = slot_doc[s]
+            if d < 0 or r >= t_np.shape[0]:
+                continue
+            entry: dict[str, float] = {
+                "lse_all": float(t_np[r, 0]),
+                "h_pre": float(t_np[r, 1]),
+                "top2_margin": float(t_np[r, 2]),
+            }
+            if has_v:
+                entry["lse_valid"] = float(t_np[r, 3])
+                entry["log_valid_mass"] = float(t_np[r, 3] - t_np[r, 0])
+            doc_telemetry[d].append(entry)
+
     def _handle_step_outputs(target_slots: Sequence[int], x_or_lg: mx.array, am_mx: mx.array) -> None:
         nonlocal mask_fallbacks
-        mx.eval(x_or_lg, am_mx)
+        telem_mx = cache.pop("_last_telemetry", None) if isinstance(cache, dict) else None
+        if telem_mx is not None:
+            mx.eval(x_or_lg, am_mx, telem_mx)
+            _record_step_telemetry(target_slots, telem_mx)
+        else:
+            mx.eval(x_or_lg, am_mx)
         am_np = np.asarray(am_mx, dtype=np.int32)
         if np.any(am_np < 0):
             bad_slots = [int(target_slots[i]) for i in range(len(target_slots)) if int(am_np[i]) < 0]
@@ -1188,29 +1255,59 @@ def run_decode_rolling(
         nonlocal prefill_sec, decode_sec, llm_steps
         tp0 = time.perf_counter()
         sub_sufs = [suf_list[d] for d in doc_indices]
-        x_or_lg, am, next_offs = model.prefill_slots_lazy_lg(
-            sub_sufs,
-            target_slots,
-            cache,
-            group_size=eff_group_size,
-            return_logits=return_logits,
-            async_eval=True,
-        )
-        prefill_sec += time.perf_counter() - tp0
-        llm_steps += 1
+        if want_telem:
+            for r, s in enumerate(target_slots):
+                d = doc_indices[r]
+                g_slot = _doc_grammar(d)
+                slot_doc[s] = d
+                slot_grammar[s] = g_slot
+                slot_matcher[s] = _new_doc_matcher(d, g_slot)
+                slot_queue[s].clear()
+            vmask_0 = _build_valid_mask_for_slots(target_slots, len(target_slots))
+            x_or_lg, am, next_offs = model.prefill_slots_lazy_lg(
+                sub_sufs,
+                target_slots,
+                cache,
+                group_size=eff_group_size,
+                return_logits=return_logits,
+                async_eval=True,
+                collect_telemetry=True,
+                valid_mask_u32=vmask_0,
+            )
+            prefill_sec += time.perf_counter() - tp0
+            llm_steps += 1
+            td0 = time.perf_counter()
+            for r, s in enumerate(target_slots):
+                slot_off[s] = next_offs[r]
+            _handle_step_outputs(target_slots, x_or_lg, am)
+            decode_sec += time.perf_counter() - td0
+        else:
+            x_or_lg, am, next_offs = model.prefill_slots_lazy_lg(
+                sub_sufs,
+                target_slots,
+                cache,
+                group_size=eff_group_size,
+                return_logits=return_logits,
+                async_eval=True,
+            )
+            prefill_sec += time.perf_counter() - tp0
+            llm_steps += 1
 
-        # Overlap CPU slot/matcher creation behind async LastTok execution
-        td0 = time.perf_counter()
-        for r, s in enumerate(target_slots):
-            d = doc_indices[r]
-            g_slot = _doc_grammar(d)
-            slot_doc[s] = d
-            slot_off[s] = next_offs[r]
-            slot_grammar[s] = g_slot
-            slot_matcher[s] = _new_doc_matcher(d, g_slot)
-            slot_queue[s].clear()
-        _handle_step_outputs(target_slots, x_or_lg, am)
-        decode_sec += time.perf_counter() - td0
+            # Overlap CPU slot/matcher creation behind async LastTok execution
+            td0 = time.perf_counter()
+            for r, s in enumerate(target_slots):
+                d = doc_indices[r]
+                g_slot = _doc_grammar(d)
+                slot_doc[s] = d
+                slot_off[s] = next_offs[r]
+                slot_grammar[s] = g_slot
+                slot_matcher[s] = _new_doc_matcher(d, g_slot)
+                slot_queue[s].clear()
+            _handle_step_outputs(target_slots, x_or_lg, am)
+            decode_sec += time.perf_counter() - td0
+        if len(doc_indices) >= 8 and callable(getattr(mx, "get_cache_memory", None)) and callable(getattr(mx, "clear_cache", None)):
+            if mx.get_cache_memory() > (256 << 20):
+                mx.clear_cache()
 
     def _admit_ane_cohort(item: dict[str, Any], target_slots: list[int]) -> None:
         nonlocal prefill_sec, decode_sec, llm_steps, ane_cohorts, ane_busy_sec, ane_nan_fallbacks
@@ -1255,17 +1352,6 @@ def run_decode_rolling(
                 start_s0=cov_start,
             )
 
-        last_toks = mx.array([sub_sufs[ri][-1] for ri in range(K)], dtype=mx.int32)[:, None]
-        last_off = mx.array([l_sys_i + len(sub_sufs[ri]) - 1 for ri in range(K)], dtype=mx.int32)
-        slot_mx = mx.array(target_slots, dtype=mx.int32)
-        x_or_lg, am = model.forward_decode_step_slot(
-            last_toks, cache, last_off, slot_mx, n_keep=K, return_logits=return_logits
-        )
-        mx.async_eval(x_or_lg, am)
-        prefill_sec += time.perf_counter() - tp0
-        llm_steps += 1
-
-        td0 = time.perf_counter()
         for r, s in enumerate(target_slots):
             d = doc_indices[r]
             g_slot = _doc_grammar(d)
@@ -1274,6 +1360,36 @@ def run_decode_rolling(
             slot_grammar[s] = g_slot
             slot_matcher[s] = _new_doc_matcher(d, g_slot)
             slot_queue[s].clear()
+
+        last_toks = mx.array([sub_sufs[ri][-1] for ri in range(K)], dtype=mx.int32)[:, None]
+        last_off = mx.array([l_sys_i + len(sub_sufs[ri]) - 1 for ri in range(K)], dtype=mx.int32)
+        slot_mx = mx.array(target_slots, dtype=mx.int32)
+        if want_telem:
+            adm_mask = _build_valid_mask_for_slots(target_slots, K)
+            x_or_lg, am = model.forward_decode_step_slot(
+                last_toks,
+                cache,
+                last_off,
+                slot_mx,
+                n_keep=K,
+                return_logits=return_logits,
+                collect_telemetry=collect_telemetry,
+                valid_mask_u32=adm_mask,
+            )
+            telem_adm = cache.get("_last_telemetry")
+            if telem_adm is not None:
+                mx.async_eval(x_or_lg, am, telem_adm)
+            else:
+                mx.async_eval(x_or_lg, am)
+        else:
+            x_or_lg, am = model.forward_decode_step_slot(
+                last_toks, cache, last_off, slot_mx, n_keep=K, return_logits=return_logits
+            )
+            mx.async_eval(x_or_lg, am)
+        prefill_sec += time.perf_counter() - tp0
+        llm_steps += 1
+
+        td0 = time.perf_counter()
         _handle_step_outputs(target_slots, x_or_lg, am)
         decode_sec += time.perf_counter() - td0
 
@@ -1486,13 +1602,25 @@ def run_decode_rolling(
                                 slot_off[s_j] += q_min
                                 for c_j in range(q_min):
                                     jump_np[r_j, c_j] = q_j.popleft()
-                            x_or_lg, am_mx = model.forward_ff_jump_slot(
-                                mx.array(jump_np),
-                                cache,
-                                mx.array(offs_np[:n_jf]),
-                                mx.array(slots_np[:n_jf]),
-                                return_logits=return_logits,
-                            )
+                            if want_telem:
+                                jmp_mask = _build_valid_mask_for_slots(ff_slots, n_jf)
+                                x_or_lg, am_mx = model.forward_ff_jump_slot(
+                                    mx.array(jump_np),
+                                    cache,
+                                    mx.array(offs_np[:n_jf]),
+                                    mx.array(slots_np[:n_jf]),
+                                    return_logits=return_logits,
+                                    collect_telemetry=collect_telemetry,
+                                    valid_mask_u32=jmp_mask,
+                                )
+                            else:
+                                x_or_lg, am_mx = model.forward_ff_jump_slot(
+                                    mx.array(jump_np),
+                                    cache,
+                                    mx.array(offs_np[:n_jf]),
+                                    mx.array(slots_np[:n_jf]),
+                                    return_logits=return_logits,
+                                )
                             llm_steps += 1
                             ff_jump_steps += 1
                             ff_jump_tokens += q_min * n_jf
@@ -1563,16 +1691,31 @@ def run_decode_rolling(
             slot_mx = mx.array(slots_np[:B_act])
             n_keep = B_samp if layer15_prefix_split else B_act
 
-            x_or_lg, am_mx = model.forward_decode_step_slot(
-                toks_mx, cache, off_mx, slot_mx, n_keep=n_keep, return_logits=return_logits
-            )
+            if want_telem:
+                vmask_step = _build_valid_mask_for_slots(
+                    samp_slots if n_keep == B_samp else (samp_slots + ff_slots), n_keep
+                )
+                x_or_lg, am_mx = model.forward_decode_step_slot(
+                    toks_mx,
+                    cache,
+                    off_mx,
+                    slot_mx,
+                    n_keep=n_keep,
+                    return_logits=return_logits,
+                    collect_telemetry=True,
+                    valid_mask_u32=vmask_step,
+                )
+            else:
+                x_or_lg, am_mx = model.forward_decode_step_slot(
+                    toks_mx, cache, off_mx, slot_mx, n_keep=n_keep, return_logits=return_logits
+                )
             llm_steps += 1
             _handle_step_outputs(samp_slots, x_or_lg, am_mx)
             decode_sec += time.perf_counter() - td0
 
         tot_up = sum(_doc_upfront_len(d) for d in range(N))
         tot_gen = sum(len(g) for g in gen_toks) + tot_up
-        return {
+        roll_out: dict[str, Any] = {
             "prefill_sec": prefill_sec,
             "decode_sec": decode_sec,
             "gen_toks": gen_toks,
@@ -1592,6 +1735,9 @@ def run_decode_rolling(
             "ane_nan_fallbacks": ane_nan_fallbacks,
             "gpu_boot_cohorts": gpu_boot_cohorts,
         }
+        if want_telem:
+            roll_out["telemetry"] = doc_telemetry
+        return roll_out
     finally:
         stop_event.set()
         if ane_thread is not None:

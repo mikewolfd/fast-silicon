@@ -13,10 +13,6 @@ import sys
 import time
 from typing import Any, Sequence
 
-# Default MLX_ENABLE_TF32=0 before importing MLX so FP32 projections and verify runs
-# remain exact IEEE FP32 across Apple9 (M4) and Apple10 (M5 NAX) unless explicitly overridden.
-os.environ.setdefault("MLX_ENABLE_TF32", "0")
-
 import numpy as np
 
 from fast_shared.bench import clear_mlx_arena, peak_footprint_gb
@@ -258,7 +254,7 @@ def _ane_verify_min_cos_threshold(
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     """Verify deterministic GPU parity separately from ANE/hetero2 drift tolerance + MLComputePlan."""
-    from .engine import _discover_ane_stage_paths, _load_coreml_lib, read_ane_manifest
+    from .engine import _discover_ane_stage_specs, _load_coreml_lib, read_ane_manifest
 
     paths = resolve_paths(args.home)
     telemetry = get_mlx_runtime_telemetry()
@@ -269,14 +265,21 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     # Check ANE MLComputePlan residency when ANE artifacts are present.
     ane_plans: dict[str, Any] = {}
     if paths.coreml_dylib.is_file() and paths.ane_models_dir.is_dir():
-        stage_map = _discover_ane_stage_paths(paths.ane_models_dir, expected_profile=req_ane_profile)
-        if stage_map:
+        stage_specs = _discover_ane_stage_specs(paths.ane_models_dir, expected_profile=req_ane_profile)
+        if stage_specs:
             lib = _load_coreml_lib(paths.coreml_dylib)
+            has_fn_inspect = hasattr(lib, "pplx_ane_inspect_plan_fn")
             buf = ctypes.create_string_buffer(512)
-            for cap, stages in stage_map.items():
+            for _cap, (stages, fn_name) in stage_specs.items():
                 for st_path in stages:
-                    rc = lib.pplx_ane_inspect_plan(str(st_path).encode("utf-8"), 0, buf, 512)
-                    ane_plans[st_path.name] = (
+                    plan_key = f"{st_path.name}:{fn_name}" if fn_name else st_path.name
+                    if fn_name and has_fn_inspect:
+                        rc = lib.pplx_ane_inspect_plan_fn(
+                            str(st_path).encode("utf-8"), fn_name.encode("utf-8"), 0, buf, 512
+                        )
+                    else:
+                        rc = lib.pplx_ane_inspect_plan(str(st_path).encode("utf-8"), 0, buf, 512)
+                    ane_plans[plan_key] = (
                         json.loads(buf.value.decode("utf-8")) if rc > 0 else {"error": buf.value.decode("utf-8", errors="replace")}
                     )
 

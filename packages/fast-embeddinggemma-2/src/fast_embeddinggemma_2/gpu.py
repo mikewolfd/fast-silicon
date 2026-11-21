@@ -13,7 +13,9 @@ from typing import Any, Sequence
 import mlx.core as mx
 import numpy as np
 
-from fast_shared.metal_mpp import HEADER_STD, make_mpp_matmul_kernel
+from fast_shared.metal_mpp import HEADER_MPP, HEADER_STD, make_mpp_matmul_kernel
+
+from .paths import MmapTokenTable, load_or_mmap_token_table
 
 NUM_LAYERS = 24
 HIDDEN_SIZE = 512
@@ -46,17 +48,18 @@ OVER_BUCKETS: tuple[int, ...] = (640, 768, 1024, 1536, 2048)
 OVER_B_OPTS: dict[int, tuple[int, ...]] = {
     640: (4, 2, 1),
     768: (4, 2, 1),
-    1024: (2, 1),
+    1024: (4, 2, 1),
     1536: (1,),
     2048: (1,),
 }
-
-# Only keep truly fused activation MPP kernels (plain projections use native mx.matmul(x, w.T),
-# which unlocks M5 Apple10 NAX / chip-tuned MLX steel_gemm schedules: -14.89% E2E on Base M5).
-# Roadmap note: on macOS 26.4+ direct FP16xINT8 TensorOps and on macOS 27.0+/27.2+ Core AI
-# shared MTLBuffer zero-copy can be evaluated behind OS gates without changing this packed scheduler.
-_MPP_GEGLU_64 = make_mpp_matmul_kernel("emb2_geglu64", tm=64, tn=64, sgs=4, epilogue="geglu")
-_MPP_PG_64 = make_mpp_matmul_kernel("emb2_pg64", tm=64, tn=64, sgs=4, epilogue="gelu_mul_pli")
+# Measured per-lane ms on Apple GPU: varlen-packs two >512 docs iff cost(combined) < cost(a) + cost(b).
+OVER_LANE_COST: dict[int, float] = {
+    640: 41.1,
+    768: 50.9,
+    1024: 72.2,
+    1536: 117.4,
+    2048: 183.5,
+}
 
 _METAL_CAP_CACHE: dict[str, Any] | None = None
 
@@ -180,6 +183,107 @@ def should_use_fused_mpp(
         return False
     min_os = (26, 1) if dtype == mx.bfloat16 else (26, 0)
     return tuple(macos_version) >= min_os
+
+
+def _probe_tanh_mpp_kernels(caps: dict[str, Any] | None = None):
+    """Instantiate tanh-GELU MPP epilogues on Metal 4 (using `fast_shared` or inline `HEADER_MPP`)."""
+    c = caps if caps is not None else probe_metal_capabilities()
+    if not (bool(c.get("metal4", False)) and tuple(c.get("macos_version", (0,))) >= (26, 0)):
+        return None, None, False
+    try:
+        k_geglu = make_mpp_matmul_kernel("emb2_geglu64", tm=64, tn=64, sgs=4, epilogue="geglu_tanh")
+        k_pg = make_mpp_matmul_kernel("emb2_pg64", tm=64, tn=64, sgs=4, epilogue="gelu_tanh_mul_pli")
+        return k_geglu, k_pg, True
+    except ValueError:
+        geglu_src = """
+        int M = (int)A_shape[0], K = (int)A_shape[1], N_tot = (int)B_shape[0];
+        int N_half = N_tot >> 1;
+        int tg_y = (int)(threadgroup_position_in_grid.y * 64);
+        int tg_x = (int)(threadgroup_position_in_grid.x * 64);
+        if (tg_y >= M || tg_x >= N_half) return;
+        int tile_m = min(64, M - tg_y);
+        int tile_n = min(64, N_half - tg_x);
+        auto tA = tensor<device half, dextents<int32_t, 2>, tensor_inline>(const_cast<device half*>(A), dextents<int32_t, 2>(K, M));
+        auto tG = tensor<device half, dextents<int32_t, 2>, tensor_inline>(const_cast<device half*>(B), dextents<int32_t, 2>(K, N_half));
+        auto tU = tensor<device half, dextents<int32_t, 2>, tensor_inline>(const_cast<device half*>(B) + (size_t)N_half * (size_t)K, dextents<int32_t, 2>(K, N_half));
+        auto tC = tensor<device half, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(N_half, M));
+        constexpr auto desc = matmul2d_descriptor(64, 64, static_cast<int>(dynamic_extent), false, true, false);
+        matmul2d<desc, execution_simdgroups<4>> op;
+        auto mA = tA.slice(0, tg_y);
+        auto mG = tG.slice(0, tg_x);
+        auto mU = tU.slice(0, tg_x);
+        auto mC = tC.slice(tg_x, tg_y);
+        auto cG = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), float>();
+        auto cU = op.get_destination_cooperative_tensor<decltype(mA), decltype(mU), float>();
+        auto cO = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), half>();
+        #pragma unroll
+        for (uint16_t i = 0; i < cG.get_capacity(); ++i) {
+            if (cG.is_valid_element(i)) { cG[i] = 0.0f; cU[i] = 0.0f; }
+        }
+        op.run(mA, mG, cG);
+        op.run(mA, mU, cU);
+        #pragma unroll
+        for (uint16_t i = 0; i < cG.get_capacity(); ++i) {
+            if (cG.is_valid_element(i)) {
+                auto idx = cG.get_multidimensional_index(i);
+                if ((int)idx[1] < tile_m && (int)idx[0] < tile_n) {
+                    float g = cG[i];
+                    float u = cU[i];
+                    float inner = clamp(0.7978845608f * (g + 0.044715f * g * g * g), -9.0f, 9.0f);
+                    float e2 = exp2(2.8853900818f * inner);
+                    cO[i] = static_cast<half>((g * e2 / (e2 + 1.0f)) * u);
+                }
+            }
+        }
+        cO.store(mC);
+        """
+        pg_src = """
+        int M = (int)A_shape[0], K = (int)A_shape[1], N = (int)B_shape[0];
+        int tg_y = (int)(threadgroup_position_in_grid.y * 64);
+        int tg_x = (int)(threadgroup_position_in_grid.x * 64);
+        if (tg_y >= M || tg_x >= N) return;
+        auto tA = tensor<device half, dextents<int32_t, 2>, tensor_inline>(const_cast<device half*>(A), dextents<int32_t, 2>(K, M));
+        auto tB = tensor<device half, dextents<int32_t, 2>, tensor_inline>(const_cast<device half*>(B), dextents<int32_t, 2>(K, N));
+        auto tC = tensor<device half, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(N, M));
+        constexpr auto desc = matmul2d_descriptor(64, 64, static_cast<int>(dynamic_extent), false, true, false);
+        matmul2d<desc, execution_simdgroups<4>> op;
+        auto mA = tA.slice(0, tg_y);
+        auto mB = tB.slice(0, tg_x);
+        auto mC = tC.slice(tg_x, tg_y);
+        auto cF = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+        auto cO = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
+        #pragma unroll
+        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {
+            if (cF.is_valid_element(i)) cF[i] = 0.0f;
+        }
+        op.run(mA, mB, cF);
+        #pragma unroll
+        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {
+            if (cF.is_valid_element(i)) {
+                auto idx = cF.get_multidimensional_index(i);
+                int r = tg_y + (int)idx[1];
+                int c = tg_x + (int)idx[0];
+                if (r < M && c < N) {
+                    float g = cF[i];
+                    float p = (float)PLI[r * N + c];
+                    float inner = clamp(0.7978845608f * (g + 0.044715f * g * g * g), -9.0f, 9.0f);
+                    float e2 = exp2(2.8853900818f * inner);
+                    cO[i] = static_cast<half>((g * e2 / (e2 + 1.0f)) * p);
+                }
+            }
+        }
+        cO.store(mC);
+        """
+        k_geglu = mx.fast.metal_kernel(
+            name="emb2_geglu_tanh64", input_names=["A", "B"], output_names=["C"], header=HEADER_MPP, source=geglu_src
+        )
+        k_pg = mx.fast.metal_kernel(
+            name="emb2_pg_tanh64", input_names=["A", "B", "PLI"], output_names=["C"], header=HEADER_MPP, source=pg_src
+        )
+        return k_geglu, k_pg, True
+
+
+_MPP_GEGLU_64, _MPP_PG_64, _HAS_TANH_MPP = _probe_tanh_mpp_kernels()
 
 
 def should_force_fused_sdpa(
@@ -663,31 +767,29 @@ def fast_pack_cost_aware(
 
 
 def build_over_chunks(over: Sequence[tuple[int, Sequence[int]]], max_toks: int = 4096) -> deque:
-    """Group >512 token documents into discrete `OVER_BUCKETS` and greedy `OVER_B_OPTS` batch sizes."""
+    """Varlen-pack >512 token documents into cost-aware `1024 / 1536 / 2048` lanes and batch via `OVER_B_OPTS`."""
     if not over:
         return deque()
-    groups: dict[int, list] = defaultdict(list)
-    for idx, tok in sorted(over, key=lambda x: len(x[1])):
-        sl = min(MAX_SEQ_LEN, len(tok))
-        ml = OVER_BUCKETS[-1]
-        for bkt in OVER_BUCKETS:
-            if sl <= bkt:
-                ml = bkt
-                break
-        groups[ml].append((idx, tok))
+
+    clipped = [(idx, tok[:MAX_SEQ_LEN]) for idx, tok in over]
+    by_lane, _ = fast_pack_cost_aware(clipped, OVER_LANE_COST)
+
     chunks: deque = deque()
-    for ml in sorted(groups):
-        docs = groups[ml]
+    for ml in OVER_BUCKETS:
+        lanes = list(by_lane.get(ml, ()))
+        if not lanes:
+            continue
         opts = OVER_B_OPTS[ml]
+        cap_b = max(1, max_toks // ml)
         pos = 0
-        rem = len(docs)
+        rem = len(lanes)
         while rem > 0:
             chosen = opts[-1]
             for opt in opts:
-                if opt <= rem:
+                if opt <= rem and opt <= cap_b:
                     chosen = opt
                     break
-            chunks.append((ml, docs[pos : pos + chosen]))
+            chunks.append((ml, lanes[pos : pos + chosen]))
             pos += chosen
             rem -= chosen
     return chunks
@@ -696,21 +798,31 @@ def build_over_chunks(over: Sequence[tuple[int, Sequence[int]]], max_toks: int =
 class FastEmbeddingGemma2GPU:
     """Compiled Metal MPP + custom-kernel EmbeddingGemma-2 forward pass on Apple GPU."""
 
-    def __init__(self, weights_npz: str | Path) -> None:
-        raw = mx.load(str(weights_npz))
-        scale_emb = mx.array(HIDDEN_SIZE ** 0.5, dtype=mx.float16)
-        self.scale_ple = mx.array(HIDDEN_SIZE ** -0.5, dtype=mx.float16)
+    def __init__(
+        self,
+        weights_npz: str | Path,
+        *,
+        token_table: MmapTokenTable | None = None,
+    ) -> None:
+        self.token_table = token_table if token_table is not None else load_or_mmap_token_table(weights_npz)
+        self.embed_scaled = None
+        self.scale_ple = mx.array(HIDDEN_SIZE**-0.5, dtype=mx.float16)
 
-        self.embed_scaled = mx.contiguous(raw["embed_tokens"].astype(mx.float16) * scale_emb)
-        self.ple_proj = mx.contiguous(raw["ple_proj"][:, :, 0, 0].astype(mx.float16))
-        self.ple_norm = mx.contiguous(raw["ple_norm"].reshape(HIDDEN_SIZE).astype(mx.float16))
-        self.final_norm = mx.contiguous(raw["final_norm"].reshape(HIDDEN_SIZE).astype(mx.float16))
-        self.emb_proj_wT32 = mx.contiguous(raw["emb_proj"][:, :, 0, 0].astype(mx.float32).T)
+        with np.load(weights_npz) as raw_z:
+            raw = {
+                k: mx.array(np.ascontiguousarray(raw_z[k]))
+                for k in raw_z.files
+                if k != "embed_tokens"
+            }
+
+        self.ple_proj = raw["ple_proj"][:, :, 0, 0].astype(mx.float16)
+        self.ple_norm = raw["ple_norm"].reshape(HIDDEN_SIZE).astype(mx.float16)
+        self.final_norm = raw["final_norm"].reshape(HIDDEN_SIZE).astype(mx.float16)
+        self.emb_proj_wT32 = mx.transpose(raw["emb_proj"][:, :, 0, 0].astype(mx.float32), axes=(1, 0))
         self._emb_proj_wT32_slices: dict[int, mx.array] = {EMBED_DIM: self.emb_proj_wT32}
 
         layers: list[dict] = []
         eval_list: list[mx.array] = [
-            self.embed_scaled,
             self.ple_proj,
             self.ple_norm,
             self.final_norm,
@@ -723,20 +835,20 @@ class FastEmbeddingGemma2GPU:
             ld = {
                 "is_swa": is_swa,
                 "hd": hd,
-                "in_ln": mx.contiguous(raw[q + "in_ln"].reshape(HIDDEN_SIZE).astype(mx.float16)),
-                "qkv": mx.contiguous(raw[q + "qkv"][:, :, 0, 0].astype(mx.float16)),
-                "qn": mx.contiguous(raw[q + "qn"].reshape(hd).astype(mx.float16)),
-                "kn": mx.contiguous(raw[q + "kn"].reshape(hd).astype(mx.float16)),
-                "o": mx.contiguous(raw[q + "o"][:, :, 0, 0].astype(mx.float16)),
-                "pa_ln": mx.contiguous(raw[q + "pa_ln"].reshape(HIDDEN_SIZE).astype(mx.float16)),
-                "pff_ln": mx.contiguous(raw[q + "pff_ln"].reshape(HIDDEN_SIZE).astype(mx.float16)),
-                "gu": mx.contiguous(raw[q + "gu"][:, :, 0, 0].astype(mx.float16)),
-                "dn": mx.contiguous(raw[q + "dn"][:, :, 0, 0].astype(mx.float16)),
-                "poff_ln": mx.contiguous(raw[q + "poff_ln"].reshape(HIDDEN_SIZE).astype(mx.float16)),
-                "pg": mx.contiguous(raw[q + "pg"][:, :, 0, 0].astype(mx.float16)),
-                "pp": mx.contiguous(raw[q + "pp"][:, :, 0, 0].astype(mx.float16)),
-                "pple_ln": mx.contiguous(raw[q + "pple_ln"].reshape(HIDDEN_SIZE).astype(mx.float16)),
-                "scalar": mx.contiguous(raw[q + "scalar"].reshape((1,)).astype(mx.float16)),
+                "in_ln": raw[q + "in_ln"].reshape(HIDDEN_SIZE).astype(mx.float16),
+                "qkv": raw[q + "qkv"][:, :, 0, 0].astype(mx.float16),
+                "qn": raw[q + "qn"].reshape(hd).astype(mx.float16),
+                "kn": raw[q + "kn"].reshape(hd).astype(mx.float16),
+                "o": raw[q + "o"][:, :, 0, 0].astype(mx.float16),
+                "pa_ln": raw[q + "pa_ln"].reshape(HIDDEN_SIZE).astype(mx.float16),
+                "pff_ln": raw[q + "pff_ln"].reshape(HIDDEN_SIZE).astype(mx.float16),
+                "gu": raw[q + "gu"][:, :, 0, 0].astype(mx.float16),
+                "dn": raw[q + "dn"][:, :, 0, 0].astype(mx.float16),
+                "poff_ln": raw[q + "poff_ln"].reshape(HIDDEN_SIZE).astype(mx.float16),
+                "pg": raw[q + "pg"][:, :, 0, 0].astype(mx.float16),
+                "pp": raw[q + "pp"][:, :, 0, 0].astype(mx.float16),
+                "pple_ln": raw[q + "pple_ln"].reshape(HIDDEN_SIZE).astype(mx.float16),
+                "scalar": raw[q + "scalar"].reshape((1,)).astype(mx.float16),
             }
             layers.append(ld)
             eval_list.extend(v for k, v in ld.items() if isinstance(v, mx.array))
@@ -753,21 +865,31 @@ class FastEmbeddingGemma2GPU:
         self._macos_version = tuple(caps["macos_version"])
         self._sdpa_supports_force_fused = bool(caps["sdpa_supports_force_fused"])
 
-        def _forward_trunk(ids_mx: mx.array, pos_mx: mx.array, mask_swa: mx.array, mask_full: mx.array) -> mx.array:
-            b_sz, seq_l = ids_mx.shape
+        def _forward_trunk(
+            h_mx: mx.array,
+            pos_mx: mx.array,
+            mask_swa: mx.array | None,
+            mask_full: mx.array | None,
+        ) -> mx.array:
+            b_sz, seq_l = pos_mx.shape
             m_tot = b_sz * seq_l
             cs = self.c256[pos_mx]
             ss = self.s256[pos_mx]
             cf = self.c512[pos_mx]
             sf = self.s512[pos_mx]
-            use_fused_mpp = should_use_fused_mpp(
-                m_tot=m_tot,
-                metal4=self._metal4,
-                macos_version=self._macos_version,
-                dtype=mx.float16,
+            use_fused_mpp = (
+                _HAS_TANH_MPP
+                and _MPP_GEGLU_64 is not None
+                and _MPP_PG_64 is not None
+                and should_use_fused_mpp(
+                    m_tot=m_tot,
+                    metal4=self._metal4,
+                    macos_version=self._macos_version,
+                    dtype=mx.float16,
+                )
             )
 
-            h = self.embed_scaled[ids_mx.reshape(m_tot)]
+            h = h_mx
             pl_raw = mx.matmul(h, self.ple_proj.T) * self.scale_ple
             pl_layers = mx.contiguous(
                 mx.fast.rms_norm(pl_raw.reshape(m_tot, NUM_LAYERS, HIDDEN_SIZE), self.ple_norm, 1e-6).transpose(1, 0, 2)
@@ -844,24 +966,52 @@ class FastEmbeddingGemma2GPU:
             return xn
 
         @mx.compile
-        def _packed_trunk_compiled(ids_mx: mx.array, pos_mx: mx.array, blk_mx: mx.array) -> mx.array:
-            msk = blk_mx[:, None, :, None] == blk_mx[:, None, None, :]
-            return _forward_trunk(ids_mx, pos_mx, msk, msk)
+        def _packed_trunk_compiled(h_mx: mx.array, pos_mx: mx.array, blk_mx: mx.array) -> mx.array:
+            same = blk_mx[:, None, :, None] == blk_mx[:, None, None, :]
+            msk = mx.where(same, mx.array(0.0, dtype=mx.float16), mx.array(-40000.0, dtype=mx.float16))
+            return _forward_trunk(h_mx, pos_mx, msk, msk)
 
         @mx.compile
-        def _over_compiled(ids_mx: mx.array, msk_mx: mx.array) -> mx.array:
-            b_sz, seq_l = ids_mx.shape
+        def _over_packed_trunk_compiled(h_mx: mx.array, pos_mx: mx.array, blk_mx: mx.array) -> mx.array:
+            same = blk_mx[:, None, :, None] == blk_mx[:, None, None, :]
+            in_swa = same & (mx.abs(pos_mx[:, None, :, None] - pos_mx[:, None, None, :]) <= 512)
+            zero_f16 = mx.array(0.0, dtype=mx.float16)
+            neg_f16 = mx.array(-40000.0, dtype=mx.float16)
+            mask_full = mx.where(same, zero_f16, neg_f16)
+            mask_swa = mx.where(in_swa, zero_f16, neg_f16)
+            return _forward_trunk(h_mx, pos_mx, mask_swa, mask_full)
+
+        @mx.compile
+        def _over_unpadded_single_compiled(h_mx: mx.array) -> mx.array:
+            seq_l = h_mx.shape[0]
+            pos_1d = mx.arange(seq_l)
+            pos_mx = pos_1d[None, :]
+            sm_bool = mx.abs(pos_1d[:, None] - pos_1d[None, :]) <= 512
+            sm = mx.where(sm_bool, mx.array(0.0, dtype=mx.float16), mx.array(-40000.0, dtype=mx.float16))[None, None, :, :]
+            # Pass mask_full=None so D=512 full-attention runs unmasked fused SDPA with zero [1,4,L,L] mask traffic!
+            ho = _forward_trunk(h_mx, pos_mx, sm, None).reshape(1, seq_l, HIDDEN_SIZE)
+            return mx.mean(ho.astype(mx.float32), axis=1)
+
+        @mx.compile
+        def _over_compiled(h_mx: mx.array, msk_mx: mx.array) -> mx.array:
+            b_sz, seq_l = msk_mx.shape
             pos_1d = mx.arange(seq_l)
             pos_mx = mx.broadcast_to(pos_1d[None], (b_sz, seq_l))
-            fm = msk_mx[:, None, None, :]
-            sm = fm & (mx.abs(pos_1d[:, None] - pos_1d[None, :]) <= 512)
-            ho = _forward_trunk(ids_mx, pos_mx, sm, fm).reshape(b_sz, seq_l, HIDDEN_SIZE)
+            fm_bool = msk_mx[:, None, None, :]
+            sm_bool = fm_bool & (mx.abs(pos_1d[:, None] - pos_1d[None, :]) <= 512)
+            zero_f16 = mx.array(0.0, dtype=mx.float16)
+            neg_f16 = mx.array(-40000.0, dtype=mx.float16)
+            fm = mx.where(fm_bool, zero_f16, neg_f16)
+            sm = mx.where(sm_bool, zero_f16, neg_f16)
+            ho = _forward_trunk(h_mx, pos_mx, sm, fm).reshape(b_sz, seq_l, HIDDEN_SIZE)
             zero_f32 = mx.array(0.0, dtype=mx.float32)
             ho_f32 = mx.where(msk_mx[:, :, None], ho.astype(mx.float32), zero_f32)
             denom = mx.maximum(mx.sum(msk_mx.astype(mx.float32), axis=1, keepdims=True), 1.0)
             return mx.sum(ho_f32, axis=1) / denom
 
         self._packed_trunk_compiled = _packed_trunk_compiled
+        self._over_packed_trunk_compiled = _over_packed_trunk_compiled
+        self._over_unpadded_single_compiled = _over_unpadded_single_compiled
         self._over_compiled = _over_compiled
 
     def _proj_wT(self, dimensions: int | None = None) -> mx.array:
@@ -873,31 +1023,61 @@ class FastEmbeddingGemma2GPU:
             self._emb_proj_wT32_slices[eff_dim] = w
         return w
 
-    def exec_packed(
+    def _exec_varlen_lanes(
         self,
         L_lane: int,
-        chunk: list[list[tuple[int, Sequence[int]]]],
+        lanes: list[list[tuple[int, Sequence[int]]]],
         *,
+        is_over: bool,
         dimensions: int | None = None,
     ) -> tuple[int, int, list[int], mx.array]:
-        B = len(chunk)
+        B = len(lanes)
+        if is_over and B == 1 and len(lanes[0]) == 1 and len(lanes[0][0][1]) > 512:
+            sl0 = min(len(lanes[0][0][1]), L_lane)
+            L_lane = min(L_lane, max(640, ((sl0 + 127) // 128) * 128))
         M = B * L_lane
-        ids_np = np.zeros((B, L_lane), dtype=np.int32)
+        if is_over and all(len(ln) == 1 for ln in lanes):
+            if B == 1 and len(lanes[0][0][1]) >= L_lane:
+                tok0 = lanes[0][0][1][:L_lane]
+                h_np = self.token_table.gather_scaled_f16(np.asarray(tok0, dtype=np.int32))
+                pooled = self._over_unpadded_single_compiled(mx.array(h_np))
+                p = pooled @ self._proj_wT(dimensions)
+                out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
+                return L_lane, L_lane, [lanes[0][0][0]], out
+
+            ids_np = np.full((B, L_lane), -1, dtype=np.int32)
+            msk_np = np.zeros((B, L_lane), dtype=np.bool_)
+            doc_idxs_1: list[int] = []
+            real_1 = 0
+            for b, ln in enumerate(lanes):
+                idx, tok = ln[0]
+                ll = min(len(tok), L_lane)
+                real_1 += ll
+                ids_np[b, :ll] = tok[:ll]
+                msk_np[b, :ll] = True
+                doc_idxs_1.append(idx)
+            h_np = self.token_table.gather_scaled_f16(ids_np.reshape(M))
+            pooled = self._over_compiled(mx.array(h_np), mx.array(msk_np))
+            p = pooled @ self._proj_wT(dimensions)
+            out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
+            return real_1, M, doc_idxs_1, out
+
+        ids_np = np.full((B, L_lane), -1, dtype=np.int32)
         pos_np = np.zeros((B, L_lane), dtype=np.int32)
         blk_np = np.full((B, L_lane), 9999, dtype=np.int32)
-        n_docs = sum(len(ln) for ln in chunk)
+        n_docs = sum(len(ln) for ln in lanes)
         starts_np = np.empty(n_docs, dtype=np.int32)
         lens_np = np.empty(n_docs, dtype=np.int32)
         doc_idxs: list[int] = []
         d_i = 0
         real_in_b = 0
-        for b, ln in enumerate(chunk):
+        for b, ln in enumerate(lanes):
             cur = 0
             base_b = b * L_lane
             for seq_i, (idx, tok) in enumerate(ln):
-                ll = len(tok)
+                ll = min(len(tok), L_lane - cur)
                 real_in_b += ll
-                ids_np[b, cur : cur + ll] = tok
+                ids_np[b, cur : cur + ll] = tok[:ll]
                 pos_np[b, cur : cur + ll] = self._arange_max[:ll]
                 blk_np[b, cur : cur + ll] = seq_i
                 starts_np[d_i] = base_b + cur
@@ -905,35 +1085,39 @@ class FastEmbeddingGemma2GPU:
                 doc_idxs.append(idx)
                 d_i += 1
                 cur += ll
+            if cur < L_lane:
+                tail = L_lane - cur
+                pos_np[b, cur:L_lane] = self._arange_max[:tail]
 
-        ho = self._packed_trunk_compiled(mx.array(ids_np), mx.array(pos_np), mx.array(blk_np))
+        h_np = self.token_table.gather_scaled_f16(ids_np.reshape(M))
+        trunk_fn = self._over_packed_trunk_compiled if is_over else self._packed_trunk_compiled
+        ho = trunk_fn(mx.array(h_np), mx.array(pos_np), mx.array(blk_np))
         pooled = mean_pool_segments(ho, mx.array(starts_np), mx.array(lens_np))
         p = pooled @ self._proj_wT(dimensions)
         out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
         return real_in_b, M, doc_idxs, out
 
-    def exec_over(
+    def exec_packed(
         self,
-        ml: int,
-        chunk: list[tuple[int, Sequence[int]]],
+        L_lane: int,
+        chunk: list[list[tuple[int, Sequence[int]]]],
         *,
         dimensions: int | None = None,
     ) -> tuple[int, int, list[int], mx.array]:
-        B = len(chunk)
-        ids_np = np.zeros((B, ml), dtype=np.int32)
-        msk_np = np.zeros((B, ml), dtype=np.bool_)
-        idxs: list[int] = []
-        rt = 0
-        for bi, (idx, t) in enumerate(chunk):
-            ll = min(len(t), ml)
-            ids_np[bi, :ll] = t[:ll]
-            msk_np[bi, :ll] = True
-            idxs.append(idx)
-            rt += ll
-        pooled = self._over_compiled(mx.array(ids_np), mx.array(msk_np))
-        p = pooled @ self._proj_wT(dimensions)
-        out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
-        return rt, B * ml, idxs, out
+        return self._exec_varlen_lanes(L_lane, chunk, is_over=False, dimensions=dimensions)
+
+    def exec_over(
+        self,
+        ml: int,
+        chunk: list[list[tuple[int, Sequence[int]]]] | list[tuple[int, Sequence[int]]],
+        *,
+        dimensions: int | None = None,
+    ) -> tuple[int, int, list[int], mx.array]:
+        if chunk and isinstance(chunk[0], tuple):
+            lanes: list[list[tuple[int, Sequence[int]]]] = [[item] for item in chunk]  # type: ignore[list-item]
+        else:
+            lanes = chunk  # type: ignore[assignment]
+        return self._exec_varlen_lanes(ml, lanes, is_over=True, dimensions=dimensions)
 
     def encode_single(
         self,
@@ -949,11 +1133,15 @@ class FastEmbeddingGemma2GPU:
         else:
             arr = list(token_ids[:sl]) if not isinstance(token_ids, np.ndarray) else token_ids[:sl]
         ml = max(64, ((sl + 63) // 64) * 64)
-        ids_np = np.zeros((1, ml), dtype=np.int32)
+        ids_np = np.full((1, ml), -1, dtype=np.int32)
         msk_np = np.zeros((1, ml), dtype=np.bool_)
         ids_np[0, :sl] = arr
         msk_np[0, :sl] = True
-        pooled = self._over_compiled(mx.array(ids_np), mx.array(msk_np))
+        h_np = self.token_table.gather_scaled_f16(ids_np.reshape(ml))
+        if sl == ml:
+            pooled = self._over_unpadded_single_compiled(mx.array(h_np))
+        else:
+            pooled = self._over_compiled(mx.array(h_np), mx.array(msk_np))
         p = pooled @ self._proj_wT(dimensions)
         out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
         mx.eval(out)

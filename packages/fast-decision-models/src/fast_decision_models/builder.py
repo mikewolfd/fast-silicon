@@ -1,11 +1,13 @@
-"""Native Objective-C++, CoreML Pure-ANE (`Laya-Typed-421M`), and MLX (`Kev-0.8B`) artifact builders."""
+"""Native Objective-C++, CoreML Pure-ANE (`Laya-Typed-421M`), and MLX (`Kev-0.8B` / `Kev-4B`) artifact builders."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import ctypes
 import json
 import math
+import os
 from pathlib import Path
 import pickle
 import shutil
@@ -16,6 +18,8 @@ import numpy as np
 
 from ._common import acquire_hw_lock
 from .paths import (
+    DEFAULT_KEV_4B_ADAPTER_REPO,
+    DEFAULT_KEV_4B_BASE_REPO,
     DEFAULT_KEV_ADAPTER_REPO,
     DEFAULT_KEV_BASE_REPO,
     DEFAULT_LAYA_REPO,
@@ -25,6 +29,8 @@ from .paths import (
 )
 
 KEV_SPECIAL_TOKENS = ["<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>"]
+DEFAULT_LAYA_SEQ_LENS: tuple[int, ...] = (64, 128, 192, 256, 384, 512)
+DEFAULT_LAYA_MAX_MARKERS: int = 32
 
 # Smallest normal IEEE-754 binary16 value (2^-14 = 6.103515625e-5, exact in FP16).
 # Clamping LayerNorm eps_u >= FP16_MIN_NORMAL prevents subnormal flush-to-zero on ANE.
@@ -50,20 +56,13 @@ def _laya_ln_gain_and_eps(
     max_ln_gain: float = 16.0,
     eps: float = 1e-5,
 ) -> tuple[np.float16, np.float16]:
-    """Compute scale-invariant FP16 LayerNorm `(ln_gain, eps_u)` compensating for `cum_r`.
-
-    Avoids double attenuation (`1/32..1/1024` residual scaling stacked with `0.25` LN down-scaling)
-    that previously pushed late-layer variances to the `2^-24` FP16 subnormal floor and inflated
-    effective `eps` to `10.0`. Keeps `u = xc * ln_gain` safe against ModernBERT `33,024` outliers
-    (`u^2 <= 16,641 < 65,504` up to `|x_orig| <= 65,504`) and clamps `eps_u >= 2^-14` (normal FP16).
-    """
+    """Compute scale-invariant FP16 LayerNorm `(ln_gain, eps_u)` compensating for `cum_r`."""
     r = float(cum_r)
     if r <= 0.0:
         raise ValueError(f"cum_r must be positive, got {cum_r}")
     if r >= 1.0:
         ln_gain_f = float(base_inv_scale)
     else:
-        # Never attenuate an already-scaled residual below 1.0; up-scale 1/1024 -> 4.0 (s_eff = 1/256).
         ln_gain_f = max(1.0, min(float(max_ln_gain), float(s_eff_floor) / r))
     s_eff = r * ln_gain_f
     eps_u_f = max(float(eps) * (s_eff * s_eff), FP16_MIN_NORMAL)
@@ -90,7 +89,6 @@ def _laya_layernorm_ch_np(
 
     ln_gain, eps_u = _laya_ln_gain_and_eps(cum_r, base_inv_scale=base_inv_scale, eps=eps)
     x16 = _f16(x)
-    # ANE reduce_mean accumulates in higher precision and stores FP16 output (unlike naive sequential FP16 sum).
     mean = _f16(np.mean(x16.astype(np.float32), axis=1, keepdims=True))
     xc = _f16(x16 - mean)
     u = xc if float(ln_gain) == 1.0 else _f16(xc * ln_gain)
@@ -109,11 +107,7 @@ def _laya_layernorm_ch_np(
 
 
 def _build_laya_quant_config(cto: Any, *, weight_threshold: int = 2048) -> Any:
-    """Build CoreML weight-only INT8 config scoped strictly to `conv` linear projections.
-
-    Keeps RoPE `cos`/`sin` tables (`mul`), SWA `-10000.0` bias masks (`add`), and LayerNorm
-    constants exact `FP16` by leaving `global_config=None`.
-    """
+    """Build CoreML weight-only INT8 config scoped strictly to `conv` linear projections."""
     return cto.OptimizationConfig(
         global_config=None,
         op_type_configs={
@@ -147,6 +141,7 @@ def _resolve_dir_or_hf(local_dir: str | None, repo_id: str) -> Path:
 
 
 def _precompute_rope_cos_sin(seq_len: int, head_dim: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return `(1, 1, seq_len, head_dim // 2)` FP16 RoPE tables (retained for `coreai_export.py`)."""
     half = head_dim // 2
     inv_freq = 1.0 / (theta ** (np.arange(half, dtype=np.float64) / half))
     angles = np.arange(seq_len, dtype=np.float64)[:, None] * inv_freq[None, :]
@@ -155,31 +150,60 @@ def _precompute_rope_cos_sin(seq_len: int, head_dim: int, theta: float) -> tuple
     return cos, sin
 
 
+def _precompute_rope_cos_sin_nchw(seq_len: int, head_dim: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return `(1, head_dim // 2, 1, seq_len)` FP16 RoPE tables for split-head `[1, hd, 1, S]` ANE layout."""
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (np.arange(half, dtype=np.float64) / half))
+    angles = inv_freq[:, None] * np.arange(seq_len, dtype=np.float64)[None, :]
+    cos = np.cos(angles).astype(np.float16)[None, :, None, :]
+    sin = np.sin(angles).astype(np.float16)[None, :, None, :]
+    return cos, sin
+
+
 def _precompute_sliding_window_bias(seq_len: int, local_attention: int = 128) -> np.ndarray:
+    """Return `(1, 1, seq_len, seq_len)` FP16 sliding-window bias (retained for `coreai_export.py`)."""
     idx = np.arange(seq_len)
     allow = np.abs(idx[:, None] - idx[None, :]) <= (local_attention // 2)
     bias = np.where(allow, 0.0, -10000.0).astype(np.float16)
     return bias[None, None, :, :]
 
 
-def _compile_laya_seq_bundle(
+def _precompute_sliding_window_bias_bkhq(seq_len: int, local_attention: int = 128) -> np.ndarray:
+    """Return `(1, seq_len, 1, seq_len)` FP16 sliding-window bias for `einsum('bkhd,bdhq->bkhq')` layout."""
+    idx = np.arange(seq_len)
+    allow = np.abs(idx[:, None] - idx[None, :]) <= (local_attention // 2)
+    bias = np.where(allow, 0.0, -10000.0).astype(np.float16)
+    return bias[None, :, None, :]
+
+
+def _build_laya_seq_mlpackage(
     seq_len: int,
-    w: dict[str, np.ndarray],
-    enc_cfg: dict[str, Any],
+    w: Mapping[str, np.ndarray],
+    enc_cfg: Mapping[str, Any],
     out_dir: Path,
     *,
+    max_markers: int = DEFAULT_LAYA_MAX_MARKERS,
     guard_ir: bool = True,
 ) -> Path:
-    """Convert `Laya-Typed-421M` ModernBERT + 2 head layers to `W8A16` Pure-ANE `.mlmodelc`."""
+    """Build quantized `W8A16` `.mlpackage` for one `Laya-Typed-421M` sequence bucket (`S`).
+
+    Architecture optimizations:
+      - Exact `erf` GELU (`mode="EXACT"`) on ModernBERT GeGLU and Laya scorer
+      - Native `mb.layer_norm` (`axes=[1]`) with `_laya_ln_gain_and_eps` `>= 2^-14` FTZ floor
+      - Split-head `[1, hd, 1, S]` `mb.einsum` (`0` 4D reshape+matmul ops; `100%` Pure-ANE)
+      - Pre-scorer `marker_map` `[1, S, 1, 32]` gather (`16x` less scorer compute at `S=512`)
+    """
     import coremltools as ct
     from coremltools.converters.mil import Builder as mb
     import coremltools.optimize.coreml as cto
     from fast_shared.ir_dtype_guard import check_coreml_model, validate_export_quant_dtypes
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     H = int(enc_cfg["hidden_size"])
     n_layers = int(enc_cfg["num_hidden_layers"])
     n_heads = int(enc_cfg["num_attention_heads"])
     hd = H // n_heads
+    M = int(max_markers)
     attn_scale = 1.0 / math.sqrt(hd)
     layer_types = enc_cfg["layer_types"]
     local_window = int(enc_cfg.get("local_attention", 128))
@@ -187,10 +211,9 @@ def _compile_laya_seq_bundle(
     theta_full = float(rope_params.get("full_attention", {}).get("rope_theta", 160000.0))
     theta_swa = float(rope_params.get("sliding_attention", {}).get("rope_theta", 10000.0))
 
-    cos_full_np, sin_full_np = _precompute_rope_cos_sin(seq_len, hd, theta_full)
-    cos_swa_np, sin_swa_np = _precompute_rope_cos_sin(seq_len, hd, theta_swa)
-    swa_bias_np = _precompute_sliding_window_bias(seq_len, local_window)
-
+    cos_full_np, sin_full_np = _precompute_rope_cos_sin_nchw(seq_len, hd, theta_full)
+    cos_swa_np, sin_swa_np = _precompute_rope_cos_sin_nchw(seq_len, hd, theta_swa)
+    swa_bias_np = _precompute_sliding_window_bias_bkhq(seq_len, local_window)
     layer_norm_eps = float(enc_cfg.get("norm_eps", enc_cfg.get("layer_norm_eps", 1e-5)))
 
     def _layernorm_ch(
@@ -207,27 +230,17 @@ def _compile_laya_seq_bundle(
             base_inv_scale=base_inv_scale,
             eps=layer_norm_eps,
         )
-        mean = mb.reduce_mean(x=x, axes=[1], keep_dims=True, name=prefix + "_mn")
-        xc = mb.sub(x=x, y=mean, name=prefix + "_xc")
-        u = xc if float(ln_gain) == 1.0 else mb.mul(x=xc, y=ln_gain, name=prefix + "_u")
-        var_u = mb.reduce_mean(
-            x=mb.mul(x=u, y=u, name=prefix + "_sq"),
-            axes=[1],
-            keep_dims=True,
-            name=prefix + "_vu",
-        )
-        rsq = mb.rsqrt(x=mb.add(x=var_u, y=eps_u, name=prefix + "_ae"), name=prefix + "_rsq")
-        gam4 = gamma_1d.astype(np.float16).reshape(1, H, 1, 1)
+        u = x if float(ln_gain) == 1.0 else mb.mul(x=x, y=ln_gain, name=prefix + "_u")
+        xn = mb.layer_norm(x=u, axes=[1], epsilon=eps_u, name=prefix + "_ln")
+        gam4 = np.asarray(gamma_1d, dtype=np.float16).reshape(1, H, 1, 1)
+        out = mb.mul(x=xn, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_gm")
         if beta_1d is None:
-            xn = mb.mul(x=u, y=rsq, name=prefix + "_xn")
-            return mb.mul(x=xn, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_gm")
-        ug = mb.mul(x=u, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_ug")
-        xn = mb.mul(x=ug, y=rsq, name=prefix + "_xn")
-        bet4 = beta_1d.astype(np.float16).reshape(1, H, 1, 1)
-        return mb.add(x=xn, y=mb.const(val=bet4, name=prefix + "_bw"), name=prefix + "_bm")
+            return out
+        bet4 = np.asarray(beta_1d, dtype=np.float16).reshape(1, H, 1, 1)
+        return mb.add(x=out, y=mb.const(val=bet4, name=prefix + "_bw"), name=prefix + "_bm")
 
-    def _rope(x4: Any, cos_c: Any, sin_c: Any, prefix: str) -> Any:
-        x0, x1 = mb.split(x=x4, num_splits=2, axis=-1, name=prefix + "_sp")
+    def _rope_head(xh: Any, cos_c: Any, sin_c: Any, prefix: str) -> Any:
+        x0, x1 = mb.split(x=xh, num_splits=2, axis=1, name=prefix + "_sp")
         y0 = mb.sub(
             x=mb.mul(x=x0, y=cos_c, name=prefix + "_c0"),
             y=mb.mul(x=x1, y=sin_c, name=prefix + "_s0"),
@@ -238,17 +251,58 @@ def _compile_laya_seq_bundle(
             y=mb.mul(x=x0, y=sin_c, name=prefix + "_s1"),
             name=prefix + "_y1",
         )
-        return mb.concat(values=[y0, y1], axis=-1, name=prefix + "_cat")
+        return mb.concat(values=[y0, y1], axis=1, name=prefix + "_cat")
+
+    def _split_head_einsum_attn(
+        qt: Any,
+        kt: Any,
+        vt: Any,
+        m_bias: Any,
+        prefix: str,
+        *,
+        cos_c: Any | None = None,
+        sin_c: Any | None = None,
+    ) -> Any:
+        q_heads = mb.split(x=qt, num_splits=n_heads, axis=1, name=prefix + "_spq")
+        k_heads = mb.split(x=kt, num_splits=n_heads, axis=1, name=prefix + "_spk")
+        v_heads = mb.split(x=vt, num_splits=n_heads, axis=1, name=prefix + "_spv")
+        att_heads: list[Any] = []
+        for hi_idx in range(n_heads):
+            qh_i = q_heads[hi_idx]
+            kh_i = k_heads[hi_idx]
+            vh_i = v_heads[hi_idx]
+            if cos_c is not None and sin_c is not None:
+                qh_i = _rope_head(qh_i, cos_c, sin_c, f"{prefix}_qrp{hi_idx}")
+                kh_i = _rope_head(kh_i, cos_c, sin_c, f"{prefix}_krp{hi_idx}")
+            kt_i = mb.transpose(x=kh_i, perm=[0, 3, 2, 1], name=f"{prefix}_kt{hi_idx}")
+            qk_i = mb.einsum(
+                values=[kt_i, qh_i],
+                equation="bkhd,bdhq->bkhq",
+                name=f"{prefix}_qk{hi_idx}",
+            )
+            probs_i = mb.softmax(
+                x=mb.add(x=qk_i, y=m_bias, name=f"{prefix}_qkb{hi_idx}"),
+                axis=1,
+                name=f"{prefix}_sm{hi_idx}",
+            )
+            att_i = mb.einsum(
+                values=[vh_i, probs_i],
+                equation="bdhk,bkhq->bdhq",
+                name=f"{prefix}_av{hi_idx}",
+            )
+            att_heads.append(att_i)
+        return mb.concat(values=att_heads, axis=1, name=prefix + "_cat")
 
     @mb.program(
         input_specs=[
             mb.TensorSpec(shape=(1, H, 1, seq_len), dtype=ct.converters.mil.mil.types.fp16),
-            mb.TensorSpec(shape=(1, 1, 1, seq_len), dtype=ct.converters.mil.mil.types.fp16),
+            mb.TensorSpec(shape=(1, seq_len, 1, 1), dtype=ct.converters.mil.mil.types.fp16),
             mb.TensorSpec(shape=(1, H, 1, 1), dtype=ct.converters.mil.mil.types.fp16),
+            mb.TensorSpec(shape=(1, seq_len, 1, M), dtype=ct.converters.mil.mil.types.fp16),
         ],
         opset_version=ct.target.macOS15,
     )
-    def prog(tok_emb_in, ext_mask, type_vec):
+    def prog(tok_emb_in, ext_mask, type_vec, marker_map):
         cos_f = mb.const(val=cos_full_np, name="cos_full")
         sin_f = mb.const(val=sin_full_np, name="sin_full")
         cos_s = mb.const(val=cos_swa_np, name="cos_swa")
@@ -270,52 +324,26 @@ def _compile_laya_seq_bundle(
                 else _layernorm_ch(cur, w[px + "attn_norm.weight"], None, f"l{i}_aln", cum_r=r_scale)
             )
 
-            wqkv_f32 = w[px + "attn.Wqkv.weight"].copy()
+            wqkv_f32 = np.asarray(w[px + "attn.Wqkv.weight"], dtype=np.float32).copy()
             wqkv_f32[:H, :] *= attn_scale
             wqkv_4d = wqkv_f32[:, :, None, None].astype(np.float16)
 
             qkv = mb.conv(x=x_attn, weight=mb.const(val=wqkv_4d, name=f"l{i}_wqkv"), name=f"l{i}_qkv")
             qt, kt, vt = mb.split(x=qkv, num_splits=3, axis=1, name=f"l{i}_spqkv")
-            qh = mb.transpose(
-                x=mb.reshape(x=qt, shape=[1, n_heads, hd, seq_len], name=f"l{i}_qr"),
-                perm=[0, 1, 3, 2],
-                name=f"l{i}_qt",
-            )
-            kh = mb.transpose(
-                x=mb.reshape(x=kt, shape=[1, n_heads, hd, seq_len], name=f"l{i}_kr"),
-                perm=[0, 1, 3, 2],
-                name=f"l{i}_kt",
-            )
-            vh = mb.transpose(
-                x=mb.reshape(x=vt, shape=[1, n_heads, hd, seq_len], name=f"l{i}_vr"),
-                perm=[0, 1, 3, 2],
-                name=f"l{i}_vt",
-            )
-
             c_t, s_t = (cos_f, sin_f) if is_full else (cos_s, sin_s)
-            qrp = _rope(qh, c_t, s_t, f"l{i}_qrp")
-            krp = _rope(kh, c_t, s_t, f"l{i}_krp")
-
-            qk = mb.matmul(x=qrp, y=krp, transpose_y=True, name=f"l{i}_qk")  # guard: allow-coreml-matmul (dynamic Q@K^T activations; [1585,0,0] ANE)
             m_bias = ext_mask if is_full else swa_mask
-            probs = mb.softmax(x=mb.add(x=qk, y=m_bias, name=f"l{i}_qkb"), axis=-1, name=f"l{i}_sm")
-            att = mb.matmul(x=probs, y=vh, name=f"l{i}_att")  # guard: allow-coreml-matmul (dynamic P@V activations; weights use 4D mb.conv)
-            att_4d = mb.reshape(
-                x=mb.transpose(x=att, perm=[0, 1, 3, 2], name=f"l{i}_at"),
-                shape=[1, H, 1, seq_len],
-                name=f"l{i}_ar",
-            )
+            att_4d = _split_head_einsum_attn(qt, kt, vt, m_bias, f"l{i}_att", cos_c=c_t, sin_c=s_t)
 
-            wo_4d = (w[px + "attn.Wo.weight"] * r_scale)[:, :, None, None].astype(np.float16)
+            wo_4d = (np.asarray(w[px + "attn.Wo.weight"], dtype=np.float32) * r_scale)[:, :, None, None].astype(np.float16)
             ao = mb.conv(x=att_4d, weight=mb.const(val=wo_4d, name=f"l{i}_wo"), name=f"l{i}_ao")
             cur = mb.add(x=cur, y=ao, name=f"l{i}_res1")
 
             x_mlp = _layernorm_ch(cur, w[px + "mlp_norm.weight"], None, f"l{i}_mln", cum_r=r_scale)
-            wi_4d = w[px + "mlp.Wi.weight"][:, :, None, None].astype(np.float16)
+            wi_4d = np.asarray(w[px + "mlp.Wi.weight"], dtype=np.float16)[:, :, None, None]
             wi_out = mb.conv(x=x_mlp, weight=mb.const(val=wi_4d, name=f"l{i}_wi"), name=f"l{i}_wio")
             val_h, gate_h = mb.split(x=wi_out, num_splits=2, axis=1, name=f"l{i}_spwi")
             geglu = mb.mul(x=mb.gelu(x=val_h, mode="EXACT", name=f"l{i}_gelu"), y=gate_h, name=f"l{i}_geglu")
-            wom_4d = (w[px + "mlp.Wo.weight"] * r_scale)[:, :, None, None].astype(np.float16)
+            wom_4d = (np.asarray(w[px + "mlp.Wo.weight"], dtype=np.float32) * r_scale)[:, :, None, None].astype(np.float16)
             mo = mb.conv(x=geglu, weight=mb.const(val=wom_4d, name=f"l{i}_wom"), name=f"l{i}_mo")
             cur = mb.add(x=cur, y=mo, name=f"l{i}_res2")
 
@@ -335,8 +363,8 @@ def _compile_laya_seq_bundle(
             hn1 = _layernorm_ch(
                 h, w[hp + "norm1.weight"], w[hp + "norm1.bias"], f"hl{hi}_n1", cum_r=1.0, base_inv_scale=0.25
             )
-            in_w = w[hp + "self_attn.in_proj_weight"].copy()
-            in_b = w[hp + "self_attn.in_proj_bias"].copy()
+            in_w = np.asarray(w[hp + "self_attn.in_proj_weight"], dtype=np.float32).copy()
+            in_b = np.asarray(w[hp + "self_attn.in_proj_bias"], dtype=np.float32).copy()
             in_w[:H, :] *= attn_scale
             in_b[:H] *= attn_scale
 
@@ -347,33 +375,14 @@ def _compile_laya_seq_bundle(
                 name=f"hl{hi}_qkv",
             )
             hqt, hkt, hvt = mb.split(x=hqkv, num_splits=3, axis=1, name=f"hl{hi}_sp")
-            hqh = mb.transpose(
-                x=mb.reshape(x=hqt, shape=[1, n_heads, hd, seq_len], name=f"hl{hi}_qr"),
-                perm=[0, 1, 3, 2],
-                name=f"hl{hi}_qt",
-            )
-            hkh = mb.transpose(
-                x=mb.reshape(x=hkt, shape=[1, n_heads, hd, seq_len], name=f"hl{hi}_kr"),
-                perm=[0, 1, 3, 2],
-                name=f"hl{hi}_kt",
-            )
-            hvh = mb.transpose(
-                x=mb.reshape(x=hvt, shape=[1, n_heads, hd, seq_len], name=f"hl{hi}_vr"),
-                perm=[0, 1, 3, 2],
-                name=f"hl{hi}_vt",
-            )
-            hqk = mb.matmul(x=hqh, y=hkh, transpose_y=True, name=f"hl{hi}_qk")  # guard: allow-coreml-matmul (dynamic head Q@K^T activations; [1585,0,0] ANE)
-            hpr = mb.softmax(x=mb.add(x=hqk, y=ext_mask, name=f"hl{hi}_qkb"), axis=-1, name=f"hl{hi}_sm")
-            hatt = mb.matmul(x=hpr, y=hvh, name=f"hl{hi}_att")  # guard: allow-coreml-matmul (dynamic head P@V activations; weights use 4D mb.conv)
-            hatt_4d = mb.reshape(
-                x=mb.transpose(x=hatt, perm=[0, 1, 3, 2], name=f"hl{hi}_at"),
-                shape=[1, H, 1, seq_len],
-                name=f"hl{hi}_ar",
-            )
+            hatt_4d = _split_head_einsum_attn(hqt, hkt, hvt, ext_mask, f"hl{hi}_att")
             hao = mb.conv(
                 x=hatt_4d,
-                weight=mb.const(val=w[hp + "self_attn.out_proj.weight"][:, :, None, None].astype(np.float16), name=f"hl{hi}_wo"),
-                bias=mb.const(val=w[hp + "self_attn.out_proj.bias"].astype(np.float16), name=f"hl{hi}_bo"),
+                weight=mb.const(
+                    val=np.asarray(w[hp + "self_attn.out_proj.weight"], dtype=np.float16)[:, :, None, None],
+                    name=f"hl{hi}_wo",
+                ),
+                bias=mb.const(val=np.asarray(w[hp + "self_attn.out_proj.bias"], dtype=np.float16), name=f"hl{hi}_bo"),
                 name=f"hl{hi}_ao",
             )
             h = mb.add(x=h, y=hao, name=f"hl{hi}_res1")
@@ -383,33 +392,45 @@ def _compile_laya_seq_bundle(
             )
             hl1 = mb.conv(
                 x=hn2,
-                weight=mb.const(val=w[hp + "linear1.weight"][:, :, None, None].astype(np.float16), name=f"hl{hi}_w1"),
-                bias=mb.const(val=w[hp + "linear1.bias"].astype(np.float16), name=f"hl{hi}_b1"),
+                weight=mb.const(
+                    val=np.asarray(w[hp + "linear1.weight"], dtype=np.float16)[:, :, None, None],
+                    name=f"hl{hi}_w1",
+                ),
+                bias=mb.const(val=np.asarray(w[hp + "linear1.bias"], dtype=np.float16), name=f"hl{hi}_b1"),
                 name=f"hl{hi}_l1",
             )
             hact = mb.relu(x=hl1, name=f"hl{hi}_relu")
             hl2 = mb.conv(
                 x=hact,
-                weight=mb.const(val=w[hp + "linear2.weight"][:, :, None, None].astype(np.float16), name=f"hl{hi}_w2"),
-                bias=mb.const(val=w[hp + "linear2.bias"].astype(np.float16), name=f"hl{hi}_b2"),
+                weight=mb.const(
+                    val=np.asarray(w[hp + "linear2.weight"], dtype=np.float16)[:, :, None, None],
+                    name=f"hl{hi}_w2",
+                ),
+                bias=mb.const(val=np.asarray(w[hp + "linear2.bias"], dtype=np.float16), name=f"hl{hi}_b2"),
                 name=f"hl{hi}_l2",
             )
             h = mb.add(x=h, y=hl2, name=f"hl{hi}_res2")
 
+        # Gather <=32 option markers BEFORE the 2-layer 1024->1024->1 scorer (`16x` less compute at S=512).
+        h_markers = mb.einsum(
+            values=[h, marker_map],
+            equation="bchs,bshm->bchm",
+            name="gather_markers",
+        )
         sn = _layernorm_ch(
-            h, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", cum_r=1.0, base_inv_scale=0.25
+            h_markers, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", cum_r=1.0, base_inv_scale=0.25
         )
         s1 = mb.conv(
             x=sn,
-            weight=mb.const(val=w["scorer.1.weight"][:, :, None, None].astype(np.float16), name="sc_w1"),
-            bias=mb.const(val=w["scorer.1.bias"].astype(np.float16), name="sc_b1"),
+            weight=mb.const(val=np.asarray(w["scorer.1.weight"], dtype=np.float16)[:, :, None, None], name="sc_w1"),
+            bias=mb.const(val=np.asarray(w["scorer.1.bias"], dtype=np.float16), name="sc_b1"),
             name="sc_l1",
         )
         sg = mb.gelu(x=s1, mode="EXACT", name="sc_gelu")
         return mb.conv(
             x=sg,
-            weight=mb.const(val=w["scorer.3.weight"][:, :, None, None].astype(np.float16), name="sc_w2"),
-            bias=mb.const(val=w["scorer.3.bias"].astype(np.float16), name="sc_b2"),
+            weight=mb.const(val=np.asarray(w["scorer.3.weight"], dtype=np.float16)[:, :, None, None], name="sc_w2"),
+            bias=mb.const(val=np.asarray(w["scorer.3.bias"], dtype=np.float16), name="sc_b2"),
             name="pos_logits",
         )
 
@@ -419,8 +440,9 @@ def _compile_laya_seq_bundle(
         prog,
         inputs=[
             ct.TensorType(name="tok_emb_in", shape=(1, H, 1, seq_len), dtype=np.float16),
-            ct.TensorType(name="ext_mask", shape=(1, 1, 1, seq_len), dtype=np.float16),
+            ct.TensorType(name="ext_mask", shape=(1, seq_len, 1, 1), dtype=np.float16),
             ct.TensorType(name="type_vec", shape=(1, H, 1, 1), dtype=np.float16),
+            ct.TensorType(name="marker_map", shape=(1, seq_len, 1, M), dtype=np.float16),
         ],
         outputs=[ct.TensorType(name="pos_logits", dtype=np.float16)],
         minimum_deployment_target=ct.target.macOS15,
@@ -450,13 +472,86 @@ def _compile_laya_seq_bundle(
     if pkg.exists():
         shutil.rmtree(pkg)
     ml.save(str(pkg))
-    compiled_tmp = ct.utils.compile_model(str(pkg))
-    dst = out_dir / f"{tag}.mlmodelc"
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.move(compiled_tmp, str(dst))
-    shutil.rmtree(pkg, ignore_errors=True)
-    return dst
+    return pkg
+
+
+def _save_laya_multifunction_mlpackage(
+    seq_pkgs: Mapping[int, Path],
+    dst_mlpackage: Path,
+    *,
+    default_seq_len: int = 512,
+) -> Path:
+    """Merge per-bucket `.mlpackage` graphs into a single weight-deduplicated multifunction `.mlpackage`."""
+    import coremltools as ct
+
+    if not seq_pkgs:
+        raise ValueError("seq_pkgs must not be empty")
+    desc = ct.utils.MultiFunctionDescriptor()
+    sorted_lens = sorted(int(s) for s in seq_pkgs.keys())
+    for s_len in sorted_lens:
+        desc.add_function(str(seq_pkgs[s_len]), "main", f"s{s_len}")
+    eff_default = default_seq_len if default_seq_len in seq_pkgs else sorted_lens[-1]
+    desc.default_function_name = f"s{eff_default}"
+    if dst_mlpackage.exists():
+        shutil.rmtree(dst_mlpackage)
+    dst_mlpackage.parent.mkdir(parents=True, exist_ok=True)
+    ct.utils.save_multifunction(desc, str(dst_mlpackage))
+    return dst_mlpackage
+
+
+def _publish_multifunction_and_symlinks(
+    mf_pkg: Path,
+    out_dir: Path,
+    seq_lens: Sequence[int],
+) -> Path:
+    """Compile multifunction `.mlpackage` -> `laya_typed_w8.mlmodelc` and publish bucket symlinks."""
+    import coremltools as ct
+
+    compiled_tmp = ct.utils.compile_model(str(mf_pkg))
+    mf_dst = out_dir / "laya_typed_w8.mlmodelc"
+    if mf_dst.exists() or mf_dst.is_symlink():
+        if mf_dst.is_symlink() or mf_dst.is_file():
+            mf_dst.unlink()
+        else:
+            shutil.rmtree(mf_dst)
+    shutil.move(compiled_tmp, str(mf_dst))
+
+    for s_len in seq_lens:
+        link_p = out_dir / f"laya_typed_s{int(s_len)}_w8.mlmodelc"
+        if link_p.exists() or link_p.is_symlink():
+            if link_p.is_symlink() or link_p.is_file():
+                link_p.unlink()
+            else:
+                shutil.rmtree(link_p)
+        os.symlink("laya_typed_w8.mlmodelc", link_p)
+    return mf_dst
+
+
+def _compile_laya_seq_bundle(
+    seq_len: int,
+    w: Mapping[str, np.ndarray],
+    enc_cfg: Mapping[str, Any],
+    out_dir: Path,
+    *,
+    guard_ir: bool = True,
+) -> Path:
+    """Convert one `Laya-Typed-421M` bucket `S` directly into standalone `{tag}.mlmodelc`."""
+    import coremltools as ct
+
+    pkg = _build_laya_seq_mlpackage(seq_len, w, enc_cfg, out_dir, guard_ir=guard_ir)
+    tag = f"laya_typed_s{seq_len}_w8"
+    try:
+        compiled_tmp = ct.utils.compile_model(str(pkg))
+        dst = out_dir / f"{tag}.mlmodelc"
+        if dst.exists() or dst.is_symlink():
+            if dst.is_symlink() or dst.is_file():
+                dst.unlink()
+            else:
+                shutil.rmtree(dst)
+        shutil.move(compiled_tmp, str(dst))
+        return dst
+    finally:
+        shutil.rmtree(pkg, ignore_errors=True)
 
 
 def build_laya_ane_artifacts(
@@ -471,8 +566,10 @@ def build_laya_ane_artifacts(
     calib_batches: int = 2,
     guard_ir: bool = True,
     inspect_placement: bool = False,
+    seq_lens: Sequence[int] | None = None,
+    multifunction: bool = True,
 ) -> Path:
-    """Build & stage `Laya-Typed-421M` Pure-ANE (`W8A16` `.mlmodelc`) or Core AI (`.aimodel`) bundles."""
+    """Build & stage `Laya-Typed-421M` Pure-ANE (`W8A16` multifunction `.mlmodelc`) or Core AI (`.aimodel`) bundles."""
     import mlx.core as mx
 
     if backend not in ("coreml", "coreai"):
@@ -511,8 +608,9 @@ def build_laya_ane_artifacts(
         eff_preset = (coreai_preset or "w4_per_block").strip().lower()
         enc_cfg = json.loads((src_dir / "encoder" / "config.json").read_text(encoding="utf-8"))
         w_np = {k: np.asarray(v.astype(mx.float32)) for k, v in raw_mx.items()}
+        eff_ca_lens = tuple(int(s) for s in seq_lens) if seq_lens is not None else (256, 512)
         stages_meta: list[dict[str, Any]] = []
-        for s_len in (256, 512):
+        for s_len in eff_ca_lens:
             res = run_laya_coreai_export(
                 out_dir=out_dir,
                 weights=w_np,
@@ -540,36 +638,84 @@ def build_laya_ane_artifacts(
         )
         return out_dir
 
+    eff_seq_lens = tuple(int(s) for s in (seq_lens if seq_lens is not None else DEFAULT_LAYA_SEQ_LENS))
     dylib_p = ensure_laya_dylib(repo_root)
     if copy_compiled_from is not None:
         pre_dir = Path(copy_compiled_from).expanduser().resolve()
-        for s_len in (256, 512):
-            name = f"laya_typed_s{s_len}_w8.mlmodelc"
-            src_mc = pre_dir / name
-            dst_mc = out_dir / name
-            if not src_mc.exists():
-                raise FileNotFoundError(f"Missing precompiled bundle: {src_mc}")
-            if dst_mc.exists():
-                shutil.rmtree(dst_mc)
-            shutil.copytree(src_mc, dst_mc)
+        mf_src = pre_dir / "laya_typed_w8.mlmodelc"
+        if mf_src.is_dir():
+            mf_dst = out_dir / "laya_typed_w8.mlmodelc"
+            if mf_dst.exists() or mf_dst.is_symlink():
+                shutil.rmtree(mf_dst, ignore_errors=True)
+            shutil.copytree(mf_src, mf_dst)
+            for s_len in eff_seq_lens:
+                lp = out_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
+                if lp.exists() or lp.is_symlink():
+                    lp.unlink() if lp.is_symlink() else shutil.rmtree(lp)
+                os.symlink("laya_typed_w8.mlmodelc", lp)
+        else:
+            copied_lens: list[int] = []
+            for s_len in eff_seq_lens:
+                name = f"laya_typed_s{s_len}_w8.mlmodelc"
+                src_mc = pre_dir / name
+                if not src_mc.exists():
+                    continue
+                dst_mc = out_dir / name
+                if dst_mc.exists() or dst_mc.is_symlink():
+                    dst_mc.unlink() if dst_mc.is_symlink() else shutil.rmtree(dst_mc)
+                shutil.copytree(src_mc.resolve(), dst_mc)
+                copied_lens.append(s_len)
+            if not copied_lens:
+                raise FileNotFoundError(f"Missing precompiled Laya bundles in {pre_dir}")
+            eff_seq_lens = tuple(copied_lens)
     else:
         enc_cfg = json.loads((src_dir / "encoder" / "config.json").read_text(encoding="utf-8"))
         w_np = {k: np.asarray(v.astype(mx.float32)) for k, v in raw_mx.items()}
         with acquire_hw_lock("build_laya_ane_models"):
-            for s_len in (256, 512):
-                _compile_laya_seq_bundle(s_len, w_np, enc_cfg, out_dir, guard_ir=guard_ir)
+            if multifunction and len(eff_seq_lens) > 1:
+                pkg_stage = out_dir / f".stage_mf_{os.getpid()}"
+                if pkg_stage.exists():
+                    shutil.rmtree(pkg_stage)
+                pkg_stage.mkdir(parents=True, exist_ok=True)
+                try:
+                    seq_pkgs = {
+                        s_len: _build_laya_seq_mlpackage(s_len, w_np, enc_cfg, pkg_stage, guard_ir=guard_ir)
+                        for s_len in eff_seq_lens
+                    }
+                    mf_pkg = _save_laya_multifunction_mlpackage(
+                        seq_pkgs, pkg_stage / "laya_typed_w8.mlpackage", default_seq_len=512
+                    )
+                    _publish_multifunction_and_symlinks(mf_pkg, out_dir, eff_seq_lens)
+                finally:
+                    shutil.rmtree(pkg_stage, ignore_errors=True)
+            else:
+                for s_len in eff_seq_lens:
+                    _compile_laya_seq_bundle(s_len, w_np, enc_cfg, out_dir, guard_ir=guard_ir)
 
     with acquire_hw_lock("verify_laya_ane_plan"):
         lib = ctypes.CDLL(str(dylib_p))
-        for s_len in (256, 512):
-            mc = out_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
+        lib.laya_ane_inspect_plan_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        mf_mc = out_dir / "laya_typed_w8.mlmodelc"
+        for s_len in eff_seq_lens:
+            if mf_mc.is_dir():
+                mc = mf_mc
+                fn_tag = f"s{s_len}".encode("utf-8")
+                label = f"{mc.name}[s{s_len}]"
+            else:
+                mc = out_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
+                fn_tag = b"main"
+                label = mc.name
             counts = (ctypes.c_int * 3)()
-            # 0 == LAYA_COMPUTE_CPU_AND_ANE (aligned with fast_shared::ComputeMode::kCpuAndNeuralEngine)
-            lib.laya_ane_inspect_plan(str(mc).encode("utf-8"), 0, counts)
-            print(f"[LAYA-ANE] {mc.name}: MLComputePlan ANE/GPU/CPU = {list(counts)}")
+            lib.laya_ane_inspect_plan_fn(str(mc.resolve()).encode("utf-8"), fn_tag, 0, counts)
+            print(f"[LAYA-ANE] {label}: MLComputePlan ANE/GPU/CPU = {list(counts)}")
             if int(counts[1]) != 0 or int(counts[2]) != 0 or int(counts[0]) < 1000:
-                raise RuntimeError(f"Unexpected non-pure-ANE compute plan on {mc}: {list(counts)}")
-            if inspect_placement:
+                raise RuntimeError(f"Unexpected non-pure-ANE compute plan on {label}: {list(counts)}")
+            if inspect_placement and not mf_mc.is_dir():
                 from fast_shared.coreai_pipeline import inspect_coreml_bundle_placement
 
                 pl = inspect_coreml_bundle_placement(mc, target_device="ane", model_name=mc.stem)
@@ -621,7 +767,7 @@ def _load_kev_head_tensors_stdlib_zip(head_pt_path: Path) -> tuple[dict[str, np.
                 if tag != "storage":
                     raise pickle.UnpicklingError(f"Unexpected persistent pid: {pid!r}")
                 st_name = getattr(st_type, "name", str(st_type))
-                dt, item_sz = dtype_map[st_name]
+                dt, _item_sz = dtype_map[st_name]
                 raw = zf.read(f"{prefix}data/{key}")
                 arr = np.frombuffer(raw, dtype=dt, count=int(count))
                 if st_name == "BFloat16Storage":
@@ -667,15 +813,21 @@ def build_kev_mlx_artifacts(
     artifacts_dir: Path | None = None,
     kev_adapter_dir: str | None = None,
     kev_base_dir: str | None = None,
+    kev_variant: str = "0.8b",
 ) -> Path:
-    """Merge `jaredpalmer/kev-0.8b` LoRA + `PointerHead` into `Qwen/Qwen3.5-0.8B-Base` and quantize W8."""
+    """Merge `jaredpalmer/kev-{0.8b,4b}` LoRA + `PointerHead` into `Qwen3.5-{0.8B,4B}-Base` and quantize."""
     import mlx.core as mx
     from tokenizers import Tokenizer
 
-    adapter_dir = _resolve_dir_or_hf(kev_adapter_dir, DEFAULT_KEV_ADAPTER_REPO)
-    base_dir = _resolve_dir_or_hf(kev_base_dir, DEFAULT_KEV_BASE_REPO)
+    is_4b = "4b" in str(kev_variant).strip().lower()
+    default_adapter = DEFAULT_KEV_4B_ADAPTER_REPO if is_4b else DEFAULT_KEV_ADAPTER_REPO
+    default_base = DEFAULT_KEV_4B_BASE_REPO if is_4b else DEFAULT_KEV_BASE_REPO
+    sub_name = "kev_4b" if is_4b else "kev_08b"
+
+    adapter_dir = _resolve_dir_or_hf(kev_adapter_dir, default_adapter)
+    base_dir = _resolve_dir_or_hf(kev_base_dir, default_base)
     out_root = artifacts_dir if artifacts_dir is not None else resolve_artifacts_dir(home=repo_root)
-    out_dir = out_root / "kev_08b"
+    out_dir = out_root / sub_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base_cfg = json.loads((base_dir / "config.json").read_text(encoding="utf-8"))
@@ -693,7 +845,7 @@ def build_kev_mlx_artifacts(
 
     head_np, native_temp = _load_kev_head_tensors(adapter_dir / "head.pt")
 
-    with acquire_hw_lock("merge_and_pack_kev_08b"):
+    with acquire_hw_lock(f"merge_and_pack_{sub_name}"):
         with mx.stream(mx.cpu):
             raw_base: dict[str, mx.array] = {}
             for sf in sorted(base_dir.glob("model*.safetensors")):
@@ -762,8 +914,9 @@ def build_kev_mlx_artifacts(
 
             mx.save_safetensors(str(out_dir / "model.safetensors"), packed)
 
+    tag_ver = "4b" if is_4b else "0.8b-r15"
     meta = {
-        "model_name": "kev-0.8b-r15-merged-bf16",
+        "model_name": f"kev-{tag_ver}-merged-bf16",
         "native_temperature": native_temp,
         "special_tokens": KEV_SPECIAL_TOKENS,
         "special_ids": special_ids,
@@ -774,8 +927,14 @@ def build_kev_mlx_artifacts(
     }
     (out_dir / "kev_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     sz_mb = (out_dir / "model.safetensors").stat().st_size / (1024 * 1024)
-    print(f"[KEV-0.8B] Saved {out_dir / 'model.safetensors'} ({sz_mb:.2f} MB, {merged_count} LoRA tensors merged, T={native_temp:.4f})")
-    quantize_kev_w8_artifacts(repo_root, artifacts_dir=out_root)
+    print(f"[KEV-{tag_ver.upper()}] Saved {out_dir / 'model.safetensors'} ({sz_mb:.2f} MB, {merged_count} LoRA tensors merged, T={native_temp:.4f})")
+    quantize_kev_w8_artifacts(
+        repo_root,
+        artifacts_dir=out_root,
+        group_size=32 if is_4b else 64,
+        bits=4 if is_4b else 8,
+        kev_variant="4b" if is_4b else "0.8b",
+    )
     return out_dir
 
 
@@ -785,19 +944,22 @@ def quantize_kev_w8_artifacts(
     artifacts_dir: Path | None = None,
     group_size: int = 64,
     bits: int = 8,
+    kev_variant: str = "0.8b",
 ) -> Path:
-    """Quantize merged BF16 `model.safetensors` linear + embedding matrices into lossless 8-bit `model_w8.safetensors`."""
+    """Quantize merged BF16 Kev `model.safetensors` (`8-bit g64` on `0.8B`; `4-bit g32` + `8-bit g32` GDN on `4B`)."""
     import mlx.core as mx
 
+    is_4b = "4b" in str(kev_variant).strip().lower()
+    sub_name = "kev_4b" if is_4b else "kev_08b"
     out_root = artifacts_dir if artifacts_dir is not None else resolve_artifacts_dir(home=repo_root)
-    out_dir = out_root / "kev_08b"
+    out_dir = out_root / sub_name
     bf16_sf = out_dir / "model.safetensors"
     meta_p = out_dir / "kev_meta.json"
     if not (bf16_sf.exists() and meta_p.exists()):
-        raise FileNotFoundError(f"Missing BF16 Kev-0.8B artifacts in {out_dir}")
+        raise FileNotFoundError(f"Missing BF16 Kev artifacts in {out_dir}")
 
     meta = json.loads(meta_p.read_text(encoding="utf-8"))
-    with acquire_hw_lock("quantize_kev_08b_w8"):
+    with acquire_hw_lock(f"quantize_{sub_name}"):
         with mx.stream(mx.cpu):
             src_w = mx.load(str(bf16_sf))
             packed_q: dict[str, mx.array] = {}
@@ -810,7 +972,9 @@ def quantize_kev_w8_artifacts(
                     and int(v.shape[-1]) % group_size == 0
                 ):
                     stem = k[: -len(".weight")]
-                    wq, scales, biases = mx.quantize(v.astype(mx.bfloat16), group_size=group_size, bits=bits)
+                    # Never crush GDN projections to 4-bit: keep all 5 GDN linears at 8-bit (`kev-4b-mlx-4bit` rule).
+                    eff_bits = 8 if (".linear_attn." in k and bits < 8) else int(bits)
+                    wq, scales, biases = mx.quantize(v.astype(mx.bfloat16), group_size=group_size, bits=eff_bits)
                     mx.eval(wq, scales, biases)
                     packed_q[stem + ".weight"] = wq
                     packed_q[stem + ".scales"] = scales
@@ -822,11 +986,16 @@ def quantize_kev_w8_artifacts(
             mx.save_safetensors(str(out_w8), packed_q)
 
     meta_w8 = dict(meta)
-    meta_w8["model_name"] = f"kev-0.8b-r15-merged-w{bits}-g{group_size}"
-    meta_w8["quantization"] = {"bits": bits, "group_size": group_size, "quantized_matrices": quant_count}
+    meta_w8["model_name"] = f"kev-{'4b' if is_4b else '0.8b-r15'}-merged-w{bits}-g{group_size}"
+    meta_w8["quantization"] = {
+        "bits": bits,
+        "gdn_bits": max(8, int(bits)),
+        "group_size": group_size,
+        "quantized_matrices": quant_count,
+    }
     (out_dir / "kev_meta_w8.json").write_text(json.dumps(meta_w8, indent=2), encoding="utf-8")
     sz_mb = (out_dir / "model_w8.safetensors").stat().st_size / (1024 * 1024)
-    print(f"[KEV-0.8B-W{bits}] Saved {out_dir / 'model_w8.safetensors'} ({sz_mb:.2f} MB, {quant_count} matrices quantized)")
+    print(f"[KEV-W{bits}] Saved {out_dir / 'model_w8.safetensors'} ({sz_mb:.2f} MB, {quant_count} matrices quantized)")
     return out_dir / "model_w8.safetensors"
 
 
@@ -842,6 +1011,12 @@ def run_build_args(args: argparse.Namespace) -> int:
         dylib = compile_native_dylib(repo_root)
         print(f"[NATIVE] Compiled {dylib}")
     if args.build_laya_ane or run_all:
+        raw_lens = getattr(args, "laya_seq_lens", None)
+        seq_lens = (
+            tuple(int(x.strip()) for x in str(raw_lens).split(",") if x.strip())
+            if raw_lens
+            else None
+        )
         build_laya_ane_artifacts(
             repo_root,
             artifacts_dir=out_artifacts,
@@ -853,16 +1028,27 @@ def run_build_args(args: argparse.Namespace) -> int:
             calib_batches=args.calib_batches,
             guard_ir=args.guard_ir,
             inspect_placement=args.inspect_placement,
+            seq_lens=seq_lens,
+            multifunction=bool(getattr(args, "multifunction", True)),
         )
+    kev_var = getattr(args, "kev_variant", "0.8b")
     if args.build_kev_mlx or run_all:
         build_kev_mlx_artifacts(
             repo_root,
             artifacts_dir=out_artifacts,
             kev_adapter_dir=args.kev_adapter_dir,
             kev_base_dir=args.kev_base_dir,
+            kev_variant=kev_var,
         )
     elif args.quantize_existing_kev_w8:
-        quantize_kev_w8_artifacts(repo_root, artifacts_dir=out_artifacts)
+        is_4b = "4b" in str(kev_var).lower()
+        quantize_kev_w8_artifacts(
+            repo_root,
+            artifacts_dir=out_artifacts,
+            group_size=32 if is_4b else 64,
+            bits=4 if is_4b else 8,
+            kev_variant=kev_var,
+        )
     return 0
 
 
@@ -872,35 +1058,45 @@ def add_setup_weights_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compile-native", action="store_true", help="Compile native/laya_ane_runner.mm -> build/liblaya_ane_runner.dylib")
     parser.add_argument("--build-laya-ane", action="store_true", help="Build & stage Laya-Typed-421M CoreML ANE W8A16 bundles")
     parser.add_argument("--laya-dir", default=None, help="Local Laya-Typed checkpoint dir (defaults to HF download)")
-    parser.add_argument("--copy-compiled-laya-from", default=None, help="Dir containing precompiled laya_typed_s{256,512}_w8.mlmodelc")
+    parser.add_argument("--copy-compiled-laya-from", default=None, help="Dir containing precompiled Laya .mlmodelc bundles")
+    parser.add_argument("--multifunction", action=argparse.BooleanOptionalAction, default=True, help="Merge Laya ANE buckets into shared-weight multifunction .mlmodelc")
     parser.add_argument("--backend", choices=("coreml", "coreai"), default="coreml", help="Laya export backend (CoreML .mlmodelc or Core AI .aimodel)")
     parser.add_argument("--coreai-preset", default=None, help="CoreAI-Opt preset (fp16, w8, w4, w4_per_block, fp4_fp8)")
     parser.add_argument("--block-size", type=int, default=32, help="CoreAI-Opt block quantization size")
     parser.add_argument("--calib-batches", type=int, default=2, help="Calibration batch count for CoreAI-Opt")
     parser.add_argument("--guard-ir", action=argparse.BooleanOptionalAction, default=True, help="Run fast_shared.ir_dtype_guard checks")
     parser.add_argument("--inspect-placement", action="store_true", help="Inspect MLComputePlan / Core AI asset statistics")
-    parser.add_argument("--build-kev-mlx", action="store_true", help="Merge & stage Kev-0.8B r15 BF16 + W8 safetensors")
-    parser.add_argument("--quantize-existing-kev-w8", action="store_true", help="Quantize staged Kev-0.8B model.safetensors -> model_w8.safetensors")
-    parser.add_argument("--kev-adapter-dir", default=None, help="Local Kev-0.8B adapter dir")
-    parser.add_argument("--kev-base-dir", default=None, help="Local Qwen3.5-0.8B-Base dir")
+    parser.add_argument("--build-kev-mlx", action="store_true", help="Merge & stage Kev BF16 + quantized safetensors")
+    parser.add_argument("--quantize-existing-kev-w8", action="store_true", help="Quantize staged Kev model.safetensors -> model_w8.safetensors")
+    parser.add_argument("--kev-variant", choices=("0.8b", "4b"), default="0.8b", help="Kev model variant (0.8b or 4b)")
+    parser.add_argument("--kev-adapter-dir", default=None, help="Local Kev adapter dir")
+    parser.add_argument("--kev-base-dir", default=None, help="Local Qwen3.5-Base dir")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build Laya-Typed ANE & Kev-0.8B MLX decision-model artifacts")
+    parser = argparse.ArgumentParser(description="Build Laya-Typed ANE & Kev MLX decision-model artifacts")
     add_setup_weights_arguments(parser)
     return run_build_args(parser.parse_args(argv))
 
 
 __all__ = [
+    "DEFAULT_LAYA_MAX_MARKERS",
+    "DEFAULT_LAYA_SEQ_LENS",
     "FP16_MIN_NORMAL",
     "KEV_SPECIAL_TOKENS",
     "_build_laya_quant_config",
+    "_build_laya_seq_mlpackage",
     "_compile_laya_seq_bundle",
     "_laya_layer_res_scale",
     "_laya_layernorm_ch_np",
     "_laya_ln_gain_and_eps",
     "_load_kev_head_tensors",
     "_load_kev_head_tensors_stdlib_zip",
+    "_precompute_rope_cos_sin",
+    "_precompute_rope_cos_sin_nchw",
+    "_precompute_sliding_window_bias",
+    "_precompute_sliding_window_bias_bkhq",
+    "_save_laya_multifunction_mlpackage",
     "acquire_hw_lock",
     "add_setup_weights_arguments",
     "build_kev_mlx_artifacts",

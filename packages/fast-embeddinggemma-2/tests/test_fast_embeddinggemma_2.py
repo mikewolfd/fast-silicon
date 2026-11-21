@@ -495,7 +495,7 @@ def test_t1_over_buckets_no_jit_and_gpu_seg_pool_mrl(engine: FastEmbeddingGemma2
 
     over_items = [(i, [2] + [100] * (520 + i * 7) + [1]) for i in range(9)]
     chunks = build_over_chunks(over_items)
-    assert sum(len(c) for _, c in chunks) == len(over_items)
+    assert sum(len(ln) for _, c in chunks for ln in c) == len(over_items)
     for ml, chk in chunks:
         assert ml in OVER_BUCKETS
         assert len(chk) in OVER_B_OPTS[ml]
@@ -753,9 +753,10 @@ def test_cpu_sme_opt_in_bounds_topology_and_explicit_cpu_mode(monkeypatch: pytes
     assert not _should_stop_hetero_cpu(0.1, 10, 1000, eff_mode="hetero3")
 
     monkeypatch.delenv("FAST_SILICON_LLM_COEXEC", raising=False)
+    # hetero3 3rd CPU-SME leg is retired (+13.6% OCR slowdown); always returns False
     assert not _allow_hetero3_cpu_worker(64, 8192, cpu_sme_available=True)
-    assert _allow_hetero3_cpu_worker(HETERO3_CPU_MIN_DOCS, 8192, cpu_sme_available=True)
-    assert _allow_hetero3_cpu_worker(32, HETERO3_CPU_MIN_TOKS, cpu_sme_available=True)
+    assert not _allow_hetero3_cpu_worker(HETERO3_CPU_MIN_DOCS, 8192, cpu_sme_available=True)
+    assert not _allow_hetero3_cpu_worker(32, HETERO3_CPU_MIN_TOKS, cpu_sme_available=True)
     assert not _allow_hetero3_cpu_worker(1000, 200000, cpu_sme_available=True, llm_coexec=True)
     monkeypatch.setenv("FAST_SILICON_LLM_COEXEC", "1")
     assert not _allow_hetero3_cpu_worker(1000, 200000, cpu_sme_available=True)
@@ -890,4 +891,266 @@ def test_nchw_output_transpose_and_build_ane_nchw_cpu() -> None:
         dst = np.empty((S, 512), dtype=np.uint16)
         lib.emb2_transpose_512xS_to_Sx512(S, src.ctypes.data, dst.ctypes.data)
         np.testing.assert_array_equal(dst, src.T)
+
+
+def test_mmap_int8_token_table_and_no_dup_cpu(tmp_path: Path) -> None:
+    """M-P1.2: Shared int8 + fp16 scale mmap token table eliminates 536.9 MB duplicate embed_scaled copies."""
+    from fast_embeddinggemma_2.paths import MmapTokenTable, write_int8_token_table
+
+    rng = np.random.default_rng(2026)
+    raw_emb = (rng.standard_normal((128, 512)) * 0.05).astype(np.float16)
+    i8_path, sc_path, _ = write_int8_token_table(tmp_path, raw_emb, pre_scale=float(512**0.5))
+    assert i8_path.is_file() and sc_path.is_file()
+
+    tbl = MmapTokenTable.from_int8_files(i8_path, sc_path, vocab_size=128, hidden_size=512, embed_scale=1.0)
+    assert isinstance(tbl.emb_i8, np.memmap) and tbl.emb_i8.flags.writeable is False
+    assert isinstance(tbl.scale_f16, np.memmap) and tbl.scale_f16.flags.writeable is False
+
+    ids = np.array([[0, 7, 42, 127], [3, -1, 19, 0]], dtype=np.int32)
+    got = tbl.gather_scaled_f16(ids)
+    assert got.shape == (2, 4, 512) and got.dtype == np.float16
+    assert np.all(got[1, 1] == 0.0)
+    ref0 = (raw_emb[0].astype(np.float32) * (512.0**0.5))
+    got0 = got[0, 0].astype(np.float32)
+    cos0 = float(np.dot(ref0, got0) / (np.linalg.norm(ref0) * np.linalg.norm(got0) + 1e-12))
+    assert cos0 >= 0.9995
+    tbl.close()
+
+
+def test_hetero3_retired_and_multifunction_builder_cpu() -> None:
+    """M-P1.2: hetero3 routes to 2-way hetero; ANE builder supports save_multifunction + parallel compile."""
+    import importlib.util
+
+    from fast_embeddinggemma_2.engine import FastEmbeddingGemma2, _allow_hetero3_cpu_worker
+
+    stub = FastEmbeddingGemma2.__new__(FastEmbeddingGemma2)
+    stub.ane_available = True
+    stub.cpu_sme_available = True
+    assert stub._resolve_mode("hetero") == "hetero"
+    assert stub._resolve_mode("hetero2") == "hetero"
+    assert stub._resolve_mode("hetero3") == "hetero"
+    assert _allow_hetero3_cpu_worker(2048, 500_000, cpu_sme_available=True) is False
+
+    pkg_root = Path(__file__).resolve().parent.parent
+    script_path = pkg_root / "scripts" / "build_ane_models.py"
+    spec = importlib.util.spec_from_file_location("emb2_build_ane_v2", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert hasattr(mod, "build_ane_multifunction_w8")
+    assert mod.emb2_function_name(256) == "emb2_pk_s256"
+    assert max(mod.DEFAULT_ANE_SEQS) <= 512
+    with pytest.raises(ValueError, match="<= 512"):
+        mod.build_ane_multifunction_w8(Path("dummy.npz"), Path("dummy_out"), seq_lens=(256, 1024))
+    src = script_path.read_text(encoding="utf-8")
+    assert "save_multifunction" in src
+    assert "compile_buckets_parallel" in src
+
+
+def test_emb2_prep_batch_swa_band_and_neg40000_cpu() -> None:
+    """M-P1.2: emb2_prep_batch & emb2_prep_batch_i8 enforce -40000.0 mask literal and |q - k| <= 512 SWA band."""
+    import ctypes
+
+    pkg_root = Path(__file__).resolve().parent.parent
+    cpp_src = (pkg_root / "native" / "emb2_fast_io.cpp").read_text(encoding="utf-8")
+    eng_src = (pkg_root / "src" / "fast_embeddinggemma_2" / "engine.py").read_text(encoding="utf-8")
+    assert "-40000.0" in eng_src
+    assert "-10000.0" not in eng_src
+    assert "512" in cpp_src
+
+    io_dylib = pkg_root / "build" / "libemb2_fast_io.dylib"
+    if not io_dylib.is_file():
+        io_dylib = resolve_paths().io_dylib
+    assert io_dylib.is_file()
+    lib = ctypes.CDLL(str(io_dylib))
+    assert hasattr(lib, "emb2_prep_batch_i8")
+
+    lib.emb2_prep_batch_i8.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint16,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.emb2_prep_batch_i8.restype = None
+
+    S = 1024
+    emb_i8 = np.ones((16, 512), dtype=np.int8) * 10
+    sc_f16 = np.full((16,), 0.5, dtype=np.float16)
+    c256 = np.zeros((S, 128), dtype=np.uint16)
+    s256 = np.zeros((S, 128), dtype=np.uint16)
+    c512 = np.zeros((S, 256), dtype=np.uint16)
+    s512 = np.zeros((S, 256), dtype=np.uint16)
+    ids = np.zeros((1, S), dtype=np.int32)
+    ids[0, 5] = 99999  # OOB >= vocab_size(16) -> safely zeroed
+    ids[0, 900:] = -1
+    pos = np.arange(S, dtype=np.int32)[None, :]
+    pos[0, 5] = 99999  # OOB >= max_pos(S) -> safely clamped to 0
+    span_offsets = np.array([0, 1], dtype=np.int32)
+    spans_se = np.array([[0, 900]], dtype=np.int32)
+    neg_u16 = int(np.float16(-40000.0).view(np.uint16))
+
+    h_all = np.empty((1, 512, S), dtype=np.float16)
+    b_all = np.empty((1, S, S), dtype=np.float16)
+    cs_all = np.empty((1, S, 128), dtype=np.uint16)
+    ss_all = np.empty((1, S, 128), dtype=np.uint16)
+    cf_all = np.empty((1, S, 256), dtype=np.uint16)
+    sf_all = np.empty((1, S, 256), dtype=np.uint16)
+
+    lib.emb2_prep_batch_i8(
+        1, S,
+        emb_i8.ctypes.data, sc_f16.ctypes.data, 16, S, 2.0,
+        c256.ctypes.data, s256.ctypes.data, c512.ctypes.data, s512.ctypes.data,
+        ids.ctypes.data, pos.ctypes.data, span_offsets.ctypes.data, spans_se.ctypes.data,
+        neg_u16,
+        h_all.ctypes.data, b_all.ctypes.data,
+        cs_all.ctypes.data, ss_all.ctypes.data, cf_all.ctypes.data, sf_all.ctypes.data,
+    )
+    # 10 * 0.5 * 2.0 = 10.0 on valid in-range positions, 0.0 on OOB idx 5 and padded [-1] tail [900, 1024)
+    assert np.allclose(h_all[0, :, :5], 10.0)
+    assert np.all(h_all[0, :, 5] == 0.0)
+    assert np.allclose(h_all[0, :, 6:900], 10.0)
+    assert np.all(h_all[0, :, 900:] == 0.0)
+    # Within segment [0, 900): |q - k| <= 512 is 0.0, |q - k| > 512 is -40000.0, cross-segment is -40000.0
+    assert float(b_all[0, 0, 512]) == 0.0
+    assert float(b_all[0, 0, 513]) == float(np.float16(-40000.0))
+    assert float(b_all[0, 600, 87]) == float(np.float16(-40000.0))
+    assert float(b_all[0, 600, 88]) == 0.0
+    assert float(b_all[0, 899, 900]) == float(np.float16(-40000.0))
+
+
+def test_over_varlen_1024_1536_2048_packing_cpu() -> None:
+    """M-P1.2: >512-tok GPU planner preserves 640/768 fast buckets AND varlen-packs complementary pairs into 1536/2048."""
+    from fast_embeddinggemma_2.gpu import OVER_B_OPTS, OVER_BUCKETS, build_over_chunks
+
+    assert OVER_BUCKETS == (640, 768, 1024, 1536, 2048)
+    assert OVER_B_OPTS == {
+        640: (4, 2, 1),
+        768: (4, 2, 1),
+        1024: (4, 2, 1),
+        1536: (1,),
+        2048: (1,),
+    }
+
+    # 1150 (1536: 117.4ms) + 850 (1024: 72.2ms) = 189.6ms > 183.5ms -> packs into ONE 2048 lane!
+    items_2048 = [(0, [2] * 1150), (1, [2] * 850)]
+    c2048 = list(build_over_chunks(items_2048))
+    assert len(c2048) == 1
+    ml, lanes = c2048[0]
+    assert ml == 2048 and len(lanes) == 1 and len(lanes[0]) == 2
+
+    # 1350 (1536: 117.4ms) + 680 (768: 50.9ms) = 168.3ms < 183.5ms -> stays in 1536 + 768 instead of slower 2048!
+    c_no_overpack = list(build_over_chunks([(0, [2] * 1350), (1, [2] * 680)]))
+    assert [m for m, _ in c_no_overpack] == [768, 1536]
+
+    # Single 1300-tok doc stays in 1536 instead of inflating +78% attention FLOPs to 2048!
+    c1536_single = list(build_over_chunks([(0, [2] * 1300)]))
+    assert len(c1536_single) == 1 and c1536_single[0][0] == 1536
+
+    # Homogeneous 600-tok docs stay in 640 lanes batched at B=2 (avoiding 2.88x quadratic attention inflation)
+    c640_b2 = list(build_over_chunks([(0, [2] * 600), (1, [2] * 610)]))
+    assert len(c640_b2) == 1 and c640_b2[0][0] == 640 and len(c640_b2[0][1]) == 2
+
+
+def test_varlen_over_gpu_no_cross_doc_leakage_and_mmap_shared(engine: FastEmbeddingGemma2) -> None:
+    """M-P1.2: Packed >512 GPU lanes match isolated single-doc runs (cos >= 0.9998) with zero duplicate embed_scaled."""
+    assert engine.gpu.embed_scaled is None
+    assert engine._emb_scaled_np is None
+    assert engine._token_table is engine.gpu.token_table
+
+    rng = np.random.default_rng(5122048)
+    toks = [
+        [engine.tokenizer.bos_id] + rng.integers(100, 30000, size=ln - 2).tolist() + [engine.tokenizer.eos_id]
+        for ln in (620, 1280, 710, 680, 1340, 590, 1890)
+    ]
+    v_packed = engine.encode_corpus(toks, mode="gpu")
+    v_iso = np.stack([engine.encode_query(t, prefer_ane=False) for t in toks], axis=0)
+    assert v_packed.shape == (len(toks), 768)
+    assert float(np.min(np.sum(v_packed * v_iso, axis=1))) >= 0.9998
+
+
+def test_openinfinity_zero_compile_loader_parity() -> None:
+    """M-P1.2: Zero-compile OpenInfinity loader runs EmbeddingGemma2Text.mlmodelc + embeddings.int8 on ANE."""
+    from fast_embeddinggemma_2.paths import resolve_openinfinity_dir
+
+    try:
+        oi_dir = resolve_openinfinity_dir(local_files_only=True)
+    except FileNotFoundError:
+        pytest.skip("OpenInfinity snapshot not cached locally")
+
+    ref = np.load(FIXTURE_64)
+    lens = ref["lens"]
+    sub_le512 = [ref["ids"][i, : int(lens[i])].tolist() for i in range(16) if int(lens[i]) <= 512]
+    ref_le512 = np.stack([ref["v_f16"][i] for i in range(16) if int(lens[i]) <= 512], axis=0)
+
+    with FastEmbeddingGemma2.from_openinfinity(oi_dir, warmup=False, verify_ane_plan=False) as oi_eng:
+        assert oi_eng.ane_available is True
+        assert oi_eng._gpu is None
+        q0 = oi_eng.encode_query(sub_le512[0], prefer_ane=True)
+        assert q0.shape == (768,) and abs(float(np.linalg.norm(q0)) - 1.0) < 1e-4
+        assert float(np.dot(q0, ref_le512[0])) >= 0.9990
+
+        v_batch = oi_eng.encode_corpus(sub_le512, mode="ane")
+        assert v_batch.shape == (len(sub_le512), 768)
+        assert float(np.min(np.sum(v_batch * ref_le512, axis=1))) >= 0.9990
+        v_256 = oi_eng.encode_corpus(sub_le512[:4], mode="ane", dimensions=256)
+        assert v_256.shape == (4, 256)
+        assert np.allclose(np.linalg.norm(v_256, axis=1), 1.0, atol=1e-4)
+        assert oi_eng._gpu is None
+
+    # Verify direct FastEmbeddingGemma2(openinfinity_dir=..., default_mode="hetero", warmup=True)
+    # works even when home has NO weights_npz on disk, and mode="hetero" routes <=512 docs to OpenInfinity!
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as empty_home:
+        empty_root = Path(empty_home)
+        (empty_root / "build").mkdir()
+        src_paths = resolve_paths()
+        for dylib in (src_paths.coreml_dylib, src_paths.io_dylib):
+            (empty_root / "build" / dylib.name).symlink_to(dylib)
+        with FastEmbeddingGemma2(
+            home=empty_root,
+            openinfinity_dir=oi_dir,
+            default_mode="hetero",
+            warmup=True,
+            verify_ane_plan=False,
+        ) as oi_het:
+            assert oi_het.default_mode == "ane"
+            assert oi_het._gpu is None
+            v_het = oi_het.encode_texts(["first test query", "second document body"], mode="hetero")
+            assert v_het.shape == (2, 768)
+            assert np.allclose(np.linalg.norm(v_het, axis=1), 1.0, atol=1e-4)
+
+
+def test_multifunction_symlinks_and_native_guards_cpu() -> None:
+    """Verify setup_all.py relative symlink emission and @available(macOS 15.0, *) guards."""
+    pkg_root = Path(__file__).resolve().parent.parent
+    build_src = (pkg_root / "scripts" / "build_ane_models.py").read_text(encoding="utf-8")
+    runner_src = (pkg_root / "native" / "emb2_coreml_runner.mm").read_text(encoding="utf-8")
+    cli_src = (pkg_root / "native" / "emb2_ane_cli.mm").read_text(encoding="utf-8")
+
+    assert "os.symlink(out_mlmodelc.name, link_p)" in build_src
+    assert "@available(macOS 15.0, *)" in runner_src
+    assert 'std::strcmp(function_name, "main") != 0' in runner_src
+    for cap in ("64", "192", "320", "448"):
+        assert cap in cli_src
+
 

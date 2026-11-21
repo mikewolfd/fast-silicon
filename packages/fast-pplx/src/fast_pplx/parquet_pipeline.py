@@ -473,6 +473,8 @@ def embed_contextual_parquet(
         win_chunks = [e[2] for e in entries]
         win_vecs: list[np.ndarray] = []
         tok_count = 0
+        encode_ctx_toks_fn = getattr(engine, "encode_contextual_tokens", None)
+        eff_max_len = getattr(engine, "max_seq_len", None)
         for st in range(0, len(win_chunks), eff_window_batch):
             sub = win_chunks[st : st + eff_window_batch]
             enc_kw: dict[str, Any] = {
@@ -482,9 +484,16 @@ def embed_contextual_parquet(
             }
             if mode is not None:
                 enc_kw["mode"] = mode
-            win_vecs.extend(engine.encode_contextual_chunks(sub, **enc_kw))
-            for chunks_w in sub:
-                tok_count += len(tokenizer.encode_contextual_document(chunks_w, return_spans=False))
+            if callable(encode_ctx_toks_fn):
+                encoded_sub = [
+                    tokenizer.encode_contextual_document(chunks_w, return_spans=True, max_length=eff_max_len)
+                    for chunks_w in sub
+                ]
+                tok_count += sum(len(ids) for ids, _ in encoded_sub)
+                win_vecs.extend(encode_ctx_toks_fn(encoded_sub, **enc_kw))
+            else:
+                win_vecs.extend(engine.encode_contextual_chunks(sub, **enc_kw))
+                tok_count += sum(len(chunks_w) for chunks_w in sub)
         clear_mlx_arena(256)
         return win_vecs, tok_count
 

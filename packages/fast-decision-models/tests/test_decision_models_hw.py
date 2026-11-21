@@ -319,3 +319,78 @@ def test_kev08b_default_auto_hit_share_routing() -> None:
             got_shared_2 = kev_auto.score_multi_states([(shared_a, [q_tls]), (shared_b, [q_tls])], batch_docs=4)
             assert kev_auto.prefix_tree.hits == 3
             assert got_shared_1 == got_shared_2
+
+
+def test_kev08b_prebuilt_abstractframework_zero_compile_and_lcp_parity() -> None:
+    """Verify zero-compile loading of cached `AbstractFramework/kev-0.8b-mlx-8bit` + 1-pass & batched LCP parity."""
+    from pathlib import Path
+    from fast_decision_models.paths import DEFAULT_KEV_08B_MLX_REPO
+
+    hub_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--AbstractFramework--kev-0.8b-mlx-8bit" / "snapshots"
+    snaps = sorted(hub_root.glob("*")) if hub_root.is_dir() else []
+    if not snaps or not (snaps[-1] / "model.safetensors").is_file():
+        pytest.skip(f"Missing cached {DEFAULT_KEV_08B_MLX_REPO}")
+
+    pairs = [(st, [qd]) for st, qd, _ in _SAMPLE_CASES]
+    shared_preamble = " ".join(
+        f"Cluster Policy {i}: Rotate all edge load balancer TLS certificates every 30 days with automated alerts."
+        for i in range(6)
+    )
+    lcp_pairs = [(shared_preamble + f" Variant {i}: " + st, [qd]) for i, (st, qd, _) in enumerate(_SAMPLE_CASES)]
+
+    with acquire_hw_lock("test_kev08b_prebuilt_af"):
+        with Kev08bMlxBackend(snaps[-1], batch_docs=4) as kev_af:
+            b1 = [kev_af.score_multi_states_noul([p], batch_docs=1)[0][0][0] for p in pairs]
+            b4 = [r[0][0] for r in kev_af.score_multi_states_noul(pairs, batch_docs=4)]
+            lcp_b1 = [kev_af.score_multi_states_noul([p], batch_docs=1)[0][0][0] for p in lcp_pairs]
+            lcp_b4 = [r[0][0] for r in kev_af.score_multi_states_noul(lcp_pairs, batch_docs=4)]
+
+    for idx, (p1, p4, (_, _, expected)) in enumerate(zip(b1, b4, _SAMPLE_CASES)):
+        assert abs(p1 - p4) < 1.5e-2, f"Prebuilt Kev-0.8B B=1 vs B=4 drift[{idx}]: {p1:.5f} vs {p4:.5f}"
+        assert (p4 >= 0.5) == expected
+    for idx, (lp1, lp4) in enumerate(zip(lcp_b1, lcp_b4)):
+        assert abs(lp1 - lp4) < 2e-2, f"Prebuilt Kev-0.8B LCP B=1 vs B=4 drift[{idx}]: {lp1:.5f} vs {lp4:.5f}"
+
+
+def test_laya_nmtz_zero_compile_and_hetero_engine_hw(tmp_path) -> None:
+    """Verify zero-compile `NMTZ` CoreML ANE adapter, `LayaMlxGpuBackend`, and `LayaHeteroEngine` real-weight parity."""
+    from pathlib import Path
+    from fast_decision_models.laya_hetero import LayaHeteroEngine, LayaMlxGpuBackend
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    nmtz_snaps = sorted((hub / "models--NMTZ--laya-typed-decisions-421m-coreml-ane" / "snapshots").glob("*"))
+    src_snaps = sorted((hub / "models--convaiinnovations--laya-typed-decisions" / "snapshots").glob("*"))
+    if not nmtz_snaps or not src_snaps or not (src_snaps[-1] / "model.safetensors").is_file():
+        pytest.skip("Missing cached NMTZ or Laya-Typed HuggingFace snapshots")
+
+    empty_laya_dir = tmp_path / "empty_laya_dir"
+    with acquire_hw_lock("test_laya_nmtz_and_hetero_hw"):
+        # 1. Zero-compile NMTZ load when local laya_dir has no compiled .mlmodelc bundles!
+        with LayaAneBackend(empty_laya_dir, ensure_laya_dylib(), pipe_depth=4, auto_prebuilt=True) as laya_nmtz:
+            plans = laya_nmtz.inspect_compute_plans()
+            assert "s512" in plans and "s192" in plans
+            for bucket, (ane_ops, gpu_ops, cpu_ops) in plans.items():
+                assert gpu_ops == 0 and cpu_ops == 0 and ane_ops > 1000, f"Unexpected NMTZ {bucket} plan: {(ane_ops, gpu_ops, cpu_ops)}"
+            encs_short = [laya_nmtz.encode_item(st, qd) for st, qd, _ in _SAMPLE_CASES]
+            nmtz_ps = laya_nmtz.score_noul_batch(encs_short)
+            for idx, (p, (_, _, expected)) in enumerate(zip(nmtz_ps, _SAMPLE_CASES)):
+                assert (p >= 0.5) == expected, f"NMTZ sample[{idx}] expected {expected}, got {p:.4f}"
+
+        # 2. LayaMlxGpuBackend + LayaHeteroEngine (`mode='ane'` vs `mode='hetero'`)
+        with LayaMlxGpuBackend(src_snaps[-1], batch_size=4) as laya_gpu:
+            gpu_ps = laya_gpu.score_noul_batch(encs_short)
+            for idx, (pg, pn, (_, _, expected)) in enumerate(zip(gpu_ps, nmtz_ps, _SAMPLE_CASES)):
+                assert (pg >= 0.5) == expected
+                assert abs(pg - pn) < 0.08, f"GPU vs NMTZ sample[{idx}] drift: {pg:.4f} vs {pn:.4f}"
+
+        long_items = [
+            (" ".join([st] * 14), qd, exp)
+            for st, qd, exp in _SAMPLE_CASES
+        ]
+        mixed_cases = list(_SAMPLE_CASES) + long_items
+        with LayaHeteroEngine(laya_dir=resolve_laya_dir(), laya_src_dir=src_snaps[-1], mode="hetero", profile="backfill") as het:
+            mixed_encs = [het.encode_item(st, qd, on_truncate="ignore") for st, qd, _ in mixed_cases]
+            het_ps = het.score_noul_batch(mixed_encs)
+            for idx, (ph, (_, _, expected)) in enumerate(zip(het_ps, mixed_cases)):
+                assert (ph >= 0.5) == expected, f"Hetero sample[{idx}] expected {expected}, got {ph:.4f}"
+

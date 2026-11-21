@@ -42,6 +42,7 @@ PRODUCTION_BUCKETS = [
     (1, 64),
     (1, 128),
     (1, 192),
+    (1, 256),
     (8, 256),
     (1, 320),
     (1, 384),
@@ -49,10 +50,17 @@ PRODUCTION_BUCKETS = [
     (1, 512),
 ]
 
-# Optional single-query S=256 bucket eliminating the 193..256 -> 320 query padding gap.
+# Retained for backward compatibility with external scripts/tests; (1, 256) is now included by default.
 OPTIONAL_QUERY_BUCKETS = [
     (1, 256),
 ]
+
+MULTIFUNCTION_BUNDLE_NAME = "bge_ane_w8a16.mlmodelc"
+
+
+def bge_function_name(batch_size: int, seq_len: int) -> str:
+    """Canonical multifunction entry name for a `(B, S)` BGE-small ANE bucket."""
+    return f"bge_b{int(batch_size)}_s{int(seq_len)}"
 
 
 def safe_fp16_layernorm_epsilon(eps: float = 1e-12) -> np.float16:
@@ -204,22 +212,17 @@ def build_bert_ane_mil(
 _WORKER_NPZ_CACHE: dict[tuple[str, int], dict[str, np.ndarray]] = {}
 
 
-def compile_bucket(
+def _convert_bge_mlmodel(
     weights: dict[str, np.ndarray],
-    ane_dir: Path,
     batch_size: int,
     seq_len: int,
     *,
     layer_norm_eps: float = 1e-12,
-) -> Path:
+    quantize_w8a16: bool = True,
+):
     import coremltools as ct
-    import shutil
-    import tempfile
+    import coremltools.optimize.coreml as cto
 
-    tag = f"bge_b{batch_size}_s{seq_len}_fp16"
-    out_mlmodelc = ane_dir / f"{tag}.mlmodelc"
-
-    t0 = time.perf_counter()
     prog = build_bert_ane_mil(weights, batch_size, seq_len, layer_norm_eps=layer_norm_eps)
     mlmodel = ct.convert(
         prog,
@@ -228,6 +231,43 @@ def compile_bucket(
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         skip_model_load=True,
+    )
+    if quantize_w8a16:
+        qcfg = cto.OptimizationConfig(
+            global_config=cto.OpLinearQuantizerConfig(
+                mode="linear_symmetric",
+                dtype="int8",
+                granularity="per_channel",
+            )
+        )
+        mlmodel = cto.linear_quantize_weights(mlmodel, config=qcfg)
+    return mlmodel
+
+
+def compile_bucket(
+    weights: dict[str, np.ndarray],
+    ane_dir: Path,
+    batch_size: int,
+    seq_len: int,
+    *,
+    layer_norm_eps: float = 1e-12,
+    quantize_w8a16: bool = True,
+) -> Path:
+    import coremltools as ct
+    import shutil
+    import tempfile
+
+    suffix = "w8a16" if quantize_w8a16 else "fp16"
+    tag = f"bge_b{batch_size}_s{seq_len}_{suffix}"
+    out_mlmodelc = ane_dir / f"{tag}.mlmodelc"
+
+    t0 = time.perf_counter()
+    mlmodel = _convert_bge_mlmodel(
+        weights,
+        batch_size,
+        seq_len,
+        layer_norm_eps=layer_norm_eps,
+        quantize_w8a16=quantize_w8a16,
     )
     with tempfile.TemporaryDirectory(prefix=f"{tag}_") as tmp_dir:
         pkg_path = Path(tmp_dir) / f"{tag}.mlpackage"
@@ -242,9 +282,33 @@ def compile_bucket(
     return out_mlmodelc
 
 
-def _compile_bge_bucket_task(task: tuple[str, str, int, int, float]) -> str:
+def _save_bge_mlpackage_task(task: tuple[str, str, int, int, float, bool]) -> tuple[str, str]:
+    """Top-level `spawn`-safe worker saving one `(B, S)` `.mlpackage` for multifunction merging."""
+    npz_path_str, pkg_dir_str, batch_size, seq_len, layer_norm_eps, quantize_w8a16 = task
+    npz_p = Path(npz_path_str)
+    cache_key = (str(npz_p), npz_p.stat().st_mtime_ns)
+    weights = _WORKER_NPZ_CACHE.get(cache_key)
+    if weights is None:
+        with np.load(npz_p) as npz_obj:
+            weights = {k: npz_obj[k] for k in npz_obj.files}
+        _WORKER_NPZ_CACHE.clear()
+        _WORKER_NPZ_CACHE[cache_key] = weights
+    fn_name = bge_function_name(batch_size, seq_len)
+    mlmodel = _convert_bge_mlmodel(
+        weights,
+        int(batch_size),
+        int(seq_len),
+        layer_norm_eps=float(layer_norm_eps),
+        quantize_w8a16=bool(quantize_w8a16),
+    )
+    pkg_path = Path(pkg_dir_str) / f"{fn_name}.mlpackage"
+    mlmodel.save(str(pkg_path))
+    return fn_name, str(pkg_path)
+
+
+def _compile_bge_bucket_task(task: tuple[str, str, int, int, float, bool]) -> str:
     """Top-level `spawn`-safe worker task compiling one `(B, S)` BGE-small `.mlmodelc` bucket."""
-    npz_path_str, ane_dir_str, batch_size, seq_len, layer_norm_eps = task
+    npz_path_str, ane_dir_str, batch_size, seq_len, layer_norm_eps, quantize_w8a16 = task
     npz_p = Path(npz_path_str)
     cache_key = (str(npz_p), npz_p.stat().st_mtime_ns)
     weights = _WORKER_NPZ_CACHE.get(cache_key)
@@ -259,6 +323,7 @@ def _compile_bge_bucket_task(task: tuple[str, str, int, int, float]) -> str:
         int(batch_size),
         int(seq_len),
         layer_norm_eps=float(layer_norm_eps),
+        quantize_w8a16=bool(quantize_w8a16),
     )
     return str(out_path)
 
@@ -281,6 +346,87 @@ def _parse_bucket_specs(spec: str) -> list[tuple[int, int]]:
     return buckets
 
 
+def build_multifunction_bundle(
+    npz_path: Path,
+    ane_dir: Path,
+    buckets: Sequence[tuple[int, int]],
+    *,
+    jobs: int | None = None,
+    layer_norm_eps: float = 1e-12,
+    quantize_w8a16: bool = True,
+    bundle_name: str = MULTIFUNCTION_BUNDLE_NAME,
+) -> Path:
+    """Export all `(B, S)` buckets in parallel, deduplicate shared W8A16 weights via `save_multifunction`, and compile."""
+    import coremltools as ct
+    import shutil
+    import tempfile
+
+    if not buckets:
+        raise ValueError("At least one (B, S) bucket is required for multifunction compilation.")
+    ane_dir.mkdir(parents=True, exist_ok=True)
+    eff_jobs = default_compile_jobs(jobs)
+    out_mlmodelc = ane_dir / bundle_name
+
+    t0 = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="bge_mf_stage_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        tasks = [
+            (
+                str(npz_path.resolve()),
+                str(tmp_root),
+                int(b),
+                int(s),
+                float(layer_norm_eps),
+                bool(quantize_w8a16),
+            )
+            for b, s in buckets
+        ]
+        results = compile_buckets_parallel(
+            tasks,
+            _save_bge_mlpackage_task,
+            max_workers=eff_jobs,
+            label_fn=lambda t: bge_function_name(t[2], t[3]),
+            extra_sys_paths=(Path(__file__).resolve().parent,),
+        )
+
+        desc = ct.utils.MultiFunctionDescriptor()
+        default_fn: str | None = None
+        for res in results:
+            fn_name, pkg_path_str = res.value
+            desc.add_function(pkg_path_str, "main", fn_name)
+            if default_fn is None:
+                default_fn = fn_name
+        assert default_fn is not None
+        desc.default_function_name = default_fn
+
+        merged_pkg = tmp_root / "bge_merged.mlpackage"
+        ct.utils.save_multifunction(desc, str(merged_pkg))
+        compiled_tmp = Path(ct.utils.compile_model(str(merged_pkg)))
+        try:
+            atomic_publish_dir(compiled_tmp, out_mlmodelc, move=True)
+        except Exception:
+            shutil.rmtree(compiled_tmp, ignore_errors=True)
+            raise
+
+    for b, s in buckets:
+        for sym_suffix in ("fp16", "w8a16"):
+            link_p = ane_dir / f"bge_b{int(b)}_s{int(s)}_{sym_suffix}.mlmodelc"
+            if link_p == out_mlmodelc:
+                continue
+            if link_p.exists() or link_p.is_symlink():
+                if link_p.is_symlink() or link_p.is_file():
+                    link_p.unlink()
+                else:
+                    shutil.rmtree(link_p)
+            os.symlink(out_mlmodelc.name, link_p)
+
+    print(
+        f"Built multifunction {bundle_name} ({len(buckets)} functions) in {time.perf_counter() - t0:.2f}s -> {out_mlmodelc}",
+        flush=True,
+    )
+    return out_mlmodelc
+
+
 def build_buckets(
     npz_path: Path,
     ane_dir: Path,
@@ -288,26 +434,35 @@ def build_buckets(
     *,
     jobs: int | None = None,
     layer_norm_eps: float = 1e-12,
+    quantize_w8a16: bool = True,
 ) -> list[Path]:
-    """Compile BGE-small CoreML buckets across `spawn` workers and return paths in deterministic order."""
+    """Compile separate BGE-small CoreML buckets across `spawn` workers in deterministic order."""
     ane_dir.mkdir(parents=True, exist_ok=True)
     eff_jobs = default_compile_jobs(jobs)
+    suffix = "w8a16" if quantize_w8a16 else "fp16"
     tasks = [
-        (str(npz_path.resolve()), str(ane_dir.resolve()), int(b), int(s), float(layer_norm_eps))
+        (
+            str(npz_path.resolve()),
+            str(ane_dir.resolve()),
+            int(b),
+            int(s),
+            float(layer_norm_eps),
+            bool(quantize_w8a16),
+        )
         for b, s in buckets
     ]
     results = compile_buckets_parallel(
         tasks,
         _compile_bge_bucket_task,
         max_workers=eff_jobs,
-        label_fn=lambda t: f"bge_b{t[2]}_s{t[3]}_fp16",
+        label_fn=lambda t: f"bge_b{t[2]}_s{t[3]}_{suffix}",
         extra_sys_paths=(Path(__file__).resolve().parent,),
     )
     return [Path(res.value) for res in results]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compile CoreML .mlmodelc ANE buckets.")
+    parser = argparse.ArgumentParser(description="Compile CoreML W8A16 multifunction ANE bundle (or separate buckets).")
     parser.add_argument("--home", type=Path, default=repo_root())
     parser.add_argument(
         "--out-dir",
@@ -318,7 +473,17 @@ def main() -> None:
     parser.add_argument(
         "--include-s256-query",
         action="store_true",
-        help="Also build optional bge_b1_s256_fp16.mlmodelc single-query bucket (fills 193..256 gap).",
+        help="Compatibility flag (bge_b1_s256 is now included in default buckets).",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Disable symmetric W8A16 weight quantization and keep FP16 weights.",
+    )
+    parser.add_argument(
+        "--separate-buckets",
+        action="store_true",
+        help="Emit individual per-bucket .mlmodelc directories instead of a unified multifunction bundle.",
     )
     parser.add_argument(
         "--buckets",
@@ -344,16 +509,30 @@ def main() -> None:
     else:
         buckets = list(PRODUCTION_BUCKETS)
         if args.include_s256_query:
-            buckets.extend(OPTIONAL_QUERY_BUCKETS)
+            for item in OPTIONAL_QUERY_BUCKETS:
+                if item not in buckets:
+                    buckets.append(item)
 
     eff_jobs = default_compile_jobs(args.jobs)
+    quantize_w8a16 = not args.fp16
     t0 = time.perf_counter()
-    built = build_buckets(npz_path, ane_dir, buckets, jobs=eff_jobs)
-    print(
-        f"Compiled {len(built)} BGE-small ANE bucket(s) with jobs={min(eff_jobs, len(built))} "
-        f"in {time.perf_counter() - t0:.2f}s -> {ane_dir}",
-        flush=True,
-    )
+    if args.separate_buckets:
+        built = build_buckets(npz_path, ane_dir, buckets, jobs=eff_jobs, quantize_w8a16=quantize_w8a16)
+        print(
+            f"Compiled {len(built)} BGE-small ANE bucket(s) with jobs={min(eff_jobs, len(built))} "
+            f"in {time.perf_counter() - t0:.2f}s -> {ane_dir}",
+            flush=True,
+        )
+    else:
+        bundle_name = MULTIFUNCTION_BUNDLE_NAME if quantize_w8a16 else "bge_ane_fp16.mlmodelc"
+        build_multifunction_bundle(
+            npz_path,
+            ane_dir,
+            buckets,
+            jobs=eff_jobs,
+            quantize_w8a16=quantize_w8a16,
+            bundle_name=bundle_name,
+        )
 
 
 if __name__ == "__main__":

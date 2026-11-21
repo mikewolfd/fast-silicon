@@ -98,6 +98,9 @@ def export_from_dir(model_dir: Path, home_dir: Path) -> Path:
 
     out_npz = weights_dir / "embeddinggemma_2_f16.npz"
     np.savez(out_npz, **d)
+    from fast_embeddinggemma_2.paths import write_int8_token_table
+
+    write_int8_token_table(weights_dir, d["embed_tokens"], pre_scale=float(d["embed_tokens"].shape[1] ** 0.5))
     copy_tokenizer_files(model_dir, tok_dir, TOKENIZER_FILES)
     print(f"Exported {len(d)} tensors to {out_npz} ({out_npz.stat().st_size / 1e6:.2f} MB)")
     return out_npz

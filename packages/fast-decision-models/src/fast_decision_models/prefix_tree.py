@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import struct
@@ -10,6 +11,9 @@ from typing import Any, Callable, Sequence
 
 ROOT_KEY: str = "root"
 DEFAULT_CHUNK_TOKENS: int = 256
+DEFAULT_ROLLING_WINDOW: int = 32
+DEFAULT_MIN_HIT_RATE: float = 0.15
+DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS: int = 16
 _MIB = 1 << 20
 _GIB = 1 << 30
 _INT32_MIN = -(1 << 31)
@@ -127,6 +131,8 @@ class PrefixTree:
       - For hybrid models (`needs_snapshot=True`), reuse caps at the deepest matched node carrying a snapshot.
       - `0 <= bytes_held <= byte_budget` is strictly enforced; eviction drops LRU leaves (`children == 0`) only,
         never stranding a child without its ancestors and never evicting the active protected chain.
+      - Rolling hit-rate circuit breaker (`< 15%` hits after warmup window) skips cold snapshot writes on
+        unshared backfill streams while continuing to serve warm hits and interactive sessions.
     """
 
     def __init__(
@@ -134,18 +140,27 @@ class PrefixTree:
         *,
         chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         byte_budget: int = 256 * _MIB,
+        rolling_window: int = DEFAULT_ROLLING_WINDOW,
+        min_hit_rate: float = DEFAULT_MIN_HIT_RATE,
+        circuit_breaker_min_lookups: int = DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS,
     ) -> None:
         if int(chunk_tokens) <= 0:
             raise ValueError(f"chunk_tokens must be positive, got {chunk_tokens}")
         if int(byte_budget) < 0:
             raise ValueError(f"byte_budget must be non-negative, got {byte_budget}")
+        if int(rolling_window) <= 0:
+            raise ValueError(f"rolling_window must be positive, got {rolling_window}")
         self.chunk_tokens = int(chunk_tokens)
         self.byte_budget = int(byte_budget)
+        self.rolling_window = int(rolling_window)
+        self.min_hit_rate = float(min_hit_rate)
+        self.circuit_breaker_min_lookups = max(1, int(circuit_breaker_min_lookups))
 
         self._lock = threading.RLock()
         self._nodes: dict[str, _PrefixNode] = {}
         self._clock: int = 0
         self._bytes_held: int = 0
+        self._recent_outcomes: deque[bool] = deque(maxlen=self.rolling_window)
 
         self.hits: int = 0
         self.misses: int = 0
@@ -167,6 +182,34 @@ class PrefixTree:
     def snapshot_count(self) -> int:
         with self._lock:
             return sum(1 for n in self._nodes.values() if n.snapshot is not None)
+
+    @property
+    def rolling_hit_rate(self) -> float:
+        with self._lock:
+            if not self._recent_outcomes:
+                return 0.0
+            return sum(1 for ok in self._recent_outcomes if ok) / len(self._recent_outcomes)
+
+    @property
+    def circuit_breaker_open(self) -> bool:
+        with self._lock:
+            if len(self._recent_outcomes) < self.circuit_breaker_min_lookups:
+                return False
+            hits_w = sum(1 for ok in self._recent_outcomes if ok)
+            return (hits_w / len(self._recent_outcomes)) < self.min_hit_rate
+
+    def should_write_snapshots(self, profile: str = "auto") -> bool:
+        """Return True when cold prefixes should write snapshots (`True` for `interactive`, gated by circuit breaker otherwise)."""
+        if self.byte_budget <= 0:
+            return False
+        if str(profile).strip().lower() == "interactive":
+            return True
+        return not self.circuit_breaker_open
+
+    def reset_circuit_breaker(self) -> None:
+        """Clear rolling hit-rate history so snapshot writes re-arm immediately."""
+        with self._lock:
+            self._recent_outcomes.clear()
 
     def has_snapshot(self, key: str) -> bool:
         with self._lock:
@@ -230,9 +273,11 @@ class PrefixTree:
                 self.hits += 1
                 self.reused_tokens += match.reused_tokens
                 self.matched_but_replayed_tokens += match.replayed_tokens
+                self._recent_outcomes.append(True)
             elif match.is_empty:
                 self.misses += 1
                 self.matched_but_replayed_tokens += match.replayed_tokens
+                self._recent_outcomes.append(False)
 
     def insert(
         self,
@@ -243,11 +288,7 @@ class PrefixTree:
         chunk: Any | Callable[[], Any],
         byte_size: int | None = None,
     ) -> str | None:
-        """Insert one full `chunk_tokens`-wide KV chunk under `parent`, enforcing hard `byte_budget`.
-
-        `chunk` may be a zero-arg factory so a chunk that cannot fit in budget is never materialized.
-        Returns the node key if present/inserted, or `None` if invalid, colliding, or over budget.
-        """
+        """Insert one full `chunk_tokens`-wide KV chunk under `parent`, enforcing hard `byte_budget`."""
         with self._lock:
             if depth <= 0 or len(tokens) != self.chunk_tokens:
                 return None
@@ -343,11 +384,12 @@ class PrefixTree:
             self.evicted_nodes += len(self._nodes)
             self._nodes.clear()
             self._bytes_held = 0
+            self._recent_outcomes.clear()
             return freed
 
     shed = clear
 
-    def stats(self) -> dict[str, int | float]:
+    def stats(self) -> dict[str, int | float | bool]:
         """Return structured telemetry snapshot."""
         with self._lock:
             reqs = self.hits + self.misses
@@ -361,6 +403,8 @@ class PrefixTree:
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": hit_rate,
+                "rolling_hit_rate": self.rolling_hit_rate,
+                "circuit_breaker_open": self.circuit_breaker_open,
                 "reused_tokens": self.reused_tokens,
                 "matched_but_replayed_tokens": self.matched_but_replayed_tokens,
                 "evicted_nodes": self.evicted_nodes,
@@ -371,7 +415,7 @@ class PrefixTree:
         reqs = int(st["hits"]) + int(st["misses"])
         return (
             f"{st['node_count']} node(s), {st['snapshot_count']} snapshot(s), "
-            f"{st['bytes_held'] / _MIB:.1f} of {st['byte_budget'] / _MIB:.1f} MiB, "
+            f"{float(st['bytes_held']) / _MIB:.1f} of {float(st['byte_budget']) / _MIB:.1f} MiB, "
             f"{st['hits']}/{reqs} hit ({float(st['hit_rate']) * 100.0:.0f}%), "
             f"{st['reused_tokens']} token(s) reused, "
             f"{st['matched_but_replayed_tokens']} replayed, {st['evicted_nodes']} evicted"
@@ -412,6 +456,9 @@ class PrefixTree:
 
 __all__ = [
     "DEFAULT_CHUNK_TOKENS",
+    "DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS",
+    "DEFAULT_MIN_HIT_RATE",
+    "DEFAULT_ROLLING_WINDOW",
     "ROOT_KEY",
     "PrefixMatch",
     "PrefixTree",
