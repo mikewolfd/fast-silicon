@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -129,7 +131,15 @@ def list_dest_tracked_candidates(dst_pkg: Path) -> list[str]:
 
 
 def _transform_content(pkg: str, rel: str, raw: bytes) -> bytes:
-    """Normalize package-local uv source references for the workspace monorepo."""
+    """Resolve sibling package references in the monorepo's directory layout."""
+    if rel.endswith(".md"):
+        # Sibling READMEs link out to the adjacent fast-silicon checkout. The imported copy lives inside it.
+        sibling_prefix = "../" * len(Path(rel).parts) + "fast-silicon/"
+        if sibling_prefix.encode() in raw:
+            package_dir = posixpath.dirname(f"packages/{pkg}/{rel}")
+            target = re.compile(r"(?<=\]\()" + re.escape(sibling_prefix) + r"([^#)\s]+)")
+            text = target.sub(lambda m: posixpath.relpath(m.group(1), package_dir), raw.decode("utf-8"))
+            return text.encode("utf-8")
     if pkg != "fast-shared" and rel == "pyproject.toml":
         text = raw.decode("utf-8")
         text = text.replace(
