@@ -33,18 +33,54 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:  # hit-aware pref
 
 ### 1. `Laya-Typed-421M` Pure-ANE (`Cat 2`: `RAGTruth + CLINC150 + RewardBench-2`, `N=1,400`)
 
+Both Laya and Kev score the same 600 RAGTruth examples, 550 CLINC150 utterances and 250 RewardBench-2 comparisons. The score averages all 1,400 per-example results. Effective outcome throughput (EOT) divides their total by the elapsed scoring and evaluation time after warmup.
+
 | Host & Engine | `S_obj,e2e` | `EOT (u/s)` | Warm `B=1` / Throughput | 4-Bucket Mem | Comparison |
 |---|---:|---:|---|---:|---|
 | **Base M5 (`24 GB`) · `laya_ane` (`W8A16`, `[1585,0,0]`)** | **`0.5050`** | **`6.158`** (`114.8 s`) | **`22.64 ms`** (`44.38 q/s`) | **`1.00 GB`** | **`8.29x` vs. Stock `CoreAI`** (`15.6x` lower `B=1` latency) · **`1.06x`** M4 Pro |
+| Base M5 · NMTZ open Core ML | 0.4993 | 7.909 (88.4 s) | 16.17 ms (47 tokens), 48.34 ms (512 tokens) | 2.73 GB | 1.28× native EOT |
 | Base M5 (`24 GB`) · Stock Apple `CoreAI` (`decision.aimodel`) | `0.4993` | `0.743` (`940.7 s`) | `354.1 ms` (`MPSGraph` FP32) | `0.33 GB` *(1.69 GB mapped)* | Accurate stock baseline (`0` ANE ops) |
 | Base M5 (`24 GB`) · Stock `MLX` (`ModernBERT 8-bit`) | `0.2757`\* | `5.319` (`72.6 s`) | — | `18.70 GB` | `1.16x` `EOT`, avoids **`-0.23` MLX quality collapse** & **`18.7x`** RAM |
 | **M4 Pro (`48 GB`) · `laya_ane` (`W8A16`, `[1585,0,0]`)** | **`0.5050`** | **`5.827`** (`121.3 s`) | **`24.28 ms`** (`41.91 q/s`) | **`0.98 GB`** | **`1.92x` vs. Stock `MLX`** (`0.2986` `S_obj`, `34.0 GB`) · **`4.46x`** MPS `B=8` |
+| M4 Pro · NMTZ open Core ML | 0.4993 | 7.598 (92.0 s) | 16.40 ms (47 tokens), 51.14 ms (512 tokens) | 2.94 GB | 1.30× native EOT |
+| M4 Pro · Stock MLX (ModernBERT 8-bit) | 0.2986 | 3.032 (137.9 s) | — | 34.02 GB | Historical public MLX run |
+
+On both Macs, `NMTZ/laya-typed-decisions-421m-coreml-ane` finished the full scoring workload faster than native Laya. Its score was 0.0057 lower and its measured memory was higher. The public adapter reads token embeddings from the upstream checkpoint, runs the fixed-size Core ML graph, and uses its option logits to calculate the probabilities scored here. The publisher's separate FP32 action head can choose an action or abstain.
+
+The public short and long probes used 47 and 512 tokens including the question. Native single-call latency and 64-question throughput come from separate runs. On both Macs, each public Laya graph (192, 384 and 512 tokens) reported 10,594 Neural Engine preferences and 5,941 unclassified operations. The first M5 public speed test spent 1.53 seconds compiling the graphs and 88.96 seconds loading them. The later scoring run reused them and loaded in 0.84 seconds.
 
 - **Opt-in `CoreAI-Opt` & `macOS 27.2.1` `.aimodel` options** ([`coreai_export.py`](src/fast_decision_models/coreai_export.py)):
   - **`CoreAI-Opt` calibrated `w8` (`ExportBackend.CoreML`, M4 Pro `26.6`):** cuts `RAGTruth` `ECE-15` by **`-14.3%`** (`0.0970` vs. `0.1131`), improves Brier (`0.2174` vs. `0.2214`) and NLL (`0.6245` vs. `0.6341`), at `5.756` vs. `5.826 EOT` (`0.988x`). (`w4_per_block` on `ExportBackend.CoreML` is blocked by default due to macOS `26.6` CoreML logit inversion.)
   - **`macOS 27.2.1` `FP16` `.aimodel` ANE (`w8_f16` + `prefer_neural_engine`, Base M5):** casting weights/inputs to `FP16` unlocks **`1,652` ANE ops** (`logit_cos = 0.999831`), cutting isolated `S=256` warm latency **`4.09x`** from `94.18 ms` (FP32 `MPSGraph`) to **`23.00 ms`** (`15.4x` faster than stock `CoreAI`'s `354.1 ms`) in **`0.44 GB`** combined (`62.3 MB` `phys_footprint`).
 
 ### 2. `Kev-0.8B` (`W8 g64`) Batched `B=8` & `256`-Token `GDN+KV` `PrefixTree` (`Cat 2`, `N=1,400`)
+
+The current native default enables automatic prefix caching. On the same 1,400 decisions, native Kev scored 0.5250 on M5 and finished in 167 seconds. The open FP16 export scored 0.5214 and finished in 322 seconds. Its row graph accepts 1,024 tokens for the state and question combined. Native Kev allows up to 1,024 state tokens and 2,048 combined tokens. The public graph’s shorter window clipped 164 of 600 RAGTruth examples and 63 of 1,000 RewardBench-2 candidates. The historical stock MLX runs used the same dataset lock.
+
+| Host | Engine | Mean score | EOT (score/s) | Time after warmup | Harness memory |
+|---|---|---:|---:|---:|---:|
+| Base M5 | Native W8, automatic cache | 0.5250 | 4.395 | 167.2 s | 1.78 GB |
+| Base M5 | FluidInference open Core ML FP16 | 0.5214 | 2.269 | 321.7 s | 1.29 GB |
+| Base M5 | Stock `mlx-lm` 8-bit | 0.5236 | 5.055 | 145.0 s | 3.06 GB |
+| M4 Pro | Native W8, automatic cache | 0.5250 | 3.415 | 215.2 s | 2.29 GB |
+| M4 Pro | FluidInference open Core ML FP16 | 0.5207 | 1.674 | 435.4 s | 9.04 GB |
+| M4 Pro | Stock `mlx-lm` 8-bit | 0.5229 | 3.062 | 239.1 s | 3.26 GB |
+
+The open export, `FluidInference/kev-0.8b-coreml`, scored one warm question at 20.72 questions/s on M5 and 16.48 on M4 Pro. Asking eight questions about the same 14-token state raised these rates to 187.30 and 130.69 questions/s. All eight branches fit in one call to the 32-token fused graph. The native `B=8` figures below use batches of eight documents.
+
+The public Kev graphs allowed the CPU and GPU. Both Macs reported the same device preferences in `MLComputePlan`.
+
+| Kev graph | GPU-preferred operations | Unclassified operations |
+|---|---:|---:|
+| Fused, six functions | 5,171 | 68,358 |
+| 512-token row | 5,893 | 10,038 |
+| 1,024-token row | 7,909 | 14,646 |
+
+The fused graph’s GPU preferences all came from its 128-token function. All 10,616 operations in the 32-token function used for the speed test were unclassified.
+
+The harness memory estimate includes the model process. On M5, macOS reported a 1.00 GB physical footprint for that process and 11.55 GB of resident pages. The corresponding M4 Pro physical footprint was 8.84 GB.
+
+The original suite below measured native Kev with its previous default of disabled prefix caching. Its explicit prefix-reuse tests are separate from the Tier-1 timings. [Benchmark methods](../../docs/BENCHMARKS.md#open-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
 
 | Host & Mode | `S_obj,e2e` | `EOT (u/s)` | Batched `B=8` / `PrefixTree` | 4-Bucket Mem | Takeaway |
 |---|---:|---:|---|---:|---|

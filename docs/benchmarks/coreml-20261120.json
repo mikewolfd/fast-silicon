@@ -1,0 +1,1653 @@
+{
+  "recovery": {
+    "m5_laya": "The initial full evaluation lacked safetensors. A one-model retry supplied the final Laya outcome after installing safetensors 0.8.0.",
+    "m5_placement": "The original BGE and FP16 compute-plan reader returned zero inspectable operations. Only placement was re-read with the current helper. The warm timings come from the initial probe.",
+    "m4_outcomes": "Five checked single-model reports, with separate times and the same dataset lock, were combined after an interrupted coordinator run. A later disk-space stop during a warm decision probe preserved the existing outcome and encoder reports."
+  },
+  "legalbench_token_audit": {
+    "dataset": "LegalBench-RAG Tier 1",
+    "subsets": [
+      "cuad",
+      "contractnli"
+    ],
+    "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+    "documents": 20,
+    "queries": 175,
+    "tokenizer_sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+    "tokenizer_sources": [
+      "fast-embeddinggemma-2/artifacts/tokenizer/tokenizer.json",
+      "FluidInference/embeddinggemma-2-coreml@3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4",
+      "OpenInfinity/embeddinggemma-2-coreml-int8@4a99ef141d6866562f64fcd1db08657bb8e9b6ba"
+    ],
+    "document_prefix": "title: none | text: ",
+    "method": "Use the benchmark's whitespace-aware character chunks with zero overlap. Count each prefixed token sequence, including BOS and EOS once. A sequence above the cap retains the first cap minus one IDs and an EOS. Counts exclude padding.",
+    "layouts": {
+      "standard": {
+        "chunk_chars": 1024,
+        "chunks": 818,
+        "max_input_tokens": 400,
+        "total_input_tokens": 181668,
+        "limits": {
+          "512": {
+            "truncated_chunks": 0,
+            "tokens_encoded": 181668
+          },
+          "2048": {
+            "truncated_chunks": 0,
+            "tokens_encoded": 181668
+          }
+        }
+      },
+      "coarse": {
+        "chunk_chars": 6144,
+        "chunks": 144,
+        "max_input_tokens": 2095,
+        "total_input_tokens": 175632,
+        "limits": {
+          "512": {
+            "truncated_chunks": 136,
+            "tokens_encoded": 71961
+          },
+          "2048": {
+            "truncated_chunks": 1,
+            "tokens_encoded": 175585
+          }
+        }
+      }
+    }
+  },
+  "software_versions": {
+    "m4": {
+      "coremltools": "9.0",
+      "mlx": "0.32.4",
+      "numpy": "2.5.5",
+      "tokenizers": "0.23.3",
+      "safetensors": "0.8.0"
+    },
+    "m5": {
+      "coremltools": "9.0",
+      "mlx": "0.32.4",
+      "numpy": "2.5.5",
+      "tokenizers": "0.23.3",
+      "safetensors": "0.8.0"
+    }
+  },
+  "macos_builds": {
+    "m4": "25G5057c",
+    "m5": "26B131"
+  },
+  "source_hashes": {
+    "m5": {
+      "initial": {
+        "configs/outcome_benchmarks.lock.json": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+        "scripts/_outcome_public_backends.py": "c011032f5306a03a6ca6cf263e4cc73b91b2b3618c49d21e5071041461f42185",
+        "scripts/benchmark_outcomes.py": "759da380cf2e3e3a64072ce26dd76e274e0faafaf7f1d2060c1c8355787f1a5d",
+        "scripts/public_baselines.py": "2bb88bbb16ed997392f8ca98c739c0ef33a29d11004da36d834fe52a0105ec06"
+      },
+      "micros": {
+        "scripts/public_baselines.py": "c012088c88d0eb5f2195faccc6f11e9a9d8fa6af78f019787a389fd333b526aa",
+        "scripts/_coreml_bench.py": "f0ca70e3f7b92e658c9195c577c5fac2abeb7d5d501909e199b1bdfa8c85e0a1",
+        "scripts/_outcome_public_backends.py": "f191d33caed01a3cf32fde7ea36b936663c49e9a82ad61ab2c2fb0735ba855a5"
+      },
+      "native_kev": "602421d550b36bff3c645f63e2cf709ac2bbb504c997fc33874bb4ee16fb072f"
+    },
+    "m4_warm": {
+      "scripts/public_baselines.py": "6c5571e4ab171c7e72fa69fcc42c4fb78d44df48f4544ee89d1f885b493dab69",
+      "scripts/_outcome_public_backends.py": "f191d33caed01a3cf32fde7ea36b936663c49e9a82ad61ab2c2fb0735ba855a5",
+      "scripts/_coreml_bench.py": "664498dccd5e6fd014eee0fad0c23001676a41f13c53f68bf7a7549c0188d85b"
+    }
+  },
+  "native_kev_source_sha256": "602421d550b36bff3c645f63e2cf709ac2bbb504c997fc33874bb4ee16fb072f",
+  "date_local": "2026-11-20",
+  "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+  "models": {
+    "coreml-bge-small": {
+      "repo_id": "sidekickd/bge-small-en-v1.5-coreml",
+      "revision": "1c487fc03546f7fe4c52f16b6fcf8ee9921609a5",
+      "allow_patterns": [
+        "fp16/*"
+      ]
+    },
+    "coreml-embeddinggemma-2-fp16": {
+      "repo_id": "FluidInference/embeddinggemma-2-coreml",
+      "revision": "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4",
+      "allow_patterns": [
+        "EmbeddingGemma2Text.mlpackage/*",
+        "embeddings.bf16",
+        "tokenizer.json"
+      ]
+    },
+    "coreml-embeddinggemma-2-int8": {
+      "repo_id": "OpenInfinity/embeddinggemma-2-coreml-int8",
+      "revision": "4a99ef141d6866562f64fcd1db08657bb8e9b6ba",
+      "allow_patterns": [
+        "text/*"
+      ]
+    },
+    "coreml-laya": {
+      "repo_id": "NMTZ/laya-typed-decisions-421m-coreml-ane",
+      "revision": "951ee6851e85b42bbcb457e2fac787fa294b8f07",
+      "allow_patterns": [
+        "L192/model.mlpackage/*",
+        "L384/model.mlpackage/*",
+        "L512/model.mlpackage/*"
+      ]
+    },
+    "coreml-kev-0.8b": {
+      "repo_id": "FluidInference/kev-0.8b-coreml",
+      "revision": "e9442093fdd748a7666a3da781b81066823dc484",
+      "allow_patterns": [
+        "fused/*",
+        "L512_K16/*",
+        "L1024_K80/KevRow_fp16.mlpackage/*",
+        "tokenizer.json"
+      ]
+    },
+    "laya-host-weights": {
+      "repo_id": "convaiinnovations/laya-typed-decisions",
+      "revision": "3903ff997712bd73ccb2dc879262dac8f0d443bb",
+      "allow_patterns": [
+        "model.safetensors",
+        "tokenizer/tokenizer.json",
+        "encoder/config.json",
+        "rl_agent_config.json"
+      ]
+    }
+  },
+  "memory_units": "Decimal GB. Combined is the model process footprint plus its observed neural and model-mapped memory and any measurable ANE daemon delta. MLX is a separate allocator reading.",
+  "first_m4_compile_seconds": {
+    "coreml-embeddinggemma-2-fp16": 2.26,
+    "coreml-laya": 2.0745,
+    "coreml-kev-0.8b": 4.4516
+  },
+  "placement": "MLComputePlan preferred operation counts, by compiled bundle and function. Other means unclassified. Counts describe the compiler plan and do not measure execution time.",
+  "comparison": "Same locked data and evaluators. All native runs except refreshed Kev were retained from earlier on the same hosts. These separate timings estimate speed ratios, not interleaved promotion decisions.",
+  "m4": {
+    "environment": {
+      "hw_model": "Mac16,8",
+      "chip": "Apple M4 Pro",
+      "mem_gb": 48,
+      "macos_version": "26.6",
+      "mlx_version": "0.32.4",
+      "python_version": "3.13.14"
+    },
+    "open_coreml": {
+      "coreml-bge-small": {
+        "package": "coreml-bge-small",
+        "config_label": "coreml-bge-small-fp16-ane",
+        "n_items": 325,
+        "n_valid": 325,
+        "objective_score_e2e": 0.473944,
+        "effective_outcome_per_sec": 2.3817,
+        "wall_sec": 64.6717,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-bge-small",
+          "config_label": "hetero",
+          "n_items": 325,
+          "n_valid": 325,
+          "objective_score_e2e": 0.473745,
+          "effective_outcome_per_sec": 12.6339,
+          "wall_sec": 12.1868,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.762318,
+            "NanoArguAna": 0.627693,
+            "NanoHotpotQA": 0.838133,
+            "legalbench_rag_isolated": 0.2432
+          }
+        },
+        "native_over_open_eot": 5.30457,
+        "native_minus_open_score": -0.000199,
+        "paired_standard_error": 0.000639,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.3959,
+          "daemon_peak_phys_gb": 0.4013,
+          "daemon_neural_outside_footprint_gb": 0.1447,
+          "daemon_model_mapped_gb": 0.2023,
+          "daemon_combined_gb": 0.7428,
+          "daemon_resident_mib": 525.12,
+          "daemon_all_mappings_mib": 291.03,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 0.7428
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 1839.553,
+        "model_warmup_ms": 30.496,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 1866.158,
+            "cold_first_infer_ms": 1.421,
+            "cold_total_ms": 1867.579,
+            "warm_count": 3032,
+            "warm_median_ms": 3.904,
+            "warm_p95_ms": 13.445,
+            "warm_min_ms": 1.187,
+            "warm_max_ms": 19.279,
+            "cold_to_warm_ratio": 0.364,
+            "cold_warmup_ms": 29.234
+          },
+          "documents": 1000,
+          "tokens": 249303,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "single",
+            "single"
+          ],
+          "b1_ms": 1.696,
+          "tok_s": 31607.8,
+          "corpus_sec": [
+            7.901152833015658,
+            7.873615916003473
+          ],
+          "placement": {
+            "128": {
+              "bundle": "fp16__model_128.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            },
+            "256": {
+              "bundle": "fp16__model_256.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            },
+            "512": {
+              "bundle": "fp16__model_512.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.762318,
+          "NanoArguAna": 0.628306,
+          "NanoHotpotQA": 0.839739,
+          "legalbench_rag_isolated": 0.242936
+        }
+      },
+      "coreml-embeddinggemma-2-fp16": {
+        "package": "coreml-embeddinggemma-2-fp16",
+        "config_label": "coreml-emb2-fp16-ane",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.518557,
+        "effective_outcome_per_sec": 1.6366,
+        "wall_sec": 158.4208,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-embeddinggemma-2",
+          "config_label": "hetero",
+          "n_items": 500,
+          "n_valid": 500,
+          "objective_score_e2e": 0.536463,
+          "effective_outcome_per_sec": 3.5833,
+          "wall_sec": 74.8565,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.881044,
+            "NanoArguAna": 0.651464,
+            "NanoHotpotQA": 0.895591,
+            "legalbench_rag_isolated": 0.270333,
+            "legalbench_rag_coarse_2k": 0.568676
+          }
+        },
+        "native_over_open_eot": 2.18948,
+        "native_minus_open_score": 0.017906,
+        "paired_standard_error": 0.004811,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.3397,
+          "daemon_peak_phys_gb": 0.449,
+          "daemon_neural_outside_footprint_gb": 0.9452,
+          "daemon_model_mapped_gb": 0.2489,
+          "daemon_combined_gb": 1.5338,
+          "daemon_resident_mib": 791.72,
+          "daemon_all_mappings_mib": 335.55,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 1.5338
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 3557.229,
+        "model_warmup_ms": 90.33,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 3666.671,
+            "cold_first_infer_ms": 3.246,
+            "cold_total_ms": 3669.917,
+            "warm_count": 10994,
+            "warm_median_ms": 29.058,
+            "warm_p95_ms": 29.476,
+            "warm_min_ms": 2.651,
+            "warm_max_ms": 37.395,
+            "cold_to_warm_ratio": 0.112,
+            "cold_warmup_ms": 87.112
+          },
+          "documents": 2000,
+          "tokens": 551889,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "packed",
+            "single",
+            "single",
+            "packed"
+          ],
+          "b1_ms": 2.696,
+          "tok_s": 14250.7,
+          "corpus_sec": [
+            38.731158790993504,
+            38.723200334003195
+          ],
+          "single_embed_sec": [
+            40.291408834047616,
+            40.2677207919769
+          ],
+          "single_embed_tok_s": 13701.5,
+          "pack_256_speedup": 1.0401,
+          "min_pack_single_cosine": 0.9994437,
+          "placement": {
+            "text": {
+              "bundle": "EmbeddingGemma2Text.mlmodelc",
+              "device_counts": {
+                "ane": 3862,
+                "other": 45223
+              },
+              "total_ops": 49085,
+              "by_function": {
+                "pack_256": {
+                  "other": 7007
+                },
+                "embed_48": {
+                  "other": 7013
+                },
+                "embed_128": {
+                  "other": 3151,
+                  "ane": 3862
+                },
+                "embed_64": {
+                  "other": 7013
+                },
+                "embed_256": {
+                  "other": 7013
+                },
+                "embed_512": {
+                  "other": 7013
+                },
+                "embed_32": {
+                  "other": 7013
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.883261,
+          "NanoArguAna": 0.653766,
+          "NanoHotpotQA": 0.895591,
+          "legalbench_rag_isolated": 0.270863,
+          "legalbench_rag_coarse_2k": 0.515695
+        }
+      },
+      "coreml-embeddinggemma-2-int8": {
+        "package": "coreml-embeddinggemma-2-int8",
+        "config_label": "coreml-emb2-int8-ane",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.51828,
+        "effective_outcome_per_sec": 1.649,
+        "wall_sec": 157.1511,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-embeddinggemma-2",
+          "config_label": "hetero",
+          "n_items": 500,
+          "n_valid": 500,
+          "objective_score_e2e": 0.536463,
+          "effective_outcome_per_sec": 3.5833,
+          "wall_sec": 74.8565,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.881044,
+            "NanoArguAna": 0.651464,
+            "NanoHotpotQA": 0.895591,
+            "legalbench_rag_isolated": 0.270333,
+            "legalbench_rag_coarse_2k": 0.568676
+          }
+        },
+        "native_over_open_eot": 2.17301,
+        "native_minus_open_score": 0.018183,
+        "paired_standard_error": 0.004838,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.3699,
+          "daemon_peak_phys_gb": 0.4566,
+          "daemon_neural_outside_footprint_gb": 0.5364,
+          "daemon_model_mapped_gb": 0.1264,
+          "daemon_combined_gb": 1.0327,
+          "daemon_resident_mib": 714.94,
+          "daemon_all_mappings_mib": 218.67,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 1.0327
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 3627.019,
+        "model_warmup_ms": 94.013,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 3680.369,
+            "cold_first_infer_ms": 2.784,
+            "cold_total_ms": 3683.153,
+            "warm_count": 10994,
+            "warm_median_ms": 28.878,
+            "warm_p95_ms": 29.428,
+            "warm_min_ms": 2.532,
+            "warm_max_ms": 33.348,
+            "cold_to_warm_ratio": 0.096,
+            "cold_warmup_ms": 86.259
+          },
+          "documents": 2000,
+          "tokens": 551889,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "packed",
+            "single",
+            "single",
+            "packed"
+          ],
+          "b1_ms": 2.59,
+          "tok_s": 14294.2,
+          "corpus_sec": [
+            38.52292000001762,
+            38.69553179200739
+          ],
+          "single_embed_sec": [
+            40.110513249994256,
+            40.08098641701508
+          ],
+          "single_embed_tok_s": 13764.3,
+          "pack_256_speedup": 1.0385,
+          "min_pack_single_cosine": 0.9997253,
+          "placement": {
+            "text": {
+              "bundle": "text__EmbeddingGemma2Text.mlmodelc",
+              "device_counts": {
+                "ane": 3862,
+                "other": 45223
+              },
+              "total_ops": 49085,
+              "by_function": {
+                "pack_256": {
+                  "other": 7007
+                },
+                "embed_48": {
+                  "other": 7013
+                },
+                "embed_128": {
+                  "other": 3151,
+                  "ane": 3862
+                },
+                "embed_64": {
+                  "other": 7013
+                },
+                "embed_256": {
+                  "other": 7013
+                },
+                "embed_512": {
+                  "other": 7013
+                },
+                "embed_32": {
+                  "other": 7013
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.881875,
+          "NanoArguAna": 0.648691,
+          "NanoHotpotQA": 0.895591,
+          "legalbench_rag_isolated": 0.269715,
+          "legalbench_rag_coarse_2k": 0.517897
+        }
+      },
+      "coreml-laya": {
+        "package": "coreml-laya",
+        "config_label": "coreml_laya_ane",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.499286,
+        "effective_outcome_per_sec": 7.5978,
+        "wall_sec": 92.0006,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-decision-models",
+          "config_label": "laya_ane",
+          "n_items": 1400,
+          "n_valid": 1400,
+          "objective_score_e2e": 0.505,
+          "effective_outcome_per_sec": 5.8272,
+          "wall_sec": 121.3284,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "ragtruth_auroc": 0.681197,
+            "clinc150_151_acc": 0.456364,
+            "rewardbench2_macro_bo4": 0.292
+          }
+        },
+        "native_over_open_eot": 0.76696,
+        "native_minus_open_score": 0.005714,
+        "paired_standard_error": 0.004517,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.4391,
+          "daemon_peak_phys_gb": 0.4601,
+          "daemon_neural_outside_footprint_gb": 2.4964,
+          "daemon_model_mapped_gb": 0.0,
+          "daemon_combined_gb": 2.9355,
+          "daemon_resident_mib": 550.77,
+          "daemon_all_mappings_mib": 98.72,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 2.9355
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 914.473,
+        "model_warmup_ms": 129.904,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 896.947,
+            "cold_first_infer_ms": 16.444,
+            "cold_total_ms": 913.391,
+            "warm_count": 23,
+            "warm_median_ms": 49.89,
+            "warm_p95_ms": 50.065,
+            "warm_min_ms": 15.843,
+            "warm_max_ms": 50.123,
+            "cold_to_warm_ratio": 0.33,
+            "cold_warmup_ms": 123.482
+          },
+          "timing_order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "short_tokens": 47,
+          "long_tokens": 512,
+          "buckets": [
+            192,
+            512
+          ],
+          "short_ms": 16.399994878156576,
+          "long_ms": 51.13961449387716,
+          "placement": {
+            "192": {
+              "bundle": "L192__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            },
+            "384": {
+              "bundle": "L384__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            },
+            "512": {
+              "bundle": "L512__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "ragtruth_auroc": 0.674127,
+          "clinc150_151_acc": 0.447273,
+          "rewardbench2_macro_bo4": 0.304
+        }
+      },
+      "coreml-kev-0.8b": {
+        "package": "coreml-kev-0.8b",
+        "config_label": "coreml_kev_08b_fp16_gpu",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.520714,
+        "effective_outcome_per_sec": 1.6743,
+        "wall_sec": 435.4135,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-decision-models",
+          "config_label": "kev_08b_w8",
+          "n_items": 1400,
+          "n_valid": 1400,
+          "objective_score_e2e": 0.525,
+          "effective_outcome_per_sec": 3.4148,
+          "wall_sec": 215.2416,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "ragtruth_auroc": 0.606178,
+            "clinc150_151_acc": 0.496364,
+            "rewardbench2_macro_bo4": 0.3
+          }
+        },
+        "native_over_open_eot": 2.03954,
+        "native_minus_open_score": 0.004286,
+        "paired_standard_error": 0.003779,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 8.8375,
+          "daemon_peak_phys_gb": 8.8532,
+          "daemon_neural_outside_footprint_gb": 0.0,
+          "daemon_model_mapped_gb": 0.1977,
+          "daemon_combined_gb": 9.0352,
+          "daemon_resident_mib": 8758.27,
+          "daemon_all_mappings_mib": 288.25,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 9.0352
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 25507.723,
+        "model_warmup_ms": 2769.872,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 25665.007,
+            "cold_first_infer_ms": 60.622,
+            "cold_total_ms": 25725.629,
+            "warm_count": 23,
+            "warm_median_ms": 59.854,
+            "warm_p95_ms": 60.487,
+            "warm_min_ms": 59.516,
+            "warm_max_ms": 62.126,
+            "cold_to_warm_ratio": 1.013,
+            "cold_warmup_ms": 2906.263
+          },
+          "timing_order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "b1_q_per_sec": 16.483883002042344,
+          "q_per_sec": 130.69013674984473,
+          "ms_per_question": 7.6516868439284735,
+          "placement": {
+            "fused": {
+              "bundle": "fused__KevFused.mlmodelc",
+              "device_counts": {
+                "gpu": 5171,
+                "other": 68358
+              },
+              "total_ops": 73529,
+              "by_function": {
+                "fused_S128_P192_B16_K16": {
+                  "other": 6418,
+                  "gpu": 5171
+                },
+                "fused_S256_P192_B16_K16": {
+                  "other": 13245
+                },
+                "fused_S192_P192_B16_K16": {
+                  "other": 12417
+                },
+                "fused_S64_P192_B16_K16": {
+                  "other": 10761
+                },
+                "fused_S384_P192_B16_K16": {
+                  "other": 14901
+                },
+                "fused_S32_P192_B16_K16": {
+                  "other": 10616
+                }
+              }
+            },
+            "L512_K16": {
+              "bundle": "L512_K16__KevRow_fp16.mlmodelc",
+              "device_counts": {
+                "gpu": 5893,
+                "other": 10038
+              },
+              "total_ops": 15931,
+              "by_function": {
+                "main": {
+                  "other": 10038,
+                  "gpu": 5893
+                }
+              }
+            },
+            "L1024_K80": {
+              "bundle": "L1024_K80__KevRow_fp16.mlmodelc",
+              "device_counts": {
+                "gpu": 7909,
+                "other": 14646
+              },
+              "total_ops": 22555,
+              "by_function": {
+                "main": {
+                  "other": 14646,
+                  "gpu": 7909
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "ragtruth_auroc": 0.604054,
+          "clinc150_151_acc": 0.492727,
+          "rewardbench2_macro_bo4": 0.3
+        }
+      }
+    },
+    "historical_stock_outcomes": {
+      "public-bge-small": {
+        "package": "public-bge-small",
+        "config_label": "mlx-embeddings-8bit",
+        "n_items": 325,
+        "n_valid": 325,
+        "objective_score_e2e": 0.477379,
+        "effective_outcome_per_sec": 1.3189,
+        "wall_sec": 117.6338,
+        "gate_verdict": "FAIL",
+        "gate_reasons": [
+          "FourBucketMemoryProbe combined_with_model_mapped_gb=38.988GB > 80% ceiling (38.40GB of 48.0GB)"
+        ]
+      },
+      "public-embeddinggemma-2": {
+        "package": "public-embeddinggemma-2",
+        "config_label": "mlx_vlm-embedding-8bit",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.535268,
+        "effective_outcome_per_sec": 0.7463,
+        "wall_sec": 358.5985,
+        "gate_verdict": "FAIL",
+        "gate_reasons": [
+          "FourBucketMemoryProbe combined_with_model_mapped_gb=39.029GB > 80% ceiling (38.40GB of 48.0GB)"
+        ]
+      },
+      "public-laya": {
+        "package": "public-laya",
+        "config_label": "mlx_embeddings_modernbert_8bit",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.298571,
+        "effective_outcome_per_sec": 3.0321,
+        "wall_sec": 137.8561,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      },
+      "public-kev-0.8b": {
+        "package": "public-kev-0.8b",
+        "config_label": "mlx_lm_kev_08b_8bit",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.522857,
+        "effective_outcome_per_sec": 3.0616,
+        "wall_sec": 239.0917,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      }
+    },
+    "reference_warm_probes": {
+      "fast-bge-small": {
+        "query_tokens": 24,
+        "b1_ms": 0.49,
+        "documents": 1000,
+        "tokens": 249303,
+        "tok_s": 187150
+      },
+      "fast-embeddinggemma-2": {
+        "query_tokens": 24,
+        "b1_ms": 2.106,
+        "documents": 2000,
+        "tokens": 551889,
+        "tok_s": 38517
+      }
+    }
+  },
+  "m5": {
+    "environment": {
+      "hw_model": "Mac17,2",
+      "chip": "Apple M5",
+      "mem_gb": 24,
+      "macos_version": "27.2.1",
+      "mlx_version": "0.32.4",
+      "python_version": "3.13.14"
+    },
+    "open_coreml": {
+      "coreml-bge-small": {
+        "package": "coreml-bge-small",
+        "config_label": "coreml-bge-small-fp16-ane",
+        "n_items": 325,
+        "n_valid": 325,
+        "objective_score_e2e": 0.473944,
+        "effective_outcome_per_sec": 2.5665,
+        "wall_sec": 60.0173,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-bge-small",
+          "config_label": "hetero",
+          "n_items": 325,
+          "n_valid": 325,
+          "objective_score_e2e": 0.473745,
+          "effective_outcome_per_sec": 13.0613,
+          "wall_sec": 11.7881,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.762318,
+            "NanoArguAna": 0.627693,
+            "NanoHotpotQA": 0.838133,
+            "legalbench_rag_isolated": 0.2432
+          }
+        },
+        "native_over_open_eot": 5.08915,
+        "native_minus_open_score": -0.000199,
+        "paired_standard_error": 0.000639,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.1952,
+          "daemon_peak_phys_gb": 0.201,
+          "daemon_neural_outside_footprint_gb": 0.145,
+          "daemon_model_mapped_gb": 0.2023,
+          "daemon_combined_gb": 0.5425,
+          "daemon_resident_mib": 294.95,
+          "daemon_all_mappings_mib": 241.12,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 0.5425
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 4378.766,
+        "model_warmup_ms": 29.222,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 1438.746,
+            "cold_first_infer_ms": 1.905,
+            "cold_total_ms": 1440.651,
+            "warm_count": 3032,
+            "warm_median_ms": 3.62,
+            "warm_p95_ms": 12.182,
+            "warm_min_ms": 1.214,
+            "warm_max_ms": 18.849,
+            "cold_to_warm_ratio": 0.526,
+            "cold_warmup_ms": 25.308
+          },
+          "documents": 1000,
+          "tokens": 249303,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "single",
+            "single"
+          ],
+          "b1_ms": 1.608,
+          "tok_s": 34318.1,
+          "corpus_sec": [
+            7.264030667007319,
+            7.264903083007084
+          ],
+          "placement": {
+            "128": {
+              "bundle": "fp16__model_128.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            },
+            "256": {
+              "bundle": "fp16__model_256.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            },
+            "512": {
+              "bundle": "fp16__model_512.mlmodelc",
+              "device_counts": {
+                "ane": 229,
+                "cpu": 16,
+                "other": 363
+              },
+              "total_ops": 608,
+              "by_function": {
+                "main": {
+                  "other": 363,
+                  "cpu": 16,
+                  "ane": 229
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.762318,
+          "NanoArguAna": 0.628306,
+          "NanoHotpotQA": 0.839739,
+          "legalbench_rag_isolated": 0.242936
+        }
+      },
+      "coreml-embeddinggemma-2-fp16": {
+        "package": "coreml-embeddinggemma-2-fp16",
+        "config_label": "coreml-emb2-fp16-ane",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.518557,
+        "effective_outcome_per_sec": 1.6655,
+        "wall_sec": 155.6758,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-embeddinggemma-2",
+          "config_label": "hetero",
+          "n_items": 500,
+          "n_valid": 500,
+          "objective_score_e2e": 0.53756,
+          "effective_outcome_per_sec": 4.7068,
+          "wall_sec": 57.1041,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.881044,
+            "NanoArguAna": 0.654082,
+            "NanoHotpotQA": 0.895591,
+            "legalbench_rag_isolated": 0.271971,
+            "legalbench_rag_coarse_2k": 0.569424
+          }
+        },
+        "native_over_open_eot": 2.82606,
+        "native_minus_open_score": 0.019003,
+        "paired_standard_error": 0.004794,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.1671,
+          "daemon_peak_phys_gb": 0.3353,
+          "daemon_neural_outside_footprint_gb": 0.9452,
+          "daemon_model_mapped_gb": 0.2684,
+          "daemon_combined_gb": 1.3807,
+          "daemon_resident_mib": 716.92,
+          "daemon_all_mappings_mib": 304.36,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 1.3807
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 72107.862,
+        "model_warmup_ms": 106.611,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 2962.746,
+            "cold_first_infer_ms": 4.462,
+            "cold_total_ms": 2967.208,
+            "warm_count": 10994,
+            "warm_median_ms": 29.536,
+            "warm_p95_ms": 29.585,
+            "warm_min_ms": 4.306,
+            "warm_max_ms": 31.574,
+            "cold_to_warm_ratio": 0.151,
+            "cold_warmup_ms": 83.318
+          },
+          "documents": 2000,
+          "tokens": 551889,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "packed",
+            "single",
+            "single",
+            "packed"
+          ],
+          "b1_ms": 4.334,
+          "tok_s": 14186.7,
+          "corpus_sec": [
+            38.90445724999881,
+            38.89949770900421
+          ],
+          "single_embed_sec": [
+            40.71600812500401,
+            40.70727133301261
+          ],
+          "single_embed_tok_s": 13556.0,
+          "pack_256_speedup": 1.0465,
+          "min_pack_single_cosine": 0.9994437,
+          "placement": {
+            "text": {
+              "bundle": "EmbeddingGemma2Text.mlmodelc",
+              "device_counts": {
+                "ane": 3862,
+                "other": 45223
+              },
+              "total_ops": 49085,
+              "by_function": {
+                "pack_256": {
+                  "other": 7007
+                },
+                "embed_48": {
+                  "other": 7013
+                },
+                "embed_128": {
+                  "other": 3151,
+                  "ane": 3862
+                },
+                "embed_64": {
+                  "other": 7013
+                },
+                "embed_256": {
+                  "other": 7013
+                },
+                "embed_512": {
+                  "other": 7013
+                },
+                "embed_32": {
+                  "other": 7013
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.883261,
+          "NanoArguAna": 0.653766,
+          "NanoHotpotQA": 0.895591,
+          "legalbench_rag_isolated": 0.270863,
+          "legalbench_rag_coarse_2k": 0.515695
+        }
+      },
+      "coreml-embeddinggemma-2-int8": {
+        "package": "coreml-embeddinggemma-2-int8",
+        "config_label": "coreml-emb2-int8-ane",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.51828,
+        "effective_outcome_per_sec": 1.7403,
+        "wall_sec": 148.9031,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-embeddinggemma-2",
+          "config_label": "hetero",
+          "n_items": 500,
+          "n_valid": 500,
+          "objective_score_e2e": 0.53756,
+          "effective_outcome_per_sec": 4.7068,
+          "wall_sec": 57.1041,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "NanoSciFact": 0.881044,
+            "NanoArguAna": 0.654082,
+            "NanoHotpotQA": 0.895591,
+            "legalbench_rag_isolated": 0.271971,
+            "legalbench_rag_coarse_2k": 0.569424
+          }
+        },
+        "native_over_open_eot": 2.70459,
+        "native_minus_open_score": 0.01928,
+        "paired_standard_error": 0.004816,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.1702,
+          "daemon_peak_phys_gb": 0.3629,
+          "daemon_neural_outside_footprint_gb": 0.5364,
+          "daemon_model_mapped_gb": 0.1342,
+          "daemon_combined_gb": 0.8408,
+          "daemon_resident_mib": 661.05,
+          "daemon_all_mappings_mib": 176.36,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 0.8408
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 76851.559,
+        "model_warmup_ms": 93.847,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 3006.191,
+            "cold_first_infer_ms": 2.737,
+            "cold_total_ms": 3008.928,
+            "warm_count": 10994,
+            "warm_median_ms": 27.9,
+            "warm_p95_ms": 27.943,
+            "warm_min_ms": 2.545,
+            "warm_max_ms": 29.923,
+            "cold_to_warm_ratio": 0.098,
+            "cold_warmup_ms": 69.798
+          },
+          "documents": 2000,
+          "tokens": 551889,
+          "query_tokens": 24,
+          "timing_scope": "token IDs through normalized vectors inside the model process",
+          "timing_order": [
+            "packed",
+            "single",
+            "single",
+            "packed"
+          ],
+          "b1_ms": 2.592,
+          "tok_s": 14945.0,
+          "corpus_sec": [
+            36.92797608299588,
+            36.92822270799661
+          ],
+          "single_embed_sec": [
+            38.22785041699535,
+            38.22437983399141
+          ],
+          "single_embed_tok_s": 14437.5,
+          "pack_256_speedup": 1.0351,
+          "min_pack_single_cosine": 0.9997253,
+          "placement": {
+            "text": {
+              "bundle": "text__EmbeddingGemma2Text.mlmodelc",
+              "device_counts": {
+                "ane": 3862,
+                "other": 45223
+              },
+              "total_ops": 49085,
+              "by_function": {
+                "pack_256": {
+                  "other": 7007
+                },
+                "embed_48": {
+                  "other": 7013
+                },
+                "embed_128": {
+                  "other": 3151,
+                  "ane": 3862
+                },
+                "embed_64": {
+                  "other": 7013
+                },
+                "embed_256": {
+                  "other": 7013
+                },
+                "embed_512": {
+                  "other": 7013
+                },
+                "embed_32": {
+                  "other": 7013
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "NanoSciFact": 0.881875,
+          "NanoArguAna": 0.648691,
+          "NanoHotpotQA": 0.895591,
+          "legalbench_rag_isolated": 0.269715,
+          "legalbench_rag_coarse_2k": 0.517897
+        }
+      },
+      "coreml-laya": {
+        "package": "coreml-laya",
+        "config_label": "coreml_laya_ane",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.499286,
+        "effective_outcome_per_sec": 7.9089,
+        "wall_sec": 88.3819,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-decision-models",
+          "config_label": "laya_ane",
+          "n_items": 1400,
+          "n_valid": 1400,
+          "objective_score_e2e": 0.505,
+          "effective_outcome_per_sec": 6.1583,
+          "wall_sec": 114.8051,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "ragtruth_auroc": 0.681197,
+            "clinc150_151_acc": 0.456364,
+            "rewardbench2_macro_bo4": 0.292
+          }
+        },
+        "native_over_open_eot": 0.77865,
+        "native_minus_open_score": 0.005714,
+        "paired_standard_error": 0.004517,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 0.2291,
+          "daemon_peak_phys_gb": 0.2564,
+          "daemon_neural_outside_footprint_gb": 2.496,
+          "daemon_model_mapped_gb": 0.0,
+          "daemon_combined_gb": 2.7251,
+          "daemon_resident_mib": 315.5,
+          "daemon_all_mappings_mib": 49.16,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 2.7251
+        },
+        "compile_sec_this_run": 0.0,
+        "model_load_ms": 839.848,
+        "model_warmup_ms": 122.021,
+        "warm_probe": {
+          "compile_sec": 1.5333,
+          "cold_warm_latency": {
+            "cold_load_ms": 88957.612,
+            "cold_first_infer_ms": 16.017,
+            "cold_total_ms": 88973.629,
+            "warm_count": 23,
+            "warm_median_ms": 47.374,
+            "warm_p95_ms": 47.476,
+            "warm_min_ms": 15.852,
+            "warm_max_ms": 47.508,
+            "cold_to_warm_ratio": 0.338,
+            "cold_warmup_ms": 120.845
+          },
+          "timing_order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "short_tokens": 47,
+          "long_tokens": 512,
+          "buckets": [
+            192,
+            512
+          ],
+          "short_ms": 16.172317749806098,
+          "long_ms": 48.34394274985243,
+          "placement": {
+            "192": {
+              "bundle": "L192__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            },
+            "384": {
+              "bundle": "L384__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            },
+            "512": {
+              "bundle": "L512__model.mlmodelc",
+              "device_counts": {
+                "ane": 10594,
+                "other": 5941
+              },
+              "total_ops": 16535,
+              "by_function": {
+                "main": {
+                  "other": 5941,
+                  "ane": 10594
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "ragtruth_auroc": 0.674127,
+          "clinc150_151_acc": 0.447273,
+          "rewardbench2_macro_bo4": 0.304
+        }
+      },
+      "coreml-kev-0.8b": {
+        "package": "coreml-kev-0.8b",
+        "config_label": "coreml_kev_08b_fp16_gpu",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.521429,
+        "effective_outcome_per_sec": 2.2691,
+        "wall_sec": 321.7088,
+        "gate_verdict": "PASS",
+        "gate_reasons": [],
+        "native": {
+          "package": "fast-decision-models",
+          "config_label": "kev_08b_w8",
+          "n_items": 1400,
+          "n_valid": 1400,
+          "objective_score_e2e": 0.525,
+          "effective_outcome_per_sec": 4.3952,
+          "wall_sec": 167.2292,
+          "gate_verdict": "PASS",
+          "gate_reasons": [],
+          "task_scores": {
+            "ragtruth_auroc": 0.605983,
+            "clinc150_151_acc": 0.5,
+            "rewardbench2_macro_bo4": 0.292
+          }
+        },
+        "native_over_open_eot": 1.93698,
+        "native_minus_open_score": 0.003571,
+        "paired_standard_error": 0.003571,
+        "memory": {
+          "mlx_peak_gb": 0.0,
+          "daemon_phys_gb": 1.0015,
+          "daemon_peak_phys_gb": 1.2941,
+          "daemon_neural_outside_footprint_gb": 0.0,
+          "daemon_model_mapped_gb": 0.198,
+          "daemon_combined_gb": 1.1994,
+          "daemon_resident_mib": 11018.23,
+          "daemon_all_mappings_mib": 18814.47,
+          "ane_daemon_permission_limited": true,
+          "evaluator_or_daemon_max_gb": 1.2941
+        },
+        "compile_sec_this_run": 3.2129,
+        "model_load_ms": 30025.949,
+        "model_warmup_ms": 22461.306,
+        "warm_probe": {
+          "compile_sec": 0.0,
+          "cold_warm_latency": {
+            "cold_load_ms": 4773.987,
+            "cold_first_infer_ms": 1038.961,
+            "cold_total_ms": 5812.948,
+            "warm_count": 23,
+            "warm_median_ms": 39.649,
+            "warm_p95_ms": 40.97,
+            "warm_min_ms": 39.343,
+            "warm_max_ms": 50.027,
+            "cold_to_warm_ratio": 26.204,
+            "cold_warmup_ms": 22145.712
+          },
+          "timing_order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "b1_q_per_sec": 20.717867639193813,
+          "q_per_sec": 187.29560287711556,
+          "ms_per_question": 5.339153640761651,
+          "placement": {
+            "fused": {
+              "bundle": "fused__KevFused.mlmodelc",
+              "device_counts": {
+                "gpu": 5171,
+                "other": 68358
+              },
+              "total_ops": 73529,
+              "by_function": {
+                "fused_S128_P192_B16_K16": {
+                  "other": 6418,
+                  "gpu": 5171
+                },
+                "fused_S256_P192_B16_K16": {
+                  "other": 13245
+                },
+                "fused_S192_P192_B16_K16": {
+                  "other": 12417
+                },
+                "fused_S64_P192_B16_K16": {
+                  "other": 10761
+                },
+                "fused_S384_P192_B16_K16": {
+                  "other": 14901
+                },
+                "fused_S32_P192_B16_K16": {
+                  "other": 10616
+                }
+              }
+            },
+            "L512_K16": {
+              "bundle": "L512_K16__KevRow_fp16.mlmodelc",
+              "device_counts": {
+                "gpu": 5893,
+                "other": 10038
+              },
+              "total_ops": 15931,
+              "by_function": {
+                "main": {
+                  "other": 10038,
+                  "gpu": 5893
+                }
+              }
+            },
+            "L1024_K80": {
+              "bundle": "L1024_K80__KevRow_fp16.mlmodelc",
+              "device_counts": {
+                "gpu": 7909,
+                "other": 14646
+              },
+              "total_ops": 22555,
+              "by_function": {
+                "main": {
+                  "other": 14646,
+                  "gpu": 7909
+                }
+              }
+            }
+          }
+        },
+        "task_scores": {
+          "ragtruth_auroc": 0.604109,
+          "clinc150_151_acc": 0.494545,
+          "rewardbench2_macro_bo4": 0.3
+        }
+      }
+    },
+    "historical_stock_outcomes": {
+      "public-bge-small": {
+        "package": "public-bge-small",
+        "config_label": "mlx-embeddings-8bit",
+        "n_items": 325,
+        "n_valid": 325,
+        "objective_score_e2e": 0.477415,
+        "effective_outcome_per_sec": 1.1596,
+        "wall_sec": 133.8006,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      },
+      "public-embeddinggemma-2": {
+        "package": "public-embeddinggemma-2",
+        "config_label": "mlx_vlm-embedding-8bit",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.536362,
+        "effective_outcome_per_sec": 1.086,
+        "wall_sec": 246.9348,
+        "gate_verdict": "FAIL",
+        "gate_reasons": [
+          "DeviceMemoryGuard tripped (exceeded 0.98 * recommendedMaxWorkingSetSize)",
+          "FourBucketMemoryProbe combined_with_model_mapped_gb=19.410GB > 80% ceiling (19.20GB of 24.0GB)"
+        ]
+      },
+      "coreai-embeddinggemma-2": {
+        "package": "coreai-embeddinggemma-2",
+        "config_label": "coreai-emb2-bf16",
+        "n_items": 500,
+        "n_valid": 500,
+        "objective_score_e2e": 0.535963,
+        "effective_outcome_per_sec": 0.7537,
+        "wall_sec": 355.5325,
+        "gate_verdict": "FAIL",
+        "gate_reasons": [
+          "FourBucketMemoryProbe combined_with_model_mapped_gb=385.791GB > 80% ceiling (19.20GB of 24.0GB)"
+        ]
+      },
+      "public-laya": {
+        "package": "public-laya",
+        "config_label": "mlx_embeddings_modernbert_8bit",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.275714,
+        "effective_outcome_per_sec": 5.3194,
+        "wall_sec": 72.5641,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      },
+      "coreai-laya": {
+        "package": "coreai-laya",
+        "config_label": "coreai_laya_decision",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.499286,
+        "effective_outcome_per_sec": 0.743,
+        "wall_sec": 940.7436,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      },
+      "public-kev-0.8b": {
+        "package": "public-kev-0.8b",
+        "config_label": "mlx_lm_kev_08b_8bit",
+        "n_items": 1400,
+        "n_valid": 1400,
+        "objective_score_e2e": 0.523571,
+        "effective_outcome_per_sec": 5.0548,
+        "wall_sec": 145.012,
+        "gate_verdict": "PASS",
+        "gate_reasons": []
+      }
+    },
+    "reference_warm_probes": {
+      "fast-bge-small": {
+        "query_tokens": 24,
+        "b1_ms": 0.793,
+        "documents": 1000,
+        "tokens": 249303,
+        "tok_s": 200646
+      },
+      "fast-embeddinggemma-2": {
+        "query_tokens": 24,
+        "b1_ms": 2.577,
+        "documents": 2000,
+        "tokens": 551889,
+        "tok_s": 48803
+      },
+      "coreai-embeddinggemma-2": {
+        "query_tokens": 24,
+        "b1_ms": 9.378,
+        "documents": 2000,
+        "tokens": 551889,
+        "tok_s": 12482.0
+      }
+    }
+  },
+  "raw_report_sha256": {
+    "m5_environment.json": "59e6540971ec61a0ec0d6e566aef935b29c81779715d63d1c8bad9200b2770e4",
+    "m5_provenance.json": "043e2603be63e2c0fbb1717d2b419e809d80ac5e7fb615395f2b48a0b5f555f0",
+    "legalbench-token-audit.json": "207a93157a0f20d59ade39c7a01d5d6032f95de3500f419544acc0d1183870e9",
+    "coreml_outcomes_m5_initial.json": "06b64ce2509945f7ea1b6c0dc42811a73b6b82b01c0f426997ac6bfda303ded5",
+    "coreml_outcomes_m5_laya_retry.json": "948710d0ed57362c7b1ce5add329f7f3445c61226040f42d2b6e3e4b56a14fee",
+    "coreml_monorepo_m5_initial.json": "43fb2255d77797bbb0c57de1e065037faf7f9ecc698de65797c54938cc472246",
+    "coreml_m5_placement_retry.json": "296dfc0eae63213d5c18d8074a32ef7f5c51251d7e0b73dd88592d9432415a10",
+    "m4_runtime_versions.json": "633d2aea20ba82b18a3baaec3dd5f47de5385b9257cbae043215b13b25b091d3",
+    "coreml_monorepo_m4.json": "00c4f084db597e5d1de6c0c2c2f70e00e419f783330b992a7077fa7c18b6c830",
+    "coreml_outcomes_m4.json": "fc3180116abbc2d1c9c5e4d7a7e2045df9be331334bc1f9cfaf1b955472a81b8",
+    "reference/m4_native_tier1.json": "9700657ea175f76562a5ce14e4c65dd712fd9831aab3164c4c1732cf63e22dee",
+    "coreml_native_kev_m4.json": "8af2c55f2d309137fceb5e3e3c38eb029af337ed8c0279831dd9ef2803cf4ca2",
+    "reference/m4_stock_tier1.json": "13ce1d6466d597af61ab8f91aebf95bfe5f12ed7193754cdcb91bd98e3e80a00",
+    "reference/m4_native_micro.json": "73eecdbb8632c8f345c72cdce98b4fd173d8f7e807383dd7a815639ee212ac71",
+    "coreml_outcomes_m5.json": "b729f410bf5580d67e5f426244cf7d7c553a99257515cddc4eaee337aa13528f",
+    "reference/m5_native_tier1.json": "f66c6545e8af418742c52003b03cf3de591def1e9a0f39a006bf2de781a21309",
+    "coreml_native_kev_m5.json": "b32dc0368511921bf1ccdb645c7592dc0999a4beb04819cd4eb20bda2886a65d",
+    "reference/m5_stock_tier1.json": "acd045849c727fa3036446286b7218c1c442b90a4707dbd5610f2ecd6396669e",
+    "reference/m5_stock_decision_retry.json": "e233c23ba0a1a9d90311819ecc72f386f807d0bb3ce2667ae18f6eca404d9a7e",
+    "coreml_monorepo_m5.json": "207e4aface1d45a7d294c00d731dcbb8e2172a3180eaae83741ccc0943736666",
+    "reference/m5_native_micro.json": "4be71cbc82ecb53ddcc9ec6a24e02f0985f5d69a6201b45e751e3b861dd2956c",
+    "reference/m5_coreai_embedding_micro.json": "6c403a395659e91b0c1bd54bc9552026b00d7851ee21acd6a43aadd3cfc4f82e"
+  }
+}

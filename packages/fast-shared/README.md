@@ -95,7 +95,7 @@ embeddinggemma-2 parquet \
 
 ## Sibling Engines: Cross-Silicon Highlights (Base M5 `24 GB` vs. M4 Pro `48 GB`)
 
-All engines below are measured under isolated subprocess runs (`EOT = valid accurate units/s` on public deterministic Tier-1 benchmarks; full tables in [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md)):
+Effective outcome throughput (EOT) divides the total score earned on valid outputs by elapsed benchmark seconds. Compare engines on the same task and inputs. Token rates and single-query timings come from separate warm runs.
 
 | Engine | Model & Path | Base M5 (`24 GB`, `Apple10 NAX`) | M4 Pro (`48 GB`, `Apple9`) | vs. Stock `MLX` / `CoreAI` (`EOT`) |
 |---|---|---|---|---|
@@ -103,9 +103,23 @@ All engines below are measured under isolated subprocess runs (`EOT = valid accu
 | [`fast-embeddinggemma-2`](../fast-embeddinggemma-2) | `google/embeddinggemma-2` (`hetero`) | **`4.707 EOT`** · **`48,803 tok/s`** (`2.58 ms` `B=1`, `3.43 GB`) | **`3.583 EOT`** · **`38,517 tok/s`** (`2.11 ms` `B=1`, `2.49 GB`) | **`4.33x` MLX / `6.24x` CoreAI** (M5) · **`4.80x` MLX** (M4 Pro) |
 | [`fast-pplx`](../fast-pplx) | `pplx-embed-v2-context-0.6b` (`hetero2`) | **`1.724 EOT`** · **`16,796 tok/s`** (`5.57 ms` `B=1`, `2.34 GB`) | **`1.407 EOT`** · **`14,330 tok/s`** (`1.97 GB`) | **`4.41x`** (M5) / **`4.33x`** (M4 Pro) vs. `pplx-context-mlx` |
 | [`fast-decision-models`](../fast-decision-models) | `Laya-Typed-421M` Pure-ANE (`[1585,0,0]`) | **`6.158 EOT`** · **`44.38 q/s`** (`1.00 GB`, `0` GPU ops) | **`5.827 EOT`** · **`41.91 q/s`** (`0.98 GB`, `0` GPU ops) | **`8.29x` CoreAI** (M5) · **`1.16x–1.92x` MLX** (`-0.23` MLX quality drop) |
-| [`fast-decision-models`](../fast-decision-models) | `Kev-0.8B` (`W8 g64`, `B=8` + `PrefixTree`) | **`5.078 EOT`** · **`86.84 q/s`** (`1.77 GB`, `1.59x` M4 Pro `B=8`) | **`3.254 EOT`** · **`54.52 q/s`** (`1.84 GB`) | **`-42%–44%` RAM**; up to **`6.19x`** (M5) / **`9.89x`** (M4 Pro) w/ `PrefixTree` |
+| [`fast-decision-models`](../fast-decision-models) | Kev-0.8B W8, automatic prefix cache | **4.395 EOT** (1.78 GB) · 86.84 questions/s in the earlier batch probe | **3.415 EOT** (2.29 GB) · 54.52 questions/s in the earlier batch probe | 0.87× the stock MLX EOT on M5 and 1.12× on M4 Pro |
 | [`fast-gemma4`](../fast-gemma4) | `google/gemma-4-E2B-it` (`kv_i8` + `llg`) | **`2.717 EOT`** (`Cat 4`) · **`10.46 valid docs/s`** (`1,479 tok/s`) | **`2.412 EOT`** (`Cat 4`) · **`8.78 valid docs/s`** (`ANE+GPU`) | **`1.81x`** (M5) / **`1.57x`** (M4 Pro) `Cat 4` `EOT`; **`5.18x`** valid `docs/s` |
 | [`fast-gpt-oss`](../fast-gpt-oss) | `openai/gpt-oss-20b` (`MXFP4` MoE) | *Gated on `24 GB`* | **`0.318 EOT`** (`49/50` valid) · **`454.1 dec tok/s`** (`B=128`) | **`1.61x`** `Cat 4` `EOT` (`+53%` valid docs) · **`2.91x`** `mlx-lm` `B=8` |
+
+### Open Core ML comparisons
+
+The public Core ML exports produced valid outputs for all 325 BGE retrieval cases, 500 EmbeddingGemma retrieval cases and 1,400 decisions per scorer. The same locked inputs show different tradeoffs across models.
+
+| Open Core ML export | M4 Pro EOT | M5 EOT | What changed against native |
+|---|---:|---:|---|
+| sidekickd BGE FP16 | 2.382 | 2.567 | Average ranking scores differed by 0.0002. Native BGE delivered 5.30× and 5.09× the score per second on M4 Pro and M5. |
+| FluidInference EmbeddingGemma FP16 | 1.637 | 1.666 | Native ranked long passages more accurately. The public export reads the first 512 tokens per passage. |
+| OpenInfinity EmbeddingGemma INT8 | 1.649 | 1.740 | This export used 1.03 GB on M4 Pro and 0.84 GB on M5. Its mean ranking score was 0.5183 on both. |
+| NMTZ Laya | 7.598 | 7.909 | The public option scorer delivered 1.30× and 1.28× the native EOT on M4 Pro and M5. Native scored 0.5050 and used about 1 GB. Open Laya scored 0.4993 and used 2.73–2.94 GB. |
+| FluidInference Kev FP16 | 1.674 | 2.269 | Native Kev delivered 2.04× and 1.94× the open EOT on M4 Pro and M5 and scored 0.5250 on both. Open Kev scored 0.5207 and 0.5214. |
+
+The results include individual task scores, warmed token rates, load times, memory components and compiler device preferences. [Benchmark methods](../../docs/BENCHMARKS.md#open-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
 
 ## Agent Plugin, Capability Matrix & Tests
 

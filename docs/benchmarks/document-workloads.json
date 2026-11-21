@@ -1,0 +1,132 @@
+{
+  "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+  "pplx_m5_tier1": [
+    {
+      "config_label": "hetero2",
+      "n_items": 325,
+      "n_valid": 150,
+      "objective_score_e2e": 0.345775,
+      "wall_sec": 168.4695,
+      "effective_outcome_per_sec": 0.667,
+      "gate_verdict": "PASS",
+      "gate_reasons": [],
+      "source": "outcomes_m5_tier1_all.json",
+      "combined_gb": 3.8343,
+      "legalbench": {
+        "n_queries": 175,
+        "span_ndcg@10": 0.0,
+        "char_recall@10": 0.0,
+        "isolated_span_ndcg@10": 0.359209,
+        "contextual_span_ndcg@10": 0.0,
+        "contextual_delta_ndcg@10": -0.359209,
+        "se_paired": 0.020009,
+        "ci95_low": -0.398427,
+        "ci95_high": -0.319992,
+        "isolated_char_recall@10": 0.68435
+      }
+    },
+    {
+      "config_label": "hetero2",
+      "n_items": 325,
+      "n_valid": 325,
+      "objective_score_e2e": 0.724399,
+      "wall_sec": 136.5252,
+      "effective_outcome_per_sec": 1.7244,
+      "gate_verdict": "PASS",
+      "gate_reasons": [],
+      "source": "3b_outcomes_pplx_tier1.json",
+      "combined_gb": 2.3403,
+      "legalbench": {
+        "n_queries": 175,
+        "span_ndcg@10": 0.703159,
+        "char_recall@10": 0.879491,
+        "isolated_span_ndcg@10": 0.359209,
+        "contextual_span_ndcg@10": 0.703159,
+        "contextual_delta_ndcg@10": 0.34395,
+        "se_paired": 0.025591,
+        "ci95_low": 0.293791,
+        "ci95_high": 0.394108,
+        "isolated_char_recall@10": 0.68435
+      }
+    },
+    {
+      "config_label": "pplx-context-mlx-zainmerchan-f16",
+      "n_items": 325,
+      "n_valid": 325,
+      "objective_score_e2e": 0.723568,
+      "wall_sec": 601.4883,
+      "effective_outcome_per_sec": 0.391,
+      "gate_verdict": "PASS",
+      "gate_reasons": [],
+      "source": "0_public_outcomes_tier1.json",
+      "combined_gb": 2.1194,
+      "legalbench": {
+        "n_queries": 175,
+        "span_ndcg@10": 0.703161,
+        "char_recall@10": 0.874989,
+        "isolated_span_ndcg@10": 0.352397,
+        "contextual_span_ndcg@10": 0.703161,
+        "contextual_delta_ndcg@10": 0.350764,
+        "se_paired": 0.025595,
+        "ci95_low": 0.300597,
+        "ci95_high": 0.40093,
+        "isolated_char_recall@10": 0.672433
+      }
+    }
+  ],
+  "gemma_m5_tier1": [
+    {
+      "config_label": "gpu_fp16_kvi8_llg_on",
+      "n_items": 300,
+      "n_valid": 299,
+      "objective_score_e2e": 0.748675,
+      "wall_sec": 82.6576,
+      "effective_outcome_per_sec": 2.7173,
+      "gate_verdict": "FAIL",
+      "gate_reasons": [
+        "repeat_loop_count=1 > 0"
+      ],
+      "source": "outcomes_m5_tier1_all.json",
+      "combined_gb": 16.9393,
+      "grounded_field_f1": 0.690684,
+      "tool_call_accuracy": 0.806667
+    },
+    {
+      "config_label": "mlx_vlm_4bit_llg_off",
+      "n_items": 300,
+      "n_valid": 286,
+      "objective_score_e2e": 0.861709,
+      "wall_sec": 172.1933,
+      "effective_outcome_per_sec": 1.5013,
+      "gate_verdict": "PASS",
+      "gate_reasons": [],
+      "source": "0_public_outcomes_tier1.json",
+      "combined_gb": 5.5844,
+      "grounded_field_f1": 0.923418,
+      "tool_call_accuracy": 0.8
+    }
+  ],
+  "gemma_m4_capacity": [
+    {
+      "source": "m4_gemma_capacity_nov19.json",
+      "timestamp_epoch": 1795133922,
+      "gpu": "[GPUOnly B=128] JSON=128/128 Strict=128/128 | pre=5.87s | dec=12.80s (1150 tok/s) | TOTAL=18.85s -> 6.79 docs/s | peak=6.33GB",
+      "ane_gpu": "[Concurrent ANE+GPU 2xB=128] JSON=256/256 Strict=256/256 | pre+wait=3.36s | dec=25.25s (1131 tok/s) | TOTAL=29.16s -> 8.78 docs/s | peak=6.28GB",
+      "stock": "mlx_vlm B=64: 809.4 dec tok/s (1.79 valid docs/s, schema=32/64, json=64/64, peak=5.00GB; B=1 72.9 tok/s)"
+    },
+    {
+      "source": "5a_benchmark_monorepo.json",
+      "timestamp_epoch": 1795193730,
+      "gpu": "[GPUOnly B=128] JSON=128/128 Strict=128/128 | pre=5.61s | dec=12.86s (1144 tok/s) | TOTAL=18.62s -> 6.87 docs/s | peak=6.33GB",
+      "ane_gpu": "[Concurrent ANE+GPU 2xB=128] JSON=256/256 Strict=256/256 | pre+wait=3.38s | dec=25.78s (1108 tok/s) | TOTAL=43.29s -> 5.91 docs/s | peak=6.28GB",
+      "stock": "mlx_vlm B=64: 811.2 dec tok/s (1.80 valid docs/s, schema=32/64, json=64/64, peak=5.27GB; B=1 69.8 tok/s)"
+    }
+  ],
+  "raw_source_sha256": {
+    "outcomes_m5_tier1_all.json": "f66c6545e8af418742c52003b03cf3de591def1e9a0f39a006bf2de781a21309",
+    "3b_outcomes_pplx_tier1.json": "94df81c669b48cb5c2ae866c0fdf3891942af9e613c246fcd9fb66655dd29969",
+    "0_public_outcomes_tier1.json": "acd045849c727fa3036446286b7218c1c442b90a4707dbd5610f2ecd6396669e",
+    "m4_gemma_capacity_nov19.json": "6d208be8611825780d80601bc499fc35c61b4f47126e0e963862ebbe889e4fed",
+    "5a_benchmark_monorepo.json": "73eecdbb8632c8f345c72cdce98b4fd173d8f7e807383dd7a815639ee212ac71"
+  }
+}

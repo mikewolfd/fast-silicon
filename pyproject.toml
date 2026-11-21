@@ -22,6 +22,7 @@ dev = [
 ]
 build = [
     "coremltools>=8.0",
+    "safetensors",
     "torch>=2.4",
 ]
 # Structured extraction, JSON Schema validation, Parquet I/O, and postal-address parsing deps

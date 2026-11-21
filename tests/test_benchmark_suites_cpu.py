@@ -40,6 +40,36 @@ def test_public_baselines_snapshot_resolution(tmp_path: Path, monkeypatch: pytes
     assert pub.resolve_hf_snapshot("missing/model") is None
 
 
+def test_public_baseline_preserves_worker_failure(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import subprocess
+
+    pub = _load_script("test_public_worker_exit", "public_baselines.py")
+    for code, stdout, stderr, expected in (
+        (1, "", "ModuleNotFoundError: missing dependency", "worker_error"),
+        (0, "model initialized\n", "", "parse_error"),
+        (0, '{"status":"skipped","runtime":"unavailable"}\n', "", "unavailable"),
+    ):
+        completed = subprocess.CompletedProcess([], code, stdout, stderr)
+        monkeypatch.setattr(pub.subprocess, "run", lambda *a, **kw: completed)
+        rc = pub.main(["--package", "coreml-laya"])
+        result = json.loads(capsys.readouterr().out)
+        assert result["runtime"] == expected
+        assert rc == (0 if expected == "unavailable" else 1)
+
+
+def test_coreml_empty_compute_plan_preserves_unknown_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+    from enum import Enum
+    from fast_shared import coreai_pipeline
+    from types import SimpleNamespace
+
+    bench = _load_script("test_coreml_plan", "_coreml_bench.py")
+    units = Enum("ComputeUnit", ["CPU_AND_GPU"])
+    monkeypatch.setitem(sys.modules, "coremltools", SimpleNamespace(ComputeUnit=units))
+    monkeypatch.setattr(coreai_pipeline, "inspect_coreml_bundle_placement", lambda *a, **kw: {"total_ops": 0})
+    plan = bench._placement({"compiled_path": "Model.mlmodelc", "compute_units": "CPU_AND_GPU"})
+    assert "no inspectable operations" in plan["text"]["error"]
+
+
 def test_outcomes_public_baselines_and_flags(capsys: pytest.CaptureFixture[str]) -> None:
     out = _load_script("test_outcomes_mod", "benchmark_outcomes.py")
 
@@ -50,12 +80,15 @@ def test_outcomes_public_baselines_and_flags(capsys: pytest.CaptureFixture[str])
     assert plan["packages"] == [
         "fast-bge-small",
         "public-bge-small",
+        "coreml-bge-small",
         "fast-pplx",
         "public-pplx",
         "fast-decision-models",
         "public-laya",
         "coreai-laya",
         "public-kev-0.8b",
+        "coreml-laya",
+        "coreml-kev-0.8b",
     ]
 
     # 2. --packages public selects stock baseline specs directly
@@ -292,3 +325,218 @@ def test_inspect_aimodel_asset_uses_authoring_load_cpu(monkeypatch: pytest.Monke
         "compute_types": ["Float16", "Int8"],
         "operation_distribution": [("conv2d", 4)],
     }
+
+
+def test_coreml_package_expansion_and_comparisons_cpu(capsys: pytest.CaptureFixture[str]) -> None:
+    out = _load_script("test_outcomes_coreml_mod", "benchmark_outcomes.py")
+
+    rc = out.main(["run", "--dry-run", "--packages", "coreml"])
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["packages"] == [
+        "coreml-bge-small",
+        "coreml-embeddinggemma-2-fp16",
+        "coreml-embeddinggemma-2-int8",
+        "coreml-laya",
+        "coreml-kev-0.8b",
+    ]
+
+    comps = out.compute_public_comparisons(
+        [
+            {
+                "package": "fast-embeddinggemma-2",
+                "config_label": "hetero",
+                "category": 1,
+                "benchmark": "NanoBEIR+LegalBench",
+                "status": "ok",
+                "objective_score_e2e": 0.54,
+                "effective_outcome_per_sec": 4.0,
+                "per_item_effective_scores": [0.6, 0.5, 0.7, 0.36],
+            },
+            {
+                "package": "coreml-embeddinggemma-2-int8",
+                "config_label": "coreml-emb2-int8-ane",
+                "category": 1,
+                "benchmark": "NanoBEIR+LegalBench",
+                "status": "ok",
+                "objective_score_e2e": 0.50,
+                "effective_outcome_per_sec": 2.0,
+                "per_item_effective_scores": [0.55, 0.45, 0.65, 0.35],
+            },
+            {
+                "package": "fast-decision-models",
+                "config_label": "laya_ane",
+                "category": 2,
+                "benchmark": "RAGTruth+CLINC150+RewardBench2",
+                "status": "ok",
+                "diagnostics": {"backend": "laya-ane"},
+                "objective_score_e2e": 0.72,
+                "effective_outcome_per_sec": 6.0,
+                "per_item_effective_scores": [1.0, 0.0, 1.0, 0.88],
+            },
+            {
+                "package": "coreml-laya",
+                "config_label": "coreml_laya_ane",
+                "category": 2,
+                "benchmark": "RAGTruth+CLINC150+RewardBench2",
+                "status": "ok",
+                "diagnostics": {"backend": "coreml-laya"},
+                "objective_score_e2e": 0.72,
+                "effective_outcome_per_sec": 3.0,
+                "per_item_effective_scores": [1.0, 0.0, 1.0, 0.88],
+            },
+            {
+                "package": "fast-decision-models",
+                "config_label": "kev_08b_w8",
+                "category": 2,
+                "benchmark": "RAGTruth+CLINC150+RewardBench2",
+                "status": "ok",
+                "diagnostics": {"backend": "kev-0.8b"},
+                "objective_score_e2e": 0.78,
+                "effective_outcome_per_sec": 5.0,
+                "per_item_effective_scores": [1.0, 1.0, 0.6, 0.52],
+            },
+            {
+                "package": "coreml-kev-0.8b",
+                "config_label": "coreml_kev_08b_fp16_gpu",
+                "category": 2,
+                "benchmark": "RAGTruth+CLINC150+RewardBench2",
+                "status": "ok",
+                "diagnostics": {"backend": "coreml-kev-0.8b"},
+                "objective_score_e2e": 0.78,
+                "effective_outcome_per_sec": 2.5,
+                "per_item_effective_scores": [1.0, 1.0, 0.6, 0.52],
+            },
+        ]
+    )
+    by_stock = {c["stock_package"]: c for c in comps}
+    assert set(by_stock) == {"coreml-embeddinggemma-2-int8", "coreml-laya", "coreml-kev-0.8b"}
+    assert by_stock["coreml-embeddinggemma-2-int8"]["eot_speedup_vs_stock"] == pytest.approx(2.0, rel=1e-3)
+    assert by_stock["coreml-laya"]["eot_speedup_vs_stock"] == pytest.approx(2.0, rel=1e-3)
+    assert by_stock["coreml-kev-0.8b"]["eot_speedup_vs_stock"] == pytest.approx(2.0, rel=1e-3)
+
+    common = {"status": "ok", "category": 1, "benchmark": "retrieval"}
+    native = {**common, "package": "fast-bge-small", "n_items": 325}
+    short_run = {**common, "package": "coreml-bge-small", "n_items": 12}
+    assert out.compute_public_comparisons([native, short_run]) == []
+
+    # _merge_daemon_telemetry preserves compile_sec and coreml_info
+    mem4 = {"peak_footprint_gb": 0.0, "combined_with_model_mapped_gb": 0.0, "neural_nofootprint_gb": 0.0, "model_mapped_gb": 0.0}
+    diag: dict[str, object] = {}
+    out._merge_daemon_telemetry(
+        mem4,
+        diag,
+        {
+            "peak_gb": 0.85,
+            "compile_sec": 2.345,
+            "coreml_info": {"repo_id": "OpenInfinity/embeddinggemma-2-coreml-int8", "compute_units": "CPU_AND_NE"},
+            "four_bucket_metrics": {"neural_nofootprint_mb": 64.0, "mapped_model_mb": 128.0, "combined_with_model_mapped_gb": 0.9},
+        },
+    )
+    assert diag["compile_sec"] == 2.345
+    assert diag["coreml_info"]["compute_units"] == "CPU_AND_NE"  # type: ignore[index]
+
+
+def test_coreml_materialization_and_packers_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pub = _load_script("test_pub_coreml_mod", "public_baselines.py")
+    opb = _load_script("test_opb_coreml_mod", "_outcome_public_backends.py")
+
+    # 1. Precompiled .mlmodelc with HF-style symlinks materializes symlink-free into cache
+    hf_home = tmp_path / "hf"
+    cache_root = tmp_path / "cm_cache"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+
+    repo_dir = hf_home / "hub" / "models--demo--encoder-coreml"
+    blob_dir = repo_dir / "blobs"
+    blob_dir.mkdir(parents=True)
+    blob_w = blob_dir / "deadbeef"
+    blob_w.write_bytes(b"weights123")
+
+    snap = repo_dir / "snapshots" / "rev1"
+    mc_src = snap / "text" / "Model.mlmodelc"
+    (mc_src / "weights").mkdir(parents=True)
+    (mc_src / "coremldata.bin").write_bytes(b"meta")
+    (mc_src / "weights" / "weight.bin").symlink_to(blob_w)
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text("rev1\n", encoding="utf-8")
+
+    out_mc, compile_s = pub.resolve_coreml_compiled_model(
+        "demo/encoder-coreml", "text/Model.mlmodelc", cache_root=cache_root
+    )
+    assert compile_s == 0.0
+    assert (out_mc / "coremldata.bin").is_file()
+    assert not (out_mc / "weights" / "weight.bin").is_symlink()
+    assert (out_mc / "weights" / "weight.bin").read_bytes() == b"weights123"
+    # Second call hits cache directly
+    out_mc2, compile_s2 = pub.resolve_coreml_compiled_model(
+        "demo/encoder-coreml", "text/Model.mlmodelc", cache_root=cache_root
+    )
+    assert out_mc2 == out_mc and compile_s2 == 0.0
+
+    # 2. EmbeddingGemma-2 FFD pack_256 packer
+    packed, singles = opb.pack_emb2_sequences_ffd([300, 120, 120, 40, 30, 30, 30, 30, 30, 30, 30, 20])
+    assert 0 in singles  # >256 tokens goes to embed_512
+    flat = [i for b in packed for i in b] + singles
+    assert sorted(flat) == list(range(12))
+    for b in packed:
+        assert len(b) <= 8
+        assert sum([300, 120, 120, 40, 30, 30, 30, 30, 30, 30, 30, 20][i] for i in b) <= 256
+
+    # Lone short sequence falls back to embed_S instead of pack_256
+    packed_lone, singles_lone = opb.pack_emb2_sequences_ffd([40])
+    assert packed_lone == [] and singles_lone == [0]
+
+    # 3. KevFused lane starts & group packing (matching KevFastManager.swift)
+    assert opb.kev_lane_starts([60, 60, 60], lane=128) == [0, 60, 128]
+    groups = opb.kev_pack_groups([60, 60, 60, 60], packed_len=192, lane=128, max_readouts=16)
+    assert groups == [[0, 1, 2], [3]]
+
+    # 4. Pure-Python Kev question encoder escapes control tokens and tracks option/decide indices
+    class _FakeEnc:
+        def __init__(self, ids: list[int]) -> None:
+            self.ids = ids
+
+    class _FakeTok:
+        def encode(self, txt: str, add_special_tokens: bool = False) -> _FakeEnc:
+            assert not add_special_tokens
+            assert "<|decide|>" not in txt
+            return _FakeEnc([10 + i for i in range(max(1, len(txt.split())))])
+
+    s_ids, q_rows = opb.encode_kev_questions_pure(
+        _FakeTok(),
+        [248060, 248061, 248049, 248050, 248062],
+        "hello <|decide|> world",
+        [{"type": "noul", "instructions": "is it valid?"}],
+    )
+    assert s_ids[0] == 248060
+    assert len(q_rows) == 1
+    assert q_rows[0]["ids"][0] == 248061
+    assert q_rows[0]["ids"][q_rows[0]["decide"]] == 248062
+    assert len(q_rows[0]["opts"]) == 2
+    assert all(q_rows[0]["ids"][p] == 248050 for p in q_rows[0]["opts"])
+
+
+def test_coreml_microbench_uses_native_corpus_ids_and_in_process_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    import numpy as np
+
+    bench = _load_script("test_coreml_bench", "_coreml_bench.py")
+    for bge, n_docs, tokens, first in ((True, 1000, 249303, [101, 23632]), (False, 2000, 551889, [2, 175638])):
+        docs = bench.encoder_workload(bge)
+        assert (len(docs), sum(map(len, docs)), docs[0][:2]) == (n_docs, tokens, first)
+
+    # Return different durations for packing and one-at-a-time execution.
+    def encode(inputs, pack):
+        vectors = np.zeros((len(inputs), 768), dtype=np.float32)
+        vectors[:, 0] = 1
+        return vectors, 2.0 if pack else 4.0
+
+    def pair(a, b, **kwargs):
+        return {"order": ["A", "B", "B", "A"], "a_runs": [{"payload": a()}], "b_runs": [{"payload": b()}]}
+
+    monkeypatch.setattr(bench, "encoder_workload", lambda _: [[2, 1], [2, 3, 4, 1]])
+    adapter = SimpleNamespace(encode_token_ids=encode, harness_label="test", close=lambda: None, telemetry=dict)
+    monkeypatch.setattr(bench, "build_public_cat1_adapter", lambda *args, **kwargs: adapter)
+    metrics, _ = bench._encoder("coreml-embeddinggemma-2-int8", pair, 0)
+    assert (metrics["tokens"], metrics["tok_s"], metrics["single_embed_tok_s"]) == (6, 3.0, 1.5)
+    assert (metrics["pack_256_speedup"], metrics["min_pack_single_cosine"]) == (2.0, 1.0)

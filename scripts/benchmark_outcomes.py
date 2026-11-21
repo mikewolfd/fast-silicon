@@ -123,23 +123,40 @@ PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("public-gpt-oss", 4, "FAST_GPT_OSS_HOME", "Stock mlx-lm GPT-OSS-20B MXFP4 (Cat 3+4)"),
     OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
 )
+COREML_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
+    OutcomePackageSpec("coreml-bge-small", 1, "FAST_BGE_SMALL_HOME", "Open HF CoreML FP16 BGE-small ANE (sidekickd, Cat 1)"),
+    OutcomePackageSpec("coreml-embeddinggemma-2-fp16", 1, "FAST_EMBEDDINGGEMMA2_HOME", "Open HF CoreML FP16 EmbeddingGemma-2 ANE + pack_256 (FluidInference, Cat 1)"),
+    OutcomePackageSpec("coreml-embeddinggemma-2-int8", 1, "FAST_EMBEDDINGGEMMA2_HOME", "Open HF CoreML INT8 EmbeddingGemma-2 ANE + pack_256 (OpenInfinity, Cat 1)"),
+    OutcomePackageSpec("coreml-laya", 2, "FAST_DECISION_MODELS_HOME", "Open HF CoreML ANE Laya-Typed-421M L192/L384/L512 (NMTZ, Cat 2)"),
+    OutcomePackageSpec("coreml-kev-0.8b", 2, "FAST_DECISION_MODELS_HOME", "Open HF CoreML FP16 Kev-0.8B Fused+Row GPU (FluidInference, Cat 2)"),
+)
 PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
-    "fast-bge-small": ("public-bge-small",),
-    "fast-embeddinggemma-2": ("public-embeddinggemma-2", "coreai-embeddinggemma-2"),
+    "fast-bge-small": ("public-bge-small", "coreml-bge-small"),
+    "fast-embeddinggemma-2": (
+        "public-embeddinggemma-2", "coreai-embeddinggemma-2",
+        "coreml-embeddinggemma-2-fp16", "coreml-embeddinggemma-2-int8",
+    ),
     "fast-pplx": ("public-pplx",),
-    "fast-decision-models": ("public-laya", "coreai-laya", "public-kev-0.8b"),
+    "fast-decision-models": ("public-laya", "coreai-laya", "public-kev-0.8b", "coreml-laya", "coreml-kev-0.8b"),
     "fast-gemma4": ("public-gemma4",),
     "fast-gpt-oss": ("public-gpt-oss",),
 }
-_SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS)}
+_SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {
+    s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS, *COREML_BASELINE_SPECS)
+}
 _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-bge-small": "fast-bge-small",
+    "coreml-bge-small": "fast-bge-small",
     "public-embeddinggemma-2": "fast-embeddinggemma-2",
     "coreai-embeddinggemma-2": "fast-embeddinggemma-2",
+    "coreml-embeddinggemma-2-fp16": "fast-embeddinggemma-2",
+    "coreml-embeddinggemma-2-int8": "fast-embeddinggemma-2",
     "public-pplx": "fast-pplx",
     "public-laya": "fast-decision-models",
     "coreai-laya": "fast-decision-models",
+    "coreml-laya": "fast-decision-models",
     "public-kev-0.8b": "fast-decision-models",
+    "coreml-kev-0.8b": "fast-decision-models",
     "public-gemma4": "fast-gemma4",
     "public-gpt-oss": "fast-gpt-oss",
     "coreai-qwen3.5-4b": "fast-gemma4",
@@ -297,6 +314,10 @@ def _merge_daemon_telemetry(
     lat = telemetry.get("cold_warm_latency")
     if isinstance(lat, Mapping) and lat:
         diag["cold_warm_latency"] = dict(lat)
+    if telemetry.get("compile_sec") is not None:
+        diag["compile_sec"] = round(float(telemetry["compile_sec"]), 4)
+    if isinstance(telemetry.get("coreml_info"), Mapping):
+        diag["coreml_info"] = dict(telemetry["coreml_info"])
     if isinstance(telemetry.get("asset_summary"), Mapping):
         diag["asset_summary"] = dict(telemetry["asset_summary"])
     if "profiler_available" in telemetry:
@@ -569,7 +590,15 @@ def _run_cat1_worker(
                 else:
                     out_mats.append(np.vstack(parts))
             return out_mats
-    elif pkg_name in ("public-bge-small", "public-embeddinggemma-2", "coreai-embeddinggemma-2", "public-pplx"):
+    elif pkg_name in (
+        "public-bge-small",
+        "coreml-bge-small",
+        "public-embeddinggemma-2",
+        "coreai-embeddinggemma-2",
+        "coreml-embeddinggemma-2-fp16",
+        "coreml-embeddinggemma-2-int8",
+        "public-pplx",
+    ):
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import build_public_cat1_adapter
 
@@ -746,7 +775,7 @@ def _run_cat1_worker(
             guard_tripped = True
 
         mem4 = _memory_4bucket_dict(probe)
-        daemon_pk = eng.close() if pkg_name.startswith(("public-", "coreai-")) else None
+        daemon_pk = eng.close() if pkg_name.startswith(("public-", "coreai-", "coreml-")) else None
         daemon_telem = eng.telemetry() if hasattr(eng, "telemetry") else None
         diag: dict[str, Any] = {
             "mode": eff_mode,
@@ -775,7 +804,7 @@ def _run_cat1_worker(
             )
         ]
     finally:
-        if not pkg_name.startswith(("public-", "coreai-")):
+        if not pkg_name.startswith(("public-", "coreai-", "coreml-")):
             eng.close()
 
 
@@ -828,7 +857,7 @@ def _run_cat2_single_backend(
     cl_s2_qdefs = {dom: build_clinc_stage2_qdef(dom) for dom in CLINC150_DOMAINS}
     rb_qdef = build_rewardbench2_score_qdef()
 
-    is_laya = backend_name in ("laya-ane", "public-laya", "coreai-laya")
+    is_laya = backend_name in ("laya-ane", "public-laya", "coreai-laya", "coreml-laya")
     if backend_name == "laya-ane":
         laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
         eng: Any = LayaAneBackend(laya_dir, ensure_laya_dylib(), pipe_depth=4)
@@ -845,6 +874,12 @@ def _run_cat2_single_backend(
 
         eng = CoreAiLayaBackend(coreai_python=coreai_python)
         eff_label = config_label or "coreai_laya_decision"
+    elif backend_name == "coreml-laya":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import CoreMlLayaBackend
+
+        eng = CoreMlLayaBackend()
+        eff_label = config_label or "coreml_laya_ane"
     elif backend_name == "public-kev-0.8b":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import PublicKev08bMlxBackend
@@ -852,6 +887,12 @@ def _run_cat2_single_backend(
         kev_dir = resolve_kev_dir(None, artifacts_dir=art_dir)
         eng = PublicKev08bMlxBackend(kev_dir, batch_docs=int(extra.batch_docs))
         eff_label = config_label or "mlx_lm_kev_08b_8bit"
+    elif backend_name == "coreml-kev-0.8b":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import CoreMlKev08bBackend
+
+        eng = CoreMlKev08bBackend()
+        eff_label = config_label or "coreml_kev_08b_fp16_gpu"
     else:
         kev_dir = resolve_kev_dir(None, artifacts_dir=art_dir)
         eng = Kev08bMlxBackend(kev_dir, quant_mode=extra.kev_quant, batch_docs=int(extra.batch_docs))
@@ -1601,8 +1642,11 @@ def _run_worker_main(args: argparse.Namespace) -> int:
             "fast-embeddinggemma-2",
             "fast-pplx",
             "public-bge-small",
+            "coreml-bge-small",
             "public-embeddinggemma-2",
             "coreai-embeddinggemma-2",
+            "coreml-embeddinggemma-2-fp16",
+            "coreml-embeddinggemma-2-int8",
             "public-pplx",
         ):
             try:
@@ -1622,7 +1666,7 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                     pplx_mlx_path=args.pplx_mlx_path,
                 )
             except FileNotFoundError as exc:
-                if pkg_name.startswith(("public-", "coreai-")):
+                if pkg_name.startswith(("public-", "coreai-", "coreml-")):
                     recs = [
                         {
                             "package": pkg_name,
@@ -1636,7 +1680,14 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                     ]
                 else:
                     raise
-        elif pkg_name in ("fast-decision-models", "public-laya", "coreai-laya", "public-kev-0.8b"):
+        elif pkg_name in (
+            "fast-decision-models",
+            "public-laya",
+            "coreai-laya",
+            "coreml-laya",
+            "public-kev-0.8b",
+            "coreml-kev-0.8b",
+        ):
             if pkg_name == "fast-decision-models":
                 backends = ["laya-ane", "kev-0.8b"] if extra.backend == "all" else [extra.backend]
             else:
@@ -2032,17 +2083,22 @@ def _cmd_compare(args: argparse.Namespace) -> int:
 
 
 def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Pair completed `fast-*` outcome records against their matching stock `public-*` / `coreai-*` baselines."""
+    """Pair completed `fast-*` outcome records against their matching stock `public-*` / `coreai-*` / `coreml-*` baselines."""
     ok_rows = [r for r in results if r.get("status") == "ok"]
     out: list[dict[str, Any]] = []
     pair_map: tuple[tuple[str, str | None, str], ...] = (
         ("fast-bge-small", None, "public-bge-small"),
+        ("fast-bge-small", None, "coreml-bge-small"),
         ("fast-embeddinggemma-2", None, "public-embeddinggemma-2"),
         ("fast-embeddinggemma-2", None, "coreai-embeddinggemma-2"),
+        ("fast-embeddinggemma-2", None, "coreml-embeddinggemma-2-fp16"),
+        ("fast-embeddinggemma-2", None, "coreml-embeddinggemma-2-int8"),
         ("fast-pplx", None, "public-pplx"),
         ("fast-decision-models", "laya-ane", "public-laya"),
         ("fast-decision-models", "laya-ane", "coreai-laya"),
+        ("fast-decision-models", "laya-ane", "coreml-laya"),
         ("fast-decision-models", "kev-0.8b", "public-kev-0.8b"),
+        ("fast-decision-models", "kev-0.8b", "coreml-kev-0.8b"),
         ("fast-gemma4", None, "public-gemma4"),
         ("fast-gpt-oss", None, "public-gpt-oss"),
     )
@@ -2056,11 +2112,8 @@ def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dic
         pub_cands = [r for r in ok_rows if r.get("package") == pub_pkg]
         for fr in fast_cands:
             for pr in pub_cands:
-                if fr.get("category") != pr.get("category"):
+                if any(fr.get(key) != pr.get(key) for key in ("category", "benchmark", "n_items")):
                     continue
-                if fr.get("category") == 4:
-                    # Pair both constrained (llg_on) and unconstrained (llg_off) against stock unconstrained.
-                    pass
                 f_eot = float(fr.get("effective_outcome_per_sec", 0.0))
                 p_eot = float(pr.get("effective_outcome_per_sec", 0.0))
                 f_sc = float(fr.get("objective_score_e2e", 0.0))
@@ -2110,11 +2163,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
             for s in PUBLIC_BASELINE_SPECS:
                 if s.name not in pkg_names:
                     pkg_names.append(s.name)
+        elif tok_p == "coreml":
+            saw_group_token = True
+            for s in COREML_BASELINE_SPECS:
+                if s.name not in pkg_names:
+                    pkg_names.append(s.name)
         elif tok_p in _SPEC_BY_NAME or tok_p == "openai-chat":
             if tok_p not in pkg_names:
                 pkg_names.append(tok_p)
         else:
-            raise ValueError(f"Unknown package {tok_p!r}; choose from all, public, {', '.join(_SPEC_BY_NAME)}, openai-chat")
+            raise ValueError(
+                f"Unknown package {tok_p!r}; choose from all, public, coreml, {', '.join(_SPEC_BY_NAME)}, openai-chat"
+            )
 
     if getattr(args, "include_public_baselines", False):
         expanded: list[str] = []
@@ -2281,7 +2341,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rn = sub.add_parser("run", help="Run isolated Tier-1 / Tier-2 objective outcome benchmarks under GPU lock")
     rn.add_argument("--tier", choices=("tier1", "tier2"), default="tier1")
-    rn.add_argument("--packages", default="all", help="Comma-separated package list or 'all'")
+    rn.add_argument("--packages", default="all", help="Comma-separated package names or groups (all, public, coreml)")
     rn.add_argument("--abba-compare", nargs="+", default=None, help="Two 'label:flags' arms for interleaved ABBA")
     rn.add_argument("--abba-rounds", type=int, default=2, help="Interleaved ABBA rounds when --abba-compare is set")
     rn.add_argument("--gate-profile", choices=("lossless", "quantized"), default="lossless")
@@ -2290,7 +2350,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument(
         "--include-public-baselines",
         action="store_true",
-        help="Also run paired stock CoreAI/MLX baselines on identical datasets & evaluators",
+        help="Also run matching public MLX, Apple Core AI and community Core ML baselines",
     )
     rn.add_argument("--public-python", default=None, help="Python executable for stock MLX baseline workers")
     rn.add_argument("--coreai-python", default=None, help="Python executable for Apple CoreAI (macOS 27.2+) workers")

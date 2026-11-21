@@ -13,8 +13,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +72,101 @@ def resolve_coreai_bundle(subpath: str, explicit_root: str | Path | None = None)
         if cand.is_dir():
             return cand
     return None
+
+
+# Open Hugging Face Core ML repositories paired against `fast-silicon` packages.
+# Note: `michaeljelly/bge-small-en-coreml-v1.5` (coremltools 7.1 FP16) contains `mul(1 - mask, -inf)`,
+# producing 100% NaN on CPU/GPU and corrupted cos=0.52-0.62 on ANE; `sidekickd/bge-small-en-v1.5-coreml`
+# ships verified Grade-A (`cos=0.999977`) precompiled `128/256/512` ANE `.mlmodelc` buckets.
+COREML_REPO_IDS: dict[str, str] = {
+    "coreml-bge-small": "sidekickd/bge-small-en-v1.5-coreml",
+    "coreml-embeddinggemma-2-fp16": "FluidInference/embeddinggemma-2-coreml",
+    "coreml-embeddinggemma-2-int8": "OpenInfinity/embeddinggemma-2-coreml-int8",
+    "coreml-laya": "NMTZ/laya-typed-decisions-421m-coreml-ane",
+    "coreml-kev-0.8b": "FluidInference/kev-0.8b-coreml",
+}
+
+
+def resolve_coreml_cache_dir(explicit_root: str | Path | None = None) -> Path:
+    """Resolve persistent cache root for materialized / compiled Core ML `.mlmodelc` bundles."""
+    raw = explicit_root or os.environ.get("FAST_SILICON_COREML_CACHE_DIR")
+    return Path(raw).expanduser() if raw else (Path.home() / ".cache" / "fast-silicon" / "coreml_compiled")
+
+
+def materialize_coreml_bundle(src_dir: Path, dst_dir: Path) -> Path:
+    """Materialize a Core ML `.mlpackage` or `.mlmodelc` resolving HF cache symlinks via hardlinks."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for root, _, files in os.walk(src_dir):
+        rel = Path(root).relative_to(src_dir)
+        (dst_dir / rel).mkdir(parents=True, exist_ok=True)
+        for fn in files:
+            src = (Path(root) / fn).resolve()
+            dst = dst_dir / rel / fn
+            if dst.exists():
+                continue
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+    return dst_dir
+
+
+def resolve_coreml_compiled_model(
+    repo_id: str,
+    rel_model_path: str | Path,
+    *,
+    cache_root: str | Path | None = None,
+) -> tuple[Path, float]:
+    """Return `(compiled_mlmodelc_path, compile_sec)` with symlink-free ANE-safe caching.
+
+    Resolves HF Hub symlinks via hardlinks before compiling `.mlpackage` (using in-process
+    `coremltools.utils.compile_model`, which works without `xcrun coremlcompiler`) or loading
+    precompiled `.mlmodelc` (preventing E5RT / ANECompiler symlink failures and CPU fallback).
+    """
+    snap = resolve_hf_snapshot(repo_id)
+    if snap is None:
+        raise FileNotFoundError(f"Missing cached HF snapshot for {repo_id}")
+    rel_p = Path(rel_model_path)
+    src_path = snap / rel_p
+    if not src_path.exists():
+        raise FileNotFoundError(f"Missing Core ML artifact {rel_p} inside {snap}")
+
+    repo_slug = repo_id.replace("/", "--")
+    rel_slug = rel_p.as_posix().replace("/", "__")
+    for suffix in (".mlpackage", ".mlmodelc"):
+        if rel_slug.endswith(suffix):
+            rel_slug = rel_slug[: -len(suffix)]
+    dst_parent = resolve_coreml_cache_dir(cache_root) / repo_slug / snap.name
+    dst_mc = dst_parent / f"{rel_slug}.mlmodelc"
+    if dst_mc.is_dir() and (dst_mc / "coremldata.bin").exists():
+        return dst_mc, 0.0
+
+    dst_parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    if src_path.suffix not in (".mlmodelc", ".mlpackage"):
+        raise ValueError(f"Expected .mlpackage or .mlmodelc, got {src_path}")
+
+    compile_sec = 0.0
+    with tempfile.TemporaryDirectory(dir=dst_parent, prefix=".prepare-") as temp:
+        staged = Path(temp) / dst_mc.name
+        if src_path.suffix == ".mlmodelc":
+            materialize_coreml_bundle(src_path, staged)
+        else:
+            import coremltools as ct
+
+            package = materialize_coreml_bundle(src_path, Path(temp) / src_path.name)
+            ct.utils.compile_model(str(package), destination_path=str(staged))
+            compile_sec = round(time.perf_counter() - t0, 4)
+        if not (staged / "coremldata.bin").is_file():
+            raise ValueError(f"Incomplete compiled Core ML bundle: {src_path}")
+        try:
+            staged.rename(dst_mc)
+        except OSError:
+            # Another process can publish the same revision while this one compiles.
+            if not (dst_mc / "coremldata.bin").is_file():
+                raise
+    return dst_mc, compile_sec
+
 
 # Child snippet executed cleanly in `--public-python` (or current Python).
 _PUBLIC_RUNNER_SNIPPET = r"""
@@ -823,6 +921,15 @@ elif pkg == "fast-decision-models":
         "load_s": round(load_s, 3),
         "highlight": f"transformers-mps B=8: {b8_qs:.2f} q/s ({(dt_b8 * 1000.0) / 8.0:.2f} ms/q; B=1 {b1_qs:.2f} q/s)",
     }), flush=True)
+elif pkg.startswith("coreml-"):
+    sys.path.insert(0, cfg["scripts_dir"])
+    from _coreml_bench import run_coreml_benchmark
+
+    try:
+        result = run_coreml_benchmark(pkg, run_abba_pair, cooldown_sec)
+    except FileNotFoundError as exc:
+        skip(str(exc))
+    print(json.dumps(result), flush=True)
 else:
     skip(f"no public runner registered for {pkg}")
 """
@@ -841,11 +948,15 @@ def run_public_baseline(
     if pkg_name == "fast-pplx":
         return {"status": "delegated", "reason": "reported inside fast-pplx speed suite (pplx-context-mlx-f16 / torch-mps / torch-cpu)"}
 
-    py_exe = public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
+    if pkg_name.startswith("coreml-"):
+        py_exe = public_python or sys.executable
+    else:
+        py_exe = public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
     payload = {
         "package": pkg_name,
         "resolved_home": str(resolved_home),
         "fast_shared_src": str(_FAST_SHARED_SRC),
+        "scripts_dir": str(Path(__file__).resolve().parent),
         "wired_limit": bool(wired_limit),
         "cooldown_sec": float(cooldown_sec),
     }
@@ -859,21 +970,30 @@ def run_public_baseline(
         )
     except subprocess.TimeoutExpired:
         return {"status": "failed", "runtime": "timeout", "highlight": f"timed out after {timeout_sec}s"}
-    except Exception as exc:
+    except FileNotFoundError as exc:
         return {"status": "skipped", "runtime": "unavailable", "reason": str(exc), "highlight": "-"}
+    except OSError as exc:
+        return {"status": "failed", "runtime": "launch_error", "reason": str(exc), "highlight": "-"}
 
-    if not proc.stdout.strip():
-        reason = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit={proc.returncode}"
-        return {"status": "skipped", "runtime": "unavailable", "reason": reason[:120], "highlight": "-"}
-    try:
-        return json.loads(proc.stdout.strip().splitlines()[-1])
-    except Exception:
-        return {
-            "status": "skipped",
-            "runtime": "parse_error",
-            "reason": proc.stdout.strip().splitlines()[-1][:120],
-            "highlight": "-",
-        }
+    if proc.returncode:
+        error_lines = proc.stderr.strip().splitlines()
+        reason = error_lines[-1] if error_lines else f"exit={proc.returncode}"
+        return {"status": "failed", "runtime": "worker_error", "reason": reason, "highlight": "-"}
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ln.startswith("{"):
+            try:
+                parsed = json.loads(ln)
+                if isinstance(parsed, dict) and "status" in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+    return {
+        "status": "failed",
+        "runtime": "parse_error",
+        "reason": lines[-1][:120] if lines else "empty stdout",
+        "highlight": "-",
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -884,7 +1004,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--package",
         required=True,
-        choices=("fast-bge-small", "fast-embeddinggemma-2", "fast-gemma4", "fast-gpt-oss", "fast-decision-models"),
+        choices=(
+            "fast-bge-small",
+            "fast-embeddinggemma-2",
+            "fast-gemma4",
+            "fast-gpt-oss",
+            "fast-decision-models",
+            "coreml-bge-small",
+            "coreml-embeddinggemma-2-fp16",
+            "coreml-embeddinggemma-2-int8",
+            "coreml-laya",
+            "coreml-kev-0.8b",
+        ),
         help="Target package to compare against its public open-source baseline",
     )
     parser.add_argument("--resolved-home", type=Path, default=None, help="Optional package artifact home directory")
