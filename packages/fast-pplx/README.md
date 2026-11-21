@@ -5,7 +5,7 @@
 `fast-pplx` preserves exact upstream tokenization, late-chunking context (`[Q]`/`[D]`/`<|chunk_sep|>`), and Matryoshka dimensions (`128..1024`, `float32`/`float16`/`int8`), while scheduling short chunks (`<= 512` tok) onto hand-crafted `100%` Pure-ANE CoreML stages and streaming long documents up to `32K` tokens on Metal GPU. On Tier-1 `NanoBEIR + LegalBench-RAG` (`4K` contextual chunks), `fast-pplx` (`hetero2`) delivers **`1.724 EOT`** on **Base M5 (`24 GB`)** (**`4.41×`** vs stock `pplx-context-mlx`, **`1.23×`** M4 Pro) and **`1.407 EOT`** on **M4 Pro (`48 GB`)** (**`4.33×`** vs stock) — with zero `torch`/`transformers` runtime dependencies and built-in Python, OpenAI `/v1/embeddings`, contextual Parquet CLI, and `pplx-ane-cli` interfaces.
 
 > [!TIP]
-> **Full Cross-Silicon & CoreAI Reference:** See [**`../../docs/BENCHMARKS.md`**](../../docs/BENCHMARKS.md) for complete Category 1–4 outcome tables, 4-bucket `RUSAGE_INFO_V6` memory footprints, and the `22/22` audited `CoreAI-Opt` / `macOS 27.2.1` promotion-gate matrix.
+> **Full Cross-Silicon & CoreAI Reference:** See [**`../../docs/BENCHMARKS.md`**](../../docs/BENCHMARKS.md) for complete Category 1–4 outcome tables, 4-bucket `RUSAGE_INFO_V6` memory footprints, and 22 audited CoreAI decisions, including rejected configurations.
 
 ## Quick start
 
@@ -48,6 +48,8 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
 | **`fast-pplx` (`hetero2`)** | **`0.7244`** | **`1.724`** (`136.5s`, `2.34 GB`) | **`0.7241`** | **`1.407`** (`167.3s`, `1.97 GB`) | **`4.41×`** / **`4.33×`** | **`1.23×`** |
 | Stock `pplx-context-mlx` (`fp16`) | `0.7236` | `0.391` (`601.5s`, `2.12 GB`) | `0.7236` | `0.325` (`723.1s`, `2.19 GB`) | `1.00×` | `1.20×` |
 
+On 175 legal questions, giving each passage its surrounding text raised the ranking score in the first ten results from 0.359 to 0.703. Stock contextual `pplx-context-mlx` also scored 0.703. The 4.41× M5 throughput result above comes from the full 325-query run after the benchmark split oversized documents into windows. [Per-task results and run records](../../docs/benchmarks/document-workloads.json)
+
 ### 2. Cross-Silicon Throughput, Latency & `32K` Scaling
 
 | Workload | M4 Pro (`48 GB`) `fast-pplx` | Base M5 (`24 GB`, `NAX`) `fast-pplx` | vs. Stock Baselines & Notes |
@@ -73,7 +75,7 @@ Measured via `packages/fast-pplx/scripts/benchmark.py ane-profiles` in isolated 
 
 ### 4. Direct MIL (`100%` Pure-ANE `2.24 ms`) vs. `CoreAI-Opt` / `.aimodel` Findings
 
-Audited across both **M4 Pro `macOS 26.6`** (`Track A`) and **Base M5 `macOS 27.2.1`** (`Track B`) in [`../../docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#7-coreai-opt-track-a--os-coreai-track-b-promotion-audit-2222-gates):
+Audited across both **M4 Pro `macOS 26.6`** (`Track A`) and **Base M5 `macOS 27.2.1`** (`Track B`) in [`../../docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#7-coreai-audit-of-22-decisions):
 
 | Export / Runtime Path | Placement (`ANE / GPU / CPU`) | Warm Latency (`s64 st2` / Cat-1) | Parity / Outcome | Promotion Verdict |
 | :--- | :---: | :---: | :--- | :---: |

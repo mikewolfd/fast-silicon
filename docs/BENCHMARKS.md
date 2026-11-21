@@ -1,8 +1,19 @@
-# `fast-silicon` Cross-Silicon Benchmark Reference
+# fast-silicon benchmarks
 
-The benchmarks measure retrieval, scoring, generation and training on an Apple M4 Pro (48 GB, macOS 26.6) and a base M5 (24 GB, macOS 27.2.1). They compare the workspace engines with named MLX implementations, public Core ML exports and Apple CoreAI. Each section gives the workload and timing boundary.
+On the 24 GB M5, `fast-embeddinggemma-2` and OpenInfinity’s public 8-bit Core ML export had nearly identical warm single-query latency. The project package produced vectors for the same 2,000 pretokenized documents at 3.27× the token rate. NMTZ’s Core ML Laya finished the mixed decision suite sooner than the project’s Laya on both Macs. Stock MLX recovered field values more accurately than constrained `fast-gemma4` on the M5. [Matched query and indexing runs](#warm-query-corpus-and-packing) · [Decision timings](#task-quality-and-elapsed-time) · [Extraction results](#structured-generation)
 
-The outcome harness measures public tasks. The throughput and capability harnesses exercise specific input shapes and batch sizes. [Outcome runner](../scripts/benchmark_outcomes.py) · [Throughput runner](../scripts/benchmark_monorepo.py) · [Capability runner](../scripts/benchmark_capabilities.py) · [PPLX benchmarks](../packages/fast-pplx/scripts/benchmark.py)
+### Which implementation ran?
+
+An engine is the software that runs a model. All four choices below run locally on Apple Silicon. A package can use more than one Apple framework.
+
+| Label in this guide | What the benchmark runs |
+| --- | --- |
+| `fast-silicon` package (for example, `fast-embeddinggemma-2`) | This project’s code for batching inputs and choosing where to run the model. Depending on the package, it can use MLX on the GPU, Core ML on the Apple Neural Engine (ANE), or both. The saved Core ML comparison calls this result `native`. |
+| Stock MLX | The public model and MLX library named in the row, such as `mlx-embeddings`, `mlx-vlm`, `mlx-lm` or `pplx-context-mlx`. |
+| Public Core ML export | A publisher’s preconverted model, such as `OpenInfinity/embeddinggemma-2-coreml-int8`. The benchmark adapter prepares its inputs, calls Apple’s Core ML runtime and scores its outputs. |
+| Apple CoreAI | A separate Apple runtime for `.aimodel` files, tested on the M5. `CoreAI-Opt` in the audit is a model conversion and optimization tool. |
+
+Model format and input limits can differ within a model family. For example, FluidInference supplies a 16-bit floating-point (FP16) EmbeddingGemma export and OpenInfinity an 8-bit integer (INT8) export. Both accept up to 512 tokens per input. The project package accepts up to 2,048. [Model revisions and input audit](benchmarks/coreml-20261120.json)
 
 ## Table of Contents
 
@@ -12,10 +23,10 @@ The outcome harness measures public tasks. The throughput and capability harness
 4. [Unified Monorepo Throughput, Latency & Footprint](#4-unified-monorepo-throughput-latency--footprint)
 5. [Local Training & Post-Training (`QLoRA`, `ModernBERT`, `GRPO`)](#5-local-training--post-training-qlora-modernbert-grpo)
 6. [Speculative Decoding, `PrefixTree`, ANE Profiles & Parallel CoreML](#6-speculative-decoding-prefixtree-ane-profiles--parallel-coreml)
-7. [`CoreAI-Opt` (Track A) & OS `CoreAI` (Track B) Promotion Audit (`22/22` Gates)](#7-coreai-opt-track-a--os-coreai-track-b-promotion-audit-2222-gates)
+7. [CoreAI audit of 22 decisions](#7-coreai-audit-of-22-decisions)
 8. [Reproducible CLI Invocations](#8-reproducible-cli-invocations)
 
-[Open Core ML results and model revisions](#open-core-ml-results)
+[Public Core ML results and model revisions](#public-core-ml-results)
 
 ---
 
@@ -34,9 +45,7 @@ The outcome harness measures public tasks. The throughput and capability harness
 | **Single-Token Matmul (`M=1`)** | **`1.21 TF`** @ `0.028 ms` (`Q4`) / **`0.19 TF`** @ `0.173 ms` (`BF16`) | `0.46 TF` @ `0.072 ms` (`Q4`) / `0.12 TF` @ `0.283 ms` (`BF16`) | `2.63×` Q4 / `1.58×` BF16 faster on M4 Pro |
 | **Connectivity** | Thunderbolt 5 (`TB5`) | Thunderbolt 4 (`TB4`) | — |
 
-**Observed on these systems**
-- **Where Base M5 (`10c` `Apple10 NAX`) wins (`1.06×–1.59×` over `20c` M4 Pro):** Measured examples — batch encoders (`fast-embeddinggemma-2`, `fast-pplx`, `fast-bge-small`), batched `Kev-0.8B` (`1.56×–1.59×`), batched structured JSON (`fast-gemma4` `1.13×–1.52×`), `ModernBERT-421M` fine-tuning (`1.42×–1.59×`), and `GRPO` rollouts (`1.44×`).
-- **Where M4 Pro (`20c` `Apple9`, `48 GB`) wins:** Bandwidth-bound `M=1` autoregressive decode (`fast-gemma4` Cat-3 reasoning `0.95×` on M5), `B=1` single-query ANE dispatch latency (`0.49–0.51 ms` vs `0.79 ms` on `fast-bge-small`), and high-memory jobs exceeding Base M5's `19.07 GB` Metal working-set cap (`fast-gpt-oss` `20B` MoE and packed `pack=2048` `E2B QLoRA`).
+The base M5 sustained higher bulk encoder throughput on these runs. The M4 Pro had higher measured memory bandwidth and encoded one warm BGE query in 0.49 ms, compared with 0.79 ms on the M5. Its 48 GB also accommodated the 20B generator at batch 128. These comparisons describe two complete systems with different chips, memory capacities and operating systems. [Encoder workloads](#warm-query-corpus-and-packing) · [Batch capacity](#generation-capacity)
 
 ---
 
@@ -46,7 +55,7 @@ The outcome harness measures public tasks. The throughput and capability harness
 
 ### Effective Outcome Throughput (`EOT`)
 
-Raw token throughput can rise while end-to-end utility falls (for example, quantization-induced repeat loops or invalid JSON outputs). To combine accuracy, structural validity, and wall-clock speed without squaring validity rate, every objective benchmark optimizes **Effective Outcome Throughput** (`outcome_units/sec`):
+Effective outcome throughput (EOT) is the sum of the scores earned on a workload divided by elapsed seconds. Each invalid result earns zero. A valid result can still earn partial credit when some fields or choices are wrong. `S_obj,e2e` in the tables is the mean score across **all** items, including invalid ones.
 
 ```text
 EOT = (1 / T_e2e) * sum_i(valid_i * score_i)
@@ -54,11 +63,11 @@ EOT = (1 / T_e2e) * sum_i(valid_i * score_i)
     = (N / T_e2e) * S_obj,e2e
 ```
 
-where `valid_i ∈ {0, 1}`, `score_i ∈ [0, 1]` is computed by a 100% deterministic, zero-LLM-judge evaluator over un-gated, permissively licensed (`Apache-2.0`, `MIT`, `CC-BY`, `ODC-BY`, `OpenMDW-1.1`) public datasets, and `T_e2e` is the wall time of the scored workload. Retrieval and decision runs load the dataset and prepare the model before the timer starts. Warm query timings measure a still narrower path.
+The evaluator assigns `valid_i` a value of 0 or 1 and `score_i` a value between 0 and 1 using public datasets and deterministic scoring. `T_e2e` is elapsed time for the scored workload. On the M5 Gemma run, 300 tasks × 0.748675 mean score ÷ 82.6576 seconds = **2.717 score units/s**. The same run produced 299 valid responses, or **3.62 valid responses/s**. [Recorded task scores and elapsed time](benchmarks/document-workloads.json)
 
 ### Quality, memory and throughput checks
 
-A candidate engine or quantization preset promotes over its baseline in [`scripts/benchmark_outcomes.py`](../scripts/benchmark_outcomes.py) only when all three gates pass under interleaved `A-B-B-A` execution:
+The outcome runner checks three conditions when deciding whether to adopt a candidate configuration over its baseline. [Outcome runner](../scripts/benchmark_outcomes.py)
 
 1. **Gate 1 — Objective Quality Non-Inferiority:**
    - `lossless` profile: `ΔS_obj,e2e >= -max(0.003, 1.96 * SE_paired)` and `repeat_loop_count == 0`.
@@ -71,13 +80,23 @@ A candidate engine or quantization preset promotes over its baseline in [`script
 
 ### How to read a comparison
 
-The Tier-1 coordinator checks for competing work and serializes model workers with a hardware lock. Separate native and public runs on the same device and locked questions support a descriptive time or score ratio. An interleaved A–B–B–A run records an explicit paired promotion decision. A per-run `PASS` can describe just that run’s local checks. Use the graded task scores and the actual comparison record to assess equivalence.
+| Reader’s question | Measurement to use | What the timer covers |
+| --- | --- | --- |
+| How quickly can I finish this job, and how good is the result? | Public task scores, valid count, elapsed time and EOT | The retrieval timer covers encoding, ranking and scoring the locked dataset after loading and warmup. Decision timing covers scoring and evaluation after warmup. |
+| How long does a single search request spend in the encoder? | Warm 24-token query latency | Ready token IDs through a returned vector. First load, tokenization, transport and client queueing are outside this timer. |
+| How fast can I index a collection or keep a generator busy? | Corpus tokens/s or valid fixture documents/s | Encoders process a named corpus. Generation capacity tests repeat a small set of prompts at a stated batch size and output limit. |
+
+The coordinator runs one model worker at a time. Runs on the same host with the same locked questions support comparisons of the observed scores and times. A separate experiment can alternate two configurations in A–B–B–A order. Its `comparisons` record contains that schedule and a verdict. The five public Core ML comparisons below use separately timed runs. A per-run `PASS` describes the checks recorded for that one run. [Outcome runner](../scripts/benchmark_outcomes.py)
+
+The `lossless` quality rule allows a larger score drop when the sample is more uncertain. On the 50 M4 Pro GPT-OSS extraction and tool tasks, the project scored 0.5063 and stock MLX scored 0.5755. The observed change was −0.0692 with a paired standard error of 0.0782, so the rule’s quality allowance was 0.1533. The project run also recorded two repeat loops and failed its local check. An application with a fixed accuracy requirement can compare it directly with the observed scores and uncertainty. [Paired item scores](benchmarks/document-workloads.json) · [Quality rule](../packages/fast-shared/src/fast_shared/outcome_eval/metrics.py)
+
+The generation servers send the completed response text in one content event. The reports leave time to first useful text and latency under concurrent HTTP requests unmeasured. [Server event construction](../packages/fast-shared/src/fast_shared/server.py)
 
 ---
 
 ## 3. External Deterministic Objective Outcomes (`Tier-1`, Cat 1–4)
 
-### Category 1 — Retrieval & Contextual Embeddings (`NanoBEIR-en` 3-Subset + `LegalBench-RAG` `cuad+contractnli`)
+### Retrieval
 
 `NanoBEIR-en` (`NanoSciFact`, `NanoArguAna`, `NanoHotpotQA`) + `LegalBench-RAG` (`cuad`, `contractnli`; `4K` contextual chunk windows for `fast-pplx` / `pplx-context-mlx`, `2K` for `EmbeddingGemma-2`).
 
@@ -93,7 +112,7 @@ The Tier-1 coordinator checks for competing work and serializes model workers wi
 
 *The CoreAI EmbeddingGemma smoke run measured 2.90 GB physical and 3.04 GB combined. The table gives full-run quality and throughput. For PPLX, combined memory includes 0.25–0.31 GB of mapped embedding weights.*
 
-The M5 PPLX result uses the package rerun after the evaluator split oversized legal documents into windows. The first run completed 150/325 scored items. The corrected run completed all 325. On the same 175 legal questions, contextual encoding raised span nDCG@10 from 0.359 to 0.703 and character recall from 0.684 to 0.879. Stock contextual PPLX also reached 0.703. [Selected runs and source hashes](benchmarks/document-workloads.json)
+The M5 PPLX rerun split oversized legal documents into windows. That recovered all 175 legal queries and took the valid count from 150/325 to 325/325. For those 175 questions, encoding each passage with its neighbors raised its ranking score in the first ten results (span nDCG@10) from 0.359 to 0.703. Coverage of relevant characters in the first ten rose from 68.4% to 87.9%. Stock contextual PPLX also scored 0.703. The faster project run finished the full 325-query suite in 136.5 seconds versus 601.5 for stock. [Selected runs and source hashes](benchmarks/document-workloads.json)
 
 
 ### Category 2 — Decision, Faithfulness & Reward (`RAGTruth` `600` + `CLINC150` `550` + `RewardBench-2` `250`, `N=1400`)
@@ -103,12 +122,14 @@ The M5 PPLX result uses the package rerun after the evaluator split oversized le
 | **`Laya-Typed-421M`** | **`fast-decision-models` (`laya_ane`)** | **`0.5050`** | **`6.158`** (`114.8s`) | `0.00 / 0.60 / 0.40 /` **`1.00 GB`** | **`0.5050`** | **`5.827`** (`121.3s`) | `0.00 / 0.58 / 0.40 /` **`0.98 GB`** | **`8.29×` CoreAI (`1.16×` MLX\*)** / **`1.92×` MLX\*** | **`1.06×`** |
 | `Laya` Stock `CoreAI` | `ahmedandaloes/laya-typed-decisions-CoreAI` (`27.2+`) | `0.4993` | `0.743` (`940.7s`) | `0.00 / 0.29 / 0.00 / 0.33 GB`† | — *(26.6)* | — *(26.6)* | — | `1.00×` *(accurate stock)* | — |
 | `Laya` Stock `MLX`\* | `mlx-embeddings` `ModernBERT 8-bit` | `0.2757`\* | `5.319` (`72.6s`) | `1.34 / 18.70 / 0.00 / 18.70 GB` | `0.2986`\* | `3.032` (`137.9s`) | `1.54 / 34.02 / 0.00 / 34.02 GB` | *(`-0.23` quality loss, `19×–34×` RAM)* | `1.75×` |
-| **`Kev-0.8B`** (earlier native run) | **`fast-decision-models` (`kev_08b_w8`)** | **`0.5257`** | **`5.078`** (`144.9s`) | `3.70 / 1.76 / 0.00 /` **`1.77 GB`** | **`0.5250`** | **`3.254`** (`225.9s`) | `3.78 / 1.84 / 0.00 /` **`1.84 GB`** | **`1.005×` (`-42%` RAM; `2.59×–6.19×` w/ `PrefixTree`)** / **`1.06×` (`-44%` RAM; `4.91×–9.89×` w/ `PrefixTree`)** | **`1.56×`** |
+| **`Kev-0.8B`** | **`fast-decision-models`** (automatic prefix cache) | **0.5250** | **4.395** (167.2 s) | 3.82 / 1.78 / 0.00 / **1.78 GB** | **0.5250** | **3.415** (215.2 s) | 4.31 / 2.29 / 0.00 / **2.29 GB** | **0.87×** / **1.12×** | **1.29×** |
 | `Kev-0.8B` Stock `MLX` | `AbstractFramework/kev-0.8b-mlx-8bit` (`mlx-lm`) | `0.5236` | `5.055` (`145.0s`) | `2.65 / 3.06 / 0.00 / 3.06 GB` | `0.5229` | `3.062` (`239.1s`) | `2.92 / 3.26 / 0.00 / 3.26 GB` | `1.00×` | `1.65×` |
 
-*Stock MLX ModernBERT lost about 0.23 mean task score against the native Laya run on M5. The CoreAI Laya export scored 0.4993 and mapped 1.68 GB across all file mappings. The open Core ML Laya export is also measured below.*
+The stock MLX ModernBERT run scored 0.2757 on M5. Laya in `fast-decision-models` scored 0.5050. The `ahmedandaloes/laya-typed-decisions-CoreAI` export, running in Apple’s CoreAI runtime, scored 0.4993 and mapped 1.68 GB across all file mappings. The Kev row uses the November 20 automatic-cache run. The Core ML section includes NMTZ’s faster Laya export, the earlier Kev timing and the shared-passage probe. [Public Core ML and project results](#task-quality-and-elapsed-time)
 
-### Categories 3 & 4 — Reasoning (`IFBench` + `MMLU-Redux` + `MATH-500`) and Structured JSON & Tool Calling (`LiquidAI/structured-extraction` + `BFCL v3`)
+### Structured generation
+
+Category 3 evaluates reasoning on `IFBench`, `MMLU-Redux` and `MATH-500`. Category 4 evaluates extracted fields on `LiquidAI/structured-extraction` and tool calls on `BFCL v3`.
 
 *(Tier-2 additionally uses `epfl-dlab/JSONSchemaBench` as a `<15s` `llguidance` compiler/jump diagnostic gate; semantic value accuracy is evaluated strictly on ground-truth targets in `LiquidAI/structured-extraction` and `BFCL v3`.)*
 
@@ -124,52 +145,58 @@ The M5 PPLX result uses the package rerun after the evaluator split oversized le
 | **Cat 4: `GPT-OSS-20B`** (`50`) | **`fast-gpt-oss` (`llg_on`)** *(48 GB only)* | *Gated (`24 GB`)* | *Gated* | — | `0.5063` (**`49/50`**) | **`0.318`** (`79.7s`) | `12.59 /` **`12.77 GB`** | — / **`1.61×` `EOT` (`+53%` valid docs)** | *48 GB only* |
 | Cat 4: Stock `MLX` | `gpt-oss-20b-MXFP4-Q4` (`mlx-lm`, unconstrained) | *Gated (`24 GB`)* | *Gated* | — | `0.5755` (`32/50`) | `0.197` (`146.2s`) | `14.48 / 14.30 GB` | `1.00×` | *48 GB only* |
 
-On the M5, constrained Gemma completed the public extraction and tool suite at 3.62 valid responses/s. Its grounded field F1 was 0.691 versus 0.923 for stock MLX on the 150 extraction tasks. Its accuracy on the 150 tool calls was 0.807 versus 0.800. One repeated-output loop failed the constrained run’s local gate. The 10.46 valid documents/s in the capacity test comes from cycling eight fixtures in a batch of 128. [Selected rows and source hashes](benchmarks/document-workloads.json)
+On M5, `fast-gemma4` produced 299 valid responses in 82.7 seconds and used 16.94 GB. Stock `mlx-vlm` produced 286 in 172.2 seconds and used 5.58 GB. The mean field F1 score (credit for recovering the correct field values) was 0.691 versus 0.923 on 150 extraction tasks. Accuracy on the other 150 tasks, which checked tool calls, was 0.807 versus 0.800. One repeated-output loop failed the project run’s local check. Its rate of 3.62 valid responses/s and the 10.46 valid documents/s from eight repeated fixtures answer different questions. [Task scores and source hashes](benchmarks/document-workloads.json) · [Batch capacity](#generation-capacity)
 
 ---
 
-## Open Core ML results
+<a id="open-core-ml-results"></a>
 
-Five public model exports ran the same Tier-1 questions as the native engines on each Mac. Every open export returned a valid output for every scored item. These are separate native and public runs on the same device. Kev’s native run uses the current default cache policy. The other native measurements come from the earlier full runs. The result file records the model revisions, per-task scores, memory and warm timings. [Machine-readable results](benchmarks/coreml-20261120.json)
+## Public Core ML results
+
+Five public Core ML exports ran the same locked questions as the corresponding `fast-silicon` packages on each Mac. Each export produced a valid output for every item. The comparison uses the November 20 `fast-decision-models` run with Kev’s automatic cache policy and the earlier full runs for the other project packages. The saved results include model revisions, per-task scores, memory and warm timings. [Machine-readable results](benchmarks/coreml-20261120.json)
 
 ### Task quality and elapsed time
 
-Each paired cell lists native first and open Core ML second. EOT measures score units per second. The 500 EmbeddingGemma items include 150 short retrieval queries and the same 175 legal questions evaluated with two passage sizes. The decision suite comprises 600 faithfulness examples, 550 intent questions and 250 best-of-four choices.
+For scores, times and memory, the **`fast-silicon` package comes first and the named public Core ML export comes second**. A rate ratio below 1 favors the public export. EOT measures score units per second. Memory is the measured combined footprint of each scored run. The 500 EmbeddingGemma items include 150 short retrieval queries and the same 175 legal questions evaluated with two passage sizes. The decision suite comprises 600 faithfulness examples, 550 intent questions and 250 best-of-four choices.
 
-| Public export | Mac | Scored items | Mean score, native / open | EOT, native / open | Seconds, native / open | Native / open EOT |
-| --- | --- | --- | --- | --- | --- | --- |
-| BGE-small · sidekickd FP16 | M4 Pro | 325 | 0.4737 / 0.4739 | 12.634 / 2.382 | 12.2 / 64.7 | 5.30× |
-| BGE-small · sidekickd FP16 | M5 | 325 | 0.4737 / 0.4739 | 13.061 / 2.567 | 11.8 / 60.0 | 5.09× |
-| EmbeddingGemma · FluidInference FP16 | M4 Pro | 500 | 0.5365 / 0.5186 | 3.583 / 1.637 | 74.9 / 158.4 | 2.19× |
-| EmbeddingGemma · FluidInference FP16 | M5 | 500 | 0.5376 / 0.5186 | 4.707 / 1.665 | 57.1 / 155.7 | 2.83× |
-| EmbeddingGemma · OpenInfinity INT8 | M4 Pro | 500 | 0.5365 / 0.5183 | 3.583 / 1.649 | 74.9 / 157.2 | 2.17× |
-| EmbeddingGemma · OpenInfinity INT8 | M5 | 500 | 0.5376 / 0.5183 | 4.707 / 1.740 | 57.1 / 148.9 | 2.70× |
-| Laya · NMTZ | M4 Pro | 1400 | 0.5050 / 0.4993 | 5.827 / 7.598 | 121.3 / 92.0 | 0.77× |
-| Laya · NMTZ | M5 | 1400 | 0.5050 / 0.4993 | 6.158 / 7.909 | 114.8 / 88.4 | 0.78× |
-| Kev · FluidInference FP16 | M4 Pro | 1400 | 0.5250 / 0.5207 | 3.415 / 1.674 | 215.2 / 435.4 | 2.04× |
-| Kev · FluidInference FP16 | M5 | 1400 | 0.5250 / 0.5214 | 4.395 / 2.269 | 167.2 / 321.7 | 1.94× |
+| Public Core ML export | Mac | Scored items | Mean task score | Score units/s | Elapsed seconds | Combined memory (GB) | Rate ratio (fast-silicon ÷ public export) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BGE-small · sidekickd FP16 | M4 Pro | 325 | 0.4737 / 0.4739 | 12.634 / 2.382 | 12.2 / 64.7 | 1.55 / 0.74 | 5.30× |
+| BGE-small · sidekickd FP16 | M5 | 325 | 0.4737 / 0.4739 | 13.061 / 2.567 | 11.8 / 60.0 | 1.54 / 0.54 | 5.09× |
+| EmbeddingGemma · FluidInference FP16 | M4 Pro | 500 | 0.5365 / 0.5186 | 3.583 / 1.637 | 74.9 / 158.4 | 2.49 / 1.53 | 2.19× |
+| EmbeddingGemma · FluidInference FP16 | M5 | 500 | 0.5376 / 0.5186 | 4.707 / 1.666 | 57.1 / 155.7 | 3.43 / 1.38 | 2.83× |
+| EmbeddingGemma · OpenInfinity INT8 | M4 Pro | 500 | 0.5365 / 0.5183 | 3.583 / 1.649 | 74.9 / 157.2 | 2.49 / 1.03 | 2.17× |
+| EmbeddingGemma · OpenInfinity INT8 | M5 | 500 | 0.5376 / 0.5183 | 4.707 / 1.740 | 57.1 / 148.9 | 3.43 / 0.84 | 2.70× |
+| Laya · NMTZ | M4 Pro | 1400 | 0.5050 / 0.4993 | 5.827 / 7.598 | 121.3 / 92.0 | 0.98 / 2.94 | 0.77× |
+| Laya · NMTZ | M5 | 1400 | 0.5050 / 0.4993 | 6.158 / 7.909 | 114.8 / 88.4 | 1.00 / 2.73 | 0.78× |
+| Kev · FluidInference FP16 | M4 Pro | 1400 | 0.5250 / 0.5207 | 3.415 / 1.674 | 215.2 / 435.4 | 2.29 / 9.04 | 2.04× |
+| Kev · FluidInference FP16 | M5 | 1400 | 0.5250 / 0.5214 | 4.395 / 2.269 | 167.2 / 321.7 | 1.78 / 1.29 | 1.94× |
 
-For EmbeddingGemma, all 818 short legal passages fit the public exports’ 512-token limit. Of 144 coarse passages, 136 exceed 512 tokens and one exceeds the native 2,048-token limit. The evaluator scores overlap against the original passage span even when the export saw just a prefix. On the M5, the long-passage ranking score was 0.569 for native, 0.516 for public FP16 and 0.518 for public INT8. The short-passage scores were 0.272, 0.271 and 0.270. The concentration of the gap in long passages is consistent with truncation. An ablation with the same 512-token input on every engine would isolate its effect.
+All 818 short legal passages fit the public EmbeddingGemma exports’ 512-token limit. In the long-passage test, 136 of 144 passages exceeded 512 tokens and one exceeded the project package’s 2,048-token limit. Out of 175,632 tokens, the public exports encoded 71,961 and `fast-embeddinggemma-2` encoded 175,585. The scorer gives credit for returning the **original passage**, so it can count a relevant clause beyond the prefix the model actually read.
 
-BGE uses the sidekickd FP16 release. In five M4 Pro spot checks its lowest cosine against native was 0.99996. A second candidate, `michaeljelly/bge-small-en-coreml-v1.5`, returned non-finite vectors on CPU/GPU and cosines of 0.52–0.62 on the Neural Engine in the preliminary check. It was excluded from the speed table.
+On M5, long-passage ranking scores were 0.569 for `fast-embeddinggemma-2`, 0.516 for FluidInference FP16 and 0.518 for OpenInfinity INT8. On short passages they were 0.272, 0.271 and 0.270. A run that gives all three the same 512-token inputs would isolate how much the input cap contributes. [Input lengths and ranking results](benchmarks/coreml-20261120.json)
+
+The public BGE comparison uses sidekickd’s FP16 export. In five M4 Pro spot checks its lowest vector cosine similarity to `fast-bge-small` was 0.99996. A second export, `michaeljelly/bge-small-en-coreml-v1.5`, returned non-finite vectors on CPU/GPU and similarities of 0.52–0.62 on the Neural Engine. These results led to the selection of sidekickd for timing.
 
 Laya measures the public typed option-scoring path, including host embedding lookup and probability conversion. Kev uses a shared-state fused function for inputs that fit and fixed row functions for larger inputs or option sets. The eight-question warm probe below reuses one short state. The public outcome suite exercises the row paths as well.
 
-Open Laya finished sooner on both Macs. At 1,400 decisions it earned 1.30× the native score units/s on M4 Pro and 1.28× on M5. It scored 0.4993 against 0.5050 for native and used more combined memory on both. A user choosing an engine for one repeated scoring job can weigh these differences directly.
+NMTZ’s public Laya export finished 1,400 decisions sooner on both Macs. On M5 it took 88.4 seconds and 2.73 GB, against 114.8 seconds and 1.00 GB for `fast-decision-models`. The project package scored 0.5050 and NMTZ scored 0.4993 on both hosts. The publisher’s separate action head, which can choose an action or abstain, falls outside this option-scoring test.
 
-Kev’s fresh M5 native result scored 735/1,400 in 167.2 seconds. Its earlier native run scored 736/1,400 in 144.9 seconds. The single changed item came from the best-of-four slice. The retained stock MLX run scored 0.5236 at 5.055 score units/s, ahead of the refreshed native run’s 4.395 and open Core ML’s 2.269. Native used 1.78 GB combined against 3.06 GB for stock. Separate runs and the default change leave the source of the timing difference open.
+On the same 1,400 M5 items, stock MLX Kev earned 5.055 score units/s, `fast-decision-models` with automatic caching earned 4.395, and FluidInference’s public export earned 2.269. The project and stock MLX runs used 1.78 and 3.06 GB, respectively. An earlier project run using the previous cache default finished in 144.9 seconds (736/1,400), compared with 167.2 seconds (735/1,400) on the rerun. Only one best-of-four answer changed. These separate timings leave the cause of the time difference open. [Runs and settings](benchmarks/coreml-20261120.json)
 
 ### Warm query, corpus and packing
 
-Native and public Core ML encoders received identical pseudo-random token IDs (seed 42). The BGE corpus has 249,303 IDs in 1,000 documents. EmbeddingGemma has 551,889 in 2,000. Each query contains 24 IDs. Timing covers synchronous vector production after model loading, excluding tokenization and interprocess transport. Public single-query figures are medians of 30 calls. Apple CoreAI is a separate runtime available on the tested M5.
+The project packages and public Core ML encoders received identical pseudo-random token IDs (seed 42). BGE processed 249,303 IDs across 1,000 documents and EmbeddingGemma processed 551,889 across 2,000. Each single query had 24 IDs. Timing starts with a loaded model and ends when it returns a vector. Tokenization, interprocess transfer and writes to a search index occur outside the timer. The public query figures are medians of 30 calls.
+
+On M5, `fast-embeddinggemma-2` and OpenInfinity INT8 took 2.577 and 2.592 ms for one query. Across the corpus the project package processed 48,803 tokens/s against 14,945, a 3.27× ratio. In the separate M5 retrieval test, the project used 3.43 GB of combined memory and the INT8 export used 0.84 GB. For a worker that starts on demand, include model load time as well. [Memory readings](benchmarks/coreml-20261120.json) · [First-use measurements](#first-use-and-reproduction)
 
 | Encoder | M4 Pro query (ms) | M4 Pro corpus (tokens/s) | M5 query (ms) | M5 corpus (tokens/s) |
 | --- | --- | --- | --- | --- |
-| BGE native | 0.490 | 187,150 | 0.793 | 200,646 |
-| BGE sidekickd FP16 | 1.696 | 31,608 | 1.608 | 34,318 |
-| EmbeddingGemma native | 2.106 | 38,517 | 2.577 | 48,803 |
-| EmbeddingGemma · FluidInference FP16 | 2.696 | 14,251 | 4.334 | 14,187 |
-| EmbeddingGemma · OpenInfinity INT8 | 2.590 | 14,294 | 2.592 | 14,945 |
+| `fast-bge-small` | 0.490 | 187,150 | 0.793 | 200,646 |
+| BGE · sidekickd public Core ML FP16 | 1.696 | 31,608 | 1.608 | 34,318 |
+| `fast-embeddinggemma-2` | 2.106 | 38,517 | 2.577 | 48,803 |
+| EmbeddingGemma · FluidInference public Core ML FP16 | 2.696 | 14,251 | 4.334 | 14,187 |
+| EmbeddingGemma · OpenInfinity public Core ML INT8 | 2.590 | 14,294 | 2.592 | 14,945 |
 | EmbeddingGemma Apple CoreAI BF16 | — | — | 9.378 | 12,482 |
 
 Both public EmbeddingGemma exports can combine up to eight short sequences in a 256-token call. Longer sequences use a single-input function. The mixed-length corpus was measured packed, single, single, packed. The cosine column reports the least similar pair of packed and single results over all 2,000 documents.
@@ -180,6 +207,8 @@ Both public EmbeddingGemma exports can combine up to eight short sequences in a 
 | EmbeddingGemma · FluidInference FP16 | M5 | 14,187 | 13,556 | 1.046× | 0.999444 |
 | EmbeddingGemma · OpenInfinity INT8 | M4 Pro | 14,294 | 13,764 | 1.038× | 0.999725 |
 | EmbeddingGemma · OpenInfinity INT8 | M5 | 14,945 | 14,438 | 1.035× | 0.999725 |
+
+These figures use the **public Core ML exports**. Kev’s eight-question call reuses one 14-token passage. The 1,400-item mixed decision suite also exercises longer inputs and separate passages.
 
 | Mac | Laya one short question, L192 (ms) | Laya one long question, L512 (ms) | Kev one question (q/s) | Kev eight on one state (q/s) |
 | --- | --- | --- | --- | --- |
@@ -217,6 +246,8 @@ Core ML prepares source packages and loads or specializes the resulting bundles 
 | Laya · NMTZ | 0.00 / 0.91 / 0.13 | 0.00 / 0.84 / 0.12 |
 | Kev · FluidInference FP16 | 0.00 / 25.51 / 2.77 | 3.21 / 30.03 / 22.46 |
 
+On M5, OpenInfinity’s EmbeddingGemma took 76.85 seconds to load before the scored run and 3.01 seconds in the later corpus probe. A first-response comparison for an on-demand worker still needs both implementations to start from the same cache state. [Recorded load and warm timings](benchmarks/coreml-20261120.json)
+
 The M5 first prepared Laya during its warm probe, which measured 1.53 seconds for compilation and 88.96 seconds for first load. The subsequent successful outcome run reused those artifacts. Its initial outcome attempt failed because the environment lacked the host weight reader, now included in the build dependencies.
 
 Install the workspace build dependencies with `uv sync --extra build --extra extract`. Use an empty, dedicated `HF_HOME` for these model snapshots so the runner selects exactly the measured revisions. The dataset setup uses its own cache. The model and file list includes the host embedding weights that the public Laya export requires.
@@ -243,19 +274,33 @@ For an individual outcome run, pass a single model key such as `coreml-embedding
 
 ## 4. Unified Monorepo Throughput, Latency & Footprint
 
-The native encoder rows time warmed token IDs through output vectors. The historical stock MLX encoder probes accept text and count target lengths used to generate their inputs. Their displayed rates describe those particular probes. The open Core ML encoder comparison below uses the same actual token IDs as the native engines. [Throughput runner](../scripts/benchmark_monorepo.py) · [Stock and open model probes](../scripts/public_baselines.py)
+### Encoder and decision throughput
 
-| Package | Metric | Base M5 `fast-*` (OS Footprint) | Base M5 Stock Baseline | M5 Speedup | M4 Pro `fast-*` (OS Footprint) | M4 Pro Stock Baseline | M4 Pro Speedup | M5 vs. M4 Pro (`fast-*`) |
-| :--- | :--- | :--- | :--- | :---: | :--- | :--- | :---: | :---: |
-| **[`fast-bge-small`](../packages/fast-bge-small/README.md)** | Corpus `tok/s` (`B=1` ANE ms) | **`200,646 tok/s`** (`0.79 ms`, `1.85 GB`) | `mlx-embeddings`: `26,667 tok/s` (`4.42 ms`) | **`7.52×`** (`5.59×` `B=1`) | **`187,150 tok/s`** (`0.49 ms`, `2.09 GB`) | `mlx-embeddings`: `30,694 tok/s` (`4.85 ms`) | **`6.10×`** (`9.90×` `B=1`) | **`1.07×`** |
-| **[`fast-embeddinggemma-2`](../packages/fast-embeddinggemma-2/README.md)** | Corpus `tok/s` (`B=1` ANE ms) | **`48,803 tok/s`** (`2.58 ms`, `2.76 GB`) | `mlx_vlm`: `16,094 tok/s` (`8.48 ms`) / `CoreAI`: `12,482` (`9.38 ms`) | **`3.03×` MLX / `3.91×` CoreAI** | **`38,517 tok/s`** (`2.11 ms`, `3.26 GB`) | `mlx_vlm`: `11,419 tok/s` (`8.39 ms`) | **`3.37×`** (`3.98×` `B=1`) | **`1.27×`** |
-| **[`fast-pplx`](../packages/fast-pplx/README.md)** | Mixed / `doc_s256` `tok/s` | **`16,796 tok/s`** mixed (`5.57 ms` `B=1`, `3.13 GB`) | `pplx-context-mlx` (`fp16`): `1.32×` slower on `doc_s256` | **`1.32×`** | `12,624 tok/s` mixed / `14,330 tok/s` fixed 256 tokens (`3.10 GB`) | `pplx-context-mlx` (`fp16`): `8,633 tok/s` | **`1.66×`** | **`1.33×`** mixed / mixed |
-| **[`fast-decision-models`](../packages/fast-decision-models/README.md)** | `kev_08b B=8` / `laya_ane` | **`86.84 q/s`** / **`44.38 q/s`** (`2.20 GB`) | `stock-mlx_lm-kev-8bit`: `81.7 q/s` (`-0.18 GB` OS) | **`1.06×`** | **`54.52 q/s`** / **`41.91 q/s`** (`2.46 GB`) | `stock-mlx_lm-kev-8bit`: `50.6 q/s` (`-0.25 GB` OS) | **`1.08×`** | **`1.59×`** (`Kev`) |
-| [Gemma 4](../packages/fast-gemma4/README.md) | Valid documents/s on repeated extraction fixtures | 10.46 at batch 128 | 2.02 at batch 64 | 5.18× across batch sizes | GPU 6.79 and 6.87 at batch 128. ANE+GPU 8.78 and 5.91 at 2 × 128. | 1.79 and 1.80 at batch 64 in the respective runs | ANE+GPU 4.90× and 3.29× across batch sizes | See the two M4 Pro runs below. |
-| [GPT-OSS](../packages/fast-gpt-oss/README.md) | Decode tokens/s on M4 Pro | Excluded at 24 GB | — | — | 454.1 at batch 128, 23.98 GB | 156.1 at batch 8 | Different prompts and output budgets | 48 GB run only |
+The BGE and EmbeddingGemma project probes start with token IDs. Historical stock MLX probes start with text and count the target lengths used to generate it. The table therefore gives the stock measurements in documents/s and the project measurements in actual tokens/s. For direct token-rate comparisons, the project and public Core ML runs used the same token IDs. [Matched encoder timings](#warm-query-corpus-and-packing) · [Throughput runner](../scripts/benchmark_monorepo.py) · [Stock MLX probes](../scripts/public_baselines.py)
 
-The two M4 Pro ANE+GPU Gemma runs each returned 256/256 valid fixture responses. Total elapsed times were 29.16 and 43.29 seconds. Each run’s GPU-only and stock results are recorded alongside it. For GPT-OSS, the native harness uses eight extraction fixtures, a schema and up to 512 output tokens. Stock repeats a summarization prompt with a 128-token cap. [Gemma measurements](benchmarks/document-workloads.json) · [Native workload](../packages/fast-gpt-oss/src/fast_gpt_oss/cli.py) · [Stock workload](../scripts/public_baselines.py)
+| Workload | M4 Pro | Base M5 |
+| --- | --- | --- |
+| `fast-bge-small`, 1,000 pretokenized documents | 187,150 tokens/s, 2.09 GB footprint | 200,646 tokens/s, 1.85 GB footprint |
+| BGE, stock `mlx-embeddings`, text inputs | 123.12 documents/s, 4.85 ms for one query | 106.96 documents/s, 4.42 ms for one query |
+| `fast-embeddinggemma-2`, 2,000 pretokenized documents | 38,517 tokens/s, 3.26 GB footprint | 48,803 tokens/s, 2.76 GB footprint |
+| EmbeddingGemma, stock `mlx-vlm`, text inputs | 46.05 documents/s, 8.39 ms for one query | 64.91 documents/s, 8.48 ms for one query |
+| `fast-pplx`, 24 short and four long inputs | 12,624 tokens/s | 16,796 tokens/s (1.33× the M4 Pro rate) |
+| Kev, eight distinct inputs per batch, project / stock `mlx-lm` | 54.52 / 50.6 questions/s | 86.84 / 81.7 questions/s |
+| Laya, `fast-decision-models` Neural Engine scorer | 41.91 questions/s | 44.38 questions/s |
 
+The PPLX package also reports fixed-length runs. For public Kev performance when eight questions share one short passage, use the shared-passage results. [PPLX workloads](../packages/fast-pplx/README.md) · [Public Kev warm timings](#warm-query-corpus-and-packing)
+
+### Generation capacity
+
+| Implementation and workload | Batch | M4 Pro | Base M5 |
+| --- | --- | --- | --- |
+| `fast-gemma4` GPU, eight repeated extraction fixtures | 128 | 6.79 and 6.87 valid documents/s | 10.46 valid documents/s |
+| `fast-gemma4` Neural Engine + GPU, same fixtures | 2 × 128 | 8.78 and 5.91 valid documents/s | — |
+| Gemma, stock `mlx-vlm`, schema validity checked after generation | 64 | 1.79 and 1.80 valid documents/s in the respective runs | 2.02 valid documents/s |
+| `fast-gpt-oss`, eight extraction fixtures, schema, up to 512 output tokens | 128 | 454.1 decode tokens/s, 23.98 GB suite footprint | Excluded by the 24 GB memory policy |
+| GPT-OSS, stock `mlx-lm`, repeated summary prompt, up to 128 output tokens | 8 | 156.1 decode tokens/s | Excluded by the same policy |
+
+Both M4 Pro Gemma runs produced 256/256 schema-valid outputs on the Neural Engine and GPU. They took 29.16 and 43.29 seconds. Against the stock measurement from each respective run, the observed valid-document rate ratios were 4.90× and 3.29× across different batch sizes. For GPT-OSS, a direct engine-speed comparison still needs the same prompts, schema, batch and output cap. For quality on common public tasks, use the scored results. [Gemma runs and source hashes](benchmarks/document-workloads.json) · [GPT-OSS fixture workload](../packages/fast-gpt-oss/src/fast_gpt_oss/cli.py) · [Stock workload](../scripts/public_baselines.py) · [Public task results](#structured-generation)
 
 ---
 
@@ -273,7 +318,7 @@ These experiments time individual training or rollout steps. The encoder through
 | **`Packed-512` + Cached `L0..17`** | **`58.19 items/s`** | **`4.89 GB`** | **`1.96×`** | **`40.84 items/s`** | **`5.06 GB`** | **`2.02×`** | **`1.42×`** |
 
 - **Parity:** `grad_cos = 0.999942` (`|Δloss| = 1.1e-4`) on Base M5; `grad_cos = 0.999946` (`|Δloss| = 2.2e-5`) on M4 Pro.
-- **Takeaway:** `10c` Base M5 `NAX` trains `ModernBERT-421M` **`1.42×–1.59×` faster** than `20c` M4 Pro in `< 4.9 GB` unified memory.
+On generated inputs with random labels, packing reached 42.26 items/s on M5 versus 26.63 on M4 Pro. Reusing cached frozen-layer outputs raised those rates to 58.19 and 40.84 items/s. These runs measure step throughput and gradient agreement. Quality after training on labeled examples remains open.
 
 ### 5.2 Causal `QLoRA` + `FFD` Packing + Shared-System KV (`Gemma-4 E2B`, `qlora-packing`)
 
@@ -288,9 +333,9 @@ These experiments time individual training or rollout steps. The encoder through
 
 ### 5.3 Disaggregated `GPU Actor + ANE Critic` `GRPO` & Best-of-N (`G=4`, `grpo-ane-critic`)
 
-`fast-gemma4` rolling GPU actor (`llguidance` schema-constrained) overlapped with `fast-decision-models` `Laya-Typed-421M` Pure-ANE critic (`[1585,0,0]` ANE ops, **`0.0 GB` GPU critic VRAM**) vs. stock `mlx-vlm` sequential rollouts + GPU `Kev-0.8B 8-bit` critic.
+The actor generates candidate answers and the critic scores them. The project configuration uses schema-constrained `fast-gemma4` on the GPU and runs the Laya critic concurrently on the Neural Engine. The stock configuration generates sequentially with `mlx-vlm` and scores with Kev on the GPU. On the M4 Pro, measured stage times give an **estimated 7.44× full-iteration speedup** at temperature 0.7 (81.48 versus 10.96 seconds). The estimate assumes the trailing critic work overlaps the GPU update. In the isolated overlap test, the same update took 2.65 seconds alone and 2.67 seconds with Laya scoring concurrently. The 7.44× estimate includes the changes to generation, scheduling and critic model. How closely Laya and Kev agree on rewards remains open. [Recorded stage times and estimates](benchmarks/document-workloads.json) · [Training harness](../scripts/benchmark_capabilities.py)
 
-| Host | Mode | Rollout + Critic (`rollouts/s`) | Speedup vs. Stock | Exposed ANE Critic During GPU VJP | Peak Mem (GB) | Full `GRPO` Step Speedup |
+| Host | Mode | Rollout + Critic (`rollouts/s`) | Speedup vs. Stock | Exposed ANE Critic During GPU VJP | Peak Mem (GB) | Estimated full-iteration speedup |
 | :--- | :--- | ---: | :---: | :---: | ---: | :---: |
 | **Base M5 (`24 GB`)** | Stock `mlx-vlm` + `Kev-8bit` GPU | `0.50 rollouts/s` (`32.01s`) | `1.00×` | `1,080 ms` (serial GPU) | — | `1.00×` |
 | **Base M5 (`24 GB`)** | **`fast-gemma4` (`T=0.7` GRPO) + `Laya` ANE** | **`2.61 rollouts/s`** | **`5.22×`** | **`0.03–0.35 ms`** (`99.96%+` hidden over `2,456 ms` VJP) | **`8.68 GB`** | — |
@@ -345,9 +390,11 @@ These experiments time individual training or rollout steps. The encoder through
 
 ---
 
-## 7. `CoreAI-Opt` (Track A) & OS `CoreAI` (Track B) Promotion Audit (`22/22` Gates)
+<a id="7-coreai-opt-track-a--os-coreai-track-b-promotion-audit-2222-gates"></a>
 
-Independent cross-stream audit across **Track A (M4 Pro `48 GB`, `macOS 26.6`, `CoreML 9.0`, `coreai-opt 0.5.0`)** and **Track B (Base M5 `24 GB`, `macOS 27.2.1`, `CoreAI 1.0.0b3`)** verified **`22/22` `evaluate_promotion_gates` verdicts** (`4` Track A + `18` Track B, `0` mismatches, including rejections), `0` `fast-ir-guard` errors, `33/33` `Laya` LayerNorms clamped to `eps_floor_fp16 = 2^-14` (`6.103515625e-5`), and `0` NaNs across all promoted/candidate evaluations.
+## 7. CoreAI audit of 22 decisions
+
+The audit reproduced all 22 recorded decisions, including configurations that failed the quality or speed checks. Four decisions covered `CoreAI-Opt` on the M4 Pro and 18 covered Apple CoreAI on the M5. The table identifies which configurations passed, failed or still need a full test. The audit also recorded zero `fast-ir-guard` errors and confirmed the FP16 epsilon floor (`2^-14`) on all 33 Laya normalization layers.
 
 ### 7.1 Cross-Mac Promotion Gate Matrix
 
@@ -360,8 +407,8 @@ Independent cross-stream audit across **Track A (M4 Pro `48 GB`, `macOS 26.6`, `
 | **Track B** Base M5 `27.2.1` | `fast-pplx --backend coreai` (`w8`, FP32 compute) vs. live `hetero2` / `gpu` (`N=24`) | `lossless` & `quantized` (`6` gates) | `0.7033` vs `0.7156` live (`-0.0123`*, `SE=0.0139`) | **T/F*** | `2.593 / 19.2 GB` (`mapped_all=4.00 GB`) | **T** | `0.660 / 3.585 = 0.1842` (`0.281×` GPU) | **F** | `336 GPU / 0 ANE` (`MPSGraph`, `130.6 ms` warm; `S=128`: `32.3 ms`, `3,965 tok/s`); `st0 w8_f16` hits `3.00 ms` | **FAIL** *(G3; G1*)* |
 | **Track B** Base M5 `27.2.1` | `fast-pplx --backend coreai` (`w4_per_block`, FP32) vs. live `hetero2` / `gpu` (`N=24`) | `lossless` & `quantized` (`6` gates) | `0.7003` vs `0.7156` (`-0.0153`, `SE=0.0140`) | **F** | `3.071 / 19.2 GB` | **T** | `0.643 / 3.585 = 0.1792` (`0.273×` GPU) | **F** | `336 GPU / 0 ANE`, worse than `w8` on speed (`138.5 ms`), RAM, & cosine (`0.981` vs `0.9997`) | **FAIL** *(G1 & G3)* |
 | **Track B** Base M5 `27.2.1` | `LayaCoreAiModel w8` (FP32 compute) vs. stock `coreai-laya` (`N=42`) | `lossless` & `quantized` (`2` gates) | `0.3571` vs `0.3571` (`+0.0000`, `SE=0.0341`) | **T** | `0.569 / 19.2 GB` (`mapped_all=1.49 GB`) | **T** | **`1.053 / 0.486 = 2.1691`** (`14.2s` vs `30.9s`) | **T** | `1397 GPU / 0 ANE`, `355 MB` vs `1,608 MB` (`4.54×` smaller), `logit_cos=0.999839` (`w4_pb` also `PASS` `2.075×` vs stock) | **PASS** *(vs stock CoreAI)* |
-| **Track B** Base M5 `27.2.1` | `LayaCoreAiModel w8` & `w4_pb` (FP32) vs. custom `LayaAneBackend` (`N=42`) | `quantized` (`2` gates + `2` `w4_pb` stock) | `0.3571` vs `0.3571` (`+0.0000`) | **T** | `0.569 / 19.2 GB` | **T** | `1.053 / 3.696 = 0.2849` (`0.273×` `w4_pb`) | **F** | FP32 compute forces GPU fallback (`94.2–102.8 ms` vs `22.64 ms` custom ANE) | **FAIL** *(vs custom ANE)* |
-| **Track B** Base M5 `27.2.1` | **`LayaCoreAiModel w8_f16` + `neural_engine`** (`S=256` ablation) | ablation | `logit_cos = 0.999831`, `argmax = 1.0`, `0` NaN | — | **`0.444 / 19.2 GB`** (`phys=62.3 MB`, `neural=360.8 MB`) | **T** | **`23.00 ms` iso** (`43.5 q/s`; `27.22 ms` shared) vs `22.64 ms` custom ANE & `354.1 ms` stock | — | **Breakthrough:** **`1,652` ANE ops** once exported in `FP16`; `4.09×` faster than FP32 `.aimodel` and `15.4×` faster than stock `CoreAI` | **PROMISING** *(needs `S=512` full gate)* |
+| **Track B** Base M5 `27.2.1` | `LayaCoreAiModel w8` & `w4_pb` (FP32) vs. the project’s `LayaAneBackend` (`N=42`) | `quantized` (`2` gates + `2` `w4_pb` stock) | `0.3571` vs `0.3571` (`+0.0000`) | **T** | `0.569 / 19.2 GB` | **T** | `1.053 / 3.696 = 0.2849` (`0.273×` `w4_pb`) | **F** | FP32 compute forces GPU fallback (`94.2–102.8 ms` vs `22.64 ms` project Laya scorer) | **FAIL** *(vs. the project Laya scorer)* |
+| **Track B** Base M5 `27.2.1` | **`LayaCoreAiModel w8_f16` + `neural_engine`** (`S=256` ablation) | ablation | `logit_cos = 0.999831`, `argmax = 1.0`, `0` NaN | — | **`0.444 / 19.2 GB`** (`phys=62.3 MB`, `neural=360.8 MB`) | **T** | **`23.00 ms` iso** (`43.5 q/s`; `27.22 ms` shared) vs `22.64 ms` project Laya scorer & `354.1 ms` stock | — | **1,652 ANE ops** in the FP16 export, `4.09×` faster than FP32 `.aimodel` and `15.4×` faster than stock `CoreAI` | **PROMISING** *(needs `S=512` full gate)* |
 
 *\*Track B `fast-pplx` `ΔS = -0.0123` vs live `hetero2` stemmed from `11` LegalBench chunks `>512` tokens truncated to static bucket `S=512` (`NanoSciFact` `0.9156` beat `hetero2` `0.9122`, FP32 cosine `0.9997`), not quantization error.*
 
@@ -404,7 +451,7 @@ All commands run from the `fast-silicon` repository root using `.venv/bin/python
 .venv/bin/python scripts/benchmark_outcomes.py run \
   --tier tier1 --packages all --json-out artifacts/outcomes_tier1.json
 
-# Run paired apples-to-apples stock MLX and macOS 27.2+ CoreAI baselines
+# Run the named public baselines on the same tasks as the project packages
 .venv/bin/python scripts/benchmark_outcomes.py run \
   --tier tier1 --packages all --include-public-baselines \
   --public-python /path/to/stock-mlx-venv/bin/python \

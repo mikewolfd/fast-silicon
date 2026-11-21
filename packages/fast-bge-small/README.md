@@ -1,8 +1,8 @@
 # fast-bge-small
 
-**Sub-millisecond text embeddings, `187K–201K tok/s` cross-silicon indexing (`9.58x–11.26x` higher `EOT` than stock `mlx-embeddings`), and zero `torch` or `transformers` runtime dependencies.**
+Turn short English queries and passages into 384-number vectors with `BAAI/bge-small-en-v1.5`. One warm 24-token query took 0.49 ms on the M4 Pro and 0.79 ms on the base M5. Across 1,000 pretokenized documents the package processed 187,150 and 200,646 tokens/s on those machines.
 
-`fast-bge-small` runs `BAAI/bge-small-en-v1.5` (`33M`, `384`-d) by routing short queries onto the 16-core Apple Neural Engine (**`0.49 ms`** on M4 Pro / **`0.79 ms`** on Base M5 `B=1`) and splitting bulk workloads concurrently across Metal GPU and ANE (**`200,646 tok/s`** on Base M5, **`187,150 tok/s`** on M4 Pro, and up to **`215,022 tok/s`** standalone Document OCR) while matching float16 reference cosine similarity to **`0.999998`**. Use it from Python, an OpenAI-compatible `/v1/embeddings` server, a resumable OCR-aware Parquet CLI, or the standalone zero-Python `bge-ane-cli` binary.
+`fast-bge-small` runs short queries on the Apple Neural Engine (ANE) and can split bulk encoding between the GPU and ANE. It includes a Python API, an OpenAI-compatible `/v1/embeddings` server, a resumable Parquet CLI and the standalone `bge-ane-cli`. Inference uses neither `torch` nor `transformers`.
 
 > **Full Cross-Silicon Benchmarks:** See [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) for full Tier-1 retrieval breakdowns, 4-bucket memory telemetry, and cross-package comparisons.
 
@@ -37,15 +37,15 @@ The retrieval score averages the ranking scores for 150 NanoBEIR queries and 175
 | Host | Engine | `S_obj,e2e` | `EOT (u/s)` | Wall Time | 4-Bucket Mem | Speedup vs. Stock `MLX` |
 |---|---|---:|---:|---:|---:|---:|
 | **Base M5 (`24 GB`, `Apple10 NAX`)** | **`fast-bge-small` (`hetero`)** | `0.4737` | **`13.061`** | **`11.8 s`** | **`1.54 GB`** | **`11.26x`** (`1.03x` M4 Pro) |
-| Base M5 | Open Core ML (sidekickd FP16) | 0.4739 | 2.567 | 60.0 s | 0.54 GB | 2.21× |
+| Base M5 | Public Core ML (sidekickd FP16) | 0.4739 | 2.567 | 60.0 s | 0.54 GB | 2.21× |
 | Base M5 (`24 GB`) | Stock `mlx-embeddings` (`bge-small-en-v1.5-8bit`) | `0.4774` | `1.160` | `133.8 s` | `18.78 GB` | `1.00x` |
 | **M4 Pro (`48 GB`, `Apple9`)** | **`fast-bge-small` (`hetero`)** | `0.4737` | **`12.634`** | **`12.2 s`** | **`1.55 GB`** | **`9.58x`** |
-| M4 Pro | Open Core ML (sidekickd FP16) | 0.4739 | 2.382 | 64.7 s | 0.74 GB | 1.81× |
+| M4 Pro | Public Core ML (sidekickd FP16) | 0.4739 | 2.382 | 64.7 s | 0.74 GB | 1.81× |
 | M4 Pro (`48 GB`) | Stock `mlx-embeddings` (`bge-small-en-v1.5-8bit`) | `0.4774` | `1.319` | `117.6 s` | `38.99 GB` | `1.00x` |
 
-Native BGE delivered 5.09× the score per second of the sidekickd FP16 export on M5 and 5.30× on M4 Pro. The mean ranking scores differed by 0.0002. The sidekickd export used less measured memory on both Macs. The harness takes the larger of its evaluator and model-process estimates. The runs used the same dataset lock and were timed separately.
+`fast-bge-small` delivered 5.09× the score per second of the sidekickd FP16 export on M5 and 5.30× on M4 Pro. The mean ranking scores differed by 0.0002. The sidekickd export used less measured memory on both Macs. The harness takes the larger of its evaluator and model-process estimates. The runs used the same dataset lock and were timed separately.
 
-The open Core ML baseline uses `sidekickd/bge-small-en-v1.5-coreml`. On M4 Pro its embeddings had at least 0.99996 cosine similarity to the native engine across two queries and three documents. The alternative `michaeljelly/bge-small-en-coreml-v1.5` export returned non-finite first-token embeddings with `CPU_ONLY` and `CPU_AND_GPU`. With `CPU_AND_NE` it reached 0.518 cosine similarity on the test query and 0.619 on the test document.
+The public Core ML comparison uses `sidekickd/bge-small-en-v1.5-coreml`. On M4 Pro its embeddings had at least 0.99996 cosine similarity to `fast-bge-small` across two queries and three documents. The alternative `michaeljelly/bge-small-en-coreml-v1.5` export returned non-finite first-token embeddings with `CPU_ONLY` and `CPU_AND_GPU`. With `CPU_AND_NE` it reached 0.518 cosine similarity on the test query and 0.619 on the test document.
 
 ### 2. Throughput, Latency & Parallel Multi-Bucket CoreML Build
 
@@ -53,13 +53,13 @@ The open Core ML baseline uses `sidekickd/bge-small-en-v1.5-coreml`. On M4 Pro i
 |---|---|---|---|
 | **Corpus throughput (`hetero`)** | **200,646 tokens/s** (1.85 GB) | **187,150 tokens/s** (2.09 GB) | Both runs encoded the same 249,303 tokens in 1,000 documents. |
 | **Single-query latency (ANE)** | **0.79 ms** | **0.49 ms** | Median for one warm 24-token query. |
-| sidekickd FP16 corpus | 34,318 tokens/s | 31,608 tokens/s | Same token IDs as the native corpus, with tokenization and interprocess transfer outside timing. |
+| sidekickd FP16 corpus | 34,318 tokens/s | 31,608 tokens/s | Same token IDs as `fast-bge-small`, with tokenization and interprocess transfer outside timing. |
 | sidekickd FP16 single query | 1.608 ms | 1.696 ms | Median of 30 warm calls on the same 24-token input. |
 | **Parallel CoreML Build (`9` buckets)** | `jobs=1` `5.12 s` -> **`jobs=4` `2.45 s` (`2.09x`)** | Legacy `26.80 s` (`jobs=1` `9.18 s`) -> **`jobs=4` `4.56 s` (`2.01x` / `5.88x` vs. legacy)** | `spawn`-only pool + `skip_model_load=True` in [`scripts/build_ane_models.py`](scripts/build_ane_models.py), bit-identical (`cos = 1.000000`, `9/9` ANE). |
 
 Core ML's `MLComputePlan` for each sidekickd input size (128, 256 and 512 tokens) preferred the Neural Engine for 229 operations and the CPU for 16. It left 363 unclassified on each Mac. The model ships precompiled. Loading it before scoring took 4.38 seconds on M5 and 1.84 seconds on M4 Pro. In its separate natural-text run, stock `mlx-embeddings` encoded 106.96 documents/s on M5 and 123.12 on M4 Pro. Its single text query took 4.42 ms and 4.85 ms, respectively.
 
-The run records include the model revisions, individual timings and per-bucket compute plans. [Benchmark methods](../../docs/BENCHMARKS.md#open-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
+The run records include the model revisions, individual timings and per-bucket compute plans. [Benchmark methods](../../docs/BENCHMARKS.md#public-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
 
 ## At a glance
 

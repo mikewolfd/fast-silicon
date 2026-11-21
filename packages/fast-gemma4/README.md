@@ -1,6 +1,6 @@
 # fast-gemma4
 
-**Guaranteed schema-valid JSON extraction and local QLoRA / GRPO post-training for Gemma-4 E2B — up to `5.18x` faster schema-valid throughput (`10.46 valid docs/s` on Base M5 `24 GB`) and `1.81x` higher `EOT` than stock `mlx-vlm` in `6.1–6.9 GB` active MLX RAM instead of `34.4 GB` OOM.**
+Extract schema-constrained records and call tools locally with Gemma 4 E2B. On the 24 GB M5, `fast-gemma4` produced 299 valid responses in 82.7 seconds on 300 public tasks. Stock `mlx-vlm` produced 286 in 172.2 seconds. On the 150 extraction tasks, field F1 was 0.691 for `fast-gemma4` and 0.923 for stock. On the 150 tool calls, accuracy was 0.807 and 0.800, respectively. [Public task results](../../docs/BENCHMARKS.md#structured-generation)
 
 Built for high-volume local structured extraction on Apple Silicon (`Apple9` M4 and `Apple10+` M5 `NAX`), `fast-gemma4` combines continuous rolling batching (`B_slots=128`), `int8` KV cache compression, lossless output vocabulary pruning (`262,144 -> 150,786` with lazy full-vocab fallback), chipset-aware `MTP` speculative decoding (`DraftScan`), and an optional Neural Engine prefill ring. Run it from Python, extract directly from resumable PDF/Parquet shards (`--max-pages`, `--ocr-pages-only`) or JSONL, fine-tune locally with `8-bit` `QLoRA`, or serve an OpenAI-compatible SSE endpoint.
 
@@ -8,23 +8,22 @@ Built for high-volume local structured extraction on Apple Silicon (`Apple9` M4 
 
 ## Quick start
 
+From the `fast-silicon` workspace root, install the package and prepare the model. This example runs on the GPU.
+
 ```bash
-make native
-uv venv --python cpython-3.13.14 .venv
-uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
-.venv/bin/gemma4 setup-weights --local-files-only
-.venv/bin/gemma4 verify
+uv sync --python 3.13 --package fast-gemma4 --inexact
+.venv/bin/gemma4 setup-weights --skip-early14
 ```
 
+Run this example with `.venv/bin/python`. Check whether the output matches the schema before using its fields.
+
 ```python
+from contextlib import closing
 from fast_gemma4 import FastGemma4Engine
 
-# Zero-argument defaults enable chip-, RAM-, and batch-aware "auto" dispatch:
-#   default_mode="auto", mtp_drafter="auto", ane_ring_variant="auto",
-#   and generate_batch(..., use_ane_ring="auto").
-with FastGemma4Engine() as eng:
-    item = eng.generate(
-        "Extract entity and topic as JSON.",
+with closing(FastGemma4Engine(default_mode="gpu", mtp_drafter=None)) as engine:
+    item = engine.generate(
+        "Extract the named entity and topic from this text: Ocean Lab studies coral.",
         json_schema={
             "type": "object",
             "properties": {"entity": {"type": "string"}, "topic": {"type": "string"}},
@@ -33,12 +32,17 @@ with FastGemma4Engine() as eng:
         },
         max_tokens=128,
     )
-    print(item.parsed)
+    if item.valid_schema:
+        print(item.parsed)
+    else:
+        print(f"Schema check failed (finish reason {item.finish_reason})")
 ```
+
+On the M4 Pro this printed `{'entity': 'Ocean Lab', 'topic': 'coral'}`.
 
 ## Cross-Silicon Benchmark Highlights (`M4 Pro 48 GB` vs `Base M5 24 GB`)
 
-All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`MLX 0.32.4`), pairing `fast-gemma4` against stock `mlx-vlm` (`lmstudio-community/gemma-4-E2B-it-MLX-4bit`). See [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) for full tables.
+The outcome runs used the same public tasks and scored each response. The capacity runs below repeated eight extraction fixtures. Stock MLX used `mlx-vlm` with `lmstudio-community/gemma-4-E2B-it-MLX-4bit`. [Benchmark methods](../../docs/BENCHMARKS.md)
 
 ### 1. Outcome (`EOT`) & Schema-Valid Batch Throughput
 
@@ -46,7 +50,9 @@ All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`
 |---|---|---|---|---|
 | **Cat 4: JSON & Tool AST** (`LiquidAI/structured-extraction + BFCL v3`, `N=300`, `llg_on`) | **`2.717 EOT`** (`299/300` valid, `S_obj=0.7487`; `llg_off`: `1.848 EOT`, `S_obj=0.8241`) | **`2.412 EOT`** (`299/300` valid, `S_obj=0.7473`; `llg_off`: `1.702 EOT`, `S_obj=0.8178`) | **`1.81x`** / **`1.57x`** `EOT` *(vs stock `1.501` / `1.537 EOT`, `286–287/300` valid)* | **`1.13x`** |
 | **Cat 3: Reasoning & IF** (`IFBench + MMLU-Redux-2.0 + MATH-500`, `N=435`, `gpu_fp16_kvi8`) | **`0.843 EOT`** (`181.5 s`, `S_obj=0.3517`) | `0.892 EOT` (`174.8 s`, `S_obj=0.3586`) | **`1.03x`** / `0.94x` *(vs stock `0.818` / `0.951 EOT`, `S_obj=0.3655`)* | `0.95x` |
-| **Monorepo Batch Extraction** (`B=128`, `kv_i8`, `100%` strict schema) | **`10.46 valid docs/s`** (`1,479 dec tok/s`, `6.13 GB` MLX / `15.54 GB` OS) | **`6.87 GPU` / `8.78 ANE+GPU valid docs/s`** (`1,144` / `1,131 dec tok/s`, `6.28–6.33 GB` MLX / `18.96 GB` OS) | **`2.59x` raw / `5.18x` valid** (`M5`) · **`1.91x–2.44x` raw / `3.82x–4.88x` valid** (`M4 Pro`; stock `50%` schema valid) | **`1.52x`** (`GPU`) / **`1.19x`** (`peak`) |
+| Repeated extraction fixtures, `kv_i8` | GPU 10.46 valid documents/s, batch 128 | GPU 6.79 and 6.87 valid documents/s. ANE+GPU 8.78 and 5.91 at 2 × 128. | Stock used batch 64. The M4 Pro ANE+GPU rates were 4.90× and 3.29× their respective stock runs. | M5 GPU / later M4 Pro GPU 1.52× |
+
+The M5 public-task rate was 3.62 valid responses/s, and one repeat loop failed the project run’s local check. Reported combined memory was 16.94 GB for the project and 5.58 GB for stock. The fixture rows use different batch sizes and track model allocator memory separately. [Run records](../../docs/benchmarks/document-workloads.json)
 
 - **Memory discipline:** `fast-gemma4` holds `B_slots=128` inside **`6.13–6.88 GB` peak active MLX RAM** (`kv_i8` saves `-0.67 GB` to `-1.21 GB` vs `BF16` KV), whereas unchunked `B=64` in stock `mlx_vlm` hits **`34.4 GB` OOM** (`15.24 GB` even with `chunk=256`).
 - **End-to-end Parquet pipeline (M4 Pro `48 GB`, Tuned LoRA, `p1-2`, `max_chars=8000`):** **`2.33 docs/s`** (`255/255` valid, `1,051.8 dec tok/s`, `5,443.2 total tok/s`, `6.88 GB` peak).
@@ -57,8 +63,8 @@ All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`
 |---|---|---|---|
 | **`MTP` Speculative + `DraftScan`** (`~150 MiB` `4`-layer drafter, `6.1%` draft share) | • `B=1` free-text: `33.5 ->` **`83.4 tok/s`** (**`2.49x`**)<br>• `B=4` free-text: `134.9 ->` **`212.1 tok/s`** (**`1.57x`**) | • `B=1` JSON: **`121.4 dec tok/s`** (`exact_match=True`, vs `69.0` stock `mlx-vlm`)<br>• `B=4` JSON: `1.09 ->` **`1.90 docs/s`** (**`1.74x`**, `272.6 tok/s`) | Strong at low `B`; auto-disabled at `B>=5` (avoids `0.56x` `B=8` saturation) and at `B>=2` on `Apple10 NAX` via `mtp_drafter="auto"`. |
 | **Shared-Prefix & Prefix-Tree KV Reuse** | Zero system-KV cloning across batch slots | Zero system-KV cloning across batch slots | `select_speculative_policy` enables prefix-tree KV verification (`shared_prefix_tokens >= 32`, `num_candidates >= 2`; up to **`2.59x`** at `N=4..8` shared-prefix candidates; see [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md)). |
-| **Local `QLoRA` + `Shared-Sys-KV`** (`8-bit g64` + `FFD` packing) | `pack=2048` (`25.1 GB`) exceeds `19.07 GB` Metal cap -> `recommend_silicon_budget` auto-scales to **`pack=1024, grad_accum=2, ckpt_tokens=512`** (`<= 19.2 GB` UMA cap) | • Stock `mlx-lm` BF16 LoRA: `579.1 tok/s` (`16.1 GB`)<br>• **`8-bit` + `shared-sys-kv`:** **`1,385.4 tok/s` (`2.39x`)** *(up to `1,581 tok/s` / `2.88x` on `1,288`-tok schemas)* | `packed_grad_cos = 0.99967`, `qlora_8bit_grad_cos = 0.99488`, `|Δloss| = 0.0039`; cuts frozen trunk weights `9.23 -> 5.00 GB`. |
-| **Disaggregated `G=4` `GRPO` + Concurrent `Laya` ANE Critic** | **`2.61 rollouts/s`** (`T=0.7`) / **`3.38 rollouts/s`** (`T=0.0` BoN, `8.68 GB`) = **`5.22x` / `6.77x`** vs stock `0.50` (`99.96%` ANE critic hidden) | **`1.81 rollouts/s`** (`T=0.7`) / **`3.15 rollouts/s`** (`T=0.0`, `7.11 GB`, `-63%` RAM) = **`8.93x` / `15.51x`** rollouts (**`7.44x` / `11.30x`** full step; `99.999%` hidden) | `10c` Base M5 generates constrained `GRPO` rollouts **`1.44x` faster** than `20c` M4 Pro with `0 GB` GPU critic VRAM. |
+| **Local `QLoRA` + `Shared-Sys-KV`** (`8-bit g64` + `FFD` packing) | The 2,048- and 1,280-token attempts exhausted memory. The sizing policy selects `pack=1024, grad_accum=2, ckpt_tokens=512`. A completed run at that setting remains unverified. | • Stock `mlx-lm` BF16 LoRA: `579.1 tok/s` (`16.1 GB`)<br>• **`8-bit` + `shared-sys-kv`:** **`1,385.4 tok/s` (`2.39x`)** *(up to `1,581 tok/s` / `2.88x` on `1,288`-tok schemas)* | `packed_grad_cos = 0.99967`, `qlora_8bit_grad_cos = 0.99488`, absolute loss difference 0.0039. Frozen trunk weights fell from 9.23 to 5.00 GB. |
+| **Disaggregated `G=4` `GRPO` + Concurrent `Laya` ANE Critic** | **`2.61 rollouts/s`** (`T=0.7`) / **`3.38 rollouts/s`** (`T=0.0` BoN, `8.68 GB`) = **`5.22x` / `6.77x`** vs stock `0.50` (`99.96%` ANE critic hidden) | **`1.81 rollouts/s`** (`T=0.7`) / **`3.15 rollouts/s`** (`T=0.0`, `7.11 GB`, `-63%` RAM) = **`8.93x` / `15.51x`** rollouts (**7.44× / 11.30×** estimated full-iteration speedups from the measured stages) | `10c` Base M5 generates constrained `GRPO` rollouts **`1.44x` faster** than `20c` M4 Pro with `0 GB` GPU critic VRAM. |
 
 ## Dynamic Runtime Modes (Default `"auto"`)
 
@@ -68,7 +74,7 @@ All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`
 |---|---|---|---|
 | `mtp_drafter` (`FastGemma4Engine`) | **`"auto"`** | **Lazy chipset-aware `MTP` loading:** pays **`0 MB` RAM and `0 ms` init** on `B>=8` batch ETL, stochastic (`T > 0`), ANE waves, or when no local drafter is staged. On the first qualifying greedy GPU wave, loads `google/gemma-4-E2B-it-assistant` (`~150 MiB`) once — strictly for **`B == 1`** on `Apple10+ NAX` (M5, where NAX TensorOps accelerate `B >= 2` directly by `1.5x–1.9x`) and **`1 <= B <= 4`** (`K=3/4` at `B=1`, `K=2` at `2 <= B <= 4`) on `Apple9` (M4). Pass `mtp_drafter=None` or `False` to disable, or `True`/a path to load eagerly. | [`engine.py`](src/fast_gemma4/engine.py), [`mtp_drafter.py`](src/fast_gemma4/mtp_drafter.py) |
 | `ane_ring_variant` (`FastGemma4Engine`) | **`"auto"`** | **RAM- & certification-aware ANE ring variant:** probes host RAM via `probe_host_hardware()` + `DynamicSiliconPolicy`; on `<= 24 GB` Macs selects **`"w8"`** (`504 MB`, `7,814.8 tok/s` ANE chunk prefill) **only when** a staged resident `w8` bundle exists and passes [`is_w8_bundle_calibrated`](src/fast_gemma4/ane_pipeline.py#L151-L175), falling back cleanly to **`"fp16"`** (`1.0 GB`, `5,799.2 tok/s`) if uncalibrated or missing. On `> 24 GB` Macs, stays on `"fp16"` unless `"w8"` is explicitly passed. | [`engine.py`](src/fast_gemma4/engine.py), [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py) |
-| `use_ane_ring` (`generate_batch`) | **`"auto"`** | **Chip- & batch-aware ANE prefill ring:** automatically enables the async ANE prefill ring **only when** all gates pass: non-`Apple10 NAX` (`Apple9` M4, boosting `6.88 -> 8.78 valid docs/s`, `+27.6%`), `>= 32 GB` RAM (or `allow_ane_on_low_ram=True`), `kv_i8=True`, `mode != "gpu"`, `len(prompts) >= max(16, ane_cohort_size)` (`max_suf >= 64`), and a valid ANE-resident ring bundle is staged. Automatically stays pure GPU on `Apple10+ NAX` (where pure GPU hits `10.46 valid docs/s`), low-RAM hosts, `kv_i8=False`, or small batches without raising. Explicit `False` always disables; explicit `True` / `"require"` always requires the ring. | [`engine.py`](src/fast_gemma4/engine.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
+| `use_ane_ring` (`generate_batch`) | **`"auto"`** | **Chip- & batch-aware ANE prefill ring:** automatically enables the async ANE prefill ring **only when** all gates pass: non-`Apple10 NAX` (`Apple9` M4, with 8.78 and 5.91 valid documents/s in two M4 Pro runs), `>= 32 GB` RAM (or `allow_ane_on_low_ram=True`), `kv_i8=True`, `mode != "gpu"`, `len(prompts) >= max(16, ane_cohort_size)` (`max_suf >= 64`), and a valid ANE-resident ring bundle is staged. Automatically stays pure GPU on `Apple10+ NAX` (where pure GPU hits `10.46 valid docs/s`), low-RAM hosts, `kv_i8=False`, or small batches without raising. Explicit `False` always disables; explicit `True` / `"require"` always requires the ring. | [`engine.py`](src/fast_gemma4/engine.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
 
 ### ANE Bundle Variants: `fp16` (`>24 GB` / fallback) vs Calibrated `w8` (`<=24 GB` `"auto"`)
 
@@ -117,7 +123,7 @@ All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`
 ## Verification, Scope & Not-tested
 
 - **Verified hosts:** Serialized under `/tmp/m4_gpu_validation.lock` on **Apple M4 Pro (`Mac16,8`, `48 GB`, `macOS 26.6`)** and **Base Apple M5 (`Mac17,2`, `24 GB`, `macOS 27.2.1`, `Apple10 NAX`)**. CPU & hardware suites pass (`0` `fast-ir-guard --strict-bool-mask` findings; `gemma4 verify` `64/64` valid JSON & schema; `gemma4-ane-cli` `ANE=1326, GPU=0, CPU=0`, `max_int8_diff == 0`, `cos = 0.9991–0.9998`; causal slice jumping bit-exact greedy parity).
-- **Memory boundaries:** `B_slots=128` inference fits cleanly on `24 GB` (`6.13 GB` MLX / `15.54 GB` OS peak) and `48 GB` hosts; full `pack=2048` `E2B` `QLoRA` peaks at `25.1 GB` (`>= 32 GB` UMA recommended, or `pack=1024, grad_accum=2, ckpt_tokens=512` on `24 GB`).
+- **Memory boundaries.** Batch-128 inference used 6.13 GB of active MLX memory and a 15.54 GB process footprint on the M5. Adapter training at 2,048 tokens completed on the 48 GB M4 Pro. The 1,024-token sizing recommendation on 24 GB still needs a completed training run.
 - **Not tested:** Concurrent unserialized Metal/ANE processes, `< 24 GB` Macs at `B_slots=128`, or non-Apple-Silicon targets.
 
 ## Author & License

@@ -197,7 +197,9 @@
             "NanoArguAna": 0.627693,
             "NanoHotpotQA": 0.838133,
             "legalbench_rag_isolated": 0.2432
-          }
+          },
+          "combined_with_model_mapped_gb": 1.5536,
+          "source_report": "reference/m4_native_tier1.json"
         },
         "native_over_open_eot": 5.30457,
         "native_minus_open_score": -0.000199,
@@ -329,7 +331,9 @@
             "NanoHotpotQA": 0.895591,
             "legalbench_rag_isolated": 0.270333,
             "legalbench_rag_coarse_2k": 0.568676
-          }
+          },
+          "combined_with_model_mapped_gb": 2.4921,
+          "source_report": "reference/m4_native_tier1.json"
         },
         "native_over_open_eot": 2.18948,
         "native_minus_open_score": 0.017906,
@@ -455,7 +459,9 @@
             "NanoHotpotQA": 0.895591,
             "legalbench_rag_isolated": 0.270333,
             "legalbench_rag_coarse_2k": 0.568676
-          }
+          },
+          "combined_with_model_mapped_gb": 2.4921,
+          "source_report": "reference/m4_native_tier1.json"
         },
         "native_over_open_eot": 2.17301,
         "native_minus_open_score": 0.018183,
@@ -579,7 +585,9 @@
             "ragtruth_auroc": 0.681197,
             "clinc150_151_acc": 0.456364,
             "rewardbench2_macro_bo4": 0.292
-          }
+          },
+          "combined_with_model_mapped_gb": 0.9846,
+          "source_report": "reference/m4_native_tier1.json"
         },
         "native_over_open_eot": 0.76696,
         "native_minus_open_score": 0.005714,
@@ -702,7 +710,9 @@
             "ragtruth_auroc": 0.606178,
             "clinc150_151_acc": 0.496364,
             "rewardbench2_macro_bo4": 0.3
-          }
+          },
+          "combined_with_model_mapped_gb": 2.2864,
+          "source_report": "coreml_native_kev_m4.json"
         },
         "native_over_open_eot": 2.03954,
         "native_minus_open_score": 0.004286,
@@ -914,7 +924,9 @@
             "NanoArguAna": 0.627693,
             "NanoHotpotQA": 0.838133,
             "legalbench_rag_isolated": 0.2432
-          }
+          },
+          "combined_with_model_mapped_gb": 1.5365,
+          "source_report": "reference/m5_native_tier1.json"
         },
         "native_over_open_eot": 5.08915,
         "native_minus_open_score": -0.000199,
@@ -1046,7 +1058,9 @@
             "NanoHotpotQA": 0.895591,
             "legalbench_rag_isolated": 0.271971,
             "legalbench_rag_coarse_2k": 0.569424
-          }
+          },
+          "combined_with_model_mapped_gb": 3.432,
+          "source_report": "reference/m5_native_tier1.json"
         },
         "native_over_open_eot": 2.82606,
         "native_minus_open_score": 0.019003,
@@ -1172,7 +1186,9 @@
             "NanoHotpotQA": 0.895591,
             "legalbench_rag_isolated": 0.271971,
             "legalbench_rag_coarse_2k": 0.569424
-          }
+          },
+          "combined_with_model_mapped_gb": 3.432,
+          "source_report": "reference/m5_native_tier1.json"
         },
         "native_over_open_eot": 2.70459,
         "native_minus_open_score": 0.01928,
@@ -1296,7 +1312,9 @@
             "ragtruth_auroc": 0.681197,
             "clinc150_151_acc": 0.456364,
             "rewardbench2_macro_bo4": 0.292
-          }
+          },
+          "combined_with_model_mapped_gb": 1.0044,
+          "source_report": "reference/m5_native_tier1.json"
         },
         "native_over_open_eot": 0.77865,
         "native_minus_open_score": 0.005714,
@@ -1419,7 +1437,9 @@
             "ragtruth_auroc": 0.605983,
             "clinc150_151_acc": 0.5,
             "rewardbench2_macro_bo4": 0.292
-          }
+          },
+          "combined_with_model_mapped_gb": 1.7778,
+          "source_report": "coreml_native_kev_m5.json"
         },
         "native_over_open_eot": 1.93698,
         "native_minus_open_score": 0.003571,

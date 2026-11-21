@@ -1,10 +1,10 @@
 # fast-embeddinggemma-2
 
-**Encode up to 2,048 tokens per passage and choose an embedding width from 128 to 768 dimensions.** Bulk encoding reached 38,517 tokens/s on M4 Pro and 48,803 on M5. On the public retrieval benchmark, the package delivered 4.33–4.80 times the score per second of stock MLX and 6.24 times that of Apple Core AI on M5.
+**Encode up to 2,048 tokens per passage and choose an embedding width from 128 to 768 dimensions.** Bulk encoding reached 38,517 tokens/s on M4 Pro and 48,803 on M5. On the public retrieval benchmark, the package delivered 4.33–4.80 times the score per second of stock MLX and 6.24 times that of Apple CoreAI on M5.
 
 `fast-embeddinggemma-2` runs the 300M-parameter `google/embeddinggemma-2` text encoder on the Metal GPU and Apple Neural Engine (ANE) together for bulk encoding. A 24-token query on the ANE took 2.11 ms on M4 Pro and 2.58 ms on M5. The package includes a Python API, OCR-aware Parquet ingestion, an OpenAI-compatible `/v1/embeddings` endpoint with `dimensions` support, and a standalone `emb2-ane-cli`. Inference uses MLX and Core ML.
 
-> **Full Cross-Silicon Benchmarks:** See [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) for complete M4 Pro vs. Base M5 retrieval, throughput, and Core AI `.aimodel` comparisons.
+> **Full Cross-Silicon Benchmarks:** See [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) for complete M4 Pro vs. Base M5 retrieval, throughput, and CoreAI `.aimodel` comparisons.
 
 ## Quick start
 
@@ -30,35 +30,35 @@ The retrieval score averages 150 NanoBEIR queries and 175 LegalBench-RAG queries
 | Host | Engine | `S_obj,e2e` | `EOT (u/s)` | Wall Time | 4-Bucket Mem | Speedup vs. Stock |
 |---|---|---:|---:|---:|---:|---|
 | **Base M5 (`24 GB`, `Apple10 NAX`)** | **`fast-embeddinggemma-2` (`hetero`)** | **`0.5376`** | **`4.707`** | **`57.1 s`** | **`3.43 GB`** | **`4.33x` MLX · `6.24x` CoreAI** (`1.31x` M4 Pro) |
-| Base M5 | Open Core ML (FluidInference FP16) | 0.5186 | 1.666 | 155.7 s | 1.38 GB | 1.53× MLX |
-| Base M5 | Open Core ML (OpenInfinity INT8) | 0.5183 | 1.740 | 148.9 s | 0.84 GB | 1.60× MLX |
+| Base M5 | Public Core ML (FluidInference FP16) | 0.5186 | 1.666 | 155.7 s | 1.38 GB | 1.53× MLX |
+| Base M5 | Public Core ML (OpenInfinity INT8) | 0.5183 | 1.740 | 148.9 s | 0.84 GB | 1.60× MLX |
 | Base M5 (`24 GB`) | Stock `mlx-vlm` (`embeddinggemma-2-8bit`) | `0.5364` | `1.086` | `246.9 s` | `19.41 GB` | `1.00x` MLX |
 | Base M5 (`24 GB`, `macOS 27.2+`) | Stock Apple `CoreAI` (`coreai-emb2-bf16` `.aimodel`) | `0.5360` | `0.754` | `355.5 s` | Unknown for full run | `0.69x` MLX |
 | **M4 Pro (`48 GB`, `Apple9`)** | **`fast-embeddinggemma-2` (`hetero`)** | **`0.5365`** | **`3.583`** | **`74.9 s`** | **`2.49 GB`** | **`4.80x` MLX** |
-| M4 Pro | Open Core ML (FluidInference FP16) | 0.5186 | 1.637 | 158.4 s | 1.53 GB | 2.19× MLX |
-| M4 Pro | Open Core ML (OpenInfinity INT8) | 0.5183 | 1.649 | 157.2 s | 1.03 GB | 2.21× MLX |
+| M4 Pro | Public Core ML (FluidInference FP16) | 0.5186 | 1.637 | 158.4 s | 1.53 GB | 2.19× MLX |
+| M4 Pro | Public Core ML (OpenInfinity INT8) | 0.5183 | 1.649 | 157.2 s | 1.03 GB | 2.21× MLX |
 | M4 Pro (`48 GB`) | Stock `mlx-vlm` (`embeddinggemma-2-8bit`) | `0.5353` | `0.746` | `358.6 s` | `39.03 GB` | `1.00x` MLX |
 
-Both open Core ML exports accept up to 512 tokens per input. All 818 short LegalBench passages fit. Of the 144 long passages, 136 exceeded 512 tokens and one exceeded the native encoder's 2,048-token limit. The evaluator ranks the original passages using the portion each engine encoded. On M5, native, FP16 and INT8 scored 0.272, 0.271 and 0.270 on short passages and 0.569, 0.516 and 0.518 on long passages. This locates most of the observed difference in the long-passage task.
+Both public Core ML exports accept up to 512 tokens per input. All 818 short LegalBench passages fit. Of the 144 long passages, 136 exceeded 512 tokens and one exceeded the package’s 2,048-token limit. The evaluator ranks the original passages using the portion each engine encoded. On M5, `fast-embeddinggemma-2`, FluidInference FP16 and OpenInfinity INT8 scored 0.272, 0.271 and 0.270 on short passages and 0.569, 0.516 and 0.518 on long passages. This locates most of the observed difference in the long-passage task.
 
-On M5, the public INT8 export used 0.84 GB and completed scoring in 149 seconds. The native GPU-plus-ANE engine used 3.43 GB and finished scoring in 57 seconds. Memory reports the larger of the evaluator and model-process estimates. The native, stock and open runs used the same dataset lock and were timed separately. Before scoring, loading the FP16 and INT8 graphs took 72.1 and 76.9 seconds on M5, and 3.6 seconds each on M4 Pro. The subsequent M5 speed test loaded each export in about 3 seconds.
+On M5, the public INT8 export used 0.84 GB and completed scoring in 149 seconds. `fast-embeddinggemma-2` used 3.43 GB and finished scoring in 57 seconds. Memory reports the larger of the evaluator and model-process estimates. The project package, stock MLX and the public Core ML exports ran the same locked inputs in separate timed runs. Before scoring, loading the FP16 and INT8 graphs took 72.1 and 76.9 seconds on M5, and 3.6 seconds each on M4 Pro. The subsequent M5 speed test loaded each export in about 3 seconds.
 
-For Apple Core AI on the 24 GB M5, the full run returned an invalid 385.79 GB memory estimate. A separate five-text check measured 3.04 GB.
+For Apple CoreAI on the 24 GB M5, the full run returned an invalid 385.79 GB memory estimate. A separate five-text check measured 3.04 GB.
 
 ### 2. Corpus Speed, `B=1` Latency & Silicon Wins
 
 | Benchmark (`benchmark_monorepo.py` / ABBA OCR) | Base M5 (`24 GB`, `macOS 27.2.1`) | M4 Pro (`48 GB`, `macOS 26.6`) | Key Architectural Takeaway |
 |---|---|---|---|
-| **Corpus throughput (`hetero`)** | **48,803 tokens/s** (2.76 GB) | **38,517 tokens/s** (3.26 GB) | Apple Core AI BF16 encoded the same 551,889 tokens at 12,482 tokens/s on M5. |
-| **Single-query latency (ANE)** | **2.58 ms** | **2.11 ms** | A 24-token query uses the 32-token ANE graph. The Apple Core AI BF16 graph took 9.38 ms on M5. |
-| **Why `hetero2` beats stock `.aimodel`** | Dynamic FFD packing avoids **`+73%` pad position waste** (`2.25M -> 3.90M` positions in static `blk_mx` `128/512/2048` `.aimodel`) while co-executing GPU + `18.56 TF` peak 16-core ANE (`2.75x` vs. GPU-only on OCR). | | `ANE=2288, GPU=0, CPU=0` across all `9` buckets on both M4 Pro and M5 `h17` (NCHW `out_h` + NEON untile + `>= 2^-14` RMSNorm epsilon floor). |
+| **Corpus throughput (`hetero`)** | **48,803 tokens/s** (2.76 GB) | **38,517 tokens/s** (3.26 GB) | Apple CoreAI BF16 encoded the same 551,889 tokens at 12,482 tokens/s on M5. |
+| **Single-query latency (ANE)** | **2.58 ms** | **2.11 ms** | A 24-token query uses the 32-token ANE graph. The Apple CoreAI BF16 graph took 9.38 ms on M5. |
+| **Input packing in `hetero2` and Apple CoreAI** | Dynamic FFD packing avoids **`+73%` pad position waste** (`2.25M -> 3.90M` positions in static `blk_mx` `128/512/2048` `.aimodel`) while co-executing GPU + `18.56 TF` peak 16-core ANE (`2.75x` vs. GPU-only on OCR). | | `ANE=2288, GPU=0, CPU=0` across all `9` buckets on both M4 Pro and M5 `h17` (NCHW `out_h` + NEON untile + `>= 2^-14` RMSNorm epsilon floor). |
 | **Base M5 `Apple10` GPU Tuning** | Native `mx.matmul` plain projections + fused GeGLU/PLE cut `7,974`-passage wall time **`-14.89%`** (`54.28 -> 46.20 s`, `1.175x`, identical Top-1/Top-5 retrieval); `Apple10`-gated `force_fused` FP16 SWA `D256` SDPA (`S in {384, 512}`) trims an extra **`-2.27%`**. | | Automatically gated on `Apple10` hardware capabilities in [`src/fast_embeddinggemma_2/gpu.py`](src/fast_embeddinggemma_2/gpu.py). |
 
 In its separate natural-text run, stock `mlx-vlm` encoded 64.91 documents/s on M5 and 46.05 on M4 Pro. Its single query took 8.48 ms and 8.39 ms, respectively.
 
-`FluidInference/embeddinggemma-2-coreml` and `OpenInfinity/embeddinggemma-2-coreml-int8` encoded the same 551,889 token IDs in 2,000 documents as the native corpus run. `pack_256` groups up to eight short inputs into 256 tokens. Longer inputs use single-input graphs. The test timed the modes in packed, single, single, packed order. Query latency is the median of 30 calls using the same 24 tokens.
+`FluidInference/embeddinggemma-2-coreml` and `OpenInfinity/embeddinggemma-2-coreml-int8` encoded the same 551,889 token IDs in 2,000 documents as `fast-embeddinggemma-2`. `pack_256` groups up to eight short inputs into 256 tokens. Longer inputs use single-input graphs. The test timed the modes in packed, single, single, packed order. Query latency is the median of 30 calls using the same 24 tokens.
 
-| Host | Open Core ML export | Query latency | Packed tokens/s | Single-input tokens/s | Packed / single |
+| Host | Public Core ML export | Query latency | Packed tokens/s | Single-input tokens/s | Packed / single |
 |---|---|---:|---:|---:|---:|
 | Base M5 | FluidInference FP16 | 4.334 ms | 14,187 | 13,556 | 1.0465× |
 | Base M5 | OpenInfinity INT8 | 2.592 ms | 14,945 | 14,438 | 1.0351× |
@@ -67,7 +67,7 @@ In its separate natural-text run, stock `mlx-vlm` encoded 64.91 documents/s on M
 
 Packing increased corpus throughput by 3.5–4.7%. Across all 2,000 documents on each Mac, the lowest cosine similarity between packed and single-input embeddings was 0.99944 for FP16 and 0.99973 for INT8. Core ML inspected seven functions in each export. Only `embed_128` exposed a Neural Engine preference, for 3,862 operations. The remaining 45,223 operations had no classified device, including all operations in `pack_256`.
 
-The run records include the publisher revisions, per-function compute plans and per-task scores. [Benchmark methods](../../docs/BENCHMARKS.md#open-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
+The run records include the publisher revisions, per-function compute plans and per-task scores. [Benchmark methods](../../docs/BENCHMARKS.md#public-core-ml-results) · [Measured results (JSON)](../../docs/benchmarks/coreml-20261120.json)
 
 ## At a glance
 
