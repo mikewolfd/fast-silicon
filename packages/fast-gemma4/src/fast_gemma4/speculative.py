@@ -142,17 +142,17 @@ def _pick_valid_token_safe(
 
 
 def _parse_use_ane_ring(use_ane_ring: bool | str) -> tuple[bool, bool]:
-    """Return `(want_ane, require_ane)` for `False | True | 'auto'`."""
+    """Return `(want_ane, require_ane)` for `False | True | 'auto' | 'require'`."""
     if isinstance(use_ane_ring, bool):
         return use_ane_ring, use_ane_ring
     mode = str(use_ane_ring).strip().lower()
     if mode in ("false", "0", "off", "gpu", "none"):
         return False, False
-    if mode in ("true", "1", "on", "ane", "hybrid"):
+    if mode in ("true", "1", "on", "ane", "hybrid", "require"):
         return True, True
     if mode == "auto":
         return True, False
-    raise ValueError(f"Unsupported use_ane_ring={use_ane_ring!r}; expected False, True, or 'auto'.")
+    raise ValueError(f"Unsupported use_ane_ring={use_ane_ring!r}; expected False, True, 'auto', or 'require'.")
 
 
 def _resolve_or_build_ane_ring(
@@ -164,6 +164,7 @@ def _resolve_or_build_ane_ring(
     use_ane_ring: bool | str,
     ane_ring: Any | None,
     ane_ring_variant: str = "fp16",
+    ane_cohort_size: int = 16,
 ) -> AsyncHybridPrefillRing | None:
     want_ane, require_ane = _parse_use_ane_ring(use_ane_ring)
     if not want_ane:
@@ -183,15 +184,21 @@ def _resolve_or_build_ane_ring(
             )
         return None
 
+    min_auto_batch = max(16, int(ane_cohort_size))
     max_suf = max((len(s) for s in suf_list), default=0)
-    if not require_ane and (len(suf_list) < 8 or max_suf < 64):
+    if not require_ane and (len(suf_list) < min_auto_batch or max_suf < 64):
         return None
 
     if ane_ring is not None:
         return ane_ring
 
-    if not require_ane and 0.0 < _host_ram_gib() < 32.0:
-        return None
+    if not require_ane:
+        if 0.0 < _host_ram_gib() < 32.0:
+            return None
+        from .mtp_drafter import _host_supports_apple10_nax
+
+        if _host_supports_apple10_nax():
+            return None
 
     paths = getattr(model, "paths", None)
     model_dir = getattr(model, "model_dir", None)
@@ -1018,6 +1025,7 @@ def run_decode_rolling(
         use_ane_ring=use_ane_ring,
         ane_ring=ane_ring,
         ane_ring_variant=ane_ring_variant,
+        ane_cohort_size=ane_cohort_size,
     )
 
     doc_order = (

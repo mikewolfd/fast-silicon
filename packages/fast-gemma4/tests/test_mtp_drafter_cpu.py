@@ -161,6 +161,90 @@ def test_lazy_exports_in_fast_gemma4_init() -> None:
     assert fast_gemma4.WhitespaceGuard is not None
 
 
+def test_engine_mtp_drafter_default_auto_vs_explicit_disable_and_eager_cpu(tmp_path: Path) -> None:
+    """Verify FastGemma4Engine defaults `mtp_drafter='auto'`, disables on None/False, and eagerly loads True/path."""
+    import inspect
+    from unittest.mock import patch
+
+    import fast_gemma4.engine as fg4_engine
+    import fast_shared.hw_check as fs_hw
+
+    sig = inspect.signature(fg4_engine.FastGemma4Engine.__init__).parameters
+    assert sig["mtp_drafter"].default == "auto"
+    assert sig["ane_ring_variant"].default == "auto"
+
+    class _DummyPaths:
+        lib_ane_prefix = tmp_path / "missing.dylib"
+
+        def resolve_ane_bundle(self, *_a: object, **_kw: object) -> None:
+            return None
+
+    class _DummyModel:
+        hidden_size = 1536
+        num_layers = 35
+        n_kv_heads = 1
+        first_kv_shared = 15
+        window_size = 512
+        kv_i8 = True
+        model_dir = tmp_path / "ckpt"
+        tokenizer_json = tmp_path / "tokenizer.json"
+
+    hw_m4 = {
+        "system": "Darwin",
+        "machine": "arm64",
+        "brand": "Apple M4 Pro",
+        "gpu_family": "Apple9",
+        "supports_apple10": False,
+        "mem_gb": 48,
+        "macos_version": "26.6",
+    }
+    eager_calls: list[object] = []
+
+    def _fake_drafter_ctor(_model: object, drafter_ref: object, **_kw: object) -> object:
+        eager_calls.append(drafter_ref)
+        return SimpleNamespace(ref=drafter_ref)
+
+    def _build(**kwargs: object) -> fg4_engine.FastGemma4Engine:
+        with (
+            patch.object(fs_hw, "probe_host_hardware", return_value=hw_m4),
+            patch.object(fg4_engine, "_host_ram_gib", return_value=48.0),
+            patch.object(fg4_engine, "resolve_paths", return_value=_DummyPaths()),
+            patch.object(fg4_engine, "FastGemma4Model", return_value=_DummyModel()),
+            patch.object(fg4_engine, "FastGemma4Tokenizer", return_value=object()),
+            patch.object(fg4_engine, "Gemma4MtpDrafter", side_effect=_fake_drafter_ctor),
+            patch.object(mx, "set_wired_limit", return_value=0, create=True),
+            patch.object(mx, "device_info", return_value={"max_recommended_working_set_size": 0}, create=True),
+        ):
+            return fg4_engine.FastGemma4Engine(warmup=False, **kwargs)  # type: ignore[arg-type]
+
+    # 1. Default (zero-arg) sets lazy auto mode with 0 eager loads.
+    eng_default = _build()
+    assert eng_default._mtp_drafter_auto is True
+    assert eng_default.mtp_drafter is None
+    assert eager_calls == []
+
+    # 2. Explicit None and False disable MTP completely.
+    for disabled_val in (None, False):
+        eng_off = _build(mtp_drafter=disabled_val)
+        assert eng_off._mtp_drafter_auto is False
+        assert eng_off.mtp_drafter is None
+        assert eng_off._has_mtp_drafter_candidate() is False
+        assert eng_off._maybe_ensure_mtp_drafter(use_ane=False, batch_w=1, temperature=0.0) is None
+    assert eager_calls == []
+
+    # 3. Explicit True and Path eagerly construct Gemma4MtpDrafter.
+    eng_true = _build(mtp_drafter=True)
+    assert eng_true._mtp_drafter_auto is False
+    assert eng_true.mtp_drafter is not None
+    assert eager_calls == [DEFAULT_MTP_DRAFTER_REPO]
+
+    custom_dir = tmp_path / "custom_drafter"
+    eng_path = _build(mtp_drafter=custom_dir)
+    assert eng_path._mtp_drafter_auto is False
+    assert eng_path.mtp_drafter is not None
+    assert eager_calls == [DEFAULT_MTP_DRAFTER_REPO, custom_dir]
+
+
 def test_mtp_drafter_b1_parity_and_b8_gate_gpu() -> None:
     """Serialized M4 GPU smoke test: B=1 MTP parity (free-text + JSON) & B=8 hard gate."""
     try:

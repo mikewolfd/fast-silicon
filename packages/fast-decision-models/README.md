@@ -2,7 +2,7 @@
 
 **Fast local document classification, scoring, fine-tuning, and zero-VRAM ANE RLVR critics on Apple Silicon — `8.29x` higher `EOT` than stock Apple `CoreAI`, up to `6.19x` (`B=8`) / `9.89x` (`B=1`) faster than `mlx-lm` with `PrefixTree`, and `5.22x–15.51x` faster GRPO rollouts.**
 
-`fast-decision-models` runs typed binary (`noul`), multi-choice (`choice`), and scalar (`score`) judges for **Kev-0.8B** on Metal (**`86.84 q/s`** on Base M5 / **`54.52 q/s`** on M4 Pro at `B=8`, plus zero-drift `256`-token `GDN+KV` `PrefixTree` caching) and **Laya-Typed-421M** purely on the 16-core Apple Neural Engine (**`44.38 q/s`** on Base M5 / **`41.91 q/s`** on M4 Pro with **`0` GPU ops**, keeping your GPU completely free for LLM generation, fine-tuning, or RLVR). Importing the package is pure Python stdlib with zero runtime PyTorch dependency, backed by CLI (`score`), CoreAI-Opt calibration/export hooks, and Python APIs.
+`fast-decision-models` runs typed binary (`noul`), multi-choice (`choice`), and scalar (`score`) judges for **Kev-0.8B** on Metal (**`86.84 q/s`** on Base M5 / **`54.52 q/s`** on M4 Pro at `B=8`, with hit- & share-aware `256`-token `GDN+KV` `PrefixTree` caching enabled by default via `prefix_cache_mb="auto"`) and **Laya-Typed-421M** purely on the 16-core Apple Neural Engine (**`44.38 q/s`** on Base M5 / **`41.91 q/s`** on M4 Pro with **`0` GPU ops**, keeping your GPU completely free for LLM generation, fine-tuning, or RLVR). Importing the package is pure Python stdlib with zero runtime PyTorch dependency, backed by CLI (`score`), CoreAI-Opt calibration/export hooks, and Python APIs.
 
 > **Full Cross-Silicon Benchmarks & Promotion Gates:** See [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) for complete Category 2 (`RAGTruth + CLINC150 + RewardBench-2`), fine-tuning, GRPO, `PrefixTree`, and `CoreAI-Opt` Track A / Track B tables.
 
@@ -20,7 +20,7 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 ```python
 from fast_decision_models import Kev08bMlxBackend, LayaAneBackend
 
-with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:
+with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:  # hit-aware prefix_cache_mb="auto" by default (None/0 to opt out)
     res = kev.score_multi_states([(
         "Invoice #8812: Total $1,240.00. Status: PAID via ACH.",
         [{"id": "overdue", "type": "noul", "instructions": "Is the balance overdue and unpaid?",
@@ -51,7 +51,7 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:
 | **Base M5 (`24 GB`, `Apple10 NAX`)** | **`0.5257`** | **`5.078`** (`144.9 s`) | **`86.84 q/s`** (`B=8`) · **`45.9 ms`** `PrefixTree` `B=1` | **`1.77 GB`** | **`1.59x` faster than `20c` M4 Pro** at `B=8` (`1.56x` `EOT`) via `NAX`; **`-42%` RAM** vs. `mlx-lm` (`3.06 GB`); `PrefixTree` vs. `mlx-lm`: **`2.59x`** `B=8` shared preamble (`22.6` vs. `8.73 q/s`), **`6.19x`** `8q` same-doc branch (`54.1 q/s`), **`5.15x`** `B=1` `512`-tok hit (`46.3` vs. `8.99 q/s`). |
 | **M4 Pro (`48 GB`, `Apple9`)** | **`0.5250`** | **`3.254`** (`225.9 s`) | **`54.52 q/s`** (`B=8`) · **`44.4 ms`** `PrefixTree` `B=1` | **`1.84 GB`** | **`-44%` RAM** vs. `mlx-lm` (`3.26 GB`); `PrefixTree` vs. `mlx-lm`: **`4.91x`** `B=8` shared preamble (`26.0` vs. `5.29 q/s`), **`5.86x`** `8q` same-doc branch (`31.0 q/s`), **`9.89x`** `B=1` `512`-tok hit (`53.8` vs. `5.44 q/s`); **`5.82x`** vs. `transformers-mps B=8`. |
 
-- `PrefixTree` ([`prefix_tree.py`](src/fast_decision_models/prefix_tree.py)) snapshots `256`-token `GDN+KV` state with **exact zero drift (`max |Δlogit| = 0.0`, `max |Δprob| = 0.0`)** — delivering `2.72x` at `550` tokens (`3.88x` @ `512`, `6.34x` @ `1024`) on Base M5 and `4.54x` at `550` tokens (`6.90x` @ `512`, `12.52x` @ `1024`) on M4 Pro.
+- **Hit- & share-aware `PrefixTree` enabled by default (`prefix_cache_mb="auto"`):** `Kev08bMlxBackend` enables [`PrefixTree`](src/fast_decision_models/prefix_tree.py) by default (`128 MiB` budget on `<= 24 GB`, `512 MiB` on `>= 48 GB`; pass `prefix_cache_mb=None` or `0` to disable). Single-item calls (`B=1`), warm prefix hits, and intra-batch shared prefixes (`>= 2` items sharing the first `256` tokens) reuse exact zero-drift (`max |Δlogit| = 0.0`, `max |Δprob| = 0.0`) `256`-token `GDN+KV` snapshots — delivering `2.72x` at `550` tokens (`3.88x` @ `512`, `6.34x` @ `1024`) on Base M5 and `4.54x` at `550` tokens (`6.90x` @ `512`, `12.52x` @ `1024`) on M4 Pro — while cold distinct `B >= 2` batches automatically stay on the fast `B=8` left-padded batched prefill path.
 
 ### 3. Local `ModernBERT-421M` Fine-Tuning (`benchmark_capabilities.py --suites encoder-finetune`, `freeze<18`)
 
@@ -84,7 +84,7 @@ Base M5 generates constrained `GRPO` rollouts **`1.44x` faster than M4 Pro** whi
 |---|---|---|
 | **Laya-Typed-421M ANE** | Piecewise Scale-Invariant Residual Re-Centering (`1 -> 1/32 -> 1/256 -> 1/1024`) w/ compensated `>= 2^-14` FP16 LayerNorm, scalar FP16 LUT + NEON `8x8` transpose into `IOSurface`-backed `CVPixelBuffer`s, `P=4` async CoreML ring, `spawn`-parallel bucket builds | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm), [`scripts/build_decision_models.py`](scripts/build_decision_models.py) |
 | **Laya CoreAI-Opt / `.aimodel` Export** | Calibrated `CoreAI-Opt` `w8` (`-14.3%` `ECE-15`) and `macOS 27.2.1` `FP16` `.aimodel` ANE (`1,652` ANE ops, `23.00 ms`) with `head_ffn_dim=4096` and `2^-14` guards | [`coreai_export.py`](src/fast_decision_models/coreai_export.py) |
-| **Kev-0.8B Metal MLX + `PrefixTree`** | Lossless `W8 (g64)` + `BF16` merged weights, `@mx.compile` forward, left-padded `B=8` batching, `_GDN_PACKED_BTREE_SRC`, `256`-token zero-drift `GDN+KV` `PrefixTree` LRU cache, stdlib ZIP `head.pt` loader | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
+| **Kev-0.8B Metal MLX + `PrefixTree`** | Lossless `W8 (g64)` + `BF16` merged weights, `@mx.compile` forward, left-padded `B=8` batching, `_GDN_PACKED_BTREE_SRC`, default hit- & share-aware `256`-token zero-drift `GDN+KV` `PrefixTree` (`prefix_cache_mb="auto"`), stdlib ZIP `head.pt` loader | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
 
 ## CLI, Setup & Verification
 

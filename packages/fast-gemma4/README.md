@@ -19,11 +19,10 @@ uv pip install --python .venv/bin/python -e ../fast-shared -e ".[dev]"
 ```python
 from fast_gemma4 import FastGemma4Engine
 
-with FastGemma4Engine(
-    default_mode="auto",
-    mtp_drafter="auto",       # Lazy-loads MTP only on qualifying low-B waves (0 MB RAM on B>=8)
-    ane_ring_variant="auto",  # Calibrated w8 on <=24 GB Macs when certified; fp16 otherwise
-) as eng:
+# Zero-argument defaults enable chip-, RAM-, and batch-aware "auto" dispatch:
+#   default_mode="auto", mtp_drafter="auto", ane_ring_variant="auto",
+#   and generate_batch(..., use_ane_ring="auto").
+with FastGemma4Engine() as eng:
     item = eng.generate(
         "Extract entity and topic as JSON.",
         json_schema={
@@ -61,20 +60,21 @@ All runs execute in isolated subprocesses under `/tmp/m4_gpu_validation.lock` (`
 | **Local `QLoRA` + `Shared-Sys-KV`** (`8-bit g64` + `FFD` packing) | `pack=2048` (`25.1 GB`) exceeds `19.07 GB` Metal cap -> `recommend_silicon_budget` auto-scales to **`pack=1024, grad_accum=2, ckpt_tokens=512`** (`<= 19.2 GB` UMA cap) | • Stock `mlx-lm` BF16 LoRA: `579.1 tok/s` (`16.1 GB`)<br>• **`8-bit` + `shared-sys-kv`:** **`1,385.4 tok/s` (`2.39x`)** *(up to `1,581 tok/s` / `2.88x` on `1,288`-tok schemas)* | `packed_grad_cos = 0.99967`, `qlora_8bit_grad_cos = 0.99488`, `|Δloss| = 0.0039`; cuts frozen trunk weights `9.23 -> 5.00 GB`. |
 | **Disaggregated `G=4` `GRPO` + Concurrent `Laya` ANE Critic** | **`2.61 rollouts/s`** (`T=0.7`) / **`3.38 rollouts/s`** (`T=0.0` BoN, `8.68 GB`) = **`5.22x` / `6.77x`** vs stock `0.50` (`99.96%` ANE critic hidden) | **`1.81 rollouts/s`** (`T=0.7`) / **`3.15 rollouts/s`** (`T=0.0`, `7.11 GB`, `-63%` RAM) = **`8.93x` / `15.51x`** rollouts (**`7.44x` / `11.30x`** full step; `99.999%` hidden) | `10c` Base M5 generates constrained `GRPO` rollouts **`1.44x` faster** than `20c` M4 Pro with `0 GB` GPU critic VRAM. |
 
-## Dynamic Runtime Modes (`094ae65`)
+## Dynamic Runtime Modes (Default `"auto"`)
 
-`FastGemma4Engine` integrates `fast_shared.runtime_lessons.DynamicSiliconPolicy` so callers can opt into hardware- and batch-aware dispatch without hand-tuning per Mac:
+`FastGemma4Engine()` integrates `fast_shared.runtime_lessons.DynamicSiliconPolicy` by default so zero-argument callers automatically receive hardware-, RAM-, and batch-aware dispatch without hand-tuning per Mac:
 
-| Parameter | Default | `"auto"` Behavior | Source |
+| Parameter | Default | `"auto"` Behavior & Overrides | Source |
 |---|---|---|---|
-| `mtp_drafter` | `None` (off) | **Lazy chipset-aware `MTP` loading:** pays **`0 MB` RAM and `0 ms` init** on `B>=8` batch ETL, stochastic (`T > 0`), ANE waves, or when no local drafter is staged. On the first qualifying greedy GPU wave, loads `google/gemma-4-E2B-it-assistant` (`~150 MiB`) once — strictly for **`B == 1`** on `Apple10+ NAX` (M5, where NAX TensorOps accelerate `B >= 2` directly by `1.5x–1.9x`) and **`1 <= B <= 4`** (`K=3/4` at `B=1`, `K=2` at `2 <= B <= 4`) on `Apple9` (M4). | [`engine.py`](src/fast_gemma4/engine.py), [`mtp_drafter.py`](src/fast_gemma4/mtp_drafter.py) |
-| `ane_ring_variant` | `"fp16"` | **RAM- & certification-aware ANE ring:** probes host RAM via `probe_host_hardware()` + `DynamicSiliconPolicy`; on `<= 24 GB` Macs selects **`"w8"`** (`504 MB`, `7,814.8 tok/s` ANE chunk prefill) **only when** a staged `w8` bundle exists and passes [`is_w8_bundle_calibrated`](src/fast_gemma4/ane_pipeline.py#L151-L175), falling back cleanly to **`"fp16"`** (`1.0 GB`, `5,799.2 tok/s`) if uncalibrated or missing. On `> 24 GB` Macs, stays on `"fp16"` unless `"w8"` is explicitly passed. | [`engine.py`](src/fast_gemma4/engine.py), [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py) |
+| `mtp_drafter` (`FastGemma4Engine`) | **`"auto"`** | **Lazy chipset-aware `MTP` loading:** pays **`0 MB` RAM and `0 ms` init** on `B>=8` batch ETL, stochastic (`T > 0`), ANE waves, or when no local drafter is staged. On the first qualifying greedy GPU wave, loads `google/gemma-4-E2B-it-assistant` (`~150 MiB`) once — strictly for **`B == 1`** on `Apple10+ NAX` (M5, where NAX TensorOps accelerate `B >= 2` directly by `1.5x–1.9x`) and **`1 <= B <= 4`** (`K=3/4` at `B=1`, `K=2` at `2 <= B <= 4`) on `Apple9` (M4). Pass `mtp_drafter=None` or `False` to disable, or `True`/a path to load eagerly. | [`engine.py`](src/fast_gemma4/engine.py), [`mtp_drafter.py`](src/fast_gemma4/mtp_drafter.py) |
+| `ane_ring_variant` (`FastGemma4Engine`) | **`"auto"`** | **RAM- & certification-aware ANE ring variant:** probes host RAM via `probe_host_hardware()` + `DynamicSiliconPolicy`; on `<= 24 GB` Macs selects **`"w8"`** (`504 MB`, `7,814.8 tok/s` ANE chunk prefill) **only when** a staged resident `w8` bundle exists and passes [`is_w8_bundle_calibrated`](src/fast_gemma4/ane_pipeline.py#L151-L175), falling back cleanly to **`"fp16"`** (`1.0 GB`, `5,799.2 tok/s`) if uncalibrated or missing. On `> 24 GB` Macs, stays on `"fp16"` unless `"w8"` is explicitly passed. | [`engine.py`](src/fast_gemma4/engine.py), [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py) |
+| `use_ane_ring` (`generate_batch`) | **`"auto"`** | **Chip- & batch-aware ANE prefill ring:** automatically enables the async ANE prefill ring **only when** all gates pass: non-`Apple10 NAX` (`Apple9` M4, boosting `6.88 -> 8.78 valid docs/s`, `+27.6%`), `>= 32 GB` RAM (or `allow_ane_on_low_ram=True`), `kv_i8=True`, `mode != "gpu"`, `len(prompts) >= max(16, ane_cohort_size)` (`max_suf >= 64`), and a valid ANE-resident ring bundle is staged. Automatically stays pure GPU on `Apple10+ NAX` (where pure GPU hits `10.46 valid docs/s`), low-RAM hosts, `kv_i8=False`, or small batches without raising. Explicit `False` always disables; explicit `True` / `"require"` always requires the ring. | [`engine.py`](src/fast_gemma4/engine.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
 
-### ANE Bundle Variants: `fp16` (Default) vs Calibrated `w8`
+### ANE Bundle Variants: `fp16` (`>24 GB` / fallback) vs Calibrated `w8` (`<=24 GB` `"auto"`)
 
 | Variant | Size (`E2B Early14`) | Weight Format | Raw ANE Chunk Speed (`S=256`, `pipe=4`) | When to Use |
 |---|---:|---|---:|---|
-| **`fp16` (default)** | `1.0 GB` | IEEE `FP16` (`types.fp16`) | `5,799.2 tok/s` (`44.144 ms/chunk`) | **Default everywhere** (`FastGemma4Engine`, `gemma4` CLI, `train_lora.py`): safe out of the box on base and arbitrary LoRA weights (`8.78 docs/s` Concurrent ANE+GPU on M4 Pro vs `7.99 docs/s` uncalibrated `w8`). |
+| **`fp16`** | `1.0 GB` | IEEE `FP16` (`types.fp16`) | `5,799.2 tok/s` (`44.144 ms/chunk`) | **Default on `>24 GB` Macs and fallback everywhere** (`FastGemma4Engine(ane_ring_variant="auto")`, `gemma4` CLI, `train_lora.py`): safe out of the box on base and arbitrary LoRA weights (`8.78 docs/s` Concurrent ANE+GPU on M4 Pro vs `7.99 docs/s` uncalibrated `w8`). |
 | **`w8` (opt-in / `"auto"` on `<=24 GB`)** | `504 MB` | Per-channel symmetric `int8` + `AWQ-MSE` | **`7,814.8 tok/s`** (`32.758 ms/chunk`, `+34.8%`, `1326/0/0` ANE/GPU/CPU) | **Domain-calibrated LoRA / QAT checkpoints** (`cos >= 0.9983`, `84/84` exact field parity, `2.723x` prefill / `1.158x` paired `ABBA` E2E speedup). |
 
 - **Certification gate ([`is_w8_bundle_calibrated`](src/fast_gemma4/ane_pipeline.py#L151-L175)):** `ane_calibration_manifest.json` must record `qat_validated=True` or `awq_mse=True` with `>= 8` real corpus/fixture documents (`corpus`, `domain_corpus`, `file`, or `fixtures`). Without real activation calibration, `Early14` quantization drift across autoregressive GPU layers (`15..34`) can trigger repeat loops; explicit `--ane-variant w8` still runs for ablation with a `UserWarning`.

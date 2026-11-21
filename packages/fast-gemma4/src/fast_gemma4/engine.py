@@ -33,6 +33,7 @@ from .mtp_drafter import (
     DEFAULT_MTP_DRAFTER_REPO,
     DEFAULT_MTP_TOP_K,
     Gemma4MtpDrafter,
+    _resolve_apple10_nax,
     resolve_mtp_drafter_dir,
     run_decode_mtp,
     should_use_mtp_drafter,
@@ -233,7 +234,7 @@ class FastGemma4Engine:
         model_dir: str | Path | None = None,
         default_mode: str = "auto",
         ane_variant: str = "fp16",
-        ane_ring_variant: str = "fp16",
+        ane_ring_variant: str = "auto",
         vocab_out: int | None = DEFAULT_KEPT_VOCAB_SIZE,
         lm_head_mode: str = "q4",
         mlp_dtype: str = "bfloat16",
@@ -245,7 +246,7 @@ class FastGemma4Engine:
         max_prefix_cache: int | None = None,
         max_b_slots: int | None = None,
         allow_ane_on_low_ram: bool = False,
-        mtp_drafter: str | Path | bool | None = None,
+        mtp_drafter: str | Path | bool | None = "auto",
         mtp_top_k: int = DEFAULT_MTP_TOP_K,
         mtp_draft_k: int | None = None,
         local_files_only: bool = True,
@@ -316,7 +317,7 @@ class FastGemma4Engine:
         self._local_files_only = bool(local_files_only)
 
         exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
-        # Default hybrid prefill ring to FP16 unless the caller opts into W8 or dynamic "auto" (calibrated W8 on <=24 GB).
+        # Default hybrid prefill ring to dynamic "auto" (calibrated W8 on <=24 GB, FP16 on >24 GB or when uncalibrated/missing).
         self._ane_ring_variant_requested = ane_ring_variant
         self._host_hw: dict[str, Any] | None = None
         self.silicon_policy: Any | None = None
@@ -499,7 +500,7 @@ class FastGemma4Engine:
         exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
         resolved, policy = _select_auto_ane_ring_variant(
             paths,
-            model_dir=self.model.model_dir,
+            model_dir=getattr(self.model, "model_dir", None),
             local_files_only=local_only,
             exit_layer=exit_layer,
             hw=getattr(self, "_host_hw", None),
@@ -514,10 +515,21 @@ class FastGemma4Engine:
     def _engine_apple10_nax(self) -> bool | None:
         pol = getattr(self, "silicon_policy", None)
         hw = getattr(self, "_host_hw", None)
-        if pol is not None and isinstance(hw, dict) and any(
+        has_chip_hw = isinstance(hw, dict) and any(
             k in hw for k in ("supports_apple10", "gpu_family", "brand", "mlx_architecture")
-        ):
+        )
+        if pol is not None and has_chip_hw:
             return bool(pol.host.apple10_nax)
+        if has_chip_hw:
+            try:
+                from fast_shared.hw_check import supports_apple10_nax
+
+                probe_dict = dict(hw)  # type: ignore[arg-type]
+                probe_dict.setdefault("system", "Darwin")
+                probe_dict.setdefault("machine", "arm64")
+                return bool(supports_apple10_nax(probe_dict))
+            except Exception:
+                pass
         return None
 
     def _has_mtp_drafter_candidate(self) -> bool:
@@ -653,12 +665,19 @@ class FastGemma4Engine:
         *,
         use_ane_ring: bool | str,
         kv_i8: bool,
+        ane_cohort_size: int = 16,
+        mode: str = "auto",
     ) -> AsyncHybridPrefillRing | None:
         want_ane, require_ane = _parse_use_ane_ring(use_ane_ring)
         if not want_ane:
             return None
-        if not require_ane and getattr(self, "_is_low_ram", False) and not getattr(self, "_allow_ane_on_low_ram", False):
-            return None
+        if not require_ane:
+            if str(mode).strip().lower() == "gpu":
+                return None
+            if _resolve_apple10_nax(self._engine_apple10_nax()):
+                return None
+            if getattr(self, "_is_low_ram", False) and not getattr(self, "_allow_ane_on_low_ram", False):
+                return None
         if not kv_i8:
             if require_ane:
                 raise ValueError("use_ane_ring=True requires kv_i8=True.")
@@ -670,8 +689,9 @@ class FastGemma4Engine:
                     f"Prefix length l_sys={l_sys} exceeds ANE Full geometry (max {ANE_P_FULL - ANE_CHUNK_S} for P_FULL={ANE_P_FULL})."
                 )
             return None
+        min_auto_batch = max(16, int(ane_cohort_size))
         max_suf = max((len(s) for s in suf_ids_list), default=0)
-        if not require_ane and (len(suf_ids_list) < 8 or max_suf < 64):
+        if not require_ane and (len(suf_ids_list) < min_auto_batch or max_suf < 64):
             return None
 
         runner = self._resolve_ane_ring_runner(require=require_ane)
@@ -789,7 +809,12 @@ class FastGemma4Engine:
                 else min(int(B_slots), int(getattr(self, "default_max_b_slots", 256)))
             )
             ring = self._maybe_get_ane_ring(
-                sys_ids, pkv, suf_ids_list, use_ane_ring=use_ane_ring, kv_i8=eff_kv_i8
+                sys_ids,
+                pkv,
+                suf_ids_list,
+                use_ane_ring=use_ane_ring,
+                kv_i8=eff_kv_i8,
+                ane_cohort_size=ane_cohort_size,
             )
             return run_decode_rolling(
                 self.model,
@@ -835,7 +860,7 @@ class FastGemma4Engine:
         whitespace_flexible: bool = False,
         max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
-        use_ane_ring: bool | str = False,
+        use_ane_ring: bool | str = "auto",
         ane_cohort_size: int = 16,
         enable_ff_jump: bool = True,
     ) -> GenerationBatchResult:
@@ -919,7 +944,13 @@ class FastGemma4Engine:
             n_docs = len(prompts)
             max_suf = max(len(s) for s in suf_all)
             ring_for_batch = self._maybe_get_ane_ring(
-                sys_ids, pkv, suf_all, use_ane_ring=use_ane_ring, kv_i8=bool(self.model.kv_i8)
+                sys_ids,
+                pkv,
+                suf_all,
+                use_ane_ring=use_ane_ring,
+                kv_i8=bool(self.model.kv_i8),
+                ane_cohort_size=ane_cohort_size,
+                mode=eff_mode,
             )
             use_ane, wave_bs = select_execution_plan(
                 eff_mode,

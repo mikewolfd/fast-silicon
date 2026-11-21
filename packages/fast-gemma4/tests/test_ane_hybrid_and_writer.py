@@ -167,16 +167,17 @@ def test_build_ane_models_linear_w8_awq_and_e4b_arch_cpu(tmp_path: Path) -> None
     import inspect
     from fast_gemma4.speculative import _parse_use_ane_ring
 
-    for sig in (
-        inspect.signature(run_decode_rolling).parameters,
-        inspect.signature(FastGemma4Engine.run_rolling).parameters,
-        inspect.signature(FastGemma4Engine.generate_batch).parameters,
+    for sig, expected_use_ane_ring in (
+        (inspect.signature(run_decode_rolling).parameters, False),
+        (inspect.signature(FastGemma4Engine.run_rolling).parameters, False),
+        (inspect.signature(FastGemma4Engine.generate_batch).parameters, "auto"),
     ):
-        assert sig["use_ane_ring"].default is False
+        assert sig["use_ane_ring"].default == expected_use_ane_ring
         assert sig["ane_cohort_size"].default == 16
         assert sig["enable_ff_jump"].default is True
     assert _parse_use_ane_ring(False) == (False, False)
     assert _parse_use_ane_ring(True) == (True, True)
+    assert _parse_use_ane_ring("require") == (True, True)
     assert _parse_use_ane_ring("auto") == (True, False)
     with pytest.raises(ValueError):
         _parse_use_ane_ring("bogus")

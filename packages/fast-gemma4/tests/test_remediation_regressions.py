@@ -362,10 +362,10 @@ def test_p0_ane_nan_inf_detection_and_gpu_fallback_cpu() -> None:
 
 
 def test_p1_awq_calibration_corpus_and_manifest_gate_cpu(tmp_path: Path) -> None:
-    """Verify real corpus loading, manifest certification gate, and FP16 default for `ane_ring_variant`."""
+    """Verify real corpus loading, manifest certification gate, and dynamic 'auto' default for `ane_ring_variant`."""
     build_ane = _load_script("build_ane_models")
 
-    assert inspect.signature(FastGemma4Engine.__init__).parameters["ane_ring_variant"].default == "fp16"
+    assert inspect.signature(FastGemma4Engine.__init__).parameters["ane_ring_variant"].default == "auto"
 
     # JSONL corpus loading
     jl = tmp_path / "domain.jsonl"

@@ -218,7 +218,7 @@ def test_kev08b_prefix_tree_parity_and_budget_invariants() -> None:
 
     tree = PrefixTree(chunk_tokens=256, byte_budget=128 << 20)
     with acquire_hw_lock("test_kev08b_prefix_tree_parity"):
-        kev_ref = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=1)
+        kev_ref = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=1, prefix_cache_mb=None)
         try:
             ref_a_all = kev_ref.score_multi_states([(doc_a, [q_tls, q_inv])], batch_docs=1)[0]
             ref_b_all = kev_ref.score_multi_states([(doc_b, [q_tls, q_inv])], batch_docs=1)[0]
@@ -275,3 +275,47 @@ def test_kev08b_prefix_tree_parity_and_budget_invariants() -> None:
 
     assert tree.shed() > 0
     assert tree.bytes_held == 0
+
+
+def test_kev08b_default_auto_hit_share_routing() -> None:
+    """Verify default `prefix_cache_mb='auto'` batches cold distinct docs and accelerates shared/repeated prefixes."""
+    kev_dir = resolve_kev_dir()
+    if not (kev_dir / "model_w8.safetensors").exists() and not (kev_dir / "model.safetensors").exists():
+        pytest.skip(f"Missing Kev-0.8B artifacts in {kev_dir}")
+
+    shared_preamble = " ".join(
+        f"Policy Section {i}: All edge load balancer TLS certificates rotate every 30 days with SRE alerts."
+        for i in range(22)
+    )
+    distinct_a = " ".join(f"Alpha cluster log {i}: Disk shard {i} latency healthy." for i in range(28)) + " " + _SAMPLE_CASES[0][0]
+    distinct_b = " ".join(f"Beta billing line {i}: Cloud storage bucket {i} settled." for i in range(28)) + " " + _SAMPLE_CASES[1][0]
+    shared_a = shared_preamble + " " + _SAMPLE_CASES[0][0]
+    shared_b = shared_preamble + " " + _SAMPLE_CASES[1][0]
+    q_tls = _SAMPLE_CASES[0][1]
+
+    with acquire_hw_lock("test_kev08b_auto_routing"):
+        with Kev08bMlxBackend(kev_dir, quant_mode="auto", prefix_cache_mb=None) as kev_off:
+            assert kev_off.prefix_tree is None
+            ref_distinct = kev_off.score_multi_states([(distinct_a, [q_tls]), (distinct_b, [q_tls])], batch_docs=4)
+
+        with Kev08bMlxBackend(kev_dir, quant_mode="auto", prefix_cache_mb=0) as kev_zero:
+            assert kev_zero.prefix_tree is None
+
+        with Kev08bMlxBackend(kev_dir, quant_mode="auto") as kev_auto:
+            assert kev_auto.prefix_tree is not None
+            assert len(kev_auto.encode_questions(distinct_a, [q_tls])[0]) >= 256
+            assert len(kev_auto.encode_questions(distinct_b, [q_tls])[0]) >= 256
+
+            # Cold distinct B=2 stays on batched wave with 0 PrefixTree insertions and bit-exact parity vs None.
+            got_distinct = kev_auto.score_multi_states([(distinct_a, [q_tls]), (distinct_b, [q_tls])], batch_docs=4)
+            assert kev_auto.prefix_tree.node_count == 0
+            assert kev_auto.prefix_tree.misses == 0 and kev_auto.prefix_tree.hits == 0
+            assert got_distinct == ref_distinct
+
+            # Shared-prefix B=2 populates on first doc and immediately hits on sibling; warm repeat is bit-exact.
+            got_shared_1 = kev_auto.score_multi_states([(shared_a, [q_tls]), (shared_b, [q_tls])], batch_docs=4)
+            assert kev_auto.prefix_tree.misses == 1 and kev_auto.prefix_tree.hits == 1
+            assert kev_auto.prefix_tree.reused_tokens >= 256
+            got_shared_2 = kev_auto.score_multi_states([(shared_a, [q_tls]), (shared_b, [q_tls])], batch_docs=4)
+            assert kev_auto.prefix_tree.hits == 3
+            assert got_shared_1 == got_shared_2

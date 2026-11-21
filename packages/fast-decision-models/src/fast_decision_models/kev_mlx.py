@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from functools import partial
 import json
 import math
@@ -628,7 +629,35 @@ def _build_qwen35_backbone(
 
 
 class Kev08bMlxBackend:
-    """Metal MLX `Kev-0.8B r15` runner with `W8` quantization + left-padded `B=8` cross-state batching."""
+    """Metal MLX `Kev-0.8B r15` runner with `W8` quantization, left-padded `B=8` batching, and hit-aware `PrefixTree`."""
+
+    @staticmethod
+    def _resolve_prefix_tree(
+        *,
+        prefix_tree: PrefixTree | None,
+        prefix_cache_mb: int | Literal["auto"] | None,
+        prefix_chunk_tokens: int,
+        host_mem_bytes: int,
+    ) -> tuple[PrefixTree | None, bool]:
+        if prefix_tree is not None:
+            return prefix_tree, False
+        if prefix_cache_mb == "auto":
+            return (
+                PrefixTree(
+                    chunk_tokens=int(prefix_chunk_tokens),
+                    byte_budget=recommended_prefix_budget_bytes(host_mem_bytes),
+                ),
+                True,
+            )
+        if prefix_cache_mb is not None and not isinstance(prefix_cache_mb, bool) and int(prefix_cache_mb) > 0:
+            return (
+                PrefixTree(
+                    chunk_tokens=int(prefix_chunk_tokens),
+                    byte_budget=int(prefix_cache_mb) << 20,
+                ),
+                True,
+            )
+        return None, False
 
     def __init__(
         self,
@@ -640,7 +669,7 @@ class Kev08bMlxBackend:
         max_branch: int = 2048,
         max_branch_batch: int | None = None,
         prefix_tree: PrefixTree | None = None,
-        prefix_cache_mb: int | Literal["auto"] | None = None,
+        prefix_cache_mb: int | Literal["auto"] | None = "auto",
         prefix_chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         prefix_snapshot_stride: int = 1,
     ) -> None:
@@ -706,23 +735,13 @@ class Kev08bMlxBackend:
         default_max_br = 16 if (0 < host_mem_bytes <= (24 << 30)) else 32
         self.max_branch_batch = max(1, int(max_branch_batch or default_max_br))
         self.prefix_snapshot_stride = max(1, int(prefix_snapshot_stride))
-        self._owns_prefix_tree = False
-        if prefix_tree is not None:
-            self.prefix_tree: PrefixTree | None = prefix_tree
-        elif prefix_cache_mb == "auto":
-            self.prefix_tree = PrefixTree(
-                chunk_tokens=int(prefix_chunk_tokens),
-                byte_budget=recommended_prefix_budget_bytes(host_mem_bytes),
-            )
-            self._owns_prefix_tree = True
-        elif prefix_cache_mb is not None:
-            self.prefix_tree = PrefixTree(
-                chunk_tokens=int(prefix_chunk_tokens),
-                byte_budget=max(0, int(prefix_cache_mb)) << 20,
-            )
-            self._owns_prefix_tree = True
-        else:
-            self.prefix_tree = None
+        self.prefix_tree: PrefixTree | None
+        self.prefix_tree, self._owns_prefix_tree = self._resolve_prefix_tree(
+            prefix_tree=prefix_tree,
+            prefix_cache_mb=prefix_cache_mb,
+            prefix_chunk_tokens=prefix_chunk_tokens,
+            host_mem_bytes=host_mem_bytes,
+        )
 
         try:
             weights = mx.load(str(sf_p))
@@ -1008,14 +1027,29 @@ class Kev08bMlxBackend:
 
         if self.prefix_tree is not None and self.prefix_tree.byte_budget > 0:
             chunk_sz = self.prefix_tree.chunk_tokens
-            short_order: list[int] = []
+            n_nonempty_items = sum(1 for i in order if encoded_all[i][1])
+            prefix_counts = Counter(
+                tuple(encoded_all[i][0][:chunk_sz])
+                for i in order
+                if encoded_all[i][1] and len(encoded_all[i][0]) >= chunk_sz
+            )
+            leftover_order: list[int] = []
             for orig_i in order:
                 state_ids, rows = encoded_all[orig_i]
                 if not rows:
                     out_by_orig[orig_i] = []
                     continue
                 if len(state_ids) < chunk_sz:
-                    short_order.append(orig_i)
+                    leftover_order.append(orig_i)
+                    continue
+                first_chunk = tuple(state_ids[:chunk_sz])
+                use_prefix_tree = (
+                    n_nonempty_items == 1
+                    or prefix_counts[first_chunk] >= 2
+                    or self.prefix_tree.match(state_ids, needs_snapshot=True).reused_tokens >= chunk_sz
+                )
+                if not use_prefix_tree:
+                    leftover_order.append(orig_i)
                     continue
                 cache = self._prefill_state_with_prefix_tree(
                     state_ids,
@@ -1026,7 +1060,7 @@ class Kev08bMlxBackend:
                 )
                 del cache
                 self._maybe_clear_wave_cache()
-            order = short_order
+            order = leftover_order
 
         for wave_start in range(0, len(order), eff_b):
             wave_orig = order[wave_start : wave_start + eff_b]

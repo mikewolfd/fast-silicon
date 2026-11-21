@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pytest
 
 import fast_decision_models.prefix_tree as pt_mod
+from fast_decision_models.kev_mlx import Kev08bMlxBackend
 from fast_decision_models.prefix_tree import (
+    DEFAULT_CHUNK_TOKENS,
     ROOT_KEY,
     PrefixTree,
     chain_key,
@@ -205,3 +209,352 @@ def test_prefix_tree_helpers_and_payload_nbytes_cpu() -> None:
     with pytest.raises(ValueError, match="byte_size mismatch"):
         tree.insert(parent=None, tokens=[1, 2, 3, 4], depth=1, chunk=b"1234", byte_size=8)
     assert "0 node(s)" in tree.summary()
+
+
+class _NumpyMx:
+    """Minimal NumPy-backed stand-in for `mlx.core` used to exercise `_run_batched_pointer` on pure CPU."""
+
+    int32 = np.int32
+    float32 = np.float32
+    bfloat16 = np.float32
+
+    @staticmethod
+    def array(x: Any, dtype: Any = None) -> np.ndarray:
+        return np.array(x, dtype=dtype)
+
+    @staticmethod
+    def arange(n: int, dtype: Any = None) -> np.ndarray:
+        return np.arange(n, dtype=dtype)
+
+    @staticmethod
+    def zeros(shape: tuple[int, ...], dtype: Any = None) -> np.ndarray:
+        return np.zeros(shape, dtype=dtype)
+
+    @staticmethod
+    def where(cond: Any, a: Any, b: Any) -> np.ndarray:
+        return np.where(cond, a, b)
+
+    @staticmethod
+    def maximum(a: Any, b: Any) -> np.ndarray:
+        return np.maximum(a, b)
+
+    @staticmethod
+    def contiguous(arr: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(arr).copy()
+
+    @staticmethod
+    def concatenate(seq: Sequence[np.ndarray], axis: int = 0) -> np.ndarray:
+        return np.concatenate(list(seq), axis=axis)
+
+    @staticmethod
+    def eval(*_args: Any) -> None:
+        return None
+
+    @staticmethod
+    def clear_cache() -> None:
+        return None
+
+    @staticmethod
+    def get_cache_memory() -> int:
+        return 0
+
+
+class _FakeDeltaCache:
+    def __init__(self) -> None:
+        self.conv_state: np.ndarray | None = None
+        self.rec_state: np.ndarray | None = None
+
+
+class _FakeFullCache:
+    def __init__(self) -> None:
+        self.keys: np.ndarray | None = None
+        self.values: np.ndarray | None = None
+        self.offset: int = 0
+
+
+class _FakeBackbone:
+    """Deterministic CPU-only hybrid backbone recording prefill waves and validating KV+GDN state."""
+
+    def __init__(self) -> None:
+        self.prefill_waves: list[tuple[int, int]] = []
+
+    def make_cache(self) -> list[Any]:
+        return [_FakeDeltaCache(), _FakeFullCache()]
+
+    def __call__(
+        self,
+        input_ids: np.ndarray,
+        cache: list[Any],
+        *,
+        valid_token_scale: np.ndarray | None = None,
+        attn_mask: Any = "causal",
+        pos_2d: np.ndarray | None = None,
+        owner_idx: np.ndarray | None = None,
+        owner_is_identity: bool = False,
+        write_state: bool = True,
+    ) -> np.ndarray:
+        del attn_mask, pos_2d, owner_is_identity
+        bsz, seq_len = input_ids.shape
+        tok_f = input_ids.astype(np.float32)
+        if write_state:
+            self.prefill_waves.append((int(bsz), int(seq_len)))
+            mask = np.ones((bsz, seq_len), dtype=np.float32) if valid_token_scale is None else valid_token_scale[:, :, 0]
+            eff_tok = tok_f * mask
+            step_sum = eff_tok.sum(axis=1, keepdims=True).reshape(bsz, 1, 1, 1) * np.float32(0.01)
+            prev_rec = (
+                cache[0].rec_state
+                if cache[0].rec_state is not None
+                else np.zeros((bsz, 1, 1, 1), dtype=np.float32)
+            )
+            cache[0].rec_state = (prev_rec + step_sum).astype(np.float32)
+            cache[0].conv_state = eff_tok[:, -1:].reshape(bsz, 1, 1).astype(np.float32) * np.float32(0.01)
+
+            k_new = eff_tok.reshape(bsz, 1, seq_len, 1).astype(np.float32)
+            v_new = (eff_tok * np.float32(0.5)).reshape(bsz, 1, seq_len, 1).astype(np.float32)
+            if cache[1].keys is None:
+                cache[1].keys = k_new
+                cache[1].values = v_new
+            else:
+                cache[1].keys = np.concatenate([cache[1].keys, k_new], axis=2)
+                cache[1].values = np.concatenate([cache[1].values, v_new], axis=2)
+            cache[1].offset += int(seq_len)
+            return np.zeros((bsz, seq_len, 4), dtype=np.float32)
+
+        owners = np.arange(bsz, dtype=np.int32) if owner_idx is None else owner_idx
+        out = np.zeros((bsz, seq_len, 4), dtype=np.float32)
+        for ri in range(bsz):
+            ob = int(owners[ri])
+            rec_val = float(cache[0].rec_state[ob, 0, 0, 0])
+            kv_val = float(cache[1].keys[ob, 0, :, 0].sum()) * 0.001
+            base = rec_val + kv_val
+            out[ri, :, 0] = base + tok_f[ri] * 0.1
+            out[ri, :, 1] = base - tok_f[ri] * 0.05
+            out[ri, :, 2] = tok_f[ri] * 0.02
+            out[ri, :, 3] = 1.0
+        return out
+
+
+def _make_fake_kev(
+    *,
+    prefix_tree: PrefixTree | None,
+    batch_docs: int = 8,
+    prefix_snapshot_stride: int = 1,
+) -> tuple[Kev08bMlxBackend, _FakeBackbone, list[list[int]]]:
+    kev = Kev08bMlxBackend.__new__(Kev08bMlxBackend)
+    backbone = _FakeBackbone()
+    kev._mx = _NumpyMx()
+    kev._np = np
+    kev.backbone = backbone
+    kev.batch_docs = batch_docs
+    kev.max_branch_batch = 16
+    kev.pad_id = 0
+    kev.native_temperature = 1.0
+    kev.q_w = np.eye(4, dtype=np.float32)
+    kev.q_b = np.zeros((4,), dtype=np.float32)
+    kev.k_w = np.array(
+        [
+            [0.5, -0.2, 0.1, 0.0],
+            [-0.1, 0.6, 0.2, 0.1],
+            [0.2, 0.1, 0.7, -0.1],
+            [0.0, 0.1, -0.1, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    kev.k_b = np.zeros((4,), dtype=np.float32)
+    kev.ptr_scale = 0.5
+    kev._linear_layer_indices = [0]
+    kev._full_layer_indices = [1]
+    kev.prefix_tree = prefix_tree
+    kev._owns_prefix_tree = False
+    kev.prefix_snapshot_stride = prefix_snapshot_stride
+
+    def _encode(state: Any, questions: Sequence[Mapping[str, Any]]) -> tuple[list[int], list[dict[str, Any]]]:
+        state_ids = [int(t) for t in state]
+        rows = []
+        for q in questions:
+            qid = int(q["id"])
+            br = [100 + qid, 200 + qid, 300 + qid, 400 + qid]
+            rows.append({"ids": br, "decide": 3, "opts": [1, 2], "k": 2})
+        return state_ids, rows
+
+    kev.encode_questions = _encode  # type: ignore[method-assign]
+
+    prefix_calls: list[list[int]] = []
+    orig_prefill = kev._prefill_state_with_prefix_tree
+
+    def _tracked_prefill(state_ids: Sequence[int], *, eval_restored_concat: bool = False) -> list[Any]:
+        prefix_calls.append(list(state_ids))
+        return orig_prefill(state_ids, eval_restored_concat=eval_restored_concat)
+
+    kev._prefill_state_with_prefix_tree = _tracked_prefill  # type: ignore[method-assign]
+    return kev, backbone, prefix_calls
+
+
+def test_kev_prefix_cache_default_and_opt_out_cpu() -> None:
+    """`Kev08bMlxBackend` defaults to `prefix_cache_mb='auto'` while preserving `None`/`0` opt-out and custom trees."""
+    sig = inspect.signature(Kev08bMlxBackend.__init__)
+    assert sig.parameters["prefix_cache_mb"].default == "auto"
+
+    t_24, owns_24 = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb="auto",
+        prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+        host_mem_bytes=24 << 30,
+    )
+    assert t_24 is not None and owns_24 is True
+    assert t_24.chunk_tokens == 256 and t_24.byte_budget == (128 << 20)
+
+    t_48, owns_48 = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb="auto",
+        prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+        host_mem_bytes=48 << 30,
+    )
+    assert t_48 is not None and owns_48 is True
+    assert t_48.byte_budget == (512 << 20)
+
+    for disabled_val in (None, 0, -1, False):
+        t_off, owns_off = Kev08bMlxBackend._resolve_prefix_tree(
+            prefix_tree=None,
+            prefix_cache_mb=disabled_val,  # type: ignore[arg-type]
+            prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+            host_mem_bytes=48 << 30,
+        )
+        assert t_off is None and owns_off is False
+
+    t_custom_mb, owns_custom_mb = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb=64,
+        prefix_chunk_tokens=128,
+        host_mem_bytes=48 << 30,
+    )
+    assert t_custom_mb is not None and owns_custom_mb is True
+    assert t_custom_mb.chunk_tokens == 128 and t_custom_mb.byte_budget == (64 << 20)
+
+    injected = PrefixTree(chunk_tokens=16, byte_budget=4096)
+    for mb_val in ("auto", None, 0, 64):
+        t_inj, owns_inj = Kev08bMlxBackend._resolve_prefix_tree(
+            prefix_tree=injected,
+            prefix_cache_mb=mb_val,  # type: ignore[arg-type]
+            prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+            host_mem_bytes=48 << 30,
+        )
+        assert t_inj is injected and owns_inj is False
+
+
+def test_kev_hit_and_share_aware_routing_cpu() -> None:
+    """Verify hit- & share-aware routing preserves B>=2 cold batching while accelerating B=1, hits, and shared prefixes."""
+    q1 = [{"id": 1}]
+    q2 = [{"id": 2}]
+
+    # 1. Cold distinct B=4 (>= chunk_sz) stays on the batched wave (zero PrefixTree detours or misses).
+    tree_a = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_a, bb_a, pt_calls_a = _make_fake_kev(prefix_tree=tree_a, batch_docs=8)
+    kev_ref, _, _ = _make_fake_kev(prefix_tree=None, batch_docs=8)
+    distinct_items = [
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], q1),
+        ([11, 12, 13, 14, 15, 16, 17, 18, 19, 20], q1),
+        ([21, 22, 23, 24, 25, 26, 27, 28, 29, 30], q1),
+        ([31, 32, 33, 34, 35, 36, 37, 38, 39, 40], q1),
+    ]
+    out_distinct = kev_a.score_multi_states(distinct_items)
+    ref_distinct = kev_ref.score_multi_states(distinct_items)
+    assert pt_calls_a == []
+    assert bb_a.prefill_waves == [(4, 10)]
+    assert tree_a.node_count == 0 and tree_a.hits == 0 and tree_a.misses == 0
+    for got_doc, ref_doc in zip(out_distinct, ref_distinct):
+        np.testing.assert_allclose(got_doc[0][0], ref_doc[0][0], atol=1e-6)
+        np.testing.assert_allclose(got_doc[0][1], ref_doc[0][1], atol=1e-6)
+
+    # 2. Intra-batch shared prefix B=4 (cold tree) routes all 4 through PrefixTree: 1 miss populates, 3 siblings hit!
+    tree_b = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_b, bb_b, pt_calls_b = _make_fake_kev(prefix_tree=tree_b, batch_docs=8)
+    shared = [50, 51, 52, 53, 54, 55, 56, 57]
+    shared_items = [
+        (shared + [1, 2], q1),
+        (shared + [3, 4], q1),
+        (shared + [5, 6], q1),
+        (shared + [7, 8], q1),
+    ]
+    out_shared = kev_b.score_multi_states(shared_items)
+    ref_shared = kev_ref.score_multi_states(shared_items)
+    assert len(pt_calls_b) == 4
+    assert tree_b.misses == 1 and tree_b.hits == 3 and tree_b.reused_tokens == 24
+    assert all(b == 1 for b, _ in bb_b.prefill_waves)
+    for got_doc, ref_doc in zip(out_shared, ref_shared):
+        np.testing.assert_allclose(got_doc[0][0], ref_doc[0][0], atol=1e-6)
+        np.testing.assert_allclose(got_doc[0][1], ref_doc[0][1], atol=1e-6)
+
+    # 3. B=1 populates PrefixTree; subsequent B=3 mixed batch hits warm doc while batching the 2 cold docs together!
+    tree_c = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_c, bb_c, pt_calls_c = _make_fake_kev(prefix_tree=tree_c, batch_docs=8)
+    warm_doc = [70, 71, 72, 73, 74, 75, 76, 77, 78, 79]
+    cold_1 = [80, 81, 82, 83, 84, 85, 86, 87, 88, 89]
+    cold_2 = [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+
+    _ = kev_c.score_multi_states([(warm_doc, q1)])
+    assert len(pt_calls_c) == 1
+    assert tree_c.misses == 1 and tree_c.hits == 0 and tree_c.node_count == 2
+
+    pt_calls_c.clear()
+    bb_c.prefill_waves.clear()
+    mixed_3 = [(cold_1, q1), (warm_doc, q2), (cold_2, q1)]
+    out_m3 = kev_c.score_multi_states(mixed_3)
+    ref_m3 = kev_ref.score_multi_states(mixed_3)
+    assert pt_calls_c == [warm_doc]
+    assert tree_c.hits == 1 and tree_c.misses == 1 and tree_c.reused_tokens == 8
+    assert (2, 10) in bb_c.prefill_waves
+    for got_doc, ref_doc in zip(out_m3, ref_m3):
+        np.testing.assert_allclose(got_doc[0][0], ref_doc[0][0], atol=1e-6)
+
+    # 4. Single non-empty item alongside an empty-question item counts as n_nonempty_items == 1 and populates tree.
+    tree_d = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_d, _, pt_calls_d = _make_fake_kev(prefix_tree=tree_d, batch_docs=8)
+    out_single_plus_empty = kev_d.score_multi_states([(warm_doc, q1), (cold_1, [])])
+    assert pt_calls_d == [warm_doc]
+    assert out_single_plus_empty[1] == []
+    assert tree_d.misses == 1 and tree_d.node_count == 2
+
+    # 5. Short items (< chunk_sz) stay out of PrefixTree even in B=1 or shared-prefix B=2 calls.
+    tree_e = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_e, bb_e, pt_calls_e = _make_fake_kev(prefix_tree=tree_e, batch_docs=8)
+    _ = kev_e.score_multi_states([([1, 2, 3], q1)])
+    _ = kev_e.score_multi_states([([1, 2, 3], q1), ([1, 2, 3], q2)])
+    assert pt_calls_e == []
+    assert tree_e.node_count == 0 and tree_e.hits == 0 and tree_e.misses == 0
+    assert (2, 3) in bb_e.prefill_waves
+
+    # 6. Full mixed batch: shared pair + 2 distinct cold long docs + short doc + empty doc.
+    tree_f = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_f, bb_f, pt_calls_f = _make_fake_kev(prefix_tree=tree_f, batch_docs=8)
+    mixed_all = [
+        (cold_1, q1),
+        (shared + [10, 11], q1),
+        ([5, 6, 7], q2),
+        (cold_2, []),
+        (shared + [12, 13], q2),
+        ([41, 42, 43, 44, 45, 46, 47, 48, 49, 50], q1),
+    ]
+    out_mixed = kev_f.score_multi_states(mixed_all)
+    ref_mixed = kev_ref.score_multi_states(mixed_all)
+    assert len(pt_calls_f) == 2
+    assert tree_f.misses == 1 and tree_f.hits == 1 and tree_f.reused_tokens == 8
+    assert (3, 10) in bb_f.prefill_waves  # cold_1 + short_doc + [41..50] batched together!
+    assert out_mixed[3] == []
+    for idx in (0, 1, 2, 4, 5):
+        np.testing.assert_allclose(out_mixed[idx][0][0], ref_mixed[idx][0][0], atol=1e-6)
+        np.testing.assert_allclose(out_mixed[idx][0][1], ref_mixed[idx][0][1], atol=1e-6)
+
+    # 7. Snapshot-stride > 1: matched KV chunk WITHOUT snapshot (`reused_tokens == 0`) must NOT divert B=2 distinct docs!
+    tree_g = PrefixTree(chunk_tokens=4, byte_budget=1 << 20)
+    kev_g, bb_g, pt_calls_g = _make_fake_kev(prefix_tree=tree_g, batch_docs=8, prefix_snapshot_stride=2)
+    # B=1 of 8-token doc with stride=2 places snapshot only at depth 2 (token 8), NOT at depth 1 (token 4).
+    _ = kev_g.score_multi_states([(shared, q1)])
+    assert tree_g.snapshot_count == 1
+    pt_calls_g.clear()
+    bb_g.prefill_waves.clear()
+    # Now pass B=2 where first doc shares only 4 tokens (no snapshot -> reused_tokens == 0) + second doc is distinct.
+    partial_no_snap = shared[:4] + [99, 98, 97, 96]
+    _ = kev_g.score_multi_states([(partial_no_snap, q1), (cold_1[:8], q1)])
+    assert pt_calls_g == []
+    assert bb_g.prefill_waves == [(2, 8)]
