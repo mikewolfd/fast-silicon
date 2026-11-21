@@ -1,0 +1,292 @@
+{
+  "dataset": "LegalBench-RAG Tier 1, CUAD and ContractNLI",
+  "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+  "host": "Apple M4 Pro, 48 GB, macOS 26.6, MLX 0.32.4",
+  "export_revisions": {
+    "OpenInfinity/embeddinggemma-2-coreml-int8": "4a99ef141d6866562f64fcd1db08657bb8e9b6ba",
+    "FluidInference/embeddinggemma-2-coreml": "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4"
+  },
+  "documents": 20,
+  "coarse_passages": 144,
+  "queries": 175,
+  "source_passage_ids_and_boundaries_sha256": "54925d649dc8bc722f253941de5c88160d165f5928f8257b2fd0a75a13d7f0ca",
+  "query_ids_sha256": "3b27d3d5f61494a05564055bd9c6adc5df6635110d8e2e0f1dcb75445213454c",
+  "identical_512_query_token_ids_sha256": "8c2d9eb9c42488ae53349c46c5826761e3dd8f1f051b77b8965a0924498e455c",
+  "identical_512_passage_token_ids_sha256": "6324c699edfb8cc01ddb78cad11e7560dabac6bd2df160eccb8923a0f97e05be",
+  "visibility": {
+    "512": {
+      "truncated_passages": 136,
+      "model_input_tokens": 71961,
+      "gold_chars_visible": 35425,
+      "gold_chars_total": 88839,
+      "queries_all_gold_visible": 54,
+      "queries_some_gold_visible": 40,
+      "queries_no_gold_visible": 81,
+      "max_mean_gold_char_recall": 0.3976832212294459
+    },
+    "2048": {
+      "truncated_passages": 1,
+      "model_input_tokens": 175585,
+      "gold_chars_visible": 88839,
+      "gold_chars_total": 88839,
+      "queries_all_gold_visible": 175,
+      "queries_some_gold_visible": 0,
+      "queries_no_gold_visible": 0,
+      "max_mean_gold_char_recall": 1.0
+    }
+  },
+  "scoring": "All 175 queries ranked all 144 original passage IDs. For each set of rankings, the whole-returned scorer credits gold overlap anywhere in the original 6,144-character passage. The visible scorer credits only the original characters covered by retained tokens, and computes ideal nDCG on those same spans. Character recall keeps the full original gold denominator. The visible scorer assigns zero to the 81 queries with no visible gold and includes them in each mean.",
+  "timing": "One run per arm from prepared token IDs to normalized 768-dimensional embeddings. Public adapters include IPC and use their default short-sequence packing. Model initialization and warmup are separate. Project query vectors were reused at 2,048. Ranking time is excluded.",
+  "paired_visible_span_ndcg_at_10_vs_project_512": {
+    "fp16_512": {
+      "n_paired": 175,
+      "delta_mean": -0.003517930204117341,
+      "se_paired": 0.0023247209617272458,
+      "ci95_low": -0.008074383289102743,
+      "ci95_high": 0.0010385228808680608
+    },
+    "int8_512": {
+      "n_paired": 175,
+      "delta_mean": 0.00026542621801096136,
+      "se_paired": 0.0007001783270308069,
+      "ci95_low": -0.0011069233029694203,
+      "ci95_high": 0.001637775738991343
+    }
+  },
+  "paired_project_2048_minus_project_512": {
+    "whole_returned_span_ndcg@5": {
+      "n_paired": 175,
+      "delta_mean": 0.04127042543770809,
+      "se_paired": 0.015456980959768546,
+      "ci95_low": 0.010974742756561743,
+      "ci95_high": 0.07156610811885444
+    },
+    "visible_span_ndcg@5": {
+      "n_paired": 175,
+      "delta_mean": 0.22582807022238952,
+      "se_paired": 0.02946899093960113,
+      "ci95_low": 0.16806884798077132,
+      "ci95_high": 0.2835872924640077
+    },
+    "whole_returned_char_recall@5": {
+      "n_paired": 175,
+      "delta_mean": 0.08088353462473538,
+      "se_paired": 0.02966640440072699,
+      "ci95_low": 0.022737381999310483,
+      "ci95_high": 0.1390296872501603
+    },
+    "visible_char_recall@5": {
+      "n_paired": 175,
+      "delta_mean": 0.43371499302275773,
+      "se_paired": 0.03923500500127475,
+      "ci95_low": 0.3568143832202592,
+      "ci95_high": 0.5106156028252562
+    },
+    "whole_returned_span_ndcg@10": {
+      "n_paired": 175,
+      "delta_mean": 0.05143760702621501,
+      "se_paired": 0.013316355470288652,
+      "ci95_low": 0.025337550304449254,
+      "ci95_high": 0.07753766374798077
+    },
+    "visible_span_ndcg@10": {
+      "n_paired": 175,
+      "delta_mean": 0.2673202024781025,
+      "se_paired": 0.027346757275854602,
+      "ci95_low": 0.2137205582174275,
+      "ci95_high": 0.32091984673877755
+    },
+    "whole_returned_char_recall@10": {
+      "n_paired": 175,
+      "delta_mean": 0.10937420095013466,
+      "se_paired": 0.027309206432968067,
+      "ci95_low": 0.05584815634151725,
+      "ci95_high": 0.16290024555875207
+    },
+    "visible_char_recall@10": {
+      "n_paired": 175,
+      "delta_mean": 0.5667709037896821,
+      "se_paired": 0.03468275923427646,
+      "ci95_low": 0.4987926956905002,
+      "ci95_high": 0.634749111888864
+    }
+  },
+  "arm_scores": {
+    "project_512": {
+      "query_seconds": 0.4597119580139406,
+      "passage_seconds": 1.9261660000192933,
+      "load_and_warm_seconds": 112.84485774999484,
+      "whole_returned": {
+        "span_ndcg@5": 0.477244,
+        "char_recall@5": 0.675787,
+        "span_ndcg@10": 0.517238,
+        "char_recall@10": 0.79317
+      },
+      "visible_512": {
+        "span_ndcg@5": 0.292687,
+        "char_recall@5": 0.322956,
+        "span_ndcg@10": 0.301356,
+        "char_recall@10": 0.335773
+      },
+      "queries_with_top10_full_passage_credit_and_zero_visible_top10_overlap": 64
+    },
+    "fp16_512": {
+      "query_seconds": 0.42968658305471763,
+      "passage_seconds": 4.5576841669972055,
+      "load_and_warm_seconds": 94.65427720895968,
+      "whole_returned": {
+        "span_ndcg@5": 0.475571,
+        "char_recall@5": 0.675787,
+        "span_ndcg@10": 0.515695,
+        "char_recall@10": 0.79317
+      },
+      "visible_512": {
+        "span_ndcg@5": 0.289169,
+        "char_recall@5": 0.322956,
+        "span_ndcg@10": 0.297838,
+        "char_recall@10": 0.335773
+      },
+      "queries_with_top10_full_passage_credit_and_zero_visible_top10_overlap": 64
+    },
+    "int8_512": {
+      "query_seconds": 0.4241003750357777,
+      "passage_seconds": 4.41820729203755,
+      "load_and_warm_seconds": 95.34252925001783,
+      "whole_returned": {
+        "span_ndcg@5": 0.477967,
+        "char_recall@5": 0.675787,
+        "span_ndcg@10": 0.517897,
+        "char_recall@10": 0.79317
+      },
+      "visible_512": {
+        "span_ndcg@5": 0.293083,
+        "char_recall@5": 0.322956,
+        "span_ndcg@10": 0.301621,
+        "char_recall@10": 0.335773
+      },
+      "queries_with_top10_full_passage_credit_and_zero_visible_top10_overlap": 64
+    },
+    "project_2048": {
+      "query_seconds": 0.4597119580139406,
+      "passage_seconds": 14.119857000012416,
+      "load_and_warm_seconds": 112.84485774999484,
+      "whole_returned": {
+        "span_ndcg@5": 0.518515,
+        "char_recall@5": 0.756671,
+        "span_ndcg@10": 0.568676,
+        "char_recall@10": 0.902544
+      },
+      "visible_2048": {
+        "span_ndcg@5": 0.518515,
+        "char_recall@5": 0.756671,
+        "span_ndcg@10": 0.568676,
+        "char_recall@10": 0.902544
+      }
+    }
+  },
+  "host_native_execution": {
+    "execution_512": {
+      "gpu_toks": 32768,
+      "ane_toks": 39193,
+      "cpu_toks": 0,
+      "gpu_docs": 64,
+      "ane_docs": 80,
+      "cpu_docs": 0
+    },
+    "execution_2048": {
+      "gpu_toks": 173256,
+      "ane_toks": 2329,
+      "cpu_toks": 0,
+      "gpu_docs": 136,
+      "ane_docs": 8,
+      "cpu_docs": 0
+    }
+  },
+  "source": {
+    "archive_directory": ".cache/archive-release/investigations/embeddinggemma-legal-512-20261121/",
+    "sha256": {
+      "compare.py": "2c8ffdcaa9b3e32b8f517b9f2cb49de223eb694f645268b7e1ef4468e42e091b",
+      "frozen.json": "aa9c24053134b76aa21d55bcf9d72271348b94f2296e480065bfedfee0b6eb6b",
+      "ranks-and-spans.json": "7ff5da3e81ea2d289e2f360cd9fbcf9d2b17326bea44453fb2ad1c20145e6a62",
+      "project-timing.json": "c706027eb64165587ee8d71b068d6d7a510ee1f31a94274e92147d75b3211280",
+      "fp16-timing.json": "75b47f1a5980181eef41511803396a99254ddfafbd3bb652f86225c25533f7a3",
+      "int8-timing.json": "a76824cb36e5999a31f8cf9577716a3cc18f332226172f952753ade9f4727f51"
+    },
+    "raw_vectors": "{project,fp16,int8}-queries.npy and {arm}-{cap}-passages.npy",
+    "scorer": "packages/fast-shared/src/fast_shared/outcome_eval/retrieval.py::evaluate_legalbench_spans",
+    "tokenizer_json_sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+  },
+  "example": {
+    "query_id": "contractnli:22",
+    "document": "contractnli/Data Use Agreement New York City.txt",
+    "passage_index_within_document": 0,
+    "whole_returned_interval": [
+      0,
+      6141
+    ],
+    "visible_512_interval": [
+      0,
+      2246
+    ],
+    "gold_interval": [
+      3180,
+      3769
+    ],
+    "ranks_and_credit": {
+      "project_512": {
+        "top10_rank": 1,
+        "whole_char_recall_at_10": 1.0,
+        "visible_char_recall_at_10": 0.0
+      },
+      "fp16_512": {
+        "top10_rank": 1,
+        "whole_char_recall_at_10": 1.0,
+        "visible_char_recall_at_10": 0.0
+      },
+      "int8_512": {
+        "top10_rank": 1,
+        "whole_char_recall_at_10": 1.0,
+        "visible_char_recall_at_10": 0.0
+      },
+      "project_2048": {
+        "top10_rank": 1,
+        "whole_char_recall_at_10": 1.0,
+        "visible_char_recall_at_10": 1.0
+      }
+    }
+  },
+  "previous_whole_passage_scores_at_10": {
+    "project_2048": {
+      "source": "artifacts/benchmarks/coreml-20261120/reference/m4_native_tier1.json",
+      "span_ndcg@10": 0.568676,
+      "char_recall@10": 0.902544,
+      "matched_to_6_decimals": true
+    },
+    "fp16_512": {
+      "source": "artifacts/benchmarks/coreml-20261120/m4_outcome_coreml-embeddinggemma-2-fp16.json",
+      "span_ndcg@10": 0.515695,
+      "char_recall@10": 0.79317,
+      "matched_to_6_decimals": true
+    },
+    "int8_512": {
+      "source": "artifacts/benchmarks/coreml-20261120/m4_outcome_coreml-embeddinggemma-2-int8.json",
+      "span_ndcg@10": 0.517897,
+      "char_recall@10": 0.79317,
+      "matched_to_6_decimals": true
+    }
+  },
+  "runtime_note": "Core ML reported a compute-plan inspection error on the native 32-token bucket during startup. Scheduler counts describe the selected execution paths; physical device placement was not traced.",
+  "measurement": {
+    "watchdog_file": "m4-watchdog.json",
+    "inference_subprocesses_completed": 3,
+    "project_passage_limits": [
+      512,
+      2048
+    ],
+    "watchdog_seconds": 331.3,
+    "peak_rss_gib": 1.844,
+    "peak_physical_gib": 2.516,
+    "watchdog_exit_code": 1,
+    "scoring": "All embeddings were saved before the original scorer asserted every query had accessible gold. The CPU replay allowed unavailable gold to score zero, retained all 175 queries and returned successfully on the saved vectors."
+  }
+}

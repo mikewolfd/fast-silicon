@@ -1,0 +1,627 @@
+{
+  "source_locations": {
+    "archive": "~/.gemini/antigravity/brain/53992a9e-105b-478f-a76e-f428be255568/scratch/",
+    "new_compiler_runs": ".cache/archive-release/investigations/fast-silicon-capabilities-20261121/",
+    "fixtures": "fast-silicon checkout",
+    "new_reporting_checks": ".cache/archive-release/investigations/fast-silicon-decisions-20261121/"
+  },
+  "draft_generation": {
+    "m5": {
+      "free_text_b1": {
+        "baseline": "plain_lq1",
+        "candidate": "mtp_k4_kvi8",
+        "baseline_decode_tok_s": 33.4945,
+        "candidate_decode_tok_s": 83.3547,
+        "baseline_output_tokens": 256,
+        "candidate_output_tokens": 256,
+        "baseline_docs_s": 0.1301,
+        "candidate_docs_s": 0.321,
+        "exact_token_match": false
+      },
+      "free_text_b4": {
+        "baseline": "plain_lq1",
+        "candidate": "mtp_k2_bf16kv",
+        "baseline_decode_tok_s": 134.9256,
+        "candidate_decode_tok_s": 212.102,
+        "baseline_output_tokens": 1024,
+        "candidate_output_tokens": 1024,
+        "baseline_docs_s": 0.5232,
+        "candidate_docs_s": 0.8191,
+        "exact_token_match": false
+      },
+      "constrained_json_b1": {
+        "baseline": "plain_lq1_no_ffj",
+        "candidate": "mtp_k4",
+        "baseline_decode_tok_s": 32.7735,
+        "candidate_decode_tok_s": 97.14,
+        "baseline_output_tokens": 153,
+        "candidate_output_tokens": 152,
+        "baseline_docs_s": 0.2116,
+        "candidate_docs_s": 0.6162,
+        "exact_token_match": false
+      },
+      "constrained_json_b4": {
+        "baseline": "plain_lq1_no_ffj",
+        "candidate": "mtp_k2",
+        "baseline_decode_tok_s": 112.0221,
+        "candidate_decode_tok_s": 221.0142,
+        "baseline_output_tokens": 518,
+        "candidate_output_tokens": 517,
+        "baseline_docs_s": 0.842,
+        "candidate_docs_s": 1.621,
+        "exact_token_match": false
+      }
+    },
+    "m4pro": {
+      "free_text_b1": {
+        "baseline": "plain_lq1",
+        "candidate": "mtp_k4_kvi8",
+        "baseline_decode_tok_s": 47.8743,
+        "candidate_decode_tok_s": 101.9514,
+        "baseline_output_tokens": 256,
+        "candidate_output_tokens": 256,
+        "baseline_docs_s": 0.1855,
+        "candidate_docs_s": 0.391,
+        "exact_token_match": false
+      },
+      "free_text_b4": {
+        "baseline": "plain_lq1",
+        "candidate": "mtp_k2_bf16kv",
+        "baseline_decode_tok_s": 186.3938,
+        "candidate_decode_tok_s": 250.8976,
+        "baseline_output_tokens": 1024,
+        "candidate_output_tokens": 1024,
+        "baseline_docs_s": 0.7207,
+        "candidate_docs_s": 0.9671,
+        "exact_token_match": false
+      },
+      "constrained_json_b1": {
+        "baseline": "plain_lq1_no_ffj",
+        "candidate": "mtp_k4",
+        "baseline_decode_tok_s": 46.7748,
+        "candidate_decode_tok_s": 121.4152,
+        "baseline_output_tokens": 152,
+        "candidate_output_tokens": 152,
+        "baseline_docs_s": 0.301,
+        "candidate_docs_s": 0.7548,
+        "exact_token_match": true
+      },
+      "constrained_json_b4": {
+        "baseline": "plain_lq1_no_ffj",
+        "candidate": "mtp_k2",
+        "baseline_decode_tok_s": 149.823,
+        "candidate_decode_tok_s": 272.6471,
+        "baseline_output_tokens": 518,
+        "candidate_output_tokens": 517,
+        "baseline_docs_s": 1.0928,
+        "candidate_docs_s": 1.9005,
+        "exact_token_match": false
+      }
+    }
+  },
+  "qwen_4b": {
+    "coreai_qwen35_4b_4bit_cat3": {
+      "n_items": 48,
+      "n_valid": 29,
+      "wall_sec": 369.2063,
+      "objective_score_e2e": 0.3125,
+      "effective_outcome_per_sec": 0.0406,
+      "gate_verdict": "FAIL",
+      "gate_reasons": [
+        "repeat_loop_count=1 > 0"
+      ],
+      "repeat_loop_count": 1,
+      "finish_length_count": 19
+    },
+    "coreai_qwen35_4b_fp4_fp8_cat3": {
+      "n_items": 48,
+      "n_valid": 28,
+      "wall_sec": 310.6981,
+      "objective_score_e2e": 0.3125,
+      "effective_outcome_per_sec": 0.0483,
+      "gate_verdict": "FAIL",
+      "gate_reasons": [
+        "repeat_loop_count=2 > 0"
+      ],
+      "repeat_loop_count": 2,
+      "finish_length_count": 20
+    },
+    "separate_25_token_probe": {
+      "4b_4bit": {
+        "n_steps": 25,
+        "finite": true,
+        "mean_nll": 4.77818,
+        "ppl": 118.8876
+      },
+      "4b_fp4_fp8": {
+        "n_steps": 25,
+        "finite": true,
+        "mean_nll": 4.53737,
+        "ppl": 93.4446
+      }
+    }
+  },
+  "gemma_e2b_training": {
+    "hardware": "Apple M4 Pro",
+    "peak_memory_unit": "GiB",
+    "timings": {
+      "stock_bf16_unpacked": {
+        "tok_s": 579.0999999999999,
+        "peak_gb": 16.09
+      },
+      "qlora_8bit_packed_2048": {
+        "tok_s": 545.8499999999999,
+        "peak_gb": 25.062
+      },
+      "qlora_8bit_shared_sys_kv": {
+        "tok_s": 1385.4499999999998,
+        "peak_gb": 25.817
+      }
+    },
+    "initial_gradients": {
+      "packed_vs_unpacked_loss_diff": 0.003923,
+      "packed_vs_unpacked_grad_cos": 0.999673,
+      "packed_min_tensor_cos": 0.999097,
+      "qlora_8bit_vs_bf16_grad_cos": 0.994881
+    },
+    "tokenizer_snapshot": "fb0b166bbb9a0eb4b37915bfc515a197c9122f39",
+    "fixture_counts_reconstructed_from_benchmark": [
+      {
+        "examples": 12,
+        "system_prompt_repeats": 1,
+        "logical_input_tokens": 11146,
+        "supervised_answer_tokens": 1683,
+        "common_prefix_tokens": 331
+      },
+      {
+        "examples": 8,
+        "system_prompt_repeats": 4,
+        "logical_input_tokens": 15003,
+        "supervised_answer_tokens": 1120,
+        "common_prefix_tokens": 1288
+      }
+    ],
+    "prepared_batches_cpu": {
+      "source": "qlora-workload-counts.json",
+      "method": "Reconstructed actual loss targets with the pinned tokenizer and packing code. Optimizer updates are scheduled counts. The replay used CPU and measured no training times.",
+      "checkpoint_revision": "fb0b166bbb9a0eb4b37915bfc515a197c9122f39",
+      "workloads": {
+        "unpacked_0": {
+          "examples": 12,
+          "logical_input_tokens": 11146,
+          "supervised_tokens": 1683,
+          "planned_optimizer_steps": 3,
+          "system_instruction_copies": 1,
+          "input_ids_and_prompt_lengths_sha256": "06bf885a7c7e4c9214816fcb833ead9c8efc3cf1a826e0a7a67371ca433cf003"
+        },
+        "packed_1280": {
+          "examples": 12,
+          "logical_input_tokens": 11146,
+          "supervised_tokens": 1683,
+          "planned_optimizer_steps": 3,
+          "system_instruction_copies": 1,
+          "input_ids_and_prompt_lengths_sha256": "06bf885a7c7e4c9214816fcb833ead9c8efc3cf1a826e0a7a67371ca433cf003"
+        },
+        "packed_2048": {
+          "examples": 12,
+          "logical_input_tokens": 11146,
+          "supervised_tokens": 1683,
+          "planned_optimizer_steps": 2,
+          "system_instruction_copies": 1,
+          "input_ids_and_prompt_lengths_sha256": "06bf885a7c7e4c9214816fcb833ead9c8efc3cf1a826e0a7a67371ca433cf003"
+        },
+        "shared_1280": {
+          "examples": 8,
+          "logical_input_tokens": 15003,
+          "supervised_tokens": 1120,
+          "planned_optimizer_steps": 1,
+          "system_instruction_copies": 4,
+          "input_ids_and_prompt_lengths_sha256": "6a088670a3cd94516e282830844e88fa7710a3703bc62fd2698c39e09576ece9"
+        },
+        "shared_2048": {
+          "examples": 8,
+          "logical_input_tokens": 15003,
+          "supervised_tokens": 1120,
+          "planned_optimizer_steps": 1,
+          "system_instruction_copies": 4,
+          "input_ids_and_prompt_lengths_sha256": "6a088670a3cd94516e282830844e88fa7710a3703bc62fd2698c39e09576ece9"
+        }
+      },
+      "current_report": "New timed passes count labels supplied to loss, examples and executed optimizer updates. They report elapsed seconds plus supervised tokens/s. The stock comparison covers the two 12-example workloads. The four-copy workload has its own identity and no matched baseline."
+    }
+  },
+  "gemma_e4b": {
+    "e4b_regular_zeroshot": {
+      "constrained_avg_output_tokens": 194.8,
+      "separate_128_document_speed_run": {
+        "strict_schema": "128/128",
+        "docs_per_sec": 0.53,
+        "total_sec": 239.72,
+        "avg_out_tok": 242.0
+      }
+    },
+    "e4b_qat_zeroshot": {
+      "constrained_avg_output_tokens": 374.4,
+      "separate_128_document_speed_run": {
+        "strict_schema": "128/128",
+        "docs_per_sec": 0.26,
+        "total_sec": 484.73,
+        "avg_out_tok": 396.2
+      }
+    }
+  },
+  "compiler": {
+    "historical": {
+      "m4pro_bge": {
+        "serial_sec": [
+          9.2425,
+          9.1176
+        ],
+        "parallel_sec": [
+          4.5187,
+          4.5979
+        ]
+      },
+      "m4pro_gemma": {
+        "serial_sec": [
+          43.5142,
+          26.3714
+        ],
+        "parallel_sec": [
+          27.7196,
+          25.9677
+        ]
+      },
+      "m5_bge_archived_log": {
+        "serial_sec": [
+          5.22,
+          5.01
+        ],
+        "parallel_sec": [
+          2.43,
+          2.48
+        ],
+        "numeric_comparison": "unmeasured",
+        "bundle_counts_per_build": 9
+      },
+      "m4pro_bge_archived_log": {
+        "serial_sec": [
+          8.25,
+          7.91
+        ],
+        "parallel_sec": [
+          4.32,
+          5.14
+        ],
+        "numeric_comparison": "unmeasured",
+        "bundle_counts_per_build": 9
+      }
+    },
+    "new_numerical_comparison": {
+      "m4": {
+        "environment": {
+          "hw_model": "Mac16,8",
+          "chip": "Apple M4 Pro",
+          "mem_gb": 48,
+          "macos_version": "26.6",
+          "mlx_version": "0.32.4",
+          "python_version": "3.13.14"
+        },
+        "jobs_1_median_sec": 9.37,
+        "jobs_4_median_sec": 4.38,
+        "comparison": {
+          "status": "ok",
+          "required_min_cosine": 0.9998,
+          "min_cosine": 0.9999999999999998,
+          "all_bit_identical": true,
+          "buckets": [
+            {
+              "bundle": "bge_b1_s24_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s64_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s128_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s192_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b8_s256_fp16.mlmodelc",
+              "vectors": 8,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s320_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s384_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s448_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s512_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            }
+          ]
+        },
+        "process_tree_peak_physical_gib": 1.952,
+        "process_tree_peak_rss_gib": 2.371
+      },
+      "m5": {
+        "environment": {
+          "hw_model": "Mac17,2",
+          "chip": "Apple M5",
+          "mem_gb": 24,
+          "macos_version": "27.2.1",
+          "mlx_version": "0.32.4",
+          "python_version": "3.13.14"
+        },
+        "jobs_1_median_sec": 5.02,
+        "jobs_4_median_sec": 2.24,
+        "comparison": {
+          "status": "ok",
+          "required_min_cosine": 0.9998,
+          "min_cosine": 0.9999999999999998,
+          "all_bit_identical": true,
+          "buckets": [
+            {
+              "bundle": "bge_b1_s24_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s64_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s128_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s192_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b8_s256_fp16.mlmodelc",
+              "vectors": 8,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s320_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s384_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s448_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 0.9999999999999998,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            },
+            {
+              "bundle": "bge_b1_s512_fp16.mlmodelc",
+              "vectors": 1,
+              "min_cosine": 1.0,
+              "max_abs_diff": 0.0,
+              "bit_identical": true
+            }
+          ]
+        },
+        "process_tree_peak_physical_gib": 1.187,
+        "process_tree_peak_rss_gib": 1.466
+      }
+    },
+    "method": "Two builds per arm in one-four-four-one worker order. Build timings exclude prediction. Each final build produced 16 normalized 384-component embeddings through the production query and corpus APIs across nine shapes. Contention was permitted. No runtime device trace was collected.",
+    "final_packaged_fixture": {
+      "sentence": "The team reviewed the annual report.",
+      "construction": "Prefix each row with Record and its one-based row number followed by a period and a space. Repeat the sentence plus a trailing space 80 times, then tokenize to the indicated bucket length.",
+      "published_timing_source": "compiler.new_numerical_comparison contains the original, separately timed builds. This fixture change affects only the predictions made after compilation. The final host rows give independent repeat timings in the same one-four-four-one build order.",
+      "harness_sha256_before_final_fixture": "7d8b2369e5466b7da1206edf5a1b97c05d7a48604034ad3a7137e4d85de0bc0a",
+      "final_harness_sha256": "85236d096937b01e7d1ce3a9fb61ae4e10226e10ddd8b944c78f5d0c745dafb2",
+      "final_prediction_function_sha256": "75b3082751c7e7f51ead2f6f4002c2b61973c3fe7eec5209f701ee839c4650ae",
+      "text_hashes_in_bucket_order_sha256": "b643aef354d60293be5d83a6bbe47e7cc842922b339a579871c72ac0240590b4",
+      "hash_format": "Each input digest covers its contiguous little-endian int32 token-ID matrix; each embedding digest covers its contiguous little-endian float32 matrix with 384 columns. Within each host both builds produced the displayed digest.",
+      "host_results": {
+        "m4": {
+          "host": "Apple M4 Pro",
+          "jobs_1_median_sec": 8.62,
+          "jobs_4_median_sec": 5.07,
+          "vectors": 16,
+          "min_cosine": 0.9999999999999998,
+          "max_abs_component_diff": 0.0,
+          "serial_parallel_bit_identical": true,
+          "result": "m4-bge-final-team.json",
+          "watchdog": "m4-bge-final-team-watchdog.json"
+        },
+        "m5": {
+          "host": "Apple M5",
+          "jobs_1_median_sec": 4.79,
+          "jobs_4_median_sec": 2.27,
+          "vectors": 16,
+          "min_cosine": 0.9999999999999998,
+          "max_abs_component_diff": 0.0,
+          "serial_parallel_bit_identical": true,
+          "result": "m5-bge-final-team.json",
+          "watchdog": "m5-bge-final-team-watchdog.json"
+        }
+      },
+      "by_bucket": {
+        "bge_b1_s24_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 24,
+          "input_ids_sha256": "8f1e3114caa9f15c67dd017527a6872b4df356a391677a19eb280d9d5080c846",
+          "m4_embeddings_sha256": "da41016baca874656c98cb298398051fdd222d7b2eb926cf3809cae48eed44df",
+          "m5_embeddings_sha256": "da41016baca874656c98cb298398051fdd222d7b2eb926cf3809cae48eed44df"
+        },
+        "bge_b1_s64_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 64,
+          "input_ids_sha256": "4b288eb1bdcb2417e3351de96620bdb3cb1c877fbb3c304b5eae3e0d2379ef18",
+          "m4_embeddings_sha256": "e9a26601de7ccc7223977092a801a8e2ff5307f6d8fe6a8cdbd050184a731b1b",
+          "m5_embeddings_sha256": "e9a26601de7ccc7223977092a801a8e2ff5307f6d8fe6a8cdbd050184a731b1b"
+        },
+        "bge_b1_s128_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 128,
+          "input_ids_sha256": "a59946d061396912e7d92aa51193a01ee8543d8060f6698eb8bb1177797d1ad8",
+          "m4_embeddings_sha256": "7033582bad333ec72f9c0764b0e3765ef427a531f01e9d8a2ce62621ff0055b2",
+          "m5_embeddings_sha256": "7033582bad333ec72f9c0764b0e3765ef427a531f01e9d8a2ce62621ff0055b2"
+        },
+        "bge_b1_s192_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 192,
+          "input_ids_sha256": "c45aba0aed1e3a37bf126b7cdd719d3a0a373d800cfc9a8cc90d1a0b4693217d",
+          "m4_embeddings_sha256": "1fc7474fd9325833134fbea5f7f8b8ac0df16def42d343b2ccd8d22e19c7de73",
+          "m5_embeddings_sha256": "1fc7474fd9325833134fbea5f7f8b8ac0df16def42d343b2ccd8d22e19c7de73"
+        },
+        "bge_b8_s256_fp16.mlmodelc": {
+          "rows": 8,
+          "tokens_per_row": 256,
+          "input_ids_sha256": "70e16773df500c903143929ed9b75f5e546baedfb68126f568541b78c6889c3b",
+          "m4_embeddings_sha256": "c0476db8669aef63899c280fd6427d32707e494d3fd4b8e33b52d63c5d624c66",
+          "m5_embeddings_sha256": "c0476db8669aef63899c280fd6427d32707e494d3fd4b8e33b52d63c5d624c66"
+        },
+        "bge_b1_s320_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 320,
+          "input_ids_sha256": "6bc416b918bde22bec63801164006a263b9f0bf2995c3283c561365ed7a61cc4",
+          "m4_embeddings_sha256": "4f952f0b738793bc51e77d169df097b09462980c0e2f3830a34fb8add7327cf7",
+          "m5_embeddings_sha256": "4f952f0b738793bc51e77d169df097b09462980c0e2f3830a34fb8add7327cf7"
+        },
+        "bge_b1_s384_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 384,
+          "input_ids_sha256": "0bc1867cbec2533d3d36c56096fe1d82768ccc2aa5f943124a2beaac354317d7",
+          "m4_embeddings_sha256": "bdc18f697bc7b8ca56cd77d255901ae4c354c0e657ff9a9c242f3bf3111912c7",
+          "m5_embeddings_sha256": "bdc18f697bc7b8ca56cd77d255901ae4c354c0e657ff9a9c242f3bf3111912c7"
+        },
+        "bge_b1_s448_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 448,
+          "input_ids_sha256": "fe6358c150be9fb30bc4ddab6114117f4727968986a90426486150b11751056d",
+          "m4_embeddings_sha256": "699e8e92c66248326ba8b8b7e6732b080ac89a99c63d2ac3496579ad1ea30c65",
+          "m5_embeddings_sha256": "699e8e92c66248326ba8b8b7e6732b080ac89a99c63d2ac3496579ad1ea30c65"
+        },
+        "bge_b1_s512_fp16.mlmodelc": {
+          "rows": 1,
+          "tokens_per_row": 512,
+          "input_ids_sha256": "550a01433e00310bd19e7d943c3988af2dde2ad43de28677cd67c8db56140de3",
+          "m4_embeddings_sha256": "30bbeb07bc9ad4404051b4d62be78b5d564d5eff5e720c067d6660334fc52041",
+          "m5_embeddings_sha256": "30bbeb07bc9ad4404051b4d62be78b5d564d5eff5e720c067d6660334fc52041"
+        }
+      }
+    }
+  },
+  "file_sha256": {
+    "m5_additional/2_mtp_drafter.json": "20f398b918b6bda46a7de65b7f0caa93f550e83d1e51691321164ac59a389dd3",
+    "m4pro_additional/2_mtp_drafter.json": "a11466843b1afe32447d6b640476626b4f42295bd125abd5ad4038ca702973b1",
+    "m5_additional/5b_coreai_qwen35_4b_cat3.json": "466d4c9ae01fd7d472769cf8322f52d454910158ad618c7458eff2a98e311ce8",
+    "m5_qwen35_parity.json": "465e53bccd3cf4ddef15d392b24241cd531fb583c4d9195493074ab1fa61c85a",
+    "m4pro_additional/1_capabilities_fixed.json": "4f567e3a087935389bd02d60b05c34f1f27c7a277e31a4e0f79e749521e345c3",
+    "packages/fast-gemma4/tests/fixtures/sys_extract_v1.txt": "5c4d459bce5a4caf116e96b19ccf34e5752332b5ecd0df719ddbbd90c01ab816",
+    "packages/fast-gemma4/tests/fixtures/sample_docs_8.json": "85f737545a45835eb0a61a0f2ee2832661b3369783acfc427b4ef39ce72a5464",
+    "lora_distill/e4b_qat_vs_regular_comparison.json": "3a810cd1dbf71b7144f1673048c1335659f56baf4ad4b25c7da43120ae9da1d1",
+    "p2_coexec_and_grpo_results.json": "e3ba25ec793b0a5d54acb9766eef81f5d78feb25ac4bfa1d23672f200eefab5a",
+    "m5_additional/logs/4b_parallel_coreml.log": "8c2331b4a66f62f4785f6edd237b5c69dcfd8b60435c6a42ede92cf0e1ca6640",
+    "m4pro_additional/logs/4b_parallel_coreml.log": "1d784266e11685ac0f15cc552f431978fb04472cdf5c039367f3d610b9fc494e",
+    "m4-bge.json": "62b4d9d61a6bba5e4fe52bf1fca11d9cfd35c6845348f920ff520f3444a216c0",
+    "m4-bge-watchdog.json": "45cadac42853a40fdc675979930c8dd7d764e9170a5de5540b45cb15ad040aa5",
+    "m5-bge.json": "fd852dae49b0a8acd507a94f5a62035bbce930158d006dad92750b5b8d8fe47d",
+    "m5-bge-watchdog.json": "eb54680f7040fa89115954f68ba3d88a3de16b4c3ada39de66fbc478fcf6aaa4",
+    "qlora-workload-counts.py": "686401bd21322836c3f73a5515438d860ef00b9d95cb9ff4c9b4a3cfacc30285",
+    "qlora-workload-counts.json": "ea242128be319b22a5d8fe7ba8ed903d44b7f000981b0915a1368a265f419dbb",
+    "mtp-reporting-control.py": "b417266da51494f2a42baae0911e6f98cfbc966b9528e2b876d9339b91c47dc6",
+    "mtp-reporting-control.json": "6cb04e901c2722eea8410459df8a39b29a33fc2ce8f76f432b885a7f4242e18d",
+    "m4-capability-reporting-tests.log": "b8b2ce46cbc45b3b8f69ee29b320fc52386ef7ea50e9c889164d082f752f9253",
+    "scripts/benchmark_capabilities.py": "85236d096937b01e7d1ce3a9fb61ae4e10226e10ddd8b944c78f5d0c745dafb2",
+    "tests/test_benchmark_suites_cpu.py": "ad350d3b5a2c479b26fed489a72b033f04d95e0127e5bdd97630121e43d7d02d",
+    "packages/fast-gemma4/src/fast_gemma4/lora_accel.py": "f0e658e825d4efcd1f1ffad6145465f4a22c90752eb483ed16f71ddd0d0ac09b",
+    "m4-bge-final-team.json": "b59e0faf7db0b4f0eb5839f3b495b6e56ccb0584986c6eaacd81ac2bfcb51486",
+    "m4-bge-final-team-watchdog.json": "7173c25981b6140a7a6aa2bbda617b73e05944b2962d29b2fd1b4bdd9e62902f",
+    "m5-bge-final-team.json": "7e1e87cf7e863626b1a1c6b0315f11ffcd5044c26ddbaf66a77e6251c86875fa",
+    "m5-bge-final-team-watchdog.json": "334b9c007193aeef787323d3468211bdd9e8bbe35a4600fd5b2a13407b7acb45",
+    "bge-final-fixture.py": "b4cb1c6f5d8beeff0d2e1c00797a452980b9d481e757a4a267c6d6547b0954ac"
+  },
+  "mtp_reporting_control": {
+    "source": "mtp-reporting-control.json",
+    "method": "Planted shorter MTP outputs on alternating prompts in a CPU test with a deterministic clock. Elapsed values below test the reporting calculation.",
+    "batch_four": {
+      "ar_output_tokens": 8,
+      "mtp_output_tokens": 6,
+      "ar_median_seconds": 2.0,
+      "mtp_median_seconds": 1.0,
+      "ar_tok_s": 4.0,
+      "mtp_tok_s": 6.0,
+      "elapsed_speedup_vs_ar": 2.0,
+      "token_rate_ratio_vs_ar": 1.5,
+      "exact_output_by_prompt": [
+        true,
+        false,
+        true,
+        false
+      ]
+    },
+    "all_workloads_exact_prompts": "6/10",
+    "missing_stock_token_rate_ratio": null,
+    "missing_stock_batch_four_token_rate_ratio": null,
+    "current_report": "Each timed AR and MTP pass records returned token lengths, actual output rate and equality against the first timed AR output. The stock subprocess reads its runtime token counter. Missing stock measurements yield a null ratio."
+  }
+}

@@ -1,10 +1,12 @@
 # fast-gpt-oss
 
-Run `openai/gpt-oss-20b` locally for structured extraction or generation. On the 48 GB M4 Pro, `fast-gpt-oss` handled 128 fixture requests at once at 454.1 decode tokens/s. On 50 public extraction and tool tasks it returned 49 valid responses in 79.7 seconds. Stock `mlx-lm` returned 32 in 146.2 seconds and earned the higher mean task score (0.5755 versus 0.5063).
+Run `openai/gpt-oss-20b` locally for structured extraction or generation. On 25 M4 Pro extraction tasks the project returned 24 valid responses and scored 0.653 field F1. Stock MLX returned 17 and scored 0.591. On 25 tool calls the project passed 9 and stock passed 14. Across both tasks they produced 49 and 32 valid outputs respectively. The two runs had different reasoning and output settings. [Task scores and comparison limits](../../docs/benchmarks/review-20261121.md#generation-and-model-precision)
 
 `fast-gpt-oss` eliminates redundant shared-prompt KV cache copies (`Hydragen v2`) and pairs Metal 4 `Hot-MPP / Cold-QMV` quantized MoE routing with `llguidance` grammar constraints so a **20.9B MXFP4** model runs at **`12.6–15.9 GB`** active MLX RAM (`23.98 GB` OS footprint at `B=128`, **`1.483 docs/s`**) or **`10.50 GB`** single-stream (`88.0–97.4 dec tok/s`), keeping all `201,088` `o200k` input prompt tokens intact with zero misses. Ready out of the box with OpenAI-compatible HTTP serving (`serve`), resumable Parquet/JSONL batch extraction (`parquet` / `extract`), and CLI generation.
 
 > **Full Benchmarks & Methodology:** For complete cross-silicon tables (`M4 Pro 48 GB` vs `Base M5 24 GB`), all 16 deterministic public outcome datasets, 4-bucket `RUSAGE_INFO_V6` footprints, and reproducible CLI commands, see the monorepo [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md).
+
+A check with the actual GPT-OSS tokenizer and shipped output vocabulary found a correctly scored answer that both minified and fixed-colon-space grammars could express for each of 150 tool requests. Changing the separator has a measured effect on Gemma. Its effect on GPT-OSS prediction accuracy remains open. [Tool outcomes and grammar check](../../docs/benchmarks/document-workloads.json)
 
 ## Quick start
 

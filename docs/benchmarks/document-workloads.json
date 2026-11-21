@@ -11,6 +11,8 @@
       "gate_verdict": "PASS",
       "gate_reasons": [],
       "source": "outcomes_m5_tier1_all.json",
+      "retrieval_coverage_status": "INCOMPLETE",
+      "selection": "Superseded. The recorded PASS allowed 175 legal queries without usable contextual embeddings.",
       "combined_gb": 3.8343,
       "legalbench": {
         "n_queries": 175,
@@ -35,6 +37,18 @@
       "gate_verdict": "PASS",
       "gate_reasons": [],
       "source": "3b_outcomes_pplx_tier1.json",
+      "retrieval_coverage_status": "COMPLETE",
+      "selection": "Selected M5 project run after splitting oversized documents into context windows.",
+      "paired_against_stock": {
+        "source": "0_public_outcomes_tier1.json",
+        "n_paired": 325,
+        "mean_delta": 0.000831,
+        "paired_standard_error": 0.00227,
+        "ci95_low": -0.003619,
+        "ci95_high": 0.005281,
+        "lossless_quality_floor": -0.003,
+        "lossless_quality_status": "UNRESOLVED"
+      },
       "combined_gb": 2.3403,
       "legalbench": {
         "n_queries": 175,
@@ -59,6 +73,7 @@
       "gate_verdict": "PASS",
       "gate_reasons": [],
       "source": "0_public_outcomes_tier1.json",
+      "retrieval_coverage_status": "COMPLETE",
       "combined_gb": 2.1194,
       "legalbench": {
         "n_queries": 175,
@@ -74,9 +89,11 @@
       }
     }
   ],
+  "gemma_current_report": "gemma-grammar-20261121.json",
   "gemma_m5_tier1": [
     {
       "config_label": "gpu_fp16_kvi8_llg_on",
+      "selection": "Historical 150786-token output vocabulary and minified JSON. The full-vocabulary strict default has a separate matched report.",
       "n_items": 300,
       "n_valid": 299,
       "objective_score_e2e": 0.748675,
@@ -257,7 +274,31 @@
     "fast_minus_stock": {
       "mean_delta": -0.069242,
       "paired_standard_error": 0.078228,
-      "lossless_allowed_drop": 0.153327
+      "lossless_allowed_drop": 0.153327,
+      "lossless_allowed_drop_basis": "Historical uncertainty-dependent allowance used in the archived comparison.",
+      "current_lossless": {
+        "n_paired": 50,
+        "ci95_low": -0.222569,
+        "ci95_high": 0.084085,
+        "quality_floor": -0.003,
+        "quality_status": "UNRESOLVED",
+        "repeat_loop_count": 2,
+        "promotion_verdict": "FAIL"
+      }
+    },
+    "grammar_layout_diagnostic": {
+      "compact": {
+        "n_items": 150,
+        "accepted_gold_answers": 150,
+        "source_sha256": "e0498c3db13f233c2701070833f65b264cb7f4379450957a6d11cb3fad4245d6"
+      },
+      "fixed": {
+        "n_items": 150,
+        "accepted_gold_answers": 150,
+        "source_sha256": "910e3c80059c9770476d016be77d47f5c82af0aec1f9fa16b91ed246870fdc28"
+      },
+      "method": "Construct a correct call or abstention from each locked BFCL label, check the existing BFCL scorer and JSON Schema validator, consume its full output with the actual GPT-OSS tokenizer and strict matcher, and verify that every token is in the shipped 131072-token output vocabulary. This tests representability. No model is asked to predict an answer.",
+      "generation_comparison": "Unmeasured. The 48 GB M4 Pro memory watchdog twice withheld the 20B inference job. The second preflight found 16.4 GiB available against a 13 GiB expected peak plus 6 GiB reserve."
     }
   },
   "grpo_m4_iteration_estimate": {

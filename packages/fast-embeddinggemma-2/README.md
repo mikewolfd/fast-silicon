@@ -45,6 +45,23 @@ On M5, the public INT8 export used 0.84 GB and completed scoring in 149 seconds.
 
 For Apple CoreAI on the 24 GB M5, the full run returned an invalid 385.79 GB memory estimate. A separate five-text check measured 3.04 GB.
 
+#### How much of a long legal passage did the encoder see?
+
+At 512 tokens, the project, FluidInference FP16 and OpenInfinity INT8 ranked legal passages about equally. All three encoded identical token IDs for 175 questions and 144 passages from 20 original documents on M4 Pro. Raising the project’s limit to 2,048 improved its top-ten whole-passage ranking score from 0.517 to 0.569.
+
+The standard score credits an answer anywhere in a returned passage. The visible-text columns count only annotated characters the encoder received. The ranking score (span nDCG) also gives more credit to higher-ranked passages. Every average includes all 175 questions.
+
+| Encoder | Token limit | Whole-passage nDCG@10 | Visible nDCG@5 / @10 | Visible character recall@5 / @10 | Warm encoding |
+|---|---:|---:|---:|---:|---:|
+| Project | 512 | 0.517 | 0.293 / 0.301 | 0.323 / 0.336 | 2.39 s |
+| FluidInference FP16 | 512 | 0.516 | 0.289 / 0.298 | 0.323 / 0.336 | 4.99 s |
+| OpenInfinity INT8 | 512 | 0.518 | 0.293 / 0.302 | 0.323 / 0.336 | 4.84 s |
+| Project | 2,048 | 0.569 | 0.519 / 0.569 | 0.757 / 0.903 | 14.58 s |
+
+At 512 tokens, 81 questions had no annotated answer text in any visible passage. All three encoders still earned whole-passage credit on 64 questions whose top ten contained no visible answer text. For example, each encoder ranked the New York City data-use agreement’s first passage first for `contractnli:22`. Its 512 tokens ended at character 2,246. The annotated answer begins at character 3,180. At 2,048 tokens the project could see all annotated answers in the dataset.
+
+Warm encoding covers all queries and passages from prepared token IDs. The 2,048-token row reuses the same queries and includes their encoding time. Loading and warmup took 112.8 s for the project, 94.7 s for FP16 and 95.3 s for INT8 in this run. [Matched scores, timing and source spans](../../docs/benchmarks/embeddinggemma-legal-512-20261121.json)
+
 ### 2. Corpus Speed, `B=1` Latency & Silicon Wins
 
 | Benchmark (`benchmark_monorepo.py` / ABBA OCR) | Base M5 (`24 GB`, `macOS 27.2.1`) | M4 Pro (`48 GB`, `macOS 26.6`) | Key Architectural Takeaway |

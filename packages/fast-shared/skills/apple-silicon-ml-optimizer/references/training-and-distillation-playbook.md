@@ -61,9 +61,9 @@ CoreML/ANE cannot execute backward passes, leaving the **16-core ANE `100%` idle
 - **Pattern A — Software-Pipelined ANE Prefix Prefetch:** When bottom layers are frozen (`L0..11` on `Gemma-4`, `L0..17` on `ModernBERT`), run batch `t+1`'s frozen prefix on static-bucket ANE (`pipe_depth=4`, zero-copy `IOSurface -> Metal` `newBufferWithIOSurface` handoff) concurrently with batch `t`'s GPU upper-layer forward+backward pass.
 - **Pattern B — Activation Caching Across Multi-Epoch / Sweep Runs:** When training upper heads (`L18..27` validator heads, linear/MLP routers, or `4`-layer `MTP` draft heads) for multiple epochs or hyperparameter sweeps, materialize `h_{frozen}` once in `BF16` (or per-token symmetric `int8` + `fp16` scale) and stream from NVMe (`~6 GB/s`), eliminating `60%–90%` of forward FLOPs completely.
 
-### 3.4 Shared-Prefix Differentiable KV Broadcast Inside `grad_accum` (`1.3×–2.0×`)
-- Inside a single optimizer step (`grad_accum = K` micro-batches), LoRA weights `(A, B)` are invariant.
-- Instead of running a shared system/schema prompt (`265–1,400` tokens) `K` times forward and backward through trainable upper layers, run `sys_ids` **once** per optimizer step to produce differentiable `(K_sys, V_sys)`, let all `K` document suffixes attend to `(K_sys, V_sys)`, and backpropagate accumulated prefix KV gradients through `sys_ids` once per step.
+### 3.4 Reusing a training prefix within gradient accumulation
+
+LoRA weights stay fixed across the micro-batches in one optimizer step. Compute the shared prefix keys and values once, let each document suffix attend to them, and accumulate prefix gradients before the update. The Gemma benchmark used 12 examples with 1,683 supervised answer tokens without reuse and eight examples with 1,120 answer tokens with reuse. Compare the same examples and updates before assigning a speedup to the cache.
 
 ### 3.5 `@mx.compile` Fused Chunked CE, Elementwise VJPs & `AdamW` (`15%–30%`)
 - **Compiled Softcap + Cross-Entropy (`Liger`-style):** Wrap the `256`-token `(bf16_logits -> fp32 -> tanh_softcap -> logsumexp -> nll)` function in `@mx.compile` so forward and VJP fuse into registers without streaming `[256, V]` `FP32` intermediate tensors to/from DRAM (`~3×` less head memory traffic).
@@ -72,7 +72,7 @@ CoreML/ANE cannot execute backward passes, leaving the **16-core ANE `100%` idle
 ### 3.6 `PrefixTree` & Rolling Engines for Distillation, `GRPO` & Post-Training Builds (`3×–6×`)
 - **Multi-Candidate Teacher Distillation:** When a teacher (`Kev-0.8B`, `E4B`, `gpt-oss-20b`) scores `8–15` corruptions or candidate spans per document, snapshot the shared document state in a `PrefixTree` (`256`-token `GDN + KV` blocks) so the teacher prefills each document **once** instead of `10×`.
 - **Online `GRPO` / Best-of-N Rollouts:** Drive rollout generation with `fast-silicon`'s persistent rolling slot engine (`B_slots=128`, `llguidance` + lazy `argmax`) while evaluating reward/schema critics concurrently on ANE (`0` GPU contention).
-- **Parallel CoreML Multi-Bucket Compilation:** Never compile static ANE sequence buckets (`s64, s128, s256, s512`) serially on one core; fan `ct.convert` / `.mlmodelc` builds across `ProcessPoolExecutor(max_workers=4)` (`~3×` faster post-training export).
+- **Parallel Core ML compilation.** Four workers cut the build time for nine BGE shapes from 9.18 to 4.56 s on M4 Pro and 5.12 to 2.45 s on M5. For two larger Gemma bundles, the second M4 Pro builds took 26.37 s serial and 25.97 s parallel. Compare actual output vectors from the compiled bundles as well as elapsed time.
 
 ### 3.7 Multi-Mac LoRA Data-Parallel (`mx.distributed` Over Thunderbolt / TB5 RDMA)
 - Because LoRA adapter gradients are compact (`~20–60 MB` in `BF16`), `mx.distributed.all_sum` once per `grad_accum` step takes `< 5 ms` over Thunderbolt / TB5 RDMA (`macOS >= 26.2`), delivering `~1.8×–1.9×` near-linear SFT and distillation scaling across heterogeneous Macs (weighing shard sizes by each Mac's measured `TFLOPS`).

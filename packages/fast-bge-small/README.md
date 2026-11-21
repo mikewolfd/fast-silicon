@@ -55,7 +55,7 @@ The public Core ML comparison uses `sidekickd/bge-small-en-v1.5-coreml`. On M4 P
 | **Single-query latency (ANE)** | **0.79 ms** | **0.49 ms** | Median for one warm 24-token query. |
 | sidekickd FP16 corpus | 34,318 tokens/s | 31,608 tokens/s | Same token IDs as `fast-bge-small`, with tokenization and interprocess transfer outside timing. |
 | sidekickd FP16 single query | 1.608 ms | 1.696 ms | Median of 30 warm calls on the same 24-token input. |
-| **Parallel CoreML Build (`9` buckets)** | `jobs=1` `5.12 s` -> **`jobs=4` `2.45 s` (`2.09x`)** | Legacy `26.80 s` (`jobs=1` `9.18 s`) -> **`jobs=4` `4.56 s` (`2.01x` / `5.88x` vs. legacy)** | `spawn`-only pool + `skip_model_load=True` in [`scripts/build_ane_models.py`](scripts/build_ane_models.py), bit-identical (`cos = 1.000000`, `9/9` ANE). |
+| **Parallel Core ML build, 9 shapes** | 5.02 s serial, 2.24 s with four workers | 9.37 s serial, 4.38 s with four workers | Both builds produced bit-identical outputs for 16 vectors across all nine shapes on each host. Timings exclude prediction. [Build runs and per-shape checks](../../docs/benchmarks/capability-corrections-20261121.json) |
 
 Core ML's `MLComputePlan` for each sidekickd input size (128, 256 and 512 tokens) preferred the Neural Engine for 229 operations and the CPU for 16. It left 363 unclassified on each Mac. The model ships precompiled. Loading it before scoring took 4.38 seconds on M5 and 1.84 seconds on M4 Pro. In its separate natural-text run, stock `mlx-embeddings` encoded 106.96 documents/s on M5 and 123.12 on M4 Pro. Its single text query took 4.42 ms and 4.85 ms, respectively.
 

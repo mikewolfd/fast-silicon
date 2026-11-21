@@ -1,0 +1,671 @@
+{
+  "task": "LiquidAI/structured-extraction, test_unseen. Grounded field F1 is between 0 and 1 and gives zero credit to invalid responses.",
+  "model": "lmstudio-community/gemma-4-E2B-it-MLX-4bit",
+  "snapshot": "31512dab743c73974a99795270031a6f85072d94",
+  "model_file": "82b24c3af19f957d5e07eca4bf99f8c6582b60d6d8f0dfa26c9649857bea58ad",
+  "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+  "mlx": "0.32.4",
+  "llguidance": "1.9.1",
+  "generation": {
+    "temperature": 0,
+    "max_tokens": 512,
+    "speculative": false,
+    "kv_i8": true,
+    "batch": 8,
+    "mlx_cache_mib": 256,
+    "prompt": "Same LiquidAI system instruction and document/schema template in benchmark_outcomes.py on every project arm.",
+    "strict_default": {
+      "output_vocabulary": "checkpoint",
+      "key_separator": ": ",
+      "item_separator": ",",
+      "whitespace_flexible": false
+    },
+    "scoring": "evaluate_structured_extraction checks JSON, schema, finish reason and agreement with gold values."
+  },
+  "m5_150": {
+    "english": 58,
+    "other_languages": 92,
+    "historical_batch_16": {
+      "mlx_vlm_4bit_llg_off": {
+        "field_f1": 0.923418,
+        "english_field_f1": 0.945392,
+        "other_languages_field_f1": 0.909565,
+        "valid_completions": 146,
+        "documents_with_perfect_field_score": 82
+      },
+      "gpu_fp16_kvi8_llg_on": {
+        "field_f1": 0.690684,
+        "english_field_f1": 0.787988,
+        "other_languages_field_f1": 0.62934,
+        "valid_completions": 149,
+        "documents_with_perfect_field_score": 6
+      },
+      "gpu_fp16_kvi8_llg_off": {
+        "field_f1": 0.801553,
+        "english_field_f1": 0.945689,
+        "other_languages_field_f1": 0.710686,
+        "valid_completions": 143,
+        "documents_with_perfect_field_score": 41
+      }
+    },
+    "controlled_batch_8": {
+      "pruned_unconstrained": {
+        "field_f1": 0.802468,
+        "english_field_f1": 0.945689,
+        "other_languages_field_f1": 0.712177,
+        "valid_completions": 143,
+        "documents_with_perfect_field_score": 42,
+        "documents_with_colon_space_string": 0,
+        "total_colon_space_string_values": 0,
+        "documents_with_same_score_as_original": 142
+      },
+      "pruned_constrained": {
+        "field_f1": 0.694586,
+        "english_field_f1": 0.785625,
+        "other_languages_field_f1": 0.637192,
+        "valid_completions": 149,
+        "documents_with_perfect_field_score": 6,
+        "documents_with_colon_space_string": 76,
+        "total_colon_space_string_values": 186,
+        "documents_with_same_score_as_original": 138
+      },
+      "full_unconstrained": {
+        "field_f1": 0.917535,
+        "english_field_f1": 0.945425,
+        "other_languages_field_f1": 0.899952,
+        "valid_completions": 145,
+        "documents_with_perfect_field_score": 81,
+        "documents_with_colon_space_string": 0,
+        "total_colon_space_string_values": 0
+      },
+      "full_constrained": {
+        "field_f1": 0.76615,
+        "english_field_f1": 0.788623,
+        "other_languages_field_f1": 0.751983,
+        "valid_completions": 150,
+        "documents_with_perfect_field_score": 11,
+        "documents_with_colon_space_string": 73,
+        "total_colon_space_string_values": 179
+      },
+      "full_fixed": {
+        "documents": 150,
+        "valid": 150,
+        "field_f1": 0.945066,
+        "field_f1_given_valid": 0.945066,
+        "english_field_f1": 0.960857,
+        "other_languages_field_f1": 0.935111,
+        "perfect_field_scores": 82,
+        "documents_with_colon_space_value": 0,
+        "completion_tokens": 20780
+      }
+    },
+    "fixed_minus_full_free": {
+      "n": 150,
+      "mean_delta": 0.027531,
+      "paired_se": 0.013863,
+      "ci95": [
+        0.00036,
+        0.054703
+      ],
+      "higher": 13,
+      "lower": 14
+    },
+    "fixed_minus_full_minified": {
+      "n": 150,
+      "mean_delta": 0.178916,
+      "paired_se": 0.013067,
+      "ci95": [
+        0.153304,
+        0.204527
+      ],
+      "higher": 127,
+      "lower": 4
+    },
+    "fixed_wall_seconds": 132.035,
+    "fixed_watchdog_peak_physical_gib": 5.862
+  },
+  "six_diagnostic_documents": {
+    "selection": "Six failure-inspection records, deliberately chosen before testing separators. This set is diagnostic.",
+    "ids": [
+      "ext-06617",
+      "ext-06726",
+      "ext-06623",
+      "ext-06751",
+      "ext-06773",
+      "ext-06562"
+    ],
+    "arms": {
+      "compact": 0.534343,
+      "compact_noff": 0.410642,
+      "comma_only": 0.523332,
+      "colon_only": 0.974107,
+      "spaced": 0.974107,
+      "flexible": 0.974107
+    }
+  },
+  "trace": {
+    "document": "ext-06623",
+    "field": "course_name",
+    "expected": "Practical Web Development Bootcamp",
+    "minified_output": ": ",
+    "fixed_output": "Practical Web Development Bootcamp",
+    "minified_first_field_events": [
+      [
+        "upfront",
+        [
+          14937,
+          12915,
+          236779,
+          1201
+        ],
+        "{\"student_name"
+      ],
+      [
+        "model",
+        [
+          1083
+        ],
+        "\":"
+      ],
+      [
+        "masked",
+        [
+          623
+        ],
+        " \""
+      ],
+      [
+        "picked",
+        [
+          1083
+        ],
+        "\":"
+      ],
+      [
+        "model",
+        [
+          623
+        ],
+        " \""
+      ]
+    ],
+    "fixed_first_field_events": [
+      [
+        "upfront",
+        [
+          14937,
+          12915,
+          236779,
+          1201,
+          1083
+        ],
+        "{\"student_name\":"
+      ],
+      [
+        "model",
+        [
+          623
+        ],
+        " \""
+      ],
+      [
+        "model",
+        [
+          87232
+        ],
+        "Mere"
+      ],
+      [
+        "model",
+        [
+          1925
+        ],
+        "ana"
+      ],
+      [
+        "model",
+        [
+          122533
+        ],
+        " Barlow"
+      ]
+    ]
+  },
+  "disjoint_m4_48": {
+    "sample": "From the 300 locked test_unseen records, exclude the original 150 IDs and matching document text. Sort by SHA-256 of strict-holdout-1|ID and take records round-robin by language to 48. Both arms use the same IDs.",
+    "host": "Apple M4 Pro",
+    "batch_size": 8,
+    "ids": [
+      "ext-06752",
+      "ext-06564",
+      "ext-06673",
+      "ext-06619",
+      "ext-06514",
+      "ext-06606",
+      "ext-06550",
+      "ext-06739",
+      "ext-06557",
+      "ext-06625",
+      "ext-06518",
+      "ext-06639",
+      "ext-06704",
+      "ext-06774",
+      "ext-06771",
+      "ext-06732",
+      "ext-06607",
+      "ext-06692",
+      "ext-06502",
+      "ext-06667",
+      "ext-06659",
+      "ext-06656",
+      "ext-06574",
+      "ext-06512",
+      "ext-06694",
+      "ext-06669",
+      "ext-06767",
+      "ext-06794",
+      "ext-06671",
+      "ext-06738",
+      "ext-06650",
+      "ext-06603",
+      "ext-06729",
+      "ext-06541",
+      "ext-06654",
+      "ext-06699",
+      "ext-06716",
+      "ext-06599",
+      "ext-06682",
+      "ext-06501",
+      "ext-06710",
+      "ext-06666",
+      "ext-06544",
+      "ext-06731",
+      "ext-06569",
+      "ext-06565",
+      "ext-06536",
+      "ext-06592"
+    ],
+    "languages": [
+      "ar",
+      "de",
+      "en",
+      "es",
+      "fr",
+      "hi",
+      "id",
+      "it",
+      "ja",
+      "ko",
+      "pl",
+      "pt",
+      "ru",
+      "th",
+      "vi",
+      "zh"
+    ],
+    "fixed": {
+      "documents": 48,
+      "valid": 48,
+      "field_f1": 0.925832,
+      "field_f1_given_valid": 0.925832,
+      "english_field_f1": 0.947917,
+      "other_languages_field_f1": 0.923824,
+      "perfect_field_scores": 21,
+      "documents_with_colon_space_value": 0,
+      "completion_tokens": 7270
+    },
+    "unconstrained": {
+      "documents": 48,
+      "valid": 48,
+      "field_f1": 0.925609,
+      "field_f1_given_valid": 0.925609,
+      "english_field_f1": 0.947917,
+      "other_languages_field_f1": 0.923581,
+      "perfect_field_scores": 21,
+      "documents_with_colon_space_value": 0,
+      "completion_tokens": 9402
+    },
+    "fixed_minus_free": {
+      "n": 48,
+      "mean_delta": 0.000223,
+      "paired_se": 0.002344,
+      "ci95": [
+        -0.00437,
+        0.004817
+      ],
+      "higher": 4,
+      "lower": 2
+    },
+    "fixed_wall_seconds": 45.037,
+    "unconstrained_wall_seconds": 49.118,
+    "timing_note": "Separate serial measurements during background CPU activity."
+  },
+  "m5_current_outcome_runner": {
+    "benchmark": "LiquidAI/structured-extraction(150)+BFCL_v3(150)",
+    "config_label": "gpu_fp16_kvi8_llg_on",
+    "n_items": 300,
+    "n_valid": 300,
+    "wall_sec": 144.3514,
+    "objective_score_e2e": 0.88295,
+    "effective_outcome_per_sec": 1.835,
+    "gate_verdict": "PASS",
+    "gate_reasons": [],
+    "memory_4bucket_gb": {
+      "mlx_peak_gb": 5.5588,
+      "phys_footprint_gb": 6.0959,
+      "peak_footprint_gb": 6.8525,
+      "model_mapped_gb": 0.0,
+      "neural_nofootprint_gb": 0.0,
+      "combined_with_model_mapped_gb": 6.0959
+    },
+    "diagnostics": {
+      "llguidance": true,
+      "grounded_field_f1": 0.945899,
+      "valid_schema_rate": 1.0,
+      "bfcl_ast_acc": 0.82,
+      "bfcl_abstention_acc": 0.866667,
+      "jsb_compile_rate": 0.875,
+      "jsb_gct_p50_ms": 0.14,
+      "avg_completion_tokens": 93.23,
+      "mask_fallback_rate": 0.003432,
+      "repeat_4gram_rate": 0.000358,
+      "repeat_loop_count": 0,
+      "finish_length_count": 0,
+      "device_guard_tripped": false,
+      "model_checkpoint": "31512dab743c73974a99795270031a6f85072d94",
+      "output_vocab_size": 262144,
+      "json_layout": "fixed",
+      "batch_size": 8,
+      "mlx_cache_limit_mb": 256
+    },
+    "sub_benchmarks": {
+      "liquidai_extraction": {
+        "n_items": 150,
+        "n_valid": 150,
+        "valid_json_rate": 1.0,
+        "valid_schema_rate": 1.0,
+        "grounded_field_f1": 0.945899,
+        "repeat_4gram_rate": 0.000715,
+        "repeat_loop_count": 0
+      },
+      "bfcl_v3": {
+        "n_items": 150,
+        "n_valid": 150,
+        "overall_ast_acc": 0.82,
+        "abstention_acc": 0.866667,
+        "split_accuracy": {
+          "irrelevance": 0.866667,
+          "live_multiple": 0.7,
+          "multiple": 0.9,
+          "parallel_multiple": 0.733333,
+          "simple": 0.9
+        },
+        "repeat_4gram_rate": 0.0,
+        "repeat_loop_count": 0
+      }
+    },
+    "timing_note": "Scoring after warmup. One worker used the GPU. Background CPU activity was permitted.",
+    "jsb_compiler_diagnostic": {
+      "n_schemas": 40,
+      "compiled_ok": 35,
+      "sample_errors": [
+        {
+          "id": "o38403",
+          "error": "ValueError: oneOf constraints are not supported. Enable 'coerce_one_of' option to approximate oneOf with anyOf"
+        },
+        {
+          "id": "o21395",
+          "error": "ValueError: oneOf constraints are not supported. Enable 'coerce_one_of' option to approximate oneOf with anyOf"
+        },
+        {
+          "id": "o48770",
+          "error": "ValueError: oneOf constraints are not supported. Enable 'coerce_one_of' option to approximate oneOf with anyOf"
+        },
+        {
+          "id": "o77304",
+          "error": "ValueError: Unimplemented keys: [\"not\"]"
+        },
+        {
+          "id": "o15103",
+          "error": "ValueError: oneOf constraints are not supported. Enable 'coerce_one_of' option to approximate oneOf with anyOf"
+        }
+      ]
+    },
+    "batching_note": "The normal benchmark submits each 150-item task set together, with eight active decoder slots. The controlled extraction replay submits 19 smaller groups using the same batch size."
+  },
+  "m5_unconstrained_outcome_runner": {
+    "benchmark": "LiquidAI/structured-extraction(150)+BFCL_v3(150)",
+    "config_label": "gpu_fp16_kvi8_llg_off",
+    "n_items": 300,
+    "n_valid": 288,
+    "wall_sec": 205.8052,
+    "objective_score_e2e": 0.878727,
+    "effective_outcome_per_sec": 1.2809,
+    "gate_verdict": "PASS",
+    "gate_reasons": [],
+    "memory_4bucket_gb": {
+      "mlx_peak_gb": 5.5586,
+      "phys_footprint_gb": 5.6845,
+      "peak_footprint_gb": 6.5486,
+      "model_mapped_gb": 0.0,
+      "neural_nofootprint_gb": 0.0,
+      "combined_with_model_mapped_gb": 5.6845
+    },
+    "diagnostics": {
+      "llguidance": false,
+      "grounded_field_f1": 0.92412,
+      "valid_schema_rate": 0.973333,
+      "bfcl_ast_acc": 0.833333,
+      "bfcl_abstention_acc": 0.866667,
+      "jsb_compile_rate": 0.875,
+      "jsb_gct_p50_ms": 0.144,
+      "avg_completion_tokens": 123.99,
+      "mask_fallback_rate": 0.0,
+      "repeat_4gram_rate": 0.004097,
+      "repeat_loop_count": 0,
+      "finish_length_count": 0,
+      "device_guard_tripped": false,
+      "model_checkpoint": "31512dab743c73974a99795270031a6f85072d94",
+      "output_vocab_size": 262144,
+      "json_layout": null,
+      "batch_size": 8,
+      "mlx_cache_limit_mb": 256
+    },
+    "sub_benchmarks": {
+      "liquidai_extraction": {
+        "n_items": 150,
+        "n_valid": 146,
+        "valid_json_rate": 1.0,
+        "valid_schema_rate": 0.973333,
+        "grounded_field_f1": 0.92412,
+        "repeat_4gram_rate": 0.006798,
+        "repeat_loop_count": 0
+      },
+      "bfcl_v3": {
+        "n_items": 150,
+        "n_valid": 142,
+        "overall_ast_acc": 0.833333,
+        "abstention_acc": 0.866667,
+        "split_accuracy": {
+          "irrelevance": 0.866667,
+          "live_multiple": 0.766667,
+          "multiple": 0.866667,
+          "parallel_multiple": 0.766667,
+          "simple": 0.9
+        },
+        "repeat_4gram_rate": 0.001395,
+        "repeat_loop_count": 0
+      }
+    },
+    "timing_note": "Scoring after warmup. One worker used the GPU. Background CPU activity was permitted."
+  },
+  "m5_normal_runner_paired_fixed_minus_unconstrained": {
+    "extraction": {
+      "n": 150,
+      "mean_delta": 0.021779,
+      "paired_se": 0.012544,
+      "ci95": [
+        -0.002807,
+        0.046365
+      ],
+      "higher": 11,
+      "lower": 13
+    },
+    "tool_calls": {
+      "n": 150,
+      "mean_delta": -0.013333,
+      "paired_se": 0.025004,
+      "ci95": [
+        -0.062341,
+        0.035675
+      ],
+      "higher": 6,
+      "lower": 8
+    },
+    "all": {
+      "n": 300,
+      "mean_delta": 0.004223,
+      "paired_se": 0.014001,
+      "ci95": [
+        -0.023218,
+        0.031664
+      ],
+      "higher": 17,
+      "lower": 21
+    }
+  },
+  "bfcl_answer_representability": {
+    "method": "Construct an answer from the locked labels, check it with the unchanged BFCL scorer and JSON Schema validator, and consume the full output with the selected model tokenizer and strict llguidance matcher. For GPT-OSS also require every generated token to be in its shipped 131072-token output mapping. This checks representability only. A missing constructed witness is inconclusive.",
+    "n_items": 150,
+    "n_witnesses": 150,
+    "missing": []
+  },
+  "disjoint_m5_tool_prompt_50": {
+    "selection": "Exclude every original Tier-1 ID and repeated question text. From the pinned 200-per-split candidate pool, sort by SHA-256 of strict-bfcl-holdout-1|ID and take ten per split.",
+    "ids": [
+      "live_multiple_592-157-13",
+      "simple_85",
+      "multiple_67",
+      "multiple_63",
+      "simple_316",
+      "simple_65",
+      "irrelevance_206",
+      "simple_123",
+      "multiple_179",
+      "live_multiple_573-155-13",
+      "multiple_82",
+      "multiple_104",
+      "parallel_multiple_92",
+      "live_multiple_823-177-6",
+      "irrelevance_6",
+      "simple_15",
+      "irrelevance_96",
+      "simple_113",
+      "irrelevance_230",
+      "live_multiple_953-201-1",
+      "simple_303",
+      "live_multiple_325-132-15",
+      "parallel_multiple_54",
+      "multiple_22",
+      "irrelevance_90",
+      "multiple_68",
+      "live_multiple_97-42-1",
+      "simple_344",
+      "simple_161",
+      "irrelevance_211",
+      "simple_209",
+      "live_multiple_868-182-5",
+      "live_multiple_1003-232-2",
+      "irrelevance_227",
+      "multiple_119",
+      "irrelevance_148",
+      "multiple_42",
+      "irrelevance_82",
+      "irrelevance_70",
+      "live_multiple_568-155-8",
+      "multiple_25",
+      "live_multiple_135-51-1",
+      "parallel_multiple_145",
+      "parallel_multiple_59",
+      "parallel_multiple_64",
+      "parallel_multiple_168",
+      "parallel_multiple_172",
+      "parallel_multiple_52",
+      "parallel_multiple_122",
+      "parallel_multiple_6"
+    ],
+    "prompts": {
+      "original": "Select matching tool calls or return empty tool_calls if none apply. Output raw JSON only.",
+      "grounded": "Match each requested action to an available function by its description. Include every requested call, in order. Use the arguments stated or implied by the user. Omit optional arguments when the user gives no value. If no available function fulfills the request, return an empty tool_calls list. Output only the JSON object."
+    },
+    "execution": "Same 50 inputs, full checkpoint vocabulary, strict fixed key separator, eight decoder slots and greedy generation for both arms.",
+    "original": {
+      "n_items": 50,
+      "n_valid": 50,
+      "overall_ast_acc": 0.82,
+      "abstention_acc": 0.7,
+      "split_accuracy": {
+        "irrelevance": 0.7,
+        "live_multiple": 0.8,
+        "multiple": 1.0,
+        "parallel_multiple": 0.7,
+        "simple": 0.9
+      },
+      "repeat_loop_count": 0
+    },
+    "grounded": {
+      "n_items": 50,
+      "n_valid": 50,
+      "overall_ast_acc": 0.82,
+      "abstention_acc": 0.7,
+      "split_accuracy": {
+        "irrelevance": 0.7,
+        "live_multiple": 0.7,
+        "multiple": 1.0,
+        "parallel_multiple": 0.8,
+        "simple": 0.9
+      },
+      "repeat_loop_count": 0
+    },
+    "change_by_item": {
+      "n": 50,
+      "mean_delta": 0.0,
+      "paired_se": 0.028571,
+      "ci95": [
+        -0.056,
+        0.056
+      ],
+      "higher": 1,
+      "lower": 1
+    }
+  },
+  "source_sha256": {
+    "compact-full-debug.json": "115ec70ae4ea9db9f2d5317a50e359db11ceff0e44b328662b41b9ec5cc54c50",
+    "compact_noff-full-debug.json": "cbdcc1dab65071fb79f0e1963f5077eccedf15d653071a26ce014e133081fcf5",
+    "comma_only-full-debug.json": "1e7e146d8d952e597146b9da56f1f803302027a002c3a82b824283dc009c4314",
+    "colon_only-full-debug.json": "36d089a9be7c8441f0e7b2cdfe03723f136001441383475b68e5d446ed5e3ab1",
+    "spaced-full-debug.json": "a348b203cacc232ecf56f7b49d50e290d9bcbe3e5a13d9452fb721ded88d7b06",
+    "flexible-full-debug.json": "30700021e4b834e472366286aa2e5fbe04ed05128b76a897c801b0ef5d8501af",
+    "production-full-all.json": "d9ad9ee2dad6a0ca4fce8b95fee26c2830b50d42062548ba3584c95399114b12",
+    "production-full-holdout.json": "8aa18babd74d2976e8a071c203fa6e709b453d17856e456881057eed97aa096e",
+    "free-full-holdout.json": "67dc33f725814fe2beaa4fee03597ea942ce2ad828bb2fa98cbec915a0219532",
+    "production-full-watchdog.json": "22c4be7f6d416eda4266d726e1a0e13cf4c3a3c823e4e4ff32e3b7ec1eff9521",
+    "trace-compact-full-ext-06623.json": "42b8ac84c3bb977a577381d0390afd90de121d05fd5615d504d374c395072fd3",
+    "trace-colon_only-full-ext-06623.json": "56dc62e4bf5c48c21a2c9ec21127d79fdadab476a0febaaa1c0f5d03e24277d5",
+    "comparison.json": "67bd675fe1efea7ea590c8cfc26f4ffdb31398198dbd58cfd8b7d3e3041b576e",
+    "loader-identity.json": "bbe101cfcdb63af1975414f90dc02599c86182600ef123ae93053c56909af97f",
+    "pruned-150.json": "093d73987c463323a799f2a63182bb5b4ba802fd303318a787ea93e36c53949c",
+    "full-150.json": "f438198eb367f149367fe7e9ab175bcc2acfa697b291be89a12431433d153a46",
+    "outcomes-current.json": "0ebe7b4e746273387ebea257999cd142c90c1d61def8d400e7f61a6a65fedcba",
+    "cli-watchdog.json": "a0b76e5f65e8de00eeb5eab467880eba10069513a3ec909fbebfbfaf5eeaa637",
+    "outcomes-free.json": "e05d1563bbcf6263abaff8cb55140a81872bc212c771e96508b6b97b92c04202",
+    "cli-free-watchdog.json": "22cfa6298f5e7ac5bb37e6e011df33106c826511cd1218561889ddf6a17ded90",
+    "tool-witness.json": "d9ea58b17cd50a5e29aa55e8ffd7f5ebe0548bccb2f56b1e08c706cdbfcbdf15",
+    "check_tool_witness.py": "7b8783d052b085b2d658aa5674e796941f2d80ef040a1d7f44f45a4020be8bf2",
+    "probe.py": "7789ccaa2c10066f62728784a8229f851b1991640c769c676f69aaad5477c723",
+    "tool_prompt_holdout.py": "368e1c41a7e6866d5fb6f8ed4362f2240bd2259d3440262ddf4237ce38eb4b62",
+    "tool-prompt-plan.json": "0ff07ddcfd1ffb1834ef3be9b6b6ffb485dcb90eb803c46e768bf431f51aced6",
+    "tool-prompt-holdout.json": "cbdef1c7b9a20d8982da37ea19315327dcdf1c9d578aff6f2aac12ba263f7de0",
+    "tool-prompt-watchdog.json": "e90f7f41e346cb6c997b71901d64b11aea39ed977b564baf88d9798359edef84"
+  }
+}

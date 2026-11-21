@@ -858,7 +858,10 @@
         "effective_outcome_per_sec": 3.0321,
         "wall_sec": 137.8561,
         "gate_verdict": "PASS",
-        "gate_reasons": []
+        "gate_reasons": [],
+        "review_status": "invalid_baseline",
+        "review_reason": "The original loader skipped all 170 pretrained encoder weights.",
+        "replacement_report": "decisions-20261121.json"
       },
       "public-kev-0.8b": {
         "package": "public-kev-0.8b",
@@ -869,7 +872,10 @@
         "effective_outcome_per_sec": 3.0616,
         "wall_sec": 239.0917,
         "gate_verdict": "PASS",
-        "gate_reasons": []
+        "gate_reasons": [],
+        "review_status": "superseded_baseline",
+        "review_reason": "The original adapter loaded a second scoring model for tokenization. The replacement uses one model and preserves the per-item decisions.",
+        "replacement_report": "decisions-20261121.json"
       }
     },
     "reference_warm_probes": {
@@ -1597,7 +1603,10 @@
         "effective_outcome_per_sec": 5.3194,
         "wall_sec": 72.5641,
         "gate_verdict": "PASS",
-        "gate_reasons": []
+        "gate_reasons": [],
+        "review_status": "invalid_baseline",
+        "review_reason": "The original loader skipped all 170 pretrained encoder weights.",
+        "replacement_report": "decisions-20261121.json"
       },
       "coreai-laya": {
         "package": "coreai-laya",
@@ -1619,7 +1628,10 @@
         "effective_outcome_per_sec": 5.0548,
         "wall_sec": 145.012,
         "gate_verdict": "PASS",
-        "gate_reasons": []
+        "gate_reasons": [],
+        "review_status": "superseded_baseline",
+        "review_reason": "The original adapter loaded a second scoring model for tokenization. The replacement uses one model and preserves the per-item decisions.",
+        "replacement_report": "decisions-20261121.json"
       }
     },
     "reference_warm_probes": {

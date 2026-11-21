@@ -30,7 +30,7 @@ Always gate quantization & approximation experiments on **`e2e docs/s × blind a
 1. `Gemma-4 Dual-MLP Q4`: Raw decode rose (`718 -> 765 dec t/s`), **but** Q4 rounding emitted `+1,152` extra verbose tokens (`26.80s` vs `26.18s`, `40/64` exact).
 2. `Gemma-4 PrefixANE W8`: Raw speed rose `+34%` (`33.96` vs `44.14 ms`), **but** unaligned `W8` triggered a `515`-token repeat loop (`2.18` vs `3.47 docs/s`).
 3. `Gemma-4 MLX-4bit` PTQ vs Aligned V4: High raw decode (`704.8 t/s`) trailed aligned throughput (`1.648` vs `2.079–2.537 docs/s`) due to verbose outputs and `72×` more grammar mask fallbacks.
-4. `Gemma-4 E4B` QAT vs PTQ unconstrained: QAT emitted `374.4` tokens vs PTQ `194.8` tokens for the exact same prompt batch (`llguidance` required for both).
+4. On schema-constrained Gemma 4 E4B extraction, the quantization-aware checkpoint averaged 374.4 output tokens against 194.8 for the post-training-quantized checkpoint. A separate 128-document batch in the same modified MLX runner averaged 396.2 versus 242.0 tokens, with 128/128 schema-valid for both checkpoints.
 
 ---
 

@@ -1,0 +1,2119 @@
+{
+  "date": "2026-11-21",
+  "dataset_lock_sha256": "e48fe76e958ed203cf3145e6ba00295776d7b3981fca9a0d318fccfac727704c",
+  "tier1_tasks": {
+    "RAGTruth faithfulness": 600,
+    "CLINC150 two-stage intent": 550,
+    "RewardBench-2 best of four": 250
+  },
+  "measurement": "Tier-1 seconds cover evaluation after warmup, including tokenization, scoring, and subtask evaluation. Each worker loads one scorer, under the host GPU lock. Different implementations were timed separately. Score units per second equals correct answers divided by scoring time.",
+  "memory": "Decimal GB. The combined harness figure is a snapshot after scoring. On the selected mixed runs, the harness scanned the staged package artifacts for clean model mappings. Any clean resident mappings backed by the stock Hugging Face cache are omitted, so these combined snapshots are lower bounds. The cache probe selected the stock snapshot directory; symlink targets outside that directory could also be omitted there. The process lifetime peak and MLX allocation peak are independent counters and are retained. Both stock adapters limit the MLX free buffer cache to 512 MiB.",
+  "timing_conditions": "Watchdog monitored process-tree memory. The coordinators permitted background CPU activity; the M4 initial preflight detected macOS media analysis and a virtualization process. These single-run elapsed times carry no timing confidence interval.",
+  "per_item_encoding": "1,400 binary per-item scores in locked RAGTruth, CLINC150, RewardBench-2 order, packed most significant bit first into 175 bytes. Each item had a valid output.",
+  "receipt_root": ".cache/archive-release/investigations/fast-silicon-decisions-20261121/ (measurement workspace)",
+  "historical_receipt_root": "fast-silicon/artifacts/reviews/readme-benchmark-20261120/coreml-input/",
+  "models": {
+    "laya": {
+      "checkpoint": "convaiinnovations/laya-typed-decisions",
+      "revision": "3903ff997712bd73ccb2dc879262dac8f0d443bb",
+      "runtime": "mlx-embeddings ModernBertModel, 8-bit weights, group size 64, BF16 head projections, FP32 scorer. Strict inner encoder load of all 170 tensors."
+    },
+    "kev": {
+      "checkpoint": "AbstractFramework/kev-0.8b-mlx-8bit",
+      "revision": "ea2212f5bc6543a96ed5385bb4ca221257c615c8",
+      "runtime": "mlx-lm 8-bit scorer and public pointer head. Uses only tokenizer.json from the original jaredpalmer/kev-0.8b adapter to match the project scorer."
+    }
+  },
+  "tokenizer_audit": {
+    "special_ids": [
+      248060,
+      248061,
+      248049,
+      248050,
+      248062
+    ],
+    "model_revision": "ea2212f5bc6543a96ed5385bb4ca221257c615c8",
+    "repacked_tokenizer_sha256": "fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927",
+    "project_tokenizer_sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "workloads": {
+      "ragtruth": {
+        "states": 600,
+        "branches": 600,
+        "equal_layouts": true,
+        "repack_different_state_indices": [],
+        "layout_sha256": "bb78797408090b0d90b8bcdc729d439df0179cbade6ea9f4c6c8b85c5b45296b"
+      },
+      "clinc_domains_and_all_possible_intent_branches": {
+        "states": 550,
+        "branches": 6050,
+        "equal_layouts": true,
+        "repack_different_state_indices": [],
+        "layout_sha256": "45c02f2d11313606b6e16c0fab0bcb11720b858d5c3bd31af19e94a0c6a58292"
+      },
+      "all_rewardbench_candidates": {
+        "states": 1000,
+        "branches": 1000,
+        "equal_layouts": true,
+        "repack_different_state_indices": [
+          558,
+          915
+        ],
+        "layout_sha256": "106b2d118e00f80cc4981ff2ddeff09abbe980dba4ab363932ff58bfdbbf30c8"
+      }
+    }
+  },
+  "laya_reference": {
+    "fixture": "../../tests/fixtures/laya_stock_reference.json",
+    "reference_source_sha256": "8d83611d480c971d640a7b7d3aa2f2219c5e8455e9cc2329fd073681bd8be23e",
+    "allowed_max_abs_probability_difference": 0.03,
+    "model": "PyTorch FP32 CPU reference with strict checkpoint load",
+    "checked": "Every probability, exact option rank, token ID sequence and marker position on five inputs. Mixed question types share one padded stock batch, while the reference scored each example individually."
+  },
+  "kev_cache_method": "Eight locked RAGTruth records draw on two repeated source contexts. Each arm runs in a new process, warms on an unrelated input, measures the first scoring call, then repeats it. Project plain sets prefix_cache_mb=0 explicitly. One symmetric six-run schedule measures each arm twice. Seconds include tokenization, the full backbone and pointer head plus transfer of every option probability and raw logit.",
+  "hosts": {
+    "m4": {
+      "host": {
+        "hw_model": "Mac16,8",
+        "chip": "Apple M4 Pro",
+        "mem_gb": 48,
+        "macos_version": "26.6",
+        "mlx_version": "0.32.4",
+        "python_version": "3.13.14",
+        "python_version_note": "Coordinator interpreter",
+        "stock_worker_python": "3.12.13",
+        "stock_libraries": {
+          "mlx": "0.32.4",
+          "mlx-embeddings": "0.1.0",
+          "mlx-lm": "0.32.2",
+          "tokenizers": "0.23.3",
+          "transformers": "5.23.0"
+        }
+      },
+      "selected": {
+        "laya": {
+          "package": "public-laya",
+          "correct": 703,
+          "valid": 1400,
+          "intended": 1400,
+          "mean_score": 0.502143,
+          "seconds": 130.6805,
+          "score_units_per_second": 5.3795,
+          "task_correct": {
+            "ragtruth": 378,
+            "clinc150": 246,
+            "rewardbench2": 79
+          },
+          "task_metrics": {
+            "ragtruth_noul": {
+              "n_items": 600,
+              "n_valid": 600,
+              "auroc": 0.672515,
+              "auroc_se_delong": 0.022238,
+              "macro_f1": 0.604626,
+              "accuracy": 0.63,
+              "brier": 0.224891,
+              "ece_15": 0.118494,
+              "length_slices": {
+                "le_512": {
+                  "n": 123,
+                  "auroc": 0.594364,
+                  "macro_f1": 0.479959,
+                  "accuracy": 0.796748
+                },
+                "gt_512": {
+                  "n": 477,
+                  "auroc": 0.628586,
+                  "macro_f1": 0.58123,
+                  "accuracy": 0.587002
+                }
+              }
+            },
+            "clinc150_2stage": {
+              "n_items": 550,
+              "n_valid": 550,
+              "stage1_domain_acc": 0.525455,
+              "end_to_end_151_acc": 0.447273,
+              "end_to_end_151_acc_given_valid": 0.447273,
+              "oos_auroc": 0.783778,
+              "oos_f1": 0.317241,
+              "stage1_nll": 3.833418
+            },
+            "reward_bench_2": {
+              "n_items": 250,
+              "n_valid": 250,
+              "macro_best_of_4_acc": 0.316,
+              "micro_best_of_4_acc": 0.316,
+              "subset_accuracy": {
+                "Factuality": 0.3,
+                "Precise IF": 0.36,
+                "Math": 0.38,
+                "Safety": 0.2,
+                "Focus": 0.34
+              }
+            }
+          },
+          "memory_gb": {
+            "mlx_peak_gb": 1.4808,
+            "phys_footprint_gb": 1.9955,
+            "peak_footprint_gb": 2.6324,
+            "model_mapped_gb": 0.0,
+            "neural_nofootprint_gb": 0.0,
+            "combined_with_model_mapped_gb": 1.9955
+          },
+          "repeat_loops": 0,
+          "device_guard_tripped": false,
+          "per_item_correct_bits_hex": "56fe5ffadee79d7ffbffb5a3f6ffffe600200000008800800001880042877f7fdfffff7daffbfdabffddd7ffff7efbffdbff02a40301402277fbeffb9ffdaef3cf5c8c7fff6ffbf577bfdfb574f17fe84bf5bbfbdbffedf71b289ffe0440000402a3db4cfaa958c6400a6160287f9d75f4eff2d5b0edfcab008200004105bc0dd9916200015825051c84808822a20241c41e2402c2018276229424908a4951001a75790b1980c30338100051842828",
+          "source": "m4-laya.json",
+          "source_sha256": "1435184dc8eae7c4de06fb055a233b564ed995d60d9227eabfdab0f58cdaebdb",
+          "status": "selected"
+        },
+        "kev": {
+          "package": "public-kev-0.8b",
+          "correct": 732,
+          "valid": 1400,
+          "intended": 1400,
+          "mean_score": 0.522857,
+          "seconds": 225.3301,
+          "score_units_per_second": 3.2486,
+          "task_correct": {
+            "ragtruth": 386,
+            "clinc150": 274,
+            "rewardbench2": 72
+          },
+          "task_metrics": {
+            "ragtruth_noul": {
+              "n_items": 600,
+              "n_valid": 600,
+              "auroc": 0.606801,
+              "auroc_se_delong": 0.024221,
+              "macro_f1": 0.416692,
+              "accuracy": 0.643333,
+              "brier": 0.254147,
+              "ece_15": 0.186932,
+              "length_slices": {
+                "le_512": {
+                  "n": 133,
+                  "auroc": 0.507203,
+                  "macro_f1": 0.45935,
+                  "accuracy": 0.849624
+                },
+                "gt_512": {
+                  "n": 467,
+                  "auroc": 0.608423,
+                  "macro_f1": 0.395884,
+                  "accuracy": 0.584582
+                }
+              }
+            },
+            "clinc150_2stage": {
+              "n_items": 550,
+              "n_valid": 550,
+              "stage1_domain_acc": 0.616364,
+              "end_to_end_151_acc": 0.498182,
+              "end_to_end_151_acc_given_valid": 0.498182,
+              "oos_auroc": 0.832178,
+              "oos_f1": 0.455172,
+              "stage1_nll": 1.203332
+            },
+            "reward_bench_2": {
+              "n_items": 250,
+              "n_valid": 250,
+              "macro_best_of_4_acc": 0.288,
+              "micro_best_of_4_acc": 0.288,
+              "subset_accuracy": {
+                "Factuality": 0.3,
+                "Precise IF": 0.28,
+                "Math": 0.58,
+                "Safety": 0.06,
+                "Focus": 0.22
+              }
+            }
+          },
+          "memory_gb": {
+            "mlx_peak_gb": 2.1216,
+            "phys_footprint_gb": 2.1017,
+            "peak_footprint_gb": 3.3909,
+            "model_mapped_gb": 0.0,
+            "neural_nofootprint_gb": 0.0,
+            "combined_with_model_mapped_gb": 2.1017
+          },
+          "repeat_loops": 0,
+          "device_guard_tripped": false,
+          "per_item_correct_bits_hex": "10040000000000000010000000000000ffffffffffffffefff200000000fffeeffdffffffffbfffffffff6fffffefbffffff080010000003fffffffffffffffffffdfffffffffffffffffffd7e77fec9a9013f839d8737603b8ce9fdc6794ccdbca25ecc8a7915024008600022000c205137877574ecfda241ba711b9dd834815809473e45f2bbdb7f21ecc77a7efec88732301c220402c20840a4821e596ff8af2322824800a055b0000020080800",
+          "source": "m4-kev-matched.json",
+          "source_sha256": "19508b78f4b1be5edfc4a9d5e316d2f7dad5b22d1a321b4e334226b986675814",
+          "status": "selected"
+        }
+      },
+      "previous": {
+        "laya": {
+          "source": "m4_stock_tier1.json",
+          "source_sha256": "13ce1d6466d597af61ab8f91aebf95bfe5f12ed7193754cdcb91bd98e3e80a00",
+          "mean_score": 0.298571,
+          "seconds": 137.8561,
+          "combined_memory_gb": 34.0165,
+          "status": "invalid",
+          "reason": "All 170 pretrained encoder weights were skipped by a non-strict load into the masked-LM wrapper.",
+          "changed_per_item_scores": 645
+        },
+        "kev": {
+          "source": "m4_stock_tier1.json",
+          "source_sha256": "13ce1d6466d597af61ab8f91aebf95bfe5f12ed7193754cdcb91bd98e3e80a00",
+          "mean_score": 0.522857,
+          "seconds": 239.0917,
+          "combined_memory_gb": 3.2622,
+          "status": "superseded",
+          "reason": "The old worker loaded a second project scorer solely to format input. Its per-item scores are retained. Its time and memory include that configuration.",
+          "changed_per_item_scores": 0
+        },
+        "kev_repacked_tokenizer_probe": {
+          "source": "m4-kev.json",
+          "source_sha256": "374467a75d8e8fad30bba25f5a4b3fdcbfabd5a1553c848e2d10b8b1172190ba",
+          "mean_score": 0.522857,
+          "seconds": 222.8527,
+          "combined_memory_gb": 2.061,
+          "status": "superseded",
+          "reason": "Single scorer, but the repacked tokenizer changed two of the 1,000 RewardBench candidate inputs. Selected run uses the original tokenizer."
+        }
+      },
+      "laya_parity": {
+        "rank_matches": 5,
+        "max_abs_probability_difference": 0.004775103250728996,
+        "cases": [
+          {
+            "case": "short_invoice",
+            "input_tokens": 50,
+            "rank": [
+              1,
+              0
+            ],
+            "stock_probabilities": [
+              0.3259599948082949,
+              0.674040005191705
+            ],
+            "max_abs_error": 0.00136332271947609
+          },
+          {
+            "case": "long_cause",
+            "input_tokens": 512,
+            "rank": [
+              0,
+              1,
+              2
+            ],
+            "stock_probabilities": [
+              0.5777341778778582,
+              0.3161266601435099,
+              0.10613916197863205
+            ],
+            "max_abs_error": 0.0018386481150685086
+          },
+          {
+            "case": "short_score",
+            "input_tokens": 60,
+            "rank": [
+              1,
+              0,
+              2
+            ],
+            "stock_probabilities": [
+              0.2775436901247372,
+              0.5705442608195321,
+              0.15191204905573058
+            ],
+            "max_abs_error": 0.004775103250728996
+          },
+          {
+            "case": "long_reordered",
+            "input_tokens": 512,
+            "rank": [
+              1,
+              2,
+              0
+            ],
+            "stock_probabilities": [
+              0.1747215005511536,
+              0.4238658807388993,
+              0.4014126187099471
+            ],
+            "max_abs_error": 0.0014542701596512164
+          },
+          {
+            "case": "long_invoice",
+            "input_tokens": 428,
+            "rank": [
+              1,
+              0
+            ],
+            "stock_probabilities": [
+              0.37826509314232304,
+              0.621734906857677
+            ],
+            "max_abs_error": 0.0011749164516405841
+          }
+        ]
+      },
+      "kev_cache": {
+        "source": "m4-kev-cache-final.json",
+        "source_sha256": "d499069ab9505d97c4afcbdd081b9a642513ae883c567341ef5dc752b568f631",
+        "input_records": [
+          {
+            "id": "10350",
+            "state_tokens": 940,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "6cad11746c98645622f72369b42db8856c0cc7310be375657ba38bca6b737eb0"
+          },
+          {
+            "id": "10351",
+            "state_tokens": 1015,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "245534746275bfcdce3be4168e2fa112285cc5aa689224e52dda33fbb2de650b"
+          },
+          {
+            "id": "10352",
+            "state_tokens": 886,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "6e014e31f31293fad2705805716bc240adfe31ad7a31b8693e29b63e67bb4f49"
+          },
+          {
+            "id": "10353",
+            "state_tokens": 920,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "a22760f4531f058d9c5ed1a31b577cfbccfa33c0d83ebbbdb998b681bf7d0b9d"
+          },
+          {
+            "id": "10354",
+            "state_tokens": 974,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "b43565dfa4847ac99c6d5e452f8e47162917aeea20bd4cb1573b23507c595439"
+          },
+          {
+            "id": "15685",
+            "state_tokens": 432,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "0b3f9c1048339e4d3def74450996ba3abd2d837385856abde2b69fb97718ee10"
+          },
+          {
+            "id": "15686",
+            "state_tokens": 455,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "03b8739b36fcb4ebaf5a04d387ff65c4ec92d965a1f37147ed1121810a2615c4"
+          },
+          {
+            "id": "15687",
+            "state_tokens": 532,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "63ac9299549333d72fb4a45d11b58afe5412d67f36869cf854079f3bfd063d56"
+          }
+        ],
+        "arm_order": [
+          "plain",
+          "cached",
+          "stock",
+          "stock",
+          "cached",
+          "plain"
+        ],
+        "arms": {
+          "plain": {
+            "prefix_cache_enabled": false,
+            "load_seconds": [
+              0.2436115420423448,
+              0.2534092919668183
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 3.749322412,
+                "process_peak_footprint": 4.401071688,
+                "process_footprint": 1.898677856,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.8987
+              },
+              {
+                "mlx_peak": 3.749322412,
+                "process_peak_footprint": 4.404643472,
+                "process_footprint": 1.90832808,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.9083
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.19809691701084375,
+                    0.19916975003434345
+                  ],
+                  "median_seconds": 0.1986333335225936,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20681644232233837,
+                        0.7931835576776617
+                      ],
+                      "logits": [
+                        0.846651017665863,
+                        4.0070481300354
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.20120604196563363,
+                    0.19917675002943724
+                  ],
+                  "median_seconds": 0.20019139599753544,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    1.6512279590242542,
+                    1.6510182499769144
+                  ],
+                  "median_seconds": 1.6511231045005843,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.21061190115722983,
+                        0.7893880988427701
+                      ],
+                      "logits": [
+                        0.850443959236145,
+                        3.956808090209961
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2044853595904588,
+                        0.7955146404095412
+                      ],
+                      "logits": [
+                        0.8813647627830505,
+                        4.075311660766602
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2662864571912386,
+                        0.7337135428087613
+                      ],
+                      "logits": [
+                        1.0182461738586426,
+                        3.4011900424957275
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22264894143548022,
+                        0.7773510585645198
+                      ],
+                      "logits": [
+                        1.040029525756836,
+                        3.9795947074890137
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.23326150355795694,
+                        0.7667384964420431
+                      ],
+                      "logits": [
+                        0.6657431125640869,
+                        3.4635133743286133
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.12363961398299811,
+                        0.8763603860170018
+                      ],
+                      "logits": [
+                        0.6376237869262695,
+                        5.242024898529053
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10187116770888106,
+                        0.898128832291119
+                      ],
+                      "logits": [
+                        0.5038347244262695,
+                        5.621240615844727
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.0701534230246442,
+                        0.9298465769753559
+                      ],
+                      "logits": [
+                        0.30685099959373474,
+                        6.382870197296143
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    1.651799375016708,
+                    1.6471889580134302
+                  ],
+                  "median_seconds": 1.649494166515069,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          },
+          "cached": {
+            "prefix_cache_enabled": true,
+            "load_seconds": [
+              0.2602233329671435,
+              0.25354254205012694
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 1.355872222,
+                "process_peak_footprint": 1.950713512,
+                "process_footprint": 1.70859076,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.7086
+              },
+              {
+                "mlx_peak": 1.355859682,
+                "process_peak_footprint": 1.953154752,
+                "process_footprint": 1.676314304,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.6763
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.20870224997634068,
+                    0.20887612499063835
+                  ],
+                  "median_seconds": 0.2087891874834895,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20913444955860278,
+                        0.7908655504413973
+                      ],
+                      "logits": [
+                        0.8633695840835571,
+                        3.9906811714172363
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.06026512500829995,
+                    0.05967741698259488
+                  ],
+                  "median_seconds": 0.05997127099544741,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "tree_after_warm_first_run": {
+                  "chunk_tokens": 256,
+                  "node_count": 3,
+                  "snapshot_count": 3,
+                  "bytes_held": 68050944,
+                  "byte_budget": 536870912,
+                  "hits": 1,
+                  "misses": 1,
+                  "hit_rate": 0.5,
+                  "reused_tokens": 768,
+                  "matched_but_replayed_tokens": 0,
+                  "evicted_nodes": 0
+                },
+                "vs_plain": {
+                  "max_abs_probability": 0.0023180072362644077,
+                  "max_abs_logit": 0.016718566417694092,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.7080959160230123,
+                    0.705373666016385
+                  ],
+                  "median_seconds": 0.7067347910196986,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20913444955860278,
+                        0.7908655504413973
+                      ],
+                      "logits": [
+                        0.8633695840835571,
+                        3.9906811714172363
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.19731243926960695,
+                        0.8026875607303932
+                      ],
+                      "logits": [
+                        0.8708661198616028,
+                        4.169869899749756
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2598789572182662,
+                        0.7401210427817339
+                      ],
+                      "logits": [
+                        1.001427412033081,
+                        3.4620790481567383
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2151962845658056,
+                        0.7848037154341944
+                      ],
+                      "logits": [
+                        1.0201655626296997,
+                        4.062208652496338
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22899777540119576,
+                        0.7710022245988042
+                      ],
+                      "logits": [
+                        0.6554774641990662,
+                        3.5096583366394043
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.12025596703811878,
+                        0.8797440329618813
+                      ],
+                      "logits": [
+                        0.6275314092636108,
+                        5.30623197555542
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10369170900552105,
+                        0.896308290994479
+                      ],
+                      "logits": [
+                        0.5025250911712646,
+                        5.573514938354492
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.06777586572638039,
+                        0.9322241342736195
+                      ],
+                      "logits": [
+                        0.29828858375549316,
+                        6.461373805999756
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.4542527499725111,
+                    0.45194220799021423
+                  ],
+                  "median_seconds": 0.45309747898136266,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "tree_after_warm_first_run": {
+                  "chunk_tokens": 256,
+                  "node_count": 5,
+                  "snapshot_count": 5,
+                  "bytes_held": 113418240,
+                  "byte_budget": 536870912,
+                  "hits": 15,
+                  "misses": 3,
+                  "hit_rate": 0.8333333333333334,
+                  "reused_tokens": 9216,
+                  "matched_but_replayed_tokens": 0,
+                  "evicted_nodes": 3
+                },
+                "vs_plain": {
+                  "max_abs_probability": 0.007452656869674612,
+                  "max_abs_logit": 0.0945582389831543,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          },
+          "stock": {
+            "prefix_cache_enabled": false,
+            "load_seconds": [
+              1.6415778329828754,
+              1.6305461670272052
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 1.94280527,
+                "process_peak_footprint": 2.987558976,
+                "process_footprint": 2.043971648,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 2.044
+              },
+              {
+                "mlx_peak": 1.942707222,
+                "process_peak_footprint": 2.980071464,
+                "process_footprint": 2.027276328,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 2.0273
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.1938190420041792,
+                    0.19601487496402115
+                  ],
+                  "median_seconds": 0.19491695848410018,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20811843872070312,
+                        0.7918815612792969
+                      ],
+                      "logits": [
+                        0.8522915840148926,
+                        3.9940717220306396
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.18991358298808336,
+                    0.18977699999231845
+                  ],
+                  "median_seconds": 0.1898452914902009,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "vs_cached": {
+                  "max_abs_probability": 0.0010160108378996502,
+                  "max_abs_logit": 0.01107800006866455,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    1.2859867090010084,
+                    1.2860858750063926
+                  ],
+                  "median_seconds": 1.2860362920037005,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20811843872070312,
+                        0.7918815612792969
+                      ],
+                      "logits": [
+                        0.8522915840148926,
+                        3.9940717220306396
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.19840861856937408,
+                        0.8015913963317871
+                      ],
+                      "logits": [
+                        0.8367812633514404,
+                        4.119546890258789
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.26797235012054443,
+                        0.7320276498794556
+                      ],
+                      "logits": [
+                        1.0303311347961426,
+                        3.393028736114502
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22666729986667633,
+                        0.7733327746391296
+                      ],
+                      "logits": [
+                        1.0424124002456665,
+                        3.927738904953003
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.23336340487003326,
+                        0.7666366100311279
+                      ],
+                      "logits": [
+                        0.6837594509124756,
+                        3.4801907539367676
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.12373068183660507,
+                        0.8762693405151367
+                      ],
+                      "logits": [
+                        0.6301611661911011,
+                        5.2325873374938965
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10415584594011307,
+                        0.8958442211151123
+                      ],
+                      "logits": [
+                        0.5212814211845398,
+                        5.580554008483887
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.07055171579122543,
+                        0.9294482469558716
+                      ],
+                      "logits": [
+                        0.3044549822807312,
+                        6.366156578063965
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    1.2902984999818727,
+                    1.2832102089887485
+                  ],
+                  "median_seconds": 1.2867543544853106,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "vs_cached": {
+                  "max_abs_probability": 0.011471015300870718,
+                  "max_abs_logit": 0.13446974754333496,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "m5": {
+      "host": {
+        "hw_model": "Mac17,2",
+        "chip": "Apple M5",
+        "mem_gb": 24,
+        "macos_version": "27.2.1",
+        "mlx_version": "0.32.4",
+        "python_version": "3.13.14",
+        "python_version_note": "Coordinator interpreter",
+        "stock_worker_python": "3.12.16",
+        "stock_libraries": {
+          "mlx": "0.32.4",
+          "mlx-embeddings": "0.1.0",
+          "mlx-lm": "0.32.2",
+          "tokenizers": "0.23.3",
+          "transformers": "5.23.0"
+        }
+      },
+      "selected": {
+        "laya": {
+          "package": "public-laya",
+          "correct": 702,
+          "valid": 1400,
+          "intended": 1400,
+          "mean_score": 0.501429,
+          "seconds": 73.9221,
+          "score_units_per_second": 9.4965,
+          "task_correct": {
+            "ragtruth": 375,
+            "clinc150": 248,
+            "rewardbench2": 79
+          },
+          "task_metrics": {
+            "ragtruth_noul": {
+              "n_items": 600,
+              "n_valid": 600,
+              "auroc": 0.670989,
+              "auroc_se_delong": 0.022277,
+              "macro_f1": 0.599643,
+              "accuracy": 0.625,
+              "brier": 0.225179,
+              "ece_15": 0.119806,
+              "length_slices": {
+                "le_512": {
+                  "n": 123,
+                  "auroc": 0.59633,
+                  "macro_f1": 0.516383,
+                  "accuracy": 0.804878
+                },
+                "gt_512": {
+                  "n": 477,
+                  "auroc": 0.627115,
+                  "macro_f1": 0.572727,
+                  "accuracy": 0.578616
+                }
+              }
+            },
+            "clinc150_2stage": {
+              "n_items": 550,
+              "n_valid": 550,
+              "stage1_domain_acc": 0.527273,
+              "end_to_end_151_acc": 0.450909,
+              "end_to_end_151_acc_given_valid": 0.450909,
+              "oos_auroc": 0.784356,
+              "oos_f1": 0.315068,
+              "stage1_nll": 3.829704
+            },
+            "reward_bench_2": {
+              "n_items": 250,
+              "n_valid": 250,
+              "macro_best_of_4_acc": 0.316,
+              "micro_best_of_4_acc": 0.316,
+              "subset_accuracy": {
+                "Factuality": 0.3,
+                "Precise IF": 0.36,
+                "Math": 0.36,
+                "Safety": 0.22,
+                "Focus": 0.34
+              }
+            }
+          },
+          "memory_gb": {
+            "mlx_peak_gb": 1.3419,
+            "phys_footprint_gb": 1.8833,
+            "peak_footprint_gb": 2.5768,
+            "model_mapped_gb": 0.0,
+            "neural_nofootprint_gb": 0.0,
+            "combined_with_model_mapped_gb": 1.8833
+          },
+          "repeat_loops": 0,
+          "device_guard_tripped": false,
+          "per_item_correct_bits_hex": "56fe5d7adee79d7ffbffb5a3f6ffffe6002000000088008000018a0042877f7fdfffff7daffbfdabffddd7ffff7efbffdbff02a40301402277fbeffb9bfdaef3cf5c8c7fff6f7bf577bfdfb574f17fe84bf5bbfbdbffedf71f289ffe0440000402a3db4cfaa958c6400a6160287f9d75f4eff2d5b0edfcab008200004105bc0dd9916220015825051c84808822a20241c41e2402c2018276229424908a4951001a55792b1980430338100451842828",
+          "source": "m5-laya.json",
+          "source_sha256": "82f1eae7f8095d1e922a8470f71894ea3dc7b8d5de794c840a7fd62121784c71",
+          "status": "selected"
+        },
+        "kev": {
+          "package": "public-kev-0.8b",
+          "correct": 733,
+          "valid": 1400,
+          "intended": 1400,
+          "mean_score": 0.523571,
+          "seconds": 145.4554,
+          "score_units_per_second": 5.0393,
+          "task_correct": {
+            "ragtruth": 386,
+            "clinc150": 273,
+            "rewardbench2": 74
+          },
+          "task_metrics": {
+            "ragtruth_noul": {
+              "n_items": 600,
+              "n_valid": 600,
+              "auroc": 0.60663,
+              "auroc_se_delong": 0.024243,
+              "macro_f1": 0.416692,
+              "accuracy": 0.643333,
+              "brier": 0.253947,
+              "ece_15": 0.18666,
+              "length_slices": {
+                "le_512": {
+                  "n": 133,
+                  "auroc": 0.503001,
+                  "macro_f1": 0.45935,
+                  "accuracy": 0.849624
+                },
+                "gt_512": {
+                  "n": 467,
+                  "auroc": 0.608574,
+                  "macro_f1": 0.395884,
+                  "accuracy": 0.584582
+                }
+              }
+            },
+            "clinc150_2stage": {
+              "n_items": 550,
+              "n_valid": 550,
+              "stage1_domain_acc": 0.614545,
+              "end_to_end_151_acc": 0.496364,
+              "end_to_end_151_acc_given_valid": 0.496364,
+              "oos_auroc": 0.830778,
+              "oos_f1": 0.455172,
+              "stage1_nll": 1.204234
+            },
+            "reward_bench_2": {
+              "n_items": 250,
+              "n_valid": 250,
+              "macro_best_of_4_acc": 0.296,
+              "micro_best_of_4_acc": 0.296,
+              "subset_accuracy": {
+                "Factuality": 0.32,
+                "Precise IF": 0.26,
+                "Math": 0.62,
+                "Safety": 0.06,
+                "Focus": 0.22
+              }
+            }
+          },
+          "memory_gb": {
+            "mlx_peak_gb": 1.843,
+            "phys_footprint_gb": 2.2819,
+            "peak_footprint_gb": 3.0104,
+            "model_mapped_gb": 0.0,
+            "neural_nofootprint_gb": 0.0,
+            "combined_with_model_mapped_gb": 2.2819
+          },
+          "repeat_loops": 0,
+          "device_guard_tripped": false,
+          "per_item_correct_bits_hex": "10040000000000000010000000000000ffffffffffffffefff200000000fffeeffdffffffffbfffffffff6fffffefbffffff080010000003fffffffffffffffffffdfffffffffffffffffffd7e77fec9a9013f839d8737603b8ce9fdc6794ccdbca25ecc8a7915024008600022000c205137877574ecfda241ba711b9dd834815809473e45f2bbdb7f21e8c77a7efec88732301c224402c20840a4821e796ff8af23a2820800a055b0000020080800",
+          "source": "m5-kev-matched.json",
+          "source_sha256": "4f380e597477d19d543ccd861e835b8057e12d075777ba0806127171b5717f62",
+          "status": "selected"
+        }
+      },
+      "previous": {
+        "laya": {
+          "source": "m5_stock_decision_retry.json",
+          "source_sha256": "e233c23ba0a1a9d90311819ecc72f386f807d0bb3ce2667ae18f6eca404d9a7e",
+          "mean_score": 0.275714,
+          "seconds": 72.5641,
+          "combined_memory_gb": 18.7012,
+          "status": "invalid",
+          "reason": "All 170 pretrained encoder weights were skipped by a non-strict load into the masked-LM wrapper.",
+          "changed_per_item_scores": 684
+        },
+        "kev": {
+          "source": "m5_stock_decision_retry.json",
+          "source_sha256": "e233c23ba0a1a9d90311819ecc72f386f807d0bb3ce2667ae18f6eca404d9a7e",
+          "mean_score": 0.523571,
+          "seconds": 145.012,
+          "combined_memory_gb": 3.0581,
+          "status": "superseded",
+          "reason": "The old worker loaded a second project scorer solely to format input. Its per-item scores are retained. Its time and memory include that configuration.",
+          "changed_per_item_scores": 0
+        },
+        "kev_repacked_tokenizer_probe": {
+          "source": "m5-kev.json",
+          "source_sha256": "09fc1f2d0ddaa7e7698194cceec4cb0bf9c7ce1ef2237d9190c83afd8e45b51c",
+          "mean_score": 0.523571,
+          "seconds": 145.7071,
+          "combined_memory_gb": 2.2637,
+          "status": "superseded",
+          "reason": "Single scorer, but the repacked tokenizer changed two of the 1,000 RewardBench candidate inputs. Selected run uses the original tokenizer."
+        }
+      },
+      "laya_parity": {
+        "rank_matches": 5,
+        "max_abs_probability_difference": 0.0034860869810188766,
+        "cases": [
+          {
+            "case": "short_invoice",
+            "input_tokens": 50,
+            "rank": [
+              1,
+              0
+            ],
+            "stock_probabilities": [
+              0.32638400893043995,
+              0.67361599106956
+            ],
+            "max_abs_error": 0.0009393085973310455
+          },
+          {
+            "case": "long_cause",
+            "input_tokens": 512,
+            "rank": [
+              0,
+              1,
+              2
+            ],
+            "stock_probabilities": [
+              0.5808472338067898,
+              0.315459007069435,
+              0.10369375912377507
+            ],
+            "max_abs_error": 0.002604157005489771
+          },
+          {
+            "case": "short_score",
+            "input_tokens": 60,
+            "rank": [
+              1,
+              0,
+              2
+            ],
+            "stock_probabilities": [
+              0.27625467385502706,
+              0.5704818953062162,
+              0.15326343083875685
+            ],
+            "max_abs_error": 0.0034860869810188766
+          },
+          {
+            "case": "long_reordered",
+            "input_tokens": 512,
+            "rank": [
+              1,
+              2,
+              0
+            ],
+            "stock_probabilities": [
+              0.1742534061377334,
+              0.4252110716968685,
+              0.4005355221653982
+            ],
+            "max_abs_error": 0.001455278930564352
+          },
+          {
+            "case": "long_invoice",
+            "input_tokens": 428,
+            "rank": [
+              1,
+              0
+            ],
+            "stock_probabilities": [
+              0.3768440134745915,
+              0.6231559865254085
+            ],
+            "max_abs_error": 0.0025959961193721126
+          }
+        ]
+      },
+      "kev_cache": {
+        "source": "m5-kev-cache.json",
+        "source_sha256": "239f0af5fb7dd9b1fc4f333bdd461fab61ce40563be9f28fb800463130ed067d",
+        "input_records": [
+          {
+            "id": "10350",
+            "state_tokens": 940,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "6cad11746c98645622f72369b42db8856c0cc7310be375657ba38bca6b737eb0"
+          },
+          {
+            "id": "10351",
+            "state_tokens": 1015,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "245534746275bfcdce3be4168e2fa112285cc5aa689224e52dda33fbb2de650b"
+          },
+          {
+            "id": "10352",
+            "state_tokens": 886,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "6e014e31f31293fad2705805716bc240adfe31ad7a31b8693e29b63e67bb4f49"
+          },
+          {
+            "id": "10353",
+            "state_tokens": 920,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "a22760f4531f058d9c5ed1a31b577cfbccfa33c0d83ebbbdb998b681bf7d0b9d"
+          },
+          {
+            "id": "10354",
+            "state_tokens": 974,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "b43565dfa4847ac99c6d5e452f8e47162917aeea20bd4cb1573b23507c595439"
+          },
+          {
+            "id": "15685",
+            "state_tokens": 432,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "0b3f9c1048339e4d3def74450996ba3abd2d837385856abde2b69fb97718ee10"
+          },
+          {
+            "id": "15686",
+            "state_tokens": 455,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "03b8739b36fcb4ebaf5a04d387ff65c4ec92d965a1f37147ed1121810a2615c4"
+          },
+          {
+            "id": "15687",
+            "state_tokens": 532,
+            "branch_tokens": [
+              44
+            ],
+            "input_sha256": "63ac9299549333d72fb4a45d11b58afe5412d67f36869cf854079f3bfd063d56"
+          }
+        ],
+        "arm_order": [
+          "plain",
+          "cached",
+          "stock",
+          "stock",
+          "cached",
+          "plain"
+        ],
+        "arms": {
+          "plain": {
+            "prefix_cache_enabled": false,
+            "load_seconds": [
+              0.28988850000314415,
+              0.2015424580022227
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 3.673267876,
+                "process_peak_footprint": 4.152788576,
+                "process_footprint": 1.968227936,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.9682
+              },
+              {
+                "mlx_peak": 3.673267876,
+                "process_peak_footprint": 4.151281296,
+                "process_footprint": 1.867073192,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.8671
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.13554837502306327,
+                    0.13555816700682044
+                  ],
+                  "median_seconds": 0.13555327101494186,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.2092530265535076,
+                        0.7907469734464924
+                      ],
+                      "logits": [
+                        0.8357264399528503,
+                        3.961352825164795
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.13609016602276824,
+                    0.13602787497802638
+                  ],
+                  "median_seconds": 0.1360590205003973,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    1.1128239590034354,
+                    1.1125515410094522
+                  ],
+                  "median_seconds": 1.1126877500064438,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.21446417305503193,
+                        0.785535826944968
+                      ],
+                      "logits": [
+                        0.8678798675537109,
+                        3.9201273918151855
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.19712058954426845,
+                        0.8028794104557316
+                      ],
+                      "logits": [
+                        0.8412479758262634,
+                        4.143100738525391
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.26745023969954834,
+                        0.7325497603004516
+                      ],
+                      "logits": [
+                        1.050803303718567,
+                        3.419762134552002
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2250385987302379,
+                        0.7749614012697622
+                      ],
+                      "logits": [
+                        1.0176308155059814,
+                        3.9248578548431396
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22935937806671333,
+                        0.7706406219332868
+                      ],
+                      "logits": [
+                        0.6455183029174805,
+                        3.494886636734009
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.12442680132575164,
+                        0.8755731986742483
+                      ],
+                      "logits": [
+                        0.6518266201019287,
+                        5.239193439483643
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10438080063494069,
+                        0.8956191993650594
+                      ],
+                      "logits": [
+                        0.48990440368652344,
+                        5.543513298034668
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.07010150641958221,
+                        0.9298984935804178
+                      ],
+                      "logits": [
+                        0.2713821828365326,
+                        6.349273204803467
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    1.1124900419963524,
+                    1.1128755420213565
+                  ],
+                  "median_seconds": 1.1126827920088544,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          },
+          "cached": {
+            "prefix_cache_enabled": true,
+            "load_seconds": [
+              0.20206620800308883,
+              0.20156358301755972
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 1.290860072,
+                "process_peak_footprint": 1.83079904,
+                "process_footprint": 1.632028352,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.632
+              },
+              {
+                "mlx_peak": 1.290860072,
+                "process_peak_footprint": 1.828488872,
+                "process_footprint": 1.63863108,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.6386
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.20365637500071898,
+                    0.2036124170117546
+                  ],
+                  "median_seconds": 0.20363439600623678,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20481784438778822,
+                        0.7951821556122118
+                      ],
+                      "logits": [
+                        0.7771637439727783,
+                        3.966308116912842
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.062307459011208266,
+                    0.06256954098353162
+                  ],
+                  "median_seconds": 0.062438499997369945,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "tree_after_warm_first_run": {
+                  "chunk_tokens": 256,
+                  "node_count": 3,
+                  "snapshot_count": 3,
+                  "bytes_held": 68050944,
+                  "byte_budget": 134217728,
+                  "hits": 1,
+                  "misses": 1,
+                  "hit_rate": 0.5,
+                  "reused_tokens": 768,
+                  "matched_but_replayed_tokens": 0,
+                  "evicted_nodes": 0
+                },
+                "vs_plain": {
+                  "max_abs_probability": 0.004435182165719476,
+                  "max_abs_logit": 0.05856269598007202,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.7296144999854732,
+                    0.7270399999979418
+                  ],
+                  "median_seconds": 0.7283272499917075,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.20481784438778822,
+                        0.7951821556122118
+                      ],
+                      "logits": [
+                        0.7771637439727783,
+                        3.966308116912842
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.19718733043880257,
+                        0.8028126695611975
+                      ],
+                      "logits": [
+                        0.8500913977622986,
+                        4.1509528160095215
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2634215466526487,
+                        0.7365784533473512
+                      ],
+                      "logits": [
+                        1.0258302688598633,
+                        3.443368434906006
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22226540223632532,
+                        0.7777345977636746
+                      ],
+                      "logits": [
+                        0.9951231479644775,
+                        3.93990159034729
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22868491436491475,
+                        0.7713150856350851
+                      ],
+                      "logits": [
+                        0.6185248494148254,
+                        3.4768738746643066
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.1224770570082559,
+                        0.877522942991744
+                      ],
+                      "logits": [
+                        0.6003531217575073,
+                        5.2300825119018555
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10314582626445663,
+                        0.8968541737355433
+                      ],
+                      "logits": [
+                        0.4590248465538025,
+                        5.543856143951416
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.06935722632737935,
+                        0.9306427736726206
+                      ],
+                      "logits": [
+                        0.2505611777305603,
+                        6.355428695678711
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.48799491600948386,
+                    0.48714700000709854
+                  ],
+                  "median_seconds": 0.4875709580082912,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "tree_after_warm_first_run": {
+                  "chunk_tokens": 256,
+                  "node_count": 5,
+                  "snapshot_count": 5,
+                  "bytes_held": 113418240,
+                  "byte_budget": 134217728,
+                  "hits": 15,
+                  "misses": 3,
+                  "hit_rate": 0.8333333333333334,
+                  "reused_tokens": 9216,
+                  "matched_but_replayed_tokens": 0,
+                  "evicted_nodes": 3
+                },
+                "vs_plain": {
+                  "max_abs_probability": 0.009646328667243798,
+                  "max_abs_logit": 0.09071612358093262,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          },
+          "stock": {
+            "prefix_cache_enabled": false,
+            "load_seconds": [
+              1.2923167920089327,
+              1.2858544579939917
+            ],
+            "memory_gb": [
+              {
+                "mlx_peak": 1.767227768,
+                "process_peak_footprint": 2.668316664,
+                "process_footprint": 1.825966072,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.826
+              },
+              {
+                "mlx_peak": 1.767244316,
+                "process_peak_footprint": 2.664318968,
+                "process_footprint": 1.884964856,
+                "model_mapped": 0.0,
+                "neural_nofootprint": 0.0,
+                "combined_with_model_mapped": 1.885
+              }
+            ],
+            "workloads": {
+              "b1": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.13171099999453872,
+                    0.13126583301345818
+                  ],
+                  "median_seconds": 0.13148841650399845,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.21088328957557678,
+                        0.7891166806221008
+                      ],
+                      "logits": [
+                        0.8495019674301147,
+                        3.9520301818847656
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.12927050000871532,
+                    0.12921995800570585
+                  ],
+                  "median_seconds": 0.12924522900721058,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "vs_cached": {
+                  "max_abs_probability": 0.006065474990111008,
+                  "max_abs_logit": 0.07233822345733643,
+                  "top_option_changes": 0
+                }
+              },
+              "b8": {
+                "cold": {
+                  "elapsed_seconds": [
+                    0.8624629999976605,
+                    0.8624826250015758
+                  ],
+                  "median_seconds": 0.8624728124996182,
+                  "scores": [
+                    {
+                      "probabilities": [
+                        0.21088328957557678,
+                        0.7891166806221008
+                      ],
+                      "logits": [
+                        0.8495019674301147,
+                        3.9520301818847656
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.19811572134494781,
+                        0.8018842935562134
+                      ],
+                      "logits": [
+                        0.82151198387146,
+                        4.108609676361084
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.2709859609603882,
+                        0.7290140390396118
+                      ],
+                      "logits": [
+                        1.0546720027923584,
+                        3.381377696990967
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.22636491060256958,
+                        0.7736350893974304
+                      ],
+                      "logits": [
+                        1.0076898336410522,
+                        3.897073745727539
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.231161430478096,
+                        0.7688385248184204
+                      ],
+                      "logits": [
+                        0.6729047298431396,
+                        3.498368978500366
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.12247481197118759,
+                        0.8775251507759094
+                      ],
+                      "logits": [
+                        0.6447591185569763,
+                        5.274538040161133
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.10535939782857895,
+                        0.8946405649185181
+                      ],
+                      "logits": [
+                        0.5068599581718445,
+                        5.535959243774414
+                      ]
+                    },
+                    {
+                      "probabilities": [
+                        0.07127354294061661,
+                        0.9287264347076416
+                      ],
+                      "logits": [
+                        0.3246000111103058,
+                        6.3605427742004395
+                      ]
+                    }
+                  ]
+                },
+                "warm": {
+                  "elapsed_seconds": [
+                    0.8622788329957984,
+                    0.8618298340006731
+                  ],
+                  "median_seconds": 0.8620543334982358,
+                  "scores_equal_to": "cold"
+                },
+                "cold_to_warm": {
+                  "max_abs_probability": 0.0,
+                  "max_abs_logit": 0.0,
+                  "top_option_changes": 0
+                },
+                "vs_cached": {
+                  "max_abs_probability": 0.007564414307739464,
+                  "max_abs_logit": 0.07403883337974548,
+                  "top_option_changes": 0
+                }
+              }
+            }
+          }
+        },
+        "tokenizer_note": "The M5 microprobe used the repacked tokenizer. Every token ID and option position for its eight RAGTruth inputs matches the original tokenizer used in the final mixed run and in every M4 microprobe arm."
+      }
+    }
+  },
+  "m4_stock_short_fixture_probe": {
+    "status": "ok",
+    "runtime": "stock-mlx_lm-kev-8bit",
+    "timing_order": [
+      "A",
+      "B",
+      "B",
+      "A"
+    ],
+    "b1_drift": 1.037,
+    "b8_drift": 1.0045,
+    "b1_q_per_sec": 43.85047417604217,
+    "q_per_sec": 62.1275331253198,
+    "ms_per_question": 16.095923171178583,
+    "peak_active_gb": 1.008905368,
+    "peak_footprint_gb": 2.97333764,
+    "rss_gb": 1.621049344,
+    "load_s": 2.2572378750192,
+    "b1_median_s": 0.022804770502261817,
+    "b8_median_s": 1.0301390829554293,
+    "fixture_ids": [
+      "root_cause_match",
+      "unpaid_balance",
+      "admission_required"
+    ],
+    "fixture_tokens": [
+      {
+        "state_tokens": 36,
+        "branch_tokens": [
+          49
+        ],
+        "input_sha256": "14e13f4e2775f1b5e08e379f1b92d3f981153c5cff1388583d8b67faa1172a66"
+      },
+      {
+        "state_tokens": 39,
+        "branch_tokens": [
+          43
+        ],
+        "input_sha256": "c6f3020f95e3f80b79b8710467d446b55f0a713598f8077cd1072d8e3019998b"
+      },
+      {
+        "state_tokens": 35,
+        "branch_tokens": [
+          39
+        ],
+        "input_sha256": "17b9aec9614ae92bad4bfeb4cac31b9c7966975d413ff86e413d12350b027c7e"
+      }
+    ],
+    "n_questions": 64,
+    "highlight": "stock MLX, 64 scored questions in batches of 8: 62.13 q/s",
+    "source": "stock-short-m4.json",
+    "source_sha256": "9cb1dae8fc8f4ca91eb82bd7f8f9c18a36d525d84707780768ef4c81e04121a4",
+    "workload": "Three synthetic CLI passage/question fixtures repeated to 64 completed decisions in the batch-8 probe. The batch-1 probe scored the first fixture. This is a different workload from the eight real cache records.",
+    "unique_b8_scores": [
+      {
+        "probabilities": [
+          0.11789608746767044,
+          0.8821039199829102
+        ],
+        "logits": [
+          1.1229991912841797,
+          5.8545942306518555
+        ]
+      },
+      {
+        "probabilities": [
+          0.8577505350112915,
+          0.14224950969219208
+        ],
+        "logits": [
+          3.45808744430542,
+          -0.7661988735198975
+        ]
+      },
+      {
+        "probabilities": [
+          0.8509775400161743,
+          0.14902248978614807
+        ],
+        "logits": [
+          2.8087399005889893,
+          -1.2875478267669678
+        ]
+      },
+      {
+        "probabilities": [
+          0.11890385299921036,
+          0.8810961246490479
+        ],
+        "logits": [
+          1.1117537021636963,
+          5.82064962387085
+        ]
+      },
+      {
+        "probabilities": [
+          0.8536050319671631,
+          0.1463949829339981
+        ],
+        "logits": [
+          3.4155211448669434,
+          -0.7298378944396973
+        ]
+      },
+      {
+        "probabilities": [
+          0.8497158288955688,
+          0.15028412640094757
+        ],
+        "logits": [
+          2.812979221343994,
+          -1.2599987983703613
+        ]
+      }
+    ],
+    "b8_score_indices": [
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      3,
+      4,
+      5,
+      3,
+      4,
+      5,
+      3,
+      4,
+      5,
+      3,
+      4,
+      5,
+      3
+    ],
+    "project_fixture_observation": {
+      "quant_mode": "w8",
+      "batch_docs": 8,
+      "n_questions": 64,
+      "elapsed_sec": 1.1738,
+      "ms_per_question": 18.34,
+      "q_per_sec": 54.52,
+      "source": "m4_native_micro.json",
+      "source_sha256": "73eecdbb8632c8f345c72cdce98b4fd173d8f7e807383dd7a815639ee212ac71",
+      "selected_reason": "Same 64 short CLI fixtures and batch size. Timed in a separate archived project run."
+    }
+  },
+  "downstream_extraction_pilot": {
+    "scope": "Separate 48-document extraction and human-review pilot. The public decision benchmark covers different tasks.",
+    "held_out_quality": {
+      "project_pipeline": 89.38,
+      "with_blocking_laya": 89.38
+    },
+    "warm_elapsed_seconds_m5": {
+      "project_pipeline": 93.31,
+      "with_blocking_laya": 160.71
+    },
+    "separate_flag_counts": {
+      "project_pipeline": 16,
+      "with_laya": 23
+    },
+    "known_defective_documents": 12,
+    "review_budget": 10,
+    "defects_in_review_queue": {
+      "rules": 4,
+      "typed_laya": 5,
+      "rules_plus_typed_laya": 7,
+      "rules_plus_kev": 8
+    },
+    "document_kind_correct_of_48": {
+      "typed_laya": 22,
+      "word_frequency_classifier": 39,
+      "generation_pipeline": 42
+    },
+    "source_revision": "8c7b0e3f134b0bc11ac8934fa457dd13e65dcdbc",
+    "source_content_sha256": {
+      "pipeline_comparison": "a490d0996891a258641bfcf7ce185848768e962c67cb3510b8bb82a3e8918ac1",
+      "flag_followup": "54b524477479ed2fbf31044ad9506eca3f1bb1be2837b7e5472953d3b71ecbbd",
+      "classifier": "36506a6910acdde8fc2708c39e7576c16e93b9f02644aad40ec33247eabc6104",
+      "review_queue": "e77023e155d39877201ab32e51e713dce1015d23308ecf1b6e30fcc31bf87bc2"
+    },
+    "source_record": "downstream-pilot-sources.json in the measurement archive",
+    "second_stage_kev_cross_validated_auroc": {
+      "m4_pro_before": 0.6488,
+      "m4_pro_with_kev": 0.6409,
+      "m5_before": 0.6513,
+      "m5_with_kev": 0.6339
+    }
+  }
+}

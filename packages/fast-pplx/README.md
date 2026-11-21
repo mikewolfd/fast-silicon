@@ -1,8 +1,8 @@
 # fast-pplx
 
-**32K-context `pplx-embed-v2-context-0.6b` embeddings in 2.69 GB of unified memory — 4.33×–4.41× higher effective retrieval throughput (`EOT`) than stock `pplx-context-mlx`, with 100% Pure-ANE short-chunk execution.**
+Use `fast-pplx` to find a passage whose meaning depends on the surrounding text. On 175 legal questions, encoding each passage with its neighbors raised the score for ranking relevant passages in the first ten results from **0.359 to 0.703**. Stock contextual MLX also scored **0.703**. On the full 325-query base M5 workload, the project finished in **136.5 seconds** and stock took **601.5 seconds**. Both returned usable results for all 325 queries. [Scored retrieval runs](../../docs/benchmarks/document-workloads.json)
 
-`fast-pplx` preserves exact upstream tokenization, late-chunking context (`[Q]`/`[D]`/`<|chunk_sep|>`), and Matryoshka dimensions (`128..1024`, `float32`/`float16`/`int8`), while scheduling short chunks (`<= 512` tok) onto hand-crafted `100%` Pure-ANE CoreML stages and streaming long documents up to `32K` tokens on Metal GPU. On Tier-1 `NanoBEIR + LegalBench-RAG` (`4K` contextual chunks), `fast-pplx` (`hetero2`) delivers **`1.724 EOT`** on **Base M5 (`24 GB`)** (**`4.41×`** vs stock `pplx-context-mlx`, **`1.23×`** M4 Pro) and **`1.407 EOT`** on **M4 Pro (`48 GB`)** (**`4.33×`** vs stock) — with zero `torch`/`transformers` runtime dependencies and built-in Python, OpenAI `/v1/embeddings`, contextual Parquet CLI, and `pplx-ane-cli` interfaces.
+`fast-pplx` runs Perplexity’s `pplx-embed-v2-context-0.6b` model locally. Its mixed mode sends short inputs to the Apple Neural Engine (ANE) and long inputs to the GPU. The M4 Pro GPU processed a 32,768-token input with a measured process footprint of 2.69 GB. The package supports Python, OpenAI-compatible `/v1/embeddings`, contextual Parquet processing and a native ANE command-line tool. [Measurements](../../docs/BENCHMARKS.md)
 
 > [!TIP]
 > **Full Cross-Silicon & CoreAI Reference:** See [**`../../docs/BENCHMARKS.md`**](../../docs/BENCHMARKS.md) for complete Category 1–4 outcome tables, 4-bucket `RUSAGE_INFO_V6` memory footprints, and 22 audited CoreAI decisions, including rejected configurations.
@@ -23,8 +23,10 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
     q = model.encode_queries(["How do ocean currents transport heat?"])
     docs = model.encode_contextual_chunks([
         ["Chunk A discussing heat transport.", "Chunk B expanding on polar gyres."],
-    ])
+    ], max_length=512)
 ```
+
+`max_length` caps the whole document, including its prefix and chunk separators. The result contains one matrix per input document and one row per original chunk, in input order. A chunk crossing the cap uses the tokens that fit. A chunk wholly beyond it gets a zero vector. To index every passage in a longer document, split it into context windows before encoding.
 
 ```bash
 ./packages/fast-pplx/build/pplx-ane-cli --seq-len 128 --inspect --bench 20
@@ -48,7 +50,9 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
 | **`fast-pplx` (`hetero2`)** | **`0.7244`** | **`1.724`** (`136.5s`, `2.34 GB`) | **`0.7241`** | **`1.407`** (`167.3s`, `1.97 GB`) | **`4.41×`** / **`4.33×`** | **`1.23×`** |
 | Stock `pplx-context-mlx` (`fp16`) | `0.7236` | `0.391` (`601.5s`, `2.12 GB`) | `0.7236` | `0.325` (`723.1s`, `2.19 GB`) | `1.00×` | `1.20×` |
 
-On 175 legal questions, giving each passage its surrounding text raised the ranking score in the first ten results from 0.359 to 0.703. Stock contextual `pplx-context-mlx` also scored 0.703. The 4.41× M5 throughput result above comes from the full 325-query run after the benchmark split oversized documents into windows. [Per-task results and run records](../../docs/benchmarks/document-workloads.json)
+The original M5 run had usable results for 150 of 325 queries. The selected rerun split oversized documents into windows and covered all 325. Its mean score exceeded stock MLX by 0.000831. The paired 95% interval ran from −0.003619 to +0.005281, leaving equivalence within the runner’s default 0.003 score-loss tolerance unresolved. The reported 4.41× compares the score units earned per second on these two runs. [Per-task results and run records](../../docs/benchmarks/document-workloads.json)
+
+Batching accounts for part of the whole-job difference. On 384 sampled passages on M4 Pro, sorting by length reduced stock MLX’s total encoding time across the four sample sets from **20.65 to 13.34 seconds** (1.55×, using each set’s median). All 24 labeled NanoBEIR queries kept the same ten passages in the same order. The long legal windows behaved differently. Stock originally processed them one at a time. On eight complete windows that took **4.39 seconds**. Processing two at a time took **4.71 seconds** in source order and **4.36 seconds** in length order. [Matched stock runs and full-corpus padding counts](../../docs/benchmarks/pplx-padding-20261121.json)
 
 ### 2. Cross-Silicon Throughput, Latency & `32K` Scaling
 
@@ -72,6 +76,8 @@ Measured via `packages/fast-pplx/scripts/benchmark.py ane-profiles` in isolated 
 | **`balanced`** (`MaxAbsRMSNorm` + `TanhSiLU`) | `12,754` | `12,856` | `9,762` | **`0.9988`** *(corpus **`0.9964`**)* | **`0.79`** | `0.94–0.95×` |
 | **`parity`** | `12,679` | `12,496` | `9,519` | **`0.9989`** | **`0.72`** | `0.92–0.94×` |
 | Stock `pplx-context-mlx` (`fp16`) | `11,707` | `8,735` | `8,425` | `1.0000` (GPU) | — | — |
+
+These measurements establish vector agreement and processing speed. Choosing a precision profile for search quality still requires a comparison of the same labeled queries across all three profiles.
 
 ### 4. Direct MIL (`100%` Pure-ANE `2.24 ms`) vs. `CoreAI-Opt` / `.aimodel` Findings
 
