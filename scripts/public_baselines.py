@@ -14,11 +14,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FAST_SHARED_SRC = _REPO_ROOT / "packages" / "fast-shared" / "src"
@@ -799,6 +800,41 @@ else:
 """
 
 
+def run_subprocess_with_killpg(
+    cmd: Sequence[str],
+    *,
+    timeout_sec: float,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``cmd`` in its own process group and SIGKILL the entire group on timeout."""
+    argv = [str(part) for part in cmd]
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd) if cwd is not None else None,
+        env=dict(env) if env is not None else None,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out_s, err_s = proc.communicate(input=input_text, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, int(proc.returncode or 0), out_s, err_s)
+
+
 def run_public_baseline(
     *,
     pkg_name: str,
@@ -825,12 +861,9 @@ def run_public_baseline(
         "cooldown_sec": float(cooldown_sec),
     }
     try:
-        proc = subprocess.run(
+        proc = run_subprocess_with_killpg(
             [py_exe, "-c", _PUBLIC_RUNNER_SNIPPET, json.dumps(payload)],
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
+            timeout_sec=timeout_sec,
         )
     except subprocess.TimeoutExpired:
         return {"status": "failed", "runtime": "timeout", "highlight": f"timed out after {timeout_sec}s"}

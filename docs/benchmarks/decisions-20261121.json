@@ -10,8 +10,8 @@
   "memory": "Decimal GB. The combined harness figure is a snapshot after scoring. On the selected mixed runs, the harness scanned the staged package artifacts for clean model mappings. Any clean resident mappings backed by the stock Hugging Face cache are omitted, so these combined snapshots are lower bounds. The cache probe selected the stock snapshot directory; symlink targets outside that directory could also be omitted there. The process lifetime peak and MLX allocation peak are independent counters and are retained. Both stock adapters limit the MLX free buffer cache to 512 MiB.",
   "timing_conditions": "Watchdog monitored process-tree memory. The coordinators permitted background CPU activity; the M4 initial preflight detected macOS media analysis and a virtualization process. These single-run elapsed times carry no timing confidence interval.",
   "per_item_encoding": "1,400 binary per-item scores in locked RAGTruth, CLINC150, RewardBench-2 order, packed most significant bit first into 175 bytes. Each item had a valid output.",
-  "receipt_root": ".cache/archive-release/investigations/fast-silicon-decisions-20261121/ (measurement workspace)",
-  "historical_receipt_root": "fast-silicon/artifacts/reviews/readme-benchmark-20261120/coreml-input/",
+  "receipt_root": "investigation:fast-silicon-decisions-20261121",
+  "historical_receipt_root": "review-archive:readme-benchmark-20261120/coreml-input",
   "models": {
     "laya": {
       "checkpoint": "convaiinnovations/laya-typed-decisions",

@@ -203,7 +203,7 @@
     }
   },
   "source": {
-    "archive_directory": ".cache/archive-release/investigations/embeddinggemma-legal-512-20261121/",
+    "archive_directory": "investigation:embeddinggemma-legal-512-20261121",
     "sha256": {
       "compare.py": "2c8ffdcaa9b3e32b8f517b9f2cb49de223eb694f645268b7e1ef4468e42e091b",
       "frozen.json": "aa9c24053134b76aa21d55bcf9d72271348b94f2296e480065bfedfee0b6eb6b",
@@ -257,19 +257,19 @@
   },
   "previous_whole_passage_scores_at_10": {
     "project_2048": {
-      "source": "artifacts/benchmarks/coreml-20261120/reference/m4_native_tier1.json",
+      "source": "coreml-20261120:reference/m4_native_tier1.json",
       "span_ndcg@10": 0.568676,
       "char_recall@10": 0.902544,
       "matched_to_6_decimals": true
     },
     "fp16_512": {
-      "source": "artifacts/benchmarks/coreml-20261120/m4_outcome_coreml-embeddinggemma-2-fp16.json",
+      "source": "coreml-20261120:m4_outcome_coreml-embeddinggemma-2-fp16.json",
       "span_ndcg@10": 0.515695,
       "char_recall@10": 0.79317,
       "matched_to_6_decimals": true
     },
     "int8_512": {
-      "source": "artifacts/benchmarks/coreml-20261120/m4_outcome_coreml-embeddinggemma-2-int8.json",
+      "source": "coreml-20261120:m4_outcome_coreml-embeddinggemma-2-int8.json",
       "span_ndcg@10": 0.517897,
       "char_recall@10": 0.79317,
       "matched_to_6_decimals": true

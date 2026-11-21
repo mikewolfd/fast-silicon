@@ -1131,6 +1131,15 @@ def _quantize_int8_np(projected: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(scaled), -128, 127).astype(np.int8)
 
 
+def _resolve_max_length(max_length: int | None, max_seq_len: int) -> int:
+    if max_length is None:
+        return max_seq_len
+    ml = int(max_length)
+    if ml <= 0:
+        raise ValueError("max_length must be > 0")
+    return min(ml, max_seq_len)
+
+
 class FastPplxGPU:
     """High-throughput MLX Metal GPU backend for `pplx-embed-v2-context-0.6b`."""
 
@@ -1405,7 +1414,7 @@ class FastPplxGPU:
         texts: Sequence[str] | str,
         *,
         batch_size: int = 16,
-        max_length: int = 32768,
+        max_length: int | None = 32768,
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
@@ -1413,7 +1422,7 @@ class FastPplxGPU:
     ) -> np.ndarray:
         single = isinstance(texts, str)
         items = [texts] if single else list(texts)
-        eff_max = min(int(max_length), self.max_seq_len) if max_length else self.max_seq_len
+        eff_max = _resolve_max_length(max_length, self.max_seq_len)
         if is_query:
             token_lists = [self.tokenizer.encode_query(t, max_length=eff_max) for t in items]
         else:
@@ -1472,12 +1481,12 @@ class FastPplxGPU:
         documents: Sequence[Sequence[str]],
         *,
         batch_size: int = 8,
-        max_length: int = 32768,
+        max_length: int | None = 32768,
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
     ) -> list[np.ndarray]:
-        eff_max = min(int(max_length), self.max_seq_len) if max_length else self.max_seq_len
+        eff_max = _resolve_max_length(max_length, self.max_seq_len)
         encoded_docs = [
             self.tokenizer.encode_contextual_document(chunks, return_spans=True, max_length=eff_max)
             for chunks in documents

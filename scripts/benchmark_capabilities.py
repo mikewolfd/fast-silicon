@@ -67,7 +67,7 @@ from fast_shared.bench import (  # noqa: E402
     get_unified_memory_footprint,
     wired_limit,
 )
-from public_baselines import resolve_hf_snapshot  # noqa: E402
+from public_baselines import resolve_hf_snapshot, run_subprocess_with_killpg  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -193,7 +193,7 @@ def _qlora_regime_report(
         if actual != (examples, logical_inputs, supervised):
             raise ValueError(f"QLoRA pass trained on {actual}, expected {(examples, logical_inputs, supervised)}")
     seconds = statistics.median(run["elapsed_seconds"] for run in runs)
-    return {
+    report: dict[str, Any] = {
         "input_ids_and_prompt_lengths_sha256": hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest(),
         "system_instruction_copies": prompt_copies, "pack_tokens": pack_tokens,
         "examples": examples, "logical_input_tokens": logical_inputs, "supervised_tokens": supervised,
@@ -206,6 +206,9 @@ def _qlora_regime_report(
         "optimizer_steps_per_pass": [run["optimizer_steps"] for run in runs],
         "runs": list(runs),
     }
+    if all("peak_gib" in run for run in runs):
+        report["peak_gib"] = statistics.median(run["peak_gib"] for run in runs)
+    return report
 
 
 def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str, Any]:
@@ -456,11 +459,13 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         counts = _pass(batches)
         mx.synchronize()
         dt = time.perf_counter() - t0
-        pk = float(mx.get_peak_memory()) / (1024**3)
+        peak_bytes = float(mx.get_peak_memory())
+        pk_gb = peak_bytes / 1e9
+        pk_gib = peak_bytes / (1024**3)
         del opt, stepper
         gc.collect()
         mx.clear_cache()
-        return {**counts, "elapsed_seconds": dt, "peak_gb": round(pk, 3)}
+        return {**counts, "elapsed_seconds": dt, "peak_gb": round(pk_gb, 3), "peak_gib": round(pk_gib, 3)}
 
     # Stock baseline A on BF16 model (unpacked, uncompiled)
     ckpt_bf16 = 256 if low_ram else 2200
@@ -502,7 +507,7 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         "stock_baseline": f"Unpacked BF16 {stock['supervised_tokens_per_sec']:,.1f} supervised tokens/s",
         "speedup_vs_stock": round(packed["supervised_tokens_per_sec"] / stock["supervised_tokens_per_sec"], 2),
         "comparison": "Packed 8-bit vs unpacked BF16 on identical input and answer IDs. The separate shared-prefix pass uses eight examples with four copies of the instructions. It has no matched baseline.",
-        "measurement": "Two consecutive timed passes per regime after optimizer warmup. Each elapsed time counts training on those examples. Optimizer steps can differ by packing. tok_s counts logical input positions, including reused prefixes. peak_gb records GiB of MLX allocations.",
+        "measurement": "Two consecutive timed passes per regime after optimizer warmup. Each elapsed time counts training on those examples. Optimizer steps can differ by packing. tok_s counts logical input positions, including reused prefixes. peak_gb records decimal GB (1e9 bytes) of MLX allocations; peak_gib records GiB.",
         "peak_gb": packed["peak_gb"], "stock_peak_gb": stock["peak_gb"],
         "parity": {
             "packed_vs_unpacked_loss_diff": round(abs(loss_p - loss_u), 6),
@@ -709,7 +714,12 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
             mx.eval(lv, mdl_a.parameters(), opt.state)
         mx.synchronize()
         dt = time.perf_counter() - t0
-        return {"items_s": total_items / max(dt, 1e-9), "peak_gb": float(mx.get_peak_memory()) / (1024**3)}
+        peak_bytes = float(mx.get_peak_memory())
+        return {
+            "items_s": total_items / max(dt, 1e-9),
+            "peak_gb": peak_bytes / 1e9,
+            "peak_gib": peak_bytes / (1024**3),
+        }
 
     def _run_compiled(batches: list[Any], *, pre_cached: bool) -> dict[str, float]:
         step_fn, st = _make_compiled_step(mdl_bf16)
@@ -726,7 +736,12 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
             mx.eval(lv, st)
         mx.synchronize()
         dt = time.perf_counter() - t0
-        return {"items_s": total_items / max(dt, 1e-9), "peak_gb": float(mx.get_peak_memory()) / (1024**3)}
+        peak_bytes = float(mx.get_peak_memory())
+        return {
+            "items_s": total_items / max(dt, 1e-9),
+            "peak_gb": peak_bytes / 1e9,
+            "peak_gib": peak_bytes / (1024**3),
+        }
 
     runners = {
         "stock_unpacked_fp32_head": _run_stock_a,
@@ -746,6 +761,7 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
         k: {
             "items_s": round(float(statistics.median(x["items_s"] for x in v)), 2),
             "peak_gb": round(float(statistics.median(x["peak_gb"] for x in v)), 3),
+            "peak_gib": round(float(statistics.median(x["peak_gib"] for x in v)), 3),
         }
         for k, v in samples.items()
     }
@@ -897,9 +913,12 @@ mx.clear_cache()
 
 critic = PublicKev08bMlxBackend(Path(cfg["kev_dir"]), batch_docs=1)
 try:
+    _ = critic.score_multi_states([({"source": "warmup", "candidate": "warmup"}, [cfg["qdef"]])])
+    mx.synchronize()
     t1 = time.perf_counter()
     for p, tx in zip(cfg["cand_prompts"], outs, strict=True):
         critic.score_multi_states([({"source": p[:600], "candidate": tx}, [cfg["qdef"]])])
+    mx.synchronize()
     crit_s = time.perf_counter() - t1
 finally:
     critic.close()
@@ -921,9 +940,18 @@ print(json.dumps({"status": "ok", "wall_sec": round(tot_s, 3), "rollout_sec": ro
                 ),
                 encoding="utf-8",
             )
-            pr = subprocess.run([str(pub_py), "-c", stock_code, str(cf)], capture_output=True, text=True, timeout=600, check=False)
-            if pr.returncode == 0 and pr.stdout.strip():
-                stock_res = json.loads(pr.stdout.strip().splitlines()[-1])
+            try:
+                pr = run_subprocess_with_killpg([str(pub_py), "-c", stock_code, str(cf)], timeout_sec=600)
+                if pr.returncode == 0 and pr.stdout.strip():
+                    stock_res = json.loads(pr.stdout.strip().splitlines()[-1])
+                else:
+                    stock_res = {
+                        "status": "failed",
+                        "returncode": pr.returncode,
+                        "reason": (pr.stderr or pr.stdout or "").strip()[-1000:] or f"exit={pr.returncode}",
+                    }
+            except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                stock_res = {"status": "failed", "reason": str(exc)}
 
     # Real GRPO policy step + concurrent Laya ANE critic overlap in `--lora-python`
     lora_py = args.lora_python or pub_py
@@ -1072,9 +1100,18 @@ print(json.dumps({"status": "ok", "grpo_gpu_ms": round(gpu_ms, 2), "ane_critic_1
                 ),
                 encoding="utf-8",
             )
-            pr2 = subprocess.run([str(lora_py), "-c", grpo_code, str(cf2)], capture_output=True, text=True, timeout=600, check=False)
-            if pr2.returncode == 0 and pr2.stdout.strip():
-                grpo_step_res = json.loads(pr2.stdout.strip().splitlines()[-1])
+            try:
+                pr2 = run_subprocess_with_killpg([str(lora_py), "-c", grpo_code, str(cf2)], timeout_sec=600)
+                if pr2.returncode == 0 and pr2.stdout.strip():
+                    grpo_step_res = json.loads(pr2.stdout.strip().splitlines()[-1])
+                else:
+                    grpo_step_res = {
+                        "status": "failed",
+                        "returncode": pr2.returncode,
+                        "reason": (pr2.stderr or pr2.stdout or "").strip()[-1000:] or f"exit={pr2.returncode}",
+                    }
+            except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                grpo_step_res = {"status": "failed", "reason": str(exc)}
 
     med_stoch_s = float(statistics.median(b_times_stoch))
     med_bon_s = float(statistics.median(b_times_bon))
@@ -1312,10 +1349,14 @@ def _run_prefix_tree(args: argparse.Namespace) -> dict[str, Any]:
     runs = []
     for arm in schedule:
         request = {"arm": arm, "records": records, "kev_dir": str(kev_dir), "use_wired_limit": not args.no_wired_limit}
-        proc = subprocess.run(
-            [public_python if arm == "stock" else sys.executable, str(_REPO_ROOT / "scripts" / "_kev_benchmark.py")],
-            input=json.dumps(request), text=True, capture_output=True, timeout=180, check=False,
-        )
+        try:
+            proc = run_subprocess_with_killpg(
+                [public_python if arm == "stock" else sys.executable, str(_REPO_ROOT / "scripts" / "_kev_benchmark.py")],
+                input_text=json.dumps(request),
+                timeout_sec=180,
+            )
+        except subprocess.TimeoutExpired:
+            return {"suite": "prefix-tree", "status": "failed", "reason": "timeout (180s)", "arm": arm}
         if proc.returncode:
             return {"suite": "prefix-tree", "status": "failed", "reason": proc.stderr[-1200:], "arm": arm}
         run = json.loads(proc.stdout.splitlines()[-1])
@@ -1614,7 +1655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             env = dict(os.environ)
             env["M4_GPU_LOCK_HELD"] = "1"
             try:
-                proc = subprocess.run(cmd, cwd=str(_REPO_ROOT), env=env, capture_output=True, text=True, timeout=int(args.timeout_sec))
+                proc = run_subprocess_with_killpg(cmd, cwd=_REPO_ROOT, env=env, timeout_sec=int(args.timeout_sec))
             except subprocess.TimeoutExpired:
                 results.append({"suite": spec.name, "status": "failed", "fast_metric": f"timeout ({args.timeout_sec}s)"})
                 continue

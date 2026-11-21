@@ -130,6 +130,56 @@ def list_dest_tracked_candidates(dst_pkg: Path) -> list[str]:
     return sorted(out)
 
 
+_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _transform_markdown_links(text: str, *, sibling_prefix: str, package_dir: str) -> str:
+    """Rewrite inline and reference-style sibling links outside fenced code blocks."""
+    inline_re = re.compile(
+        r"(?<=\]\()" + re.escape(sibling_prefix) + r"([^#)\s]*)(#[^)\s]*)?"
+    )
+    ref_re = re.compile(
+        r"^([ ]{0,3}\[[^\]]+\]:[ \t]+<?)" + re.escape(sibling_prefix) + r"([^#>\s]*)(#[^>\s]*)?"
+    )
+
+    def _rewrite_target(path_part: str, anchor: str | None) -> str:
+        anch = anchor or ""
+        if not path_part:
+            return f"{posixpath.relpath('.', package_dir)}/{anch}"
+        rel_target = posixpath.relpath(path_part, package_dir)
+        if path_part.endswith("/") and not rel_target.endswith("/"):
+            rel_target += "/"
+        return f"{rel_target}{anch}"
+
+    out_lines: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if fence_char:
+            out_lines.append(line)
+            if re.match(rf"^[ ]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ ]*$", stripped):
+                fence_char = ""
+                fence_len = 0
+            continue
+
+        m_open = _FENCE_OPEN_RE.match(stripped)
+        if m_open:
+            marker, info = m_open.group(1), m_open.group(2)
+            # CommonMark: backtick fence info strings cannot contain backticks.
+            if marker[0] == "~" or "`" not in info:
+                fence_char = marker[0]
+                fence_len = len(marker)
+                out_lines.append(line)
+                continue
+
+        if sibling_prefix in line:
+            line = inline_re.sub(lambda m: _rewrite_target(m.group(1), m.group(2)), line)
+            line = ref_re.sub(lambda m: f"{m.group(1)}{_rewrite_target(m.group(2), m.group(3))}", line)
+        out_lines.append(line)
+    return "".join(out_lines)
+
+
 def _transform_content(pkg: str, rel: str, raw: bytes) -> bytes:
     """Resolve sibling package references in the monorepo's directory layout."""
     if rel.endswith(".md"):
@@ -137,8 +187,11 @@ def _transform_content(pkg: str, rel: str, raw: bytes) -> bytes:
         sibling_prefix = "../" * len(Path(rel).parts) + "fast-silicon/"
         if sibling_prefix.encode() in raw:
             package_dir = posixpath.dirname(f"packages/{pkg}/{rel}")
-            target = re.compile(r"(?<=\]\()" + re.escape(sibling_prefix) + r"([^#)\s]+)")
-            text = target.sub(lambda m: posixpath.relpath(m.group(1), package_dir), raw.decode("utf-8"))
+            text = _transform_markdown_links(
+                raw.decode("utf-8"),
+                sibling_prefix=sibling_prefix,
+                package_dir=package_dir,
+            )
             return text.encode("utf-8")
     if pkg != "fast-shared" and rel == "pyproject.toml":
         text = raw.decode("utf-8")

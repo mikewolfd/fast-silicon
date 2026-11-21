@@ -50,11 +50,19 @@ def test_public_baseline_preserves_worker_failure(monkeypatch: pytest.MonkeyPatc
         (0, '{"status":"skipped","runtime":"unavailable"}\n', "", "unavailable"),
     ):
         completed = subprocess.CompletedProcess([], code, stdout, stderr)
-        monkeypatch.setattr(pub.subprocess, "run", lambda *a, **kw: completed)
+        monkeypatch.setattr(pub, "run_subprocess_with_killpg", lambda *a, **kw: completed)
         rc = pub.main(["--package", "coreml-laya"])
         result = json.loads(capsys.readouterr().out)
         assert result["runtime"] == expected
         assert rc == (0 if expected == "unavailable" else 1)
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["python"], timeout=1)
+
+    monkeypatch.setattr(pub, "run_subprocess_with_killpg", _timeout)
+    rc_to = pub.main(["--package", "coreml-laya", "--timeout-sec", "1"])
+    res_to = json.loads(capsys.readouterr().out)
+    assert rc_to == 1 and res_to["runtime"] == "timeout"
 
 
 def test_coreml_empty_compute_plan_preserves_unknown_placement(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -716,3 +724,552 @@ def test_coreml_microbench_uses_native_corpus_ids_and_in_process_time(monkeypatc
     metrics, _ = bench._encoder("coreml-embeddinggemma-2-int8", pair, 0)
     assert (metrics["tokens"], metrics["tok_s"], metrics["single_embed_tok_s"]) == (6, 3.0, 1.5)
     assert (metrics["pack_256_speedup"], metrics["min_pack_single_cosine"]) == (2.0, 1.0)
+
+
+def test_killpg_timeout_kills_grandchild_and_capabilities_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import os
+    import subprocess
+    import time
+
+    pub = _load_script("test_pub_killpg_mod", "public_baselines.py")
+    cap = _load_script("test_cap_killpg_mod", "benchmark_capabilities.py")
+
+    pid_file = tmp_path / "grandchild.pid"
+    parent_script = (
+        "import pathlib, subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid), encoding='utf-8')\n"
+        "time.sleep(30)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        pub.run_subprocess_with_killpg([sys.executable, "-c", parent_script], timeout_sec=0.5)
+
+    assert pid_file.is_file()
+    gc_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    # Wait briefly for kernel process-group teardown after SIGKILL.
+    dead = False
+    for _ in range(40):
+        try:
+            os.kill(gc_pid, 0)
+        except ProcessLookupError:
+            dead = True
+            break
+        time.sleep(0.05)
+    assert dead, f"grandchild pid {gc_pid} survived run_subprocess_with_killpg timeout"
+
+    # Capabilities coordinator uses run_subprocess_with_killpg and fails cleanly on timeout.
+    monkeypatch.setattr(cap, "_hw_lock", cap._null_ctx)
+    monkeypatch.setattr(cap, "check_system_quiescence", lambda: [])
+
+    def _raise_to(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["python"], timeout=1)
+
+    monkeypatch.setattr(cap, "run_subprocess_with_killpg", _raise_to)
+    rc = cap.main(["--suites", "parallel-coreml", "--allow-contended", "--timeout-sec", "1"])
+    assert rc == 1
+    assert "timeout (1s)" in capsys.readouterr().out
+
+
+def test_coreai_client_close_kills_hung_daemon_and_cat12_finally_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import types
+    import numpy as np
+
+    opb = _load_script("test_opb_close_mod", "_outcome_public_backends.py")
+    out = _load_script("test_out_close_mod", "benchmark_outcomes.py")
+
+    # 1. Hung daemon is SIGKILLed and its tempdir is cleaned up on close(), and close() is idempotent.
+    hung_daemon = (
+        "import time\n"
+        "sys.stdout.write('READY\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    client = opb._CoreAiSubprocessClient(
+        cmd=[sys.executable],
+        daemon_script=hung_daemon,
+        script_name="hung.py",
+        prefix="test_hung_daemon_",
+    )
+    client._close_timeout = 0.2
+    tmp_dir = client.tmp_dir
+    assert tmp_dir.is_dir()
+    client.close()
+    assert client._proc.poll() is not None
+    assert not tmp_dir.exists()
+    # Second close() is a clean no-op.
+    assert isinstance(client.close(), dict)
+
+    # 2. Startup failure calls both kill() and wait().
+    waited = {"kill": 0, "wait": 0}
+
+    class _StartFailProc:
+        def __init__(self, *_a, **_kw):
+            import io
+
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("NOT_READY\n")
+
+        def kill(self) -> None:
+            waited["kill"] += 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            waited["wait"] += 1
+            return -9
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        opb._CoreAiSubprocessClient(cmd=[sys.executable], daemon_script="pass", popen_cls=_StartFailProc)
+    assert waited == {"kill": 1, "wait": 1}
+
+    # 3. Cat 1 finally: closes coreml-* adapter even when mid-eval raises.
+    cat1_closed = {"count": 0}
+
+    def _boom_encode(_txts: list[str]) -> np.ndarray:
+        raise RuntimeError("mid-eval failure")
+
+    fake_adapter = opb.Cat1Adapter(
+        harness_label="coreml-bge-small-fp16-ane",
+        mrl_dims=(128, "max"),
+        int8_mode="sym_int8",
+        nb_pre_normalized=True,
+        enc_q_nb=_boom_encode,
+        enc_d_nb=lambda txts: np.ones((len(txts), 4), dtype=np.float32),
+        enc_q=lambda txts: np.ones((len(txts), 4), dtype=np.float32),
+        enc_d=lambda txts: np.ones((len(txts), 4), dtype=np.float32),
+        close_fn=lambda: (cat1_closed.__setitem__("count", cat1_closed["count"] + 1) or 0.0),
+        telemetry_fn=dict,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "_outcome_public_backends",
+        SimpleNamespace(
+            build_public_cat1_adapter=lambda *a, **kw: fake_adapter,
+            stock_hf_model_files=lambda _pkg: [],
+            stock_decision_model_files=lambda _b: [],
+        ),
+    )
+    monkeypatch.setattr(
+        out,
+        "load_nanobeir_subset",
+        lambda sub, **kw: {"queries": {"q1": "hello"}, "corpus": {"d1": "world"}, "qrels": {"q1": {"d1": 1.0}}},
+    )
+    monkeypatch.setattr(
+        out,
+        "load_legalbench_rag",
+        lambda **kw: {
+            "subsets": ["cuad"],
+            "corpus_texts": {"doc1": "Some legal clause text."},
+            "queries": [{"id": "lb1", "query": "clause?", "snippets": [{"file_path": "doc1", "span": [0, 10]}]}],
+        },
+    )
+    monkeypatch.setattr(out, "FourBucketMemoryProbe", lambda **kw: SimpleNamespace(snapshot=lambda **k: {}))
+    monkeypatch.setattr(out, "DeviceMemoryGuard", lambda: SimpleNamespace(arm=lambda: None, check=lambda: (True, None)))
+    extra = out._parse_extra_flags([])
+    lock = {"datasets": {"nanobeir_en": {"tier1_subsets": ["NanoSciFact"], "tier2_subsets": ["NanoSciFact"]}}}
+    with pytest.raises(RuntimeError, match="mid-eval failure"):
+        out._run_cat1_worker(
+            "coreml-bge-small",
+            tier="tier1",
+            config_label="",
+            extra=extra,
+            lock=lock,
+            cache_dir=tmp_path,
+            local_files_only=True,
+            max_items=None,
+            smoke=True,
+            home=tmp_path,
+            host_mem_gb=48.0,
+        )
+    assert cat1_closed["count"] == 1
+
+    # 4. Cat 2 finally: closes coreml-laya backend even when mid-eval raises.
+    cat2_closed = {"count": 0}
+    cat2_calls = {"n": 0}
+
+    class _FakeCoreMlLaya:
+        peak_gb = 0.0
+
+        def encode_item(self, state, qdef, *, on_truncate="ignore"):
+            del state, qdef, on_truncate
+            return {"ids": [1, 2], "markers": [0, 1], "original_state_tokens": 2}
+
+        def score_noul_batch(self, encs):
+            del encs
+            cat2_calls["n"] += 1
+            if cat2_calls["n"] > 1:
+                raise RuntimeError("cat2 mid-eval failure")
+            return [0.5]
+
+        def telemetry(self):
+            return {}
+
+        def close(self):
+            cat2_closed["count"] += 1
+            return 0.0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "_outcome_public_backends",
+        SimpleNamespace(
+            CoreMlLayaBackend=_FakeCoreMlLaya,
+            stock_decision_model_files=lambda _b: [],
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "fast_decision_models.kev_mlx", types.SimpleNamespace(Kev08bMlxBackend=object))
+    monkeypatch.setitem(sys.modules, "fast_decision_models.laya_ane", types.SimpleNamespace(LayaAneBackend=object))
+    monkeypatch.setitem(
+        sys.modules,
+        "fast_decision_models.paths",
+        types.SimpleNamespace(ensure_laya_dylib=lambda: None, resolve_kev_dir=lambda *a, **k: tmp_path, resolve_laya_dir=lambda *a, **k: tmp_path),
+    )
+    monkeypatch.setattr(out, "load_ragtruth", lambda **kw: [{"id": "r1", "source": "s", "response": "r", "label": 1}])
+    monkeypatch.setattr(out, "load_clinc_oos", lambda **kw: {"items": []})
+    monkeypatch.setattr(out, "load_reward_bench_2", lambda **kw: [])
+    with pytest.raises(RuntimeError, match="cat2 mid-eval failure"):
+        out._run_cat2_single_backend(
+            "coreml-laya",
+            pkg_name="coreml-laya",
+            tier="tier1",
+            config_label="",
+            extra=extra,
+            lock=lock,
+            cache_dir=tmp_path,
+            local_files_only=True,
+            max_items=None,
+            smoke=True,
+            home=tmp_path,
+            host_mem_gb=48.0,
+        )
+    assert cat2_closed["count"] == 1
+
+
+def test_merge_daemon_telemetry_keeps_phys_peak_and_combined_distinct() -> None:
+    out = _load_script("test_out_merge_distinct", "benchmark_outcomes.py")
+    mib_to_gb = (1024.0 * 1024.0) / 1e9
+    mem4: dict[str, float] = {
+        "mlx_peak_gb": 0.0,
+        "phys_footprint_gb": 0.05,
+        "peak_footprint_gb": 0.05,
+        "model_mapped_gb": 0.0,
+        "neural_nofootprint_gb": 0.0,
+        "combined_with_model_mapped_gb": 0.05,
+    }
+    diag: dict[str, object] = {}
+    telem = {
+        "peak_gb": 3.04,
+        "four_bucket_metrics": {
+            "rusage_version": 6,
+            "phys_footprint_mb": 400.0,
+            "lifetime_max_phys_footprint_mb": 450.0,
+            "neural_nofootprint_mb": 2400.0,
+            "mapped_model_mb": 100.0,
+            "combined_with_model_mapped_mb": 2900.0,
+        },
+    }
+    out._merge_daemon_telemetry(mem4, diag, telem)
+    assert mem4["phys_footprint_gb"] == round(400.0 * mib_to_gb, 4)
+    assert mem4["peak_footprint_gb"] == round(450.0 * mib_to_gb, 4)
+    assert mem4["combined_with_model_mapped_gb"] == round(2900.0 * mib_to_gb, 4)
+    assert mem4["phys_footprint_gb"] < mem4["peak_footprint_gb"] < mem4["combined_with_model_mapped_gb"]
+
+    # Fallback to external_peak_gb ONLY when lifetime_max_phys_footprint_mb is missing.
+    mem4_fb: dict[str, float] = {
+        "phys_footprint_gb": 0.05,
+        "peak_footprint_gb": 0.05,
+        "combined_with_model_mapped_gb": 0.05,
+    }
+    out._merge_daemon_telemetry(
+        mem4_fb,
+        {},
+        {
+            "external_peak_gb": 2.25,
+            "four_bucket_metrics": {"phys_footprint_mb": 100.0, "combined_with_model_mapped_mb": 2500.0},
+        },
+    )
+    assert mem4_fb["peak_footprint_gb"] == 2.25
+    assert mem4_fb["combined_with_model_mapped_gb"] == round(2500.0 * mib_to_gb, 4)
+
+
+def test_max_coarse_tokens_unjudged_filter_abba_public_python_and_smoke_unresolved(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _load_script("test_out_coarse_and_smoke", "benchmark_outcomes.py")
+
+    # 1. --max-coarse-tokens CLI flag & dry-run propagation
+    rc_dry = out.main(["run", "--dry-run", "--packages", "fast-embeddinggemma-2", "--max-coarse-tokens", "512"])
+    assert rc_dry == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["max_coarse_tokens"] == 512
+    assert out._parse_extra_flags(["--max-coarse-tokens", "512"]).max_coarse_tokens == 512
+
+    # 2. coarse_max_tokens_mismatch in compute_public_comparisons
+    base_rec = {
+        "category": 1,
+        "benchmark": "NanoBEIR+LegalBench",
+        "n_items": 4,
+        "status": "ok",
+        "objective_score_e2e": 0.52,
+        "effective_outcome_per_sec": 3.0,
+        "per_item_effective_scores": [0.5, 0.5, 0.5, 0.58],
+    }
+    mismatch = out.compute_public_comparisons(
+        [
+            {**base_rec, "package": "fast-embeddinggemma-2", "config_label": "hetero", "diagnostics": {"coarse_max_tokens": 2048}},
+            {**base_rec, "package": "coreml-embeddinggemma-2-int8", "config_label": "int8", "diagnostics": {"coarse_max_tokens": 512}},
+        ]
+    )
+    assert len(mismatch) == 1 and mismatch[0]["coarse_max_tokens_mismatch"] is True
+
+    matched = out.compute_public_comparisons(
+        [
+            {**base_rec, "package": "fast-embeddinggemma-2", "config_label": "hetero", "diagnostics": {"coarse_max_tokens": 512}},
+            {**base_rec, "package": "coreml-embeddinggemma-2-int8", "config_label": "int8", "diagnostics": {"coarse_max_tokens": 512}},
+        ]
+    )
+    assert len(matched) == 1 and matched[0]["coarse_max_tokens_mismatch"] is False
+
+    # 3. MTEB unjudged query filtering
+    judged, unjudged = out._split_judged_query_ids(
+        ["q_missing", "q_zero", "q_pos"],
+        {"q_zero": {"d1": 0.0}, "q_pos": {"d1": 1.0}},
+    )
+    assert judged == ["q_pos"]
+    assert unjudged == ["q_missing", "q_zero"]
+
+    # 4. --abba-compare honors --public-python AND UNRESOLVED exits 0 under --smoke / --max-items, 1 on full runs.
+    seen_pythons: list[str] = []
+
+    def _fake_spawn(*, python_exe: str, pkg_name: str, label: str, extra_flags: str, args) -> list[dict[str, object]]:
+        del extra_flags, args
+        seen_pythons.append(python_exe)
+        # Small noisy delta whose 95% CI spans -0.003 -> UNRESOLVED.
+        scores = [0.5, 0.5, 0.5, 0.5] if label == "base" else [0.49, 0.51, 0.49, 0.51]
+        return [
+            out._build_record(
+                package=pkg_name,
+                category=2,
+                config_label=label,
+                benchmark="decisions",
+                valid_flags=[True] * 4,
+                item_scores=scores,
+                wall_sec=1.0,
+                diagnostics={"repeat_loop_count": 0},
+                memory_4bucket_gb={"combined_with_model_mapped_gb": 1.0},
+                sub_benchmarks={},
+                host_mem_gb=48.0,
+            )
+        ]
+
+    monkeypatch.setattr(out, "_hw_lock", out._null_ctx)
+    monkeypatch.setattr(out, "check_system_quiescence", lambda: [])
+    monkeypatch.setattr(out, "_spawn_isolated_worker", _fake_spawn)
+
+    rc_smoke = out.main([
+        "run", "--packages", "public-laya", "--public-python", "/opt/stock/python",
+        "--abba-compare", "base:", "cand:", "--smoke", "--cooldown-sec", "0",
+    ])
+    _ = capsys.readouterr()
+    assert rc_smoke == 0
+    assert seen_pythons and all(p == "/opt/stock/python" for p in seen_pythons)
+
+    rc_max = out.main([
+        "run", "--packages", "public-laya", "--public-python", "/opt/stock/python",
+        "--abba-compare", "base:", "cand:", "--max-items", "4", "--cooldown-sec", "0",
+    ])
+    _ = capsys.readouterr()
+    assert rc_max == 0
+
+    rc_full = out.main([
+        "run", "--packages", "public-laya", "--public-python", "/opt/stock/python",
+        "--abba-compare", "base:", "cand:", "--cooldown-sec", "0",
+    ])
+    _ = capsys.readouterr()
+    assert rc_full == 1
+
+
+def test_coreml_decision_probe_excludes_ipc_and_stock_hf_model_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bench = _load_script("test_coreml_dec_ipc", "_coreml_bench.py")
+    opb = _load_script("test_opb_hf_files", "_outcome_public_backends.py")
+
+    # 1. _decision uses in-process last_encode_sec rather than outer IPC wall time
+    class _FakeLaya:
+        last_encode_sec = 0.0
+
+        def encode_item(self, text, _qdef):
+            return {"ids": [1] * (40 if len(text) < 100 else 400), "markers": [0, 1]}
+
+        def score_noul_batch(self, encs):
+            self.last_encode_sec = 0.01 if len(encs[0]["ids"]) < 100 else 0.05
+            return [0.5]
+
+        def close(self):
+            return 0.0
+
+        def telemetry(self):
+            return {"coreml_info": {"buckets": [192, 384, 512]}}
+
+    def _pair(a, b, **_kw):
+        # Deliberately return huge outer wall time vs small in-process encode_sec payload.
+        return {
+            "order": ["A", "B", "B", "A"],
+            "a_median_s": 10.0,
+            "b_median_s": 20.0,
+            "a_runs": [{"payload": a()}],
+            "b_runs": [{"payload": b()}],
+        }
+
+    monkeypatch.setattr(bench, "CoreMlLayaBackend", _FakeLaya)
+    metrics, _ = bench._decision("coreml-laya", _pair, 0.0)
+    assert metrics["short_ms"] == pytest.approx(10.0, rel=1e-6)
+    assert metrics["long_ms"] == pytest.approx(50.0, rel=1e-6)
+    assert "excluding temp-JSON IPC" in metrics["timing_scope"]
+
+    # 2. stock_hf_model_files resolves blobs symlinks for Cat 1 and Cat 3/4 public-* packages
+    snap = tmp_path / "snapshots" / "rev1"
+    snap.mkdir(parents=True)
+    blob = tmp_path / "blobs" / "weights.safetensors"
+    blob.parent.mkdir()
+    blob.write_bytes(b"ok")
+    (snap / "model.safetensors").symlink_to(blob)
+    monkeypatch.setattr(opb, "resolve_hf_snapshot", lambda _repo: snap)
+    for pkg in ("public-bge-small", "public-embeddinggemma-2", "public-pplx", "public-gemma4", "public-gpt-oss"):
+        assert opb.stock_hf_model_files(pkg) == [blob]
+    assert opb.stock_hf_model_files("fast-bge-small") == []
+
+
+def test_llm_worker_merges_final_telemetry_before_gate_and_grpo_error_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inspect
+    import subprocess
+    import types
+
+    out = _load_script("test_out_llm_gate_mod", "benchmark_outcomes.py")
+    cap = _load_script("test_cap_grpo_err_mod", "benchmark_capabilities.py")
+
+    # 1. _run_llm_worker merges final daemon telemetry from pub_llm.close() BEFORE _build_record computes gate_verdict.
+    state = {"closed": False}
+
+    def _fake_gen(prompts, **_kw):
+        return ["Answer: A"] * len(prompts), ["stop"] * len(prompts), [[1, 2]] * len(prompts), {"completion_tokens": 2 * len(prompts), "mask_fallbacks": 0}
+
+    def _fake_close():
+        state["closed"] = True
+        return 22.0  # Exceeds 80% of 24 GB host_mem_gb (= 19.2 GB)
+
+    def _fake_telem():
+        if not state["closed"]:
+            return {"peak_gb": 1.0, "four_bucket_metrics": {"combined_with_model_mapped_gb": 1.0}}
+        return {"peak_gb": 22.0, "four_bucket_metrics": {"combined_with_model_mapped_gb": 22.0, "lifetime_max_phys_footprint_mb": 20000.0}}
+
+    fake_llm = SimpleNamespace(
+        default_label="coreai_qwen35_4b_4bit",
+        generate_fn=_fake_gen,
+        close=_fake_close,
+        telemetry=_fake_telem,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "_outcome_public_backends",
+        SimpleNamespace(build_public_llm_adapter=lambda *a, **k: fake_llm, stock_hf_model_files=lambda _p: []),
+    )
+    monkeypatch.setattr(
+        out,
+        "FourBucketMemoryProbe",
+        lambda **kw: SimpleNamespace(
+            snapshot=lambda **k: {
+                "phys_footprint": {"phys_footprint_gb": 0.1, "peak_footprint_gb": 0.1},
+                "task_vm_info": {"ledger_tag_neural_nofootprint_bytes": 0},
+                "mapped_files": {"model_bytes": 0},
+                "combined_with_model_mapped_gb": 0.1,
+            }
+        ),
+    )
+    monkeypatch.setattr(out, "DeviceMemoryGuard", lambda: SimpleNamespace(arm=lambda: None, check=lambda: (True, None)))
+    monkeypatch.setattr(out, "load_ifbench_test", lambda **kw: [{"id": "i1", "prompt": "Say ok", "instruction_id_list": [], "kwargs": []}])
+    monkeypatch.setattr(out, "load_mmlu_redux", lambda **kw: [{"id": "m1", "subject": "math", "question": "1+1?", "choices": ["2", "3", "4", "5"], "answer": 0}])
+    monkeypatch.setattr(out, "load_math_500", lambda **kw: [{"id": "ma1", "problem": "1+1", "answer": "2"}])
+    monkeypatch.setattr(out, "evaluate_instruction_following", lambda *a, **k: {"prompt_loose_acc": 1.0, "repeat_4gram_rate": 0.0, "repeat_loop_count": 0, "per_item_valid": [True], "per_item_scores": [1.0]})
+    monkeypatch.setattr(out, "evaluate_mmlu_redux", lambda *a, **k: {"exact_accuracy": 1.0, "repeat_loop_count": 0, "per_item_valid": [True], "per_item_scores": [1.0]})
+    monkeypatch.setattr(out, "evaluate_math_500", lambda *a, **k: {"verified_accuracy": 1.0, "repeat_loop_count": 0, "per_item_valid": [True], "per_item_scores": [1.0]})
+
+    recs = out._run_llm_worker(
+        "coreai-qwen3.5-4b",
+        tier="tier1",
+        config_label="",
+        extra=out._parse_extra_flags(["--categories", "3"]),
+        lock={"datasets": {"mmlu_redux_2": {"subjects": ["math"]}}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=None,
+        smoke=True,
+        include_unconstrained=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    assert len(recs) == 1
+    assert recs[0]["memory_4bucket_gb"]["combined_with_model_mapped_gb"] == 22.0
+    assert recs[0]["gate_verdict"] == "FAIL"
+    assert any("19.2" in r or "ceiling" in r.lower() or "mem" in r.lower() for r in recs[0]["gate_reasons"])
+
+    # 2. grpo-ane-critic warms PublicKev08bMlxBackend before t1, captures non-zero subprocess stderr,
+    #    and qlora-packing / encoder-finetune standardize peak_gb to decimal GB (/ 1e9).
+    grpo_src = inspect.getsource(cap._run_grpo_ane_critic)
+    assert grpo_src.index('"warmup"') < grpo_src.index("t1 = time.perf_counter()")
+    qlora_src = inspect.getsource(cap._run_qlora_packing)
+    enc_src = inspect.getsource(cap._run_encoder_finetune)
+    assert "peak_bytes / 1e9" in qlora_src and "peak_bytes / 1e9" in enc_src
+
+    laya_bundle = tmp_path / "laya_typed_s512_w8.mlmodelc"
+    laya_bundle.mkdir()
+    fake_py = tmp_path / "fake_py"
+    fake_py.touch()
+
+    class _FakeG4:
+        def __init__(self, **_kw):
+            pass
+
+        def generate_batch(self, prompts, **_kw):
+            return SimpleNamespace(items=[SimpleNamespace(text="{}", token_ids=[1, 2]) for _ in prompts])
+
+        def close(self):
+            pass
+
+    class _FakeLayaAne:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def encode_item(self, *_a, **_kw):
+            return {"ids": [1, 2], "markers": [0, 1]}
+
+        def score_noul_batch(self, encs):
+            return [0.8] * len(encs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "fast_decision_models.laya_ane", types.SimpleNamespace(LayaAneBackend=_FakeLayaAne))
+    monkeypatch.setitem(sys.modules, "fast_decision_models.paths", types.SimpleNamespace(ensure_laya_dylib=lambda: None, resolve_laya_dir=lambda *a, **k: tmp_path))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.cli", types.SimpleNamespace(_load_fixture_dataset=lambda _p: ("sys", "{}", ["p0", "p1", "p2", "p3"])))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.engine", types.SimpleNamespace(FastGemma4Engine=_FakeG4))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.paths", types.SimpleNamespace(resolve_paths=lambda h: h))
+    monkeypatch.setattr(cap, "resolve_pkg_home", lambda *_a: tmp_path)
+    monkeypatch.setattr(cap, "get_unified_memory_footprint", lambda: {"peak_footprint_gb": 1.23})
+    monkeypatch.setattr(
+        cap,
+        "run_subprocess_with_killpg",
+        lambda *_a, **_kw: subprocess.CompletedProcess([], 2, "", "RuntimeError: critic exploded\n"),
+    )
+    grpo_out = cap._run_grpo_ane_critic(SimpleNamespace(abba_rounds=1, public_python=str(fake_py), lora_python=str(fake_py)))
+    assert grpo_out["stock_detail"]["status"] == "failed"
+    assert grpo_out["stock_detail"]["returncode"] == 2
+    assert "critic exploded" in grpo_out["stock_detail"]["reason"]
+    assert grpo_out["grpo_step_overlap"]["status"] == "failed"
+    assert grpo_out["grpo_step_overlap"]["returncode"] == 2
+    assert "critic exploded" in grpo_out["grpo_step_overlap"]["reason"]

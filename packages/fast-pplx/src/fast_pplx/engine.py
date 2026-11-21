@@ -16,7 +16,7 @@ import numpy as np
 from fast_shared.embeddings import resolve_embedding_dim, truncate_and_normalize
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
-from .gpu import FastPplxGPU, _find_local_hf_snapshot, get_mlx_runtime_telemetry
+from .gpu import FastPplxGPU, _find_local_hf_snapshot, _resolve_max_length, get_mlx_runtime_telemetry
 from .paths import RepoPaths, resolve_paths
 from .tokenizer import ContextualTokenizer
 
@@ -1283,7 +1283,7 @@ class FastPplx:
         texts: Sequence[str] | str,
         *,
         batch_size: int = 16,
-        max_length: int = 32768,
+        max_length: int | None = 32768,
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
@@ -1291,7 +1291,7 @@ class FastPplx:
         mode: str | None = None,
     ) -> np.ndarray:
         items_txt = [texts] if isinstance(texts, str) else list(texts)
-        eff_max = min(int(max_length), self.max_seq_len) if max_length else self.max_seq_len
+        eff_max = _resolve_max_length(max_length, self.max_seq_len)
         if is_query:
             token_lists = [self.tokenizer.encode_query(t, max_length=eff_max) for t in items_txt]
         else:
@@ -1354,13 +1354,13 @@ class FastPplx:
         documents: Sequence[Sequence[str]],
         *,
         batch_size: int = 8,
-        max_length: int = 32768,
+        max_length: int | None = 32768,
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
     ) -> list[np.ndarray]:
-        eff_max = min(int(max_length), self.max_seq_len) if max_length else self.max_seq_len
+        eff_max = _resolve_max_length(max_length, self.max_seq_len)
         items: list[tuple[int, list[int], list[tuple[int, int]]]] = []
         for idx, chunks in enumerate(documents):
             tok_ids, spans = self.tokenizer.encode_contextual_document(
@@ -1396,7 +1396,7 @@ class FastPplx:
         mode: str | None = None,
     ) -> np.ndarray:
         items_txt = [texts] if isinstance(texts, str) else list(texts)
-        eff_max = self.max_seq_len if max_length is None else min(int(max_length), self.max_seq_len)
+        eff_max = _resolve_max_length(max_length, self.max_seq_len)
         eff_prefix = self.tokenizer.resolve_prefix(
             prefix=prefix,
             prompt_name=prompt_name,

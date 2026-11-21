@@ -87,6 +87,26 @@ def test_tokenizer_only_kev_matches_project_for_all_question_types_and_clipping(
         assert stock.encode_questions(state, qs) == project.encode_questions(state, qs)
 
 
+def test_public_decision_adapters_delegate_to_laya_and_kev_helpers(monkeypatch):
+    import fast_decision_models.kev_mlx as kev_mlx
+
+    seen = {}
+
+    def _spy_encode(tok, state, questions, *, special_ids=None, max_state_tokens=1024, max_branch_tokens=2048):
+        seen["args"] = (tok, state, questions, special_ids, max_state_tokens, max_branch_tokens)
+        return [1], [{"ids": [2, 3], "decide": 1, "opts": [0], "k": 1}]
+
+    monkeypatch.setattr(kev_mlx, "encode_kev_questions", _spy_encode)
+    tok = object()
+    res = public.encode_kev_questions_pure(tok, [1, 2, 3, 4, 5], "st", [{"type": "noul"}], max_state=64, max_branch=128)
+    assert res == ([1], [{"ids": [2, 3], "decide": 1, "opts": [0], "k": 1}])
+    assert seen["args"] == (tok, "st", [{"type": "noul"}], [1, 2, 3, 4, 5], 64, 128)
+
+    src = (ROOT / "scripts" / "_outcome_public_backends.py").read_text(encoding="utf-8")
+    assert "object.__new__(LayaAneBackend)" not in src
+    assert src.count("LayaAneBackend.from_tokenizer_only(") == 3
+
+
 @pytest.mark.parametrize("mutation", ["missing", "unexpected", "wrong_shape"])
 def test_stock_laya_strictly_checks_every_inner_encoder_weight(tmp_path, monkeypatch, mutation):
     mx = pytest.importorskip("mlx.core")

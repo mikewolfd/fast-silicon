@@ -2416,3 +2416,140 @@ def test_use_ane_ring_auto_chip_ram_batch_and_explicit_overrides_cpu(tmp_path: P
             assert seen_rings[-1][0] is True and isinstance(seen_rings[-1][1], _FakeRing)
     finally:
         fg4_mtp._APPLE10_NAX_CACHE = prev_cache
+
+
+def test_tied_checkpoint_vocab_remap_auto_detect_and_validation_cpu(tmp_path: Path) -> None:
+    """Verify tied-weight ckpt `vocab_remap.npz` auto-detection, full-vocab override, `vocab_out <= 0` validation, and typed `extract_parquet`."""
+    from functools import partial
+    from fast_gemma4.cli import build_parser
+    from fast_gemma4.pipeline import extract_parquet
+
+    # 1. Typed `extract_parquet` wrapper (not functools.partial) defaulting `whitespace_flexible=None`
+    assert not isinstance(extract_parquet, partial)
+    assert inspect.isfunction(extract_parquet)
+    sig = inspect.signature(extract_parquet)
+    assert sig.parameters["whitespace_flexible"].default is None
+
+    # 2. CLI rejects `--vocab-out 0` and negative values cleanly
+    parser = build_parser()
+    for bad in ("0", "-1", "-150786"):
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["generate", "hi", "--vocab-out", bad])
+        assert exc_info.value.code == 2
+
+    # 3. `FastGemma4Model.__init__` rejects `vocab_out <= 0` immediately before touching weights
+    for bad_v in (0, -1, -100):
+        with pytest.raises(ValueError, match="vocab_out"):
+            FastGemma4Model(vocab_out=bad_v, local_files_only=True)
+
+    # 4. Synthetic tied-weight checkpoint (2 layers, 0 shared) using pure-CPU `_FakeMx` / `_FakeNN`
+    V_FULL = 64
+    V_KEPT = 24
+    H_DIM = 64
+    PLE_D = 16
+    D_SWA = 16
+    D_FULL = 32
+    MLP_H = 64
+    N_LAYERS = 2
+
+    model_dir = tmp_path / "tied_ckpt"
+    model_dir.mkdir()
+
+    vocab = {f"tok{i}": i for i in range(V_FULL)}
+    tok = Tokenizer(BPE(vocab=vocab, merges=[]))
+    tok.save(str(model_dir / "tokenizer.json"))
+
+    cfg = {
+        "text_config": {
+            "hidden_size": H_DIM,
+            "num_hidden_layers": N_LAYERS,
+            "num_kv_shared_layers": 0,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 512,
+            "head_dim": D_SWA,
+            "global_head_dim": D_FULL,
+            "hidden_size_per_layer_input": PLE_D,
+            "final_logit_softcapping": 30.0,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": True,
+        }
+    }
+    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"mock")
+
+    fake_mx = _FakeMx()
+
+    class _FakeLinear:
+        def __init__(self, in_f: int, out_f: int, bias: bool = False) -> None:
+            self.in_features = in_f
+            self.out_features = out_f
+            self.weight = None
+
+        def parameters(self) -> list[Any]:
+            return [self.weight]
+
+    class _FakeNN:
+        Linear = _FakeLinear
+        QuantizedLinear = type("_NeverQLinear", (), {})
+        QuantizedEmbedding = type("_NeverQEmb", (), {})
+        Embedding = _FakeLinear
+
+    def _bf16(out_f: int, in_f: int) -> _FakeArray:
+        return _FakeArray(np.zeros((out_f, in_f), dtype=np.float32), dtype=fake_mx.bfloat16)
+
+    raw_weights: dict[str, _FakeArray] = {
+        "language_model.model.embed_tokens.weight": _bf16(V_FULL, H_DIM),
+        "language_model.model.embed_tokens_per_layer.weight": _bf16(V_FULL, N_LAYERS * PLE_D),
+        "language_model.model.per_layer_model_projection.weight": _bf16(N_LAYERS * PLE_D, H_DIM),
+        "language_model.model.per_layer_projection_norm.weight": _FakeArray(np.ones((PLE_D,), dtype=np.float32), dtype=fake_mx.bfloat16),
+        "language_model.model.norm.weight": _FakeArray(np.ones((H_DIM,), dtype=np.float32), dtype=fake_mx.bfloat16),
+    }
+    for i, hd in enumerate((D_SWA, D_FULL)):
+        lp = f"language_model.model.layers.{i}"
+        raw_weights[f"{lp}.self_attn.q_proj.weight"] = _bf16(2 * hd, H_DIM)
+        raw_weights[f"{lp}.self_attn.k_proj.weight"] = _bf16(hd, H_DIM)
+        raw_weights[f"{lp}.self_attn.v_proj.weight"] = _bf16(hd, H_DIM)
+        raw_weights[f"{lp}.self_attn.k_norm.weight"] = _FakeArray(np.ones((hd,), dtype=np.float32), dtype=fake_mx.bfloat16)
+        raw_weights[f"{lp}.self_attn.q_norm.weight"] = _FakeArray(np.ones((hd,), dtype=np.float32), dtype=fake_mx.bfloat16)
+        raw_weights[f"{lp}.self_attn.o_proj.weight"] = _bf16(H_DIM, 2 * hd)
+        raw_weights[f"{lp}.mlp.gate_proj.weight"] = _bf16(MLP_H, H_DIM)
+        raw_weights[f"{lp}.mlp.up_proj.weight"] = _bf16(MLP_H, H_DIM)
+        raw_weights[f"{lp}.mlp.down_proj.weight"] = _bf16(H_DIM, MLP_H)
+        raw_weights[f"{lp}.per_layer_input_gate.weight"] = _bf16(PLE_D, H_DIM)
+        raw_weights[f"{lp}.per_layer_projection.weight"] = _bf16(H_DIM, PLE_D)
+        for nw in ("input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm"):
+            raw_weights[f"{lp}.{nw}.weight"] = _FakeArray(np.ones((H_DIM,), dtype=np.float32), dtype=fake_mx.bfloat16)
+        raw_weights[f"{lp}.layer_scalar"] = _FakeArray([1.0], dtype=fake_mx.bfloat16)
+
+    fake_mx.load = lambda path: raw_weights  # type: ignore[attr-defined]
+    fake_mx.power = lambda a, b: _FakeArray(np.power(a, b.data), dtype=fake_mx.float32)  # type: ignore[attr-defined]
+    paths_obj = resolve_paths(tmp_path / "home")
+
+    with (
+        patch.object(fg4_model, "mx", fake_mx),
+        patch.object(fg4_model, "nn", _FakeNN),
+        patch.object(fg4_model, "tree_flatten", side_effect=lambda x: []),
+    ):
+        # (a) Stock tied checkpoint (no vocab_remap.npz in model_dir) + vocab_out=None -> full vocab
+        m_stock = FastGemma4Model(paths=paths_obj, model_dir=model_dir, vocab_out=None, use_mpp=False)
+        assert m_stock.remapper is None
+        assert m_stock.vocab_size == V_FULL
+        assert int(m_stock.lm_head.weight.shape[0]) == V_FULL
+
+        # (b) Packed tied checkpoint WITH model_dir / "vocab_remap.npz" + vocab_out=None -> auto-loads ckpt_remap
+        kept_ids = np.arange(0, V_KEPT * 2, 2, dtype=np.int32)
+        np.savez(model_dir / "vocab_remap.npz", kept_old_ids=kept_ids, old_ids=kept_ids)
+
+        m_packed = FastGemma4Model(paths=paths_obj, model_dir=model_dir, vocab_out=None, use_mpp=False)
+        assert m_packed.remapper is not None
+        assert m_packed.vocab_size == V_KEPT
+        assert int(m_packed.lm_head.weight.shape[0]) == V_KEPT
+        np.testing.assert_array_equal(m_packed.new_to_old, kept_ids)
+
+        # (c) Explicit vocab_out=full_vocab_rows overrides ckpt_remap to full vocab
+        m_override = FastGemma4Model(paths=paths_obj, model_dir=model_dir, vocab_out=V_FULL, use_mpp=False)
+        assert m_override.remapper is None
+        assert m_override.vocab_size == V_FULL
+        assert int(m_override.lm_head.weight.shape[0]) == V_FULL

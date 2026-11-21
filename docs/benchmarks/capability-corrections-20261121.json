@@ -1,9 +1,9 @@
 {
   "source_locations": {
-    "archive": "~/.gemini/antigravity/brain/53992a9e-105b-478f-a76e-f428be255568/scratch/",
-    "new_compiler_runs": ".cache/archive-release/investigations/fast-silicon-capabilities-20261121/",
-    "fixtures": "fast-silicon checkout",
-    "new_reporting_checks": ".cache/archive-release/investigations/fast-silicon-decisions-20261121/"
+    "archive": "offline-measurement-archive:2026-11-20",
+    "new_compiler_runs": "investigation:fast-silicon-capabilities-20261121",
+    "fixtures": "fast-silicon repository (commit 936edba for historical file_sha256 receipts)",
+    "new_reporting_checks": "investigation:fast-silicon-decisions-20261121"
   },
   "draft_generation": {
     "m5": {

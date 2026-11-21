@@ -24,6 +24,13 @@ from .prefix_tree import (
 _KEV_SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 _KEV_CACHE_LIMIT_BYTES = 512 << 20
 _KEV_CLEAR_CACHE_THRESHOLD_BYTES = 256 << 20
+KEV_SPECIAL_TOKENS: tuple[str, ...] = (
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|fim_suffix|>",
+)
 
 # Metal kernel source for Qwen3.5 `GatedDeltaNet` (`Dk=128`, `Dv % 8 == 0` packed butterfly).
 # Reads prefix `state_in` indirectly via `owner_idx[b_idx]` (zero `N_br`-way FP32 GDN state cloning!)
@@ -136,6 +143,86 @@ def _kev_render(v: Any, indent: int = 0) -> str:
             for k, x in v.items()
         )
     return str(v)
+
+
+def resolve_kev_special_ids(
+    tok: Any,
+    delimiters: Sequence[str] = KEV_SPECIAL_TOKENS,
+) -> list[int]:
+    """Resolve the 5 Kev delimiter token IDs from a Rust `Tokenizer`."""
+    ids = [tok.token_to_id(t) for t in delimiters]
+    if len(ids) != 5 or any(tid is None for tid in ids):
+        raise ValueError(f"Kev requires all five decision delimiters in its tokenizer: {list(delimiters)!r}")
+    return [int(tid) for tid in ids]
+
+
+def _encode_kev_user_tokens(tok: Any, text: str) -> list[int]:
+    return list(tok.encode(_KEV_SPECIAL_RE.sub(r"<¦\1¦>", text), add_special_tokens=False).ids)
+
+
+def encode_kev_questions(
+    tok: Any,
+    state: Any,
+    questions: Sequence[Mapping[str, Any]],
+    *,
+    special_ids: Sequence[int] | None = None,
+    max_state_tokens: int = 1024,
+    max_branch_tokens: int = 2048,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Pure-Python Kev-0.8B question encoder (zero MLX weight load; single source of truth).
+
+    Encodes one shared state prefix plus all typed branch questions (`noul`, `choice`, `score`).
+    When ``special_ids`` is omitted, resolves ``KEV_SPECIAL_TOKENS`` directly from ``tok``.
+    """
+    if special_ids is None:
+        s_ids = resolve_kev_special_ids(tok)
+    else:
+        s_ids = [int(x) for x in special_ids]
+        if len(s_ids) != 5:
+            raise ValueError(f"Expected 5 Kev special_ids, got {len(s_ids)}")
+    max_state = int(max_state_tokens)
+    max_branch = int(max_branch_tokens)
+    if max_state < 1:
+        raise ValueError(f"max_state_tokens must be >= 1, got {max_state_tokens!r}")
+    if max_branch < 3:
+        raise ValueError(f"max_branch_tokens must be >= 3, got {max_branch_tokens!r}")
+
+    s_toks = _encode_kev_user_tokens(tok, _kev_render(state))
+    state_ids = [s_ids[0]] + s_toks[: max_state - 1]
+    q_id, o_id, c_id, d_id = s_ids[1:]
+
+    rows: list[dict[str, Any]] = []
+    for qdef in questions:
+        t = str(qdef["type"])
+        crit = qdef.get("criteria")
+        if t == "noul":
+            cm = crit if isinstance(crit, Mapping) else {}
+            f_desc = cm.get("false")
+            t_desc = cm.get("true")
+            opts = [
+                "no" if not f_desc else f"no: {_kev_render(f_desc)}",
+                "yes" if not t_desc else f"yes: {_kev_render(t_desc)}",
+            ]
+        elif t == "choice":
+            if isinstance(crit, list):
+                opts = [str(x) for x in crit]
+            else:
+                opts = [k if not v else f"{k}: {_kev_render(v)}" for k, v in (crit or {}).items()]
+        else:
+            opts = [_kev_render(x) for x in (crit or ())]
+
+        instr = [q_id] + _encode_kev_user_tokens(tok, _kev_render(qdef.get("instructions")))
+        spans = [[o_id] + _encode_kev_user_tokens(tok, o) + [c_id] for o in opts]
+        br = instr + [tid for sp in spans for tid in sp] + [d_id]
+        if len(state_ids) + len(br) > max_branch:
+            br = br[: max(2, max_branch - len(state_ids) - 1)] + [d_id]
+        ends: list[int] = []
+        cursor = len(instr)
+        for sp in spans:
+            cursor += len(sp)
+            ends.append(min(cursor - 1, len(br) - 2))
+        rows.append({"ids": br, "decide": len(br) - 1, "opts": ends, "k": len(opts)})
+    return state_ids, rows
 
 
 def _parse_ver_tuple(ver_str: str) -> tuple[int, ...]:
@@ -789,46 +876,18 @@ class Kev08bMlxBackend:
         self.close()
 
     def _user_tokens(self, text: str) -> list[int]:
-        return list(self.tok.encode(_KEV_SPECIAL_RE.sub(r"<¦\1¦>", text), add_special_tokens=False).ids)
+        return _encode_kev_user_tokens(self.tok, text)
 
     def encode_questions(self, state: Any, questions: Sequence[Mapping[str, Any]]) -> tuple[list[int], list[dict[str, Any]]]:
         """Encode one shared state prefix plus all typed branch questions (`noul`, `choice`, `score`)."""
-        s_toks = self._user_tokens(_kev_render(state))
-        state_ids = [self.special_ids[0]] + s_toks[: self.max_state - 1]
-        q_id, o_id, c_id, d_id = self.special_ids[1:]
-
-        rows: list[dict[str, Any]] = []
-        for qdef in questions:
-            t = str(qdef["type"])
-            crit = qdef.get("criteria")
-            if t == "noul":
-                cm = crit if isinstance(crit, Mapping) else {}
-                f_desc = cm.get("false")
-                t_desc = cm.get("true")
-                opts = [
-                    "no" if not f_desc else f"no: {_kev_render(f_desc)}",
-                    "yes" if not t_desc else f"yes: {_kev_render(t_desc)}",
-                ]
-            elif t == "choice":
-                if isinstance(crit, list):
-                    opts = [str(x) for x in crit]
-                else:
-                    opts = [k if not v else f"{k}: {_kev_render(v)}" for k, v in (crit or {}).items()]
-            else:
-                opts = [_kev_render(x) for x in (crit or ())]
-
-            instr = [q_id] + self._user_tokens(_kev_render(qdef.get("instructions")))
-            spans = [[o_id] + self._user_tokens(o) + [c_id] for o in opts]
-            br = instr + [tid for sp in spans for tid in sp] + [d_id]
-            if len(state_ids) + len(br) > self.max_branch:
-                br = br[: self.max_branch - len(state_ids) - 1] + [d_id]
-            ends: list[int] = []
-            cursor = len(instr)
-            for sp in spans:
-                cursor += len(sp)
-                ends.append(min(cursor - 1, len(br) - 2))
-            rows.append({"ids": br, "decide": len(br) - 1, "opts": ends, "k": len(opts)})
-        return state_ids, rows
+        return encode_kev_questions(
+            self.tok,
+            state,
+            questions,
+            special_ids=self.special_ids,
+            max_state_tokens=self.max_state,
+            max_branch_tokens=self.max_branch,
+        )
 
     def _pointer_logits_and_probs(
         self,
@@ -1225,8 +1284,11 @@ class Kev08bMlxBackend:
 
 
 __all__ = [
+    "KEV_SPECIAL_TOKENS",
     "Kev08bMlxBackend",
     "_build_branch_attn_mask",
     "_build_state_attn_mask",
     "_detect_apple10_d256_force_fused",
+    "encode_kev_questions",
+    "resolve_kev_special_ids",
 ]

@@ -43,7 +43,7 @@ The project rows use eight extraction fixtures, a JSON schema and up to 512 outp
 | `fast-gpt-oss`, batched | 128 (128) | 128/128 | 46.141 s | 39.868 s decode | 454.1 | 1.483 | 14.79 GB |
 | Stock `mlx-lm`, summary prompt | 8 (8) | — | — | — | 156.1 | 1.188 | 11.24 GB |
 
-- **Standalone long-prefix suite (`gpt-oss bench --batches 8,64,128`, `L_sys=1,275`, `max_tokens=512`, `vocab_out=131,072`):** reaches **`462.8 dec tok/s`** (`0.710 docs/s`, `128/128` valid, `16.56 GB` peak MLX) at `B=128` vs `71.4 tok/s` (`0.200 docs/s`, `11.46 GB`) sustained `B=1` (**`+6.5x`** decode scaling).
+- **Standalone long-prefix suite (`gpt-oss bench --batches 8,64,128`, `L_sys=1,275`, `max_tokens=512`, `vocab_out=131,072`):** reaches **`462.8 dec tok/s`** (`0.710 docs/s`, `128/128` valid, `16.56 GB` peak MLX) at `B=128` vs `71.4 tok/s` (`0.200 docs/s`, `11.46 GB`) sustained `B=1` (**`6.5x`** decode scaling).
 - **Parity (`gpt-oss verify`):** passes `b1_valid=4/4` (`89.0 dec tok/s`), `b8_valid=8/8` (`185.0 dec tok/s`), `prefix16_token_matches=4`, and `key_field_matches=4`.
 
 ## Hardware Sizing Guidance

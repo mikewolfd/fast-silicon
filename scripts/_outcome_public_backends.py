@@ -34,7 +34,14 @@ from public_baselines import (
 )
 
 _FAST_SHARED_SRC = Path(__file__).resolve().parents[1] / "packages" / "fast-shared" / "src"
+_FAST_DECISION_MODELS_SRC = Path(__file__).resolve().parents[1] / "packages" / "fast-decision-models" / "src"
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+
+
+def _ensure_fast_decision_models_on_path() -> None:
+    src = str(_FAST_DECISION_MODELS_SRC)
+    if _FAST_DECISION_MODELS_SRC.is_dir() and src not in sys.path:
+        sys.path.insert(0, src)
 
 _COREAI_DAEMON_PREAMBLE = r"""
 import ctypes, json, os, sys, time
@@ -174,6 +181,8 @@ class _DaemonTelemetry:
             "cold_warm_latency": lat,
             "profiler_available": bool(self.profiler_available),
         }
+        if self.external_peak_gb > 0.0:
+            out["external_peak_gb"] = round(self.external_peak_gb, 4)
         if self.compile_sec > 0.0 or self.coreml_info is not None:
             out["compile_sec"] = round(self.compile_sec, 4)
         if self.coreml_info is not None:
@@ -230,9 +239,15 @@ class _CoreAiSubprocessClient:
         ready = self._proc.stdout.readline().strip() if self._proc.stdout else ""
         if ready != "READY":
             self._proc.kill()
+            if hasattr(self._proc, "wait"):
+                try:
+                    self._proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             self._tmp_obj.cleanup()
             raise RuntimeError(f"CoreAI daemon ({script_name}) failed to start: {ready}")
         self._closed = False
+        self._close_timeout = 10.0
         self._call_n = 0
         self._telemetry: dict[str, Any] = {
             "peak_gb": 0.0,
@@ -244,6 +259,10 @@ class _CoreAiSubprocessClient:
     def _merge_response(self, resp: Mapping[str, Any]) -> None:
         if "peak_gb" in resp and resp["peak_gb"] is not None:
             self._telemetry["peak_gb"] = round(max(float(self._telemetry.get("peak_gb", 0.0)), float(resp["peak_gb"])), 4)
+        if "external_peak_gb" in resp and resp["external_peak_gb"] is not None:
+            self._telemetry["external_peak_gb"] = round(
+                max(float(self._telemetry.get("external_peak_gb", 0.0)), float(resp["external_peak_gb"])), 4
+            )
         if "compile_sec" in resp and resp["compile_sec"] is not None:
             self._telemetry["compile_sec"] = round(float(resp["compile_sec"]), 4)
         for key in ("four_bucket_metrics", "cold_warm_latency", "asset_summary", "coreml_info"):
@@ -284,15 +303,44 @@ class _CoreAiSubprocessClient:
         if self._closed:
             return self.telemetry()
         self._closed = True
+        quit_msg = json.dumps({"cmd": "quit"}) + "\n"
         try:
-            if getattr(self._proc, "stdin", None) and getattr(self._proc, "stdout", None):
-                self._proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
-                self._proc.stdin.flush()
-                raw_line = self._proc.stdout.readline()
-                if raw_line:
-                    self._merge_response(json.loads(raw_line))
-                self._proc.wait(timeout=10)
+            try:
+                if hasattr(self._proc, "communicate"):
+                    out_s, _ = self._proc.communicate(input=quit_msg, timeout=self._close_timeout)
+                    for line in reversed((out_s or "").splitlines()):
+                        line_s = line.strip()
+                        if line_s:
+                            self._merge_response(json.loads(line_s))
+                            break
+                else:
+                    if getattr(self._proc, "stdin", None) and getattr(self._proc, "stdout", None):
+                        self._proc.stdin.write(quit_msg)
+                        self._proc.stdin.flush()
+                        raw_line = self._proc.stdout.readline()
+                        if raw_line:
+                            self._merge_response(json.loads(raw_line))
+                    if hasattr(self._proc, "wait"):
+                        self._proc.wait(timeout=self._close_timeout)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                if hasattr(self._proc, "kill"):
+                    try:
+                        self._proc.kill()
+                    except OSError:
+                        pass
+                if hasattr(self._proc, "wait"):
+                    try:
+                        self._proc.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
         finally:
+            for pipe_name in ("stdin", "stdout", "stderr"):
+                pipe = getattr(self._proc, pipe_name, None)
+                if pipe is not None and hasattr(pipe, "close"):
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
             self._tmp_obj.cleanup()
         return self.telemetry()
 
@@ -314,6 +362,7 @@ class Cat1Adapter:
     close_fn: Callable[[], float | None] | None = None
     telemetry_fn: Callable[[], dict[str, Any]] | None = None
     encode_token_ids: Callable[[list[list[int]], bool], tuple[np.ndarray, float]] | None = None
+    coarse_max_tokens: int | None = None
 
     def telemetry(self) -> dict[str, Any] | None:
         return self.telemetry_fn() if self.telemetry_fn is not None else None
@@ -419,27 +468,6 @@ def kev_pack_groups(
     return groups
 
 
-_KEV_SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
-
-
-def _kev_render_pure(v: Any, indent: int = 0) -> str:
-    pad = "  " * indent
-    if v is None:
-        return ""
-    if isinstance(v, (str, int, float, bool)):
-        return str(v)
-    if isinstance(v, list):
-        return "\n".join(f"{pad}- {_kev_render_pure(x, indent + 1).lstrip()}" for x in v)
-    if isinstance(v, Mapping):
-        return "\n".join(
-            f"{pad}{k}:\n{_kev_render_pure(x, indent + 1)}"
-            if isinstance(x, (Mapping, list))
-            else f"{pad}{k}: {_kev_render_pure(x)}"
-            for k, x in v.items()
-        )
-    return str(v)
-
-
 def encode_kev_questions_pure(
     tok: Any,
     special_ids: Sequence[int],
@@ -449,50 +477,21 @@ def encode_kev_questions_pure(
     max_state: int = 1024,
     max_branch: int = 2048,
 ) -> tuple[list[int], list[dict[str, Any]]]:
-    """Pure-Python Kev-0.8B question encoder matching `Kev08bMlxBackend.encode_questions` (0 MLX load)."""
+    """Thin backwards-compatible wrapper over `fast_decision_models.kev_mlx.encode_kev_questions`."""
+    _ensure_fast_decision_models_on_path()
+    from fast_decision_models.kev_mlx import encode_kev_questions
 
-    def _utoks(text: str) -> list[int]:
-        return list(tok.encode(_KEV_SPECIAL_RE.sub(r"<¦\1¦>", text), add_special_tokens=False).ids)
-
-    s_toks = _utoks(_kev_render_pure(state))
-    state_ids = [int(special_ids[0])] + s_toks[: max_state - 1]
-    q_id, o_id, c_id, d_id = (int(x) for x in special_ids[1:5])
-
-    rows: list[dict[str, Any]] = []
-    for qdef in questions:
-        t = str(qdef["type"])
-        crit = qdef.get("criteria")
-        if t == "noul":
-            cm = crit if isinstance(crit, Mapping) else {}
-            f_desc = cm.get("false")
-            t_desc = cm.get("true")
-            opts = [
-                "no" if not f_desc else f"no: {_kev_render_pure(f_desc)}",
-                "yes" if not t_desc else f"yes: {_kev_render_pure(t_desc)}",
-            ]
-        elif t == "choice":
-            if isinstance(crit, list):
-                opts = [str(x) for x in crit]
-            else:
-                opts = [k if not v else f"{k}: {_kev_render_pure(v)}" for k, v in (crit or {}).items()]
-        else:
-            opts = [_kev_render_pure(x) for x in (crit or ())]
-
-        instr = [q_id] + _utoks(_kev_render_pure(qdef.get("instructions")))
-        spans = [[o_id] + _utoks(o) + [c_id] for o in opts]
-        br = instr + [tid for sp in spans for tid in sp] + [d_id]
-        if len(state_ids) + len(br) > max_branch:
-            br = br[: max(2, max_branch - len(state_ids) - 1)] + [d_id]
-        ends: list[int] = []
-        cursor = len(instr)
-        for sp in spans:
-            cursor += len(sp)
-            ends.append(min(cursor - 1, len(br) - 2))
-        rows.append({"ids": br, "decide": len(br) - 1, "opts": ends, "k": len(opts)})
-    return state_ids, rows
+    return encode_kev_questions(
+        tok,
+        state,
+        questions,
+        special_ids=special_ids,
+        max_state_tokens=max_state,
+        max_branch_tokens=max_branch,
+    )
 
 
-def _build_coreml_emb2_adapter(variant: str) -> Cat1Adapter:
+def _build_coreml_emb2_adapter(variant: str, *, max_coarse_tokens: int | None = None) -> Cat1Adapter:
     """Build DRY Core ML ANE EmbeddingGemma-2 adapter (`fp16` FluidInference or `int8` OpenInfinity)."""
     from tokenizers import Tokenizer
 
@@ -541,7 +540,7 @@ def main():
     table_mode = {table_mode!r}
     snap = resolve_hf_snapshot(repo_id)
     mc_path, compile_s = resolve_coreml_compiled_model(repo_id, rel_model)
-    model_dirs = [snap.parents[1], snap.parents[2] / "blobs", mc_path.parent]
+    model_dirs = [snap.parents[1], snap.parents[1] / "blobs", mc_path.parent]
     telem = _DaemonTelemetry(model_dirs)
     telem.mark_compiled(compile_s)
     telem.set_coreml_info({{
@@ -580,7 +579,10 @@ def main():
         wx = np.broadcast_to(pad_row, (1, s, 512)).copy()
         wm = np.zeros((1, s), dtype=np.float16)
         wm[0, 0] = np.float16(1.0)
+        t_first = time.perf_counter()
         _ = embed_models[s].predict({{"inputs_embeds": wx, "attention_mask": wm}})
+        if telem.cold_first_infer_ms is None:
+            telem.record_infer((time.perf_counter() - t_first) * 1000.0)
     wb = np.full((1, 1, 256, 256), -10000.0, dtype=np.float16)
     np.fill_diagonal(wb[0, 0], np.float16(0.0))
     wp = np.zeros((256, 1), dtype=np.float16)
@@ -701,6 +703,7 @@ main()
             seqs.append(ids)
         return encode_ids(seqs, True)[0]
 
+    coarse_cap = min(512, int(max_coarse_tokens)) if max_coarse_tokens is not None else 512
     return Cat1Adapter(
         harness_label=harness_label,
         mrl_dims=(128, 256, 512, "max"),
@@ -710,10 +713,11 @@ main()
         enc_d_nb=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512),
         enc_q=lambda txts: _enc_emb2(txts, prefix=q_prefix, max_len=512),
         enc_d=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512),
-        enc_coarse_2k=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512),
+        enc_coarse_2k=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=coarse_cap),
         close_fn=lambda: float(client.close().get("peak_gb", 0.0)),
         telemetry_fn=client.telemetry,
         encode_token_ids=encode_ids,
+        coarse_max_tokens=coarse_cap,
     )
 
 
@@ -723,6 +727,7 @@ def build_public_cat1_adapter(
     tier: str,
     coreai_python: str | None = None,
     pplx_mlx_path: str | None = None,
+    max_coarse_tokens: int | None = None,
 ) -> Cat1Adapter:
     """Instantiate the fastest verified stock baseline encoder for Category 1."""
     if pkg_name == "public-bge-small":
@@ -792,6 +797,7 @@ def build_public_cat1_adapter(
                 mx.synchronize()
             return np.vstack(out_vecs) if out_vecs else np.zeros((0, 768), dtype=np.float32)
 
+        coarse_cap = int(max_coarse_tokens) if max_coarse_tokens is not None else 2048
         return Cat1Adapter(
             harness_label=lbl,
             mrl_dims=(128, 256, 512, "max"),
@@ -801,7 +807,8 @@ def build_public_cat1_adapter(
             enc_d_nb=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512, bsz=32),
             enc_q=lambda txts: _enc_emb2(txts, prefix=q_prefix, max_len=512, bsz=32),
             enc_d=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512, bsz=32),
-            enc_coarse_2k=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=2048, bsz=8),
+            enc_coarse_2k=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=coarse_cap, bsz=8),
+            coarse_max_tokens=coarse_cap,
         )
 
     if pkg_name == "coreai-embeddinggemma-2":
@@ -909,6 +916,7 @@ asyncio.run(main())
             client.request({"seqs": seqs, "max_cap": max_len, "out_npy": str(npy_p)})
             return np.load(npy_p)
 
+        coarse_cap = min(2048, int(max_coarse_tokens)) if max_coarse_tokens is not None else 2048
         return Cat1Adapter(
             harness_label="coreai-emb2-bf16",
             mrl_dims=(128, 256, 512, "max"),
@@ -918,9 +926,10 @@ asyncio.run(main())
             enc_d_nb=lambda txts: _enc_ca(txts, prefix=d_prefix, max_len=512),
             enc_q=lambda txts: _enc_ca(txts, prefix=q_prefix, max_len=512),
             enc_d=lambda txts: _enc_ca(txts, prefix=d_prefix, max_len=512),
-            enc_coarse_2k=lambda txts: _enc_ca(txts, prefix=d_prefix, max_len=2048),
+            enc_coarse_2k=lambda txts: _enc_ca(txts, prefix=d_prefix, max_len=coarse_cap),
             close_fn=lambda: float(client.close().get("peak_gb", 0.0)),
             telemetry_fn=client.telemetry,
+            coarse_max_tokens=coarse_cap,
         )
 
     if pkg_name == "public-pplx":
@@ -1018,7 +1027,7 @@ def main():
         p, c_s = resolve_coreml_compiled_model(repo_id, f"fp16/model_{{s}}.mlmodelc")
         mc_paths[s] = p
         tot_compile += c_s
-    telem = _DaemonTelemetry([snap.parents[1], snap.parents[2] / "blobs", mc_paths[128].parent])
+    telem = _DaemonTelemetry([snap.parents[1], snap.parents[1] / "blobs", mc_paths[128].parent])
     telem.mark_compiled(tot_compile)
     telem.set_coreml_info({{
         "repo_id": repo_id,
@@ -1039,7 +1048,10 @@ def main():
         ii = np.zeros((1, s), dtype=np.int32)
         am = np.zeros((1, s), dtype=np.int32)
         ii[0, 0] = {cls_id}; ii[0, 1] = {sep_id}; am[0, :2] = 1
+        t_first = time.perf_counter()
         _ = models[s].predict({{"input_ids": ii, "attention_mask": am}})
+        if telem.cold_first_infer_ms is None:
+            telem.record_infer((time.perf_counter() - t_first) * 1000.0)
     telem.mark_warmed((time.perf_counter() - t_warm) * 1000.0)
 
     ii_bufs = {{s: np.zeros((1, s), dtype=np.int32) for s in _BUCKETS}}
@@ -1109,10 +1121,10 @@ main()
         )
 
     if pkg_name == "coreml-embeddinggemma-2-fp16":
-        return _build_coreml_emb2_adapter("fp16")
+        return _build_coreml_emb2_adapter("fp16", max_coarse_tokens=max_coarse_tokens)
 
     if pkg_name == "coreml-embeddinggemma-2-int8":
-        return _build_coreml_emb2_adapter("int8")
+        return _build_coreml_emb2_adapter("int8", max_coarse_tokens=max_coarse_tokens)
 
     raise ValueError(f"Unsupported public Cat 1 package: {pkg_name}")
 
@@ -1122,15 +1134,42 @@ _STOCK_DECISION_REPOS = {
     "public-kev-0.8b": "AbstractFramework/kev-0.8b-mlx-8bit",
 }
 
+_STOCK_HF_REPOS: dict[str, tuple[str, ...]] = {
+    "public-bge-small": (
+        "mlx-community/bge-small-en-v1.5-8bit",
+        "mlx-community/bge-small-en-v1.5-bf16",
+    ),
+    "public-embeddinggemma-2": (
+        "mlx-community/embeddinggemma-2-8bit",
+        "mlx-community/embeddinggemma-2-bf16",
+        "google/embeddinggemma-2",
+    ),
+    "public-pplx": (
+        "zainmerchan/pplx-embed-v2-context-0.6b-mlx",
+        "perplexity-ai/pplx-embed-v2-context-0.6b",
+    ),
+    "public-laya": (_STOCK_DECISION_REPOS["public-laya"],),
+    "public-kev-0.8b": (_STOCK_DECISION_REPOS["public-kev-0.8b"],),
+    "public-gemma4": ("lmstudio-community/gemma-4-E2B-it-MLX-4bit",),
+    "public-gpt-oss": ("mlx-community/gpt-oss-20b-MXFP4-Q4",),
+}
+
+
+def stock_hf_model_files(pkg_name: str) -> list[Path]:
+    """Return the actual cached files the OS may report for a stock HF baseline's mappings."""
+    for repo in _STOCK_HF_REPOS.get(pkg_name, ()):
+        snapshot = resolve_hf_snapshot(repo)
+        if snapshot is not None:
+            # Hugging Face snapshots can contain symlinks into a sibling blobs directory.
+            return [path.resolve() for path in snapshot.rglob("*") if path.is_file()]
+    return []
+
 
 def stock_decision_model_files(backend_name: str) -> list[Path]:
     """Return the actual cached files the OS may report for this model's mappings."""
-    repo = _STOCK_DECISION_REPOS.get(backend_name)
-    snapshot = resolve_hf_snapshot(repo) if repo else None
-    if snapshot is None:
+    if backend_name not in _STOCK_DECISION_REPOS:
         return []
-    # Hugging Face snapshots can contain symlinks into a sibling blobs directory.
-    return [path.resolve() for path in snapshot.rglob("*") if path.is_file()]
+    return stock_hf_model_files(backend_name)
 
 
 class PublicLayaMlxBackend:
@@ -1140,7 +1179,8 @@ class PublicLayaMlxBackend:
         import mlx.core as mx
         import mlx.nn as nn
         from mlx_embeddings.models import modernbert
-        from tokenizers import Tokenizer
+
+        _ensure_fast_decision_models_on_path()
         from fast_decision_models.laya_ane import LayaAneBackend
 
         snap = resolve_hf_snapshot(_STOCK_DECISION_REPOS["public-laya"])
@@ -1189,25 +1229,24 @@ class PublicLayaMlxBackend:
         self.sc_1_b = raw_w["scorer.1.bias"].astype(mx.float32)
         self.sc_3_w = raw_w["scorer.3.weight"].astype(mx.float32)
         self.sc_3_b = raw_w["scorer.3.bias"].astype(mx.float32)
-        mx.eval(self.encoder.parameters(), self.type_emb_w, self.sc_n_w, self.sc_1_w, self.sc_3_w)
+        mx.eval(
+            self.encoder.parameters(),
+            self.type_emb_w,
+            self.head_layers,
+            self.sc_n_w,
+            self.sc_n_b,
+            self.sc_1_w,
+            self.sc_1_b,
+            self.sc_3_w,
+            self.sc_3_b,
+        )
 
-        tok_helper = object.__new__(LayaAneBackend)
-        tok_helper.laya_dir = snap
-        tok_helper.temperature = [float(x) for x in rl_cfg.get("temperature", [1.0, 1.0, 1.0])]
-        tok_helper.temperature_by_options = {
-            str(k): float(v) for k, v in rl_cfg.get("temperature_by_options", {}).items()
-        }
-        tok_helper.max_len = 512
-        tok_helper.head_max_len = LayaAneBackend._resolve_head_max_len(rl_cfg, 512)
-        tok_helper.tok = Tokenizer.from_file(str(snap / "tokenizer" / "tokenizer.json"))
-        tok_helper.tok.no_truncation()
-        tok_helper.tok.no_padding()
-        tok_helper.cls_id = int(tok_helper.tok.token_to_id("[CLS]") or 50281)
-        tok_helper.sep_id = int(tok_helper.tok.token_to_id("[SEP]") or 50282)
-        tok_helper.pad_id = int(tok_helper.tok.token_to_id("[PAD]") or 50283)
-        tok_helper.mask_id = int(tok_helper.tok.token_to_id("[MASK]") or 50284)
-        tok_helper.mask_tok = "[MASK]"
-        self._tok_helper = tok_helper
+        self._tok_helper = LayaAneBackend.from_tokenizer_only(
+            snap / "tokenizer" / "tokenizer.json",
+            rl_agent_config=rl_cfg,
+            laya_dir=snap,
+            max_len=512,
+        )
         self._qtype_map = {"choice": 0, "score": 1, "noul": 2}
         # The variable-length suite issues many allocation shapes on the 24 GB host.
         self._previous_cache_limit = mx.set_cache_limit(512 << 20)
@@ -1258,7 +1297,7 @@ class PublicLayaMlxBackend:
             pos_np = np.asarray(pos_l)
             for r_i, e in enumerate(batch):
                 m_pos = e["markers"]
-                temp = self._tok_helper._resolve_temperature(qtypes[r_i], len(m_pos))
+                temp = self._tok_helper.resolve_temperature(qtypes[r_i], len(m_pos))
                 raw_l = np.array([pos_np[r_i, p] for p in m_pos], dtype=np.float64) / max(temp, 0.05)
                 raw_l -= np.max(raw_l)
                 ex = np.exp(raw_l)
@@ -1284,7 +1323,7 @@ class CoreAiLayaBackend:
     """Apple `CoreAI` (`ahmedandaloes/laya-typed-decisions-CoreAI` `decision.aimodel`) backend."""
 
     def __init__(self, coreai_python: str | None = None) -> None:
-        from tokenizers import Tokenizer
+        _ensure_fast_decision_models_on_path()
         from fast_decision_models.laya_ane import LayaAneBackend
 
         snap_ca = resolve_hf_snapshot("ahmedandaloes/laya-typed-decisions-CoreAI")
@@ -1298,22 +1337,14 @@ class CoreAiLayaBackend:
         m_cap = int(manifest_ca["marker_capacity"])
         out_name0 = manifest_ca["outputs"][0]
 
-        tok_helper = object.__new__(LayaAneBackend)
-        tok_helper.laya_dir = snap_ca
-        tok_helper.temperature = [float(x) for x in rl_cfg.get("temperature", [1.0, 1.0, 1.0])]
-        tok_helper.temperature_by_options = {
-            str(k): float(v) for k, v in rl_cfg.get("temperature_by_options", {}).items()
-        }
-        tok_helper.max_len = min(512, seq_cap)
-        tok_helper.head_max_len = min(LayaAneBackend._resolve_head_max_len(rl_cfg, 512), m_cap)
-        tok_helper.tok = Tokenizer.from_file(str(snap_ca / "tokenizer" / "tokenizer.json"))
-        tok_helper.tok.no_truncation()
-        tok_helper.tok.no_padding()
-        tok_helper.cls_id = int(tok_helper.tok.token_to_id("[CLS]") or 50281)
-        tok_helper.sep_id = int(tok_helper.tok.token_to_id("[SEP]") or 50282)
-        tok_helper.pad_id = int(tok_helper.tok.token_to_id("[PAD]") or 50283)
-        tok_helper.mask_id = int(tok_helper.tok.token_to_id("[MASK]") or 50284)
-        tok_helper.mask_tok = "[MASK]"
+        tok_helper = LayaAneBackend.from_tokenizer_only(
+            snap_ca / "tokenizer" / "tokenizer.json",
+            rl_agent_config=rl_cfg,
+            laya_dir=snap_ca,
+            max_len=min(512, seq_cap),
+            head_max_len=LayaAneBackend.resolve_head_max_len(rl_cfg, 512),
+            head_max_len_cap=m_cap,
+        )
         self._tok_helper = tok_helper
         self._qtype_map = {"choice": 0, "score": 1, "noul": 2}
         self.peak_gb = 0.0
@@ -1387,7 +1418,7 @@ asyncio.run(main())
         raw_list = json.loads(oj.read_text(encoding="utf-8"))
         probs: list[list[float]] = []
         for lg, qti in zip(raw_list, qt_list):
-            temp = self._tok_helper._resolve_temperature(qti, len(lg))
+            temp = self._tok_helper.resolve_temperature(qti, len(lg))
             arr = np.asarray(lg, dtype=np.float64) / max(temp, 0.05)
             arr -= np.max(arr)
             ex = np.exp(arr)
@@ -1413,6 +1444,9 @@ asyncio.run(main())
 def load_kev_benchmark_tokenizer(kev_dir: Path | None, delimiters: Sequence[str]):
     from tokenizers import Tokenizer
 
+    _ensure_fast_decision_models_on_path()
+    from fast_decision_models.kev_mlx import resolve_kev_special_ids
+
     # The 8-bit repack changed Unicode pre-tokenization. Use the original Kev
     # adapter tokenizer for both scorers. Only tokenizer.json is required.
     source = kev_dir
@@ -1423,9 +1457,7 @@ def load_kev_benchmark_tokenizer(kev_dir: Path | None, delimiters: Sequence[str]
     tok = Tokenizer.from_file(str(source / "tokenizer.json"))
     tok.no_truncation()
     tok.no_padding()
-    ids = [tok.token_to_id(t) for t in delimiters]
-    if len(ids) != 5 or None in ids:
-        raise ValueError("Kev requires all five decision delimiters in its tokenizer")
+    ids = resolve_kev_special_ids(tok, delimiters)
     return tok, ids
 
 
@@ -1522,7 +1554,7 @@ class CoreMlLayaBackend:
     """Open HF Core ML ANE (`NMTZ/laya-typed-decisions-421m-coreml-ane`, `L192`/`L384`/`L512`) backend."""
 
     def __init__(self) -> None:
-        from tokenizers import Tokenizer
+        _ensure_fast_decision_models_on_path()
         from fast_decision_models.laya_ane import LayaAneBackend
 
         repo_id = COREML_REPO_IDS["coreml-laya"]
@@ -1541,25 +1573,17 @@ class CoreMlLayaBackend:
         rl_cfg = json.loads((snap_src / "rl_agent_config.json").read_text(encoding="utf-8"))
         local_half = int(enc_cfg.get("local_attention", 128)) // 2
 
-        tok_helper = object.__new__(LayaAneBackend)
-        tok_helper.laya_dir = snap_src
-        tok_helper.temperature = [float(x) for x in rl_cfg.get("temperature", [1.0, 1.0, 1.0])]
-        tok_helper.temperature_by_options = {
-            str(k): float(v) for k, v in rl_cfg.get("temperature_by_options", {}).items()
-        }
-        tok_helper.max_len = 512
-        tok_helper.head_max_len = min(LayaAneBackend._resolve_head_max_len(rl_cfg, 512), 256)
-        tok_helper.tok = Tokenizer.from_file(str(snap_src / "tokenizer" / "tokenizer.json"))
-        tok_helper.tok.no_truncation()
-        tok_helper.tok.no_padding()
-        tok_helper.cls_id = int(tok_helper.tok.token_to_id("[CLS]") or 50281)
-        tok_helper.sep_id = int(tok_helper.tok.token_to_id("[SEP]") or 50282)
-        tok_helper.pad_id = int(tok_helper.tok.token_to_id("[PAD]") or 50283)
-        tok_helper.mask_id = int(tok_helper.tok.token_to_id("[MASK]") or 50284)
-        tok_helper.mask_tok = "[MASK]"
+        tok_helper = LayaAneBackend.from_tokenizer_only(
+            snap_src / "tokenizer" / "tokenizer.json",
+            rl_agent_config=rl_cfg,
+            laya_dir=snap_src,
+            max_len=512,
+            head_max_len_cap=256,
+        )
         self._tok_helper = tok_helper
         self._qtype_map = {"choice": 0, "score": 1, "noul": 2}
         self.peak_gb = 0.0
+        self.last_encode_sec = 0.0
 
         daemon_laya = f"""
 import coremltools as ct
@@ -1582,7 +1606,13 @@ def main():
         mc_paths[b] = p
         tot_compile += c_s
 
-    telem = _DaemonTelemetry([snap_ane.parents[1], snap_src.parents[1], snap_ane.parents[2] / "blobs", mc_paths[_BUCKETS[0]].parent])
+    telem = _DaemonTelemetry([
+        snap_ane.parents[1],
+        snap_src.parents[1],
+        snap_ane.parents[1] / "blobs",
+        snap_src.parents[1] / "blobs",
+        mc_paths[_BUCKETS[0]].parent,
+    ])
     telem.mark_compiled(tot_compile)
     telem.set_coreml_info({{
         "repo_id": repo_id,
@@ -1646,8 +1676,7 @@ def main():
     for b in _BUCKETS:
         _ = _run_one([_PAD_ID] * b, [0, 1], 0)
     telem.mark_warmed((time.perf_counter() - t_warm) * 1000.0)
-    # Reset infer latency tracker after warmup so cold_first_infer_ms starts on real workload.
-    telem.cold_first_infer_ms = None
+    # Preserve true first cold inference latency from warmup; keep warm_latencies_ms post-READY only.
     telem.warm_latencies_ms = []
 
     sys.stdout.write("READY\\n")
@@ -1658,12 +1687,14 @@ def main():
             sys.stdout.write(json.dumps(telem.payload(final=True)) + "\\n")
             sys.stdout.flush()
             break
+        t_batch = time.perf_counter()
         out_logits = [
             _run_one(ids, mpos, qti)
             for ids, mpos, qti in zip(req["ids_list"], req["mpos_list"], req["qt_list"])
         ]
+        encode_sec = time.perf_counter() - t_batch
         Path(req["out_json"]).write_text(json.dumps(out_logits), encoding="utf-8")
-        sys.stdout.write(json.dumps({{"ok": True}}) + "\\n")
+        sys.stdout.write(json.dumps({{"ok": True, "encode_sec": encode_sec}}) + "\\n")
         sys.stdout.flush()
 
 main()
@@ -1680,25 +1711,30 @@ main()
 
     def _score_generic(self, encs: Sequence[Mapping[str, Any]], qtype_override: str | None = None) -> list[list[float]]:
         if not encs:
+            self.last_encode_sec = 0.0
             return []
         oj = self._client.next_temp_path("o_{n}.json")
         qt_list = [
             self._qtype_map[qtype_override] if qtype_override else int(e.get("qtype", 0))
             for e in encs
         ]
-        self._client.request(
-            {
-                "qt_list": qt_list,
-                "ids_list": [e["ids"] for e in encs],
-                "mpos_list": [e["markers"] for e in encs],
-                "out_json": str(oj),
-            }
-        )
-        self.peak_gb = max(self.peak_gb, self._client.peak_gb)
-        raw_list = json.loads(oj.read_text(encoding="utf-8"))
+        try:
+            resp = self._client.request(
+                {
+                    "qt_list": qt_list,
+                    "ids_list": [e["ids"] for e in encs],
+                    "mpos_list": [e["markers"] for e in encs],
+                    "out_json": str(oj),
+                }
+            )
+            self.last_encode_sec = float(resp.get("encode_sec", 0.0))
+            self.peak_gb = max(self.peak_gb, self._client.peak_gb)
+            raw_list = json.loads(oj.read_text(encoding="utf-8"))
+        finally:
+            oj.unlink(missing_ok=True)
         probs: list[list[float]] = []
         for lg, qti in zip(raw_list, qt_list):
-            temp = self._tok_helper._resolve_temperature(qti, len(lg))
+            temp = self._tok_helper.resolve_temperature(qti, len(lg))
             arr = np.asarray(lg, dtype=np.float64) / max(temp, 0.05)
             arr -= np.max(arr)
             ex = np.exp(arr)
@@ -1745,6 +1781,7 @@ class CoreMlKev08bBackend:
         self._tok.no_truncation()
         self._tok.no_padding()
         self.peak_gb = 0.0
+        self.last_encode_sec = 0.0
 
         daemon_kev = f"""
 import coremltools as ct
@@ -1779,7 +1816,7 @@ def main():
     fused_mc, c0 = resolve_coreml_compiled_model(repo_id, "fused/KevFused.mlpackage")
     row512_mc, c1 = resolve_coreml_compiled_model(repo_id, "L512_K16/KevRow_fp16.mlpackage")
     row1024_mc, c2 = resolve_coreml_compiled_model(repo_id, "L1024_K80/KevRow_fp16.mlpackage")
-    telem = _DaemonTelemetry([snap.parents[1], snap.parents[2] / "blobs", fused_mc.parent])
+    telem = _DaemonTelemetry([snap.parents[1], snap.parents[1] / "blobs", fused_mc.parent])
     telem.mark_compiled(c0 + c1 + c2)
     telem.set_coreml_info({{
         "repo_id": repo_id,
@@ -1933,7 +1970,7 @@ def main():
     # Also warm L1024_K80 via >512 dummy state
     _ = _run_row([pad_id] * 513, dummy_br)
     telem.mark_warmed((time.perf_counter() - t_warm) * 1000.0)
-    telem.cold_first_infer_ms = None
+    # Preserve true first cold inference latency from warmup; keep warm_latencies_ms post-READY only.
     telem.warm_latencies_ms = []
 
     sys.stdout.write("READY\\n")
@@ -1944,6 +1981,7 @@ def main():
             sys.stdout.write(json.dumps(telem.payload(final=True)) + "\\n")
             sys.stdout.flush()
             break
+        t_batch = time.perf_counter()
         out_all = []
         for s_ids, q_rows in req["items"]:
             doc_out = [None] * len(q_rows)
@@ -1968,8 +2006,9 @@ def main():
                     for qi, pair_val in zip(orig_qis, res_grp):
                         doc_out[qi] = pair_val
             out_all.append(doc_out)
+        encode_sec = time.perf_counter() - t_batch
         Path(req["out_json"]).write_text(json.dumps(out_all), encoding="utf-8")
-        sys.stdout.write(json.dumps({{"ok": True}}) + "\\n")
+        sys.stdout.write(json.dumps({{"ok": True, "encode_sec": encode_sec}}) + "\\n")
         sys.stdout.flush()
 
 main()
@@ -1992,12 +2031,17 @@ main()
     ) -> list[list[tuple[list[float], list[float]]]]:
         del batch_docs
         if not pairs:
+            self.last_encode_sec = 0.0
             return []
         encoded = [self.encode_questions(st, qs) for st, qs in pairs]
         oj = self._client.next_temp_path("kev_{n}.json")
-        self._client.request({"items": encoded, "out_json": str(oj)})
-        self.peak_gb = max(self.peak_gb, self._client.peak_gb)
-        raw = json.loads(oj.read_text(encoding="utf-8"))
+        try:
+            resp = self._client.request({"items": encoded, "out_json": str(oj)})
+            self.last_encode_sec = float(resp.get("encode_sec", 0.0))
+            self.peak_gb = max(self.peak_gb, self._client.peak_gb)
+            raw = json.loads(oj.read_text(encoding="utf-8"))
+        finally:
+            oj.unlink(missing_ok=True)
         return [[(list(pr), list(lg)) for pr, lg in doc_rows] for doc_rows in raw]
 
     def score_multi_states_noul(

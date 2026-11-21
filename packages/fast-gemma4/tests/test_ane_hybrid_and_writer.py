@@ -451,7 +451,7 @@ def test_async_hybrid_prefill_ring_rolling_and_long_tail(paths: Gemma4Paths, eng
     assert roll_long["valid_schemas"] == [True, True]
 
 
-def test_writer_nan_argmax_empty_batch_and_full_vocab_fallback(engine: FastGemma4Engine) -> None:
+def test_writer_nan_argmax_empty_batch_and_full_vocab_fallback(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:
     """Verify Pillar 4a/4b: all-NaN `-1` argmax, FloatingPointError in rolling, `m_rows==0` guards, and `full_logits_1d` fallback."""
     # 1. fused_softcap_argmax_bf16 NaN -> -1 & empty batch
     empty_am = fused_softcap_argmax_bf16(mx.zeros((0, 1, 256), dtype=mx.bfloat16), 30.0)
@@ -515,42 +515,59 @@ def test_writer_nan_argmax_empty_batch_and_full_vocab_fallback(engine: FastGemma
     assert _cosine(np.array(rr.astype(mx.float32)), np.array(rr_ref.astype(mx.float32))) >= 0.9999
 
     # 3. Full-vocab (`262,144`) fallback hygiene when schema requires tokens outside pruned `150,786` head
-    model = engine.model
-    assert model.remapper is not None
-    x_probe = mx.array(rng.standard_normal((model.hidden_size,)), dtype=mx.bfloat16)
-    full_lg = model.compute_full_vocab_logits_1d(x_probe, apply_softcap=True)
-    pruned_lg = np.array(model._apply_lm_head(x_probe.reshape(1, 1, -1), apply_softcap=True)[0, 0].astype(mx.float32))
-    assert full_lg.shape == (262144,)
-    assert np.allclose(full_lg[model.new_to_old], pruned_lg, atol=5e-2)
-
-    # Pick two clean printable multi-char non-ASCII tokens that were pruned (`old_to_new == -1`)
-    unkept = np.where(model.old_to_new < 0)[0]
-    chosen_toks: list[str] = []
-    for tid in unkept[:5000]:
-        s = engine.tokenizer.decode([int(tid)], skip_special_tokens=False)
-        if len(s) >= 2 and s.strip() and all(ord(ch) > 127 for ch in s):
-            enc_back = engine.tokenizer.encode(s, add_special_tokens=False)
-            if enc_back == [int(tid)]:
-                chosen_toks.append(s)
-                if len(chosen_toks) == 2:
-                    break
-    assert len(chosen_toks) == 2, f"Could not find 2 single-token unkept literals, got {chosen_toks}"
-    unkept_schema = {
-        "type": "object",
-        "properties": {"tag": {"type": "string", "enum": chosen_toks}},
-        "required": ["tag"],
-        "additionalProperties": False,
-    }
-    res_unkept = engine.generate_batch(
-        [f"Select tag {chosen_toks[1]} in JSON."],
-        json_schema=unkept_schema,
-        max_tokens=24,
-        mode="gpu",
-        speculative=False,
+    # Default stock engine uses full `262,144` vocab (`remapper is None`); construct explicit pruned engine to verify fallback.
+    assert engine.model.remapper is None
+    assert engine.model.vocab_size == 262144
+    pruned_engine = FastGemma4Engine(
+        home=paths.home,
+        default_mode="gpu",
+        vocab_out=150786,
+        mtp_drafter=None,
+        warmup=False,
+        warmup_ane=False,
     )
-    assert res_unkept.items[0].valid_json is True
-    assert res_unkept.items[0].valid_schema is True
-    assert res_unkept.items[0].parsed["tag"] in chosen_toks
+    try:
+        model = pruned_engine.model
+        assert model.remapper is not None
+        assert model.vocab_size == 150786
+        x_probe = mx.array(rng.standard_normal((model.hidden_size,)), dtype=mx.bfloat16)
+        full_lg = model.compute_full_vocab_logits_1d(x_probe, apply_softcap=True)
+        pruned_lg = np.array(
+            model._apply_lm_head(x_probe.reshape(1, 1, -1), apply_softcap=True)[0, 0].astype(mx.float32)
+        )
+        assert full_lg.shape == (262144,)
+        assert np.allclose(full_lg[model.new_to_old], pruned_lg, atol=5e-2)
+
+        # Pick two clean printable multi-char non-ASCII tokens that were pruned (`old_to_new == -1`)
+        unkept = np.where(model.old_to_new < 0)[0]
+        chosen_toks: list[str] = []
+        for tid in unkept[:5000]:
+            s = pruned_engine.tokenizer.decode([int(tid)], skip_special_tokens=False)
+            if len(s) >= 2 and s.strip() and all(ord(ch) > 127 for ch in s):
+                enc_back = pruned_engine.tokenizer.encode(s, add_special_tokens=False)
+                if enc_back == [int(tid)]:
+                    chosen_toks.append(s)
+                    if len(chosen_toks) == 2:
+                        break
+        assert len(chosen_toks) == 2, f"Could not find 2 single-token unkept literals, got {chosen_toks}"
+        unkept_schema = {
+            "type": "object",
+            "properties": {"tag": {"type": "string", "enum": chosen_toks}},
+            "required": ["tag"],
+            "additionalProperties": False,
+        }
+        res_unkept = pruned_engine.generate_batch(
+            [f"Select tag {chosen_toks[1]} in JSON."],
+            json_schema=unkept_schema,
+            max_tokens=24,
+            mode="gpu",
+            speculative=False,
+        )
+        assert res_unkept.items[0].valid_json is True
+        assert res_unkept.items[0].valid_schema is True
+        assert res_unkept.items[0].parsed["tag"] in chosen_toks
+    finally:
+        pruned_engine.close()
 
 
 def test_ff_q_causal_slice_jumping_and_prompt_lookup_parity(paths: Gemma4Paths, engine: FastGemma4Engine) -> None:

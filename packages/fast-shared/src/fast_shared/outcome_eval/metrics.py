@@ -288,24 +288,40 @@ def retrieval_coverage_errors(record: Mapping[str, Any]) -> list[str]:
 def _paired_score_evidence(
     baseline: Mapping[str, Any], candidate: Mapping[str, Any],
     base_items: Sequence[float] | None, cand_items: Sequence[float] | None,
-) -> dict[str, float | int] | None:
-    arrays = []
-    for record, items in ((baseline, base_items), (candidate, cand_items)):
+) -> tuple[dict[str, float | int] | None, list[str]]:
+    arrays: list[np.ndarray] = []
+    mismatch_reasons: list[str] = []
+    valid = True
+    for arm, record, items in (("baseline", baseline, base_items), ("candidate", candidate, cand_items)):
         if items is None:
             items = record.get("per_item_effective_scores")
         if items is None:
-            return None
+            valid = False
+            continue
         scores = np.asarray(items, dtype=np.float64)
-        if scores.ndim != 1 or scores.size < 2 or scores.size != record.get("n_items", scores.size):
-            return None
+        if scores.ndim != 1 or scores.size < 2 or not np.all(np.isfinite(scores)):
+            valid = False
+            continue
         # Stored item scores and headlines are rounded independently to six decimal places.
         mean = record.get("objective_score_e2e")
-        if mean is None or not np.all(np.isfinite(scores)) or not math.isclose(float(scores.mean()), mean, abs_tol=2e-6):
-            return None
+        if mean is None or not math.isfinite(float(mean)):
+            valid = False
+            continue
+        item_mean = float(scores.mean())
+        if not math.isclose(item_mean, float(mean), abs_tol=2e-6):
+            mismatch_reasons.append(
+                f"{arm} paired item scores mean ({item_mean:.6f}) disagrees with "
+                f"objective_score_e2e ({float(mean):.6f})"
+            )
+            valid = False
+            continue
+        if scores.size != record.get("n_items", scores.size):
+            valid = False
+            continue
         arrays.append(scores)
-    if arrays[0].shape != arrays[1].shape:
-        return None
-    return compute_paired_se(*arrays)
+    if not valid or len(arrays) != 2 or arrays[0].shape != arrays[1].shape:
+        return None, mismatch_reasons
+    return compute_paired_se(*arrays), mismatch_reasons
 
 
 def evaluate_promotion_gates(
@@ -346,9 +362,14 @@ def evaluate_promotion_gates(
     base_ids = baseline.get("retrieval_query_order_sha256")
     cand_ids = candidate.get("retrieval_query_order_sha256")
     different_queries = bool(base_ids and cand_ids and base_ids != cand_ids)
-    paired = None if different_queries else _paired_score_evidence(
-        baseline, candidate, base_effective_scores, cand_effective_scores,
-    )
+    paired: dict[str, float | int] | None
+    paired_mismatch_reasons: list[str]
+    if different_queries:
+        paired, paired_mismatch_reasons = None, []
+    else:
+        paired, paired_mismatch_reasons = _paired_score_evidence(
+            baseline, candidate, base_effective_scores, cand_effective_scores,
+        )
 
     base_diag = baseline.get("diagnostics") if isinstance(baseline.get("diagnostics"), Mapping) else {}
     cand_diag = candidate.get("diagnostics") if isinstance(candidate.get("diagnostics"), Mapping) else {}
@@ -370,8 +391,14 @@ def evaluate_promotion_gates(
     elif prof == "lossless":
         if paired is None:
             quality_status = "UNRESOLVED"
-            reasons.append("Gate1(lossless) quality unresolved: complete paired scores for at least two items "
-                           "must match both reported means")
+            if paired_mismatch_reasons:
+                reasons.extend(
+                    f"Gate1(lossless) quality unresolved: {reason}"
+                    for reason in paired_mismatch_reasons
+                )
+            else:
+                reasons.append("Gate1(lossless) quality unresolved: complete paired scores for at least two items "
+                               "must match both reported means")
         elif paired["ci95_high"] < threshold:
             quality_status = "FAIL"
             reasons.append(f"Gate1(lossless) quality regression: paired 95% upper bound "
@@ -380,9 +407,15 @@ def evaluate_promotion_gates(
             quality_status = "UNRESOLVED"
             reasons.append(f"Gate1(lossless) quality unresolved: paired 95% interval "
                            f"[{paired['ci95_low']:+.4f}, {paired['ci95_high']:+.4f}] crosses fixed floor {quality_floor:+.4f}")
-    elif delta_s < threshold:
-        quality_status = "FAIL"
-        reasons.append(f"Gate1(quantized) quality regression: delta_S={delta_s:+.4f} < floor {quality_floor:+.4f}")
+    else:
+        if paired_mismatch_reasons:
+            reasons.extend(
+                f"Paired score evidence ignored: {reason}"
+                for reason in paired_mismatch_reasons
+            )
+        if delta_s < threshold:
+            quality_status = "FAIL"
+            reasons.append(f"Gate1(quantized) quality regression: delta_S={delta_s:+.4f} < floor {quality_floor:+.4f}")
 
     diagnostics_ok = True
     if prof == "lossless":

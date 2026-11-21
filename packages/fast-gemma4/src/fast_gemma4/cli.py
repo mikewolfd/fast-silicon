@@ -428,8 +428,15 @@ def _add_json_layout_args(subparser: argparse.ArgumentParser) -> None:
     subparser.set_defaults(whitespace_flexible=None)
 
 
+def _positive_int(raw: str) -> int:
+    val = int(raw)
+    if val <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {val}")
+    return val
+
+
 def _add_model_args(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument("--vocab-out", type=int, help="Limit allowed output tokens, e.g. 150786 for the English-oriented profile (default: checkpoint vocabulary)")
+    subparser.add_argument("--vocab-out", type=_positive_int, help="Limit allowed output tokens, e.g. 150786 for the English-oriented profile (default: checkpoint vocabulary)")
     subparser.add_argument("--model-dir", default=None, help="Override local HuggingFace/fused checkpoint directory")
     subparser.add_argument("--no-kv-i8", action="store_true", help="Disable INT8 rolling KV cache compression")
     subparser.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")

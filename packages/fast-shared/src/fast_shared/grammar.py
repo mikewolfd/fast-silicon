@@ -141,9 +141,9 @@ class GrammarHelper:
         schema: str | dict[str, Any],
         new_to_old: np.ndarray | None = None,
         *,
-        whitespace_flexible: bool = False,
+        whitespace_flexible: bool | None = False,
         eos_token_id: int | None = None,
-        separators: tuple[str, str] = (",", ":"),
+        separators: tuple[str, str] | None = None,
     ) -> None:
         llguidance = _import_llguidance()
         self.tokenizer = tokenizer
@@ -155,10 +155,17 @@ class GrammarHelper:
             if eos_token_id is not None
             else getattr(tokenizer, "eos_token_id", getattr(self.ltok, "eos_token", 0))
         )
-        self.separators = separators
+        eff_separators = (
+            separators
+            if separators is not None
+            else ((",", ": ") if whitespace_flexible is None else (",", ":"))
+        )
+        eff_whitespace_flexible = bool(whitespace_flexible)
+        self.separators = eff_separators
+        self.whitespace_flexible = eff_whitespace_flexible
         self.gram = llguidance.JsonCompiler(
-            separators=separators,
-            whitespace_flexible=whitespace_flexible,
+            separators=eff_separators,
+            whitespace_flexible=eff_whitespace_flexible,
         ).compile(self.schema_str)
         m = llguidance.LLMatcher(self.ltok, self.gram)
         self.upfront_ff: list[int] = list(m.compute_ff_tokens())

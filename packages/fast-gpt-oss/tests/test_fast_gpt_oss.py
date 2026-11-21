@@ -698,6 +698,149 @@ def test_batched_wave_multitoken_ff_and_strict_schema_cpu(tmp_path: Path, monkey
     assert res2.items[1].valid_json is True and res2.items[1].valid_schema is True
 
 
+def test_http_adapter_whitespace_flexible_and_compact_contract_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify `FastGptOssOpenAIAdapter` does not inject `compact=True` and preserves `eff_ws`."""
+    from collections import OrderedDict
+    import sys
+    from fast_gpt_oss.engine import FastGptOssEngine
+    from fast_gpt_oss.server import FastGptOssOpenAIAdapter
+
+    tok_path = _write_synthetic_o200k_tokenizer(tmp_path)
+    tok = FastGptOssTokenizer(tok_path)
+    vocab_n = tok.vocab_size
+
+    class _NoopMx:
+        @staticmethod
+        def reset_peak_memory():
+            return None
+
+        @staticmethod
+        def get_peak_memory():
+            return 0
+
+        @staticmethod
+        def clear_cache():
+            return None
+
+        @staticmethod
+        def set_cache_limit(_limit):
+            return 0
+
+    import mlx
+    monkeypatch.setattr(mlx, "core", _NoopMx)
+    monkeypatch.setitem(sys.modules, "mlx.core", _NoopMx)
+
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    spaced_ids = tok.encode('{"ok": true}')
+    compact_ids = tok.encode('{"ok":true}')
+
+    class _SpyGptOssEngine(FastGptOssEngine):
+        model_name = "openai/gpt-oss-20b"
+
+        def __init__(self) -> None:
+            self.tokenizer = tok
+            self.model = SimpleNamespace(new_to_old=np.arange(vocab_n, dtype=np.int32), vocab_n=vocab_n)
+            self.default_mode = "b1"
+            self.default_reasoning_effort = "skip"
+            self.min_prefix_cache_tokens = 1
+            self._max_prefix_cache = 8
+            self._max_grammar_cache = 8
+            self._prefix_cache = OrderedDict()
+            self._grammar_cache = OrderedDict()
+            self._lock = threading.RLock()
+            self._dummy_pad_id = 0
+            self.received_kwargs: list[dict[str, object]] = []
+            self.observed_eff_ws: list[tuple[bool, bool | None]] = []
+
+        def generate_batch(self, prompts, **kwargs):
+            self.received_kwargs.append(dict(kwargs))
+            return super().generate_batch(prompts, **kwargs)
+
+        def _run_b1_single(self, prompt_ids, *, grammar, whitespace_flexible, **kwargs):
+            self.observed_eff_ws.append(
+                (bool(whitespace_flexible), None if grammar is None else grammar.whitespace_flexible)
+            )
+            out_ids = list(spaced_ids if whitespace_flexible else compact_ids)
+            return {
+                "out_ids": out_ids,
+                "ana_ids": [],
+                "ff_skipped": 0,
+                "mask_hits": 0,
+                "finished": True,
+                "prefill_sec": 0.0,
+                "decode_sec": 0.001,
+                "steps": 1,
+            }
+
+    eng = _SpyGptOssEngine()
+    adapter = FastGptOssOpenAIAdapter(eng)
+    assert adapter.default_whitespace_flexible is True
+
+    with FastGptOssServer(eng, port=0) as srv:
+        base = f"http://127.0.0.1:{srv.port}"
+
+        def _post(path: str, payload: dict) -> dict:
+            req = urllib.request.Request(
+                f"{base}{path}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        rf = {"type": "json_schema", "json_schema": {"name": "s", "schema": schema}}
+
+        # 1. Default chat request: default_whitespace_flexible=True, compact NOT injected -> eff_ws=True.
+        out_default = _post("/v1/chat/completions", {"messages": [{"role": "user", "content": "d"}], "response_format": rf})
+        assert out_default["choices"][0]["message"]["content"] == '{"ok": true}'
+        assert "compact" not in eng.received_kwargs[-1]
+        assert eng.received_kwargs[-1]["whitespace_flexible"] is True
+        assert eng.observed_eff_ws[-1] == (True, True)
+        assert out_default["fast_gpt_oss"]["valid_schema_count"] == 1
+
+        # 2. Explicit whitespace_flexible=True: compact NOT injected -> eff_ws=True.
+        out_ws_true = _post(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "t"}], "response_format": rf, "whitespace_flexible": True},
+        )
+        assert out_ws_true["choices"][0]["message"]["content"] == '{"ok": true}'
+        assert "compact" not in eng.received_kwargs[-1]
+        assert eng.observed_eff_ws[-1] == (True, True)
+        assert out_ws_true["fast_gpt_oss"]["valid_schema_count"] == 1
+
+        # 3. Default /v1/completions also must NOT inject compact=True -> eff_ws=True.
+        out_cmpl = _post("/v1/completions", {"prompt": "c", "response_format": rf})
+        assert out_cmpl["choices"][0]["text"] == '{"ok": true}'
+        assert "compact" not in eng.received_kwargs[-1]
+        assert eng.observed_eff_ws[-1] == (True, True)
+
+        # 4. Explicit compact=True overrides whitespace_flexible -> eff_ws=False (compact JSON).
+        out_compact = _post(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "k"}], "response_format": rf, "compact": True},
+        )
+        assert out_compact["choices"][0]["message"]["content"] == '{"ok":true}'
+        assert eng.received_kwargs[-1]["compact"] is True
+        assert eng.observed_eff_ws[-1] == (False, False)
+        assert out_compact["fast_gpt_oss"]["valid_schema_count"] == 1
+
+        # 5. Explicit whitespace_flexible=False selects compact JSON -> eff_ws=False.
+        out_ws_false = _post(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "f"}], "response_format": rf, "whitespace_flexible": False},
+        )
+        assert out_ws_false["choices"][0]["message"]["content"] == '{"ok":true}'
+        assert "compact" not in eng.received_kwargs[-1]
+        assert eng.received_kwargs[-1]["whitespace_flexible"] is False
+        assert eng.observed_eff_ws[-1] == (False, False)
+        assert out_ws_false["fast_gpt_oss"]["valid_schema_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Live Metal 4 GPU Synthetic Model Test (M4 Pro hardware kernels end-to-end)
 # ---------------------------------------------------------------------------

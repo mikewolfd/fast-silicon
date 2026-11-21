@@ -158,11 +158,11 @@ The minified matcher blocked Gemma’s usual token for a space and opening quote
 
 The normal M5 benchmark submitted all 150 forms and then all 150 tool requests. The two current project runs used the same checkpoint, full vocabulary, prompts, batch size of eight, and 256 MiB MLX cache limit. The older stock run used batch 16. Field F1 gives zero credit to an invalid extraction. Tool accuracy checks both selected tools and argument values, including cases where the correct decision was to abstain.
 
-| M5 configuration | Field F1 | Valid extractions / 150 | Correct tool decisions / 150 | Usable tool responses / 150 | Full-job seconds |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **Project, strict fixed separators** | **0.9459** | **150** | **123** | **150** | **144.35** |
-| Project, unconstrained | 0.9241 | 146 | 125 | 142 | 205.81 |
-| Stock MLX, unconstrained (archived) | 0.9234 | 146 | 120 | 140 | 172.19 |
+| M5 configuration | Field F1 | Valid extractions / 150 | Correct tool decisions / 150 | Usable tool responses / 150 | `S_obj,e2e` | `EOT (u/s)` (vs. Stock) | Full-job seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Project, strict fixed separators** | **0.9459** | **150** | **123** | **150** | **0.8830** | **1.835** (**1.22×**) | **144.35** |
+| Project, unconstrained | 0.9241 | 146 | 125 | 142 | 0.8787 | 1.281 (0.85×) | 205.81 |
+| Stock MLX, unconstrained (archived) | 0.9234 | 146 | 120 | 140 | 0.8617 | 1.501 (1.00×) | 172.19 |
 
 Both project runs finished without a repeat loop. Against unconstrained project decoding, strict decoding improved field F1 by 0.0218 and recovered twelve additional usable outputs across both workloads. It answered two fewer tool requests correctly. The paired 95% intervals were −0.0028 to +0.0464 for field F1 and −0.0623 to +0.0357 for tool accuracy. The strict run reported a 6.10 GB combined memory snapshot. The controlled extraction replay above split admissions into 19 smaller calls and scored 0.9451. [Runner settings, task splits and paired scores](benchmarks/gemma-grammar-20261121.json) · [Historical stock run](benchmarks/document-workloads.json)
 
@@ -179,7 +179,7 @@ Category 3 evaluates reasoning on `IFBench`, `MMLU-Redux` and `MATH-500`. Catego
 | **Cat 3: `GPT-OSS-20B`** (`75`) | **`fast-gpt-oss` (`auto`)** *(48 GB only)* | *Gated (`24 GB`)* | *Gated* | — | `0.3067` (`40/75`) | **`0.174`** (`132.3s`) | `11.94 / 12.26 GB` | — / **`1.23×`** | *48 GB only* |
 | Cat 3: Stock `MLX` | `gpt-oss-20b-MXFP4-Q4` (`mlx-lm`) | *Gated (`24 GB`)* | *Gated* | — | `0.3600` (`69/75`) | `0.141` (`191.0s`) | `12.97 / 12.07 GB` | `1.00×` | *48 GB only* |
 | **Cat 3: `CoreAI Qwen3.5-4B`** (`48`) | CoreAI `4bit` / `fp4_fp8` | 0.3125 (29/48 valid) / 0.3125 (28/48 valid) | 0.041 / 0.048 (369 s / 311 s) | `0.00 / 1.65 -> 1.72 GB` | — *(26.6)* | — *(26.6)* | — | Both failed the repeat-loop check (1 / 2 loops) | — |
-| **Cat 4: `Gemma-4 E2B`** (`300`) | **`fast-gemma4` (`llg_on` / `llg_off`)** | `0.7487` (**`299/300`**) / `0.8241` (`284/300`) | **`2.717`** (`82.7s`) / `1.848` (`133.8s`) | `5.92 / 16.94 GB` | `0.7473` (**`299/300`**) / `0.8178` (`285/300`) | **`2.412`** (`92.9s`) / `1.702` (`144.1s`) | `5.93 / 18.37 GB` | **`1.81×`** / **`1.57×`** (`llg_on` `EOT`) | **`1.13×`** |
+| **Cat 4: `Gemma-4 E2B`** (`300`, historical, pre-repair minified) | `fast-gemma4` (`llg_on` / `llg_off`, 150K vocab, minified) | `0.7487` (`299/300`) / `0.8241` (`284/300`) | `2.717` (`82.7s`) / `1.848` (`133.8s`) | `5.92 / 16.94 GB` | `0.7473` (`299/300`) / `0.8178` (`285/300`) | `2.412` (`92.9s`) / `1.702` (`144.1s`) | `5.93 / 18.37 GB` | `1.81×` / `1.57×` (`llg_on` `EOT`, historical) | `1.13×` |
 | Cat 4: Stock `MLX` | `gemma-4-E2B-it-MLX-4bit` (`mlx-vlm`, unconstrained) | `0.8617` (`286/300`) | `1.501` (`172.2s`) | `6.11 / 5.58 GB` | `0.8658` (`287/300`) | `1.537` (`169.0s`) | `6.36 / 5.66 GB` | `1.00×` | `0.98×` |
 | **Cat 4: `GPT-OSS-20B`** (`50`) | **`fast-gpt-oss` (`llg_on`)** *(48 GB only)* | *Gated (`24 GB`)* | *Gated* | — | `0.5063` (**`49/50`**) | **`0.318`** (`79.7s`) | `12.59 /` **`12.77 GB`** | — / **`1.61×` `EOT` (`+53%` valid docs)** | *48 GB only* |
 | Cat 4: Stock `MLX` | `gpt-oss-20b-MXFP4-Q4` (`mlx-lm`, unconstrained) | *Gated (`24 GB`)* | *Gated* | — | `0.5755` (`32/50`) | `0.197` (`146.2s`) | `14.48 / 14.30 GB` | `1.00×` | *48 GB only* |
@@ -333,7 +333,7 @@ The BGE and EmbeddingGemma project probes start with token IDs. Historical stock
 | `fast-embeddinggemma-2`, 2,000 pretokenized documents | 38,517 tokens/s, 3.26 GB footprint | 48,803 tokens/s, 2.76 GB footprint |
 | EmbeddingGemma, stock `mlx-vlm`, text inputs | 46.05 documents/s, 8.39 ms for one query | 64.91 documents/s, 8.48 ms for one query |
 | `fast-pplx`, 24 short and four long inputs | 12,624 tokens/s | 16,796 tokens/s (1.33× the M4 Pro rate) |
-| Kev, eight distinct inputs per batch, project / stock `mlx-lm` | 54.52 / 50.6 questions/s | 86.84 / 81.7 questions/s |
+| Kev, 64 short fixtures in batches of eight, project / stock `mlx-lm` | 54.52 / 62.13 questions/s | 86.84 questions/s project (scored stock short-fixture probe not rerun on M5; 1,400-item decision suite: 4.395 vs 5.039 score units/s in [Decision scoring](#decision-models)) |
 | Laya, `fast-decision-models` Neural Engine scorer | 41.91 questions/s | 44.38 questions/s |
 
 The PPLX package also reports fixed-length runs. For public Kev performance when eight questions share one short passage, use the shared-passage results. [PPLX workloads](../packages/fast-pplx/README.md) · [Public Kev warm timings](#warm-query-corpus-and-packing)

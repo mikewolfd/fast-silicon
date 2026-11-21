@@ -79,5 +79,6 @@ sync-clean-check:
 	$(PYTHON) scripts/sync_from_siblings.py --check --require-clean
 
 leak-check:
-	@! rg -n -i "/users/|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \
+	@! rg -n -i "/users/|\.gemini|antigravity|\.cache/archive-release|focus-macbook|~/work|~/desktop|~/documents|~/downloads|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \
 		packages scripts tests docs pyproject.toml .agents LICENSE .gitignore uv.lock README.md
+	@! rg -n -i "~/" docs README.md pyproject.toml .agents LICENSE .gitignore uv.lock

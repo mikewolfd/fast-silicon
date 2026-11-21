@@ -817,3 +817,125 @@ def test_thread_safe_last_stats_and_hetero_vs_hetero2_deterministic(tmp_path: Pa
         _ = eng_det.encode_tokens([[4, 5, 6]], dimensions=16, mode="hetero2")
         assert eng_det.last_stats["mode"] == "gpu"
         assert eng_det.last_stats["deterministic"] is True
+
+
+def test_max_length_validation_and_hetero2_contextual_work_stealing_cpu(tmp_path: Path) -> None:
+    """Verify `max_length <= 0` raises `ValueError` and `hetero2` contextual work-stealing preserves order & limits."""
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.gpu import FastPplxGPU
+
+    tok = ContextualTokenizer(_write_synthetic_tokenizer(tmp_path), DEFAULT_PPLX_CONFIG)
+    gpu_stole_evt = threading.Event()
+    ane_first_call = {"done": False}
+    ane_lock = threading.Lock()
+    gpu_calls = {"n": 0}
+
+    class _IdentityGPU(FastPplxGPU):
+        def __init__(self) -> None:
+            self.tokenizer = tok
+            self.max_seq_len = 32768
+            self.max_batch_size = 4
+            self.dim = 1
+            self.model = SimpleNamespace(contextual_projection=lambda x: x)
+
+        def forward_hidden(self, input_ids, attention_mask):
+            assert input_ids.shape[1] <= 10
+            return mx.array(input_ids[..., None], dtype=mx.float32)
+
+        def _project_mean_pool(self, hidden, attention_mask):
+            with mx.stream(mx.cpu):
+                return super()._project_mean_pool(hidden, attention_mask)
+
+        def _project_span_pool(self, hidden, spans):
+            with mx.stream(mx.cpu):
+                return super()._project_span_pool(hidden, spans)
+
+        def encode_contextual_tokens(self, encoded_docs, **kwargs):
+            out = super().encode_contextual_tokens(encoded_docs, **kwargs)
+            gpu_calls["n"] += 1
+            # Any call with a short (<=7 tok) doc means GPU has stolen work from short_dq
+            if any(len(ids) <= 7 for ids, _ in encoded_docs):
+                gpu_stole_evt.set()
+            return out
+
+    class _MeanANE:
+        caps = (7,)
+
+        def run_buckets(self, buckets, **kwargs):
+            with ane_lock:
+                is_first = not ane_first_call["done"]
+                ane_first_call["done"] = True
+            if is_first:
+                # Hold ANE's first chunk until GPU steals at least one short batch (bounded wait, no sleep)
+                gpu_stole_evt.wait(timeout=5.0)
+            return [
+                (
+                    bucket,
+                    np.array(
+                        [[bucket.token_ids[t.start : t.end].mean()] for t in bucket.targets if t.end > t.start],
+                        dtype=np.float32,
+                    ),
+                )
+                for bucket in buckets
+            ]
+
+        def close(self) -> None:
+            pass
+
+    gpu = _IdentityGPU()
+    # 1. Direct GPU and FastPplx validation on max_length <= 0
+    for bad_ml in (0, -1, -32):
+        with pytest.raises(ValueError, match="max_length must be > 0"):
+            gpu.encode(["hello world"], max_length=bad_ml, dimensions=1, normalize=False)
+        with pytest.raises(ValueError, match="max_length must be > 0"):
+            gpu.encode_contextual_chunks([["hello", "world"]], max_length=bad_ml, dimensions=1, normalize=False)
+
+    with FastPplx(home=tmp_path, mode="hetero2", _gpu_backend=gpu, _ane_backend=_MeanANE(), _tokenizer=tok) as eng:
+        for bad_ml in (0, -1, -16):
+            with pytest.raises(ValueError, match="max_length must be > 0"):
+                eng.encode(["hello world"], max_length=bad_ml, dimensions=1, normalize=False, mode="gpu")
+            with pytest.raises(ValueError, match="max_length must be > 0"):
+                eng.encode_contextual_chunks(
+                    [["hello", "world"]], max_length=bad_ml, dimensions=1, normalize=False, mode="gpu"
+                )
+            with pytest.raises(ValueError, match="max_length must be > 0"):
+                eng.encode_texts(["hello world"], max_length=bad_ml, dimensions=1, normalize=False, mode="gpu")
+
+        # max_length=None uses self.max_seq_len cleanly
+        none_ok = eng.encode(["hello"], max_length=None, dimensions=1, normalize=False, mode="gpu")
+        assert none_ok.shape == (1, 1)
+
+        # 2. >= 6-document hetero2 contextual work-stealing (16 short + 1 long = 17 docs, steal_min_chunk=4)
+        short_templates: list[tuple[list[str], list[float]]] = [
+            (["hello"], [4.0]),
+            (["world"], [5.0]),
+            (["chunk", "", "world"], [6.0, 0.0, 5.0]),
+            (["two"], [8.0]),
+            ([], []),
+            (["one", "two"], [7.0, 8.0]),
+            (["hello", "one"], [4.0, 7.0]),
+            (["chunk", "two"], [6.0, 8.0]),
+        ]
+        docs: list[list[str]] = [
+            ["hello world one", "two one hello chunk world one", "two"],  # long (>7 toks, truncated to 10)
+        ]
+        expected: list[list[float]] = [[16 / 3, 19 / 3, 0.0]]
+        for idx in range(16):
+            d_chunks, exp_means = short_templates[idx % len(short_templates)]
+            docs.append(d_chunks)
+            expected.append(exp_means)
+
+        actual = eng.encode_contextual_chunks(
+            docs, max_length=10, batch_size=4, mode="hetero2", dimensions=1, normalize=False
+        )
+        assert len(actual) == len(docs) == 17
+        for vectors, means in zip(actual, expected, strict=True):
+            assert vectors.shape == (len(means), 1)
+            np.testing.assert_allclose(vectors[:, 0], means, rtol=1e-6)
+
+        st = eng.last_stats
+        assert st["mode"] == "hetero2"
+        assert st["deterministic"] is False
+        assert st["gpu_stolen_items"] >= 4
+        assert st["ane_items"] > 0
+        assert st["ane_items"] + st["gpu_items"] == len(docs)

@@ -259,10 +259,53 @@ def test_monorepo_benchmark_dry_run_and_parsers(capsys: pytest.CaptureFixture[st
         {"status": "ok", "parsed_json": {"batched_B128": {"decode_tok_s": 400.0}}},
         {"status": "ok", "runtime": "stock-mlx_lm", "decode_tok_s": 100.0},
     )
-    assert "vs transformers-mps-bf16: 3.00x" in mod.extract_public_comparison(
+    valid_scores = [{"probabilities": [0.2, 0.8], "logits": [-1.0, 1.0]}] * 2
+    assert "Kev vs transformers-mps-bf16: 3.00x" in mod.extract_public_comparison(
         "fast-decision-models",
-        {"status": "ok", "peak_footprint_gb": 1.1, "parsed_json": {"kev_08b": {"q_per_sec": 60.0}}},
-        {"status": "ok", "runtime": "transformers-mps-bf16", "q_per_sec": 20.0, "peak_footprint_gb": 2.1},
+        {
+            "status": "ok",
+            "peak_footprint_gb": 1.1,
+            "parsed_json": {"kev_08b": {"q_per_sec": 60.0, "batch_docs": 8, "n_questions": 2}},
+        },
+        {
+            "status": "ok",
+            "runtime": "transformers-mps-bf16",
+            "q_per_sec": 20.0,
+            "peak_footprint_gb": 2.1,
+            "n_questions": 2,
+            "b8_scores": valid_scores,
+        },
+    )
+    assert (
+        mod.extract_public_comparison(
+            "fast-decision-models",
+            {
+                "status": "ok",
+                "peak_footprint_gb": 1.1,
+                "parsed_json": {"kev_08b": {"q_per_sec": 60.0, "batch_docs": 8, "n_questions": 2}},
+            },
+            {"status": "ok", "runtime": "transformers-mps-bf16", "q_per_sec": 20.0, "peak_footprint_gb": 2.1},
+        )
+        == "Full stock decision scores unavailable"
+    )
+    assert (
+        mod.extract_public_comparison(
+            "fast-decision-models",
+            {
+                "status": "ok",
+                "peak_footprint_gb": 1.1,
+                "parsed_json": {"kev_08b": {"q_per_sec": 60.0, "batch_docs": 8, "n_questions": 2}},
+            },
+            {
+                "status": "ok",
+                "runtime": "transformers-mps-bf16",
+                "q_per_sec": 20.0,
+                "peak_footprint_gb": 2.1,
+                "n_questions": 2,
+                "b8_scores": [{"probabilities": [0.2, 0.8], "logits": [-1.0]}] * 2,
+            },
+        )
+        == "Full stock decision scores unavailable"
     )
     assert mod.classify_failure("", "FileNotFoundError: missing snapshot", None) == "skipped"
     assert mod.classify_failure("", "AssertionError: parity mismatch", None) == "failed"
@@ -283,14 +326,21 @@ def test_monorepo_benchmark_dry_run_and_parsers(capsys: pytest.CaptureFixture[st
             "status": "ok",
             "peak_footprint_gb": 1.1,
             "parsed_json": {
-                "kev_08b": {"q_per_sec": 60.0},
+                "kev_08b": {"q_per_sec": 60.0, "batch_docs": 8, "n_questions": 2},
                 "laya_ane": {"q_per_sec": 40.0},
             },
         },
-        {"status": "ok", "runtime": "transformers-mps-bf16", "q_per_sec": 20.0, "peak_footprint_gb": 2.1},
+        {
+            "status": "ok",
+            "runtime": "transformers-mps-bf16",
+            "q_per_sec": 20.0,
+            "peak_footprint_gb": 2.1,
+            "n_questions": 2,
+            "b8_scores": valid_scores,
+        },
     )
-    assert "vs transformers-mps-bf16: 3.00x" in pub_dec
-    assert "laya_ane 2.00x" in pub_dec
+    assert "Kev vs transformers-mps-bf16: 3.00x" in pub_dec
+    assert "laya_ane" not in pub_dec
 
     import inspect
 

@@ -1,4 +1,4 @@
-"""Rust-backed Gemma-4 tokenizer, chat formatter, and lossless vocabulary pruner (zero transformers/torch)."""
+"""Rust-backed Gemma-4 tokenizer, chat formatter, and optional domain/ASCII-focused LM-head vocabulary pruner (zero transformers/torch)."""
 
 from __future__ import annotations
 
@@ -236,8 +236,8 @@ class VocabRemapper:
         target_size: int = DEFAULT_KEPT_VOCAB_SIZE,
     ) -> "VocabRemapper":
         if cache_npz_path is not None and Path(cache_npz_path).exists():
-            data = np.load(cache_npz_path)
-            kept = np.asarray(data["kept_old_ids"], dtype=np.int32)
+            with np.load(cache_npz_path) as data:
+                kept = np.asarray(data["kept_old_ids"] if "kept_old_ids" in data else data["old_ids"], dtype=np.int32)
             if target_size is None or len(kept) == int(target_size):
                 return cls(tokenizer_json_path, len(kept), kept_old_ids=kept)
         inst = cls(tokenizer_json_path, target_size=target_size)

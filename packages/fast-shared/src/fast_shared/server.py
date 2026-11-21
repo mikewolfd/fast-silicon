@@ -52,13 +52,30 @@ class _PayloadTooLargeError(ValueError):
     """Raised when an HTTP request body exceeds `max_body_bytes`."""
 
 
-def extract_request_param(req: dict[str, Any], key: str, default: Any = None) -> Any:
-    """Read `key` from top-level request or OpenAI SDK `extra_body`."""
-    if key in req and req[key] is not None:
-        return req[key]
+_UNSET = object()
+
+
+def extract_request_param(
+    req: dict[str, Any],
+    key: str,
+    default: Any = None,
+    *,
+    allow_none: bool = False,
+) -> Any:
+    """Read `key` from top-level request or OpenAI SDK `extra_body`.
+
+    When `allow_none=True`, an explicit JSON `null` (`None`) value is preserved
+    instead of falling back to `default`.
+    """
+    if key in req:
+        val = req[key]
+        if val is not None or allow_none:
+            return val
     extra = req.get("extra_body")
-    if isinstance(extra, dict) and key in extra and extra[key] is not None:
-        return extra[key]
+    if isinstance(extra, dict) and key in extra:
+        val = extra[key]
+        if val is not None or allow_none:
+            return val
     return default
 
 
@@ -653,8 +670,13 @@ def schema_cache_key(schema: Any) -> str | None:
     return json.dumps(schema, ensure_ascii=False)
 
 
-def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: bool | None = True) -> dict[str, Any]:
-    whitespace = extract_request_param(req, "whitespace_flexible", default_whitespace_flexible)
+def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: Any = _UNSET) -> dict[str, Any]:
+    whitespace = extract_request_param(
+        req,
+        "whitespace_flexible",
+        default_whitespace_flexible,
+        allow_none=True,
+    )
     kw: dict[str, Any] = {
         "json_schema": extract_json_schema(req),
         "max_tokens": int(extract_request_param(req, "max_tokens", 512)),
@@ -663,17 +685,19 @@ def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: bool | None
         "seed": int(extract_request_param(req, "seed", 42)),
         "mode": extract_request_param(req, "mode"),
         "speculative": extract_request_param(req, "speculative"),
-        "whitespace_flexible": None if whitespace is None else bool(whitespace),
         "enable_thinking": bool(extract_request_param(req, "enable_thinking", False)),
     }
+    if whitespace is not _UNSET:
+        kw["whitespace_flexible"] = None if whitespace is None else bool(whitespace)
     sys_prompt = extract_request_param(req, "system_prompt")
     if sys_prompt is not None:
         kw["system_prompt"] = str(sys_prompt)
     batch_size = extract_request_param(req, "batch_size")
     if batch_size is not None:
         kw["batch_size"] = int(batch_size)
-    if extract_request_param(req, "compact") is not None:
-        kw["compact"] = bool(extract_request_param(req, "compact"))
+    compact = extract_request_param(req, "compact")
+    if compact is not None:
+        kw["compact"] = bool(compact)
     reasoning_effort = extract_request_param(req, "reasoning_effort")
     if reasoning_effort is not None:
         kw["reasoning_effort"] = str(reasoning_effort)
@@ -992,8 +1016,6 @@ class OpenAIChatAdapter:
         req_model = str(req.get("model") or model_name or self.model_name)
         kw = _gen_kwargs(req, default_whitespace_flexible=self.default_whitespace_flexible)
         kw["use_chat_template"] = bool(extract_request_param(req, "use_chat_template", True))
-        if "compact" not in kw:
-            kw["compact"] = True
         kw.pop("batch_size", None)
         item, stats = self.batcher.submit(msgs, **kw)
         if bool(req.get("stream", False)):
@@ -1018,8 +1040,6 @@ class OpenAIChatAdapter:
         req_model = str(req.get("model") or model_name or self.model_name)
         kw = _gen_kwargs(req, default_whitespace_flexible=self.default_whitespace_flexible)
         kw["use_chat_template"] = bool(extract_request_param(req, "use_chat_template", True))
-        if "compact" not in kw:
-            kw["compact"] = True
         items, stats = self.batcher.submit_prompts(prompts, **kw)
         if bool(req.get("stream", False)):
             sopts = req.get("stream_options") or {}
@@ -1099,9 +1119,11 @@ def dispatch_chat_completion(
         return 400, {"error": {"message": "`messages` must be a non-empty list", "type": "invalid_request_error"}}, False
 
     eff_model = str(req.get("model") or model_name or getattr(engine_or_adapter, "model_name", "fast-chat"))
+    default_ws = getattr(engine_or_adapter, "default_whitespace_flexible", _UNSET)
+    kw = _gen_kwargs(req, default_whitespace_flexible=default_ws)
     eng_lock = lock if lock is not None else get_engine_lock(engine_or_adapter)
     with eng_lock:
-        res = engine_or_adapter.generate_batch([msgs], **_gen_kwargs(req))
+        res = engine_or_adapter.generate_batch([msgs], **kw)
         clear_mlx_arena(256)
     item = res.items[0]
     stream = bool(req.get("stream", False))
@@ -1132,7 +1154,8 @@ def dispatch_completion(
         return 400, {"error": {"message": "`prompt` must be a non-empty string or list of strings", "type": "invalid_request_error"}}, False
 
     eff_model = str(req.get("model") or model_name or getattr(engine_or_adapter, "model_name", "fast-chat"))
-    kw = _gen_kwargs(req)
+    default_ws = getattr(engine_or_adapter, "default_whitespace_flexible", _UNSET)
+    kw = _gen_kwargs(req, default_whitespace_flexible=default_ws)
     kw["use_chat_template"] = bool(extract_request_param(req, "use_chat_template", True))
     eng_lock = lock if lock is not None else get_engine_lock(engine_or_adapter)
     with eng_lock:

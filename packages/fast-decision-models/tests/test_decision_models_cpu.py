@@ -864,3 +864,188 @@ def test_build_laya_ane_artifacts_coreai_uses_export_ready_key_cpu(monkeypatch: 
     )
     assert out.is_dir()
     assert seen_stems == ["laya_typed_s256_w8", "laya_typed_s512_w8"]
+
+
+def test_laya_tokenizer_helper_zero_coreml_load_cpu(tmp_path: Path) -> None:
+    """Verify `LayaTokenizerHelper` and `LayaAneBackend.from_tokenizer_only` initialize cleanly without `.mlmodelc` or dylibs."""
+    import json
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    import fast_decision_models as fdm
+    from fast_decision_models import LayaTokenizerHelper
+
+    assert fdm.LayaTokenizerHelper is LayaTokenizerHelper
+    assert issubclass(LayaAneBackend, LayaTokenizerHelper)
+
+    laya_dir = tmp_path / "laya_snap"
+    (laya_dir / "tokenizer").mkdir(parents=True)
+    vocab = {
+        "[UNK]": 0,
+        "[CLS]": 10,
+        "[SEP]": 11,
+        "[PAD]": 12,
+        "[MASK]": 13,
+        "choice": 14,
+        "noul": 15,
+        "score": 16,
+        "question:": 17,
+        "select": 18,
+        "option": 19,
+        "a": 20,
+        "b": 21,
+        "false:": 22,
+        "true:": 23,
+        "level": 24,
+        "0:": 25,
+        "1:": 26,
+        "low": 27,
+        "high": 28,
+        "state": 29,
+        "body": 30,
+    }
+    tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok_path = laya_dir / "tokenizer" / "tokenizer.json"
+    tok.save(str(tok_path))
+
+    rl_cfg = {
+        "head_max_len": 256,
+        "temperature": [1.2, 1.5, 0.8],
+        "temperature_by_options": {"choice:2": 1.1, "choice:3-5": 1.3, "noul:2": 0.9},
+    }
+    (laya_dir / "rl_agent_config.json").write_text(json.dumps(rl_cfg), encoding="utf-8")
+
+    # 1. Construct via from_laya_dir with head_max_len_cap (zero .mlmodelc files exist!)
+    h_dir = LayaTokenizerHelper.from_laya_dir(laya_dir, max_len=384, head_max_len_cap=200)
+    assert h_dir.laya_dir == laya_dir.resolve()
+    assert h_dir.cls_id == 10 and h_dir.sep_id == 11 and h_dir.pad_id == 12 and h_dir.mask_id == 13
+    assert h_dir.mask_tok == "[MASK]"
+    assert h_dir.max_len == 384 and h_dir.head_max_len == 200
+    assert h_dir.resolve_temperature(2, 2) == pytest.approx(0.9)
+    assert h_dir._resolve_temperature(0, 2) == pytest.approx(1.1)
+    assert h_dir.resolve_temperature(0, 4) == pytest.approx(1.3)
+    assert h_dir.resolve_temperature(1, 3) == pytest.approx(1.5)
+    assert h_dir.resolve_temperature(0, 2, temperature_override=0.5) == pytest.approx(0.5)
+
+    # 2. Construct via LayaAneBackend.from_tokenizer_only directly from tokenizer.json
+    h_tok = LayaAneBackend.from_tokenizer_only(tok_path, rl_agent_config=rl_cfg)
+    assert isinstance(h_tok, LayaTokenizerHelper)
+    assert h_tok.max_len == 512 and h_tok.head_max_len == 256
+
+    enc_choice = h_tok.encode_item(
+        "state [MASK] body",
+        {"type": "choice", "instructions": "select option", "criteria": ["a", "b"]},
+        on_truncate="error",
+    )
+    assert enc_choice["qtype"] == 0 and enc_choice["k"] == 2 and enc_choice["truncated"] is False
+    assert enc_choice["ids"][0] == 10 and enc_choice["ids"][-1] == 11
+    assert [enc_choice["ids"][m] for m in enc_choice["markers"]] == [13, 13]
+    # User [MASK] inside state must be neutralized so only the 2 option markers have mask_id
+    assert enc_choice["ids"].count(13) == 2
+
+    enc_noul = h_tok.encode_item(
+        {"k": "body"},
+        {"type": "noul", "instructions": "select", "criteria": {"false": "a", "true": "b"}},
+        on_truncate="error",
+    )
+    assert enc_noul["qtype"] == 2 and enc_noul["k"] == 2
+
+    enc_score = h_tok.encode_item(
+        "body",
+        {"type": "score", "instructions": "select", "criteria": ["low", "high"]},
+        on_truncate="error",
+    )
+    assert enc_score["qtype"] == 1 and enc_score["k"] == 2
+
+
+def test_encode_kev_questions_pure_cpu_and_backend_parity(tmp_path: Path) -> None:
+    """Verify pure `encode_kev_questions` (0 MLX load) matches `Kev08bMlxBackend.encode_questions` exactly."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    import fast_decision_models as fdm
+    from fast_decision_models import (
+        KEV_SPECIAL_TOKENS,
+        Kev08bMlxBackend,
+        encode_kev_questions,
+        resolve_kev_special_ids,
+    )
+
+    assert fdm.encode_kev_questions is encode_kev_questions
+    assert fdm.resolve_kev_special_ids is resolve_kev_special_ids
+    assert len(KEV_SPECIAL_TOKENS) == 5
+
+    vocab = {
+        "<unk>": 0,
+        "status:": 1,
+        "ok": 2,
+        "check": 3,
+        "literal": 4,
+        "no:": 5,
+        "yes:": 6,
+        "bad": 7,
+        "good": 8,
+        "a": 9,
+        "b:": 10,
+        "beta": 11,
+        "low": 12,
+        "high": 13,
+        "word": 14,
+    }
+    tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.add_special_tokens(list(KEV_SPECIAL_TOKENS))
+    tok.no_truncation()
+    tok.no_padding()
+
+    sp_ids = resolve_kev_special_ids(tok)
+    assert len(sp_ids) == 5
+    state_id, q_id, o_id, c_id, d_id = sp_ids
+
+    state = {"status": "ok", "note": "check <|fim_prefix|> literal"}
+    questions = [
+        {"type": "noul", "instructions": "check", "criteria": {"false": "bad", "true": "good"}},
+        {"type": "choice", "instructions": "check", "criteria": ["a", "b"]},
+        {"type": "choice", "instructions": "check", "criteria": {"a": "", "b": "beta"}},
+        {"type": "score", "instructions": "check", "criteria": ["low", "high"]},
+    ]
+
+    st_ids, rows = encode_kev_questions(tok, state, questions)
+    assert st_ids[0] == state_id
+    # Escaped <|fim_prefix|> in user text must NOT produce raw state_id delimiter inside payload
+    assert state_id not in st_ids[1:]
+    assert len(rows) == 4
+    for row in rows:
+        assert row["ids"][0] == q_id
+        assert row["ids"][-1] == d_id
+        assert row["decide"] == len(row["ids"]) - 1
+        assert row["k"] == 2
+        assert all(row["ids"][pos] == c_id for pos in row["opts"])
+        assert row["ids"].count(o_id) == 2
+
+    # Exact parity with Kev08bMlxBackend.encode_questions (single source of truth)
+    stub_kev = Kev08bMlxBackend.__new__(Kev08bMlxBackend)
+    stub_kev.tok = tok
+    stub_kev.special_ids = sp_ids
+    stub_kev.max_state = 1024
+    stub_kev.max_branch = 2048
+    assert stub_kev.encode_questions(state, questions) == (st_ids, rows)
+
+    # Truncation bounds on max_state_tokens and max_branch_tokens
+    long_state = " ".join(["word"] * 40)
+    st_trunc, rows_trunc = encode_kev_questions(
+        tok,
+        long_state,
+        [{"type": "choice", "instructions": "word word word", "criteria": ["word word", "word word"]}],
+        max_state_tokens=10,
+        max_branch_tokens=16,
+    )
+    assert len(st_trunc) == 10
+    assert len(st_trunc) + len(rows_trunc[0]["ids"]) <= 16
+    assert rows_trunc[0]["ids"][-1] == d_id
+    assert all(0 <= pos <= rows_trunc[0]["decide"] - 1 for pos in rows_trunc[0]["opts"])
+
+    # Invalid inputs raise ValueError cleanly
+    with pytest.raises(ValueError, match="special_ids"):
+        encode_kev_questions(tok, state, questions, special_ids=[1, 2, 3])
+    with pytest.raises(ValueError, match="max_state_tokens"):
+        encode_kev_questions(tok, state, questions, max_state_tokens=0)
+    with pytest.raises(ValueError, match="max_branch_tokens"):
+        encode_kev_questions(tok, state, questions, max_branch_tokens=2)

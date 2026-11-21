@@ -2475,3 +2475,230 @@ def test_coreai_pipeline_coreml_w4_block_guard_and_fp16_cast_cpu(monkeypatch: An
     assert res_f32.sensitivity_report is not None
     assert res_f32.sensitivity_report["compute_dtype"] == "fp32"
     assert res_f32.cache_key_sha256 != res_f16.cache_key_sha256
+
+
+def test_grammar_helper_none_whitespace_and_explicit_separators_cpu() -> None:
+    llg = pytest.importorskip("llguidance")
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.grammar import GrammarHelper
+
+    assert llg is not None
+    # ByteLevel maps ASCII space (0x20) to 'Ġ' (U+0120).
+    vocab = {
+        "<|endoftext|>": 0,
+        "{": 1,
+        '"': 2,
+        "a": 3,
+        ":": 4,
+        "1": 5,
+        "}": 6,
+        "\u0120": 7,
+        ",": 8,
+        "b": 9,
+        "2": 10,
+    }
+    bt = Tokenizer(BPE(vocab=vocab, merges=[]))
+    bt.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bt.decoder = ByteLevelDecoder(add_prefix_space=False)
+    ltok = llg.LLTokenizer(bt.to_str(), eos_token=0)
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+        "additionalProperties": False,
+    }
+
+    # whitespace_flexible=None selects strict (",", ": ") separators without raising TypeError.
+    gh_none = GrammarHelper(ltok, schema, whitespace_flexible=None, eos_token_id=0)
+    assert gh_none.separators == (",", ": ")
+    assert gh_none.whitespace_flexible is False
+    assert gh_none.upfront_ff == [1, 2, 3, 2, 4, 7]
+    assert gh_none.validate_token_sequence(bt.encode('{"a": 1,"b": 2}').ids)
+    assert not gh_none.validate_token_sequence(bt.encode('{"a":1,"b":2}').ids)
+
+    # whitespace_flexible=False defaults to compact (",", ":") separators.
+    gh_compact = GrammarHelper(ltok, schema, whitespace_flexible=False, eos_token_id=0)
+    assert gh_compact.separators == (",", ":")
+    assert gh_compact.whitespace_flexible is False
+    assert gh_compact.validate_token_sequence(bt.encode('{"a":1,"b":2}').ids)
+    assert not gh_compact.validate_token_sequence(bt.encode('{"a": 1,"b": 2}').ids)
+
+    # Explicit separators override the default cleanly.
+    gh_custom = GrammarHelper(ltok, schema, whitespace_flexible=False, separators=(", ", ": "), eos_token_id=0)
+    assert gh_custom.separators == (", ", ": ")
+    assert gh_custom.whitespace_flexible is False
+    assert gh_custom.validate_token_sequence(bt.encode('{"a": 1, "b": 2}').ids)
+    assert not gh_custom.validate_token_sequence(bt.encode('{"a": 1,"b": 2}').ids)
+
+
+def test_server_schema_key_batcher_whitespace_compact_and_raw_dispatch_cpu() -> None:
+    import concurrent.futures
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from fast_shared.server import (
+        ChatMicroBatcher,
+        OpenAIChatAdapter,
+        dispatch_chat_completion,
+        dispatch_completion,
+        extract_request_param,
+        schema_cache_key,
+    )
+
+    # 1. schema_cache_key preserves insertion key order (top-level and nested properties).
+    s_ab = {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}
+    s_ba = {"type": "object", "properties": {"b": {"type": "integer"}, "a": {"type": "string"}}}
+    assert schema_cache_key(s_ab) != schema_cache_key(s_ba)
+    assert schema_cache_key(None) is None
+    assert schema_cache_key('{"b":1,"a":2}') == '{"b":1,"a":2}'
+
+    # 2. extract_request_param cleanly distinguishes missing key vs explicit JSON null.
+    sentinel = object()
+    assert extract_request_param({}, "whitespace_flexible", sentinel, allow_none=True) is sentinel
+    assert extract_request_param({"whitespace_flexible": None}, "whitespace_flexible", True, allow_none=True) is None
+    assert (
+        extract_request_param(
+            {"extra_body": {"whitespace_flexible": None}},
+            "whitespace_flexible",
+            True,
+            allow_none=True,
+        )
+        is None
+    )
+    assert extract_request_param({"max_tokens": None}, "max_tokens", 512) == 512
+
+    # 3. ChatMicroBatcher does NOT coalesce across whitespace_flexible in (None, False, True),
+    #    while coalescing identical whitespace_flexible=None requests.
+    class _RecordingEngine:
+        model_name = "rec-llm"
+        ane_available = False
+        default_mode = "gpu"
+
+        def __init__(self, delay: float = 0.0) -> None:
+            self.delay = delay
+            self.calls: list[tuple[int, dict[str, object]]] = []
+            self._lock = threading.Lock()
+
+        def generate_batch(self, prompts, **kwargs):
+            with self._lock:
+                self.calls.append((len(prompts), dict(kwargs)))
+            if self.delay > 0.0:
+                time.sleep(self.delay)
+            items = [
+                SimpleNamespace(
+                    text="{}",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    finish_reason="stop",
+                )
+                for _ in prompts
+            ]
+            return SimpleNamespace(items=items, stats={"docs": len(prompts)})
+
+    eng_batch = _RecordingEngine(delay=0.02)
+    batcher = ChatMicroBatcher(eng_batch, coalesce_ms=30.0, max_batch_size=16)
+
+    def _sub(ws: bool | None, tag: str) -> None:
+        batcher.submit(
+            [{"role": "user", "content": tag}],
+            json_schema=s_ab,
+            max_tokens=32,
+            temperature=0.0,
+            top_p=1.0,
+            seed=42,
+            whitespace_flexible=ws,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [
+            pool.submit(_sub, None, "n1"),
+            pool.submit(_sub, None, "n2"),
+            pool.submit(_sub, False, "f1"),
+            pool.submit(_sub, True, "t1"),
+        ]
+        for fut in futs:
+            fut.result()
+
+    ws_seen = [kw["whitespace_flexible"] for _, kw in eng_batch.calls]
+    assert set(ws_seen) == {None, False, True}
+    # Every call must stay homogeneous; total prompts across calls == 4; False and True each have size 1.
+    assert sum(n for n, _ in eng_batch.calls) == 4
+    for n, kw in eng_batch.calls:
+        if kw["whitespace_flexible"] in (False, True):
+            assert n == 1
+        assert "compact" not in kw
+
+    # 4. OpenAIChatAdapter does NOT inject compact=True, respects explicit compact and whitespace_flexible=None.
+    eng_adapt = _RecordingEngine()
+    adapter = OpenAIChatAdapter(eng_adapt, default_whitespace_flexible=True)
+
+    status, _, _ = adapter.handle_chat_completion({"messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200
+    assert "compact" not in eng_adapt.calls[-1][1]
+    assert eng_adapt.calls[-1][1]["whitespace_flexible"] is True
+
+    status, _, _ = adapter.handle_chat_completion(
+        {"messages": [{"role": "user", "content": "hi"}], "whitespace_flexible": None}
+    )
+    assert status == 200
+    assert "compact" not in eng_adapt.calls[-1][1]
+    assert eng_adapt.calls[-1][1]["whitespace_flexible"] is None
+
+    status, _, _ = adapter.handle_chat_completion(
+        {"messages": [{"role": "user", "content": "hi"}], "extra_body": {"whitespace_flexible": None, "compact": True}}
+    )
+    assert status == 200
+    assert eng_adapt.calls[-1][1]["whitespace_flexible"] is None
+    assert eng_adapt.calls[-1][1]["compact"] is True
+
+    status, _, _ = adapter.handle_completion({"prompt": "hi"})
+    assert status == 200
+    assert "compact" not in eng_adapt.calls[-1][1]
+    assert eng_adapt.calls[-1][1]["whitespace_flexible"] is True
+
+    status, _, _ = adapter.handle_completion({"prompt": "hi", "compact": False, "whitespace_flexible": None})
+    assert status == 200
+    assert eng_adapt.calls[-1][1]["compact"] is False
+    assert eng_adapt.calls[-1][1]["whitespace_flexible"] is None
+
+    # 5. Raw-engine dispatch_chat_completion / dispatch_completion omit whitespace_flexible unless set.
+    eng_raw = _RecordingEngine()
+    st_c, _, _ = dispatch_chat_completion(eng_raw, {"messages": [{"role": "user", "content": "a"}]})
+    assert st_c == 200
+    assert "whitespace_flexible" not in eng_raw.calls[-1][1]
+    assert "compact" not in eng_raw.calls[-1][1]
+
+    st_p, _, _ = dispatch_completion(eng_raw, {"prompt": "a"})
+    assert st_p == 200
+    assert "whitespace_flexible" not in eng_raw.calls[-1][1]
+    assert "compact" not in eng_raw.calls[-1][1]
+
+    st_null, _, _ = dispatch_chat_completion(
+        eng_raw, {"messages": [{"role": "user", "content": "a"}], "whitespace_flexible": None}
+    )
+    assert st_null == 200
+    assert "whitespace_flexible" in eng_raw.calls[-1][1]
+    assert eng_raw.calls[-1][1]["whitespace_flexible"] is None
+
+    st_p_false, _, _ = dispatch_completion(eng_raw, {"prompt": "a", "whitespace_flexible": False, "compact": True})
+    assert st_p_false == 200
+    assert eng_raw.calls[-1][1]["whitespace_flexible"] is False
+    assert eng_raw.calls[-1][1]["compact"] is True
+
+    # Raw engine declaring `default_whitespace_flexible = None` preserves that default when request omits it.
+    class _GemmaLikeRawEngine(_RecordingEngine):
+        default_whitespace_flexible = None
+
+    eng_gemma_raw = _GemmaLikeRawEngine()
+    dispatch_chat_completion(eng_gemma_raw, {"messages": [{"role": "user", "content": "g"}]})
+    assert eng_gemma_raw.calls[-1][1]["whitespace_flexible"] is None
+    dispatch_completion(eng_gemma_raw, {"prompt": "g"})
+    assert eng_gemma_raw.calls[-1][1]["whitespace_flexible"] is None
+    dispatch_chat_completion(
+        eng_gemma_raw, {"messages": [{"role": "user", "content": "g"}], "whitespace_flexible": True}
+    )
+    assert eng_gemma_raw.calls[-1][1]["whitespace_flexible"] is True

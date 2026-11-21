@@ -48,14 +48,27 @@ def collect_pplx_window_vectors(
 ) -> list[np.ndarray]:
     """Restore source chunk order and remove the header duplicated into continuation windows."""
     parts: list[list[np.ndarray]] = [[] for _ in range(n_docs)]
+    inferred_dim: int | None = None
     for window, mat in zip(windows, matrices, strict=True):
         if mat.ndim != 2 or mat.shape[0] != len(window.chunks):
             raise ValueError(f"Expected {len(window.chunks)} contextual chunk vectors, got shape {mat.shape}")
-        parts[window.doc_index].append(mat[1:] if window.has_anchor else mat)
+        part = mat[1:] if window.has_anchor else mat
+        if inferred_dim is None and part.shape[0] > 0:
+            inferred_dim = int(part.shape[1])
+        parts[window.doc_index].append(part)
+    if inferred_dim is None:
+        for group in parts:
+            for part in group:
+                if part.shape[1] > 0:
+                    inferred_dim = int(part.shape[1])
+                    break
+            if inferred_dim is not None:
+                break
+    empty_dim = inferred_dim if inferred_dim is not None else 1024
     result = []
     for group in parts:
         if not group:
-            result.append(np.zeros((0, 1024), dtype=np.float32))
+            result.append(np.zeros((0, empty_dim), dtype=np.float32))
         elif len(group) == 1:
             result.append(group[0])
         else:

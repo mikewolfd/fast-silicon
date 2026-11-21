@@ -321,6 +321,38 @@ def test_lossless_gate_uses_fixed_tolerance_and_requires_paired_evidence() -> No
     assert gate([0.5] * 4, [0.495] * 4).quality_status == "FAIL"
     assert gate([0.5] * 4, [0.495] * 4, lossless_tolerance=0.01).verdict == "PASS"
 
+    # Mean-mismatch between per_item_effective_scores and objective_score_e2e reports an explicit diagnostic reason.
+    bad_base = {
+        "objective_score_e2e": 0.5,
+        "effective_outcome_per_sec": 1.0,
+        "n_items": 4,
+        "per_item_effective_scores": [0.8, 0.8, 0.8, 0.8],
+    }
+    good_cand = {
+        "objective_score_e2e": 0.5,
+        "effective_outcome_per_sec": 2.0,
+        "n_items": 4,
+        "per_item_effective_scores": [0.5, 0.5, 0.5, 0.5],
+    }
+    mismatch = evaluate_promotion_gates(bad_base, good_cand, profile="lossless")
+    assert mismatch.verdict == mismatch.quality_status == "UNRESOLVED"
+    assert mismatch.n_paired == 0 and mismatch.ci95_low is None
+    assert any("baseline paired item scores mean (0.800000) disagrees with objective_score_e2e (0.500000)" in r for r in mismatch.reasons)
+    assert not any("complete paired scores for at least two items" in r for r in mismatch.reasons)
+
+    mismatch_both = evaluate_promotion_gates(
+        bad_base,
+        dict(good_cand, per_item_effective_scores=[0.2, 0.2, 0.2, 0.2]),
+        profile="lossless",
+    )
+    joined = " | ".join(mismatch_both.reasons)
+    assert "baseline paired item scores mean (0.800000) disagrees with objective_score_e2e (0.500000)" in joined
+    assert "candidate paired item scores mean (0.200000) disagrees with objective_score_e2e (0.500000)" in joined
+
+    mismatch_quant = evaluate_promotion_gates(bad_base, good_cand, profile="quantized")
+    assert mismatch_quant.verdict == "PASS"
+    assert any("disagrees with objective_score_e2e" in r for r in mismatch_quant.reasons)
+
 
 def test_retrieval_coverage_blocks_promotion_of_partial_historical_rows() -> None:
     complete = {"category": 1, "n_items": 325, "n_valid": 325, "objective_score_e2e": 1.0,
@@ -434,7 +466,20 @@ def test_pplx_benchmark_windows_restore_source_rows_and_refuse_partial_batches()
     values = [np.array([[1], [2]]), np.array([[10], [3]]), np.array([[11], [4]]), np.array([[5]])]
     restored = collect_pplx_window_vectors(windows, values, len(docs))
     assert restored[0][:, 0].tolist() == [1, 2, 3, 4]
-    assert restored[1].shape == (0, 1024) and restored[2][:, 0].tolist() == [5]
+    assert restored[1].shape == (0, 1) and restored[2][:, 0].tolist() == [5]
+    # Infer non-1024 embedding width (e.g. 768-d) for empty docs, falling back to 1024 only when all docs are empty.
+    values_768 = [
+        np.ones((2, 768), dtype=np.float32),
+        np.ones((2, 768), dtype=np.float32) * 2.0,
+        np.ones((2, 768), dtype=np.float32) * 3.0,
+        np.ones((1, 768), dtype=np.float32) * 4.0,
+    ]
+    restored_768 = collect_pplx_window_vectors(windows, values_768, len(docs))
+    assert restored_768[0].shape == (4, 768)
+    assert restored_768[1].shape == (0, 768) and restored_768[1].dtype == np.float32
+    assert restored_768[2].shape == (1, 768)
+    all_empty = collect_pplx_window_vectors([], [], 2)
+    assert [m.shape for m in all_empty] == [(0, 1024), (0, 1024)]
     with pytest.raises(ValueError):
         collect_pplx_window_vectors(windows, values[1:], len(docs))
     with pytest.raises(ValueError, match="contextual chunk vectors"):

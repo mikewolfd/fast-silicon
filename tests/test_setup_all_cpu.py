@@ -117,3 +117,62 @@ def test_setup_all_marks_staged_artifacts_ready_and_validates_flags_cpu(tmp_path
     )
     with pytest.raises(ValueError, match="Unknown package"):
         mod.parse_packages_arg("bge-small,nonexistent")
+
+
+def test_sync_from_siblings_transform_content_markdown_links_and_idempotence() -> None:
+    sync_path = _REPO_ROOT / "scripts" / "sync_from_siblings.py"
+    spec = importlib.util.spec_from_file_location("test_sync_from_siblings_mod", sync_path)
+    assert spec is not None and spec.loader is not None
+    sync_mod = importlib.util.module_from_spec(spec)
+    sys.modules["test_sync_from_siblings_mod"] = sync_mod
+    spec.loader.exec_module(sync_mod)
+
+    src_md = (
+        "# Sample README\n\n"
+        "Inline file: [Benchmarks](../fast-silicon/docs/BENCHMARKS.md#retrieval)\n"
+        "Inline root anchor: [Overview](../fast-silicon/#overview)\n"
+        "Inline root dir: [Monorepo](../fast-silicon/)\n"
+        "Inline subdir: [Docs](../fast-silicon/docs/)\n\n"
+        "```markdown\n"
+        "[Do Not Rewrite](../fast-silicon/docs/BENCHMARKS.md#inside-fence)\n"
+        "[ref-fence]: ../fast-silicon/docs/BENCHMARKS.md\n"
+        "```\n\n"
+        "~~~text\n"
+        "[Also Skip Tilde](../fast-silicon/#tilde)\n"
+        "~~~\n\n"
+        "[bench]: ../fast-silicon/docs/BENCHMARKS.md#structured-generation\n"
+        "[root-anch]: ../fast-silicon/#top\n"
+        "[root-dir]: ../fast-silicon/\n"
+        "[angle]: <../fast-silicon/docs/benchmarks/review-20261121.md#decision-scoring>\n"
+    ).encode("utf-8")
+
+    once = sync_mod._transform_content("fast-gemma4", "README.md", src_md)
+    text = once.decode("utf-8")
+
+    assert "[Benchmarks](../../docs/BENCHMARKS.md#retrieval)" in text
+    assert "[Overview](../../#overview)" in text
+    assert "[Monorepo](../../)" in text
+    assert "[Docs](../../docs/)" in text
+    assert "[Do Not Rewrite](../fast-silicon/docs/BENCHMARKS.md#inside-fence)" in text
+    assert "[ref-fence]: ../fast-silicon/docs/BENCHMARKS.md" in text
+    assert "[Also Skip Tilde](../fast-silicon/#tilde)" in text
+    assert "[bench]: ../../docs/BENCHMARKS.md#structured-generation" in text
+    assert "[root-anch]: ../../#top" in text
+    assert "[root-dir]: ../../" in text
+    assert "[angle]: <../../docs/benchmarks/review-20261121.md#decision-scoring>" in text
+
+    # Idempotence: running _transform_content a second time changes zero bytes.
+    twice = sync_mod._transform_content("fast-gemma4", "README.md", once)
+    assert twice == once
+
+    # Deeper nested markdown path rewrites `../../fast-silicon/` to `../../../...`
+    nested_src = b"See [Guide](../../fast-silicon/docs/BENCHMARKS.md#top) and [Ref][r]\n\n[r]: ../../fast-silicon/#root\n"
+    nested_once = sync_mod._transform_content("fast-gemma4", "docs/guide.md", nested_src)
+    assert nested_once.decode("utf-8") == "See [Guide](../../../docs/BENCHMARKS.md#top) and [Ref][r]\n\n[r]: ../../../#root\n"
+    assert sync_mod._transform_content("fast-gemma4", "docs/guide.md", nested_once) == nested_once
+
+    # pyproject.toml workspace transform
+    py_raw = b'fast-shared = { path = "../fast-shared", editable = true }\n'
+    py_out = sync_mod._transform_content("fast-gemma4", "pyproject.toml", py_raw)
+    assert py_out == b"fast-shared = { workspace = true }\n"
+    assert sync_mod._transform_content("fast-shared", "pyproject.toml", py_raw) == py_raw

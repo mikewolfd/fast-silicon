@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,62 @@ from fast_shared.pipeline_llm import (
 )
 
 
-extract_parquet = partial(_shared_extract_parquet, whitespace_flexible=None)
+def extract_parquet(
+    engine: Any,
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    system_prompt: str,
+    json_schema: str | dict[str, Any] | None = None,
+    text_col: str | None = None,
+    keep_cols: list[str] | None = None,
+    drop_text_col: bool = False,
+    mode: str | None = None,
+    speculative: bool | None = None,
+    batch_rows: int | None = None,
+    gpu_batch_size: int | None = None,
+    shard_rows: int = 4096,
+    max_tokens: int = 512,
+    temperature: float = 0.0,
+    whitespace_flexible: bool | None = None,
+    max_chars: int = 8000,
+    max_pages: int = 0,
+    filter_ocr: bool = False,
+    ocr_pages_only: bool = False,
+    skip_empty: bool = True,
+    resume: bool = False,
+    mlx_cache_limit_mb: int | None = 512,
+    use_wired_limit: bool = False,
+    **extra_gen_kwargs: Any,
+) -> ParquetExtractSummary:
+    """Stream-extract structured JSON from Parquet input(s) with overlapped reader/GPU/writer threads."""
+    return _shared_extract_parquet(
+        engine,
+        input_path,
+        output_path,
+        system_prompt=system_prompt,
+        json_schema=json_schema,
+        text_col=text_col,
+        keep_cols=keep_cols,
+        drop_text_col=drop_text_col,
+        mode=mode,
+        speculative=speculative,
+        batch_rows=batch_rows,
+        gpu_batch_size=gpu_batch_size,
+        shard_rows=shard_rows,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        whitespace_flexible=whitespace_flexible,
+        max_chars=max_chars,
+        max_pages=max_pages,
+        filter_ocr=filter_ocr,
+        ocr_pages_only=ocr_pages_only,
+        skip_empty=skip_empty,
+        resume=resume,
+        mlx_cache_limit_mb=mlx_cache_limit_mb,
+        use_wired_limit=use_wired_limit,
+        **extra_gen_kwargs,
+    )
 
 
 def extract_jsonl(

@@ -20,137 +20,100 @@ COMPUTE_MODE_CPU_ONLY = 1
 COMPUTE_MODE_ALL = 2
 
 
-class LayaAneBackend:
-    """Zero-GPU CoreML ANE `W8A16` runner (`S=256` & `S=512` buckets, `[1585, 0, 0]` ops on ANE)."""
+def _tok_id_or_default(tok: Any, piece: str, default: int) -> int:
+    tid = tok.token_to_id(piece)
+    return default if tid is None else int(tid)
+
+
+class LayaTokenizerHelper:
+    """Zero-CoreML tokenizer, question encoder, and temperature resolver for `Laya-Typed-421M`."""
 
     def __init__(
         self,
-        laya_dir: Path | str | None = None,
-        dylib_path: Path | str | None = None,
+        tokenizer_json: str | Path,
         *,
-        pipe_depth: int = 4,
-        compute_mode: int = COMPUTE_MODE_CPU_AND_ANE,
+        rl_agent_config: Mapping[str, Any] | str | Path | None = None,
+        laya_dir: str | Path | None = None,
+        max_len: int = 512,
+        head_max_len: int | None = None,
+        head_max_len_cap: int | None = None,
     ) -> None:
-        import numpy as np
         from tokenizers import Tokenizer
 
-        self._np = np
-        self._exec_lock = threading.Lock()
-        self.laya_dir = Path(laya_dir).expanduser().resolve() if laya_dir is not None else resolve_laya_dir()
-        self.dylib_path = (
-            Path(dylib_path).expanduser().resolve() if dylib_path is not None else ensure_laya_dylib()
-        )
-        self.pipe_depth = max(1, int(pipe_depth))
-        self.compute_mode = int(compute_mode)
+        src = Path(tokenizer_json).expanduser().resolve()
+        if src.is_dir():
+            resolved_dir: Path | None = src
+            cand_nested = src / "tokenizer" / "tokenizer.json"
+            tok_path = cand_nested if cand_nested.is_file() else (src / "tokenizer.json")
+        else:
+            resolved_dir = Path(laya_dir).expanduser().resolve() if laya_dir is not None else None
+            tok_path = src
 
-        cfg = json.loads((self.laya_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
+        if not tok_path.is_file():
+            raise FileNotFoundError(f"Missing Laya tokenizer file: {tok_path}")
+
+        cfg: Mapping[str, Any]
+        if isinstance(rl_agent_config, Mapping):
+            cfg = rl_agent_config
+        elif rl_agent_config is not None:
+            cfg = json.loads(Path(rl_agent_config).expanduser().resolve().read_text(encoding="utf-8"))
+        elif resolved_dir is not None and (resolved_dir / "rl_agent_config.json").is_file():
+            cfg = json.loads((resolved_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
+        else:
+            cfg = {}
+
+        self.laya_dir = resolved_dir
         self.temperature = [float(x) for x in cfg.get("temperature", [1.0, 1.0, 1.0])]
         self.temperature_by_options = {
             str(k): float(v) for k, v in cfg.get("temperature_by_options", {}).items()
         }
-        self.max_len = 512
-        self.head_max_len = self._resolve_head_max_len(cfg, self.max_len)
+        self.max_len = int(max_len)
+        resolved_head = (
+            int(head_max_len)
+            if head_max_len is not None
+            else self.resolve_head_max_len(cfg, self.max_len)
+        )
+        if head_max_len_cap is not None:
+            resolved_head = min(resolved_head, int(head_max_len_cap))
+        self.head_max_len = resolved_head
 
-        tok_path = self.laya_dir / "tokenizer" / "tokenizer.json"
         self.tok = Tokenizer.from_file(str(tok_path))
         self.tok.no_truncation()
         self.tok.no_padding()
-        self.cls_id = int(self.tok.token_to_id("[CLS]") or 50281)
-        self.sep_id = int(self.tok.token_to_id("[SEP]") or 50282)
-        self.pad_id = int(self.tok.token_to_id("[PAD]") or 50283)
-        self.mask_id = int(self.tok.token_to_id("[MASK]") or 50284)
+        self.cls_id = _tok_id_or_default(self.tok, "[CLS]", 50281)
+        self.sep_id = _tok_id_or_default(self.tok, "[SEP]", 50282)
+        self.pad_id = _tok_id_or_default(self.tok, "[PAD]", 50283)
+        self.mask_id = _tok_id_or_default(self.tok, "[MASK]", 50284)
         self.mask_tok = "[MASK]"
 
-        emb = np.load(self.laya_dir / "laya_typed_emb_f16.npz")
-        self._word_f16 = np.ascontiguousarray(emb["word_f16"])
-        self._type_f16 = np.ascontiguousarray(emb["type_f16"])
-        H = int(self._word_f16.shape[1])
-        vocab_sz = int(self._word_f16.shape[0])
-
-        self._lib = ctypes.CDLL(str(self.dylib_path))
-        self._lib.laya_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        self._lib.laya_ane_load.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-        self._lib.laya_ane_load.restype = ctypes.c_void_p
-        self._lib.laya_ane_exec_batch.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        self._lib.laya_ane_exec_batch.restype = ctypes.c_double
-        self._has_last_error = hasattr(self._lib, "laya_ane_last_error")
-        if self._has_last_error:
-            self._lib.laya_ane_last_error.argtypes = [ctypes.c_void_p]
-            self._lib.laya_ane_last_error.restype = ctypes.c_char_p
-        self._lib.laya_ane_free.argtypes = [ctypes.c_void_p]
-
-        mc_s256_raw = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
-        mc_s512_raw = self.laya_dir / "laya_typed_s512_w8.mlmodelc"
-        self._mc_s256 = mc_s256_raw.resolve() if mc_s256_raw.exists() else mc_s256_raw
-        self._mc_s512 = mc_s512_raw.resolve() if mc_s512_raw.exists() else mc_s512_raw
-        if not self._mc_s512.exists():
-            raise FileNotFoundError(
-                f"Missing ANE bundle {self._mc_s512}. Run 'decision-models setup-weights --build-laya-ane'."
-            )
-
-        self._h512 = self._lib.laya_ane_load(
-            str(self._mc_s512).encode("utf-8"),
-            H,
-            512,
-            self.pipe_depth,
-            self.compute_mode,
-            self._word_f16.ctypes.data,
-            vocab_sz,
-            self._type_f16.ctypes.data,
+    @classmethod
+    def from_laya_dir(
+        cls,
+        laya_dir: str | Path,
+        *,
+        max_len: int = 512,
+        head_max_len: int | None = None,
+        head_max_len_cap: int | None = None,
+    ) -> "LayaTokenizerHelper":
+        """Build a tokenizer-only helper from a Laya snapshot/artifact directory (zero CoreML load)."""
+        base = Path(laya_dir).expanduser().resolve()
+        tok_path = base / "tokenizer" / "tokenizer.json"
+        if not tok_path.is_file():
+            tok_path = base / "tokenizer.json"
+        cfg_path = base / "rl_agent_config.json"
+        return cls(
+            tok_path,
+            rl_agent_config=cfg_path if cfg_path.is_file() else None,
+            laya_dir=base,
+            max_len=max_len,
+            head_max_len=head_max_len,
+            head_max_len_cap=head_max_len_cap,
         )
-        if not self._h512:
-            raise RuntimeError(f"Failed to load ANE bundle {self._mc_s512}")
-
-        self._h256 = None
-        if self._mc_s256.exists():
-            self._h256 = self._lib.laya_ane_load(
-                str(self._mc_s256).encode("utf-8"),
-                H,
-                256,
-                self.pipe_depth,
-                self.compute_mode,
-                self._word_f16.ctypes.data,
-                vocab_sz,
-                self._type_f16.ctypes.data,
-            )
-
-    def __enter__(self) -> "LayaAneBackend":
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
-    def inspect_compute_plans(self) -> dict[str, tuple[int, int, int]]:
-        """Return `{bucket: (ane_ops, gpu_ops, cpu_ops)}` from `MLComputePlan`."""
-        plans: dict[str, tuple[int, int, int]] = {}
-        for tag, mc in (("s256", self._mc_s256), ("s512", self._mc_s512)):
-            if mc.exists():
-                counts = (ctypes.c_int * 3)()
-                self._lib.laya_ane_inspect_plan(str(mc.resolve()).encode("utf-8"), self.compute_mode, counts)
-                plans[tag] = (int(counts[0]), int(counts[1]), int(counts[2]))
-        return plans
 
     def _encode_ids(self, text: str) -> list[int]:
         return list(self.tok.encode(text, add_special_tokens=False).ids)
 
-    def _resolve_temperature(self, qtype: int, k: int, temperature_override: float | None = None) -> float:
+    def resolve_temperature(self, qtype: int, k: int, temperature_override: float | None = None) -> float:
         if temperature_override is not None:
             return float(temperature_override)
         if qtype == 2:
@@ -165,11 +128,18 @@ class LayaAneBackend:
             return float(self.temperature_by_options.get(f"{prefix}:6-10", default_t))
         return float(self.temperature_by_options.get(f"{prefix}:11+", 1.0))
 
+    def _resolve_temperature(self, qtype: int, k: int, temperature_override: float | None = None) -> float:
+        return self.resolve_temperature(qtype, k, temperature_override)
+
     @staticmethod
-    def _resolve_head_max_len(cfg: Mapping[str, Any], max_len: int) -> int:
+    def resolve_head_max_len(cfg: Mapping[str, Any], max_len: int) -> int:
         raw = int(cfg.get("head_max_len", 192))
         cap = min(256, max(128, int(max_len) - 128))
         return max(128, min(cap, raw))
+
+    @staticmethod
+    def _resolve_head_max_len(cfg: Mapping[str, Any], max_len: int) -> int:
+        return LayaTokenizerHelper.resolve_head_max_len(cfg, max_len)
 
     def encode_item(
         self,
@@ -258,6 +228,141 @@ class LayaAneBackend:
             "truncated": truncated,
             "original_state_tokens": len(st_ids_raw),
         }
+
+
+class LayaAneBackend(LayaTokenizerHelper):
+    """Zero-GPU CoreML ANE `W8A16` runner (`S=256` & `S=512` buckets, `[1585, 0, 0]` ops on ANE)."""
+
+    @classmethod
+    def from_tokenizer_only(
+        cls,
+        tokenizer_json: str | Path,
+        *,
+        rl_agent_config: Mapping[str, Any] | str | Path | None = None,
+        laya_dir: str | Path | None = None,
+        max_len: int = 512,
+        head_max_len: int | None = None,
+        head_max_len_cap: int | None = None,
+    ) -> LayaTokenizerHelper:
+        """Return a `LayaTokenizerHelper` with zero CoreML `.mlmodelc` or native dylib loading."""
+        return LayaTokenizerHelper(
+            tokenizer_json,
+            rl_agent_config=rl_agent_config,
+            laya_dir=laya_dir,
+            max_len=max_len,
+            head_max_len=head_max_len,
+            head_max_len_cap=head_max_len_cap,
+        )
+
+    def __init__(
+        self,
+        laya_dir: Path | str | None = None,
+        dylib_path: Path | str | None = None,
+        *,
+        pipe_depth: int = 4,
+        compute_mode: int = COMPUTE_MODE_CPU_AND_ANE,
+    ) -> None:
+        import numpy as np
+
+        self._np = np
+        self._exec_lock = threading.Lock()
+        resolved_dir = Path(laya_dir).expanduser().resolve() if laya_dir is not None else resolve_laya_dir()
+        self.dylib_path = (
+            Path(dylib_path).expanduser().resolve() if dylib_path is not None else ensure_laya_dylib()
+        )
+        self.pipe_depth = max(1, int(pipe_depth))
+        self.compute_mode = int(compute_mode)
+
+        cfg = json.loads((resolved_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
+        tok_path = resolved_dir / "tokenizer" / "tokenizer.json"
+        super().__init__(tok_path, rl_agent_config=cfg, laya_dir=resolved_dir, max_len=512)
+        assert self.laya_dir is not None
+
+        emb = np.load(self.laya_dir / "laya_typed_emb_f16.npz")
+        self._word_f16 = np.ascontiguousarray(emb["word_f16"])
+        self._type_f16 = np.ascontiguousarray(emb["type_f16"])
+        H = int(self._word_f16.shape[1])
+        vocab_sz = int(self._word_f16.shape[0])
+
+        self._lib = ctypes.CDLL(str(self.dylib_path))
+        self._lib.laya_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        self._lib.laya_ane_load.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self._lib.laya_ane_load.restype = ctypes.c_void_p
+        self._lib.laya_ane_exec_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        self._lib.laya_ane_exec_batch.restype = ctypes.c_double
+        self._has_last_error = hasattr(self._lib, "laya_ane_last_error")
+        if self._has_last_error:
+            self._lib.laya_ane_last_error.argtypes = [ctypes.c_void_p]
+            self._lib.laya_ane_last_error.restype = ctypes.c_char_p
+        self._lib.laya_ane_free.argtypes = [ctypes.c_void_p]
+
+        mc_s256_raw = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
+        mc_s512_raw = self.laya_dir / "laya_typed_s512_w8.mlmodelc"
+        self._mc_s256 = mc_s256_raw.resolve() if mc_s256_raw.exists() else mc_s256_raw
+        self._mc_s512 = mc_s512_raw.resolve() if mc_s512_raw.exists() else mc_s512_raw
+        if not self._mc_s512.exists():
+            raise FileNotFoundError(
+                f"Missing ANE bundle {self._mc_s512}. Run 'decision-models setup-weights --build-laya-ane'."
+            )
+
+        self._h512 = self._lib.laya_ane_load(
+            str(self._mc_s512).encode("utf-8"),
+            H,
+            512,
+            self.pipe_depth,
+            self.compute_mode,
+            self._word_f16.ctypes.data,
+            vocab_sz,
+            self._type_f16.ctypes.data,
+        )
+        if not self._h512:
+            raise RuntimeError(f"Failed to load ANE bundle {self._mc_s512}")
+
+        self._h256 = None
+        if self._mc_s256.exists():
+            self._h256 = self._lib.laya_ane_load(
+                str(self._mc_s256).encode("utf-8"),
+                H,
+                256,
+                self.pipe_depth,
+                self.compute_mode,
+                self._word_f16.ctypes.data,
+                vocab_sz,
+                self._type_f16.ctypes.data,
+            )
+
+    def __enter__(self) -> "LayaAneBackend":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def inspect_compute_plans(self) -> dict[str, tuple[int, int, int]]:
+        """Return `{bucket: (ane_ops, gpu_ops, cpu_ops)}` from `MLComputePlan`."""
+        plans: dict[str, tuple[int, int, int]] = {}
+        for tag, mc in (("s256", self._mc_s256), ("s512", self._mc_s512)):
+            if mc.exists():
+                counts = (ctypes.c_int * 3)()
+                self._lib.laya_ane_inspect_plan(str(mc.resolve()).encode("utf-8"), self.compute_mode, counts)
+                plans[tag] = (int(counts[0]), int(counts[1]), int(counts[2]))
+        return plans
 
     def _exec_bucket(self, bucket_items: list[dict[str, Any]], S: int, handle: Any) -> Any:
         np = self._np
@@ -370,4 +475,5 @@ __all__ = [
     "COMPUTE_MODE_CPU_AND_ANE",
     "COMPUTE_MODE_CPU_ONLY",
     "LayaAneBackend",
+    "LayaTokenizerHelper",
 ]

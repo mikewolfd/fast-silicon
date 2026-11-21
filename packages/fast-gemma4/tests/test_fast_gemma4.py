@@ -338,7 +338,7 @@ def test_http_server_smoke(engine: FastGemma4Engine) -> None:
         with urllib.request.urlopen(f"{base}/health", timeout=5) as resp:
             h = json.loads(resp.read().decode("utf-8"))
             assert h["status"] == "ok"
-            assert h["vocab_size"] == 150786
+            assert h["vocab_size"] == engine.model.vocab_size == 262144
 
         with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as resp:
             models = json.loads(resp.read().decode("utf-8"))
@@ -408,9 +408,11 @@ def test_tuned_defaults_and_routing_cpu(paths: Gemma4Paths) -> None:
     rem = VocabRemapper.load_or_build(paths.resolve_tokenizer_json(), paths.vocab_remap_npz)
     city_schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": False}
     gh_flex = GrammarHelper(tok, city_schema, rem.kept_old_ids, whitespace_flexible=True)
-    m_flex = gh_flex.new_matcher()
-    assert m_flex.validate_tokens(tok.encode('{"city": "Tokyo"}', add_special_tokens=False))
-    assert m_flex.validate_tokens(tok.encode('{"city":"Tokyo"}', add_special_tokens=False))
+    for sample_json in ('{"city": "Tokyo"}', '{"city":"Tokyo"}'):
+        sample_ids = tok.encode(sample_json, add_special_tokens=False)
+        m_flex = gh_flex.new_matcher()
+        assert m_flex.try_consume_tokens(sample_ids) == len(sample_ids)
+        assert m_flex.is_accepting()
 
     schema = {"type": "object", "properties": {"student_name": {"type": "string"}},
               "required": ["student_name"], "additionalProperties": False}
@@ -421,7 +423,10 @@ def test_tuned_defaults_and_routing_cpu(paths: Gemma4Paths) -> None:
     assert len(opening) == 1
     matcher = fixed.new_matcher()
     assert matcher.try_consume_tokens(opening) == 1
-    assert matcher.validate_tokens(tok.encode('Mereana Barlow"}', add_special_tokens=False))
+    tail = tok.encode('Mereana Barlow"}', add_special_tokens=False)
+    assert matcher.validate_tokens(tail) == len(tail)
+    assert matcher.try_consume_tokens(tail) == len(tail)
+    assert matcher.is_accepting()
     assert compact.new_matcher().try_consume_tokens(opening) == 0
 
     # 4. CLI defaults

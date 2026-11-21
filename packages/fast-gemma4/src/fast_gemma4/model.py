@@ -351,7 +351,7 @@ class FastGemma4Model:
       - Exact power-of-2 bitmask SWA ring buffer (`512`) + Full KV linear buffer
       - `EarlyExit` prefill with final KV-owning layer `kv_proj_only`
       - Apple Metal 4 `MPP::matmul2d` BF16 GeGLU (`16<=M<=64` + MLX down; `M>=2048` prefill gated on `>=26.1`)
-      - Lossless English+JSON `150,786` LM head pruning (with full `262,144` input embeddings + PLE)
+      - Full checkpoint `262,144` LM head by default, with optional domain/ASCII-focused pruned LM heads (`vocab_remap.npz` / `vocab_out`) while keeping full `262,144` input embeddings + PLE
     """
 
     def __init__(
@@ -374,6 +374,8 @@ class FastGemma4Model:
             raise ValueError(f"Unsupported mlp_dtype={mlp_dtype!r}")
         if lm_head_mode not in ("q4", "bf16_mpp"):
             raise ValueError(f"Unsupported lm_head_mode={lm_head_mode!r}")
+        if vocab_out is not None and int(vocab_out) <= 0:
+            raise ValueError(f"vocab_out must be a positive integer (or None), got {vocab_out!r}")
 
         self.paths = paths or resolve_paths()
         self.model_dir = self.paths.resolve_model_dir(model_dir, local_files_only=local_files_only)
@@ -572,6 +574,14 @@ class FastGemma4Model:
                         self.paths.vocab_remap_npz,
                         target_size=int(vocab_out),
                     )
+                kept = mx.array(self.remapper.kept_old_ids, dtype=mx.int32)
+                self.lm_head = _slice_linear_or_emb(head_source, kept)
+                self.new_to_old = self.remapper.kept_old_ids
+                self.old_to_new = self.remapper.old_to_new
+            elif vocab_out is None and ckpt_remap.is_file():
+                # Packed tied-weight checkpoints shipping `vocab_remap.npz` auto-apply their pruned head
+                # unless the caller explicitly requests `vocab_out >= full_vocab_rows`.
+                self.remapper = VocabRemapper.load_or_build(self.tokenizer_json, ckpt_remap, target_size=None)
                 kept = mx.array(self.remapper.kept_old_ids, dtype=mx.int32)
                 self.lm_head = _slice_linear_or_emb(head_source, kept)
                 self.new_to_old = self.remapper.kept_old_ids

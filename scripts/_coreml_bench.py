@@ -129,20 +129,41 @@ def _decision(pkg: str, run_pair: Callable, cooldown_sec: float) -> tuple[dict, 
             qdef = {"type": "noul", "instructions": "Does the passage state that ocean currents transport heat?"}
             short = eng.encode_item("Ocean currents move warm tropical water toward the poles.", qdef)
             long = eng.encode_item("Ocean currents transfer thermal energy across hemispheres. " * 55, qdef)
-            first = lambda: eng.score_noul_batch([short])
-            second = lambda: eng.score_noul_batch([long])
+
+            def first() -> float:
+                eng.score_noul_batch([short])
+                return float(getattr(eng, "last_encode_sec", 0.0))
+
+            def second() -> float:
+                eng.score_noul_batch([long])
+                return float(getattr(eng, "last_encode_sec", 0.0))
         else:
             state = "Ocean currents transfer heat across hemispheres and regulate coastal climates."
             qs = [{"type": "noul", "instructions": f"Question {i}: does the passage mention ocean currents?"}
                   for i in range(8)]
-            first = lambda: eng.score_multi_states_noul([(state, qs[:1])])
-            second = lambda: eng.score_multi_states_noul([(state, qs)])
-        a = run_pair(lambda: [first() for _ in range(4)], lambda: [second() for _ in range(4)],
+
+            def first() -> float:
+                eng.score_multi_states_noul([(state, qs[:1])])
+                return float(getattr(eng, "last_encode_sec", 0.0))
+
+            def second() -> float:
+                eng.score_multi_states_noul([(state, qs)])
+                return float(getattr(eng, "last_encode_sec", 0.0))
+
+        a = run_pair(lambda: sum(first() for _ in range(4)), lambda: sum(second() for _ in range(4)),
                      cooldown_sec=cooldown_sec, rounds=2, use_mlx_abba=False)
     finally:
         eng.close()
     telemetry = eng.telemetry()
-    short_s, long_s = a["a_median_s"] / 4, a["b_median_s"] / 4
+    a_encode = [float(r["payload"]) for r in a.get("a_runs", []) if float(r.get("payload") or 0.0) > 0.0]
+    b_encode = [float(r["payload"]) for r in a.get("b_runs", []) if float(r.get("payload") or 0.0) > 0.0]
+    short_s = (median(a_encode) if a_encode else a["a_median_s"]) / 4
+    long_s = (median(b_encode) if b_encode else a["b_median_s"]) / 4
+    timing_scope = (
+        "in-process model scoring inside the model process (excluding temp-JSON IPC)"
+        if (a_encode and b_encode)
+        else "end-to-end decision call including subprocess IPC"
+    )
     if pkg == "coreml-laya":
         buckets = telemetry["coreml_info"]["buckets"]
         sizes = [len(item["ids"]) for item in (short, long)]
@@ -155,7 +176,7 @@ def _decision(pkg: str, run_pair: Callable, cooldown_sec: float) -> tuple[dict, 
         metrics = {"b1_q_per_sec": 1 / short_s, "q_per_sec": 8 / long_s,
                    "ms_per_question": 1000 * long_s / 8,
                    "highlight": f"{8/long_s:.2f} questions/s for eight questions on one state"}
-    return {"runtime": pkg, "timing_order": a["order"], **metrics}, telemetry
+    return {"runtime": pkg, "timing_order": a["order"], "timing_scope": timing_scope, **metrics}, telemetry
 
 
 def run_coreml_benchmark(pkg: str, run_pair: Callable, cooldown_sec: float) -> dict:

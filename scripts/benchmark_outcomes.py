@@ -280,27 +280,44 @@ def _merge_daemon_telemetry(
     fallback_peak_gb: float | None = None,
 ) -> None:
     """Merge subprocess daemon 4-bucket `RUSAGE_INFO_V6`, asset summary, and cold/warm latency."""
-    pk_val: float | None = None
-    if telemetry and telemetry.get("peak_gb") is not None:
-        pk_val = float(telemetry["peak_gb"])
-    elif fallback_peak_gb is not None:
-        pk_val = float(fallback_peak_gb)
-    if pk_val is not None and pk_val > 0:
-        mem4["peak_footprint_gb"] = round(max(float(mem4.get("peak_footprint_gb", 0.0)), pk_val), 4)
-        mem4["combined_with_model_mapped_gb"] = round(
-            max(float(mem4.get("combined_with_model_mapped_gb", 0.0)), pk_val), 4
-        )
-    if not telemetry:
-        return
-
     mib_to_gb = (1024.0 * 1024.0) / 1e9
-    four = telemetry.get("four_bucket_metrics")
-    if isinstance(four, Mapping) and four:
-        comb_gb = float(four.get("combined_with_model_mapped_gb", 0.0) or 0.0)
+    four = telemetry.get("four_bucket_metrics") if telemetry else None
+    has_four = isinstance(four, Mapping) and bool(four)
+
+    ext_pk: float | None = None
+    if telemetry and telemetry.get("external_peak_gb") is not None and float(telemetry["external_peak_gb"]) > 0:
+        ext_pk = float(telemetry["external_peak_gb"])
+    elif telemetry and telemetry.get("peak_gb") is not None and float(telemetry["peak_gb"]) > 0:
+        ext_pk = float(telemetry["peak_gb"])
+    elif fallback_peak_gb is not None and float(fallback_peak_gb) > 0:
+        ext_pk = float(fallback_peak_gb)
+
+    if has_four:
+        phys_mb = four.get("phys_footprint_mb")
+        if phys_mb is not None and float(phys_mb) > 0:
+            mem4["phys_footprint_gb"] = round(
+                max(float(mem4.get("phys_footprint_gb", 0.0)), float(phys_mb) * mib_to_gb), 4
+            )
+        max_phys_mb = four.get("lifetime_max_phys_footprint_mb")
+        if max_phys_mb is not None and float(max_phys_mb) > 0:
+            mem4["peak_footprint_gb"] = round(
+                max(float(mem4.get("peak_footprint_gb", 0.0)), float(max_phys_mb) * mib_to_gb), 4
+            )
+        elif ext_pk is not None:
+            mem4["peak_footprint_gb"] = round(max(float(mem4.get("peak_footprint_gb", 0.0)), ext_pk), 4)
+
+        comb_gb = 0.0
+        if four.get("combined_with_model_mapped_gb") is not None and float(four["combined_with_model_mapped_gb"]) > 0:
+            comb_gb = float(four["combined_with_model_mapped_gb"])
+        elif four.get("combined_with_model_mapped_mb") is not None and float(four["combined_with_model_mapped_mb"]) > 0:
+            comb_gb = float(four["combined_with_model_mapped_mb"]) * mib_to_gb
+        elif ext_pk is not None:
+            comb_gb = ext_pk
         if comb_gb > 0:
             mem4["combined_with_model_mapped_gb"] = round(
                 max(float(mem4.get("combined_with_model_mapped_gb", 0.0)), comb_gb), 4
             )
+
         neural_gb = max(0.0, float(four.get("neural_nofootprint_mb", 0.0) or 0.0)) * mib_to_gb
         mapped_gb = max(0.0, float(four.get("mapped_model_mb", 0.0) or 0.0)) * mib_to_gb
         if neural_gb > 0:
@@ -312,6 +329,14 @@ def _merge_daemon_telemetry(
                 float(four.get("ane_daemon_footprint_delta_mb", 0.0) or 0.0), 2
             )
         diag["daemon_four_bucket_metrics"] = dict(four)
+    elif ext_pk is not None:
+        mem4["peak_footprint_gb"] = round(max(float(mem4.get("peak_footprint_gb", 0.0)), ext_pk), 4)
+        mem4["combined_with_model_mapped_gb"] = round(
+            max(float(mem4.get("combined_with_model_mapped_gb", 0.0)), ext_pk), 4
+        )
+
+    if not telemetry:
+        return
 
     lat = telemetry.get("cold_warm_latency")
     if isinstance(lat, Mapping) and lat:
@@ -408,6 +433,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--gemma-json-layout", choices=("fixed", "compact", "flexible"), default="fixed")
     p.add_argument("--reasoning-effort", default=None)
     p.add_argument("--coreai-variant", choices=("4bit", "fp4_fp8", "both"), default="both")
+    p.add_argument("--max-coarse-tokens", type=int, default=None)
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -415,6 +441,21 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Category 1 Workers: fast-bge-small, fast-embeddinggemma-2, fast-pplx
 # ---------------------------------------------------------------------------
+
+
+def _split_judged_query_ids(
+    query_ids: Sequence[str], qrels: Mapping[str, Mapping[str, float]]
+) -> tuple[list[str], list[str]]:
+    """Split retrieval query IDs into `(judged_ids, unjudged_ids)` matching MTEB positive-qrel filtering."""
+    judged: list[str] = []
+    unjudged: list[str] = []
+    for qid in query_ids:
+        rel_map = qrels.get(qid)
+        if rel_map and any(float(sc) > 0.0 for sc in rel_map.values()):
+            judged.append(qid)
+        else:
+            unjudged.append(qid)
+    return judged, unjudged
 
 
 def _retrieval_query_outcomes(
@@ -457,8 +498,15 @@ def _run_cat1_worker(
     host_mem_gb: float,
     coreai_python: str | None = None,
     pplx_mlx_path: str | None = None,
+    max_coarse_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
-    probe = FourBucketMemoryProbe(model_directories=[home / "artifacts"])
+    model_dirs: list[Path] = [home / "artifacts"]
+    if pkg_name.startswith("public-"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import stock_hf_model_files
+
+        model_dirs.extend(stock_hf_model_files(pkg_name))
+    probe = FourBucketMemoryProbe(model_directories=model_dirs)
     guard = DeviceMemoryGuard()
     guard_tripped = False
 
@@ -474,11 +522,15 @@ def _run_cat1_worker(
         sub: load_nanobeir_subset(sub, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
         for sub in subsets
     }
+    skipped_unjudged_by_sub: dict[str, list[str]] = {}
     if smoke or max_items:
         q_cap = 12 if smoke else int(max_items or 50)
         d_cap = 120 if smoke else None
         for sub, pack in nb_loaded.items():
-            q_ids_keep = sorted(pack["queries"].keys())[:q_cap]
+            judged_all, unjudged_all = _split_judged_query_ids(sorted(pack["queries"].keys()), pack["qrels"])
+            if unjudged_all:
+                skipped_unjudged_by_sub[sub] = unjudged_all
+            q_ids_keep = judged_all[:q_cap]
             pack["queries"] = {qid: pack["queries"][qid] for qid in q_ids_keep}
             pack["qrels"] = {qid: pack["qrels"][qid] for qid in q_ids_keep if qid in pack["qrels"]}
             if d_cap is not None:
@@ -512,6 +564,7 @@ def _run_cat1_worker(
     mode = extra.mode
     nb_pre_normalized = True
     _enc_coarse_2k = None
+    coarse_max_tokens: int | None = None
     if pkg_name == "fast-bge-small":
         from fast_bge_small.engine import FastBgeSmall
 
@@ -536,6 +589,7 @@ def _run_cat1_worker(
         eng = FastEmbeddingGemma2(home=home, default_mode=eff_mode, warmup=True)
         mrl_dims = (128, 256, 512, "max")
         int8_mode = "sym_int8"
+        coarse_max_tokens = int(max_coarse_tokens) if max_coarse_tokens is not None else 2048
 
         def _enc_q(txts: list[str]) -> np.ndarray:
             return eng.encode_texts(txts, is_query=True, add_query_prefix=True, mode=eff_mode)
@@ -544,8 +598,8 @@ def _run_cat1_worker(
             return eng.encode_texts(txts, is_query=False, add_document_prefix=True, mode=eff_mode)
 
         def _enc_coarse_2k(txts: list[str]) -> np.ndarray:
-            # Exercise native 2K-token context via encode_corpus(..., allow_gpu_overflow=True).
-            tok_lists = eng.tokenizer.encode_batch(txts, add_document_prefix=True, max_length=2048)
+            # Exercise native 2K-token context (or matched --max-coarse-tokens override) via allow_gpu_overflow=True.
+            tok_lists = eng.tokenizer.encode_batch(txts, add_document_prefix=True, max_length=coarse_max_tokens)
             return eng.encode_corpus(tok_lists, mode=eff_mode, allow_gpu_overflow=True)
 
         _enc_q_nb = _enc_q
@@ -601,6 +655,7 @@ def _run_cat1_worker(
             tier=tier,
             coreai_python=coreai_python,
             pplx_mlx_path=pplx_mlx_path,
+            max_coarse_tokens=max_coarse_tokens,
         )
         eng = pub_ad
         eff_mode = pub_ad.harness_label
@@ -613,6 +668,7 @@ def _run_cat1_worker(
         _enc_d = pub_ad.enc_d
         _enc_coarse_2k = pub_ad.enc_coarse_2k
         _enc_ctx = pub_ad.enc_ctx
+        coarse_max_tokens = pub_ad.coarse_max_tokens
     else:
         raise ValueError(f"Unsupported Cat 1 package: {pkg_name}")
 
@@ -635,7 +691,9 @@ def _run_cat1_worker(
         nb_ndcgs: list[float] = []
         for sub in subsets:
             pack = nb_loaded[sub]
-            q_ids = sorted(pack["queries"].keys())
+            q_ids, unjudged_nb = _split_judged_query_ids(sorted(pack["queries"].keys()), pack["qrels"])
+            if unjudged_nb:
+                skipped_unjudged_by_sub[sub] = sorted(set(skipped_unjudged_by_sub.get(sub, [])) | set(unjudged_nb))
             d_ids = sorted(pack["corpus"].keys())
             q_vecs = _enc_q_nb([pack["queries"][qid] for qid in q_ids])
             d_vecs = _enc_d_nb([pack["corpus"][did] for did in d_ids])
@@ -665,7 +723,7 @@ def _run_cat1_worker(
             valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_main, "per_query_ndcg")
             all_valid.extend(valid)
             all_scores.extend(scores)
-            sub_reports[sub] = {
+            sub_entry: dict[str, Any] = {
                 **coverage,
                 "n_docs": r_main["n_docs"],
                 "ndcg@10": round(float(r_main["ndcg@10"]), 6),
@@ -673,6 +731,9 @@ def _run_cat1_worker(
                 "recall@10": round(float(r_main["recall@10"]), 6),
                 "mrl_grid": grid,
             }
+            if sub in skipped_unjudged_by_sub:
+                sub_entry["skipped_unjudged_query_ids"] = skipped_unjudged_by_sub[sub]
+            sub_reports[sub] = sub_entry
 
         # 1B: LegalBench-RAG isolated (plus ~2K coarse chunks for fast-embeddinggemma-2 and contextual lift for fast-pplx)
         contextual_lift = None
@@ -723,6 +784,7 @@ def _run_cat1_worker(
                     **coverage,
                     "n_chunks": len(lb_coarse_chunks),
                     "chunk_chars": 6144,
+                    "max_tokens": coarse_max_tokens,
                     "span_ndcg@10": round(float(r_coarse["span_ndcg@10"]), 6),
                     "char_recall@10": round(float(r_coarse["char_recall@10"]), 6),
                     "coarse_2k_delta_ndcg@10": coarse_2k_lift["contextual_delta_ndcg@10"],
@@ -752,7 +814,9 @@ def _run_cat1_worker(
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
                 )
-                q_ids = sorted(le_pack["queries"].keys())
+                q_ids, unjudged_le = _split_judged_query_ids(sorted(le_pack["queries"].keys()), le_pack["qrels"])
+                if unjudged_le:
+                    skipped_unjudged_by_sub[f"longembed_{le_sub}"] = unjudged_le
                 d_ids = sorted(le_pack["corpus"].keys())
                 q_vecs = _enc_q([le_pack["queries"][qid] for qid in q_ids])
                 d_vecs = _enc_d([le_pack["corpus"][did] for did in d_ids])
@@ -761,13 +825,16 @@ def _run_cat1_worker(
                 valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_le, "per_query_ndcg")
                 all_valid.extend(valid)
                 all_scores.extend(scores)
-                sub_reports[f"longembed_{le_sub}"] = {
+                le_entry: dict[str, Any] = {
                     **coverage,
                     "n_docs": r_le["n_docs"],
                     "ndcg@10": round(float(r_le["ndcg@10"]), 6),
                     "mrr@10": round(float(r_le["mrr@10"]), 6),
                     "recall@10": round(float(r_le["recall@10"]), 6),
                 }
+                if unjudged_le:
+                    le_entry["skipped_unjudged_query_ids"] = unjudged_le
+                sub_reports[f"longembed_{le_sub}"] = le_entry
 
         _mx_sync()
         wall_sec = time.perf_counter() - t0
@@ -784,6 +851,8 @@ def _run_cat1_worker(
             "mrl_128_int8_mean_delta_ndcg10": round(float(np.mean(mrl_deltas)) if mrl_deltas else 0.0, 6),
             "contextual_delta_ndcg10": contextual_lift["contextual_delta_ndcg@10"] if contextual_lift else None,
             "coarse_2k_delta_ndcg10": coarse_2k_lift["contextual_delta_ndcg@10"] if coarse_2k_lift else None,
+            "coarse_max_tokens": coarse_max_tokens,
+            "skipped_unjudged_query_ids": skipped_unjudged_by_sub,
             "device_guard_tripped": guard_tripped,
             "repeat_loop_count": 0,
         }
@@ -805,7 +874,7 @@ def _run_cat1_worker(
             )
         ]
     finally:
-        if not pkg_name.startswith(("public-", "coreai-", "coreml-")):
+        if hasattr(eng, "close"):
             eng.close()
 
 
@@ -1134,7 +1203,7 @@ def _run_cat2_single_backend(
             host_mem_gb=host_mem_gb,
         )
     finally:
-        if not (hasattr(eng, "telemetry") or hasattr(eng, "peak_gb")):
+        if hasattr(eng, "close"):
             eng.close()
 
 
@@ -1218,7 +1287,13 @@ def _run_llm_worker(
     coreai_variant_override: str | None = None,
 ) -> list[dict[str, Any]]:
     want_cats = {3, 4} if extra.categories == "all" else {int(x.strip()) for x in extra.categories.split(",") if x.strip()}
-    probe = FourBucketMemoryProbe(model_directories=[home / "artifacts"] if home.exists() else None)
+    model_dirs: list[Path] = [home / "artifacts"] if home.exists() else []
+    if pkg_name.startswith("public-"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _outcome_public_backends import stock_hf_model_files
+
+        model_dirs.extend(stock_hf_model_files(pkg_name))
+    probe = FourBucketMemoryProbe(model_directories=model_dirs or None)
     guard = DeviceMemoryGuard()
     guard_tripped = False
 
@@ -1378,6 +1453,7 @@ def _run_llm_worker(
         return texts, reasons, tok_ids, st
 
     records: list[dict[str, Any]] = []
+    pending_records: list[dict[str, Any]] = []
     try:
         guard.arm()
         # Untimed warmup
@@ -1505,20 +1581,20 @@ def _run_llm_worker(
             }
             if pub_llm is not None:
                 _merge_daemon_telemetry(mem3, diag3, pub_llm.telemetry())
-            records.append(
-                _build_record(
-                    package=pkg_name,
-                    category=3,
-                    config_label=f"{eff_label}_cat3",
-                    benchmark="IFBench+MMLU-Redux+MATH-500",
-                    valid_flags=all_v3,
-                    item_scores=all_s3,
-                    wall_sec=wall3,
-                    diagnostics=diag3,
-                    memory_4bucket_gb=mem3,
-                    sub_benchmarks=sub3,
-                    host_mem_gb=host_mem_gb,
-                )
+            pending_records.append(
+                {
+                    "package": pkg_name,
+                    "category": 3,
+                    "config_label": f"{eff_label}_cat3",
+                    "benchmark": "IFBench+MMLU-Redux+MATH-500",
+                    "valid_flags": all_v3,
+                    "item_scores": all_s3,
+                    "wall_sec": wall3,
+                    "diagnostics": diag3,
+                    "memory_4bucket_gb": mem3,
+                    "sub_benchmarks": sub3,
+                    "host_mem_gb": host_mem_gb,
+                }
             )
 
         # ---------------- Category 4: Structured JSON & Tool AST ----------------
@@ -1614,30 +1690,36 @@ def _run_llm_worker(
                     diag4.update(model_settings, json_layout=extra.gemma_json_layout if use_llg else None)
                 if pub_llm is not None:
                     _merge_daemon_telemetry(mem4, diag4, pub_llm.telemetry())
-                records.append(
-                    _build_record(
-                        package=pkg_name,
-                        category=4,
-                        config_label=f"{eff_label}_{'llg_on' if use_llg else 'llg_off'}",
-                        benchmark=f"LiquidAI/structured-extraction({len(lq_items)})+BFCL_v3({len(bfcl_items)})",
-                        valid_flags=all_v4,
-                        item_scores=all_s4,
-                        wall_sec=wall4,
-                        diagnostics=diag4,
-                        memory_4bucket_gb=mem4,
-                        sub_benchmarks=sub4,
-                        host_mem_gb=host_mem_gb,
-                    )
+                pending_records.append(
+                    {
+                        "package": pkg_name,
+                        "category": 4,
+                        "config_label": f"{eff_label}_{'llg_on' if use_llg else 'llg_off'}",
+                        "benchmark": f"LiquidAI/structured-extraction({len(lq_items)})+BFCL_v3({len(bfcl_items)})",
+                        "valid_flags": all_v4,
+                        "item_scores": all_s4,
+                        "wall_sec": wall4,
+                        "diagnostics": diag4,
+                        "memory_4bucket_gb": mem4,
+                        "sub_benchmarks": sub4,
+                        "host_mem_gb": host_mem_gb,
+                    }
                 )
-    finally:
         if pub_llm is not None:
             daemon_pk = pub_llm.close()
             final_telem = pub_llm.telemetry()
-            for rec in records:
-                m4 = rec.get("memory_4bucket_gb")
-                dg = rec.get("diagnostics")
-                if isinstance(m4, dict) and isinstance(dg, dict):
-                    _merge_daemon_telemetry(m4, dg, final_telem, fallback_peak_gb=daemon_pk)
+            for item in pending_records:
+                _merge_daemon_telemetry(
+                    item["memory_4bucket_gb"],
+                    item["diagnostics"],
+                    final_telem,
+                    fallback_peak_gb=daemon_pk,
+                )
+        for item in pending_records:
+            records.append(_build_record(**item))
+    finally:
+        if pub_llm is not None:
+            pub_llm.close()
         if eng is not None and hasattr(eng, "close"):
             eng.close()
     return records
@@ -1664,6 +1746,13 @@ def _run_worker_main(args: argparse.Namespace) -> int:
         import mlx.core as mx
 
         mx.set_cache_limit(extra.mlx_cache_limit_mb * 1024**2)
+    max_coarse_tokens = (
+        extra.max_coarse_tokens
+        if extra.max_coarse_tokens is not None
+        else getattr(args, "max_coarse_tokens", None)
+    )
+    if max_coarse_tokens is not None and int(max_coarse_tokens) <= 0:
+        raise ValueError("--max-coarse-tokens must be positive")
     use_wl = not bool(args.no_wired_limit)
     ctx = wired_limit() if use_wl else _null_ctx()
     with ctx:
@@ -1694,6 +1783,7 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                     host_mem_gb=host_mem,
                     coreai_python=args.coreai_python,
                     pplx_mlx_path=args.pplx_mlx_path,
+                    max_coarse_tokens=max_coarse_tokens,
                 )
             except FileNotFoundError as exc:
                 if pkg_name.startswith(("public-", "coreai-", "coreml-")):
@@ -1880,6 +1970,8 @@ def _spawn_isolated_worker(
         cmd.extend(["--coreai-python", str(args.coreai_python)])
     if getattr(args, "pplx_mlx_path", None):
         cmd.extend(["--pplx-mlx-path", str(args.pplx_mlx_path)])
+    if getattr(args, "max_coarse_tokens", None) is not None:
+        cmd.extend(["--max-coarse-tokens", str(int(args.max_coarse_tokens))])
 
     env = dict(os.environ)
     env["M4_GPU_LOCK_HELD"] = "1"
@@ -2117,6 +2209,15 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     return 0 if verdict == "PASS" else 1
 
 
+_DEFAULT_COARSE_MAX_TOKENS: dict[str, int] = {
+    "fast-embeddinggemma-2": 2048,
+    "public-embeddinggemma-2": 2048,
+    "coreai-embeddinggemma-2": 2048,
+    "coreml-embeddinggemma-2-fp16": 512,
+    "coreml-embeddinggemma-2-int8": 512,
+}
+
+
 def compute_public_comparisons(
     results: Sequence[Mapping[str, Any]], *, lossless_tolerance: float = DEFAULT_LOSSLESS_TOLERANCE,
 ) -> list[dict[str, Any]]:
@@ -2156,29 +2257,40 @@ def compute_public_comparisons(
                 f_sc = float(fr.get("objective_score_e2e", 0.0))
                 p_sc = float(pr.get("objective_score_e2e", 0.0))
                 evidence = evaluate_promotion_gates(pr, fr, lossless_tolerance=lossless_tolerance).to_dict()
-                out.append(
-                    {
-                        "fast_package": fast_pkg,
-                        "fast_config": fr.get("config_label"),
-                        "stock_package": pub_pkg,
-                        "stock_config": pr.get("config_label"),
-                        "category": fr.get("category"),
-                        "benchmark": fr.get("benchmark"),
-                        "fast_score_e2e": round(f_sc, 4),
-                        "stock_score_e2e": round(p_sc, 4),
-                        "delta_score_e2e": round(f_sc - p_sc, 4),
-                        "se_paired": evidence["se_paired"],
-                        "n_paired": evidence["n_paired"],
-                        "ci95_low": evidence["ci95_low"],
-                        "ci95_high": evidence["ci95_high"],
-                        "lossless_quality_floor": evidence["quality_floor"],
-                        "lossless_quality_status": evidence["quality_status"],
-                        "retrieval_coverage_pass": evidence["retrieval_coverage_pass"],
-                        "fast_eot": round(f_eot, 3),
-                        "stock_eot": round(p_eot, 3),
-                        "eot_speedup_vs_stock": round(f_eot / max(p_eot, 1e-6), 3),
-                    }
-                )
+                f_diag = fr.get("diagnostics") or {}
+                p_diag = pr.get("diagnostics") or {}
+                f_cap = f_diag.get("coarse_max_tokens")
+                if f_cap is None:
+                    f_cap = _DEFAULT_COARSE_MAX_TOKENS.get(fast_pkg)
+                p_cap = p_diag.get("coarse_max_tokens")
+                if p_cap is None:
+                    p_cap = _DEFAULT_COARSE_MAX_TOKENS.get(pub_pkg)
+                row: dict[str, Any] = {
+                    "fast_package": fast_pkg,
+                    "fast_config": fr.get("config_label"),
+                    "stock_package": pub_pkg,
+                    "stock_config": pr.get("config_label"),
+                    "category": fr.get("category"),
+                    "benchmark": fr.get("benchmark"),
+                    "fast_score_e2e": round(f_sc, 4),
+                    "stock_score_e2e": round(p_sc, 4),
+                    "delta_score_e2e": round(f_sc - p_sc, 4),
+                    "se_paired": evidence["se_paired"],
+                    "n_paired": evidence["n_paired"],
+                    "ci95_low": evidence["ci95_low"],
+                    "ci95_high": evidence["ci95_high"],
+                    "lossless_quality_floor": evidence["quality_floor"],
+                    "lossless_quality_status": evidence["quality_status"],
+                    "retrieval_coverage_pass": evidence["retrieval_coverage_pass"],
+                    "fast_eot": round(f_eot, 3),
+                    "stock_eot": round(p_eot, 3),
+                    "eot_speedup_vs_stock": round(f_eot / max(p_eot, 1e-6), 3),
+                }
+                if f_cap is not None and p_cap is not None:
+                    row["fast_coarse_max_tokens"] = int(f_cap)
+                    row["stock_coarse_max_tokens"] = int(p_cap)
+                    row["coarse_max_tokens_mismatch"] = int(f_cap) != int(p_cap)
+                out.append(row)
     return out
 
 
@@ -2234,6 +2346,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "dry_run": True,
             "tier": args.tier,
             "smoke": bool(args.smoke),
+            "max_coarse_tokens": args.max_coarse_tokens,
             "packages": pkg_names,
             "abba_arms": [{"label": lbl, "flags": fl} for lbl, fl in abba_arms],
             "dataset_lock_sha256": lock_sha,
@@ -2254,12 +2367,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     comparisons: list[dict[str, Any]] = []
     cooldown = max(0.0, float(args.cooldown_sec))
+    pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or args.python
 
     with _hw_lock():
         for idx, pkg in enumerate(pkg_names, 1):
             if idx > 1 and cooldown > 0.0:
                 time.sleep(cooldown)
             print(f"[{idx}/{len(pkg_names)}] Running outcome benchmarks for {pkg} ({args.tier})...", file=sys.stderr, flush=True)
+            worker_py = pub_py if pkg.startswith(("public-", "coreai-")) else args.python
 
             if len(abba_arms) >= 2:
                 # Interleaved A-B-B-A execution in isolated child subprocesses.
@@ -2276,7 +2391,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     lbl, fl = (lbl_a, fl_a) if tag == "A" else (lbl_b, fl_b)
                     print(f"  ABBA step {step_i + 1}/{len(schedule)} [{tag}:{lbl}]...", file=sys.stderr, flush=True)
                     recs = _spawn_isolated_worker(
-                        python_exe=args.python, pkg_name=pkg, label=lbl, extra_flags=fl, args=args
+                        python_exe=worker_py, pkg_name=pkg, label=lbl, extra_flags=fl, args=args
                     )
                     (runs_a if tag == "A" else runs_b).append(recs)
                 agg_a = _aggregate_abba_records(runs_a)
@@ -2309,8 +2424,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 results.extend(agg_b)
             else:
                 lbl, fl = abba_arms[0] if abba_arms else ("", args.extra_args or "")
-                pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or args.python
-                worker_py = pub_py if pkg.startswith(("public-", "coreai-")) else args.python
                 recs = _spawn_isolated_worker(
                     python_exe=worker_py, pkg_name=pkg, label=lbl, extra_flags=fl, args=args
                 )
@@ -2355,7 +2468,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(md)
     failed = [r for r in results if r.get("status") == "failed" or
               (r.get("category") == 1 and r.get("status") == "ok" and retrieval_coverage_errors(r))]
-    comp_failed = [c for c in comparisons if c.get("verdict") != "PASS"]
+    is_subset = bool(args.smoke or args.max_items is not None)
+    comp_failed = [
+        c for c in comparisons
+        if (c.get("verdict") == "FAIL" if is_subset else c.get("verdict") != "PASS")
+    ]
     return 1 if (failed or comp_failed) else 0
 
 
@@ -2393,6 +2510,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--coreai-python", default=None, help="Python executable for Apple CoreAI (macOS 27.2+) workers")
     rn.add_argument("--pplx-mlx-path", default=None, help="Optional repo path for public pplx-context-mlx")
     rn.add_argument("--extra-args", default="", help="Forwarded worker flags (e.g. '--mode hetero2')")
+    rn.add_argument("--max-coarse-tokens", type=int, default=None, help="Optional token cap for LegalBench-RAG coarse passages (e.g. 512)")
     rn.add_argument("--max-items", type=int, default=None, help="Optional per-sub-benchmark item cap")
     rn.add_argument("--smoke", action="store_true", help="Fast end-to-end smoke slice across selected packages")
     rn.add_argument("--openai-url", default=None)
@@ -2438,6 +2556,7 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--openai-model", default=None)
     wk.add_argument("--coreai-python", default=None)
     wk.add_argument("--pplx-mlx-path", default=None)
+    wk.add_argument("--max-coarse-tokens", type=int, default=None)
     wk.set_defaults(func=_run_worker_main)
     return p
 
