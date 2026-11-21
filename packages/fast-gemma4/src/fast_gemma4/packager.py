@@ -12,7 +12,7 @@ Supports:
        (`weight` `U32 [out, in//4]`, `scales` `BF16 [out, in//64]`, `biases` `BF16 [out, in//64]`)
      - MLP projections (`.mlp.{gate,up,down}_proj`) -> unquantized `BF16`
      - 1D norms & `layer_scalar` -> unquantized `BF16`
-  3. Lossless `vocab_out=150,786` row remapping via `VocabRemapper` (`kept_old_ids` / `old_ids`).
+  3. Optional `vocab_out=150,786` output-row remapping via `VocabRemapper` (`kept_old_ids` / `old_ids`).
 """
 
 from __future__ import annotations

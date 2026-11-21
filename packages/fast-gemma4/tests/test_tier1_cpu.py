@@ -940,6 +940,44 @@ def test_drain_ff_slots_mixed_ks_swa512_wrap_cpu() -> None:
     assert 0 not in slot0_written
 
 
+def test_default_grammar_preserves_field_values_and_explicit_layouts(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    # Use real byte-level BPE merges for the two delimiter tokens Gemma predicts.
+    pieces = ["<pad>", "<eos>", "<bos>"] + sorted(pre_tokenizers.ByteLevel.alphabet()) + ['":', 'Ġ"']
+    tokenizer = Tokenizer(BPE(vocab={p: i for i, p in enumerate(pieces)}, merges=[('"', ':'), ('Ġ', '"')]))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    for piece in pieces[:3]:
+        tokenizer.add_special_tokens([AddedToken(piece, special=True)])
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+    tok = FastGemma4Tokenizer(tokenizer_path)
+    tok.eos_token_id = 1
+    properties = {"a": {"type": "string"}, "b": {"type": "string"}}
+    schema = {"type": "object", "properties": properties, "required": ["a", "b"], "additionalProperties": False}
+    engine = object.__new__(FastGemma4Engine)
+    engine.tokenizer = tok
+    engine.model = SimpleNamespace(new_to_old=np.arange(tok.vocab_size, dtype=np.int32))
+    engine._grammar_cache = {}
+    fixed = engine.get_grammar(schema)
+    minified = engine.get_grammar(schema, whitespace_flexible=False)
+    flexible = engine.get_grammar(schema, whitespace_flexible=True)
+    values = {"a": "alpha: beta", "b": ": "}
+    spaced_ids = tok.encode(json.dumps(values, separators=(",", ": ")))
+    minified_ids = tok.encode(json.dumps(values, separators=(",", ":")))
+    assert fixed.validate_token_sequence(spaced_ids)
+    assert not fixed.validate_token_sequence(minified_ids)
+    assert minified.validate_token_sequence(minified_ids)
+    assert not minified.validate_token_sequence(spaced_ids)
+    assert flexible.validate_token_sequence(spaced_ids) and flexible.validate_token_sequence(minified_ids)
+    assert not fixed.validate_token_sequence(tok.encode('{"a": 42,"b": "beta"}'))
+    assert not fixed.validate_token_sequence(tok.encode('{"a": "alpha"}'))
+    reversed_schema = {**schema, "properties": dict(reversed(properties.items()))}
+    assert engine.get_grammar(reversed_schema) is not fixed
+    assert engine.get_grammar(schema) is fixed
+
+
 def test_rolling_valid_schema_propagation_and_per_doc_grammars_cpu(tmp_path: Path) -> None:
     """Verify A4 removal: valid_schemas propagated directly without validate_token_sequence + per_doc_grammars."""
     ft = _build_tiny_json_tokenizer(tmp_path)

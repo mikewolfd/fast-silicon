@@ -26,6 +26,7 @@ def _make_engine(args: argparse.Namespace) -> FastGemma4Engine:
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
         default_mode=getattr(args, "mode", "auto"),
+        vocab_out=getattr(args, "vocab_out", None),
         ane_variant=ane_var,
         ane_ring_variant=ane_var,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
@@ -89,7 +90,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             temperature=args.temperature,
             mode=args.mode,
             speculative=spec,
-            whitespace_flexible=(not args.compact_json),
+            whitespace_flexible=args.whitespace_flexible,
             max_whitespace_run=getattr(args, "json_max_whitespace", None),
         )
         if args.json:
@@ -244,7 +245,7 @@ def _load_fixture_dataset(paths) -> tuple[str, str, list[str]]:
             "additionalProperties": False,
         }
     )
-    sys_prompt = "Extract document metadata as one compact minified JSON matching the schema. Output raw JSON only."
+    sys_prompt = "Extract document metadata as one JSON object matching the schema. Output raw JSON only."
     prompts = [
         f"Filename: report_{i:02d}.txt\nText:\nPacific Transmission Consortium technical report PTR-2025-{i:02d} on regional substation inverter stability and grid protection upgrades."
         for i in range(8)
@@ -258,6 +259,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
         default_mode="gpu",
+        vocab_out=args.vocab_out,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
         mlp_dtype=getattr(args, "mlp_dtype", "bfloat16"),
         kv_i8=not getattr(args, "no_kv_i8", False),
@@ -326,6 +328,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         home=args.home,
         model_dir=getattr(args, "model_dir", None),
         default_mode="auto",
+        vocab_out=args.vocab_out,
         ane_variant=args.ane_variant,
         ane_ring_variant=args.ane_variant,
         lm_head_mode=getattr(args, "lm_head_mode", "q4"),
@@ -418,7 +421,15 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_json_layout_args(subparser: argparse.ArgumentParser) -> None:
+    group = subparser.add_mutually_exclusive_group()
+    group.add_argument("--compact-json", dest="whitespace_flexible", action="store_false", help="Generate minified JSON with no separator spaces")
+    group.add_argument("--whitespace-flexible", dest="whitespace_flexible", action="store_true", help="Allow JSON whitespace between tokens")
+    subparser.set_defaults(whitespace_flexible=None)
+
+
 def _add_model_args(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--vocab-out", type=int, help="Limit allowed output tokens, e.g. 150786 for the English-oriented profile (default: checkpoint vocabulary)")
     subparser.add_argument("--model-dir", default=None, help="Override local HuggingFace/fused checkpoint directory")
     subparser.add_argument("--no-kv-i8", action="store_true", help="Disable INT8 rolling KV cache compression")
     subparser.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
@@ -464,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
     gn.add_argument("--speculative", action="store_true")
     gn.add_argument("--no-speculative", action="store_true")
-    gn.add_argument("--compact-json", action="store_true", help="Disallow optional JSON whitespace for maximum jump-forward speed")
+    _add_json_layout_args(gn)
     gn.add_argument(
         "--json-max-whitespace",
         type=int,
@@ -481,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("output")
     ex.add_argument(
         "--system",
-        default="Extract structured metadata as one compact minified JSON matching the schema. Output raw JSON only.",
+        default="Extract structured metadata as one JSON object matching the schema. Output raw JSON only.",
     )
     ex.add_argument("--system-file", default=None)
     ex.add_argument("--schema", default=None)
@@ -493,7 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
     ex.add_argument("--speculative", action="store_true")
     ex.add_argument("--no-speculative", action="store_true")
-    ex.add_argument("--whitespace-flexible", action="store_true")
+    _add_json_layout_args(ex)
     ex.add_argument("--no-warmup", action="store_true")
     ex.set_defaults(func=_cmd_extract)
 
@@ -503,7 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     pq_p.add_argument("output")
     pq_p.add_argument(
         "--system",
-        default="Extract structured metadata as one compact minified JSON matching the schema. Output raw JSON only.",
+        default="Extract structured metadata as one JSON object matching the schema. Output raw JSON only.",
     )
     pq_p.add_argument("--system-file", default=None)
     pq_p.add_argument("--schema", default=None)
@@ -520,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     pq_p.add_argument("--ane-variant", choices=("fp16", "w8"), default="fp16")
     pq_p.add_argument("--speculative", action="store_true")
     pq_p.add_argument("--no-speculative", action="store_true")
-    pq_p.add_argument("--whitespace-flexible", action="store_true")
+    _add_json_layout_args(pq_p)
     pq_p.add_argument("--filter-ocr", action="store_true")
     pq_p.add_argument("--ocr-pages-only", action="store_true")
     pq_p.add_argument("--resume", action="store_true")

@@ -650,10 +650,11 @@ def schema_cache_key(schema: Any) -> str | None:
         return None
     if isinstance(schema, str):
         return schema
-    return json.dumps(schema, sort_keys=True, ensure_ascii=False)
+    return json.dumps(schema, ensure_ascii=False)
 
 
-def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: bool = True) -> dict[str, Any]:
+def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: bool | None = True) -> dict[str, Any]:
+    whitespace = extract_request_param(req, "whitespace_flexible", default_whitespace_flexible)
     kw: dict[str, Any] = {
         "json_schema": extract_json_schema(req),
         "max_tokens": int(extract_request_param(req, "max_tokens", 512)),
@@ -662,7 +663,7 @@ def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: bool = True
         "seed": int(extract_request_param(req, "seed", 42)),
         "mode": extract_request_param(req, "mode"),
         "speculative": extract_request_param(req, "speculative"),
-        "whitespace_flexible": bool(extract_request_param(req, "whitespace_flexible", default_whitespace_flexible)),
+        "whitespace_flexible": None if whitespace is None else bool(whitespace),
         "enable_thinking": bool(extract_request_param(req, "enable_thinking", False)),
     }
     sys_prompt = extract_request_param(req, "system_prompt")
@@ -731,7 +732,7 @@ class ChatMicroBatcher:
         seed: int,
         mode: str | None = None,
         speculative: bool | None = None,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = True,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
         system_prompt: str | None = None,
@@ -749,7 +750,7 @@ class ChatMicroBatcher:
             eff_seed,
             mode,
             speculative,
-            bool(whitespace_flexible),
+            whitespace_flexible,
             bool(use_chat_template),
             bool(enable_thinking),
             system_prompt,
@@ -764,7 +765,7 @@ class ChatMicroBatcher:
             "seed": int(seed),
             "mode": mode,
             "speculative": speculative,
-            "whitespace_flexible": bool(whitespace_flexible),
+            "whitespace_flexible": whitespace_flexible,
             "use_chat_template": bool(use_chat_template),
             "enable_thinking": bool(enable_thinking),
             **clean_extra,
@@ -815,7 +816,7 @@ class ChatMicroBatcher:
         seed: int,
         mode: str | None = None,
         speculative: bool | None = None,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = True,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
         system_prompt: str | None = None,
@@ -853,7 +854,7 @@ class ChatMicroBatcher:
         seed: int,
         mode: str | None = None,
         speculative: bool | None = None,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = True,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
         system_prompt: str | None = None,
@@ -950,7 +951,7 @@ class OpenAIChatAdapter:
         extra_key: str = "fast_chat",
         coalesce_ms: float = 0.0,
         max_batch_size: int = 128,
-        default_whitespace_flexible: bool = True,
+        default_whitespace_flexible: bool | None = True,
         extra_health: Callable[[Any], dict[str, Any]] | None = None,
     ) -> None:
         self.engine = engine

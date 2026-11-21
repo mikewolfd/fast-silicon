@@ -86,7 +86,7 @@ def format_gemma4_chat(
 
 
 def build_kept_vocab(tokenizer_json_path: str | Path, target_size: int = DEFAULT_KEPT_VOCAB_SIZE):
-    """Select an English + JSON + symbol lossless subset of the 262,144 Gemma-4 vocabulary."""
+    """Select an English and JSON output vocabulary with byte fallbacks for other text."""
     with Path(tokenizer_json_path).open("r", encoding="utf-8") as fp:
         tj = json.load(fp)
 
@@ -178,7 +178,7 @@ def build_kept_vocab(tokenizer_json_path: str | Path, target_size: int = DEFAULT
 
 
 class VocabRemapper:
-    """Lossless pruned vocabulary mapping (`kept_old_ids` <-> contiguous `0..V_new-1`)."""
+    """Reversible mapping of retained vocabulary IDs (`kept_old_ids` <-> contiguous `0..V_new-1`)."""
 
     def __init__(
         self,

@@ -46,7 +46,7 @@ from .speculative import (
     run_decode_prompt_lookup,
     run_decode_rolling,
 )
-from .tokenizer import DEFAULT_KEPT_VOCAB_SIZE, FastGemma4Tokenizer
+from .tokenizer import FastGemma4Tokenizer
 
 
 @dataclass
@@ -72,9 +72,9 @@ PromptInput = str | Sequence[dict[str, Any]]
 
 def _normalize_schema_key(
     json_schema: str | dict[str, Any],
-    whitespace_flexible: bool,
+    whitespace_flexible: bool | None,
     max_whitespace_run: int | None = None,
-) -> tuple[str, bool, int]:
+) -> tuple[str, bool | None, int]:
     eff_ws = (
         0
         if not whitespace_flexible
@@ -82,7 +82,7 @@ def _normalize_schema_key(
     )
     if isinstance(json_schema, str):
         return json_schema, whitespace_flexible, eff_ws
-    return json.dumps(json_schema, sort_keys=True, ensure_ascii=False), whitespace_flexible, eff_ws
+    return json.dumps(json_schema, ensure_ascii=False), whitespace_flexible, eff_ws
 
 
 def select_execution_plan(
@@ -235,7 +235,7 @@ class FastGemma4Engine:
         default_mode: str = "auto",
         ane_variant: str = "fp16",
         ane_ring_variant: str = "auto",
-        vocab_out: int | None = DEFAULT_KEPT_VOCAB_SIZE,
+        vocab_out: int | None = None,
         lm_head_mode: str = "q4",
         mlp_dtype: str = "bfloat16",
         use_mpp: bool = True,
@@ -305,7 +305,7 @@ class FastGemma4Engine:
 
         self._gpu_lock = threading.Lock()
         self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
-        self._grammar_cache: dict[tuple[str, bool, int], GrammarHelper] = {}
+        self._grammar_cache: dict[tuple[str, bool | None, int], GrammarHelper] = {}
         self._ane_runner: AnePrefixRunner | None = None
         self._ane_ring_runner: AnePrefixRunner | None = None
         self._ane_ring_checked: bool = False
@@ -445,9 +445,10 @@ class FastGemma4Engine:
         self,
         json_schema: str | dict[str, Any],
         *,
-        whitespace_flexible: bool = False,
+        whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
     ) -> GrammarHelper:
+        """Use fixed colon-space separators by default, False for minified JSON, or True for flexible whitespace."""
         key = _normalize_schema_key(json_schema, whitespace_flexible, max_whitespace_run)
         gh = self._grammar_cache.get(key)
         if gh is None:
@@ -756,7 +757,7 @@ class FastGemma4Engine:
         mode: str | None = None,
         speculative: bool | None = None,
         use_chat_template: bool = True,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
     ) -> GenerationItem:
         res = self.generate_batch(
@@ -857,7 +858,7 @@ class FastGemma4Engine:
         compact: bool = True,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
-        whitespace_flexible: bool = False,
+        whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
         use_ane_ring: bool | str = "auto",

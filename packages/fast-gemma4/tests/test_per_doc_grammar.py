@@ -28,6 +28,74 @@ def _schema(kinds: list[str]) -> str:
     )
 
 
+@pytest.fixture
+def byte_tokenizer(tmp_path: Path) -> FastGemma4Tokenizer:
+    from tokenizers import AddedToken, Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import BPE
+
+    pieces = ["<pad>", "<eos>", "<bos>"] + sorted(pre_tokenizers.ByteLevel.alphabet())
+    raw = Tokenizer(BPE(vocab={piece: index for index, piece in enumerate(pieces)}, merges=[]))
+    raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    raw.decoder = decoders.ByteLevel()
+    raw.add_special_tokens([AddedToken(piece, special=True) for piece in pieces[:3]])
+    path = tmp_path / "tokenizer.json"
+    raw.save(str(path))
+    return FastGemma4Tokenizer(path)
+
+
+def _accepts_document(helper: PerDocGrammarHelper, text: str, doc_idx: int = 0) -> bool:
+    tokens = helper.tok.encode(text, add_special_tokens=False)
+    upfront = helper.upfront_ff_for_doc(doc_idx)
+    if tokens[: len(upfront)] != upfront:
+        return False
+    matcher = helper.new_matcher_for_doc(doc_idx)
+    remaining = tokens[len(upfront) :]
+    return matcher.try_consume_tokens(remaining) == len(remaining) and matcher.is_accepting()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_named_document_inherits_layout_and_whitespace_limit(byte_tokenizer: FastGemma4Tokenizer, sync: bool) -> None:
+    schema = json.dumps({"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]})
+    cache = {}
+
+    def build(flexible: bool | None, limit: int = 0) -> PerDocGrammarHelper:
+        base = GrammarHelper(byte_tokenizer, schema, whitespace_flexible=flexible, max_whitespace_run=limit)
+        return PerDocGrammarHelper(
+            base, [0], doc_schema_keys={0: "x"}, schema_for_key=lambda key: schema,
+            grammar_cache=cache, sync_ff_with_std=sync,
+        )
+
+    compact, fixed, capped, unlimited = build(False), build(None), build(True, 1), build(True)
+    assert cache["x"] is compact.get_grammar_entry("x")
+    assert cache[((",", ": "), "x")] is fixed.get_grammar_entry("x")
+    assert capped.get_grammar_entry("x") is unlimited.get_grammar_entry("x")
+    assert len(cache) == 3
+    for doc in (0, 1):  # named and standard documents in the same batch
+        assert _accepts_document(compact, '{"x":1}', doc)
+        assert not _accepts_document(compact, '{"x": 1}', doc)
+        assert _accepts_document(fixed, '{"x": 1}', doc)
+        assert not _accepts_document(fixed, '{"x":1}', doc)
+        assert _accepts_document(capped, '{\n"x" : 1}', doc)
+        assert not _accepts_document(capped, '{  "x":1}', doc)
+        assert _accepts_document(unlimited, '{  "x":1}', doc)
+
+
+def test_synchronized_document_uses_its_own_field_order(byte_tokenizer: FastGemma4Tokenizer) -> None:
+    def schema(keys: str) -> str:
+        return json.dumps({
+            "type": "object",
+            "properties": {k: {"type": "integer"} for k in keys},
+            "required": list(keys),
+            "additionalProperties": False,
+        })
+
+    base = GrammarHelper(byte_tokenizer, schema("ab"))
+    helper = PerDocGrammarHelper(base, [0, 1], doc_schema_keys={0: "ba"}, schema_for_key=schema, sync_ff_with_std=True)
+    assert helper.upfront_ff_for_doc(0) != helper.upfront_ff_for_doc(1)
+    assert _accepts_document(helper, '{"b": 1,"a": 2}', 0)
+    assert _accepts_document(helper, '{"a": 2,"b": 1}', 1)
+
+
 def test_stdlib_only_modules_import_without_third_party_packages() -> None:
     code = (
         "import sys\n"
@@ -90,5 +158,11 @@ def test_helper_hands_each_document_its_own_matcher_in_admission_order() -> None
         grammar_cache=cache,
     )
     assert compiled == ["beta", "alpha|gamma"]
+    # A minified grammar and a fixed-space grammar for the same key need distinct compiled entries.
+    fixed = GrammarHelper(tok, _schema(["alpha", "beta", "gamma"]), rem.kept_old_ids)
+    other_layout = PerDocGrammarHelper(fixed, [0], doc_schema_keys={0: "beta"}, schema_for_key=schema_for_key,
+                                       grammar_cache=cache)
+    assert other_layout.get_grammar_entry("beta")[0] != again.get_grammar_entry("beta")[0]
+    assert compiled == ["beta", "alpha|gamma", "beta"]
     assert again.upfront_ff_for_doc(1) == list(again.get_grammar_entry("alpha|gamma")[1])
     assert again.validate_token_sequence(gh_std.upfront_ff) in (True, False)

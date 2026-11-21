@@ -360,7 +360,7 @@ class FastGemma4Model:
         paths: Gemma4Paths | None = None,
         model_dir: str | Path | None = None,
         mlp_dtype: str = "bfloat16",
-        vocab_out: int | None = DEFAULT_KEPT_VOCAB_SIZE,
+        vocab_out: int | None = None,
         use_mpp: bool = True,
         lm_head_mode: str = "q4",
         local_files_only: bool = True,
@@ -528,7 +528,7 @@ class FastGemma4Model:
                 if int(vocab_out) == DEFAULT_KEPT_VOCAB_SIZE:
                     warnings.warn(
                         f"Checkpoint {self.model_dir} has materialized pruned lm_head ({lm_rows} rows); "
-                        f"using checkpoint vocab size {lm_rows} instead of default vocab_out={vocab_out}.",
+                        f"using checkpoint vocab size {lm_rows} instead of legacy preset vocab_out={vocab_out}.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -551,7 +551,7 @@ class FastGemma4Model:
                     elif int(vocab_out) == DEFAULT_KEPT_VOCAB_SIZE:
                         warnings.warn(
                             f"Checkpoint {self.model_dir} provides vocab_remap.npz with {ckpt_v} tokens "
-                            f"(differs from default vocab_out={vocab_out}); loading checkpoint remap ({ckpt_v}).",
+                            f"(differs from legacy preset vocab_out={vocab_out}); loading checkpoint remap ({ckpt_v}).",
                             UserWarning,
                             stacklevel=2,
                         )

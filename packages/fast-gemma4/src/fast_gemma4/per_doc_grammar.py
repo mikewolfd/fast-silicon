@@ -12,6 +12,9 @@ from __future__ import annotations
 from typing import Any, Callable, Sequence
 
 
+GrammarCacheKey = str | tuple[tuple[str, str], str] | tuple[tuple[str, str], bool, str]
+
+
 class SyncMatcher:
     """Keeps a document's own (narrower) `LLMatcher` in step with a shadow matcher of the batch's standard schema.
 
@@ -99,7 +102,7 @@ class PerDocGrammarHelper:
         *,
         doc_schema_keys: dict[int, str] | None = None,
         schema_for_key: Callable[[str], str],
-        grammar_cache: dict[str, tuple[Any, list[int]]] | None = None,
+        grammar_cache: dict[GrammarCacheKey, tuple[Any, list[int]]] | None = None,
         sync_ff_with_std: bool = False,
     ):
         import llguidance
@@ -111,13 +114,20 @@ class PerDocGrammarHelper:
         self.upfront_ff = gh_std.upfront_ff
         self.new_to_old = gh_std.new_to_old
         self._gh_std = gh_std
-        self._sync_ff_with_std = sync_ff_with_std
         self._schema_for_key = schema_for_key
+        self._separators = getattr(gh_std, "separators", (",", ":"))
+        self._whitespace_flexible = bool(getattr(gh_std, "whitespace_flexible", False))
+        self._max_whitespace_run = getattr(gh_std, "max_whitespace_run", 0)
+        self._ws_profile = None
+        if self._max_whitespace_run:
+            from .grammar import get_whitespace_profile
+
+            self._ws_profile = get_whitespace_profile(self.ltok)
         self._compiler = llguidance.JsonCompiler(
-            separators=(",", ":"),
-            whitespace_flexible=False,
+            separators=self._separators,
+            whitespace_flexible=self._whitespace_flexible,
         )
-        self._grammar_cache: dict[str, tuple[Any, list[int]]] = (
+        self._grammar_cache: dict[GrammarCacheKey, tuple[Any, list[int]]] = (
             grammar_cache if grammar_cache is not None else {}
         )
         self._doc_order = list(doc_order)
@@ -125,23 +135,35 @@ class PerDocGrammarHelper:
         self._cursor = 0
         self.dispatched_doc_indices: list[int] = []
 
+        # Prompt prefill and matcher initialization must agree even when the narrower schema reorders fields.
+        self._use_standard_upfront: set[str] = set()
         for key in set(self._doc_schema_keys.values()):
-            self.get_grammar_entry(key)
+            gram, up_ff = self.get_grammar_entry(key)
+            if sync_ff_with_std and (
+                up_ff[: len(self.upfront_ff)] == self.upfront_ff
+                or llguidance.LLMatcher(self.ltok, gram).validate_tokens(self.upfront_ff) == len(self.upfront_ff)
+            ):
+                self._use_standard_upfront.add(key)
 
     def get_grammar_entry(self, key: str) -> tuple[Any, list[int]]:
         """`(compiled grammar, its upfront fast-forward tokens)` for a schema key, compiled once per cache."""
-        entry = self._grammar_cache.get(key)
+        cache_key: GrammarCacheKey
+        if self._whitespace_flexible:
+            cache_key = (self._separators, True, key)
+        else:
+            cache_key = key if self._separators == (",", ":") else (self._separators, key)
+        entry = self._grammar_cache.get(cache_key)
         if entry is None:
             gram = self._compiler.compile(self._schema_for_key(key))
             probe_m = self._llguidance.LLMatcher(self.ltok, gram)
             up_ff = list(probe_m.compute_ff_tokens())
             entry = (gram, up_ff)
-            self._grammar_cache[key] = entry
+            self._grammar_cache[cache_key] = entry
         return entry
 
     def upfront_ff_for_doc(self, doc_idx: int) -> list[int]:
         key = self._doc_schema_keys.get(doc_idx)
-        if key is None or self._sync_ff_with_std:
+        if key is None or key in self._use_standard_upfront:
             return list(self._gh_std.upfront_ff)
         return list(self.get_grammar_entry(key)[1])
 
@@ -153,13 +175,14 @@ class PerDocGrammarHelper:
         if key is not None:
             gram, up_ff = self.get_grammar_entry(key)
             m = self._llguidance.LLMatcher(self.ltok, gram)
-            if self._sync_ff_with_std:
-                std_up = self._gh_std.upfront_ff
-                if std_up:
-                    consumed = m.try_consume_tokens(std_up)
-                    if consumed == len(std_up):
-                        return SyncMatcher(m, self._gh_std.new_matcher())
-                    m = self._llguidance.LLMatcher(self.ltok, gram)
+            if self._ws_profile is not None:
+                from .grammar import WhitespaceGuard, WhitespaceGuardedMatcher
+
+                m = WhitespaceGuardedMatcher(m, WhitespaceGuard(self._max_whitespace_run, self._ws_profile))
+            if key in self._use_standard_upfront:
+                if self.upfront_ff:
+                    m.consume_tokens(self.upfront_ff)
+                return SyncMatcher(m, self._gh_std.new_matcher())
             if up_ff:
                 m.consume_tokens(up_ff)
             return m

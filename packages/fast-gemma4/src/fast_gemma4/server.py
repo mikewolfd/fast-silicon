@@ -32,7 +32,7 @@ class FastGemma4OpenAIAdapter(OpenAIChatAdapter):
             extra_key="fast_gemma4",
             coalesce_ms=coalesce_ms,
             max_batch_size=max_batch_size,
-            default_whitespace_flexible=True,
+            default_whitespace_flexible=None,
         )
 
 

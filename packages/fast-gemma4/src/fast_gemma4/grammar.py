@@ -304,7 +304,7 @@ class GrammarHelper(_BaseGrammarHelper):
         schema: str | dict[str, Any],
         new_to_old: np.ndarray | None = None,
         *,
-        whitespace_flexible: bool = False,
+        whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         eos_token_id: int | None = None,
     ) -> None:
@@ -312,7 +312,9 @@ class GrammarHelper(_BaseGrammarHelper):
             tokenizer,
             schema,
             new_to_old,
-            whitespace_flexible=whitespace_flexible,
+            # A fixed space lets Gemma finish the key delimiter before predicting a string value.
+            separators=(",", ": ") if whitespace_flexible is None else (",", ":"),
+            whitespace_flexible=bool(whitespace_flexible),
             eos_token_id=eos_token_id,
         )
         self.whitespace_flexible = bool(whitespace_flexible)

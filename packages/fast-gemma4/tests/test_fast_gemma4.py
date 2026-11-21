@@ -403,7 +403,7 @@ def test_tuned_defaults_and_routing_cpu(paths: Gemma4Paths) -> None:
     assert should_use_speculative(True, False, 32, 0.0) is True
     assert should_use_speculative(True, False, 4, 0.7) is False
 
-    # 3. CPU llguidance whitespace flexibility for ad-hoc prompts vs minified batch extraction
+    # 3. Use the real tokenizer at a key/value boundary observed on the extraction benchmark.
     tok = FastGemma4Tokenizer(paths.resolve_tokenizer_json())
     rem = VocabRemapper.load_or_build(paths.resolve_tokenizer_json(), paths.vocab_remap_npz)
     city_schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": False}
@@ -412,16 +412,31 @@ def test_tuned_defaults_and_routing_cpu(paths: Gemma4Paths) -> None:
     assert m_flex.validate_tokens(tok.encode('{"city": "Tokyo"}', add_special_tokens=False))
     assert m_flex.validate_tokens(tok.encode('{"city":"Tokyo"}', add_special_tokens=False))
 
+    schema = {"type": "object", "properties": {"student_name": {"type": "string"}},
+              "required": ["student_name"], "additionalProperties": False}
+    fixed = GrammarHelper(tok, schema)
+    compact = GrammarHelper(tok, schema, whitespace_flexible=False)
+    assert tok.decode(fixed.upfront_ff, skip_special_tokens=False) == '{"student_name":'
+    opening = tok.encode(' "', add_special_tokens=False)
+    assert len(opening) == 1
+    matcher = fixed.new_matcher()
+    assert matcher.try_consume_tokens(opening) == 1
+    assert matcher.validate_tokens(tok.encode('Mereana Barlow"}', add_special_tokens=False))
+    assert compact.new_matcher().try_consume_tokens(opening) == 0
+
     # 4. CLI defaults
     p = build_parser()
     a_gen = p.parse_args(["generate", "hi"])
-    assert a_gen.max_tokens == 512 and a_gen.mode == "auto" and a_gen.ane_variant == "fp16" and a_gen.compact_json is False
+    assert a_gen.max_tokens == 512 and a_gen.mode == "auto" and a_gen.ane_variant == "fp16" and a_gen.whitespace_flexible is None
     a_ext = p.parse_args(["extract", "in.jsonl", "out.jsonl"])
-    assert a_ext.batch_size == 128 and a_ext.max_tokens == 512 and a_ext.whitespace_flexible is False
-    assert "minified JSON" in a_ext.system
+    assert a_ext.batch_size == 128 and a_ext.max_tokens == 512 and a_ext.whitespace_flexible is None
+    assert "JSON object" in a_ext.system
     a_pq = p.parse_args(["parquet", "in.parquet", "out/"])
-    assert a_pq.batch_rows == 128 and a_pq.max_tokens == 512 and a_pq.whitespace_flexible is False
-    assert "minified JSON" in a_pq.system
+    assert a_pq.batch_rows == 128 and a_pq.max_tokens == 512 and a_pq.whitespace_flexible is None
+    assert "JSON object" in a_pq.system
+    assert p.parse_args(["generate", "hi", "--compact-json"]).whitespace_flexible is False
+    assert p.parse_args(["extract", "a", "b", "--whitespace-flexible"]).whitespace_flexible is True
+    assert p.parse_args(["generate", "hi", "--vocab-out", "150786"]).vocab_out == 150786
     a_srv = p.parse_args(["serve", "--coalesce-ms", "2.5", "--max-batch", "64", "--model-name", "gemma4-local"])
     assert a_srv.coalesce_ms == 2.5 and a_srv.max_batch == 64 and a_srv.model_name == "gemma4-local"
 
@@ -531,6 +546,7 @@ def test_http_server_coalescing_sse_and_unified_cpu() -> None:
             assert parsed == {"q": f"doc-{i}", "thinking": True, "sys": "SYS", "schema": True}
         assert len(eng.calls) < 6, f"Expected concurrent requests to coalesce (<6 batches), got {eng.calls}"
         assert any(batch_len >= 2 for batch_len, _ in eng.calls)
+        assert all(kwargs["whitespace_flexible"] is False for _, kwargs in eng.calls)
 
         # SSE streaming check
         sse_req = urllib.request.Request(
@@ -551,6 +567,8 @@ def test_http_server_coalescing_sse_and_unified_cpu() -> None:
             assert json.loads(chunks[1]["choices"][0]["delta"]["content"])["q"] == "stream-me"
             assert chunks[2]["choices"][0]["finish_reason"] == "stop"
             assert chunks[2]["usage"]["total_tokens"] == 16
+
+        assert eng.calls[-1][1]["whitespace_flexible"] is None
 
     # Verify FastGemma4OpenAIAdapter mounts cleanly into UnifiedOpenAIServer
     class _MockEmbTok:

@@ -143,6 +143,7 @@ class GrammarHelper:
         *,
         whitespace_flexible: bool = False,
         eos_token_id: int | None = None,
+        separators: tuple[str, str] = (",", ":"),
     ) -> None:
         llguidance = _import_llguidance()
         self.tokenizer = tokenizer
@@ -154,8 +155,9 @@ class GrammarHelper:
             if eos_token_id is not None
             else getattr(tokenizer, "eos_token_id", getattr(self.ltok, "eos_token", 0))
         )
+        self.separators = separators
         self.gram = llguidance.JsonCompiler(
-            separators=(",", ":"),
+            separators=separators,
             whitespace_flexible=whitespace_flexible,
         ).compile(self.schema_str)
         m = llguidance.LLMatcher(self.ltok, self.gram)

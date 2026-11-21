@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +10,16 @@ from fast_shared.pipeline_llm import (
     DEFAULT_TEXT_COLUMNS,
     ParquetExtractSummary,
     extract_jsonl as _shared_extract_jsonl,
-    extract_parquet,
+    extract_parquet as _shared_extract_parquet,
     resolve_input_files,
     resolve_llm_text_column as _resolve_gemma4_text_column,
     resolve_text_column,
     slice_first_pages_utf8,
     slice_ocr_pages_utf8,
 )
+
+
+extract_parquet = partial(_shared_extract_parquet, whitespace_flexible=None)
 
 
 def extract_jsonl(
@@ -31,7 +35,7 @@ def extract_jsonl(
     batch_size: int = 128,
     max_tokens: int = 512,
     temperature: float = 0.0,
-    whitespace_flexible: bool = False,
+    whitespace_flexible: bool | None = None,
 ) -> dict[str, Any]:
     """Batch-extract structured JSON from a JSON or JSONL file into JSONL."""
     return _shared_extract_jsonl(
