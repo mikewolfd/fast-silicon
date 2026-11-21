@@ -1,0 +1,140 @@
+{
+  "checkpoint": "convaiinnovations/laya-typed-decisions",
+  "revision": "3903ff997712bd73ccb2dc879262dac8f0d443bb",
+  "reference_source": "https://huggingface.co/convaiinnovations/laya/blob/e333cb7c823cd1787276228260f56d02fbf5180b/rl_common.py",
+  "reference_source_sha256": "8d83611d480c971d640a7b7d3aa2f2219c5e8455e9cc2329fd073681bd8be23e",
+  "reference_runtime": "PyTorch 2.15.0 float32 CPU, transformers 5.23.0, independent build_sequence at max_len=512 and head_max_len=256, strict checkpoint load and per-option-count temperature",
+  "max_abs_probability_error": 0.03,
+  "states": {
+    "short_invoice": "Invoice 8812 shows a zero remaining balance. The ACH payment cleared on June 3.",
+    "long_cause": "Our billing API stopped accepting requests when its TLS certificate expired. Storage and power were healthy.  The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating. The dispatcher checked the storage monitor, power feed, and certificate history against the incident log. The disks had spare capacity and both power feeds were operating.",
+    "short_score": "Our billing API stopped accepting requests when its TLS certificate expired. Storage and power were healthy.",
+    "long_invoice": "Invoice 8812 shows a zero remaining balance. The ACH payment cleared on June 3.  The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference. The audit recorded the clearing date, payment method and supplier reference."
+  },
+  "cases": [
+    {
+      "case": "short_invoice",
+      "state": "short_invoice",
+      "question": {
+        "id": "paid",
+        "type": "noul",
+        "instructions": "Has the invoice already been paid?",
+        "criteria": {
+          "false": "An unpaid balance remains.",
+          "true": "The payment has cleared."
+        }
+      },
+      "num_tokens": 50,
+      "tokens_sha256": "842ec6a81a256e122fd9c8f0ff3b552e2f1dba5a108b5c32091cdb49cf0a3a0d",
+      "markers": [
+        13,
+        21
+      ],
+      "reference_probabilities": [
+        0.327323317527771,
+        0.672676682472229
+      ]
+    },
+    {
+      "case": "long_cause",
+      "state": "long_cause",
+      "question": {
+        "id": "cause",
+        "type": "choice",
+        "instructions": "Which issue caused the outage?",
+        "criteria": {
+          "certificate": "An expired TLS certificate.",
+          "disk": "A full storage volume.",
+          "power": "An interruption to the electricity supply."
+        }
+      },
+      "num_tokens": 512,
+      "tokens_sha256": "7510fddb7f616b59845bf765ca8b87a1b6028353e69a81be46ad012da7d681e9",
+      "markers": [
+        12,
+        20,
+        28
+      ],
+      "reference_probabilities": [
+        0.5782430768013,
+        0.31745636463165283,
+        0.10430051386356354
+      ]
+    },
+    {
+      "case": "short_score",
+      "state": "short_score",
+      "question": {
+        "id": "risk",
+        "type": "score",
+        "instructions": "How urgent is the incident?",
+        "criteria": [
+          "No disruption.",
+          "Resolved after a brief interruption.",
+          "Active outage impacting all customers."
+        ]
+      },
+      "num_tokens": 60,
+      "tokens_sha256": "a8ccabb34d50febc0fecd53a1726d23aff7a231328842d7674915612487a342a",
+      "markers": [
+        11,
+        18,
+        29
+      ],
+      "reference_probabilities": [
+        0.2727685868740082,
+        0.5706076622009277,
+        0.15662379562854767
+      ]
+    },
+    {
+      "case": "long_reordered",
+      "state": "long_cause",
+      "question": {
+        "id": "cause",
+        "type": "choice",
+        "instructions": "Which issue caused the outage?",
+        "criteria": {
+          "power": "An interruption to the electricity supply.",
+          "disk": "A full storage volume.",
+          "certificate": "An expired TLS certificate."
+        }
+      },
+      "num_tokens": 512,
+      "tokens_sha256": "56552026d5b4bdce2ad1cee7464ef466d4ac4809508dc5b8a19034a3020fb403",
+      "markers": [
+        12,
+        22,
+        30
+      ],
+      "reference_probabilities": [
+        0.17326723039150238,
+        0.4247419238090515,
+        0.4019908010959625
+      ]
+    },
+    {
+      "case": "long_invoice",
+      "state": "long_invoice",
+      "question": {
+        "id": "paid",
+        "type": "noul",
+        "instructions": "Has the invoice already been paid?",
+        "criteria": {
+          "false": "An unpaid balance remains.",
+          "true": "The payment has cleared."
+        }
+      },
+      "num_tokens": 428,
+      "tokens_sha256": "ffc54ec7923cc48a79621f13fd546eb629430eb3d4e0264ea200ff7d273f6014",
+      "markers": [
+        13,
+        21
+      ],
+      "reference_probabilities": [
+        0.37943997979164124,
+        0.6205599904060364
+      ]
+    }
+  ]
+}

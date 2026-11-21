@@ -85,6 +85,7 @@ from .hub_loader import (
     stratified_sha256_sample,
 )
 from .metrics import (
+    DEFAULT_LOSSLESS_TOLERANCE,
     GateEvaluation,
     OutcomeSummary,
     compute_corpus_outcome_metrics,
@@ -94,6 +95,7 @@ from .metrics import (
     compute_unpaired_se,
     evaluate_memory_gate,
     evaluate_promotion_gates,
+    retrieval_coverage_errors,
 )
 from .retrieval import (
     CharSpanChunk,
@@ -122,6 +124,7 @@ from .structured import (
 )
 
 __all__ = [
+    "DEFAULT_LOSSLESS_TOLERANCE",
     "ALLOWED_LEGALBENCH_SUBSETS",
     "ALLOWED_LONGEMBED_SUBSETS",
     "ALLOWED_REWARDBENCH2_SUBSETS",
@@ -176,6 +179,7 @@ __all__ = [
     "evaluate_mrl_dtype_grid",
     "evaluate_multiclass_choice",
     "evaluate_promotion_gates",
+    "retrieval_coverage_errors",
     "evaluate_ragtruth_noul",
     "evaluate_retrieval_rankings",
     "evaluate_reward_bench_2",

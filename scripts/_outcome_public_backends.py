@@ -957,46 +957,23 @@ asyncio.run(main())
         ctx_max_len = 4096 if tier == "tier1" else 16384
 
         def _enc_ctx_pplx(doc_groups: list[list[str]]) -> list[np.ndarray]:
-            safe_budget = max(512, ctx_max_len - 64)
-            flat_windows: list[list[str]] = []
-            win_meta: list[tuple[int, bool]] = []
-            for d_idx, chunks in enumerate(doc_groups):
-                if not chunks:
-                    continue
-                lens = [len(eng.tokenizer._tokenizer.encode(c, add_special_tokens=False)) + 2 for c in chunks]
-                if sum(lens) <= safe_budget or len(chunks) == 1:
-                    flat_windows.append(list(chunks))
-                    win_meta.append((d_idx, False))
-                else:
-                    anc = chunks[0][:2048]
-                    anc_l = len(eng.tokenizer._tokenizer.encode(anc, add_special_tokens=False)) + 2
-                    cur = [chunks[0]]
-                    cur_l = lens[0]
-                    has_anc = False
-                    for c_txt, c_l in zip(chunks[1:], lens[1:]):
-                        if cur and cur_l + c_l > safe_budget:
-                            flat_windows.append(cur)
-                            win_meta.append((d_idx, has_anc))
-                            cur = [anc, c_txt]
-                            cur_l = anc_l + c_l
-                            has_anc = True
-                        else:
-                            cur.append(c_txt)
-                            cur_l += c_l
-                    if cur:
-                        flat_windows.append(cur)
-                        win_meta.append((d_idx, has_anc))
+            from fast_shared.outcome_eval.retrieval import collect_pplx_window_vectors, plan_pplx_windows
 
-            per_doc: list[list[np.ndarray]] = [[] for _ in doc_groups]
-            for (d_idx, has_anc), w_chunks in zip(win_meta, flat_windows):
-                v = eng.project_documents([w_chunks])[0, : len(w_chunks), :].astype(mx.float32)
+            def count_tokens(text: str) -> int:
+                return len(eng.tokenizer._tokenizer.encode(text, add_special_tokens=False))
+
+            windows = plan_pplx_windows(doc_groups, ctx_max_len, count_tokens)
+
+            def project_window(chunks: list[str]) -> np.ndarray:
+                v = eng.project_documents([chunks])[0, :len(chunks), :].astype(mx.float32)
                 v = v / mx.maximum(mx.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
                 mx.eval(v)
-                arr = np.asarray(v)
-                per_doc[d_idx].append(arr[1:] if has_anc else arr)
+                return np.asarray(v)
+
+            result = collect_pplx_window_vectors(windows, (project_window(w.chunks) for w in windows), len(doc_groups))
             if hasattr(mx, "synchronize"):
                 mx.synchronize()
-            return [np.vstack(p) if p else np.zeros((0, 1024), dtype=np.float32) for p in per_doc]
+            return result
 
         return Cat1Adapter(
             harness_label=lbl,
@@ -1140,6 +1117,22 @@ main()
     raise ValueError(f"Unsupported public Cat 1 package: {pkg_name}")
 
 
+_STOCK_DECISION_REPOS = {
+    "public-laya": "convaiinnovations/laya-typed-decisions",
+    "public-kev-0.8b": "AbstractFramework/kev-0.8b-mlx-8bit",
+}
+
+
+def stock_decision_model_files(backend_name: str) -> list[Path]:
+    """Return the actual cached files the OS may report for this model's mappings."""
+    repo = _STOCK_DECISION_REPOS.get(backend_name)
+    snapshot = resolve_hf_snapshot(repo) if repo else None
+    if snapshot is None:
+        return []
+    # Hugging Face snapshots can contain symlinks into a sibling blobs directory.
+    return [path.resolve() for path in snapshot.rglob("*") if path.is_file()]
+
+
 class PublicLayaMlxBackend:
     """Stock `mlx-embeddings` (`modernbert` 8-bit g64) Laya-Typed backend matching `LayaAneBackend` API."""
 
@@ -1150,7 +1143,7 @@ class PublicLayaMlxBackend:
         from tokenizers import Tokenizer
         from fast_decision_models.laya_ane import LayaAneBackend
 
-        snap = resolve_hf_snapshot("convaiinnovations/laya-typed-decisions")
+        snap = resolve_hf_snapshot(_STOCK_DECISION_REPOS["public-laya"])
         if snap is None:
             raise FileNotFoundError("Missing cached HF snapshot for convaiinnovations/laya-typed-decisions")
         enc_cfg = json.loads((snap / "encoder" / "config.json").read_text(encoding="utf-8"))
@@ -1159,12 +1152,11 @@ class PublicLayaMlxBackend:
 
         self._mx = mx
         self._nn = nn
-        self.encoder = modernbert.Model(modernbert.ModelArgs.from_dict(enc_cfg))
+        # The checkpoint stores the inner ModernBERT, without a masked-language-model head.
+        self.encoder = modernbert.ModernBertModel(modernbert.ModelArgs.from_dict(enc_cfg))
         enc_w = {k[len("encoder.") :]: v.astype(mx.bfloat16) for k, v in raw_w.items() if k.startswith("encoder.")}
-        if hasattr(self.encoder, "sanitize"):
-            enc_w = self.encoder.sanitize(enc_w)
-        self.encoder.load_weights(list(enc_w.items()), strict=False)
-        self.encoder.set_dtype(mx.bfloat16)
+        self.encoder.load_weights(list(enc_w.items()), strict=True)
+        self.encoder.eval()
         nn.quantize(self.encoder, group_size=64, bits=8)
 
         self.H = int(enc_cfg["hidden_size"])
@@ -1217,6 +1209,8 @@ class PublicLayaMlxBackend:
         tok_helper.mask_tok = "[MASK]"
         self._tok_helper = tok_helper
         self._qtype_map = {"choice": 0, "score": 1, "noul": 2}
+        # The variable-length suite issues many allocation shapes on the 24 GB host.
+        self._previous_cache_limit = mx.set_cache_limit(512 << 20)
 
     def encode_item(self, state: Any, qdef: Mapping[str, Any], *, on_truncate: str = "ignore") -> dict[str, Any]:
         return self._tok_helper.encode_item(state, qdef, on_truncate=on_truncate)
@@ -1228,8 +1222,8 @@ class PublicLayaMlxBackend:
         for i in range(0, len(encs), bsz):
             batch = encs[i : i + bsz]
             B = len(batch)
-            qt_idx = self._qtype_map[qtype_override] if qtype_override else int(batch[0].get("qtype", 0))
-            tv = self.type_emb_w[qt_idx].reshape(1, 1, self.H)
+            qtypes = [self._qtype_map[qtype_override] if qtype_override else int(e["qtype"]) for e in batch]
+            tv = self.type_emb_w[mx.array(qtypes)][:, None, :]
             max_l = max(len(e["ids"]) for e in batch)
             ids_np = np.full((B, max_l), self._tok_helper.pad_id, dtype=np.int32)
             mask_np = np.zeros((B, max_l), dtype=np.int32)
@@ -1238,8 +1232,9 @@ class PublicLayaMlxBackend:
                 ids_np[r_i, :L] = e["ids"]
                 mask_np[r_i, :L] = 1
             ids_mx = mx.array(ids_np)
-            mask_mx = mx.array(mask_np)
-            h = self.encoder(ids_mx, attention_mask=mask_mx).last_hidden_state.astype(mx.bfloat16) + tv
+            # Stock ModernBERT casts its additive padding and sliding-window masks to this dtype.
+            mask_mx = mx.array(mask_np, dtype=mx.bfloat16)
+            h = self.encoder(ids_mx, attention_mask=mask_mx)["last_hidden_state"] + tv
             mask_bf16 = mx.where(
                 mask_mx[:, None, None, :] == 1,
                 mx.array(0.0, dtype=mx.bfloat16),
@@ -1263,8 +1258,7 @@ class PublicLayaMlxBackend:
             pos_np = np.asarray(pos_l)
             for r_i, e in enumerate(batch):
                 m_pos = e["markers"]
-                e_qi = self._qtype_map[qtype_override] if qtype_override else int(e.get("qtype", qt_idx))
-                temp = self._tok_helper._resolve_temperature(e_qi, len(m_pos))
+                temp = self._tok_helper._resolve_temperature(qtypes[r_i], len(m_pos))
                 raw_l = np.array([pos_np[r_i, p] for p in m_pos], dtype=np.float64) / max(temp, 0.05)
                 raw_l -= np.max(raw_l)
                 ex = np.exp(raw_l)
@@ -1281,7 +1275,9 @@ class PublicLayaMlxBackend:
         return self._score_generic(encs, qtype_override=None)
 
     def close(self) -> None:
-        pass
+        if self._previous_cache_limit is not None:
+            self._mx.set_cache_limit(self._previous_cache_limit)
+            self._previous_cache_limit = None
 
 
 class CoreAiLayaBackend:
@@ -1414,18 +1410,37 @@ asyncio.run(main())
         return self.peak_gb
 
 
+def load_kev_benchmark_tokenizer(kev_dir: Path | None, delimiters: Sequence[str]):
+    from tokenizers import Tokenizer
+
+    # The 8-bit repack changed Unicode pre-tokenization. Use the original Kev
+    # adapter tokenizer for both scorers. Only tokenizer.json is required.
+    source = kev_dir
+    if source is None or not (source / "tokenizer.json").is_file():
+        source = resolve_hf_snapshot("jaredpalmer/kev-0.8b")
+    if source is None or not (source / "tokenizer.json").is_file():
+        raise FileNotFoundError("Missing original jaredpalmer/kev-0.8b tokenizer.json for matched scoring")
+    tok = Tokenizer.from_file(str(source / "tokenizer.json"))
+    tok.no_truncation()
+    tok.no_padding()
+    ids = [tok.token_to_id(t) for t in delimiters]
+    if len(ids) != 5 or None in ids:
+        raise ValueError("Kev requires all five decision delimiters in its tokenizer")
+    return tok, ids
+
+
 class PublicKev08bMlxBackend:
     """Stock `mlx-lm` (`AbstractFramework/kev-0.8b-mlx-8bit`) backend matching `Kev08bMlxBackend` API."""
 
-    def __init__(self, kev_dir: Path, *, batch_docs: int = 8) -> None:
+    def __init__(self, kev_dir: Path | None = None, *, batch_docs: int = 8) -> None:
         import mlx.core as mx
         import mlx_lm
-        from fast_decision_models.kev_mlx import Kev08bMlxBackend
 
-        snap_k8 = resolve_hf_snapshot("AbstractFramework/kev-0.8b-mlx-8bit")
+        snap_k8 = resolve_hf_snapshot(_STOCK_DECISION_REPOS["public-kev-0.8b"])
         if snap_k8 is None:
             raise FileNotFoundError("Missing cached HF snapshot for AbstractFramework/kev-0.8b-mlx-8bit")
         dec_cfg = json.loads((snap_k8 / "decision.json").read_text(encoding="utf-8"))
+        self._tok, self._special_ids = load_kev_benchmark_tokenizer(kev_dir, dec_cfg["delimiters"])
         hw = mx.load(str(snap_k8 / "head.safetensors"))
         self._mx = mx
         self.q_w = hw["q.weight"].astype(mx.float32)
@@ -1439,10 +1454,11 @@ class PublicKev08bMlxBackend:
         mdl, _ = mlx_lm.load(str(snap_k8))
         self.backbone = mdl.language_model.model if hasattr(mdl, "language_model") else mdl.model
         mx.eval(mdl.parameters(), self.q_w, self.q_b, self.k_w, self.k_b)
-        self._fmt = Kev08bMlxBackend(kev_dir, quant_mode="w8", batch_docs=1)
+        # Match the allocator budget used by the project scorer in both benchmark arms.
+        self._previous_cache_limit = mx.set_cache_limit(512 << 20)
 
     def encode_questions(self, state: Any, questions: Sequence[Mapping[str, Any]]) -> tuple[list[int], list[dict[str, Any]]]:
-        return self._fmt.encode_questions(state, questions)
+        return encode_kev_questions_pure(self._tok, self._special_ids, state, questions)
 
     def score_multi_states(
         self,
@@ -1456,7 +1472,7 @@ class PublicKev08bMlxBackend:
         out_by_doc: list[list[tuple[list[float], list[float]]]] = [[] for _ in pairs]
         by_len: dict[int, list[tuple[int, int, list[int], int, list[int]]]] = defaultdict(list)
         for d_i, (st, qlist) in enumerate(pairs):
-            s_ids, q_rows = self._fmt.encode_questions(st, qlist)
+            s_ids, q_rows = self.encode_questions(st, qlist)
             out_by_doc[d_i] = [([], []) for _ in q_rows]
             q_off = len(s_ids)
             for q_i, qr in enumerate(q_rows):
@@ -1465,7 +1481,6 @@ class PublicKev08bMlxBackend:
                 opt_pos = [q_off + int(p) for p in qr["opts"]]
                 by_len[len(full_ids)].append((d_i, q_i, full_ids, dec_pos, opt_pos))
 
-        scale = math.sqrt(int(self.q_w.shape[0])) * self.temp_s
         for _, grp in sorted(by_len.items()):
             for i in range(0, len(grp), bsz):
                 chunk = grp[i : i + bsz]
@@ -1498,7 +1513,9 @@ class PublicKev08bMlxBackend:
         ]
 
     def close(self) -> None:
-        self._fmt.close()
+        if self._previous_cache_limit is not None:
+            self._mx.set_cache_limit(self._previous_cache_limit)
+            self._previous_cache_limit = None
 
 
 class CoreMlLayaBackend:

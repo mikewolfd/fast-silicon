@@ -5,8 +5,8 @@ Consolidates all advanced engine capability benchmarks into one isolated-subproc
 serialized under `/tmp/m4_gpu_validation.lock`, pairing every `fast-*` capability against
 its fastest verified stock `MLX` / `coremltools` baseline:
 
-  - `qlora-packing`   : Gemma-4 E2B QLoRA (`8-bit g64`) + `pack=2048 tile64` + `shared-sys-kv`
-                        vs stock `mlx-lm` unpacked `BF16` LoRA (step-0 gradient parity + ABBA)
+  - `qlora-packing`   : Packed 8-bit and unpacked BF16 training on the same 12 examples,
+                        plus a separate eight-example, four-copy system prompt workload
   - `encoder-finetune`: ModernBERT-421M (`28L, H=1024, freeze<18`) `BF16+compile` + `Packed 512`
                         + `Cached L0..17` vs stock unpacked MLX `nn.Module` (gradient parity + ABBA)
   - `grpo-ane-critic` : `G=4` GRPO / Best-of-N rolling `FastGemma4Engine` + concurrent `Laya` ANE
@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 import gc
+import hashlib
 import json
 import math
 import os
@@ -36,7 +38,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -140,34 +142,70 @@ def _hw_lock() -> Iterator[None]:
             os.close(fd)
 
 
-def _abba_ms(fn_a: Any, fn_b: Any, *, rounds: int = 2) -> dict[str, Any]:
-    fn_a()
-    fn_b()
-    times_a: list[float] = []
-    times_b: list[float] = []
-    for r in range(max(1, int(rounds))):
-        order = ("A", "B", "B", "A") if r % 2 == 0 else ("B", "A", "A", "B")
-        for tag in order:
-            t0 = time.perf_counter()
-            if tag == "A":
-                fn_a()
-                times_a.append((time.perf_counter() - t0) * 1000.0)
-            else:
-                fn_b()
-                times_b.append((time.perf_counter() - t0) * 1000.0)
-    med_a = float(statistics.median(times_a))
-    med_b = float(statistics.median(times_b))
-    return {
-        "a_median_ms": round(med_a, 3),
-        "b_median_ms": round(med_b, 3),
-        "speedup_b_over_a": round(med_a / max(med_b, 1e-9), 3),
-        "n_samples": len(times_a),
-    }
-
-
 # ---------------------------------------------------------------------------
 # 1. QLoRA Packing + Shared-Sys-KV (`fast_gemma4.lora_accel` vs stock `mlx-lm`)
 # ---------------------------------------------------------------------------
+
+
+def _qlora_pairs(
+    raw_docs: Sequence[Any], sys_txt: str, tokenizer: Any, *, n_docs: int, sys_repeat: int,
+) -> list[tuple[list[int], int]]:
+    stxt = "\n\n".join([sys_txt] * sys_repeat) if sys_repeat > 1 else sys_txt
+    pairs: list[tuple[list[int], int]] = []
+    for i in range(n_docs):
+        doc_id, fname, meta_str, body = raw_docs[i % len(raw_docs)]
+        expanded = "\n".join(f"[Section {r + 1} - Record {i:02d}] {body}" for r in range(2 + (i % 2)))
+        prompt = (
+            f"<bos><start_of_turn>user\n{stxt}\n\n"
+            f"FILE: {fname} (batch_item={i})\nTEXT:\n{expanded}<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
+        meta_obj = json.loads(meta_str)
+        ans_obj = {
+            "status": "usable",
+            "text_quality": "native",
+            "primary_kind": "technical_report",
+            "domain": meta_obj["domain"],
+            "title": f"{doc_id} Report {i}",
+            "organization": meta_obj["org"],
+            "doc_date": meta_obj["date"],
+            "year": int(meta_obj["date"][:4]),
+            "people": [{"name": "Lead Analyst", "role": "author", "org": meta_obj["org"]}],
+            "refs": [f"REF-{i:03d}-A", f"STD-{200 + i}"],
+            "summary": f"Technical assessment summarizing operational metrics for {fname}.",
+            "topics": ["reliability", "compliance", "operations", f"topic_{i % 4}"],
+        }
+        ans = json.dumps(ans_obj, separators=(",", ":")) + "<end_of_turn>\n"
+        p_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        a_ids = tokenizer.encode(ans, add_special_tokens=False)
+        pairs.append((p_ids + a_ids, len(p_ids)))
+    return pairs
+
+
+def _qlora_regime_report(
+    pairs: Sequence[tuple[list[int], int]], runs: Sequence[dict[str, Any]], *, prompt_copies: int, pack_tokens: int,
+) -> dict[str, Any]:
+    examples = len(pairs)
+    logical_inputs = sum(len(full) - 1 for full, _ in pairs)
+    supervised = sum(len(full) - prompt for full, prompt in pairs)
+    for run in runs:
+        actual = (run["examples"], run["logical_input_tokens"], run["supervised_tokens"])
+        if actual != (examples, logical_inputs, supervised):
+            raise ValueError(f"QLoRA pass trained on {actual}, expected {(examples, logical_inputs, supervised)}")
+    seconds = statistics.median(run["elapsed_seconds"] for run in runs)
+    return {
+        "input_ids_and_prompt_lengths_sha256": hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest(),
+        "system_instruction_copies": prompt_copies, "pack_tokens": pack_tokens,
+        "examples": examples, "logical_input_tokens": logical_inputs, "supervised_tokens": supervised,
+        "elapsed_seconds": seconds,
+        "supervised_tokens_per_sec": statistics.median(supervised / run["elapsed_seconds"] for run in runs),
+        "examples_per_sec": statistics.median(examples / run["elapsed_seconds"] for run in runs),
+        # Historical tok_s counts logical input positions, including any reused prefixes.
+        "tok_s": round(statistics.median(logical_inputs / run["elapsed_seconds"] for run in runs), 1),
+        "peak_gb": statistics.median(run["peak_gb"] for run in runs),
+        "optimizer_steps_per_pass": [run["optimizer_steps"] for run in runs],
+        "runs": list(runs),
+    }
 
 
 def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str, Any]:
@@ -211,38 +249,6 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
     raw_docs = json.loads((fix_dir / "sample_docs_8.json").read_text(encoding="utf-8"))
     tokenizer = load_tokenizer(base_snap)
     num_lora_layers = 23
-
-    def _build_pairs(n_docs: int, sys_repeat: int) -> list[tuple[list[int], int]]:
-        stxt = "\n\n".join([sys_txt] * sys_repeat) if sys_repeat > 1 else sys_txt
-        pairs: list[tuple[list[int], int]] = []
-        for i in range(n_docs):
-            doc_id, fname, meta_str, body = raw_docs[i % len(raw_docs)]
-            expanded = "\n".join(f"[Section {r + 1} - Record {i:02d}] {body}" for r in range(2 + (i % 2)))
-            prompt = (
-                f"<bos><start_of_turn>user\n{stxt}\n\n"
-                f"FILE: {fname} (batch_item={i})\nTEXT:\n{expanded}<end_of_turn>\n"
-                f"<start_of_turn>model\n"
-            )
-            meta_obj = json.loads(meta_str)
-            ans_obj = {
-                "status": "usable",
-                "text_quality": "native",
-                "primary_kind": "technical_report",
-                "domain": meta_obj["domain"],
-                "title": f"{doc_id} Report {i}",
-                "organization": meta_obj["org"],
-                "doc_date": meta_obj["date"],
-                "year": int(meta_obj["date"][:4]),
-                "people": [{"name": "Lead Analyst", "role": "author", "org": meta_obj["org"]}],
-                "refs": [f"REF-{i:03d}-A", f"STD-{200 + i}"],
-                "summary": f"Technical assessment summarizing operational metrics for {fname}.",
-                "topics": ["reliability", "compliance", "operations", f"topic_{i % 4}"],
-            }
-            ans = json.dumps(ans_obj, separators=(",", ":")) + "<end_of_turn>\n"
-            p_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            a_ids = tokenizer.encode(ans, add_special_tokens=False)
-            pairs.append((p_ids + a_ids, len(p_ids)))
-        return pairs
 
     def _load_lora(*, qlora_8bit: bool, seed: int = 42) -> tuple[Any, int]:
         mx.random.seed(seed)
@@ -321,8 +327,8 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
     def _np_tree_to_mx(ntree: Any) -> Any:
         return tree_map(lambda x: mx.array(x), ntree)
 
-    pairs = _build_pairs(n_docs=12, sys_repeat=1)
-    pairs_long_sys = _build_pairs(n_docs=8, sys_repeat=4)
+    pairs = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=12, sys_repeat=1)
+    pairs_long_sys = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=8, sys_repeat=4)
 
     # Step-0 parity: unpacked BF16 vs packed BF16 (B=1 on <=28GB hosts to stay strictly under 19 GB Metal limit)
     mdl_bf16, first_l = _load_lora(qlora_8bit=False, seed=42)
@@ -383,8 +389,8 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         else:
             batches = [[p] for p in pair_list]
 
-        def _pass(b_list: list[list[tuple[list[int], int]]]) -> int:
-            toks = 0
+        def _pass(b_list: list[list[tuple[list[int], int]]]) -> dict[str, int]:
+            counts = {"logical_input_tokens": 0, "supervised_tokens": 0, "examples": 0, "optimizer_steps": 0}
             if shared_sys:
                 for cur in range(0, len(b_list), 4):
                     win = b_list[cur : cur + 4]
@@ -401,8 +407,11 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
                     )
                     stepper.step(mdl, grads, lr=1.8e-4, accum_divisor=1)
                     mx.eval(mdl.parameters(), opt.state)
-                    toks += sum(sb.logical_total_tokens for sb in sbins)
-                return toks
+                    counts["logical_input_tokens"] += sum(sb.logical_total_tokens for sb in sbins)
+                    counts["supervised_tokens"] += sum(sb.y_flat.size for sb in sbins)
+                    counts["examples"] += sum(sb.num_examples for sb in sbins)
+                    counts["optimizer_steps"] += 1
+                return counts
 
             acc_g: Any = None
             acc_n = 0
@@ -414,7 +423,9 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
                         mdl, h1, m1, i1, p1, r1, pb.ans_indices, pb.y_flat, None, first_l,
                         use_ckpt=(pb.bin_tokens > ckpt_toks), chunk_size=256, compiled_ce=compiled,
                     )
-                    toks += pb.real_tokens
+                    counts["logical_input_tokens"] += pb.real_tokens
+                    counts["supervised_tokens"] += pb.y_flat.size
+                    counts["examples"] += pb.num_examples
                 else:
                     mx_i = max(len(f) - 1 for f, _ in b)
                     inp = mx.array([f[:-1] + [0] * (mx_i - (len(f) - 1)) for f, _ in b], dtype=mx.int32)
@@ -423,30 +434,33 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
                     bt = int(inp.shape[0] * inp.shape[1])
                     h1, m1, i1, p1 = _frozen_legacy(mdl, inp, first_l)
                     loss, grads = vgl(mdl, h1, m1, i1, p1, sp, yf, first_l, bt > ckpt_toks, compiled)
-                    toks += bt
+                    counts["logical_input_tokens"] += sum(len(full) - 1 for full, _ in b)
+                    counts["supervised_tokens"] += yf.size
+                    counts["examples"] += len(b)
                 acc_g = stepper.accumulate(acc_g, grads)
                 acc_n += 1
                 mx.eval(loss, acc_g)
                 if acc_n >= 4 or idx_b == len(b_list) - 1:
                     stepper.step(mdl, acc_g, lr=1.8e-4, accum_divisor=acc_n)
                     mx.eval(mdl.parameters(), opt.state)
+                    counts["optimizer_steps"] += 1
                     acc_g = None
                     acc_n = 0
-            return toks
+            return counts
 
         _ = _pass(batches[: max(1, min(len(batches), 4 if shared_sys else 1))])
         mx.synchronize()
         mx.clear_cache()
         mx.reset_peak_memory()
         t0 = time.perf_counter()
-        toks = _pass(batches)
+        counts = _pass(batches)
         mx.synchronize()
         dt = time.perf_counter() - t0
         pk = float(mx.get_peak_memory()) / (1024**3)
         del opt, stepper
         gc.collect()
         mx.clear_cache()
-        return {"tok_s": round(toks / max(dt, 1e-6), 1), "docs_s": round(len(pair_list) / max(dt, 1e-6), 3), "peak_gb": round(pk, 3)}
+        return {**counts, "elapsed_seconds": dt, "peak_gb": round(pk, 3)}
 
     # Stock baseline A on BF16 model (unpacked, uncompiled)
     ckpt_bf16 = 256 if low_ram else 2200
@@ -474,20 +488,22 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
     b_pack_runs = [_run_regime(mdl_q8, pairs, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=False, compiled=True, ckpt_toks=ckpt_q8) for _ in range(2)]
     b_sys_runs = [_run_regime(mdl_q8, pairs_long_sys, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=True, compiled=True, ckpt_toks=ckpt_q8) for _ in range(2)]
 
-    a_tps = float(statistics.median(r["tok_s"] for r in a_runs))
-    b_tps = float(statistics.median(r["tok_s"] for r in b_pack_runs))
-    s_tps = float(statistics.median(r["tok_s"] for r in b_sys_runs))
-    a_pk = float(statistics.median(r["peak_gb"] for r in a_runs))
-    b_pk = float(statistics.median(r["peak_gb"] for r in b_pack_runs))
+    stock = _qlora_regime_report(pairs, a_runs, prompt_copies=1, pack_tokens=0)
+    packed = _qlora_regime_report(pairs, b_pack_runs, prompt_copies=1, pack_tokens=pack_tok_bench)
+    shared = _qlora_regime_report(pairs_long_sys, b_sys_runs, prompt_copies=4, pack_tokens=pack_tok_bench)
 
     return {
         "suite": "qlora-packing",
         "status": "ok",
-        "fast_metric": f"{b_tps:,.1f} tok/s (shared-sys {s_tps:,.1f} tok/s)",
-        "stock_baseline": f"mlx-lm BF16 LoRA: {a_tps:,.1f} tok/s",
-        "speedup_vs_stock": round(b_tps / max(a_tps, 1e-6), 2),
-        "peak_gb": b_pk,
-        "stock_peak_gb": a_pk,
+        "fast_metric": (
+            f"Packed 8-bit {packed['supervised_tokens_per_sec']:,.1f} supervised tokens/s on the same {packed['examples']} examples. "
+            f"The separate shared-prefix run uses {shared['examples']} examples with four copies of the instructions."
+        ),
+        "stock_baseline": f"Unpacked BF16 {stock['supervised_tokens_per_sec']:,.1f} supervised tokens/s",
+        "speedup_vs_stock": round(packed["supervised_tokens_per_sec"] / stock["supervised_tokens_per_sec"], 2),
+        "comparison": "Packed 8-bit vs unpacked BF16 on identical input and answer IDs. The separate shared-prefix pass uses eight examples with four copies of the instructions. It has no matched baseline.",
+        "measurement": "Two consecutive timed passes per regime after optimizer warmup. Each elapsed time counts training on those examples. Optimizer steps can differ by packing. tok_s counts logical input positions, including reused prefixes. peak_gb records GiB of MLX allocations.",
+        "peak_gb": packed["peak_gb"], "stock_peak_gb": stock["peak_gb"],
         "parity": {
             "packed_vs_unpacked_loss_diff": round(abs(loss_p - loss_u), 6),
             "packed_vs_unpacked_grad_cos": round(float(cos_pack), 6),
@@ -495,9 +511,9 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
             "qlora_8bit_vs_bf16_grad_cos": round(float(cos_q8), 6),
         },
         "regimes": {
-            "stock_bf16_unpacked": {"tok_s": a_tps, "peak_gb": a_pk},
-            "qlora_8bit_packed_2048": {"tok_s": b_tps, "peak_gb": b_pk},
-            "qlora_8bit_shared_sys_kv": {"tok_s": s_tps, "peak_gb": float(statistics.median(r["peak_gb"] for r in b_sys_runs))},
+            "stock_bf16_unpacked": stock,
+            f"qlora_8bit_packed_{pack_tok_bench}": packed,
+            "qlora_8bit_shared_sys_kv": {**shared, "matched_baseline": None},
         },
     }
 
@@ -757,7 +773,7 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
 
 def _run_grpo_ane_critic(args: argparse.Namespace) -> dict[str, Any]:
     from fast_decision_models.laya_ane import LayaAneBackend
-    from fast_decision_models.paths import ensure_laya_dylib, resolve_kev_dir, resolve_laya_dir
+    from fast_decision_models.paths import ensure_laya_dylib, resolve_laya_dir
     from fast_gemma4.cli import _load_fixture_dataset
     from fast_gemma4.engine import FastGemma4Engine
     from fast_gemma4.paths import resolve_paths as resolve_g4_paths
@@ -844,16 +860,15 @@ def _run_grpo_ane_critic(args: argparse.Namespace) -> dict[str, Any]:
     stock_res: dict[str, Any] | None = None
     if Path(pub_py).is_file():
         stock_code = r"""
-import json, math, sys, time
+import json, sys, time
 from pathlib import Path
 import mlx.core as mx
-import mlx_lm, mlx_vlm
+import mlx_vlm
 
 cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 sys.path.insert(0, cfg["scripts_dir"])
-sys.path.insert(0, cfg["fdm_src"])
 from public_baselines import resolve_hf_snapshot
-from fast_decision_models.kev_mlx import Kev08bMlxBackend
+from _outcome_public_backends import PublicKev08bMlxBackend
 
 s_g4 = resolve_hf_snapshot("lmstudio-community/gemma-4-E2B-it-MLX-4bit")
 s_k8 = resolve_hf_snapshot("AbstractFramework/kev-0.8b-mlx-8bit")
@@ -880,43 +895,24 @@ roll_s = time.perf_counter() - t0
 del model, proc
 mx.clear_cache()
 
-dec_cfg = json.loads((s_k8 / "decision.json").read_text(encoding="utf-8"))
-hw = mx.load(str(s_k8 / "head.safetensors"))
-qw, qb = hw["q.weight"].astype(mx.float32), hw["q.bias"].astype(mx.float32)
-kw, kb = hw["k.weight"].astype(mx.float32), hw["k.bias"].astype(mx.float32)
-temp_s = float(dec_cfg.get("temperature", 2.3510958125672174))
-k_mdl, _ = mlx_lm.load(str(s_k8))
-bb = k_mdl.language_model.model if hasattr(k_mdl, "language_model") else k_mdl.model
-mx.eval(k_mdl.parameters(), qw, qb, kw, kb)
-fmt = Kev08bMlxBackend(Path(cfg["kev_dir"]), quant_mode="w8", batch_docs=1)
-
-t1 = time.perf_counter()
-for p, tx in zip(cfg["cand_prompts"], outs):
-    s_ids, q_rows = fmt.encode_questions({"source": p[:600], "candidate": tx}, [cfg["qdef"]])
-    qr = q_rows[0]
-    f_ids = list(s_ids) + list(qr["ids"])
-    dec_p = len(s_ids) + int(qr.get("decide", len(qr["ids"]) - 1))
-    op = [len(s_ids) + int(x) for x in qr["opts"]]
-    lh = bb(mx.array([f_ids], dtype=mx.int32))[0].astype(mx.float32)
-    qv = lh[dec_p] @ qw.T + qb
-    kv = lh[mx.array(op, dtype=mx.int32)] @ kw.T + kb
-    pr = mx.softmax((kv @ qv) / (math.sqrt(int(qv.shape[-1])) * temp_s), axis=-1)
-    mx.eval(pr)
-mx.synchronize()
-crit_s = time.perf_counter() - t1
-fmt.close()
+critic = PublicKev08bMlxBackend(Path(cfg["kev_dir"]), batch_docs=1)
+try:
+    t1 = time.perf_counter()
+    for p, tx in zip(cfg["cand_prompts"], outs, strict=True):
+        critic.score_multi_states([({"source": p[:600], "candidate": tx}, [cfg["qdef"]])])
+    crit_s = time.perf_counter() - t1
+finally:
+    critic.close()
 tot_s = roll_s + crit_s
 print(json.dumps({"status": "ok", "wall_sec": round(tot_s, 3), "rollout_sec": round(roll_s, 3), "critic_sec": round(crit_s, 3), "rollouts_s": round(len(fmts) / max(tot_s, 1e-6), 3)}))
 """
         with tempfile.TemporaryDirectory(prefix="grpo_stock_") as td:
             cf = Path(td) / "cfg.json"
-            kev_dir = resolve_kev_dir(None, artifacts_dir=fdm_home / "artifacts")
             cf.write_text(
                 json.dumps(
                     {
                         "scripts_dir": str(_REPO_ROOT / "scripts"),
-                        "fdm_src": str(_REPO_ROOT / "packages" / "fast-decision-models" / "src"),
-                        "kev_dir": str(kev_dir),
+                        "kev_dir": str(fdm_home / "artifacts" / "kev_08b"),
                         "sys_prompt": sys_prompt,
                         "cand_prompts": cand_prompts,
                         "max_toks": max_toks,
@@ -1105,6 +1101,63 @@ print(json.dumps({"status": "ok", "grpo_gpu_ms": round(gpu_ms, 2), "ane_critic_1
 # ---------------------------------------------------------------------------
 
 
+def _measure_mtp_pair(generate_ar: Callable[[], Any], generate_mtp: Callable[[], Any], *, batch_size: int, rounds: int) -> dict[str, Any]:
+    generators = {"ar": generate_ar, "mtp": generate_mtp}
+    for generate in generators.values():
+        generate()
+    samples: dict[str, list[dict[str, Any]]] = {"ar": [], "mtp": []}
+    reference = None
+    exact = [True] * batch_size
+    for round_idx in range(max(1, rounds)):
+        order = ("ar", "mtp", "mtp", "ar") if round_idx % 2 == 0 else ("mtp", "ar", "ar", "mtp")
+        for arm in order:
+            started = time.perf_counter()
+            batch = generators[arm]()
+            seconds = time.perf_counter() - started
+            if len(batch.items) != batch_size:
+                raise ValueError(f"{arm} returned {len(batch.items)} completions for {batch_size} prompts")
+            tokens = [list(item.token_ids) for item in batch.items]
+            if reference is None:
+                reference = tokens  # First timed AR output for each prompt.
+            matches = [ids == expected for ids, expected in zip(tokens, reference, strict=True)]
+            exact = [all(pair) for pair in zip(exact, matches, strict=True)]
+            counts = [len(ids) for ids in tokens]
+            samples[arm].append({
+                "elapsed_seconds": seconds, "output_tokens_by_prompt": counts, "output_tokens": sum(counts),
+                "exact_vs_first_ar_by_prompt": matches,
+            })
+
+    med_seconds = {arm: statistics.median(r["elapsed_seconds"] for r in runs) for arm, runs in samples.items()}
+    rates = {arm: statistics.median(r["output_tokens"] / r["elapsed_seconds"] for r in runs) for arm, runs in samples.items()}
+    stable_totals = {}
+    for arm, runs in samples.items():
+        totals = {r["output_tokens"] for r in runs}
+        stable_totals[arm] = totals.pop() if len(totals) == 1 else None
+    elapsed_ratio = med_seconds["ar"] / med_seconds["mtp"]
+    return {
+        "ar_tok_s": rates["ar"], "mtp_tok_s": rates["mtp"],
+        "ar_output_tokens": stable_totals["ar"], "mtp_output_tokens": stable_totals["mtp"],
+        "ar_median_seconds": med_seconds["ar"], "mtp_median_seconds": med_seconds["mtp"],
+        "elapsed_speedup_vs_ar": elapsed_ratio, "token_rate_ratio_vs_ar": rates["mtp"] / rates["ar"] if rates["ar"] else None,
+        "exact_output_by_prompt": exact, "samples": samples,
+        # Historical fields: speedup meant elapsed time and total_out_tokens meant MTP output.
+        "speedup_vs_ar": round(elapsed_ratio, 3), "total_out_tokens": stable_totals["mtp"],
+    }
+
+
+def _stock_generated_token_count(result: Any, batch_size: int) -> int:
+    if batch_size > 1 and len(result.texts) != batch_size:
+        raise ValueError("Stock mlx-vlm returned the wrong number of completions")
+    value = getattr(result, "generation_tokens", None)
+    if value is None:
+        value = getattr(getattr(result, "stats", None), "generation_tokens", None)
+    if isinstance(value, list) and len(value) == batch_size and all(isinstance(n, int) and n >= 0 for n in value):
+        return sum(value)
+    if isinstance(value, int) and value >= 0:
+        return value
+    raise ValueError("Stock mlx-vlm did not expose a generated-token count")
+
+
 def _run_mtp_speculative(args: argparse.Namespace) -> dict[str, Any]:
     from fast_gemma4.cli import _load_fixture_dataset
     from fast_gemma4.engine import FastGemma4Engine
@@ -1128,8 +1181,6 @@ def _run_mtp_speculative(args: argparse.Namespace) -> dict[str, Any]:
     eng_ar = FastGemma4Engine(home=fg4_home, default_mode="gpu", kv_i8=True, mtp_drafter=None, local_files_only=True, warmup=True, warmup_ane=False)
     eng_mtp = FastGemma4Engine(home=fg4_home, default_mode="gpu", kv_i8=True, mtp_drafter=drafter_dir, local_files_only=True, warmup=True, warmup_ane=False)
     workloads: dict[str, Any] = {}
-    parity_exact = 0
-    parity_total = 0
     try:
         for wname, plist, sys_p, sch, mtok in (
             ("free_b1", free_prompts[:1], None, None, 192),
@@ -1137,34 +1188,19 @@ def _run_mtp_speculative(args: argparse.Namespace) -> dict[str, Any]:
             ("json_b1", json_prompts[:1], sys_prompt, schema_str, 256),
             ("json_b4", json_prompts[:4], sys_prompt, schema_str, 256),
         ):
-            r_ar = eng_ar.generate_batch(plist, system_prompt=sys_p, json_schema=sch, max_tokens=mtok, temperature=0.0, mode="gpu", speculative=False, batch_size=len(plist))
-            r_mt = eng_mtp.generate_batch(plist, system_prompt=sys_p, json_schema=sch, max_tokens=mtok, temperature=0.0, mode="gpu", speculative=True, batch_size=len(plist))
-            for ia, ib in zip(r_ar.items, r_mt.items):
-                parity_total += 1
-                if list(ia.token_ids) == list(ib.token_ids):
-                    parity_exact += 1
-
-            ab = _abba_ms(
-                lambda _p=plist, _s=sys_p, _sc=sch, _m=mtok: eng_ar.generate_batch(_p, system_prompt=_s, json_schema=_sc, max_tokens=_m, temperature=0.0, mode="gpu", speculative=False, batch_size=len(_p)),
-                lambda _p=plist, _s=sys_p, _sc=sch, _m=mtok: eng_mtp.generate_batch(_p, system_prompt=_s, json_schema=_sc, max_tokens=_m, temperature=0.0, mode="gpu", speculative=True, batch_size=len(_p)),
-                rounds=args.abba_rounds,
+            settings = dict(system_prompt=sys_p, json_schema=sch, max_tokens=mtok, temperature=0.0, mode="gpu", batch_size=len(plist))
+            workloads[wname] = _measure_mtp_pair(
+                partial(eng_ar.generate_batch, plist, speculative=False, **settings),
+                partial(eng_mtp.generate_batch, plist, speculative=True, **settings),
+                batch_size=len(plist), rounds=args.abba_rounds,
             )
-            tot_tok = sum(len(it.token_ids) for it in r_mt.items)
-            ar_tps = round(tot_tok / max(ab["a_median_ms"] / 1000.0, 1e-9), 1)
-            mt_tps = round(tot_tok / max(ab["b_median_ms"] / 1000.0, 1e-9), 1)
-            workloads[wname] = {
-                "ar_tok_s": ar_tps,
-                "mtp_tok_s": mt_tps,
-                "speedup_vs_ar": ab["speedup_b_over_a"],
-                "total_out_tokens": tot_tok,
-            }
     finally:
         eng_ar.close()
         eng_mtp.close()
 
     # Stock `mlx-vlm` B=1 & B=4 on the exact same JSON prompts
     pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
-    stock_vlm: dict[str, Any] | None = None
+    stock_vlm: dict[str, Any] = {"status": "unavailable", "reason": f"Missing stock interpreter {pub_py}"}
     if Path(pub_py).is_file():
         vlm_code = r"""
 import json, statistics, sys, time
@@ -1172,6 +1208,7 @@ from pathlib import Path
 import mlx.core as mx, mlx_vlm
 sys.path.insert(0, sys.argv[2])
 from public_baselines import resolve_hf_snapshot
+from benchmark_capabilities import _stock_generated_token_count
 
 snap = resolve_hf_snapshot("lmstudio-community/gemma-4-E2B-it-MLX-4bit")
 if snap is None:
@@ -1190,43 +1227,60 @@ for p in cfg["json_prompts"]:
 
 _ = mlx_vlm.generate(model, proc, fmts[0], max_tokens=32, temp=0.0, verbose=False)
 mx.synchronize()
-t1 = []
-for _ in range(2):
-    t0 = time.perf_counter()
-    r1 = mlx_vlm.generate(model, proc, fmts[0], max_tokens=256, temp=0.0, verbose=False)
-    mx.synchronize()
-    t1.append(time.perf_counter() - t0)
-n1 = len(tok.encode(getattr(r1, "text", ""), add_special_tokens=False))
-t4 = []
-for _ in range(2):
-    t0 = time.perf_counter()
-    r4 = mlx_vlm.batch_generate(model, proc, prompts=fmts[:4], max_tokens=256, verbose=False)
-    mx.synchronize()
-    t4.append(time.perf_counter() - t0)
-n4 = sum(len(tok.encode(tx, add_special_tokens=False)) for tx in (getattr(r4, "texts", []) or []))
-print(json.dumps({"status": "ok", "json_b1_tok_s": round(n1 / max(statistics.median(t1), 1e-9), 1), "json_b4_tok_s": round(n4 / max(statistics.median(t4), 1e-9), 1)}))
+result = {"status": "ok", "generation_mode": "Same JSON prompts with unrestricted decoding"}
+for batch_size in (1, 4):
+    key = f"json_b{batch_size}"
+    samples = []
+    for _ in range(2):
+        t0 = time.perf_counter()
+        if batch_size == 1:
+            out = mlx_vlm.generate(model, proc, fmts[0], max_tokens=256, temp=0.0, verbose=False)
+        else:
+            out = mlx_vlm.batch_generate(model, proc, prompts=fmts[:batch_size], max_tokens=256, verbose=False)
+        mx.synchronize()
+        seconds = time.perf_counter() - t0
+        samples.append({"elapsed_seconds": seconds, "output_tokens": _stock_generated_token_count(out, batch_size)})
+    result[key] = {"samples": samples, "median_seconds": statistics.median(r["elapsed_seconds"] for r in samples)}
+    result[key + "_tok_s"] = statistics.median(r["output_tokens"] / r["elapsed_seconds"] for r in samples)
+print(json.dumps(result))
 """
         with tempfile.TemporaryDirectory(prefix="mtp_stock_") as td:
             cf = Path(td) / "vcfg.json"
             cf.write_text(json.dumps({"sys_prompt": sys_prompt, "json_prompts": json_prompts[:4]}), encoding="utf-8")
-            pr = subprocess.run([str(pub_py), "-c", vlm_code, str(cf), str(_REPO_ROOT / "scripts")], capture_output=True, text=True, timeout=300, check=False)
-            if pr.returncode == 0 and pr.stdout.strip():
-                stock_vlm = json.loads(pr.stdout.strip().splitlines()[-1])
+            try:
+                pr = subprocess.run([str(pub_py), "-c", vlm_code, str(cf), str(_REPO_ROOT / "scripts")], capture_output=True, text=True, timeout=300, check=False)
+                if pr.returncode == 0 and pr.stdout.strip():
+                    stock_vlm = json.loads(pr.stdout.strip().splitlines()[-1])
+                else:
+                    stock_vlm = {"status": "unavailable", "reason": pr.stderr.strip()[-1000:] or "No stock result"}
+            except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                stock_vlm = {"status": "unavailable", "reason": str(exc)}
 
     fp = get_unified_memory_footprint()
     jb1 = workloads["json_b1"]["mtp_tok_s"]
     jb4 = workloads["json_b4"]["mtp_tok_s"]
-    sb1 = float((stock_vlm or {}).get("json_b1_tok_s") or 0.0)
-    sb4 = float((stock_vlm or {}).get("json_b4_tok_s") or 0.0)
+    for name in ("json_b1", "json_b4"):
+        row = workloads[name]
+        stock_rate = stock_vlm.get(name + "_tok_s")
+        stock_seconds = (stock_vlm.get(name) or {}).get("median_seconds")
+        row["token_rate_ratio_vs_stock"] = row["mtp_tok_s"] / stock_rate if stock_rate else None
+        row["elapsed_speedup_vs_stock"] = stock_seconds / row["mtp_median_seconds"] if stock_seconds else None
+    sb1 = stock_vlm.get("json_b1_tok_s")
+    sb4 = stock_vlm.get("json_b4_tok_s")
+    exact = [flag for row in workloads.values() for flag in row["exact_output_by_prompt"]]
     return {
         "suite": "mtp-speculative",
         "status": "ok",
-        "fast_metric": f"JSON B=1 {jb1:.1f} tok/s ({workloads['json_b1']['speedup_vs_ar']:.2f}x AR) | B=4 {jb4:.1f} tok/s",
-        "stock_baseline": f"mlx-vlm 4-bit: B=1 {sb1:.1f} tok/s | B=4 {sb4:.1f} tok/s" if sb1 > 0 else "stock unavailable",
-        "speedup_vs_stock": round(jb1 / max(sb1, 1e-6), 2) if sb1 > 0 else workloads["json_b1"]["speedup_vs_ar"],
-        "b4_speedup_vs_stock": round(jb4 / max(sb4, 1e-6), 2) if sb4 > 0 else None,
+        "fast_metric": (
+            f"Constrained JSON B=1 {jb1:.1f} output tokens/s ({workloads['json_b1']['elapsed_speedup_vs_ar']:.2f}x elapsed vs AR), "
+            f"B=4 {jb4:.1f} tokens/s. Exact AR/MTP outputs on {sum(exact)}/{len(exact)} prompts across workloads."
+        ),
+        "stock_baseline": f"Unrestricted mlx-vlm B=1 {sb1:.1f}, B=4 {sb4:.1f} output tokens/s" if sb1 is not None and sb4 is not None else "stock unavailable",
+        "speedup_vs_stock": workloads["json_b1"]["token_rate_ratio_vs_stock"],
+        "b4_speedup_vs_stock": workloads["json_b4"]["token_rate_ratio_vs_stock"],
+        "comparison": "Project rates count the token IDs returned in each timed pass. Stock rates use the library's generated-token counter. Elapsed speedup divides median wall times. Each exact-output flag requires identical token IDs on that prompt across every timed AR and MTP pass. The stock ratio compares output-token rates under different decoding constraints.",
         "peak_gb": round(float(fp["peak_footprint_gb"]), 3),
-        "greedy_exact_token_matches": f"{parity_exact}/{parity_total}",
+        "greedy_exact_token_matches": f"{sum(exact)}/{len(exact)}",
         "workloads": workloads,
         "stock_mlx_vlm": stock_vlm,
     }
@@ -1237,128 +1291,137 @@ print(json.dumps({"status": "ok", "json_b1_tok_s": round(n1 / max(statistics.med
 # ---------------------------------------------------------------------------
 
 
-def _run_prefix_tree(args: argparse.Namespace, host_mem_gb: float) -> dict[str, Any]:
-    from fast_decision_models.kev_mlx import Kev08bMlxBackend
+def _run_prefix_tree(args: argparse.Namespace) -> dict[str, Any]:
+    from _kev_benchmark import cache_probe_inputs, score_differences
     from fast_decision_models.paths import resolve_kev_dir
-    from fast_decision_models.prefix_tree import PrefixTree, recommended_prefix_budget_bytes
 
     fdm_home = resolve_pkg_home("fast-decision-models", "FAST_DECISION_MODELS_HOME")
     kev_dir = resolve_kev_dir(None, artifacts_dir=fdm_home / "artifacts")
-    if not (kev_dir / "kev_meta.json").exists() and not (kev_dir / "kev_meta_w8.json").exists():
-        return {"suite": "prefix-tree", "status": "skipped", "reason": f"missing Kev-0.8B artifacts in {kev_dir}"}
-
-    preamble = " ".join(
-        f"Section {i:02d}: Operational compliance handbook for regional infrastructure, TLS certificate lifecycle, "
-        "automated telemetry auditing, canary deployment thresholds, and incident escalation across data centers."
-        for i in range(20)
-    )
-    suffixes = [
-        "Incident Report #402: auth-api experienced 502 errors for 14 minutes due to TLS certificate expiration.",
-        "Invoice #8812: Total $1,240.00 for cloud storage (20 TB). Payment status: PAID via ACH.",
-        "Deployment Log: Release v2.8.1 rolled back after canary health checks exceeded 5% 5xx threshold.",
-        "Clinical Triage Note: Dry cough and fever 38.6C for 3 days; chest X-ray clear; discharged home.",
-        "Grid Assessment PTR-2025-09: Battery-backed inverters held frequency within 0.04 Hz across 19 substations.",
-        "Audit Memo OT12: Unsegmented diagnostic ports at Berth 4 were isolated via firewall ACLs.",
-        "Transit Minutes 2025-14: Automated train control trials approved for 90-second headways starting April 7.",
-        "Water Survey CWL-2025-04: Dissolved oxygen averaged 9.4 mg/L and nitrate stayed below 0.35 mg/L.",
-    ]
-    q_one = [
-        {
-            "id": "tls_outage",
-            "type": "noul",
-            "instructions": "Does the report state that TLS certificate expiration caused an outage?",
-            "criteria": {"false": "No TLS outage reported.", "true": "TLS certificate expiration caused the outage."},
-        }
-    ]
-    docs = [f"{preamble} {s}" for s in suffixes]
-    budget_b = recommended_prefix_budget_bytes(int(max(24.0, host_mem_gb) * (1024**3)))
-    tree = PrefixTree(chunk_tokens=256, byte_budget=budget_b)
-
-    kev_plain = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=8)
-    kev_pt = Kev08bMlxBackend(kev_dir, quant_mode="auto", batch_docs=8, prefix_tree=tree)
     try:
-        tree.clear()
-        cold = kev_pt.score_multi_states([(d, q_one) for d in docs], batch_docs=8)
-        warm = kev_pt.score_multi_states([(d, q_one) for d in docs], batch_docs=8)
-        max_prob_diff = max(
-            abs(a - b)
-            for dc, dw in zip(cold, warm)
-            for a, b in zip(dc[0][0], dw[0][0])
+        records = cache_probe_inputs()
+    except FileNotFoundError as exc:
+        return {"suite": "prefix-tree", "status": "skipped", "reason": str(exc)}
+
+    # Each arm has one scorer and its own allocator. Warm model weights before measuring
+    # the first pass through an empty prefix tree and the repeat of the exact same inputs.
+    public_python = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
+    schedule = []
+    for i in range(max(1, args.abba_rounds)):
+        order = ("plain", "cached", "stock") if i % 2 == 0 else ("stock", "plain", "cached")
+        schedule.extend((*order, *reversed(order)))
+    runs = []
+    for arm in schedule:
+        request = {"arm": arm, "records": records, "kev_dir": str(kev_dir), "use_wired_limit": not args.no_wired_limit}
+        proc = subprocess.run(
+            [public_python if arm == "stock" else sys.executable, str(_REPO_ROOT / "scripts" / "_kev_benchmark.py")],
+            input=json.dumps(request), text=True, capture_output=True, timeout=180, check=False,
         )
+        if proc.returncode:
+            return {"suite": "prefix-tree", "status": "failed", "reason": proc.stderr[-1200:], "arm": arm}
+        run = json.loads(proc.stdout.splitlines()[-1])
+        if run.get("status") == "skipped":
+            return {"suite": "prefix-tree", "status": "skipped", "reason": run["reason"], "arm": arm}
+        if runs and runs[0]["token_layouts"] != run["token_layouts"]:
+            raise ValueError(f"Kev token IDs or readout positions differed in {arm}")
+        runs.append(run)
 
-        # B=1 repeated ~835-tok doc
-        tree.clear()
-        kev_pt.score_multi_states([(docs[0], q_one)], batch_docs=1)
-        ab_b1 = _abba_ms(
-            lambda: kev_plain.score_multi_states([(docs[0], q_one)], batch_docs=1),
-            lambda: kev_pt.score_multi_states([(docs[0], q_one)], batch_docs=1),
-            rounds=args.abba_rounds,
-        )
-
-        # B=8 distinct docs sharing 512-tok preamble
-        items_b8 = [(d, q_one) for d in docs]
-        tree.clear()
-        kev_pt.score_multi_states(items_b8[:1], batch_docs=1)
-        ab_b8 = _abba_ms(
-            lambda: kev_plain.score_multi_states(items_b8, batch_docs=8),
-            lambda: kev_pt.score_multi_states(items_b8, batch_docs=8),
-            rounds=args.abba_rounds,
-        )
-        s0_len = len(kev_plain.encode_questions(docs[0], q_one)[0]) + 48
-    finally:
-        kev_plain.close()
-        kev_pt.close()
-
-    pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
-    stock_k8: dict[str, Any] | None = None
-    if Path(pub_py).is_file():
-        k8_code = f"""
-import json, statistics, sys, time
-import mlx.core as mx, mlx_lm
-sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r})
-from public_baselines import resolve_hf_snapshot
-
-sk = resolve_hf_snapshot("AbstractFramework/kev-0.8b-mlx-8bit")
-if sk is None:
-    print(json.dumps({{"status": "skipped"}}))
-    raise SystemExit(0)
-mdl, _ = mlx_lm.load(str(sk))
-bb = mdl.language_model.model if hasattr(mdl, "language_model") else mdl.model
-xb1 = mx.random.randint(10, 2000, (1, {s0_len}), dtype=mx.int32)
-xb8 = mx.random.randint(10, 2000, (8, {s0_len}), dtype=mx.int32)
-mx.eval(bb(xb1), bb(xb8))
-mx.synchronize()
-t1, t8 = [], []
-for _ in range(3):
-    t0 = time.perf_counter(); mx.eval(bb(xb1)); mx.synchronize(); t1.append((time.perf_counter() - t0) * 1000.0)
-    t0 = time.perf_counter(); mx.eval(bb(xb8)); mx.synchronize(); t8.append((time.perf_counter() - t0) * 1000.0)
-print(json.dumps({{"status": "ok", "b1_qps": round(1000.0 / statistics.median(t1), 2), "b8_qps": round(8000.0 / statistics.median(t8), 2)}}))
-"""
-        pr = subprocess.run([str(pub_py), "-c", k8_code], capture_output=True, text=True, timeout=180, check=False)
-        if pr.returncode == 0 and pr.stdout.strip():
-            stock_k8 = json.loads(pr.stdout.strip().splitlines()[-1])
-
-    pt_b1_qps = round(1000.0 / max(ab_b1["b_median_ms"], 1e-9), 2)
-    pt_b8_qps = round(8000.0 / max(ab_b8["b_median_ms"], 1e-9), 2)
-    st_b8_qps = float((stock_k8 or {}).get("b8_qps") or 0.0)
-    fp = get_unified_memory_footprint()
+    summary = {}
+    for arm in ("plain", "cached", "stock"):
+        selected = [r for r in runs if r["arm"] == arm]
+        summary[arm] = {
+            batch: {phase: statistics.median(r["workloads"][batch][phase]["seconds"] for r in selected)
+                    for phase in ("cold", "warm")}
+            for batch in ("b1", "b8")
+        }
+    cached, plain, stock = (summary[a] for a in ("cached", "plain", "stock"))
+    repeated = [
+        score_differences(work["cold"]["scores"], work["warm"]["scores"])
+        for run in runs if run["arm"] == "cached"
+        for work in run["workloads"].values()
+    ]
+    max_diff = max(check["max_abs_probability"] for check in repeated)
+    max_logit_diff = max(check["max_abs_logit"] for check in repeated)
     return {
-        "suite": "prefix-tree",
-        "status": "ok",
-        "fast_metric": f"B=1 {pt_b1_qps:.2f} q/s ({ab_b1['speedup_b_over_a']:.2f}x plain) | B=8 {pt_b8_qps:.2f} q/s ({ab_b8['speedup_b_over_a']:.2f}x plain)",
-        "stock_baseline": f"mlx-lm kev-8bit: B=1 {(stock_k8 or {}).get('b1_qps', 0):.2f} q/s | B=8 {st_b8_qps:.2f} q/s" if st_b8_qps > 0 else "stock unavailable",
-        "speedup_vs_stock": round(pt_b8_qps / max(st_b8_qps, 1e-6), 2) if st_b8_qps > 0 else ab_b8["speedup_b_over_a"],
-        "peak_gb": round(float(fp["peak_footprint_gb"]), 3),
-        "cold_vs_warm_max_prob_diff": max_prob_diff,
-        "abba_b1": ab_b1,
-        "abba_b8_shared_preamble": ab_b8,
-        "stock_mlx_lm": stock_k8,
+        "suite": "prefix-tree", "status": "ok" if max_diff == max_logit_diff == 0.0 else "failed",
+        "record_ids": [r["id"] for r in records], "dataset": "wandb/RAGTruth-processed",
+        "fast_metric": f"warm B=1 {1/cached['b1']['warm']:.2f} q/s | B=8 {8/cached['b8']['warm']:.2f} q/s",
+        "stock_baseline": f"stock mlx-lm, same eight questions {8/stock['b8']['warm']:.2f} q/s",
+        "speedup_vs_stock": stock["b8"]["warm"] / cached["b8"]["warm"],
+        "speedup_vs_plain": plain["b8"]["warm"] / cached["b8"]["warm"],
+        "peak_gb": max(r["memory_gb"]["process_peak_footprint"] for r in runs if r["arm"] == "cached"),
+        "cold_vs_warm_max_prob_diff": max_diff, "cold_vs_warm_max_logit_diff": max_logit_diff,
+        "median_seconds": summary, "runs": runs,
     }
 
 
 # ---------------------------------------------------------------------------
 # 6. Parallel Multi-Bucket CoreML ANE Compilation (`jobs=4` vs `jobs=1`)
 # ---------------------------------------------------------------------------
+
+
+def _predict_bge_buckets(bge_home: Path, compiled_home: Path) -> dict[str, np.ndarray]:
+    from fast_bge_small.engine import FastBgeSmall, _ANE_BUCKETS
+
+    assets = compiled_home / "artifacts"
+    for name in ("weights", "tokenizer"):
+        (assets / name).symlink_to(bge_home / "artifacts" / name, target_is_directory=True)
+    (compiled_home / "build").symlink_to(bge_home / "build", target_is_directory=True)
+    outputs = {}
+    with FastBgeSmall(home=compiled_home, default_mode="ane", warmup=False, verify_ane_plan=False) as engine:
+        try:
+            for length, filename, batch_size, _ in _ANE_BUCKETS:
+                if length not in engine.buckets or (batch_size == 1 and length not in engine.query_buckets):
+                    raise RuntimeError(f"Could not load {filename} from {assets / 'ane_models'}")
+                # Give each row a different input and force dispatch to this exact compiled shape.
+                sequences = [
+                    engine.tokenizer.encode(
+                        f"Record {row + 1}. " + "The team reviewed the annual report. " * 80,
+                        max_length=length,
+                    )
+                    for row in range(batch_size)
+                ]
+                if any(len(ids) != length for ids in sequences):
+                    raise ValueError(f"Input did not reach the {length}-token bucket")
+                if batch_size == 1:
+                    vectors = engine.encode_query(sequences[0], prefer_ane=True)[None, :]
+                else:
+                    vectors = engine.encode_corpus(sequences, mode="ane")
+                if vectors.shape != (batch_size, engine.dim) or not np.isfinite(vectors).all():
+                    raise ValueError(f"Invalid embeddings for {filename}: shape {vectors.shape}, expected finite {(batch_size, engine.dim)}")
+                norms = np.linalg.norm(vectors.astype(np.float64), axis=1)
+                if not np.allclose(norms, 1.0, rtol=0, atol=1e-4):
+                    raise ValueError(f"Expected unit-length embeddings for {filename}")
+                outputs[filename] = vectors
+        finally:
+            # The native bucket registry is process-wide. Release these builds before loading the other arm.
+            if engine.ane is not None:
+                engine.ane.bge_ane_free_all()
+    return outputs
+
+
+def _compare_bge_builds(bge_home: Path, builds: Mapping[int, Path]) -> dict[str, Any]:
+    serial = _predict_bge_buckets(bge_home, builds[1])
+    parallel = _predict_bge_buckets(bge_home, builds[4])
+    buckets = []
+    for name, left in serial.items():
+        right = parallel[name]
+        a, b = left.astype(np.float64), right.astype(np.float64)
+        cosines = (a * b).sum(axis=1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1))
+        buckets.append({
+            "bundle": name,
+            "vectors": len(left),
+            "min_cosine": float(np.clip(cosines.min(), -1.0, 1.0)),
+            "max_abs_diff": float(np.max(np.abs(a - b))),
+            "bit_identical": left.tobytes() == right.tobytes(),
+        })
+    min_cosine = min(row["min_cosine"] for row in buckets)
+    return {
+        "status": "ok" if min_cosine >= 0.9998 else "failed",
+        "required_min_cosine": 0.9998,
+        "min_cosine": min_cosine,
+        "all_bit_identical": all(row["bit_identical"] for row in buckets),
+        "buckets": buckets,
+    }
 
 
 def _run_parallel_coreml(args: argparse.Namespace) -> dict[str, Any]:
@@ -1372,29 +1435,36 @@ def _run_parallel_coreml(args: argparse.Namespace) -> dict[str, Any]:
         tmp_r = Path(td)
         seq_times: list[float] = []
         par_times: list[float] = []
+        builds = {}
         for r in range(max(1, int(args.abba_rounds))):
             order = ((1, seq_times), (4, par_times)) if r % 2 == 0 else ((4, par_times), (1, seq_times))
             for jobs, sink in order:
-                out_d = tmp_r / f"r{r}_j{jobs}"
+                builds[jobs] = tmp_r / f"r{r}_j{jobs}"
+                out_d = builds[jobs] / "artifacts" / "ane_models"
                 t0 = time.perf_counter()
                 subprocess.check_call(
                     [sys.executable, str(build_script), "--home", str(bge_home), "--out-dir", str(out_d), "--jobs", str(jobs)],
                     stdout=subprocess.DEVNULL,
                 )
                 sink.append(time.perf_counter() - t0)
+        try:
+            embeddings = _compare_bge_builds(bge_home, builds)
+        except Exception as exc:
+            embeddings = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
 
     med_1 = round(float(statistics.median(seq_times)), 2)
     med_4 = round(float(statistics.median(par_times)), 2)
     fp = get_unified_memory_footprint()
     return {
         "suite": "parallel-coreml",
-        "status": "ok",
+        "status": embeddings["status"],
         "fast_metric": f"9 BGE-small buckets in {med_4:.2f}s (jobs=4 spawn pool)",
         "stock_baseline": f"Sequential coremltools (jobs=1): {med_1:.2f}s",
         "speedup_vs_stock": round(med_1 / max(med_4, 1e-6), 2),
         "peak_gb": round(float(fp["peak_footprint_gb"]), 3),
         "jobs_1_median_sec": med_1,
         "jobs_4_median_sec": med_4,
+        "embedding_comparison": embeddings,
     }
 
 
@@ -1424,7 +1494,7 @@ def _run_worker_main(args: argparse.Namespace) -> int:
         elif suite == "mtp-speculative":
             rec = _run_mtp_speculative(args)
         elif suite == "prefix-tree":
-            rec = _run_prefix_tree(args, host_mem)
+            rec = _run_prefix_tree(args)
         elif suite == "parallel-coreml":
             rec = _run_parallel_coreml(args)
         else:

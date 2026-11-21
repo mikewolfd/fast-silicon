@@ -6,7 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -114,7 +114,7 @@ def test_outcomes_public_baselines_and_flags(capsys: pytest.CaptureFixture[str])
                 "category": 1,
                 "benchmark": "NanoBEIR+LegalBench",
                 "status": "ok",
-                "objective_score_e2e": 0.7244,
+                "objective_score_e2e": 0.725,
                 "effective_outcome_per_sec": 1.724,
                 "per_item_effective_scores": [0.8, 0.7, 0.9, 0.5],
             },
@@ -124,7 +124,7 @@ def test_outcomes_public_baselines_and_flags(capsys: pytest.CaptureFixture[str])
                 "category": 1,
                 "benchmark": "NanoBEIR+LegalBench",
                 "status": "ok",
-                "objective_score_e2e": 0.7240,
+                "objective_score_e2e": 0.725,
                 "effective_outcome_per_sec": 0.862,
                 "per_item_effective_scores": [0.8, 0.7, 0.9, 0.5],
             },
@@ -133,6 +133,67 @@ def test_outcomes_public_baselines_and_flags(capsys: pytest.CaptureFixture[str])
     assert len(comps) == 1
     assert comps[0]["eot_speedup_vs_stock"] == pytest.approx(2.0, rel=1e-3)
     assert comps[0]["se_paired"] == 0.0
+
+
+def test_required_generation_grammar_failure_identifies_the_item() -> None:
+    out = _load_script("required_grammar_runner", "benchmark_outcomes.py")
+    seen = []
+    def compile_schema(schema, *, whitespace_flexible):
+        seen.append(whitespace_flexible)
+        if "not" in schema:
+            raise ValueError("unsupported keyword")
+        return "compiled"
+
+    assert out._compile_required_grammars("fast-gemma4", [{}], compile_schema, whitespace_flexible=None) == ["compiled"]
+    with pytest.raises(ValueError, match="fast-gemma4 input 1: unsupported keyword"):
+        out._compile_required_grammars("fast-gemma4", [{}, {"not": {}}], compile_schema, whitespace_flexible=False)
+    with pytest.raises(ValueError, match="Missing required schema for fast-gemma4 input 1"):
+        out._compile_required_grammars("fast-gemma4", [{}, None], compile_schema, whitespace_flexible=True)
+    assert seen == [None, False, False, True]
+
+
+def test_retrieval_run_abba_and_compare_require_all_selected_queries(tmp_path, monkeypatch, capsys) -> None:
+    out = _load_script("retrieval_gate_runner", "benchmark_outcomes.py")
+    ids = ["unjudged", "miss", "hit"]
+    ranking = {"per_query_ids": ["hit", "miss"], "per_query_valid": [True, True], "per_query_ndcg": [1.0, 0.0]}
+    valid, scores, coverage = out._retrieval_query_outcomes(ids, ranking, "per_query_ndcg")
+    assert valid == [False, True, True] and scores == [0, 0, 1]
+    assert coverage["unscored_query_ids"] == ["unjudged"]
+    assert coverage["n_queries"] == 3 and coverage["n_valid_queries"] == 2
+
+    def record(valid_flags, parts):
+        return out._build_record(
+            package="fast-pplx", category=1, config_label="gpu", benchmark="retrieval",
+            valid_flags=valid_flags, item_scores=scores, wall_sec=1.0, diagnostics={},
+            memory_4bucket_gb={}, sub_benchmarks=parts, host_mem_gb=48.0,
+        )
+
+    complete = record([True] * 3, {})
+    partial = record(valid, {"short": coverage})
+    assert complete["gate_verdict"] == "PASS"
+    assert partial["retrieval_coverage_status"] == "INCOMPLETE" and partial["gate_verdict"] == "FAIL"
+    assert record([True] * 3, {"isolated": coverage})["gate_verdict"] == "FAIL"
+    repeated = out._aggregate_abba_records([[complete], [partial]])[0]
+    assert repeated["gate_verdict"] == "FAIL" and repeated["incomplete_retrieval_repeats"] == [2]
+
+    monkeypatch.setattr(out, "_hw_lock", out._null_ctx)
+    monkeypatch.setattr(out, "_spawn_isolated_worker", lambda **kw: [partial])
+    assert out.main(["run", "--packages", "fast-pplx", "--allow-contended"]) == 1
+    assert "2/3" in capsys.readouterr().out
+
+    report = tmp_path / "archive.json"
+    # Legacy snapshots could report PASS even for incomplete retrieval.
+    report.write_text(json.dumps({"results": [dict(partial, gate_verdict="PASS")]}))
+    assert out.main(["compare", str(report), str(report)]) == 1
+    assert json.loads(capsys.readouterr().out)["comparisons"][0]["retrieval_coverage_pass"] is False
+
+    # Same counts with a different query order cannot establish paired non-inferiority.
+    _, _, ordered = out._retrieval_query_outcomes(["hit", "miss"], ranking, "per_query_ndcg")
+    _, _, reordered = out._retrieval_query_outcomes(["miss", "hit"], ranking, "per_query_ndcg")
+    assert ordered["ordered_query_ids_sha256"] != reordered["ordered_query_ids_sha256"]
+    a, b = [record([True] * 3, {"short": c}) for c in (ordered, reordered)]
+    changed = out.evaluate_promotion_gates(a, b)
+    assert changed.verdict == "FAIL" and changed.quality_status == "UNRESOLVED" and changed.n_paired == 0
 
 
 def test_capabilities_suite_dry_run_and_formatting(capsys: pytest.CaptureFixture[str]) -> None:
@@ -161,6 +222,121 @@ def test_capabilities_suite_dry_run_and_formatting(capsys: pytest.CaptureFixture
     )
     assert "`prefix-tree`" in md
     assert "`2.59x`" in md
+
+
+def test_mtp_counts_each_timed_arm_and_preserves_per_prompt_agreement(tmp_path, monkeypatch):
+    cap = _load_script("capability_mtp_counts", "benchmark_capabilities.py")
+    clock = [0.0]
+    monkeypatch.setattr(cap, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+
+    class Engine:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate_batch(self, prompts, *, speculative, **kwargs):
+            clock[0] += 1.0 if speculative else 2.0
+            items = [SimpleNamespace(token_ids=[1] if speculative and i % 2 else [1, 2]) for i in range(len(prompts))]
+            return SimpleNamespace(items=items)
+
+        def close(self):
+            pass
+
+    fixture = ("system", "schema", list("abcd"))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.cli", SimpleNamespace(_load_fixture_dataset=lambda _: fixture))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.engine", SimpleNamespace(FastGemma4Engine=Engine))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.mtp_drafter", SimpleNamespace(resolve_mtp_drafter_dir=lambda **kw: tmp_path))
+    monkeypatch.setitem(sys.modules, "fast_gemma4.paths", SimpleNamespace(resolve_paths=lambda home: home))
+    monkeypatch.setattr(cap, "resolve_pkg_home", lambda *args: tmp_path)
+    monkeypatch.setattr(cap, "get_unified_memory_footprint", lambda: {"peak_footprint_gb": 1})
+    args = SimpleNamespace(abba_rounds=1, public_python=str(tmp_path / "missing"))
+    result = cap._run_mtp_speculative(args)
+    assert result["greedy_exact_token_matches"] == "6/10"
+    assert result["speedup_vs_stock"] is None and result["b4_speedup_vs_stock"] is None
+    four = result["workloads"]["json_b4"]
+    assert four["ar_output_tokens"] == 8 and four["mtp_output_tokens"] == four["total_out_tokens"] == 6
+    assert four["ar_tok_s"] == 4 and four["mtp_tok_s"] == 6
+    assert four["elapsed_speedup_vs_ar"] == four["speedup_vs_ar"] == 2
+    assert four["token_rate_ratio_vs_ar"] == 1.5
+    assert four["exact_output_by_prompt"] == [True, False, True, False]
+    assert len(four["samples"]["mtp"]) == 2
+
+    stock_python = tmp_path / "stock"
+    stock_python.touch()
+    args.public_python = str(stock_python)
+    receipt = {"status": "ok", "json_b1_tok_s": 1, "json_b4_tok_s": 3,
+               "json_b1": {"median_seconds": 3}, "json_b4": {"median_seconds": 4}}
+    monkeypatch.setattr(cap.subprocess, "run", lambda *args, **kw: SimpleNamespace(returncode=0, stdout=json.dumps(receipt)))
+    result = cap._run_mtp_speculative(args)
+    assert result["b4_speedup_vs_stock"] == result["workloads"]["json_b4"]["token_rate_ratio_vs_stock"] == 2
+    assert result["workloads"]["json_b4"]["elapsed_speedup_vs_stock"] == 4
+
+
+def test_decoding_reports_missing_counts_and_short_batches():
+    cap = _load_script("capability_token_count_failures", "benchmark_capabilities.py")
+    assert cap._stock_generated_token_count(SimpleNamespace(generation_tokens=12), 1) == 12
+    assert cap._stock_generated_token_count(SimpleNamespace(texts=["a", "b"], generation_tokens=[2, 3]), 2) == 5
+    assert cap._stock_generated_token_count(SimpleNamespace(texts=["a", "b"], stats=SimpleNamespace(generation_tokens=7)), 2) == 7
+    with pytest.raises(ValueError, match="generated-token count"):
+        cap._stock_generated_token_count(SimpleNamespace(text="an ambiguous token count"), 1)
+    with pytest.raises(ValueError, match="number of completions"):
+        cap._stock_generated_token_count(SimpleNamespace(texts=["short"]), 2)
+    with pytest.raises(ValueError, match="1 completions for 2"):
+        result = SimpleNamespace(items=[SimpleNamespace(token_ids=[1])])
+        cap._measure_mtp_pair(lambda: result, lambda: result, batch_size=2, rounds=1)
+
+
+def test_qlora_report_checks_targets_and_distinguishes_repeated_inputs():
+    cap = _load_script("capability_training_counts", "benchmark_capabilities.py")
+    original = [([1, 2, 3, 4, 5], 2), ([1, 2, 8, 9], 3)]
+    run = {"examples": 2, "supervised_tokens": 4, "logical_input_tokens": 7,
+           "optimizer_steps": 2, "elapsed_seconds": 2, "peak_gb": 1.0}
+    stock = cap._qlora_regime_report(original, [run, run], prompt_copies=1, pack_tokens=0)
+    packed = cap._qlora_regime_report(original, [{**run, "optimizer_steps": 1}], prompt_copies=1, pack_tokens=2048)
+    repeated = [([1, 1, 1, 1, 2, 3, 4, 5], 5)]
+    shared_run = dict(run, examples=1, supervised_tokens=3, logical_input_tokens=7, optimizer_steps=1)
+    shared = cap._qlora_regime_report(repeated, [shared_run], prompt_copies=4, pack_tokens=2048)
+    assert stock["input_ids_and_prompt_lengths_sha256"] == packed["input_ids_and_prompt_lengths_sha256"]
+    assert shared["input_ids_and_prompt_lengths_sha256"] != packed["input_ids_and_prompt_lengths_sha256"]
+    assert stock["supervised_tokens_per_sec"] == 2 and stock["examples_per_sec"] == 1
+    assert stock["tok_s"] == 3.5 and stock["elapsed_seconds"] == 2
+    assert stock["optimizer_steps_per_pass"] == [2, 2] and packed["optimizer_steps_per_pass"] == [1]
+    assert shared["examples"] == 1 and shared["system_instruction_copies"] == 4
+    with pytest.raises(ValueError, match="QLoRA pass trained on"):
+        cap._qlora_regime_report(original, [{**run, "supervised_tokens": 7}], prompt_copies=1, pack_tokens=0)
+
+
+def test_parallel_coreml_reports_failed_predictions_and_changed_vectors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+
+    import numpy as np
+
+    cap = _load_script("test_parallel_coreml_capability", "benchmark_capabilities.py")
+    weights = tmp_path / "artifacts" / "weights" / "bge_small_f16.npz"
+    weights.parent.mkdir(parents=True)
+    weights.touch()
+    monkeypatch.setattr(cap, "resolve_pkg_home", lambda *_: tmp_path)
+    monkeypatch.setattr(cap.subprocess, "check_call", lambda *a, **kw: 0)
+    monkeypatch.setattr(cap, "get_unified_memory_footprint", lambda: {"peak_footprint_gb": 1.0})
+    args = argparse.Namespace(abba_rounds=1)
+
+    def failed_prediction(*_args):
+        raise AttributeError("embedding call unavailable")
+
+    monkeypatch.setattr(cap, "_predict_bge_buckets", failed_prediction)
+    failed = cap._run_parallel_coreml(args)
+    assert failed["status"] == "failed"
+    assert "embedding call unavailable" in failed["embedding_comparison"]["reason"]
+    assert "min_cosine" not in failed["embedding_comparison"]
+
+    def changed_prediction(_home, build):
+        vector = [0, 1] if build.name.endswith("j4") else [1, 0]
+        return {"example.mlmodelc": np.array([vector], dtype=np.float32)}
+
+    monkeypatch.setattr(cap, "_predict_bge_buckets", changed_prediction)
+    changed = cap._run_parallel_coreml(args)
+    assert changed["status"] == "failed"
+    assert changed["embedding_comparison"]["min_cosine"] == 0.0
+    assert changed["embedding_comparison"]["all_bit_identical"] is False
 
 
 def test_coreai_subprocess_client_preamble_and_telemetry_cpu(tmp_path: Path) -> None:

@@ -776,151 +776,15 @@ elif pkg == "fast-gpt-oss":
         }), flush=True)
 
 elif pkg == "fast-decision-models":
-    kev_8bit_snap = resolve_hf_snapshot("AbstractFramework/kev-0.8b-mlx-8bit")
-    kev_dir = resolved_home / "artifacts" / "kev_08b"
-    if kev_8bit_snap is None and not (kev_dir / "model.safetensors").is_file():
-        skip(f"missing AbstractFramework/kev-0.8b-mlx-8bit and BF16 kev_08b weights at {kev_dir}")
-    try:
-        import mlx.core as mx
-        import mlx_lm
-        from mlx_lm.models import qwen3_5
+    sys.path.insert(0, cfg["scripts_dir"])
+    from _kev_benchmark import stock_short_probe
 
+    try:
         with mlx_wired_scope(use_wired):
-            t0 = time.perf_counter()
-            if kev_8bit_snap is not None:
-                mdl, _ = mlx_lm.load(str(kev_8bit_snap))
-                rt_lbl = "stock-mlx_lm-kev-8bit"
-            else:
-                meta = json.loads((kev_dir / "kev_meta.json").read_text(encoding="utf-8"))
-                raw = mx.load(str(kev_dir / "model.safetensors"))
-                margs = qwen3_5.ModelArgs.from_dict({"text_config": meta["text_config"]})
-                lm_w = {(k if k.startswith("language_model.") else f"language_model.{k}"): v for k, v in raw.items() if not k.startswith("pointer_head.")}
-                mdl = qwen3_5.Model(margs)
-                if hasattr(mdl, "sanitize"):
-                    lm_w = mdl.sanitize(lm_w)
-                mdl.load_weights(list(lm_w.items()), strict=False)
-                mx.eval(mdl.parameters())
-                mdl.eval()
-                del raw, lm_w
-                rt_lbl = "stock-mlx_lm-qwen3_5-bf16"
-            load_s = time.perf_counter() - t0
-
-            backbone = mdl.language_model.model if hasattr(mdl, "language_model") else mdl.model
-            seq_len = 96
-            x_b1 = mx.random.randint(10, 2000, (1, seq_len), dtype=mx.int32)
-            x_b8 = mx.random.randint(10, 2000, (8, seq_len), dtype=mx.int32)
-            mx.reset_peak_memory()
-
-            def _sync_q(_):
-                if hasattr(mx, "synchronize"):
-                    mx.synchronize()
-
-            def _run_b1():
-                out = None
-                for _ in range(4):
-                    out = backbone(x_b1)
-                    mx.eval(out)
-                return out
-
-            def _run_b8():
-                out = None
-                for _ in range(4):
-                    out = backbone(x_b8)
-                    mx.eval(out)
-                return out
-
-            abba = run_abba_pair(_run_b1, _run_b8, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_q, use_mlx_abba=True)
-            dt_b1 = abba["a_median_s"] / 4.0
-            dt_b8 = abba["b_median_s"] / 4.0
-            b1_qs = 1.0 / max(dt_b1, 1e-9)
-            b8_qs = 8.0 / max(dt_b8, 1e-9)
-            fp_gb, rss_gb = footprint_gb()
-            print(json.dumps({
-                "status": "ok",
-                "runtime": rt_lbl,
-                "timing_order": abba["order"],
-                "b1_drift": abba["a_drift"],
-                "b8_drift": abba["b_drift"],
-                "b1_q_per_sec": round(b1_qs, 2),
-                "q_per_sec": round(b8_qs, 2),
-                "ms_per_question": round((dt_b8 * 1000.0) / 8.0, 2),
-                "peak_active_gb": round(float(mx.get_peak_memory()) / 1e9, 4),
-                "peak_footprint_gb": fp_gb,
-                "rss_gb": rss_gb,
-                "load_s": round(load_s, 3),
-                "highlight": f"{rt_lbl} B=8: {b8_qs:.2f} q/s ({(dt_b8 * 1000.0) / 8.0:.2f} ms/q; B=1 {b1_qs:.2f} q/s)",
-            }), flush=True)
-            raise SystemExit(0)
-    except Exception:
-        pass
-    meta_path = kev_dir / "kev_meta.json"
-    if not meta_path.is_file():
-        skip(f"missing kev_meta.json at {kev_dir}")
-    try:
-        import torch
-        from safetensors.torch import load_file
-        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
-    except Exception as exc:
-        skip(f"torch+transformers Qwen3_5 unavailable ({exc})")
-    if not torch.backends.mps.is_available():
-        skip("torch MPS unavailable")
-
-    t0 = time.perf_counter()
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    cfg = Qwen3_5TextConfig(**meta["text_config"])
-    sd = load_file(str(kev_dir / "model.safetensors"))
-    clean_sd = {}
-    for k, v in sd.items():
-        if k.startswith("pointer_head."):
-            continue
-        if k.endswith("linear_attn.conv1d.weight") and v.ndim == 3 and v.shape[-1] == 1:
-            v = v.transpose(1, 2).contiguous()
-        clean_sd[k] = v
-    full_model = Qwen3_5ForCausalLM(cfg).to(dtype=torch.bfloat16)
-    full_model.load_state_dict(clean_sd, strict=False)
-    model = full_model.model.to("mps").eval()
-    del full_model, sd, clean_sd
-    torch.mps.synchronize()
-    load_s = time.perf_counter() - t0
-    seq_len = 96
-    with torch.inference_mode():
-        x_b1 = torch.randint(10, 2000, (1, seq_len), device="mps", dtype=torch.long)
-        m_b1 = torch.ones_like(x_b1)
-        x_b8 = torch.randint(10, 2000, (8, seq_len), device="mps", dtype=torch.long)
-        m_b8 = torch.ones_like(x_b8)
-
-        def _sync_mps(_):
-            torch.mps.synchronize()
-
-        def _run_b1():
-            for _ in range(4):
-                _ = model(input_ids=x_b1, attention_mask=m_b1, use_cache=False)
-
-        def _run_b8():
-            for _ in range(4):
-                _ = model(input_ids=x_b8, attention_mask=m_b8, use_cache=False)
-
-        abba = run_abba_pair(_run_b1, _run_b8, rounds=2, cooldown_sec=cooldown_sec, sync_fn=_sync_mps, use_mlx_abba=False)
-        dt_b1 = abba["a_median_s"] / 4.0
-        dt_b8 = abba["b_median_s"] / 4.0
-    b1_qs = 1.0 / max(dt_b1, 1e-9)
-    b8_qs = 8.0 / max(dt_b8, 1e-9)
-    fp_gb, rss_gb = footprint_gb()
-    print(json.dumps({
-        "status": "ok",
-        "runtime": "transformers-mps-bf16",
-        "timing_order": abba["order"],
-        "b1_drift": abba["a_drift"],
-        "b8_drift": abba["b_drift"],
-        "b1_q_per_sec": round(b1_qs, 2),
-        "q_per_sec": round(b8_qs, 2),
-        "ms_per_question": round((dt_b8 * 1000.0) / 8.0, 2),
-        "peak_active_gb": round(float(torch.mps.current_allocated_memory()) / 1e9, 4),
-        "peak_footprint_gb": fp_gb,
-        "rss_gb": rss_gb,
-        "load_s": round(load_s, 3),
-        "highlight": f"transformers-mps B=8: {b8_qs:.2f} q/s ({(dt_b8 * 1000.0) / 8.0:.2f} ms/q; B=1 {b1_qs:.2f} q/s)",
-    }), flush=True)
+            result = stock_short_probe(resolved_home / "artifacts" / "kev_08b", run_abba_pair, cooldown_sec)
+    except (ImportError, FileNotFoundError) as exc:
+        skip(str(exc))
+    print(json.dumps(result, allow_nan=False), flush=True)
 elif pkg.startswith("coreml-"):
     sys.path.insert(0, cfg["scripts_dir"])
     from _coreml_bench import run_coreml_benchmark

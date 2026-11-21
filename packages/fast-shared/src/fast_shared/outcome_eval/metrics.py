@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+DEFAULT_LOSSLESS_TOLERANCE = 0.003
+
 
 @dataclass(frozen=True)
 class OutcomeSummary:
@@ -193,14 +195,19 @@ def compute_corpus_outcome_metrics(
 class GateEvaluation:
     """Two-Gate + Memory Ceiling promotion verdict for a candidate vs baseline."""
 
-    verdict: str  # "PASS" or "FAIL"
+    verdict: str  # PASS, FAIL, or UNRESOLVED
     profile: str  # "lossless" or "quantized"
     gate1_quality_pass: bool
     gate2_memory_pass: bool
     gate3_eot_pass: bool
-    delta_objective_score_e2e: float
+    quality_status: str
+    retrieval_coverage_pass: bool | None
+    delta_objective_score_e2e: float | None
     quality_floor: float
-    se_paired: float
+    n_paired: int
+    se_paired: float | None
+    ci95_low: float | None
+    ci95_high: float | None
     eot_ratio: float
     min_eot_ratio: float
     memory_ceiling_gb: float | None
@@ -214,9 +221,15 @@ class GateEvaluation:
             "gate1_quality_pass": bool(self.gate1_quality_pass),
             "gate2_memory_pass": bool(self.gate2_memory_pass),
             "gate3_eot_pass": bool(self.gate3_eot_pass),
-            "delta_objective_score_e2e": round(float(self.delta_objective_score_e2e), 6),
+            "quality_status": self.quality_status,
+            "retrieval_coverage_pass": self.retrieval_coverage_pass,
+            "delta_objective_score_e2e": round(self.delta_objective_score_e2e, 6)
+            if self.delta_objective_score_e2e is not None else None,
             "quality_floor": round(float(self.quality_floor), 6),
-            "se_paired": round(float(self.se_paired), 6),
+            "n_paired": self.n_paired,
+            "se_paired": round(self.se_paired, 6) if self.se_paired is not None else None,
+            "ci95_low": round(self.ci95_low, 6) if self.ci95_low is not None else None,
+            "ci95_high": round(self.ci95_high, 6) if self.ci95_high is not None else None,
             "eot_ratio": round(float(self.eot_ratio), 4),
             "min_eot_ratio": round(float(self.min_eot_ratio), 4),
             "memory_ceiling_gb": round(float(self.memory_ceiling_gb), 3)
@@ -254,11 +267,53 @@ def evaluate_memory_gate(
     return (len(reasons) == 0), ceiling_gb, combined_gb, reasons
 
 
+def retrieval_coverage_errors(record: Mapping[str, Any]) -> list[str]:
+    """Check intended query counts, including optional component results and repeated runs."""
+    if record.get("category") != 1:
+        return []
+    intended, valid = record.get("n_items"), record.get("n_valid")
+    errors = []
+    if intended is None or valid is None:
+        errors.append("retrieval coverage unavailable: intended and valid query counts are required")
+    elif intended <= 0 or valid != intended:
+        errors.append(f"retrieval coverage: {valid}/{intended} intended queries produced usable results")
+    for name, sub in (record.get("sub_benchmarks") or {}).items():
+        if "n_valid_queries" in sub and (not sub.get("n_queries") or sub["n_valid_queries"] != sub["n_queries"]):
+            errors.append(f"{name} retrieval coverage: {sub['n_valid_queries']}/{sub.get('n_queries')} queries")
+    if record.get("incomplete_retrieval_repeats"):
+        errors.append(f"incomplete retrieval repeats: {record['incomplete_retrieval_repeats']}")
+    return errors
+
+
+def _paired_score_evidence(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any],
+    base_items: Sequence[float] | None, cand_items: Sequence[float] | None,
+) -> dict[str, float | int] | None:
+    arrays = []
+    for record, items in ((baseline, base_items), (candidate, cand_items)):
+        if items is None:
+            items = record.get("per_item_effective_scores")
+        if items is None:
+            return None
+        scores = np.asarray(items, dtype=np.float64)
+        if scores.ndim != 1 or scores.size < 2 or scores.size != record.get("n_items", scores.size):
+            return None
+        # Stored item scores and headlines are rounded independently to six decimal places.
+        mean = record.get("objective_score_e2e")
+        if mean is None or not np.all(np.isfinite(scores)) or not math.isclose(float(scores.mean()), mean, abs_tol=2e-6):
+            return None
+        arrays.append(scores)
+    if arrays[0].shape != arrays[1].shape:
+        return None
+    return compute_paired_se(*arrays)
+
+
 def evaluate_promotion_gates(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
     *,
     profile: str = "lossless",
+    lossless_tolerance: float = DEFAULT_LOSSLESS_TOLERANCE,
     min_eot_ratio: float = 1.0,
     host_mem_gb: float | None = None,
     max_host_fraction: float = 0.80,
@@ -268,7 +323,8 @@ def evaluate_promotion_gates(
     """Apply the Two-Gate + Unified-Memory Promotion Contract.
 
     Profiles:
-      - ``lossless``: ``delta_S >= -max(0.003, 1.96 * SE_paired)`` and ``repeat_loop_count == 0``.
+      - ``lossless``: the paired 95% lower bound clears the fixed score-loss tolerance and there are no repeat loops.
+        Missing pairs or an interval crossing the floor leave non-inferiority unresolved.
       - ``quantized``: ``delta_S >= -0.010`` and ``mask_fallback_rate <= max(0.005, 2.0 * base_fb_rate)``.
     Memory Gate:
       - ``combined_with_model_mapped_gb <= 0.80 * host_mem_gb`` and ``device_guard_tripped == False``.
@@ -279,17 +335,20 @@ def evaluate_promotion_gates(
     if prof not in ("lossless", "quantized"):
         raise ValueError(f"Unsupported gate profile={profile!r}; expected 'lossless' or 'quantized'")
 
+    if not 0.0 <= lossless_tolerance <= 1.0:
+        raise ValueError("lossless_tolerance must be a fixed score difference in [0, 1]")
+
     reasons: list[str] = []
+    base_s = baseline.get("objective_score_e2e")
+    cand_s = candidate.get("objective_score_e2e")
+    delta_s = float(cand_s) - float(base_s) if base_s is not None and cand_s is not None else math.nan
 
-    base_s = float(baseline.get("objective_score_e2e", 0.0))
-    cand_s = float(candidate.get("objective_score_e2e", 0.0))
-    delta_s = cand_s - base_s
-
-    if base_effective_scores is not None and cand_effective_scores is not None:
-        paired = compute_paired_se(base_effective_scores, cand_effective_scores)
-        se_paired = float(paired["se_paired"])
-    else:
-        se_paired = float(candidate.get("se_paired_vs_baseline") or 0.0)
+    base_ids = baseline.get("retrieval_query_order_sha256")
+    cand_ids = candidate.get("retrieval_query_order_sha256")
+    different_queries = bool(base_ids and cand_ids and base_ids != cand_ids)
+    paired = None if different_queries else _paired_score_evidence(
+        baseline, candidate, base_effective_scores, cand_effective_scores,
+    )
 
     base_diag = baseline.get("diagnostics") if isinstance(baseline.get("diagnostics"), Mapping) else {}
     cand_diag = candidate.get("diagnostics") if isinstance(candidate.get("diagnostics"), Mapping) else {}
@@ -298,26 +357,57 @@ def evaluate_promotion_gates(
     cand_fb = float(cand_diag.get("mask_fallback_rate", 0.0) or 0.0)
 
     # Gate 1: Objective Quality Non-Inferiority
-    g1_ok = True
+    quality_floor = -lossless_tolerance if prof == "lossless" else -0.010
+    # A score exactly on the floor passes despite floating-point subtraction roundoff.
+    threshold = quality_floor - 1e-12
+    quality_status = "PASS"
+    if not math.isfinite(delta_s):
+        quality_status = "UNRESOLVED"
+        reasons.append("Gate1 quality unresolved: finite baseline and candidate scores are required")
+    elif different_queries:
+        quality_status = "UNRESOLVED"
+        reasons.append("Gate1 quality unresolved: intended query IDs or order differ between runs")
+    elif prof == "lossless":
+        if paired is None:
+            quality_status = "UNRESOLVED"
+            reasons.append("Gate1(lossless) quality unresolved: complete paired scores for at least two items "
+                           "must match both reported means")
+        elif paired["ci95_high"] < threshold:
+            quality_status = "FAIL"
+            reasons.append(f"Gate1(lossless) quality regression: paired 95% upper bound "
+                           f"{paired['ci95_high']:+.4f} < fixed floor {quality_floor:+.4f}")
+        elif paired["ci95_low"] < threshold:
+            quality_status = "UNRESOLVED"
+            reasons.append(f"Gate1(lossless) quality unresolved: paired 95% interval "
+                           f"[{paired['ci95_low']:+.4f}, {paired['ci95_high']:+.4f}] crosses fixed floor {quality_floor:+.4f}")
+    elif delta_s < threshold:
+        quality_status = "FAIL"
+        reasons.append(f"Gate1(quantized) quality regression: delta_S={delta_s:+.4f} < floor {quality_floor:+.4f}")
+
+    diagnostics_ok = True
     if prof == "lossless":
-        quality_floor = -max(0.003, 1.96 * se_paired)
-        if delta_s < quality_floor:
-            g1_ok = False
-            reasons.append(f"Gate1(lossless) quality regression: delta_S={delta_s:+.4f} < floor {quality_floor:+.4f}")
         if repeat_loops > 0:
-            g1_ok = False
+            diagnostics_ok = False
             reasons.append(f"Gate1(lossless) repeat_loop_count={repeat_loops} > 0")
     else:
-        quality_floor = -0.010
-        if delta_s < quality_floor:
-            g1_ok = False
-            reasons.append(f"Gate1(quantized) quality regression: delta_S={delta_s:+.4f} < floor -0.0100")
         fb_limit = max(0.005, 2.0 * base_fb)
         if cand_fb > fb_limit:
-            g1_ok = False
+            diagnostics_ok = False
             reasons.append(
                 f"Gate1(quantized) mask_fallback_rate={cand_fb:.4f} > limit {fb_limit:.4f} (baseline={base_fb:.4f})"
             )
+    g1_ok = quality_status == "PASS" and diagnostics_ok
+
+    coverage_ok = None
+    if baseline.get("category") == 1 or candidate.get("category") == 1:
+        coverage_errors = [
+            f"{arm} {error}" for arm, rec in (("baseline", baseline), ("candidate", candidate))
+            for error in retrieval_coverage_errors(rec)
+        ]
+        if baseline.get("n_items") != candidate.get("n_items") or different_queries:
+            coverage_errors.append("retrieval comparison requires the same intended queries")
+        coverage_ok = not coverage_errors
+        reasons.extend(coverage_errors)
 
     # Gate 2: Unified Memory Headroom
     mem_map = candidate.get("memory_4bucket_gb") if isinstance(candidate.get("memory_4bucket_gb"), Mapping) else None
@@ -343,16 +433,21 @@ def evaluate_promotion_gates(
             f"Gate3(EOT) ratio={eot_ratio:.4f} ({cand_eot:.4f} / {base_eot:.4f}) < required {float(min_eot_ratio):.4f}"
         )
 
-    verdict = "PASS" if (g1_ok and g2_ok and g3_ok) else "FAIL"
+    verdict = quality_status if diagnostics_ok and g2_ok and g3_ok and coverage_ok is not False else "FAIL"
     return GateEvaluation(
         verdict=verdict,
         profile=prof,
         gate1_quality_pass=g1_ok,
         gate2_memory_pass=g2_ok,
         gate3_eot_pass=g3_ok,
-        delta_objective_score_e2e=delta_s,
+        quality_status=quality_status,
+        retrieval_coverage_pass=coverage_ok,
+        delta_objective_score_e2e=delta_s if math.isfinite(delta_s) else None,
         quality_floor=quality_floor,
-        se_paired=se_paired,
+        n_paired=int(paired["n_paired"]) if paired else 0,
+        se_paired=float(paired["se_paired"]) if paired else None,
+        ci95_low=float(paired["ci95_low"]) if paired else None,
+        ci95_high=float(paired["ci95_high"]) if paired else None,
         eot_ratio=eot_ratio if math.isfinite(eot_ratio) else 0.0,
         min_eot_ratio=float(min_eot_ratio),
         memory_ceiling_gb=ceiling_gb,
@@ -362,6 +457,7 @@ def evaluate_promotion_gates(
 
 
 __all__ = [
+    "DEFAULT_LOSSLESS_TOLERANCE",
     "GateEvaluation",
     "OutcomeSummary",
     "compute_corpus_outcome_metrics",
@@ -371,4 +467,5 @@ __all__ = [
     "compute_unpaired_se",
     "evaluate_memory_gate",
     "evaluate_promotion_gates",
+    "retrieval_coverage_errors",
 ]

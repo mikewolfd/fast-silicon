@@ -762,16 +762,19 @@ def extract_public_comparison(
 
     if pkg_name == "fast-decision-models" and isinstance(parsed, dict):
         fast_kev = parsed.get("kev_08b")
-        fast_laya = parsed.get("laya_ane")
         pub_qs = float(public_res.get("q_per_sec", 0.0))
-        if isinstance(fast_kev, dict) and pub_qs > 0:
+        scored = public_res.get("b8_scores", [])
+        if not isinstance(scored, list) or not scored or not all(
+            isinstance(row, dict)
+            and isinstance(row.get("probabilities"), list) and row["probabilities"]
+            and isinstance(row.get("logits"), list) and len(row["logits"]) == len(row["probabilities"])
+            for row in scored
+        ):
+            return "Full stock decision scores unavailable"
+        if (isinstance(fast_kev, dict) and pub_qs > 0 and fast_kev.get("batch_docs") == 8
+                and fast_kev.get("n_questions") == public_res.get("n_questions") == len(scored)):
             fq = float(fast_kev["q_per_sec"])
-            dfp = float(bench_res.get("peak_footprint_gb", 0.0)) - float(public_res.get("peak_footprint_gb", 0.0))
-            laya_note = ""
-            if isinstance(fast_laya, dict) and float(fast_laya.get("q_per_sec", 0.0)) > 0:
-                lq = float(fast_laya["q_per_sec"])
-                laya_note = f"; laya_ane {lq / pub_qs:.2f}x"
-            return f"vs {rt}: {fq / pub_qs:.2f}x ({fq:.1f} vs {pub_qs:.1f} q/s, dFP={dfp:+.2f}GB{laya_note})"
+            return f"Kev vs {rt}: {fq / pub_qs:.2f}x ({fq:.1f} vs {pub_qs:.1f} completed questions/s)"
         return str(public_res.get("highlight", rt))
 
     return str(public_res.get("highlight", rt))

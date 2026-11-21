@@ -4,11 +4,63 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
 from .metrics import compute_paired_se
+
+
+@dataclass
+class PplxWindow:
+    doc_index: int
+    has_anchor: bool
+    chunks: list[str]
+
+
+def plan_pplx_windows(
+    documents: Sequence[Sequence[str]], max_length: int, token_count: Callable[[str], int],
+) -> list[PplxWindow]:
+    """Use the same source chunks and repeated header in both Tier-1 and Tier-2 PPLX benchmark arms."""
+    budget = max(512, max_length - 64)
+    windows = []
+    for doc_index, chunks in enumerate(documents):
+        if not chunks:
+            continue
+        sizes = [token_count(chunk) + 2 for chunk in chunks]
+        current = [chunks[0]]
+        used = sizes[0]
+        anchor = chunks[0][:2048]
+        anchor_size = sizes[0] if anchor == chunks[0] else token_count(anchor) + 2
+        has_anchor = False
+        for chunk, size in zip(chunks[1:], sizes[1:], strict=True):
+            if used + size > budget:
+                windows.append(PplxWindow(doc_index, has_anchor, current))
+                current, used, has_anchor = [anchor], anchor_size, True
+            current.append(chunk)
+            used += size
+        windows.append(PplxWindow(doc_index, has_anchor, current))
+    return windows
+
+
+def collect_pplx_window_vectors(
+    windows: Sequence[PplxWindow], matrices: Iterable[np.ndarray], n_docs: int,
+) -> list[np.ndarray]:
+    """Restore source chunk order and remove the header duplicated into continuation windows."""
+    parts: list[list[np.ndarray]] = [[] for _ in range(n_docs)]
+    for window, mat in zip(windows, matrices, strict=True):
+        if mat.ndim != 2 or mat.shape[0] != len(window.chunks):
+            raise ValueError(f"Expected {len(window.chunks)} contextual chunk vectors, got shape {mat.shape}")
+        parts[window.doc_index].append(mat[1:] if window.has_anchor else mat)
+    result = []
+    for group in parts:
+        if not group:
+            result.append(np.zeros((0, 1024), dtype=np.float32))
+        elif len(group) == 1:
+            result.append(group[0])
+        else:
+            result.append(np.concatenate(group))
+    return result
 
 
 def check_embedding_validity(
@@ -149,6 +201,7 @@ def evaluate_retrieval_rankings(
         d_f64 = np.where(d_valid_all[:, None], d_f64, 0.0)
 
     n_docs = len(doc_ids)
+    available_doc_ids = set(doc_ids)
     eff_k = min(int(k), n_docs)
 
     eval_indices: list[int] = []
@@ -165,7 +218,7 @@ def evaluate_retrieval_rankings(
         eval_qids.append(qid)
         pos_qrels_list.append(pos)
 
-    if not eval_indices or n_docs == 0:
+    if not eval_indices:
         return {
             "k": int(k),
             "n_queries": 0,
@@ -197,7 +250,8 @@ def evaluate_retrieval_rankings(
             q_pos = start + loc_i
             pos_map = pos_qrels_list[q_pos]
             row_sim = sims[loc_i]
-            row_ok = bool(q_valid_all[orig_i]) and all_docs_valid and bool(np.all(np.isfinite(row_sim)))
+            row_ok = (bool(q_valid_all[orig_i]) and all_docs_valid and pos_map.keys() <= available_doc_ids
+                      and bool(np.all(np.isfinite(row_sim))))
             if not row_ok:
                 per_valid.append(False)
                 per_ndcg.append(0.0)
@@ -422,7 +476,7 @@ def evaluate_legalbench_spans(
 
     n_chunks = len(chunks)
     eff_k = min(int(k), n_chunks)
-    if not queries or n_chunks == 0:
+    if not queries:
         return {
             "k": int(k),
             "n_queries": 0,
@@ -441,7 +495,7 @@ def evaluate_legalbench_spans(
         doc_to_chunk_indices.setdefault(ch.doc_id, []).append(ci)
 
     sims = q_f64 @ c_f64.T
-    all_chunks_valid = bool(np.all(c_valid_all))
+    all_chunks_valid = n_chunks > 0 and bool(np.all(c_valid_all))
     per_ids: list[str] = []
     per_valid: list[bool] = []
     per_ndcg: list[float] = []
@@ -500,7 +554,7 @@ def evaluate_legalbench_spans(
         idcg = dcg_at_k(ideal_rels, k)
         sndcg = (dcg_at_k(rels, k) / idcg) if idcg > 0.0 else 0.0
 
-        per_valid.append(True)
+        per_valid.append(idcg > 0.0)
         per_ndcg.append(sndcg)
         per_recall.append(char_rec)
 
@@ -545,14 +599,17 @@ def compute_contextual_lift(
 
 __all__ = [
     "CharSpanChunk",
+    "PplxWindow",
     "check_embedding_validity",
     "chunk_document_char_spans",
+    "collect_pplx_window_vectors",
     "compute_contextual_lift",
     "dcg_at_k",
     "evaluate_legalbench_spans",
     "evaluate_mrl_dtype_grid",
     "evaluate_retrieval_rankings",
     "merge_char_spans",
+    "plan_pplx_windows",
     "project_mrl_dtype",
     "span_overlap_length",
 ]

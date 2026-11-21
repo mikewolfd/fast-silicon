@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 import urllib.request
 
 import numpy as np
@@ -36,6 +37,7 @@ from fast_shared.bench import (
     wired_limit,
 )
 from fast_shared.outcome_eval import (
+    DEFAULT_LOSSLESS_TOLERANCE,
     CLINC150_DOMAINS,
     CLINC_STAGE1_DOMAINS,
     build_banking77_flat_qdef,
@@ -51,7 +53,6 @@ from fast_shared.outcome_eval import (
     compute_contextual_lift,
     compute_effective_item_scores,
     compute_outcome_metrics,
-    compute_paired_se,
     evaluate_bfcl_v3,
     evaluate_clinc_two_stage,
     evaluate_instruction_following,
@@ -66,6 +67,7 @@ from fast_shared.outcome_eval import (
     evaluate_promotion_gates,
     evaluate_ragtruth_noul,
     evaluate_retrieval_rankings,
+    retrieval_coverage_errors,
     evaluate_reward_bench_2,
     evaluate_structured_extraction,
     load_banking77,
@@ -352,7 +354,15 @@ def _build_record(
         host_mem_gb=host_mem_gb,
         device_guard_tripped=bool(diagnostics.get("device_guard_tripped", False)),
     )
-    reasons = list(mem_reasons)
+    coverage_errors = retrieval_coverage_errors({"category": category, **rec, "sub_benchmarks": sub_benchmarks})
+    if category == 1:
+        rec["retrieval_coverage_status"] = "INCOMPLETE" if coverage_errors else "COMPLETE"
+        query_groups = [(name, sub["ordered_query_ids_sha256"]) for name, sub in sub_benchmarks.items()
+                        if "ordered_query_ids_sha256" in sub]
+        if query_groups:
+            encoded = json.dumps(query_groups, separators=(",", ":")).encode("utf-8")
+            rec["retrieval_query_order_sha256"] = hashlib.sha256(encoded).hexdigest()
+    reasons = [*mem_reasons, *coverage_errors]
     if rec["n_valid"] <= 0:
         reasons.append("n_valid == 0 (all outputs failed validity checks)")
     rep_loops = int(diagnostics.get("repeat_loop_count", 0) or 0)
@@ -393,6 +403,9 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--categories", default="all")
     p.add_argument("--no-llguidance", action="store_true")
+    p.add_argument("--mlx-cache-limit-mb", type=int, help="Cap the isolated MLX worker allocation cache, in MiB")
+    p.add_argument("--gemma-vocab-out", type=int, help="Limit the project Gemma output vocabulary; the default uses the checkpoint head")
+    p.add_argument("--gemma-json-layout", choices=("fixed", "compact", "flexible"), default="fixed")
     p.add_argument("--reasoning-effort", default=None)
     p.add_argument("--coreai-variant", choices=("4bit", "fp4_fp8", "both"), default="both")
     ns, _ = p.parse_known_args(list(extra_args))
@@ -402,6 +415,31 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Category 1 Workers: fast-bge-small, fast-embeddinggemma-2, fast-pplx
 # ---------------------------------------------------------------------------
+
+
+def _retrieval_query_outcomes(
+    intended_ids: Sequence[str], result: Mapping[str, Any], score_key: str,
+) -> tuple[list[bool], list[float], dict[str, Any]]:
+    """Keep benchmark coverage on the selected queries even when a ranking metric skips an unjudged query."""
+    scored_rows = zip(result["per_query_valid"], result[score_key], strict=True)
+    by_id = dict(zip(result["per_query_ids"], scored_rows, strict=True))
+    if len(by_id) != len(result["per_query_ids"]) or len(set(intended_ids)) != len(intended_ids):
+        raise ValueError("Duplicate retrieval query IDs")
+    if by_id.keys() - set(intended_ids):
+        raise ValueError("Scored query outside the intended retrieval workload")
+    valid, scores = [], []
+    for qid in intended_ids:
+        ok, score = by_id.get(qid, (False, 0.0))
+        usable = bool(ok and np.isfinite(score))
+        valid.append(usable)
+        scores.append(float(score) if usable else 0.0)
+    id_bytes = json.dumps(list(intended_ids), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    details = {"n_queries": len(intended_ids), "n_valid_queries": sum(valid),
+               "ordered_query_ids_sha256": hashlib.sha256(id_bytes).hexdigest()}
+    omitted = [qid for qid in intended_ids if qid not in by_id]
+    if omitted:
+        details["unscored_query_ids"] = omitted
+    return valid, scores, details
 
 
 def _run_cat1_worker(
@@ -467,6 +505,9 @@ def _run_cat1_worker(
     lb_flat_chunks = [ch for did in lb_doc_ids for ch in lb_chunks_by_doc[did]]
     lb_queries = lb_pack["queries"]
     lb_q_texts = [q["query"] for q in lb_queries]
+    lb_q_ids = [q["id"] for q in lb_queries]
+    if not lb_queries or not lb_flat_chunks:
+        raise ValueError(f"LegalBench-RAG selected {len(lb_queries)} queries and {len(lb_flat_chunks)} chunks; both are required")
 
     mode = extra.mode
     nb_pre_normalized = True
@@ -535,61 +576,14 @@ def _run_cat1_worker(
         ctx_max_len = 4096 if tier == "tier1" else 16384
 
         def _enc_ctx(doc_groups: list[list[str]]) -> list[np.ndarray]:
-            # Partition oversized multi-thousand-token contracts into <= ctx_max_len windows
-            # (anchoring chunk[0] header/party context on continuation windows) so no chunk
-            # beyond ctx_max_len receives an empty truncated span (zero-norm vector).
-            chunk_tok_lens: list[list[int]] = []
-            flat_windows: list[list[str]] = []
-            window_meta: list[tuple[int, bool, int]] = []  # (doc_idx, has_anchor_prefix, n_real)
-            safe_budget = max(512, ctx_max_len - 64)
-            for d_idx, chunks in enumerate(doc_groups):
-                if not chunks:
-                    chunk_tok_lens.append([])
-                    continue
-                lens = [len(eng.tokenizer.encode(c)) + 2 for c in chunks]
-                chunk_tok_lens.append(lens)
-                if sum(lens) <= safe_budget or len(chunks) == 1:
-                    flat_windows.append(list(chunks))
-                    window_meta.append((d_idx, False, len(chunks)))
-                else:
-                    anchor_txt = chunks[0][:2048]
-                    anchor_len = len(eng.tokenizer.encode(anchor_txt)) + 2
-                    cur: list[str] = [chunks[0]]
-                    cur_tok = lens[0]
-                    has_anchor = False
-                    for c_txt, c_len in zip(chunks[1:], lens[1:]):
-                        if cur and (cur_tok + c_len > safe_budget):
-                            flat_windows.append(cur)
-                            window_meta.append((d_idx, has_anchor, len(cur) - (1 if has_anchor else 0)))
-                            cur = [anchor_txt, c_txt]
-                            cur_tok = anchor_len + c_len
-                            has_anchor = True
-                        else:
-                            cur.append(c_txt)
-                            cur_tok += c_len
-                    if cur:
-                        flat_windows.append(cur)
-                        window_meta.append((d_idx, has_anchor, len(cur) - (1 if has_anchor else 0)))
+            from fast_shared.outcome_eval.retrieval import collect_pplx_window_vectors, plan_pplx_windows
 
-            win_mats = (
-                eng.encode_contextual_chunks(
-                    flat_windows, max_length=ctx_max_len, mode=eff_mode, output_dtype="float32", normalize=True
-                )
-                if flat_windows
-                else []
+            windows = plan_pplx_windows(doc_groups, ctx_max_len, lambda text: len(eng.tokenizer.encode(text)))
+            matrices = eng.encode_contextual_chunks(
+                [w.chunks for w in windows], max_length=ctx_max_len, mode=eff_mode, output_dtype="float32", normalize=True
             )
-            per_doc_parts: list[list[np.ndarray]] = [[] for _ in doc_groups]
-            for (d_idx, has_anchor, _n_real), mat in zip(window_meta, win_mats):
-                per_doc_parts[d_idx].append(mat[1:] if has_anchor else mat)
-            out_mats: list[np.ndarray] = []
-            for d_idx, parts in enumerate(per_doc_parts):
-                if not parts:
-                    out_mats.append(np.zeros((0, 1024), dtype=np.float32))
-                elif len(parts) == 1:
-                    out_mats.append(parts[0])
-                else:
-                    out_mats.append(np.vstack(parts))
-            return out_mats
+            return collect_pplx_window_vectors(windows, matrices, len(doc_groups))
+
     elif pkg_name in (
         "public-bge-small",
         "coreml-bge-small",
@@ -668,10 +662,11 @@ def _run_cat1_worker(
             nb_ndcgs.append(float(r_main["ndcg@10"]))
             if grid.get("mrl_128_int8_delta_ndcg@10") is not None:
                 mrl_deltas.append(float(grid["mrl_128_int8_delta_ndcg@10"]))
-            all_valid.extend(r_main["per_query_valid"])
-            all_scores.extend(r_main["per_query_ndcg"])
+            valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_main, "per_query_ndcg")
+            all_valid.extend(valid)
+            all_scores.extend(scores)
             sub_reports[sub] = {
-                "n_queries": r_main["n_queries"],
+                **coverage,
                 "n_docs": r_main["n_docs"],
                 "ndcg@10": round(float(r_main["ndcg@10"]), 6),
                 "mrr@10": round(float(r_main["mrr@10"]), 6),
@@ -687,8 +682,9 @@ def _run_cat1_worker(
             lb_iso_vecs = _enc_d([ch.text for ch in lb_flat_chunks])
             _mx_sync()
             r_iso = evaluate_legalbench_spans(lb_queries, lb_flat_chunks, lb_q_vecs, lb_iso_vecs, k=10)
+            iso_valid, iso_scores, coverage = _retrieval_query_outcomes(lb_q_ids, r_iso, "per_query_span_ndcg")
             sub_reports["legalbench_rag_isolated"] = {
-                "n_queries": r_iso["n_queries"],
+                **coverage,
                 "n_chunks": len(lb_flat_chunks),
                 "chunk_chars": 1024,
                 "span_ndcg@10": round(float(r_iso["span_ndcg@10"]), 6),
@@ -698,17 +694,20 @@ def _run_cat1_worker(
                 doc_chunk_texts = [[ch.text for ch in lb_chunks_by_doc[did]] for did in lb_doc_ids]
                 ctx_mats = _enc_ctx(doc_chunk_texts)
                 _mx_sync()
+                if [len(mat) for mat in ctx_mats] != [len(doc) for doc in doc_chunk_texts]:
+                    raise ValueError("Contextual embedding count differs from the intended chunks per document")
                 lb_ctx_vecs = np.vstack(ctx_mats) if ctx_mats else np.zeros((0, lb_q_vecs.shape[1]), dtype=np.float32)
                 r_ctx = evaluate_legalbench_spans(lb_queries, lb_flat_chunks, lb_q_vecs, lb_ctx_vecs, k=10)
                 contextual_lift = compute_contextual_lift(r_iso, r_ctx, k=10)
+                valid, scores, coverage = _retrieval_query_outcomes(lb_q_ids, r_ctx, "per_query_span_ndcg")
                 sub_reports["legalbench_rag_contextual"] = {
-                    "n_queries": r_ctx["n_queries"],
+                    **coverage,
                     "span_ndcg@10": round(float(r_ctx["span_ndcg@10"]), 6),
                     "char_recall@10": round(float(r_ctx["char_recall@10"]), 6),
                     **contextual_lift,
                 }
-                all_valid.extend(r_ctx["per_query_valid"])
-                all_scores.extend(r_ctx["per_query_span_ndcg"])
+                all_valid.extend(valid)
+                all_scores.extend(scores)
             elif _enc_coarse_2k is not None:
                 lb_coarse_chunks = [
                     ch
@@ -719,8 +718,9 @@ def _run_cat1_worker(
                 _mx_sync()
                 r_coarse = evaluate_legalbench_spans(lb_queries, lb_coarse_chunks, lb_q_vecs, lb_coarse_vecs, k=10)
                 coarse_2k_lift = compute_contextual_lift(r_iso, r_coarse, k=10)
+                valid, scores, coverage = _retrieval_query_outcomes(lb_q_ids, r_coarse, "per_query_span_ndcg")
                 sub_reports["legalbench_rag_coarse_2k"] = {
-                    "n_queries": r_coarse["n_queries"],
+                    **coverage,
                     "n_chunks": len(lb_coarse_chunks),
                     "chunk_chars": 6144,
                     "span_ndcg@10": round(float(r_coarse["span_ndcg@10"]), 6),
@@ -728,13 +728,13 @@ def _run_cat1_worker(
                     "coarse_2k_delta_ndcg@10": coarse_2k_lift["contextual_delta_ndcg@10"],
                     "se_paired": coarse_2k_lift["se_paired"],
                 }
-                all_valid.extend(r_iso["per_query_valid"])
-                all_scores.extend(r_iso["per_query_span_ndcg"])
-                all_valid.extend(r_coarse["per_query_valid"])
-                all_scores.extend(r_coarse["per_query_span_ndcg"])
+                all_valid.extend(iso_valid)
+                all_scores.extend(iso_scores)
+                all_valid.extend(valid)
+                all_scores.extend(scores)
             else:
-                all_valid.extend(r_iso["per_query_valid"])
-                all_scores.extend(r_iso["per_query_span_ndcg"])
+                all_valid.extend(iso_valid)
+                all_scores.extend(iso_scores)
 
         # 1C: Tier-2 LongEmbed (fast-pplx / public-pplx 4K-32K)
         if tier == "tier2" and pkg_name in ("fast-pplx", "public-pplx") and not smoke:
@@ -758,10 +758,11 @@ def _run_cat1_worker(
                 d_vecs = _enc_d([le_pack["corpus"][did] for did in d_ids])
                 _mx_sync()
                 r_le = evaluate_retrieval_rankings(q_ids, q_vecs, d_ids, d_vecs, le_pack["qrels"], k=10)
-                all_valid.extend(r_le["per_query_valid"])
-                all_scores.extend(r_le["per_query_ndcg"])
+                valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_le, "per_query_ndcg")
+                all_valid.extend(valid)
+                all_scores.extend(scores)
                 sub_reports[f"longembed_{le_sub}"] = {
-                    "n_queries": r_le["n_queries"],
+                    **coverage,
                     "n_docs": r_le["n_docs"],
                     "ndcg@10": round(float(r_le["ndcg@10"]), 6),
                     "mrr@10": round(float(r_le["mrr@10"]), 6),
@@ -832,9 +833,10 @@ def _run_cat2_single_backend(
     from fast_decision_models.kev_mlx import Kev08bMlxBackend
     from fast_decision_models.laya_ane import LayaAneBackend
     from fast_decision_models.paths import ensure_laya_dylib, resolve_kev_dir, resolve_laya_dir
+    from _outcome_public_backends import stock_decision_model_files
 
     art_dir = home / "artifacts"
-    probe = FourBucketMemoryProbe(model_directories=[art_dir])
+    probe = FourBucketMemoryProbe(model_directories=[art_dir, *stock_decision_model_files(backend_name)])
     guard = DeviceMemoryGuard()
     guard_tripped = False
 
@@ -1178,6 +1180,24 @@ def _format_bfcl_prompt(item: Mapping[str, Any]) -> str:
     )
 
 
+def _compile_required_grammars(
+    package: str,
+    schemas: Sequence[dict[str, Any] | None],
+    compile_schema: Callable[..., Any],
+    *,
+    whitespace_flexible: bool | None,
+) -> list[Any]:
+    grammars = []
+    for index, schema in enumerate(schemas):
+        if schema is None:
+            raise ValueError(f"Missing required schema for {package} input {index}")
+        try:
+            grammars.append(compile_schema(schema, whitespace_flexible=whitespace_flexible))
+        except Exception as exc:
+            raise ValueError(f"Could not compile required schema for {package} input {index}: {exc}") from exc
+    return grammars
+
+
 def _run_llm_worker(
     pkg_name: str,
     *,
@@ -1217,6 +1237,7 @@ def _run_llm_worker(
         eng = FastGemma4Engine(
             home=home,
             model_dir=extra.model_dir,
+            vocab_out=extra.gemma_vocab_out,
             default_mode=eff_mode,
             ane_variant=extra.ane_variant,
             ane_ring_variant=extra.ane_variant,
@@ -1263,6 +1284,15 @@ def _run_llm_worker(
         eff_label = config_label or (openai_model or "openai_chat")
     else:
         raise ValueError(f"Unsupported LLM package: {pkg_name}")
+
+    model_settings = {}
+    if pkg_name == "fast-gemma4":
+        model_settings = {
+            "model_checkpoint": eng.model.model_dir.name,
+            "output_vocab_size": eng.model.vocab_size,
+            "batch_size": batch_sz,
+            "mlx_cache_limit_mb": extra.mlx_cache_limit_mb,
+        }
 
     def _generate_batch(
         prompts: list[str],
@@ -1316,23 +1346,14 @@ def _run_llm_worker(
                 tot_comp += int(payload.get("usage", {}).get("completion_tokens", 0))
             return texts, reasons, [[] for _ in texts], {"completion_tokens": tot_comp, "mask_fallbacks": 0}
 
-        # Compile per-doc schemas defensively so an unsupported upstream schema keyword never aborts a run.
-        safe_grammars: list[Any] | None = None
-        compile_fallbacks = 0
+        safe_grammars = None
         if per_doc_schemas is not None:
-            safe_grammars = []
-            for sch in per_doc_schemas:
-                if sch is None:
-                    safe_grammars.append(None)
-                    continue
-                try:
-                    if pkg_name == "fast-gemma4":
-                        safe_grammars.append(eng.get_grammar(sch, whitespace_flexible=False))
-                    else:
-                        safe_grammars.append(eng._get_grammar(sch, whitespace_flexible=False))
-                except Exception:
-                    safe_grammars.append(None)
-                    compile_fallbacks += 1
+            is_gemma = pkg_name == "fast-gemma4"
+            whitespace = {"fixed": None, "compact": False, "flexible": True}[extra.gemma_json_layout] if is_gemma else False
+            safe_grammars = _compile_required_grammars(
+                pkg_name, per_doc_schemas, eng.get_grammar if is_gemma else eng._get_grammar,
+                whitespace_flexible=whitespace,
+            )
 
         kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
@@ -1353,7 +1374,7 @@ def _run_llm_worker(
         reasons = [it.finish_reason for it in res.items]
         tok_ids = [list(it.token_ids) for it in res.items]
         st = dict(res.stats)
-        st["grammar_compile_fallbacks"] = compile_fallbacks
+        st["grammar_compile_fallbacks"] = 0
         return texts, reasons, tok_ids, st
 
     records: list[dict[str, Any]] = []
@@ -1471,6 +1492,7 @@ def _run_llm_worker(
             mem3 = _memory_4bucket_dict(probe)
             comp3 = float(np.mean([float(np.mean(if_scores_for_comp)), float(r_mm["exact_accuracy"]), float(np.mean(reason_scores))]))
             diag3 = {
+                **model_settings,
                 "composite_macro_score": round(comp3, 6),
                 "if_prompt_loose_acc": round(float(np.mean(if_scores_for_comp)), 6),
                 "mmlu_redux_exact_acc": r_mm["exact_accuracy"],
@@ -1588,6 +1610,8 @@ def _run_llm_worker(
                     "finish_length_count": tot_len_4,
                     "device_guard_tripped": guard_tripped,
                 }
+                if model_settings:
+                    diag4.update(model_settings, json_layout=extra.gemma_json_layout if use_llg else None)
                 if pub_llm is not None:
                     _merge_daemon_telemetry(mem4, diag4, pub_llm.telemetry())
                 records.append(
@@ -1634,6 +1658,12 @@ def _run_worker_main(args: argparse.Namespace) -> int:
         spec = _SPEC_BY_NAME[pkg_name]
         home = resolve_package_home(spec)
 
+    if extra.mlx_cache_limit_mb is not None:
+        if extra.mlx_cache_limit_mb < 0:
+            raise ValueError("--mlx-cache-limit-mb must be nonnegative")
+        import mlx.core as mx
+
+        mx.set_cache_limit(extra.mlx_cache_limit_mb * 1024**2)
     use_wl = not bool(args.no_wired_limit)
     ctx = wired_limit() if use_wl else _null_ctx()
     with ctx:
@@ -1930,12 +1960,13 @@ def _aggregate_abba_records(runs: Sequence[list[dict[str, Any]]]) -> list[dict[s
     if len(runs) == 1:
         return [dict(r) for r in runs[0]]
 
-    n_slots = len(runs[0])
+    n_slots = max(map(len, runs))
     aggregated: list[dict[str, Any]] = []
     for slot_i in range(n_slots):
-        slot_runs = [r[slot_i] for r in runs if slot_i < len(r) and r[slot_i].get("status") == "ok"]
+        slot_records = [r[slot_i] if slot_i < len(r) else {} for r in runs]
+        slot_runs = [r for r in slot_records if r.get("status") == "ok"]
         if not slot_runs:
-            aggregated.append(dict(runs[0][slot_i]))
+            aggregated.append(dict(next(r for r in slot_records if r)))
             continue
         med_wall = float(statistics.median([float(r["wall_sec"]) for r in slot_runs]))
         rep = dict(min(slot_runs, key=lambda r: abs(float(r["wall_sec"]) - med_wall)))
@@ -1947,6 +1978,13 @@ def _aggregate_abba_records(runs: Sequence[list[dict[str, Any]]]) -> list[dict[s
         )
         rep["abba_repeats"] = len(slot_runs)
         rep["wall_series_sec"] = [round(float(r["wall_sec"]), 4) for r in slot_runs]
+        if rep.get("category") == 1:
+            incomplete = [i for i, r in enumerate(slot_records, 1) if r.get("status") != "ok" or retrieval_coverage_errors(r)]
+            if incomplete:
+                rep["incomplete_retrieval_repeats"] = incomplete
+                rep["retrieval_coverage_status"] = "INCOMPLETE"
+                rep["gate_verdict"] = "FAIL"
+                rep["gate_reasons"] = [*rep.get("gate_reasons", []), f"incomplete retrieval repeats: {incomplete}"]
         aggregated.append(rep)
     return aggregated
 
@@ -1962,7 +2000,7 @@ def parse_abba_arm(raw: str) -> tuple[str, str]:
 def format_outcomes_markdown(results: Sequence[Mapping[str, Any]]) -> str:
     """Render concise Markdown summary table of External Objective Outcome Benchmark results."""
     lines = [
-        "| Package | Cat | Config | Benchmark | N (Valid) | `S_obj,e2e` | `EOT` (u/s) | Wall (s) | 4-Bucket Mem (GB) | Gate |",
+        "| Package | Cat | Config | Benchmark | Valid / intended | `S_obj,e2e` | `EOT` (u/s) | Wall (s) | 4-Bucket Mem (GB) | Gate |",
         "|---|---:|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for r in results:
@@ -1973,14 +2011,13 @@ def format_outcomes_markdown(results: Sequence[Mapping[str, Any]]) -> str:
         if r.get("status") != "ok":
             lines.append(f"| `{pkg}` | {cat} | `{cfg}` | {bench} | - | - | - | - | - | `{r.get('gate_verdict', r.get('status', 'FAIL'))}` |")
             continue
-        n_str = f"{r['n_items']} ({r['n_valid']})"
+        n_str = f"{r['n_valid']}/{r['n_items']}"
         s_val = f"{float(r['objective_score_e2e']):.4f}"
         eot_val = f"{float(r['effective_outcome_per_sec']):.3f}"
         wall = f"{float(r['wall_sec']):.2f}"
         mem = float((r.get("memory_4bucket_gb") or {}).get("combined_with_model_mapped_gb", 0.0))
-        lines.append(
-            f"| `{pkg}` | {cat} | `{cfg}` | {bench} | {n_str} | {s_val} | {eot_val} | {wall} | {mem:.3f} | `{r.get('gate_verdict', 'PASS')}` |"
-        )
+        guard = "FAIL (retrieval coverage)" if retrieval_coverage_errors(r) else r.get("gate_verdict", "PASS")
+        lines.append(f"| `{pkg}` | {cat} | `{cfg}` | {bench} | {n_str} | {s_val} | {eot_val} | {wall} | {mem:.3f} | `{guard}` |")
     return "\n".join(lines)
 
 
@@ -2012,6 +2049,10 @@ def _compare_record_key(rec: Mapping[str, Any]) -> tuple[Any, ...]:
 def _cmd_compare(args: argparse.Namespace) -> int:
     base_doc = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
     cand_doc = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
+    if (base_doc.get("dataset_lock_sha256") and cand_doc.get("dataset_lock_sha256")
+            and base_doc["dataset_lock_sha256"] != cand_doc["dataset_lock_sha256"]):
+        print(json.dumps({"comparisons": [], "verdict": "FAIL", "error": "Dataset lock fingerprints differ."}, indent=2))
+        return 1
     host_mem = float(args.host_mem_gb) if args.host_mem_gb is not None else float(
         (cand_doc.get("environment") or {}).get("mem_gb") or 0.0
     )
@@ -2021,7 +2062,6 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         base_by_key.setdefault(_compare_record_key(br), []).append(br)
 
     comparisons: list[dict[str, Any]] = []
-    any_fail = False
     for cr in cand_doc.get("results", []):
         key = _compare_record_key(cr)
         bucket = base_by_key.get(key)
@@ -2032,7 +2072,6 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         else:
             exact = [r for r in bucket if r.get("config_label") == cr.get("config_label")]
             if len(exact) != 1:
-                any_fail = True
                 comparisons.append(
                     {
                         "package": cr.get("package"),
@@ -2046,20 +2085,14 @@ def _cmd_compare(args: argparse.Namespace) -> int:
                 )
                 continue
             br = exact[0]
-        b_eff = br.get("per_item_effective_scores")
-        c_eff = cr.get("per_item_effective_scores")
-        use_paired = isinstance(b_eff, list) and isinstance(c_eff, list) and len(b_eff) == len(c_eff) and len(b_eff) > 0
         ev = evaluate_promotion_gates(
             br,
             cr,
             profile=args.gate_profile,
+            lossless_tolerance=args.lossless_tolerance,
             min_eot_ratio=float(args.min_eot_ratio),
             host_mem_gb=host_mem if host_mem > 0 else None,
-            base_effective_scores=b_eff if use_paired else None,
-            cand_effective_scores=c_eff if use_paired else None,
         )
-        if ev.verdict != "PASS":
-            any_fail = True
         comparisons.append(
             {
                 "package": cr.get("package"),
@@ -2078,11 +2111,15 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         }
         print(json.dumps(out_empty, indent=2))
         return 1
-    print(json.dumps({"comparisons": comparisons, "verdict": "FAIL" if any_fail else "PASS"}, indent=2))
-    return 1 if any_fail else 0
+    verdicts = {r["verdict"] for r in comparisons}
+    verdict = "FAIL" if "FAIL" in verdicts else "UNRESOLVED" if "UNRESOLVED" in verdicts else "PASS"
+    print(json.dumps({"comparisons": comparisons, "verdict": verdict}, indent=2))
+    return 0 if verdict == "PASS" else 1
 
 
-def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def compute_public_comparisons(
+    results: Sequence[Mapping[str, Any]], *, lossless_tolerance: float = DEFAULT_LOSSLESS_TOLERANCE,
+) -> list[dict[str, Any]]:
     """Pair completed `fast-*` outcome records against their matching stock `public-*` / `coreai-*` / `coreml-*` baselines."""
     ok_rows = [r for r in results if r.get("status") == "ok"]
     out: list[dict[str, Any]] = []
@@ -2118,11 +2155,7 @@ def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dic
                 p_eot = float(pr.get("effective_outcome_per_sec", 0.0))
                 f_sc = float(fr.get("objective_score_e2e", 0.0))
                 p_sc = float(pr.get("objective_score_e2e", 0.0))
-                fe = fr.get("per_item_effective_scores")
-                pe = pr.get("per_item_effective_scores")
-                se_val = None
-                if isinstance(fe, list) and isinstance(pe, list) and len(fe) == len(pe) and len(fe) > 0:
-                    se_val = round(float(compute_paired_se(pe, fe)["se_paired"]), 6)
+                evidence = evaluate_promotion_gates(pr, fr, lossless_tolerance=lossless_tolerance).to_dict()
                 out.append(
                     {
                         "fast_package": fast_pkg,
@@ -2134,7 +2167,13 @@ def compute_public_comparisons(results: Sequence[Mapping[str, Any]]) -> list[dic
                         "fast_score_e2e": round(f_sc, 4),
                         "stock_score_e2e": round(p_sc, 4),
                         "delta_score_e2e": round(f_sc - p_sc, 4),
-                        "se_paired": se_val,
+                        "se_paired": evidence["se_paired"],
+                        "n_paired": evidence["n_paired"],
+                        "ci95_low": evidence["ci95_low"],
+                        "ci95_high": evidence["ci95_high"],
+                        "lossless_quality_floor": evidence["quality_floor"],
+                        "lossless_quality_status": evidence["quality_status"],
+                        "retrieval_coverage_pass": evidence["retrieval_coverage_pass"],
                         "fast_eot": round(f_eot, 3),
                         "stock_eot": round(p_eot, 3),
                         "eot_speedup_vs_stock": round(f_eot / max(p_eot, 1e-6), 3),
@@ -2244,20 +2283,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 agg_b = _aggregate_abba_records(runs_b)
                 for ra, rb in zip(agg_a, agg_b):
                     if ra.get("status") == "ok" and rb.get("status") == "ok":
-                        ea = ra.get("per_item_effective_scores")
-                        eb = rb.get("per_item_effective_scores")
-                        if isinstance(ea, list) and isinstance(eb, list) and len(ea) == len(eb) and len(ea) > 0:
-                            paired = compute_paired_se(ea, eb)
-                            rb["se_paired_vs_baseline"] = round(float(paired["se_paired"]), 6)
                         ev = evaluate_promotion_gates(
                             ra,
                             rb,
                             profile=args.gate_profile,
+                            lossless_tolerance=args.lossless_tolerance,
                             min_eot_ratio=float(args.min_eot_ratio),
                             host_mem_gb=host_mem if host_mem > 0 else None,
-                            base_effective_scores=ea if (isinstance(ea, list) and isinstance(eb, list) and len(ea) == len(eb)) else None,
-                            cand_effective_scores=eb if (isinstance(ea, list) and isinstance(eb, list) and len(ea) == len(eb)) else None,
                         )
+                        rb["se_paired_vs_baseline"] = ev.to_dict()["se_paired"]
                         rb["gate_verdict"] = ev.verdict
                         rb["gate_reasons"] = list(ev.reasons)
                         comparisons.append(
@@ -2282,7 +2316,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )
                 results.extend(recs)
 
-    public_comparisons = compute_public_comparisons(results)
+    public_comparisons = compute_public_comparisons(results, lossless_tolerance=args.lossless_tolerance)
 
     # Strip verbose per-item score vectors only when requested; keep compact by default for `compare`.
     if args.omit_item_scores:
@@ -2319,8 +2353,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         out_m.write_text(md + "\n", encoding="utf-8")
 
     print(md)
-    failed = [r for r in results if r.get("status") == "failed"]
-    comp_failed = [c for c in comparisons if c.get("verdict") == "FAIL"]
+    failed = [r for r in results if r.get("status") == "failed" or
+              (r.get("category") == 1 and r.get("status") == "ok" and retrieval_coverage_errors(r))]
+    comp_failed = [c for c in comparisons if c.get("verdict") != "PASS"]
     return 1 if (failed or comp_failed) else 0
 
 
@@ -2345,6 +2380,8 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--abba-compare", nargs="+", default=None, help="Two 'label:flags' arms for interleaved ABBA")
     rn.add_argument("--abba-rounds", type=int, default=2, help="Interleaved ABBA rounds when --abba-compare is set")
     rn.add_argument("--gate-profile", choices=("lossless", "quantized"), default="lossless")
+    rn.add_argument("--lossless-tolerance", type=float, default=DEFAULT_LOSSLESS_TOLERANCE,
+                    help="Fixed acceptable score loss for the paired 95%% interval (default: 0.003)")
     rn.add_argument("--min-eot-ratio", type=float, default=1.0)
     rn.add_argument("--include-unconstrained-baseline", action="store_true")
     rn.add_argument(
@@ -2379,6 +2416,8 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("baseline", help="Path to baseline outcomes JSON")
     cp.add_argument("candidate", help="Path to candidate outcomes JSON")
     cp.add_argument("--gate-profile", choices=("lossless", "quantized"), default="lossless")
+    cp.add_argument("--lossless-tolerance", type=float, default=DEFAULT_LOSSLESS_TOLERANCE,
+                    help="Fixed acceptable score loss for the paired 95%% interval (default: 0.003)")
     cp.add_argument("--min-eot-ratio", type=float, default=1.0)
     cp.add_argument("--host-mem-gb", type=float, default=None)
     cp.set_defaults(func=_cmd_compare)

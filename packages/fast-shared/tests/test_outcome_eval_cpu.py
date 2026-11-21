@@ -259,7 +259,10 @@ def test_paired_se_and_two_gate_promotion_contract() -> None:
         "diagnostics": {"mask_fallback_rate": 0.001, "repeat_loop_count": 0},
         "memory_4bucket_gb": {"combined_with_model_mapped_gb": 12.5},
     }
-    g_pass = evaluate_promotion_gates(base_rec, cand_pass, profile="lossless", min_eot_ratio=1.03, host_mem_gb=48.0)
+    g_pass = evaluate_promotion_gates(
+        base_rec, cand_pass, profile="lossless", min_eot_ratio=1.03, host_mem_gb=48.0,
+        base_effective_scores=[0.85, 0.85], cand_effective_scores=[0.849, 0.849],
+    )
     assert g_pass.verdict == "PASS"
 
     # Lossless FAIL on repeat loop
@@ -294,6 +297,40 @@ def test_paired_se_and_two_gate_promotion_contract() -> None:
 # ---------------------------------------------------------------------------
 # 3. Category 1: Retrieval, Stable Tie-Breaking, MRL Grid & LegalBench Spans
 # ---------------------------------------------------------------------------
+
+
+def test_lossless_gate_uses_fixed_tolerance_and_requires_paired_evidence() -> None:
+    base = {"objective_score_e2e": 0.5, "effective_outcome_per_sec": 1.0, "n_items": 4}
+    cand = dict(base, effective_outcome_per_sec=2.0)
+
+    def gate(b, c, **kwargs):
+        return evaluate_promotion_gates(base, cand, base_effective_scores=b, cand_effective_scores=c, **kwargs)
+
+    wide = gate([0, 1, 0, 1], [1, 0, 1, 0])
+    assert wide.quality_floor == -0.003
+    assert wide.verdict == wide.quality_status == "UNRESOLVED"
+    assert wide.ci95_low < wide.quality_floor < wide.ci95_high
+    assert wide.n_paired == 4
+    for b, c in ((None, None), ([0.5], [0.5]), ([0.5] * 2, [0.5] * 2)):
+        unknown = gate(b, c)
+        assert unknown.quality_status == "UNRESOLVED" and unknown.ci95_low is None
+    assert gate([0, 1, 0, 1], [0, 1, 0, 1]).verdict == "PASS"
+    cand["objective_score_e2e"] = 0.497
+    assert gate([0.5] * 4, [0.497] * 4).verdict == "PASS"
+    cand["objective_score_e2e"] = 0.495
+    assert gate([0.5] * 4, [0.495] * 4).quality_status == "FAIL"
+    assert gate([0.5] * 4, [0.495] * 4, lossless_tolerance=0.01).verdict == "PASS"
+
+
+def test_retrieval_coverage_blocks_promotion_of_partial_historical_rows() -> None:
+    complete = {"category": 1, "n_items": 325, "n_valid": 325, "objective_score_e2e": 1.0,
+                "effective_outcome_per_sec": 1.0}
+    partial = dict(complete, n_valid=150, gate_verdict="PASS")
+    for base, candidate in ((partial, complete), (complete, partial)):
+        result = evaluate_promotion_gates(base, candidate, profile="quantized")
+        assert result.verdict == "FAIL" and result.retrieval_coverage_pass is False
+        assert "150/325" in " ".join(result.reasons)
+    assert evaluate_promotion_gates(complete, complete, profile="quantized").verdict == "PASS"
 
 
 def test_retrieval_ndcg_mrr_recall_stable_ties_and_mrl_grid() -> None:
@@ -385,6 +422,25 @@ def test_retrieval_ndcg_mrr_recall_stable_ties_and_mrl_grid() -> None:
     assert grid_tanh["mrl_128_int8_delta_ndcg@10"] is not None
 
 
+def test_pplx_benchmark_windows_restore_source_rows_and_refuse_partial_batches() -> None:
+    from fast_shared.outcome_eval.retrieval import collect_pplx_window_vectors, plan_pplx_windows
+
+    docs = [["Header", "first", "second", "third"], [], ["short"]]
+    windows = plan_pplx_windows(docs, 600, lambda text: 300 if text != "Header" else 20)
+    assert [(w.doc_index, w.has_anchor, w.chunks) for w in windows] == [
+        (0, False, ["Header", "first"]), (0, True, ["Header", "second"]),
+        (0, True, ["Header", "third"]), (2, False, ["short"]),
+    ]
+    values = [np.array([[1], [2]]), np.array([[10], [3]]), np.array([[11], [4]]), np.array([[5]])]
+    restored = collect_pplx_window_vectors(windows, values, len(docs))
+    assert restored[0][:, 0].tolist() == [1, 2, 3, 4]
+    assert restored[1].shape == (0, 1024) and restored[2][:, 0].tolist() == [5]
+    with pytest.raises(ValueError):
+        collect_pplx_window_vectors(windows, values[1:], len(docs))
+    with pytest.raises(ValueError, match="contextual chunk vectors"):
+        collect_pplx_window_vectors(windows, [values[0][:1], *values[1:]], len(docs))
+
+
 def test_retrieval_and_legalbench_reject_nan_corpus_and_chunk_embeddings() -> None:
     # Clean unit-norm queries vs corrupted (all-NaN or partially-NaN) corpus MUST fail validity (0 valid queries!).
     q_vecs = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
@@ -394,6 +450,10 @@ def test_retrieval_and_legalbench_reject_nan_corpus_and_chunk_embeddings() -> No
     assert r_all_nan["n_valid_queries"] == 0
     assert r_all_nan["per_query_valid"] == [False, False]
     assert r_all_nan["ndcg@10"] == pytest.approx(0.0)
+    out_of_scope = evaluate_retrieval_rankings(["q0", "q1"], q_vecs, ["d0", "other"], q_vecs, qrels)
+    assert out_of_scope["per_query_valid"] == [True, False]
+    empty_corpus = evaluate_retrieval_rankings(["q0", "q1"], q_vecs, [], q_vecs[:0], qrels)
+    assert empty_corpus["n_queries"] == 2 and empty_corpus["per_query_valid"] == [False, False]
 
     # Even a single NaN document corrupts the ranking matrix and invalidates queries.
     d_one_nan = np.array([[1.0, 0.0], [0.0, 1.0], [np.nan, 0.0]], dtype=np.float32)
@@ -410,6 +470,11 @@ def test_retrieval_and_legalbench_reject_nan_corpus_and_chunk_embeddings() -> No
     assert r_lb_nan["n_valid_queries"] == 0
     assert r_lb_nan["per_query_valid"] == [False]
     assert r_lb_nan["span_ndcg@10"] == pytest.approx(0.0)
+    wrong_document = [dict(lb_q[0], gold_spans=[("absent_document", 0, 20)])]
+    valid_chunks = np.tile(q_vecs[0], (len(chunks), 1))
+    assert evaluate_legalbench_spans(wrong_document, chunks, q_vecs[:1], valid_chunks)["per_query_valid"] == [False]
+    no_chunks = evaluate_legalbench_spans(lb_q, [], q_vecs[:1], q_vecs[:0])
+    assert no_chunks["n_queries"] == 1 and no_chunks["per_query_valid"] == [False]
 
     # project_mrl_dtype preserves non-finite rows cleanly without int8 RuntimeWarning.
     p_nan = project_mrl_dtype(np.array([[1.0, 2.0], [np.nan, 0.5]], dtype=np.float32), dim=2, dtype_mode="int8", int8_mode="sym_int8")
@@ -843,6 +908,8 @@ def test_benchmark_outcomes_cli_dry_run_and_compare(tmp_path: Path) -> None:
                 "category": 1,
                 "config_label": "gpu",
                 "benchmark": "NanoBEIR",
+                "n_items": 20,
+                "n_valid": 20,
                 "objective_score_e2e": 0.620,
                 "effective_outcome_per_sec": 50.0,
                 "per_item_effective_scores": [0.62] * 20,
@@ -859,6 +926,8 @@ def test_benchmark_outcomes_cli_dry_run_and_compare(tmp_path: Path) -> None:
                 "category": 1,
                 "config_label": "hetero2",
                 "benchmark": "NanoBEIR",
+                "n_items": 20,
+                "n_valid": 20,
                 "objective_score_e2e": 0.619,
                 "effective_outcome_per_sec": 62.0,
                 "per_item_effective_scores": [0.619] * 20,
