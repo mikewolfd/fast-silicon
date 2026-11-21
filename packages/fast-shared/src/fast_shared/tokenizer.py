@@ -1,11 +1,133 @@
-"""Shared Rust-backed `tokenizers` wrapper with sliding-window chunking and prompt prefixes."""
+"""Shared Rust-backed `tokenizers` wrapper with 1-pass batch chunking and header-anchored windows."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from tokenizers import Tokenizer
+
+
+@dataclass(frozen=True)
+class HeaderAnchoredWindow:
+    """Contextual chunk window with optional repeated document header anchor."""
+
+    window_index: int
+    has_anchor: bool
+    chunk_indices: tuple[int, ...]
+    chunks: list[str]
+    estimated_tokens: int
+
+
+def plan_header_anchored_windows(
+    chunks: Sequence[str],
+    max_window_tokens: int = 2048,
+    header_max_chars: int = 2048,
+    *,
+    token_count: Callable[[str], int] | None = None,
+    tokenizer: Any | None = None,
+    overhead_tokens: int | None = None,
+    per_chunk_extra_tokens: int = 2,
+) -> list[HeaderAnchoredWindow]:
+    """Group ordered chunks into `<= max_window_tokens` windows, anchoring continuation windows with `chunks[0][:header_max_chars]`."""
+    max_win = int(max_window_tokens)
+    hdr_chars = int(header_max_chars)
+    extra = max(0, int(per_chunk_extra_tokens))
+    if max_win <= 0:
+        raise ValueError("max_window_tokens must be positive")
+    if hdr_chars < 0:
+        raise ValueError("header_max_chars must be nonnegative")
+    if not chunks:
+        return []
+
+    chunk_list = [str(c) for c in chunks]
+    eff_overhead = int(overhead_tokens) if overhead_tokens is not None else (64 if max_win >= 512 else 0)
+    budget = max(1, max_win - max(0, eff_overhead))
+
+    if token_count is not None:
+        sizes = [max(1, int(token_count(c))) + extra for c in chunk_list]
+
+        def _count_one(text: str) -> int:
+            return max(1, int(token_count(text))) + extra
+
+    elif tokenizer is not None:
+        raw_tok = getattr(tokenizer, "_tok", None)
+        if raw_tok is not None and hasattr(raw_tok, "encode_batch"):
+            encs = raw_tok.encode_batch(chunk_list, add_special_tokens=False)
+            sizes = [len(e.ids) + extra for e in encs]
+
+            def _count_one(text: str) -> int:
+                return len(raw_tok.encode(text, add_special_tokens=False).ids) + extra
+
+        elif hasattr(tokenizer, "encode_batch"):
+            encs_b = tokenizer.encode_batch(chunk_list)
+            sizes = [len(ids) + extra for ids in encs_b]
+
+            def _count_one(text: str) -> int:
+                return len(tokenizer.encode(text)) + extra
+
+        else:
+            sizes = [len(tokenizer.encode(c)) + extra for c in chunk_list]
+
+            def _count_one(text: str) -> int:
+                return len(tokenizer.encode(text)) + extra
+
+    else:
+        sizes = [max(1, (len(c.encode("utf-8")) + 3) // 4) + extra for c in chunk_list]
+
+        def _count_one(text: str) -> int:
+            return max(1, (len(text.encode("utf-8")) + 3) // 4) + extra
+
+    anchor = chunk_list[0][:hdr_chars] if hdr_chars > 0 else ""
+    anchor_size = 0
+    if anchor:
+        anchor_size = sizes[0] if anchor == chunk_list[0] else _count_one(anchor)
+    use_anchor = bool(anchor) and anchor_size < budget
+
+    windows: list[HeaderAnchoredWindow] = []
+    current_chunks: list[str] = [chunk_list[0]]
+    current_indices: list[int] = [0]
+    used = sizes[0]
+    has_anchor = False
+
+    for idx in range(1, len(chunk_list)):
+        chunk_str = chunk_list[idx]
+        size = sizes[idx]
+        if used + size > budget:
+            windows.append(
+                HeaderAnchoredWindow(
+                    window_index=len(windows),
+                    has_anchor=has_anchor,
+                    chunk_indices=tuple(current_indices),
+                    chunks=current_chunks,
+                    estimated_tokens=used,
+                )
+            )
+            if use_anchor:
+                current_chunks = [anchor, chunk_str]
+                used = anchor_size + size
+                has_anchor = True
+            else:
+                current_chunks = [chunk_str]
+                used = size
+                has_anchor = False
+            current_indices = [idx]
+        else:
+            current_chunks.append(chunk_str)
+            current_indices.append(idx)
+            used += size
+
+    windows.append(
+        HeaderAnchoredWindow(
+            window_index=len(windows),
+            has_anchor=has_anchor,
+            chunk_indices=tuple(current_indices),
+            chunks=current_chunks,
+            estimated_tokens=used,
+        )
+    )
+    return windows
 
 
 class BaseFastTokenizer:
@@ -46,6 +168,7 @@ class BaseFastTokenizer:
         self.document_prefix = document_prefix
         self.prompts = dict(prompts or {})
         self._trunc_cache: dict[int, Tokenizer] = {}
+        self._prefix_frame_cache: dict[str, tuple[list[int], list[int]]] = {}
         self._get_trunc_tok(self.default_max_length)
 
     def _get_trunc_tok(self, max_length: int) -> Tokenizer:
@@ -83,6 +206,36 @@ class BaseFastTokenizer:
         if len(ids) > max_length:
             return ids[: max_length - 1] + [self.eos_id]
         return ids
+
+    def _resolve_special_and_prefix_ids(self, eff_prefix: str) -> tuple[list[int], list[int]]:
+        cached = self._prefix_frame_cache.get(eff_prefix)
+        if cached is not None:
+            return cached
+
+        probe_raw = self._tok.encode("a", add_special_tokens=False).ids
+        probe_full = self._tok.encode("a", add_special_tokens=True).ids
+        lead_special: list[int] | None = None
+        tail_special: list[int] | None = None
+        if probe_raw and len(probe_full) >= len(probe_raw):
+            m = len(probe_raw)
+            for idx in range(len(probe_full) - m + 1):
+                if probe_full[idx : idx + m] == probe_raw:
+                    lead_special = list(probe_full[:idx])
+                    tail_special = list(probe_full[idx + m :])
+                    break
+        if lead_special is None or tail_special is None:
+            empty_ids = self._tok.encode("", add_special_tokens=True).ids
+            if len(empty_ids) >= 2:
+                lead_special = list(empty_ids[:-1])
+                tail_special = list(empty_ids[-1:])
+            else:
+                lead_special = [self.bos_id]
+                tail_special = [self.eos_id]
+
+        prefix_raw = self._tok.encode(eff_prefix, add_special_tokens=False).ids if eff_prefix else []
+        frame = ([*lead_special, *prefix_raw], tail_special)
+        self._prefix_frame_cache[eff_prefix] = frame
+        return frame
 
     def encode(
         self,
@@ -228,3 +381,115 @@ class BaseFastTokenizer:
                 raise ValueError("overlap leaves no forward progress after boundary encoding; reduce overlap or increase max_chunk_tokens")
             pos = next_pos
         return chunks
+
+    def chunk_texts_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        max_body_tokens: int | None = None,
+        overlap: int = 51,
+        prefix: str | None = None,
+        prompt_name: str | None = None,
+        add_document_prefix: bool = False,
+        max_chunk_tokens: int = 512,
+        batch_size: int = 2048,
+    ) -> list[list[tuple[list[int], int, int]]]:
+        """1-pass Rust `Tokenizer.encode_batch(..., add_special_tokens=False)` sliding-window chunker.
+
+        Encodes batches of strings once in multi-threaded Rust and slices token ID spans
+        directly with pre-encoded prefix and special token IDs (zero per-slice Python re-tokenization).
+        """
+        max_chunk_tokens = int(max_chunk_tokens)
+        overlap = int(overlap)
+        batch_sz = int(batch_size)
+        if max_chunk_tokens <= 0:
+            raise ValueError("max_chunk_tokens must be positive")
+        if max_body_tokens is not None and int(max_body_tokens) <= 0:
+            raise ValueError("max_body_tokens must be positive")
+        if overlap < 0:
+            raise ValueError("overlap must be nonnegative")
+        if batch_sz <= 0:
+            raise ValueError("batch_size must be positive")
+
+        eff_prefix = self.resolve_prefix(
+            prefix=prefix,
+            prompt_name=prompt_name,
+            add_document_prefix=add_document_prefix,
+        )
+        lead_ids, tail_ids = self._resolve_special_and_prefix_ids(eff_prefix)
+        frame_size = (len(lead_ids) + len(tail_ids)) if (lead_ids or tail_ids) else 2
+        max_allowed_body = max_chunk_tokens - frame_size
+        if max_allowed_body <= 0:
+            raise ValueError("max_chunk_tokens must leave room for body tokens after the prefix and special tokens")
+        eff_max_body = max_allowed_body if max_body_tokens is None else min(int(max_body_tokens), max_allowed_body)
+        if overlap >= eff_max_body:
+            raise ValueError(f"overlap must be smaller than the usable body window ({eff_max_body} tokens)")
+
+        if not texts:
+            return []
+
+        norm_texts = [t if isinstance(t, str) else str(t) for t in texts]
+        empty_chunk_ids = self._finalize_ids([*lead_ids, *tail_ids], max_chunk_tokens)
+        results: list[list[tuple[list[int], int, int]]] = []
+
+        for start in range(0, len(norm_texts), batch_sz):
+            sub_texts = norm_texts[start : start + batch_sz]
+            encs = self._tok.encode_batch(sub_texts, add_special_tokens=False)
+            for text, enc in zip(sub_texts, encs):
+                body_ids = enc.ids
+                offsets = enc.offsets
+                n = len(body_ids)
+                if not n:
+                    results.append([(list(empty_chunk_ids), 0, len(text))])
+                    continue
+
+                doc_chunks: list[tuple[list[int], int, int]] = []
+                pos = 0
+                while pos < n:
+                    end = min(n, pos + eff_max_body)
+                    c0 = 0 if pos == 0 else offsets[pos][0]
+                    while end > pos and end < n and offsets[end - 1][1] > offsets[end][0]:
+                        end -= 1
+                    if end <= pos:
+                        raise ValueError("A source character or token span cannot fit max_chunk_tokens with its prefix")
+
+                    c1 = len(text) if end == n else max(offsets[end - 1][1], offsets[end][0])
+                    win_ids = self._finalize_ids([*lead_ids, *body_ids[pos:end], *tail_ids], max_chunk_tokens)
+                    doc_chunks.append((win_ids, c0, c1))
+                    if end >= n:
+                        break
+
+                    raw_next = end - overlap
+                    if raw_next <= pos:
+                        raise ValueError(
+                            "overlap leaves no forward progress after boundary encoding; reduce overlap or increase max_chunk_tokens"
+                        )
+                    next_pos = raw_next
+                    while next_pos > 0 and next_pos < n and offsets[next_pos - 1][1] > offsets[next_pos][0]:
+                        next_pos -= 1
+                    if next_pos <= pos:
+                        next_pos = raw_next
+                        while next_pos < end and offsets[next_pos - 1][1] > offsets[next_pos][0]:
+                            next_pos += 1
+                    pos = next_pos
+                results.append(doc_chunks)
+
+        return results
+
+    def plan_header_anchored_windows(
+        self,
+        chunks: Sequence[str],
+        max_window_tokens: int = 2048,
+        header_max_chars: int = 2048,
+        *,
+        overhead_tokens: int | None = None,
+        per_chunk_extra_tokens: int = 2,
+    ) -> list[HeaderAnchoredWindow]:
+        return plan_header_anchored_windows(
+            chunks,
+            max_window_tokens=max_window_tokens,
+            header_max_chars=header_max_chars,
+            tokenizer=self,
+            overhead_tokens=overhead_tokens,
+            per_chunk_extra_tokens=per_chunk_extra_tokens,
+        )

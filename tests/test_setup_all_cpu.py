@@ -176,3 +176,55 @@ def test_sync_from_siblings_transform_content_markdown_links_and_idempotence() -
     py_out = sync_mod._transform_content("fast-gemma4", "pyproject.toml", py_raw)
     assert py_out == b"fast-shared = { workspace = true }\n"
     assert sync_mod._transform_content("fast-shared", "pyproject.toml", py_raw) == py_raw
+
+
+def test_setup_all_prebuilt_zero_compile_repos_and_offline_plan_cpu(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    mod = _load_setup_all()
+
+    expected_repos = {
+        "OpenInfinity/embeddinggemma-2-coreml-int8",
+        "NMTZ/laya-typed-decisions-421m-coreml-ane",
+        "AbstractFramework/kev-0.8b-mlx-8bit",
+        "AbstractFramework/kev-4b-mlx-4bit",
+        "mlx-community/gpt-oss-20b-MXFP4-Q8",
+        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+    }
+    all_registered = {repo for repos in mod.VETTED_PREBUILT_HF_REPOS.values() for repo in repos}
+    assert expected_repos <= all_registered
+
+    # Offline --prebuilt --dry-run --json builds zero-compile HF snapshot plan without network calls
+    rc = mod.main(
+        [
+            "--dry-run",
+            "--json",
+            "--prebuilt",
+            "--skip-native",
+            "--artifacts-root",
+            str(tmp_path / "prebuilt_root"),
+            "--packages",
+            "embeddinggemma-2,decision-models,gemma4,gpt-oss",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["prebuilt"] is True
+    planned_repos = { repo for plan in payload["plans"] for repo in plan["hf_repos"] }
+    assert expected_repos <= planned_repos
+    for plan in payload["plans"]:
+        assert all(not act["requires_coreml"] for act in plan["actions"])
+
+    # Programmatic pull_prebuilt_package delegates cleanly to injected downloader
+    pulled: list[tuple[str, bool]] = []
+
+    def _fake_downloader(*, repo_id: str, local_files_only: bool = False) -> Path:
+        pulled.append((repo_id, local_files_only))
+        d = tmp_path / repo_id.replace("/", "--")
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    out_map = mod.pull_prebuilt_package("decision-models", local_files_only=True, downloader=_fake_downloader)
+    assert "NMTZ/laya-typed-decisions-421m-coreml-ane" in out_map
+    assert "AbstractFramework/kev-0.8b-mlx-8bit" in out_map
+    assert "AbstractFramework/kev-4b-mlx-4bit" in out_map
+    assert all(local_only is True for _, local_only in pulled)
+

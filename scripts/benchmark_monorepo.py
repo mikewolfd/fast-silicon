@@ -866,7 +866,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _effective_bench_args(spec: PackageSpec, args: argparse.Namespace) -> list[str]:
+def _effective_bench_args(
+    spec: PackageSpec,
+    args: argparse.Namespace,
+    *,
+    host_mem_gb: float | None = None,
+) -> list[str]:
     cmd_args = list(spec.bench_args)
     if spec.name == "fast-pplx":
         pub_py = getattr(args, "public_python", None) or os.environ.get("FAST_SILICON_PUBLIC_PYTHON")
@@ -887,6 +892,11 @@ def _effective_bench_args(spec: PackageSpec, args: argparse.Namespace) -> list[s
             var_idx = cmd_args.index("--ane-variant") + 1
             if var_idx < len(cmd_args):
                 cmd_args[var_idx] = ane_var
+    elif spec.name == "fast-gpt-oss":
+        if host_mem_gb is not None and 0 < float(host_mem_gb) <= 28.5 and "--batches" in cmd_args:
+            b_idx = cmd_args.index("--batches") + 1
+            if b_idx < len(cmd_args):
+                cmd_args[b_idx] = "1,8,16"
     return cmd_args
 
 
@@ -908,6 +918,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     specs = select_specs(args.packages)
     quiescence = check_system_quiescence()
     env_meta = collect_environment_metadata(args.python)
+    host_mem_gb = float(env_meta.get("mem_gb") or 0.0)
     wired_limit = not bool(getattr(args, "no_wired_limit", False))
     abba_rounds = max(1, int(getattr(args, "abba_rounds", 2)))
     cooldown_sec = max(0.0, float(getattr(args, "cooldown_sec", 2.0)))
@@ -932,7 +943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "name": s.name,
                     "role": s.role,
                     "resolved_home": str(resolve_package_home(s)),
-                    "bench_args": _effective_bench_args(s, args),
+                    "bench_args": _effective_bench_args(s, args, host_mem_gb=host_mem_gb),
                     "baseline_runs": {}
                     if args.skip_extra_baselines
                     else {lbl: list(b_args) for lbl, b_args in s.baseline_runs},
@@ -963,7 +974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _cooldown()
             print(f"[{idx}/{total_specs}] Benchmarking {spec.name}...", file=sys.stderr, flush=True)
             resolved_home = resolve_package_home(spec)
-            eff_bench = _effective_bench_args(spec, args)
+            eff_bench = _effective_bench_args(spec, args, host_mem_gb=host_mem_gb)
             extra_bl_list = [] if args.skip_extra_baselines else list(spec.baseline_runs)
             primary_runs: list[dict[str, Any]] = []
             baseline_run_lists: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl, _ in extra_bl_list}

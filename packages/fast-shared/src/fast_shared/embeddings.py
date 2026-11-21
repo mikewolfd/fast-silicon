@@ -289,20 +289,21 @@ def resolve_embedding_dim(
 
 
 def truncate_and_normalize(vecs: np.ndarray, dim: int | None = None) -> np.ndarray:
-    """Slice embeddings to `[:dim]` and re-normalize L2 across the trailing axis."""
+    """Slice embeddings to `[:dim]` and L2-normalize across the trailing axis in `float32`."""
     arr = np.asarray(vecs, dtype=np.float32)
+    if arr.ndim == 0:
+        raise ValueError("`vecs` must be at least 1D")
     if dim is None:
-        return np.ascontiguousarray(arr, dtype=np.float32)
-    eff_dim = int(dim)
-    if eff_dim <= 0 or eff_dim > arr.shape[-1]:
-        raise ValueError(f"Cannot truncate vectors of width {arr.shape[-1]} to dimensions={eff_dim}")
-    if eff_dim == arr.shape[-1]:
-        return np.ascontiguousarray(arr, dtype=np.float32)
-    sub = np.ascontiguousarray(arr[..., :eff_dim], dtype=np.float32)
-    if sub.shape[0] == 0:
+        sub = np.array(arr, dtype=np.float32, copy=True, order="C")
+    else:
+        eff_dim = int(dim)
+        if eff_dim <= 0 or eff_dim > arr.shape[-1]:
+            raise ValueError(f"Cannot truncate vectors of width {arr.shape[-1]} to dimensions={eff_dim}")
+        sub = np.array(arr[..., :eff_dim], dtype=np.float32, copy=True, order="C")
+    if sub.size == 0:
         return sub
     norms = np.linalg.norm(sub, axis=-1, keepdims=True)
-    sub /= np.maximum(norms, 1e-12)
+    sub /= np.maximum(norms, np.float32(1e-12))
     return sub
 
 

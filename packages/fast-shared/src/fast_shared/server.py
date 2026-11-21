@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -594,40 +594,179 @@ def iter_chat_sse_events(
     item: Any,
     *,
     include_usage: bool = False,
-) -> list[dict[str, Any]]:
-    """Build OpenAI `chat.completion.chunk` SSE events from a generated item."""
+    request_start_perf: float | None = None,
+    stats_out: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield incremental OpenAI `chat.completion.chunk` SSE events from a token stream or completed item."""
+    t0 = request_start_perf if request_start_perf is not None else time.perf_counter()
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    events: list[dict[str, Any]] = [
-        {
-            "id": cmpl_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": req_model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        },
-        {
+
+    yield {
+        "id": cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": req_model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+
+    is_completed_item = hasattr(item, "text") and not isinstance(item, Iterator)
+    if is_completed_item:
+        raw_ttft = getattr(item, "ttft_ms", None)
+        ttft_ms = round(float(raw_ttft), 3) if raw_ttft is not None else round((time.perf_counter() - t0) * 1000.0, 3)
+        total_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        prompt_toks = int(getattr(item, "prompt_tokens", 0) or 0)
+        comp_toks = int(getattr(item, "completion_tokens", 0) or 0)
+        finish_reason = getattr(item, "finish_reason", "stop")
+
+        reasoning = getattr(item, "reasoning", None)
+        if reasoning:
+            yield {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "delta": {"reasoning": str(reasoning)}, "finish_reason": None}],
+            }
+
+        yield {
             "id": cmpl_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": req_model,
             "choices": [{"index": 0, "delta": {"content": item.text}, "finish_reason": None}],
-        },
-        {
+        }
+
+        if stats_out is not None:
+            stats_out.update(
+                {
+                    "ttft_ms": ttft_ms,
+                    "total_ms": total_ms,
+                    "prompt_tokens": prompt_toks,
+                    "completion_tokens": comp_toks,
+                    "finish_reason": finish_reason,
+                    "streaming": False,
+                }
+            )
+
+        final_ev: dict[str, Any] = {
             "id": cmpl_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": req_model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": item.finish_reason}],
-        },
-    ]
-    if include_usage:
-        events[-1]["usage"] = {
-            "prompt_tokens": int(item.prompt_tokens),
-            "completion_tokens": int(item.completion_tokens),
-            "total_tokens": int(item.prompt_tokens + item.completion_tokens),
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "ttft_ms": ttft_ms,
         }
-    return events
+        if include_usage:
+            final_ev["usage"] = {
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": comp_toks,
+                "total_tokens": prompt_toks + comp_toks,
+            }
+        yield final_ev
+        return
+
+    # Incremental token generator / iterable path
+    ttft_ms_opt: float | None = None
+    prompt_toks = 0
+    explicit_comp_toks: int | None = None
+    streamed_chunks = 0
+    finish_reason = "stop"
+
+    for raw_chunk in item:
+        delta_text: str | None = None
+        reasoning_text: str | None = None
+        if isinstance(raw_chunk, str):
+            delta_text = raw_chunk
+        elif isinstance(raw_chunk, Mapping):
+            raw_delta = raw_chunk.get("delta")
+            if isinstance(raw_delta, Mapping):
+                if raw_delta.get("content") is not None:
+                    delta_text = str(raw_delta["content"])
+                if raw_delta.get("reasoning") is not None:
+                    reasoning_text = str(raw_delta["reasoning"])
+            elif isinstance(raw_delta, str):
+                delta_text = raw_delta
+            else:
+                for k_txt in ("content", "text", "token"):
+                    if raw_chunk.get(k_txt) is not None:
+                        delta_text = str(raw_chunk[k_txt])
+                        break
+            if reasoning_text is None and raw_chunk.get("reasoning") is not None:
+                reasoning_text = str(raw_chunk["reasoning"])
+            if raw_chunk.get("prompt_tokens") is not None:
+                prompt_toks = int(raw_chunk["prompt_tokens"])
+            if raw_chunk.get("completion_tokens") is not None:
+                explicit_comp_toks = int(raw_chunk["completion_tokens"])
+            if raw_chunk.get("finish_reason") is not None:
+                finish_reason = str(raw_chunk["finish_reason"])
+        else:
+            for attr_txt in ("delta", "content", "text", "token"):
+                val_txt = getattr(raw_chunk, attr_txt, None)
+                if val_txt is not None:
+                    delta_text = str(val_txt)
+                    break
+            val_reas = getattr(raw_chunk, "reasoning", None)
+            if val_reas is not None:
+                reasoning_text = str(val_reas)
+            if getattr(raw_chunk, "prompt_tokens", None) is not None:
+                prompt_toks = int(raw_chunk.prompt_tokens)
+            if getattr(raw_chunk, "completion_tokens", None) is not None:
+                explicit_comp_toks = int(raw_chunk.completion_tokens)
+            if getattr(raw_chunk, "finish_reason", None) is not None:
+                finish_reason = str(raw_chunk.finish_reason)
+
+        if (delta_text or reasoning_text) and ttft_ms_opt is None:
+            ttft_ms_opt = round((time.perf_counter() - t0) * 1000.0, 3)
+
+        if reasoning_text:
+            yield {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "delta": {"reasoning": reasoning_text}, "finish_reason": None}],
+            }
+        if delta_text:
+            streamed_chunks += 1
+            yield {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+            }
+
+    eff_ttft_ms = ttft_ms_opt if ttft_ms_opt is not None else round((time.perf_counter() - t0) * 1000.0, 3)
+    total_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    eff_comp_toks = explicit_comp_toks if explicit_comp_toks is not None else streamed_chunks
+    if stats_out is not None:
+        stats_out.update(
+            {
+                "ttft_ms": eff_ttft_ms,
+                "total_ms": total_ms,
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": eff_comp_toks,
+                "finish_reason": finish_reason,
+                "streaming": True,
+            }
+        )
+
+    end_ev: dict[str, Any] = {
+        "id": cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": req_model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        "ttft_ms": eff_ttft_ms,
+    }
+    if include_usage:
+        end_ev["usage"] = {
+            "prompt_tokens": prompt_toks,
+            "completion_tokens": eff_comp_toks,
+            "total_tokens": prompt_toks + eff_comp_toks,
+        }
+    yield end_ev
 
 
 def iter_completion_sse_events(
@@ -985,6 +1124,16 @@ class OpenAIChatAdapter:
         self.default_whitespace_flexible = default_whitespace_flexible
         self._extra_health = extra_health
         self.batcher = ChatMicroBatcher(engine, coalesce_ms=coalesce_ms, max_batch_size=max_batch_size)
+        self.last_stream_stats: dict[str, Any] | None = None
+        if callable(getattr(engine, "generate_chat_stream", None)) and "generate_chat_stream" not in type(self).__dict__:
+            self.generate_chat_stream = self._engine_generate_chat_stream  # type: ignore[method-assign]
+
+    def _engine_generate_chat_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[Any]:
+        with self.batcher._engine_lock:
+            try:
+                yield from self.engine.generate_chat_stream(messages, **kwargs)
+            finally:
+                clear_mlx_arena(256)
 
     def health_info(self) -> dict[str, Any]:
         model_obj = getattr(self.engine, "model", None)
@@ -999,6 +1148,8 @@ class OpenAIChatAdapter:
         }
         if model_obj is not None and hasattr(model_obj, "lm_head_mode"):
             payload["lm_head_mode"] = getattr(model_obj, "lm_head_mode")
+        if self.last_stream_stats and "ttft_ms" in self.last_stream_stats:
+            payload["last_ttft_ms"] = self.last_stream_stats["ttft_ms"]
         if self._extra_health is not None:
             payload.update(self._extra_health(self.engine))
         return payload
@@ -1008,7 +1159,7 @@ class OpenAIChatAdapter:
         req: dict[str, Any],
         *,
         model_name: str | None = None,
-    ) -> tuple[int, dict[str, Any] | list[dict[str, Any]], bool]:
+    ) -> tuple[int, dict[str, Any] | Iterable[dict[str, Any]], bool]:
         msgs = req.get("messages")
         if not isinstance(msgs, list) or not msgs:
             return 400, {"error": {"message": "`messages` must be a non-empty list", "type": "invalid_request_error"}}, False
@@ -1017,10 +1168,41 @@ class OpenAIChatAdapter:
         kw = _gen_kwargs(req, default_whitespace_flexible=self.default_whitespace_flexible)
         kw["use_chat_template"] = bool(extract_request_param(req, "use_chat_template", True))
         kw.pop("batch_size", None)
-        item, stats = self.batcher.submit(msgs, **kw)
         if bool(req.get("stream", False)):
+            t0 = time.perf_counter()
             sopts = req.get("stream_options") or {}
-            return 200, iter_chat_sse_events(req_model, item, include_usage=bool(sopts.get("include_usage", False))), True
+            include_usage = bool(sopts.get("include_usage", False))
+            stream_fn = getattr(self, "generate_chat_stream", None)
+            if callable(stream_fn):
+                stats_box: dict[str, Any] = {}
+                self.last_stream_stats = stats_box
+                return (
+                    200,
+                    iter_chat_sse_events(
+                        req_model,
+                        stream_fn(msgs, **kw),
+                        include_usage=include_usage,
+                        request_start_perf=t0,
+                        stats_out=stats_box,
+                    ),
+                    True,
+                )
+            item, stats = self.batcher.submit(msgs, **kw)
+            stats_box = dict(stats)
+            self.last_stream_stats = stats_box
+            return (
+                200,
+                iter_chat_sse_events(
+                    req_model,
+                    item,
+                    include_usage=include_usage,
+                    request_start_perf=t0,
+                    stats_out=stats_box,
+                ),
+                True,
+            )
+
+        item, stats = self.batcher.submit(msgs, **kw)
         return 200, build_chat_completion(req_model, item, stats=stats, extra_key=self.extra_key), False
 
     def handle_completion(
@@ -1109,8 +1291,8 @@ def dispatch_chat_completion(
     model_name: str | None = None,
     extra_key: str = "fast_gemma4",
     lock: threading.Lock | None = None,
-) -> tuple[int, dict[str, Any] | list[dict[str, Any]], bool]:
-    """Run `/v1/chat/completions` via adapter method or locked `engine.generate_batch`."""
+) -> tuple[int, dict[str, Any] | Iterable[dict[str, Any]], bool]:
+    """Run `/v1/chat/completions` via adapter method, `generate_chat_stream`, or locked `engine.generate_batch`."""
     if hasattr(engine_or_adapter, "handle_chat_completion"):
         return engine_or_adapter.handle_chat_completion(req, model_name=model_name)
 
@@ -1122,14 +1304,39 @@ def dispatch_chat_completion(
     default_ws = getattr(engine_or_adapter, "default_whitespace_flexible", _UNSET)
     kw = _gen_kwargs(req, default_whitespace_flexible=default_ws)
     eng_lock = lock if lock is not None else get_engine_lock(engine_or_adapter)
+    stream = bool(req.get("stream", False))
+    if stream:
+        t0 = time.perf_counter()
+        sopts = req.get("stream_options") or {}
+        include_usage = bool(sopts.get("include_usage", False))
+        stream_fn = getattr(engine_or_adapter, "generate_chat_stream", None)
+        if callable(stream_fn):
+            def _locked_gen() -> Iterator[Any]:
+                with eng_lock:
+                    try:
+                        yield from stream_fn(msgs, **kw)
+                    finally:
+                        clear_mlx_arena(256)
+
+            return 200, iter_chat_sse_events(eff_model, _locked_gen(), include_usage=include_usage, request_start_perf=t0), True
+
+    t0_batch = time.perf_counter()
     with eng_lock:
         res = engine_or_adapter.generate_batch([msgs], **kw)
         clear_mlx_arena(256)
     item = res.items[0]
-    stream = bool(req.get("stream", False))
     if stream:
         sopts = req.get("stream_options") or {}
-        return 200, iter_chat_sse_events(eff_model, item, include_usage=bool(sopts.get("include_usage", False))), True
+        return (
+            200,
+            iter_chat_sse_events(
+                eff_model,
+                item,
+                include_usage=bool(sopts.get("include_usage", False)),
+                request_start_perf=t0_batch,
+            ),
+            True,
+        )
     return 200, build_chat_completion(eff_model, item, stats=res.stats, extra_key=extra_key), False
 
 

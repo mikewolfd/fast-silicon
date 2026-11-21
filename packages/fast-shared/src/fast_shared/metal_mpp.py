@@ -25,6 +25,12 @@ inline float exact_erf(float x) {
     float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-ax * ax);
     return x >= 0.0f ? y : -y;
 }
+
+inline float gelu_pytorch_tanh(float x) {
+    const float kSqrt2OverPi = 0.7978845608028654f;
+    float inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + metal::precise::tanh(inner));
+}
 """
 
 
@@ -125,8 +131,9 @@ def make_mpp_matmul_kernel(
         }
         cO.store(mC);
         """
-    elif epilogue == "geglu":
+    elif epilogue in ("geglu", "geglu_tanh"):
         inputs = ["A", "B"]
+        gelu_expr = "gelu_pytorch_tanh(g)" if epilogue == "geglu_tanh" else "0.5f * g * (1.0f + exact_erf(g * 0.7071067811865475f))"
         src = f"""
         int M = (int)A_shape[0], K = (int)A_shape[1], N_tot = (int)B_shape[0];
         int N_half = N_tot >> 1;
@@ -154,7 +161,6 @@ def make_mpp_matmul_kernel(
         }}
         op.run(mA, mG, cG);
         op.run(mA, mU, cU);
-        const float inv_s2 = 0.7071067811865475f;
         #pragma unroll
         for (uint16_t i = 0; i < cG.get_capacity(); ++i) {{
             if (cG.is_valid_element(i)) {{
@@ -162,39 +168,39 @@ def make_mpp_matmul_kernel(
                 if ((int)idx[1] < tile_m && (int)idx[0] < tile_n) {{
                     float g = cG[i];
                     float u = cU[i];
-                    cO[i] = static_cast<half>(0.5f * g * (1.0f + exact_erf(g * inv_s2)) * u);
+                    cO[i] = static_cast<half>({gelu_expr} * u);
                 }}
             }}
         }}
         cO.store(mC);
         """
         return mx.fast.metal_kernel(name=name, input_names=inputs, output_names=["C"], header=HEADER_MPP, source=src)
-    elif epilogue == "gelu_mul_pli":
+    elif epilogue in ("gelu_mul_pli", "gelu_tanh_mul_pli"):
         inputs = ["A", "B", "PLI"]
         n_expr = "N"
         b_cols_expr = "N"
-        ep_body = """
+        gelu_expr = "gelu_pytorch_tanh(g)" if epilogue == "gelu_tanh_mul_pli" else "0.5f * g * (1.0f + exact_erf(g * 0.7071067811865475f))"
+        ep_body = f"""
         auto cF = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
         auto cO = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
         #pragma unroll
-        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {
+        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {{
             if (cF.is_valid_element(i)) cF[i] = 0.0f;
-        }
+        }}
         op.run(mA, mB, cF);
-        const float inv_s2 = 0.7071067811865475f;
         #pragma unroll
-        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {
-            if (cF.is_valid_element(i)) {
+        for (uint16_t i = 0; i < cF.get_capacity(); ++i) {{
+            if (cF.is_valid_element(i)) {{
                 auto idx = cF.get_multidimensional_index(i);
                 int r = tg_y + (int)idx[1];
                 int c = tg_x + (int)idx[0];
-                if (r < M && c < N) {
+                if (r < M && c < N) {{
                     float g = cF[i];
                     float p = (float)PLI[r * N + c];
-                    cO[i] = static_cast<half>(0.5f * g * (1.0f + exact_erf(g * inv_s2)) * p);
-                }
-            }
-        }
+                    cO[i] = static_cast<half>({gelu_expr} * p);
+                }}
+            }}
+        }}
         cO.store(mC);
         """
     else:
