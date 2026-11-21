@@ -42,6 +42,17 @@ from .packager import is_ple_gate_or_proj_key, quantize_q4_0_sym_u32
 from .paths import Gemma4Paths, resolve_paths
 from .tokenizer import DEFAULT_KEPT_VOCAB_SIZE, FULL_VOCAB_SIZE, VocabRemapper
 
+try:
+    from fast_shared.metal_mpp_int8 import (
+        get_or_pack_affine_module_weights,
+        mpp_quantized_linear,
+        should_use_mpp_int8_linear,
+    )
+except ImportError:
+    get_or_pack_affine_module_weights = None  # type: ignore[assignment]
+    mpp_quantized_linear = None  # type: ignore[assignment]
+    should_use_mpp_int8_linear = None  # type: ignore[assignment]
+
 
 def _macos_version_tuple() -> tuple[int, int]:
     ver_str = platform.mac_ver()[0]
@@ -618,7 +629,9 @@ class Gemma4Router:
         self.proj = proj
         self.scale = scale.astype(dtype)
         self.per_expert_scale = per_expert_scale.astype(dtype)
-        self.scaled_norm_w = (scale.astype(mx.float32) * (float(hidden_size) ** -0.5)).astype(dtype)
+        self.per_expert_scale_f32 = per_expert_scale.astype(mx.float32)
+        self.scaled_norm_w_f32 = scale.astype(mx.float32) * (float(hidden_size) ** -0.5)
+        self.scaled_norm_w = self.scaled_norm_w_f32.astype(dtype)
         self.top_k = int(top_k)
         self.eps = float(eps)
 
@@ -626,11 +639,20 @@ class Gemma4Router:
         return [self.proj.parameters(), self.scale, self.per_expert_scale, self.scaled_norm_w]
 
     def __call__(self, x: mx.array, *, singleton: bool = False) -> tuple[mx.array, mx.array]:
-        x_norm = mx.fast.rms_norm(x, self.scaled_norm_w, self.eps)
-        scores = _singleton_verify_linear(self.proj, x_norm) if singleton else self.proj(x_norm)
+        x_f32 = x.astype(mx.float32)
+        x_norm = mx.fast.rms_norm(x_f32, self.scaled_norm_w_f32, self.eps)
+        if isinstance(self.proj, nn.Linear):
+            w_f32 = self.proj.weight.astype(mx.float32)
+            scores = mx.matmul(x_norm, w_f32.T)
+            if "bias" in self.proj and self.proj.bias is not None:
+                scores = scores + self.proj.bias.astype(mx.float32)
+        elif isinstance(self.proj, nn.QuantizedLinear):
+            scores = self.proj(x_norm).astype(mx.float32)
+        else:
+            scores = (_singleton_verify_linear(self.proj, x_norm) if singleton else self.proj(x_norm)).astype(mx.float32)
         top_k_idx = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        top_k_w = mx.softmax(mx.take_along_axis(scores, top_k_idx, axis=-1), axis=-1, precise=True).astype(x.dtype)
-        top_k_w = top_k_w * self.per_expert_scale[top_k_idx]
+        top_k_w = mx.softmax(mx.take_along_axis(scores, top_k_idx, axis=-1), axis=-1, precise=True)
+        top_k_w = top_k_w * self.per_expert_scale_f32[top_k_idx]
         return top_k_idx, top_k_w
 
 
@@ -672,7 +694,9 @@ class Gemma4SwitchGLU:
             sorted_indices=True,
         )
         y = y_sorted[inv_order].reshape((*orig_idx_shape, -1))
-        return (mx.expand_dims(top_k_weights, -1) * y).sum(axis=-2)
+        return (mx.expand_dims(top_k_weights.astype(mx.float32), -1) * y.astype(mx.float32)).sum(axis=-2).astype(
+            y.dtype
+        )
 
     def __call__(
         self,
@@ -912,6 +936,9 @@ class FastGemma4Model:
         self._lm_head_mpp_min_m = 64
         self._use_mpp_requested = bool(use_mpp)
         self.use_mpp = bool(use_mpp and (mlp_dtype in ("bfloat16", "auto")) and self._mpp_bf16_supported)
+        self._mpp_apple10_int8_enabled = bool(
+            self._use_mpp_requested and self._gpu_family == "apple10" and mpp_quantized_linear is not None
+        )
         self.lm_head_mode = lm_head_mode
         if isinstance(kv_i8, bool):
             self.kv_i8_mode = "explicit"
@@ -1729,6 +1756,48 @@ class FastGemma4Model:
                     released += 1
         return released
 
+    def _apply_qlinear(self, ld: dict[str, Any], key: str, x: mx.array) -> mx.array:
+        """Apply Apple10+ `W8A8`/`W4A8` MPP linear projection when enabled and profitable, else `mod(x)`."""
+        mod = ld[key]
+        if (
+            getattr(self, "_mpp_apple10_int8_enabled", False)
+            and mpp_quantized_linear is not None
+            and isinstance(mod, nn.QuantizedLinear)
+            and getattr(mod, "biases", None) is not None
+            and mx.default_device() == mx.gpu
+        ):
+            bits = int(mod.bits)
+            gs = int(mod.group_size)
+            mode = str(mod.mode)
+            k = int(x.shape[-1])
+            m = x.size // k if k > 0 and x.size > 0 else 0
+            n = int(mod.weight.shape[0])
+            if should_use_mpp_int8_linear(
+                m,
+                k,
+                n,
+                bits=bits,
+                group_size=gs,
+                mode=mode,
+                apple10_nax=True,
+            ):
+                packed = get_or_pack_affine_module_weights(
+                    ld, f"_mpp_i8_{key}", mod, bits=bits, group_size=gs
+                )
+                return mpp_quantized_linear(
+                    x,
+                    mod.weight,
+                    mod.scales,
+                    mod.biases,
+                    bits=bits,
+                    group_size=gs,
+                    mode=mode,
+                    bias=getattr(mod, "bias", None),
+                    out_dtype=x.dtype,
+                    packed_weights=packed,
+                )
+        return mod(x)
+
     def _run_mlp(
         self,
         mlp_in: mx.array,
@@ -1782,8 +1851,10 @@ class FastGemma4Model:
                 if mlp_mode == "auto" and isinstance(ld["gate_up_proj"], nn.QuantizedLinear):
                     mlp_act = fused_geglu_split(mlp_in @ ld["w_gu"].T)
                     return mlp_act @ ld["w_dn"].T
-        mlp_act = fused_geglu_split(ld["gate_up_proj"](mlp_in))
-        return ld["down_proj"](mlp_act)
+        mlp_act = fused_geglu_split(
+            self._apply_qlinear(ld, "gate_up_proj", mlp_in) if allow_mpp else ld["gate_up_proj"](mlp_in)
+        )
+        return self._apply_qlinear(ld, "down_proj", mlp_act) if allow_mpp else ld["down_proj"](mlp_act)
 
     def _run_ffn_and_ple(
         self,
@@ -1997,7 +2068,7 @@ class FastGemma4Model:
                 n_q = l.get("n_q_heads", default_n_q)
                 n_kv = l.get("n_kv_heads", default_n_kv)
                 if i == self.first_kv_shared - 1:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_1, self.eps, n_kv=n_kv
                     )
@@ -2005,7 +2076,7 @@ class FastGemma4Model:
                     v_sys_list[i][s0:s1] = v_norm[0]
                     break
 
-                qkv = l["qkv_proj"](x_in)
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                 q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope(
                     qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_meta, self.eps, n_q=n_q, n_kv=n_kv
                 )
@@ -2037,7 +2108,7 @@ class FastGemma4Model:
                     .transpose(0, 2, 1, 3)
                     .reshape(1, lc, n_q * D)
                 )
-                attn_out = l["o_proj"](att)
+                attn_out = self._apply_qlinear(l, "o_proj", att)
                 h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             mx.eval(*k_sys_list, *v_sys_list)
         if l_sys > eff_chunk_sz and callable(getattr(mx, "clear_cache", None)):
@@ -2125,7 +2196,7 @@ class FastGemma4Model:
 
             if not l["is_shared"]:
                 if i == split_idx and keep_from_col > 0:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                     )
@@ -2135,16 +2206,16 @@ class FastGemma4Model:
                     if pli is not None:
                         pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
-                    q_raw = l["q_proj_split"](x_in)
+                    q_raw = self._apply_qlinear(l, "q_proj_split", x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
                 else:
-                    qkv = l["qkv_proj"](x_in)
+                    qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                     q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                         qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
                     )
                     scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
             else:
-                q_raw = l["q_proj"](x_in)
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
             if int(q_rot.shape[1]) > 1:
@@ -2180,7 +2251,7 @@ class FastGemma4Model:
                     vec4_reduce=self.vec4_reduce,
                 )
 
-            attn_out = l["o_proj"](att)
+            attn_out = self._apply_qlinear(l, "o_proj", att)
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
@@ -2236,7 +2307,7 @@ class FastGemma4Model:
                 is_4d = c["k"].ndim == 4
 
                 if i == self.first_kv_shared - 1:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_bg, self.eps, n_kv=n_kv
                     )
@@ -2251,7 +2322,7 @@ class FastGemma4Model:
                         c["v"][b_idx, s0:s1] = v_store
                     break
 
-                qkv = l["qkv_proj"](x_in)
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                 q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope(
                     qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_meta, self.eps, n_q=n_q, n_kv=n_kv
                 )
@@ -2326,7 +2397,7 @@ class FastGemma4Model:
                     .transpose(0, 2, 1, 3)
                     .reshape(Bg, lc, n_q * D)
                 )
-                attn_out = l["o_proj"](att)
+                attn_out = self._apply_qlinear(l, "o_proj", att)
                 h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             mx.eval(*[(c["k"], c["v"]) for c in doc_layers])
 
@@ -2495,14 +2566,14 @@ class FastGemma4Model:
             ring_cap = cap if c["ring"] else 0
 
             if i == self.first_kv_shared - 1:
-                kv = l["kv_proj_only"](x_in)
+                kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                 k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                     kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                 )
                 scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
                 break
 
-            qkv = l["qkv_proj"](x_in)
+            qkv = self._apply_qlinear(l, "qkv_proj", x_in)
             q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                 qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
             )
@@ -2539,7 +2610,7 @@ class FastGemma4Model:
                     meta=cache["meta_swa"],
                     vec4_reduce=self.vec4_reduce,
                 )
-            attn_out = l["o_proj"](att)
+            attn_out = self._apply_qlinear(l, "o_proj", att)
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
     # ------------------------------------------------------------------
@@ -2691,7 +2762,7 @@ class FastGemma4Model:
                 kv = (
                     _singleton_verify_linear(l["kv_proj_only"], x_in)
                     if use_singleton
-                    else l["kv_proj_only"](x_in)
+                    else self._apply_qlinear(l, "kv_proj_only", x_in)
                 )
                 k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                     kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
@@ -2709,7 +2780,7 @@ class FastGemma4Model:
             qkv = (
                 _singleton_verify_linear(l["qkv_proj"], x_in)
                 if use_singleton
-                else l["qkv_proj"](x_in)
+                else self._apply_qlinear(l, "qkv_proj", x_in)
             )
             q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                 qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
@@ -2740,7 +2811,7 @@ class FastGemma4Model:
             attn_out = (
                 _singleton_verify_linear(l["o_proj"], att)
                 if use_singleton
-                else l["o_proj"](att)
+                else self._apply_qlinear(l, "o_proj", att)
             )
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=use_singleton)
 
@@ -2786,7 +2857,7 @@ class FastGemma4Model:
             if not l["is_shared"]:
                 pos_slot = swa_slot if c["ring"] else full_slot
                 if i == split_idx and keep_from_col > 0:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                     )
@@ -2803,11 +2874,11 @@ class FastGemma4Model:
                     if pli is not None:
                         pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
-                    q_raw = l["q_proj_split"](x_in)
+                    q_raw = self._apply_qlinear(l, "q_proj_split", x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
                     ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B * (L_q - keep_from_col))
                 else:
-                    qkv = l["qkv_proj"](x_in)
+                    qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                     q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                         qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
                     )
@@ -2820,7 +2891,7 @@ class FastGemma4Model:
                             c["k"], c["v"], k_rot, v_norm, s_idx_sc, pos_slot
                         )
             else:
-                q_raw = l["q_proj"](x_in)
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
             att = mqa8_sdpa_prefix_ragged_slot(
@@ -2838,7 +2909,7 @@ class FastGemma4Model:
                 vec4_reduce=self.vec4_reduce,
             )
 
-            attn_out = l["o_proj"](att)
+            attn_out = self._apply_qlinear(l, "o_proj", att)
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
@@ -2907,7 +2978,7 @@ class FastGemma4Model:
                     kv = (
                         _singleton_verify_linear(l["kv_proj_only"], x_in)
                         if step_single
-                        else l["kv_proj_only"](x_in)
+                        else self._apply_qlinear(l, "kv_proj_only", x_in)
                     )
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
@@ -2925,7 +2996,7 @@ class FastGemma4Model:
                     if pli is not None:
                         pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
-                    q_raw = l["q_proj_split"](x_in)
+                    q_raw = self._apply_qlinear(l, "q_proj_split", x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
                     ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B)
                     step_single = False
@@ -2933,7 +3004,7 @@ class FastGemma4Model:
                     qkv = (
                         _singleton_verify_linear(l["qkv_proj"], x_in)
                         if step_single
-                        else l["qkv_proj"](x_in)
+                        else self._apply_qlinear(l, "qkv_proj", x_in)
                     )
                     q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                         qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
@@ -2947,7 +3018,7 @@ class FastGemma4Model:
                             c["k"], c["v"], k_rot, v_norm, s_idx_sc, pos_slot
                         )
             else:
-                q_raw = l["q_proj"](x_in)
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
             att = mqa8_sdpa_prefix_ragged_slot(
@@ -2968,7 +3039,7 @@ class FastGemma4Model:
             attn_out = (
                 _singleton_verify_linear(l["o_proj"], att)
                 if step_single
-                else l["o_proj"](att)
+                else self._apply_qlinear(l, "o_proj", att)
             )
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=step_single)
 
@@ -3038,7 +3109,7 @@ class FastGemma4Model:
 
             if not l["is_shared"]:
                 pos_slot = swa_slot if c["ring"] else full_slot
-                qkv = l["qkv_proj"](x_in)
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                 q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                     qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
                 )
@@ -3060,7 +3131,7 @@ class FastGemma4Model:
                     B = n_keep
                     ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, B)
             else:
-                q_raw = l["q_proj"](x_in)
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
             att = mqa8_sdpa_prefix_ragged_slot(
@@ -3078,7 +3149,7 @@ class FastGemma4Model:
                 vec4_reduce=self.vec4_reduce,
             )
 
-            attn_out = l["o_proj"](att)
+            attn_out = self._apply_qlinear(l, "o_proj", att)
             h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
 
         cache["_last_x_in"] = x_in
@@ -3323,7 +3394,7 @@ class FastGemma4Model:
                 is_4d = c["k"].ndim == 4
 
                 if i == self.first_kv_shared - 1:
-                    kv = l["kv_proj_only"](x_in)
+                    kv = self._apply_qlinear(l, "kv_proj_only", x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_bg, self.eps, n_kv=n_kv
                     )
@@ -3344,7 +3415,7 @@ class FastGemma4Model:
                             c["v"][b_idx, s0:s1] = v_store
                     break
 
-                qkv = l["qkv_proj"](x_in)
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
                 q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope(
                     qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_meta, self.eps, n_q=n_q, n_kv=n_kv
                 )
@@ -3442,7 +3513,7 @@ class FastGemma4Model:
                     .transpose(0, 2, 1, 3)
                     .reshape(Bg, lc, n_q * D)
                 )
-                attn_out = l["o_proj"](att)
+                attn_out = self._apply_qlinear(l, "o_proj", att)
                 h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
             self._eval_doc_layers(doc_layers, use_kv_i8)
 

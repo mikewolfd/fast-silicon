@@ -913,11 +913,11 @@ def _get_softcap_argmax_telem_kernel(stride: int, v_lim: int, softcap: float, ha
     bool saw_nan = false;
 
     for (int j = (int)tid; j < V; j += 256) {{
-        float raw_f = (float)rp[j];
-        if (isnan(raw_f)) {{
+        if ((as_type<ushort>(rp[j]) & 0x7f80u) == 0x7f80u) {{
             saw_nan = true;
             continue;
         }}
+        float raw_f = (float)rp[j];
         bfloat x_div = rp[j] / SC_BF;
         bfloat y_bf = (bfloat)(metal::precise::tanh((float)x_div)) * SC_BF;
         float v = (float)y_bf;
@@ -1157,11 +1157,11 @@ def fused_softcap_argmax_bf16(
     bool saw_nan = false;
 
     for (int j = (int)tid; j < V; j += 256) {{
-        float raw_f = (float)rp[j];
-        if (isnan(raw_f)) {{
+        if ((as_type<ushort>(rp[j]) & 0x7f80u) == 0x7f80u) {{
             saw_nan = true;
             continue;
         }}
+        float raw_f = (float)rp[j];
         bfloat x_div = rp[j] / SC_BF;
         bfloat y_bf = (bfloat)(metal::precise::tanh((float)x_div)) * SC_BF;
         float v = (float)y_bf;

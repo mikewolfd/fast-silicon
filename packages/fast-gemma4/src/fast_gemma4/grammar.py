@@ -274,6 +274,13 @@ class WhitespaceGuardedMatcher:
             self._guard.accept_many(toks)
         return ok
 
+    def rollback(self, count: int) -> None:
+        n = int(count)
+        if n <= 0:
+            return
+        self._guard.rollback(n)
+        self._inner.rollback(n)
+
     def compute_ff_tokens(self) -> list[int]:
         return list(self._inner.compute_ff_tokens())
 

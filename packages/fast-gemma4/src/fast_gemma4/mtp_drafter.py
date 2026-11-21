@@ -28,12 +28,13 @@ from .model import (
     _singleton_verify_linear,
     safe_argmax_with_nan_guard,
 )
-from .speculative import _pick_valid_token_safe
+from .speculative import _pick_valid_token_safe, _seed_tables, _update_ngrams_from_tail
 
 DEFAULT_MTP_DRAFTER_REPO: str = "google/gemma-4-E2B-it-assistant"
 DEFAULT_QAT_MTP_DRAFTER_REPO: str = "google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant"
 DEFAULT_MTP_TOP_K: int = 32
 MAX_MTP_BATCH_SIZE: int = 4
+MAX_CONSTRAINED_MTP_BATCH_SIZE_APPLE9: int = 2
 
 _APPLE10_NAX_CACHE: bool | None = None
 
@@ -88,11 +89,17 @@ def should_use_mtp_drafter(
     *,
     speculative: bool | None = None,
     apple10_nax: bool | None = None,
+    has_grammar: bool = False,
 ) -> bool:
-    """Enable MTP drafter strictly for `B == 1` on Apple10+ NAX or `1 <= B <= 4` on Apple9, `T == 0`, non-ANE GPU waves."""
+    """Enable MTP drafter strictly for winning batch regimes on each GPU generation."""
     if drafter is None or speculative is False or use_ane or temperature > 0.0:
         return False
-    max_b = 1 if _resolve_apple10_nax(apple10_nax) else MAX_MTP_BATCH_SIZE
+    if _resolve_apple10_nax(apple10_nax):
+        max_b = 1
+    elif has_grammar:
+        max_b = MAX_CONSTRAINED_MTP_BATCH_SIZE_APPLE9
+    else:
+        max_b = MAX_MTP_BATCH_SIZE
     return 1 <= int(batch_w) <= max_b
 
 
@@ -207,6 +214,190 @@ def draft_scan_top_k(
     best_local = best_flat % per_centroid
     best_c = mx.take_along_axis(top_c, best_c_pos[:, None], axis=1).squeeze(1)
     return order_2d[best_c, best_local]
+
+
+def draft_scan_top_candidates(
+    x_norm_2d: mx.array,
+    centroids_w: mx.array,
+    embed_perm: mx.array,
+    order_2d: mx.array,
+    *,
+    top_k: int = DEFAULT_MTP_TOP_K,
+    top_m: int = 16,
+    embed_perm_t: mx.array | None = None,
+) -> mx.array:
+    """Return top `top_m` candidate token IDs `[B, M]` descending by score across `top_k` centroid tiles."""
+    B = int(x_norm_2d.shape[0])
+    num_centroids = int(centroids_w.shape[0])
+    per_centroid = int(embed_perm.shape[1])
+    eff_k = max(1, min(int(top_k), num_centroids))
+
+    c_logits = x_norm_2d @ centroids_w.T
+    if eff_k < num_centroids:
+        top_c = mx.argpartition(-c_logits, kth=eff_k, axis=-1)[:, :eff_k]
+    else:
+        top_c = mx.broadcast_to(mx.arange(num_centroids, dtype=mx.int32)[None, :], (B, num_centroids))
+
+    if mx.default_device() == mx.gpu:
+        ep_t = embed_perm_t if embed_perm_t is not None else mx.contiguous(embed_perm.swapaxes(-1, -2))
+        scores = mx.gather_mm(
+            x_norm_2d[:, None, None, :].astype(ep_t.dtype),
+            ep_t,
+            rhs_indices=top_c,
+        ).squeeze(-2)
+    else:
+        cand_w = embed_perm[top_c]
+        scores = mx.matmul(cand_w, x_norm_2d[:, None, :, None].astype(cand_w.dtype)).squeeze(-1)
+
+    flat_scores = scores.reshape(B, eff_k * per_centroid)
+    total_cands = int(flat_scores.shape[1])
+    m_eff = max(1, min(int(top_m), total_cands))
+    if m_eff == 1:
+        best_flat = mx.argmax(flat_scores, axis=-1).astype(mx.int32)[:, None]
+    else:
+        if m_eff < total_cands:
+            top_idx = mx.argpartition(-flat_scores, kth=m_eff, axis=-1)[:, :m_eff]
+        else:
+            top_idx = mx.broadcast_to(mx.arange(total_cands, dtype=mx.int32)[None, :], (B, total_cands))
+        top_vals = mx.take_along_axis(flat_scores, top_idx, axis=-1)
+        ord_m = mx.argsort(-top_vals, axis=-1)
+        best_flat = mx.take_along_axis(top_idx, ord_m, axis=-1).astype(mx.int32)
+    best_c_pos = best_flat // per_centroid
+    best_local = best_flat % per_centroid
+    best_c = mx.take_along_axis(top_c, best_c_pos, axis=1)
+    return order_2d[best_c, best_local]
+
+
+class _ConstrainedMtpWalker:
+    """Splash-style single-`LLMatcher` DFS walker (`_reach` / `_walk` + prompt lookup + rollback)."""
+
+    def __init__(
+        self,
+        matcher: Any,
+        vocab_size: int,
+        stop_token_ids: frozenset[int],
+        t3: dict[tuple[int, int, int], list[int]],
+        t2: dict[tuple[int, int], list[int]],
+    ) -> None:
+        self.matcher = matcher
+        self.vocab_size = int(vocab_size)
+        self.stop_token_ids = stop_token_ids
+        self.t3 = t3
+        self.t2 = t2
+
+    def _reach(self, rows_rem: int) -> tuple[int, ...]:
+        if rows_rem <= 0:
+            return ()
+        return tuple(int(t) for t in self.matcher.compute_ff_tokens()[:rows_rem])
+
+    def _prompt_lookup_candidates(self, ctx: Sequence[int]) -> list[int]:
+        if len(ctx) >= 3:
+            hit = self.t3.get((int(ctx[-3]), int(ctx[-2]), int(ctx[-1])))
+            if hit:
+                return [int(t) for t in hit]
+        if len(ctx) >= 2:
+            hit2 = self.t2.get((int(ctx[-2]), int(ctx[-1])))
+            if hit2:
+                return [int(t) for t in hit2]
+        return []
+
+    def _walk(
+        self,
+        cand_step: int,
+        slots_rem: int,
+        cands_by_step: Sequence[Sequence[int]],
+        ctx: list[int],
+        shifted: bool,
+        *,
+        max_branch: int = 4,
+    ) -> tuple[list[int], bool]:
+        """DFS up to `slots_rem` tokens using `try_consume_tokens` + `rollback`; restores matcher state."""
+        if slots_rem <= 0:
+            return [], False
+
+        ff = self._reach(slots_rem)
+        if ff:
+            n_ff = int(self.matcher.try_consume_tokens(list(ff)))
+            if n_ff > 0:
+                taken = list(ff[:n_ff])
+                accepting = bool(self.matcher.is_stopped() and self.matcher.is_accepting())
+                if accepting or n_ff >= slots_rem:
+                    self.matcher.rollback(n_ff)
+                    return taken, accepting
+                ctx.extend(taken)
+                tail, tail_acc = self._walk(
+                    cand_step,
+                    slots_rem - n_ff,
+                    cands_by_step,
+                    ctx,
+                    True,
+                    max_branch=max_branch,
+                )
+                del ctx[-n_ff:]
+                self.matcher.rollback(n_ff)
+                return taken + tail, tail_acc
+
+        pl = self._prompt_lookup_candidates(ctx)
+        step_i = min(cand_step, len(cands_by_step) - 1) if cands_by_step else 0
+        dr = [int(t) for t in cands_by_step[step_i]] if cands_by_step else []
+
+        ordered: list[tuple[int, bool, int]] = []
+        seen: set[int] = set()
+        if not shifted and dr:
+            t0 = dr[0]
+            if 0 <= t0 < self.vocab_size and t0 not in self.stop_token_ids:
+                seen.add(t0)
+                ordered.append((t0, False, cand_step + 1))
+        for pt in pl:
+            if pt not in seen and 0 <= pt < self.vocab_size and pt not in self.stop_token_ids:
+                seen.add(pt)
+                ordered.append((pt, True, cand_step))
+        for dt in dr:
+            if dt not in seen and 0 <= dt < self.vocab_size and dt not in self.stop_token_ids:
+                seen.add(dt)
+                ordered.append((dt, shifted or not dr or dt != dr[0], cand_step + 1))
+
+        best_path: list[int] = []
+        best_acc = False
+        tried = 0
+        branch_limit = max_branch if cand_step == 0 and not shifted else min(2, max_branch)
+        for tok, child_shifted, next_cand_step in ordered:
+            if self.matcher.try_consume_tokens([tok]) <= 0:
+                continue
+            tried += 1
+            accepting = bool(self.matcher.is_stopped() and self.matcher.is_accepting())
+            if accepting or slots_rem == 1:
+                cand_path, cand_acc = [tok], accepting
+            else:
+                ctx.append(tok)
+                tail, cand_acc = self._walk(
+                    next_cand_step,
+                    slots_rem - 1,
+                    cands_by_step,
+                    ctx,
+                    child_shifted,
+                    max_branch=branch_limit,
+                )
+                ctx.pop()
+                cand_path = [tok] + tail
+            self.matcher.rollback(1)
+            if (len(cand_path) > len(best_path)) or (cand_acc and not best_acc and len(cand_path) == len(best_path)):
+                best_path = cand_path
+                best_acc = cand_acc
+            if len(best_path) >= slots_rem or (tried >= branch_limit) or (not child_shifted and best_path):
+                break
+        return best_path, best_acc
+
+    def build_draft(
+        self,
+        cands_by_step: Sequence[Sequence[int]],
+        ctx: Sequence[int],
+        max_draft: int,
+    ) -> list[int]:
+        if max_draft <= 0 or (self.matcher.is_stopped() and self.matcher.is_accepting()):
+            return []
+        path, _ = self._walk(0, int(max_draft), cands_by_step, [int(t) for t in ctx], False)
+        return path[: int(max_draft)]
 
 
 class Gemma4MtpDrafter:
@@ -468,6 +659,30 @@ class Gemma4MtpDrafter:
         dr_lg = _singleton_verify_linear(self.lm_head, h_2d[:, None, :])
         return mx.argmax(dr_lg[:, 0, :], axis=-1).astype(mx.int32)
 
+    def draft_scan_top_m(self, h_2d: mx.array, *, k: int | None = None, top_m: int = 16) -> mx.array:
+        """Select top `top_m` draft candidate IDs `[B, M]` via centroid tiles or projected `lm_head`."""
+        eff_k = self.top_k if k is None else int(k)
+        if self.use_ordered_embeddings:
+            assert self.centroids_w is not None and self.embed_perm is not None and self.order_2d is not None
+            return draft_scan_top_candidates(
+                h_2d,
+                self.centroids_w,
+                self.embed_perm,
+                self.order_2d,
+                top_k=eff_k,
+                top_m=top_m,
+                embed_perm_t=self.embed_perm_t,
+            )
+        assert self.lm_head is not None
+        dr_lg = _singleton_verify_linear(self.lm_head, h_2d[:, None, :])[:, 0, :]
+        m_eff = max(1, min(int(top_m), int(dr_lg.shape[-1])))
+        if m_eff == 1:
+            return mx.argmax(dr_lg, axis=-1).astype(mx.int32)[:, None]
+        top_idx = mx.argpartition(-dr_lg, kth=m_eff, axis=-1)[:, :m_eff] if m_eff < int(dr_lg.shape[-1]) else mx.broadcast_to(mx.arange(m_eff, dtype=mx.int32)[None, :], (int(dr_lg.shape[0]), m_eff))
+        top_vals = mx.take_along_axis(dr_lg, top_idx, axis=-1)
+        ord_m = mx.argsort(-top_vals, axis=-1)
+        return mx.take_along_axis(top_idx, ord_m, axis=-1).astype(mx.int32)
+
     def draft_step(
         self,
         last_tokens: mx.array,
@@ -477,8 +692,9 @@ class Gemma4MtpDrafter:
         off_rope: mx.array,
         *,
         slot_idx: mx.array | None = None,
+        top_m: int = 1,
     ) -> tuple[mx.array, mx.array]:
-        """Run one MTP step for `B <= 4` -> `(next_token_ids [B], next_hidden [B, 1, H_target])`."""
+        """Run one MTP step for `B <= 4` -> `(next_token_ids [B] or [B, M], next_hidden [B, 1, H_target])`."""
         B = int(last_tokens.shape[0])
         if not (1 <= B <= self.MAX_BATCH_SIZE):
             raise ValueError(f"Gemma4MtpDrafter is strictly gated to 1 <= B <= {self.MAX_BATCH_SIZE}, got B={B}")
@@ -552,7 +768,10 @@ class Gemma4MtpDrafter:
             )
 
         next_hidden = self.post_projection(x_in)
-        next_tok = self.draft_scan_top_k(x_in[:, 0, :], k=self.top_k)
+        if int(top_m) > 1:
+            next_tok = self.draft_scan_top_m(x_in[:, 0, :], k=self.top_k, top_m=int(top_m))
+        else:
+            next_tok = self.draft_scan_top_k(x_in[:, 0, :], k=self.top_k)
         return next_tok, next_hidden
 
     def draft_k(
@@ -582,6 +801,37 @@ class Gemma4MtpDrafter:
             cur_toks = nxt_tok[:, None]
         return mx.concatenate(cols, axis=1)
 
+    def draft_k_candidates(
+        self,
+        anchor_tokens: mx.array,
+        seed_hidden: mx.array,
+        cache: dict[str, Any],
+        off_cur: mx.array,
+        k: int,
+        *,
+        top_m: int = 16,
+        slot_idx: mx.array | None = None,
+    ) -> mx.array:
+        """Autoregressively draft `k` steps with top `top_m` candidates `[B, k, M]` in one fused GPU graph."""
+        B = int(anchor_tokens.shape[0])
+        if not (1 <= B <= self.MAX_BATCH_SIZE):
+            raise ValueError(f"Gemma4MtpDrafter is strictly gated to 1 <= B <= {self.MAX_BATCH_SIZE}, got B={B}")
+        if int(k) <= 0:
+            raise ValueError(f"draft_k must be positive, got {k}")
+        m_eff = max(1, int(top_m))
+        off_kv = mx.maximum(off_cur - 1, 0)
+        cur_toks = anchor_tokens.reshape(B, 1)
+        cur_h = seed_hidden.reshape(B, 1, self.target.hidden_size)
+        cols: list[mx.array] = []
+        for _ in range(int(k)):
+            nxt_cands, cur_h = self.draft_step(
+                cur_toks, cur_h, cache, off_kv, off_cur, slot_idx=slot_idx, top_m=m_eff
+            )
+            nxt_top1 = nxt_cands[:, 0:1] if m_eff > 1 else nxt_cands[:, None]
+            cols.append((nxt_cands if m_eff > 1 else nxt_top1)[:, None, :])
+            cur_toks = nxt_top1
+        return mx.concatenate(cols, axis=1)
+
 
 def run_decode_mtp(
     model: FastGemma4Model,
@@ -597,19 +847,32 @@ def run_decode_mtp(
     draft_k: int | None = None,
     enable_ff_jump: bool = True,
     init_am: mx.array | None = None,
+    per_doc_grammars: Sequence[Any] | None = None,
+    doc_prompts: Sequence[Sequence[int]] | None = None,
+    doc_indices: Sequence[int] | None = None,
+    constrained_top_m: int = 16,
+    apple10_nax: bool | None = None,
 ) -> dict[str, Any]:
-    """Speculative MTP decode (`B=1..4`, `T=0`) supporting both free-text and `llguidance` constrained JSON."""
+    """Speculative MTP decode (`B=1..4` Apple9 / `B=1` Apple10, `T=0`) supporting constrained JSON + DFS."""
     if not (1 <= int(B) <= MAX_MTP_BATCH_SIZE):
         raise ValueError(f"run_decode_mtp is strictly gated to 1 <= B <= {MAX_MTP_BATCH_SIZE}, got B={B}")
+    if apple10_nax is True and int(B) > 1:
+        raise ValueError(f"run_decode_mtp on Apple10+ NAX is strictly gated to B == 1, got B={B}")
+    if per_doc_grammars is not None and len(per_doc_grammars) != int(B):
+        raise ValueError(f"Mismatched per_doc_grammars={len(per_doc_grammars)} vs B={B}")
+    if doc_prompts is not None and len(doc_prompts) != int(B):
+        raise ValueError(f"Mismatched doc_prompts={len(doc_prompts)} vs B={B}")
+    if doc_indices is not None and len(doc_indices) != int(B):
+        raise ValueError(f"Mismatched doc_indices={len(doc_indices)} vs B={B}")
+
     init_x = cache.get("_last_x_in")
     if init_x is None:
         raise RuntimeError("MTP decode requires `cache['_last_x_in']` from prefill.")
 
     t_dec0 = time.perf_counter()
     new_to_old = model.new_to_old
-    fallback_pad = grammar.upfront_ff[0] if (grammar is not None and grammar.upfront_ff) else int(new_to_old[0])
-
-    if grammar is None:
+    doc_helpers = [per_doc_grammars[b] if per_doc_grammars is not None else grammar for b in range(B)]
+    if all(h is None for h in doc_helpers):
         return _run_decode_mtp_unconstrained(
             model,
             drafter,
@@ -625,9 +888,39 @@ def run_decode_mtp(
             init_am=init_am,
         )
 
+    orig_doc_ids = [int(doc_indices[b]) if doc_indices is not None else b for b in range(B)]
+
+    def _helper_upfront_tokens(b: int) -> list[int]:
+        h = doc_helpers[b]
+        if h is None:
+            return []
+        up_fn = getattr(h, "upfront_ff_for_doc", None)
+        if callable(up_fn):
+            return list(up_fn(orig_doc_ids[b]))
+        return list(getattr(h, "upfront_ff", ()))
+
+    def _new_doc_matcher(b: int) -> Any:
+        h = doc_helpers[b]
+        if h is None:
+            return None
+        by_doc = getattr(h, "new_matcher_for_doc", None)
+        if callable(by_doc):
+            return by_doc(orig_doc_ids[b])
+        return h.new_matcher()
+
+    upfront_lists = [_helper_upfront_tokens(b) for b in range(B)]
+    upfront_lens = [len(u) for u in upfront_lists]
+    fallback_pad = next((int(u[0]) for u in upfront_lists if u), int(new_to_old[0]))
+
     is_slot_cache = "swa_cap" in cache
     slot_mx = mx.arange(B, dtype=mx.int32)
-    matchers = [grammar.new_matcher() for _ in range(B)]
+    matchers = [_new_doc_matcher(b) for b in range(B)]
+    doc_ctx: list[list[int]] = [
+        [int(t) for t in doc_prompts[b]] if doc_prompts is not None else [] for b in range(B)
+    ]
+    prompt_tables = _seed_tables(doc_ctx)
+    n_indexed = [len(ctx) for ctx in doc_ctx]
+    vocab_sz = max(int(getattr(drafter, "vocab_size", 0)), int(new_to_old.size))
     queues: list[collections.deque[int]] = [collections.deque() for _ in range(B)]
     gen_toks: list[list[int]] = [[] for _ in range(B)]
     done = [False] * B
@@ -642,6 +935,20 @@ def run_decode_mtp(
     ff_jump_steps = 0
     ff_jump_tokens = 0
 
+    def _append_tok(orig_b: int, tok: int) -> None:
+        gen_toks[orig_b].append(tok)
+        doc_ctx[orig_b].append(tok)
+        t3, t2 = prompt_tables[orig_b]
+        n_indexed[orig_b] = _update_ngrams_from_tail(t3, t2, doc_ctx[orig_b], n_indexed[orig_b])
+
+    def _append_toks(orig_b: int, toks: Sequence[int]) -> None:
+        if not toks:
+            return
+        gen_toks[orig_b].extend(toks)
+        doc_ctx[orig_b].extend(toks)
+        t3, t2 = prompt_tables[orig_b]
+        n_indexed[orig_b] = _update_ngrams_from_tail(t3, t2, doc_ctx[orig_b], n_indexed[orig_b])
+
     def sample_and_queue(
         orig_b: int,
         row_logits: np.ndarray | None,
@@ -650,16 +957,27 @@ def run_decode_mtp(
     ) -> bool:
         nonlocal ff_skipped, mask_fallbacks
         m = matchers[orig_b]
+        h = doc_helpers[orig_b]
+        if m is None or h is None:
+            t_orig = int(new_to_old[argmax_j])
+            _append_tok(orig_b, t_orig)
+            if t_orig in stop_token_ids or len(gen_toks[orig_b]) >= max_tokens:
+                done[orig_b] = True
+                queues[orig_b].clear()
+                return True
+            queues[orig_b].append(t_orig)
+            return True
+
         if row_logits is None:
             t_orig = int(new_to_old[argmax_j])
             if not m.validate_tokens([t_orig]):
                 return False
         else:
-            t_orig, fell = _pick_valid_token_safe(grammar, model, m, row_logits, argmax_j, x_row_mx=x_row_mx)
+            t_orig, fell = _pick_valid_token_safe(h, model, m, row_logits, argmax_j, x_row_mx=x_row_mx)
             if fell:
                 mask_fallbacks += 1
         m.consume_token(t_orig)
-        gen_toks[orig_b].append(t_orig)
+        _append_tok(orig_b, t_orig)
         if m.is_stopped() and m.is_accepting():
             done[orig_b] = True
             queues[orig_b].clear()
@@ -668,7 +986,7 @@ def run_decode_mtp(
         ff = m.compute_ff_tokens()
         if ff:
             m.consume_tokens(ff)
-            gen_toks[orig_b].extend(ff)
+            _append_toks(orig_b, ff)
             ff_skipped += len(ff)
             if m.is_stopped() and m.is_accepting():
                 done[orig_b] = True
@@ -714,7 +1032,11 @@ def run_decode_mtp(
             active = [active[r] for r in keep_rows]
 
         B_cur = len(active)
-        cur_k = int(draft_k) if draft_k is not None else recommended_mtp_draft_k(B_cur, has_grammar=True)
+        if draft_k is not None:
+            cur_k = int(draft_k)
+        else:
+            eff_nax_k = False if (apple10_nax is None and B_cur > 1) else apple10_nax
+            cur_k = recommended_mtp_draft_k(B_cur, has_grammar=True, apple10_nax=eff_nax_k)
         L_step = cur_k + 1
 
         q_lens = [len(queues[b]) for b in active]
@@ -806,20 +1128,39 @@ def run_decode_mtp(
             mtp_rounds += 1
             anc_by_row = {r: mtp_anchors[idx] for idx, r in enumerate(need_mtp_rows)}
             all_anc = [anc_by_row.get(r, first_toks[r]) for r in range(B_cur)]
-            mtp_dr = drafter.draft_k(
+            any_constrained_row = any(matchers[active[r]] is not None for r in need_mtp_rows)
+            top_m_req = max(1, int(constrained_top_m)) if any_constrained_row else 1
+            mtp_cands = drafter.draft_k_candidates(
                 mx.array(all_anc, dtype=mx.int32)[:, None],
                 seed_h,
                 cache,
                 off_cur,
                 cur_k,
+                top_m=top_m_req,
                 slot_idx=(slot_mx if is_slot_cache else None),
             )
-            mx.eval(mtp_dr)  # guard: allow-eval (draft tokens merged into grammar verify batch)
-            mtp_dr_list = mtp_dr.tolist()
+            mx.eval(mtp_cands)  # guard: allow-eval (draft candidate tree merged into grammar verify batch)
+            mtp_cands_list = mtp_cands.tolist()
             for r in need_mtp_rows:
-                row_dr = mtp_dr_list[r]
+                b = active[r]
+                row_cands = mtp_cands_list[r]
+                m_row = matchers[b]
+                if m_row is None:
+                    row_dr = [int(step_cands[0]) for step_cands in row_cands[:cur_k]]
+                else:
+                    t3, t2 = prompt_tables[b]
+                    walker = _ConstrainedMtpWalker(
+                        m_row,
+                        vocab_sz,
+                        stop_token_ids,
+                        t3,
+                        t2,
+                    )
+                    row_dr = walker.build_draft(row_cands[:cur_k], doc_ctx[b], cur_k)
                 batch_seq[r, 0] = anc_by_row[r]
-                batch_seq[r, 1 : 1 + cur_k] = row_dr[:cur_k]
+                if row_dr:
+                    n_dr = min(len(row_dr), cur_k)
+                    batch_seq[r, 1 : 1 + n_dr] = row_dr[:n_dr]
                 drafts[r] = [int(t) for t in row_dr[:cur_k]]
 
         keep_from_col = 0
@@ -874,12 +1215,36 @@ def run_decode_mtp(
                 next_seed_valid[r] = False
                 continue
 
+            m_b = matchers[b]
             matched = 0
             stopped = False
-            for j, d_tok in enumerate(dr):
+            j = 0
+            while j < len(dr):
+                d_tok = dr[j]
                 pos = (nf - 1 - keep_from_col) + j
                 pred_orig = int(new_to_old[am_list[r][pos]])
-                if not matchers[b].validate_tokens([pred_orig]):
+                if m_b is None:
+                    if pred_orig == d_tok:
+                        _append_tok(b, pred_orig)
+                        matched += 1
+                        mtp_accepted += 1
+                        if pred_orig in stop_token_ids or len(gen_toks[b]) >= max_tokens:
+                            done[b] = True
+                            queues[b].clear()
+                            acc_lens[r] = nf + matched
+                            seed_col_idx[r] = pos
+                            stopped = True
+                            break
+                        j += 1
+                        continue
+                    sample_and_queue(b, None, am_list[r][pos])
+                    acc_lens[r] = nf + matched
+                    seed_col_idx[r] = pos
+                    next_seed_valid[r] = len(queues[b]) == 1 and not done[b]
+                    stopped = True
+                    break
+
+                if not m_b.validate_tokens([pred_orig]):
                     if lg_full_np is None:
                         lg_full_np = np.array(lg_step.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
                     sample_and_queue(b, lg_full_np[r, pos], am_list[r][pos], x_row_mx=x_step[r, pos])
@@ -889,32 +1254,57 @@ def run_decode_mtp(
                     stopped = True
                     break
                 if pred_orig == d_tok:
-                    matchers[b].consume_token(pred_orig)
-                    gen_toks[b].append(pred_orig)
+                    m_b.consume_token(pred_orig)
+                    _append_tok(b, pred_orig)
                     matched += 1
                     mtp_accepted += 1
-                    if len(gen_toks[b]) >= max_tokens or (matchers[b].is_stopped() and matchers[b].is_accepting()):
+                    if len(gen_toks[b]) >= max_tokens or (m_b.is_stopped() and m_b.is_accepting()):
                         done[b] = True
                         queues[b].clear()
                         acc_lens[r] = nf + matched
                         seed_col_idx[r] = pos
                         stopped = True
                         break
-                    ff = matchers[b].compute_ff_tokens()
+                    ff = m_b.compute_ff_tokens()
                     if ff:
-                        matchers[b].consume_tokens(ff)
-                        gen_toks[b].extend(ff)
-                        ff_skipped += len(ff)
-                        if (matchers[b].is_stopped() and matchers[b].is_accepting()) or len(gen_toks[b]) >= max_tokens:
+                        n_ff_in_dr = 0
+                        rem_dr = len(dr) - (j + 1)
+                        if rem_dr > 0:
+                            while (
+                                n_ff_in_dr < len(ff)
+                                and n_ff_in_dr < rem_dr
+                                and dr[j + 1 + n_ff_in_dr] == ff[n_ff_in_dr]
+                            ):
+                                n_ff_in_dr += 1
+                        if n_ff_in_dr > 0:
+                            ff_in = ff[:n_ff_in_dr]
+                            m_b.consume_tokens(ff_in)
+                            _append_toks(b, ff_in)
+                            ff_skipped += n_ff_in_dr
+                            matched += n_ff_in_dr
+                            mtp_accepted += n_ff_in_dr
+                        ff_rem = ff[n_ff_in_dr:]
+                        if ff_rem:
+                            m_b.consume_tokens(ff_rem)
+                            _append_toks(b, ff_rem)
+                            ff_skipped += len(ff_rem)
+                        if (m_b.is_stopped() and m_b.is_accepting()) or len(gen_toks[b]) >= max_tokens:
                             done[b] = True
                             queues[b].clear()
-                        else:
-                            queues[b].extend(ff)
-                        acc_lens[r] = nf + matched
-                        seed_col_idx[r] = pos
-                        next_seed_valid[r] = False
-                        stopped = True
-                        break
+                            acc_lens[r] = nf + matched
+                            seed_col_idx[r] = pos + n_ff_in_dr
+                            stopped = True
+                            break
+                        if ff_rem:
+                            queues[b].extend(ff_rem)
+                            acc_lens[r] = nf + matched
+                            seed_col_idx[r] = pos + n_ff_in_dr
+                            next_seed_valid[r] = False
+                            stopped = True
+                            break
+                        j += 1 + n_ff_in_dr
+                        continue
+                    j += 1
                 else:
                     sample_and_queue(b, None, am_list[r][pos])
                     acc_lens[r] = nf + matched
@@ -943,11 +1333,16 @@ def run_decode_mtp(
         del lg_step, am_mx, x_step
 
     dec_sec = time.perf_counter() - t_dec0
-    upfront_len = len(grammar.upfront_ff)
-    tot_gen = sum(len(g) for g in gen_toks) + upfront_len * B
+    tot_upfront = sum(upfront_lens)
+    tot_gen = sum(len(g) for g in gen_toks) + tot_upfront
+    valid_schemas = [
+        True if matchers[b] is None else bool(matchers[b].is_stopped() and matchers[b].is_accepting())
+        for b in range(B)
+    ]
     return {
         "decode_sec": dec_sec,
         "gen_toks": gen_toks,
+        "valid_schemas": valid_schemas,
         "tot_out_tok": tot_gen,
         "verify_steps": verify_steps,
         "acc_tok_per_step": tot_gen / max(B * verify_steps, 1),
@@ -955,7 +1350,7 @@ def run_decode_mtp(
         "mtp_accept_rate": mtp_accepted / max(mtp_proposed, 1),
         "mtp_accepted": mtp_accepted,
         "mtp_proposed": mtp_proposed,
-        "ff_tokens": ff_skipped + upfront_len * B,
+        "ff_tokens": ff_skipped + tot_upfront,
         "ff_jump_steps": ff_jump_steps,
         "ff_jump_tokens": ff_jump_tokens,
         "mask_fallbacks": mask_fallbacks,

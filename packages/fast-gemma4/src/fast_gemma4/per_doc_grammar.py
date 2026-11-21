@@ -23,35 +23,71 @@ class SyncMatcher:
     sees the same upfront tokens and fast-forward lengths (no cross-slot prefill-length or FF-drain jitter).
     """
 
-    __slots__ = ("kind_m", "std_m", "_synced")
+    __slots__ = ("kind_m", "std_m", "_synced", "_sync_history")
 
     def __init__(self, kind_m: Any, std_m: Any):
         self.kind_m = kind_m
         self.std_m = std_m
         self._synced = True
+        self._sync_history: list[tuple[bool, bool]] = []
+
+    def _record_consumed(self, tokens: Sequence[int]) -> None:
+        toks = [int(t) for t in tokens]
+        n = len(toks)
+        if n <= 0:
+            return
+        if self._synced:
+            s = int(self.std_m.try_consume_tokens(toks))
+            for i in range(n):
+                prev_synced = self._synced
+                std_did = prev_synced and (i < s)
+                self._sync_history.append((prev_synced, std_did))
+                if not std_did:
+                    self._synced = False
+        else:
+            for _ in range(n):
+                self._sync_history.append((False, False))
 
     def try_consume_tokens(self, tokens: list[int]) -> int:
-        n = self.kind_m.try_consume_tokens(tokens)
-        if n == 0:
-            self._synced = False
-        elif self._synced:
-            if self.std_m.try_consume_tokens(tokens[:n]) != n:
-                self._synced = False
+        toks = list(tokens)
+        n = int(self.kind_m.try_consume_tokens(toks))
+        if n <= 0:
+            return 0
+        self._record_consumed(toks[:n])
         return n
 
     def consume_token(self, tok_id: int) -> bool:
-        ok = self.kind_m.consume_token(tok_id)
-        if ok and self._synced:
-            if not self.std_m.consume_token(tok_id):
-                self._synced = False
+        tid = int(tok_id)
+        ok = bool(self.kind_m.consume_token(tid))
+        if ok:
+            self._record_consumed([tid])
         return ok
 
     def consume_tokens(self, tokens: list[int]) -> bool:
-        ok = self.kind_m.consume_tokens(tokens)
-        if ok and self._synced:
-            if not self.std_m.consume_tokens(tokens):
-                self._synced = False
+        toks = [int(t) for t in tokens]
+        ok = bool(self.kind_m.consume_tokens(toks))
+        if ok:
+            self._record_consumed(toks)
         return ok
+
+    def rollback(self, count: int) -> None:
+        n = int(count)
+        if n <= 0:
+            return
+        self.kind_m.rollback(n)
+        if n <= len(self._sync_history):
+            popped = self._sync_history[-n:]
+            del self._sync_history[-n:]
+            std_rb = sum(1 for _, did_std in popped if did_std)
+            if std_rb > 0:
+                self.std_m.rollback(std_rb)
+            self._synced = popped[0][0]
+        else:
+            all_std_rb = sum(1 for _, did_std in self._sync_history if did_std)
+            if all_std_rb > 0:
+                self.std_m.rollback(all_std_rb)
+            self._sync_history.clear()
+            self._synced = True
 
     def compute_ff_tokens(self) -> list[int]:
         k_ff = self.kind_m.compute_ff_tokens()

@@ -624,6 +624,7 @@ class FastGemma4Engine:
         batch_w: int,
         temperature: float,
         speculative: bool | None = None,
+        has_grammar: bool = False,
     ) -> Gemma4MtpDrafter | None:
         """Return active MTP drafter for this wave, lazy-loading once under `mtp_drafter='auto'`."""
         apple10_nax = self._engine_apple10_nax()
@@ -638,6 +639,7 @@ class FastGemma4Engine:
                     temperature,
                     speculative=speculative,
                     apple10_nax=apple10_nax,
+                    has_grammar=has_grammar,
                 )
                 else None
             )
@@ -650,6 +652,7 @@ class FastGemma4Engine:
             temperature,
             speculative=speculative,
             apple10_nax=apple10_nax,
+            has_grammar=has_grammar,
         ):
             return None
 
@@ -1126,6 +1129,7 @@ class FastGemma4Engine:
                     batch_w=Bw,
                     temperature=temperature,
                     speculative=eff_spec,
+                    has_grammar=(grammar is not None),
                 )
                 if mtp_drafter is not None:
                     any_spec_used = True
@@ -1141,6 +1145,9 @@ class FastGemma4Engine:
                         max_tokens=max_tokens,
                         draft_k=getattr(self, "mtp_draft_k", None),
                         enable_ff_jump=enable_ff_jump,
+                        doc_prompts=[full_prompts[idx] for idx in w_indices],
+                        doc_indices=w_indices,
+                        apple10_nax=self._engine_apple10_nax(),
                     )
                 use_spec = should_use_speculative(eff_spec, use_ane, Bw, temperature)
                 if use_spec:
@@ -1178,6 +1185,39 @@ class FastGemma4Engine:
                 if dec_res.get("used_speculative"):
                     any_spec_used = True
                 return dec_res
+
+            _apple10_nax = self._engine_apple10_nax()
+            _can_slot_mtp = hasattr(self.model, "make_slot_cache") and hasattr(
+                self.model, "prefill_slots_lazy_lg"
+            )
+
+            def _should_enter_mtp_spec_waves() -> bool:
+                if ring_for_batch is not None or collect_telemetry or collect_valid_lse:
+                    return False
+                has_any_grammar = (grammar is not None) or (resolved_grammars is not None)
+                mtp_gate = should_use_mtp_drafter(
+                    True if self._has_mtp_drafter_candidate() else None,
+                    False,
+                    min(n_docs, wave_bs),
+                    temperature,
+                    speculative=eff_spec,
+                    apple10_nax=_apple10_nax,
+                    has_grammar=has_any_grammar,
+                )
+                if resolved_grammars is not None:
+                    if not mtp_gate or not _can_slot_mtp:
+                        return False
+                    return (
+                        self._maybe_ensure_mtp_drafter(
+                            use_ane=False,
+                            batch_w=min(n_docs, wave_bs),
+                            temperature=temperature,
+                            speculative=eff_spec,
+                            has_grammar=True,
+                        )
+                        is not None
+                    )
+                return mtp_gate or should_use_speculative(eff_spec, False, min(n_docs, wave_bs), temperature)
 
             if use_ane and resolved_grammars is None and ring_for_batch is None:
                 ane_worker = self._get_ane_worker(sys_ids, pkv)
@@ -1233,35 +1273,25 @@ class FastGemma4Engine:
                         if next_err:
                             raise next_err[0]
                         ane_cur = next_box
-            elif (
-                ring_for_batch is None
-                and resolved_grammars is None
-                and not collect_telemetry
-                and not collect_valid_lse
-                and (
-                    should_use_mtp_drafter(
-                        True if self._has_mtp_drafter_candidate() else None,
-                        False,
-                        min(n_docs, wave_bs),
-                        temperature,
-                        speculative=eff_spec,
-                        apple10_nax=self._engine_apple10_nax(),
-                    )
-                    or should_use_speculative(eff_spec, False, min(n_docs, wave_bs), temperature)
-                )
-            ):
-                can_slot_mtp = hasattr(self.model, "make_slot_cache") and hasattr(
-                    self.model, "prefill_slots_lazy_lg"
-                )
+            elif _should_enter_mtp_spec_waves():
+                can_slot_mtp = _can_slot_mtp
+                wave_valid_schemas: list[bool | None] = [None] * n_docs
                 for w_docs in waves:
                     Bw = len(w_docs)
                     sufs_w = [suf_all[i] for i in w_docs]
+                    w_doc_grammars = (
+                        [resolved_grammars[d] for d in w_docs] if resolved_grammars is not None else None
+                    )
+                    has_wave_grammar = (grammar is not None) or (
+                        w_doc_grammars is not None and any(g is not None for g in w_doc_grammars)
+                    )
                     cap_full = max(max(len(s) for s in sufs_w) + max_tokens + 64, 128)
                     mtp_drafter_w = self._maybe_ensure_mtp_drafter(
                         use_ane=False,
                         batch_w=Bw,
                         temperature=temperature,
                         speculative=eff_spec,
+                        has_grammar=has_wave_grammar,
                     )
                     if mtp_drafter_w is not None and can_slot_mtp:
                         any_spec_used = True
@@ -1280,7 +1310,7 @@ class FastGemma4Engine:
                             list(range(Bw)),
                             cache,
                             group_size=8 if Bw <= 32 else 16,
-                            return_logits=(grammar is not None),
+                            return_logits=has_wave_grammar,
                         )
                         ob0 = mx.array(next_offs, dtype=mx.int32)
                         tot_pre_sec += time.perf_counter() - tp0
@@ -1297,6 +1327,10 @@ class FastGemma4Engine:
                             draft_k=getattr(self, "mtp_draft_k", None),
                             enable_ff_jump=enable_ff_jump,
                             init_am=am0,
+                            per_doc_grammars=w_doc_grammars,
+                            doc_prompts=[full_prompts[d] for d in w_docs],
+                            doc_indices=w_docs,
+                            apple10_nax=_apple10_nax,
                         )
                     else:
                         wave_swa_cap = max(
@@ -1338,11 +1372,16 @@ class FastGemma4Engine:
                         extra_roll_stats["mtp_accept_rate"] = extra_roll_stats["mtp_accepted"] / max(
                             extra_roll_stats["mtp_proposed"], 1
                         )
+                    w_valids = dec_res.get("valid_schemas")
                     for r, doc_i in enumerate(w_docs):
                         all_gen_toks[doc_i] = dec_res["gen_toks"][r]
+                        if w_valids is not None:
+                            wave_valid_schemas[doc_i] = bool(w_valids[r])
                     del cache
                     gc.collect()
                     mx.clear_cache()
+                if all(v is not None for v in wave_valid_schemas):
+                    roll_valid_schemas = [bool(v) for v in wave_valid_schemas]
             else:
                 rolling_used = True
                 actual_kv_i8_used = eff_kv_i8

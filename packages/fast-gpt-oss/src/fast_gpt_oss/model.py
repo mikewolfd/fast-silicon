@@ -411,9 +411,11 @@ def pack_gpt_oss_layer_tensors(
         "o_bits": o_bits,
         "o_gs": o_gs,
         "r_w": r_w if r_quant else _as_dtype(r_w, f16_dtype),
+        "r_w_f32": None if r_quant else _as_dtype(r_w, f32_dtype),
         "r_s": _as_dtype(r_s_raw, f16_dtype) if r_quant else None,
         "r_b": _as_dtype(weights[p + "mlp.router.biases"], f16_dtype) if r_quant else None,
         "r_bias": _as_dtype(weights[p + "mlp.router.bias"], f16_dtype),
+        "r_bias_f32": _as_dtype(weights[p + "mlp.router.bias"], f32_dtype),
         "r_quant": r_quant,
         "r_bits": r_bits,
         "r_gs": r_gs,
@@ -479,8 +481,9 @@ def _get_compiled_route(k: int = 4):
         import mlx.core as mx
 
         def _fn(logits: Any) -> tuple[Any, Any]:
-            idx = mx.argpartition(logits, kth=-ik, axis=-1)[..., -ik:]
-            vals = mx.take_along_axis(logits, idx, axis=-1)
+            lg_f32 = logits.astype(mx.float32)
+            idx = mx.argpartition(lg_f32, kth=-ik, axis=-1)[..., -ik:]
+            vals = mx.take_along_axis(lg_f32, idx, axis=-1)
             scores = mx.softmax(vals, axis=-1, precise=True)
             return idx, scores
 
@@ -507,7 +510,8 @@ def _get_compiled_b1_moe_combine():
         import mlx.core as mx
 
         def _fn(h: Any, dn: Any, dn_bias_e: Any, scores: Any) -> Any:
-            weighted = (dn[:, 0, :] + dn_bias_e) * scores[0, :, None]
+            summed = dn[:, 0, :].astype(mx.float32) + dn_bias_e.astype(mx.float32)
+            weighted = summed * scores[0, :, None].astype(mx.float32)
             return h + weighted.sum(axis=0).reshape(1, 1, -1).astype(mx.bfloat16)
 
         _COMPILED_B1_MOE_COMBINE = mx.compile(_fn)
@@ -902,6 +906,55 @@ class FastGptOssModel:
         )[0]
         return out.reshape(shape)
 
+    def rms_f16_and_f32(self, h: Any, w: Any) -> tuple[Any, Any]:
+        """Compute `fp16` expert input alongside `fp32` router input from one `bfloat16` RMSNorm pass."""
+        import mlx.core as mx
+
+        if (
+            self._kernels is None
+            or "rmsnorm_bf16_to_f16_f32" not in self._kernels
+            or h.dtype != mx.bfloat16
+            or w.dtype != mx.bfloat16
+        ):
+            out_f32 = mx.fast.rms_norm(h.astype(mx.float32), w.astype(mx.float32), self.eps)
+            return out_f32.astype(mx.float16), out_f32
+        shape = h.shape
+        n_tok = int(math.prod(shape[:-1]))
+        out16, out32 = self._kernels["rmsnorm_bf16_to_f16_f32"](  # guard: allow-fp32
+            inputs=[h.reshape(n_tok, self.H), w, self.eps_arr],
+            grid=(n_tok * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n_tok, self.H), (n_tok, self.H)],
+            output_dtypes=[mx.float16, mx.float32],
+        )
+        return out16.reshape(shape), out32.reshape(shape)
+
+    def _route_f32(self, h: Any, ld: dict[str, Any]) -> tuple[Any, Any, Any]:
+        """Compute `(pn_f16, topk_inds, topk_scores_f32)` with exact `float32` router projection + softmax."""
+        import mlx.core as mx
+
+        pn, pn_f32 = self.rms_f16_and_f32(h, ld["pa_ln"])
+        bias_f32 = ld["r_bias_f32"] if ld.get("r_bias_f32") is not None else ld["r_bias"].astype(mx.float32)
+        if ld["r_quant"]:
+            rl = (
+                mx.quantized_matmul(
+                    pn_f32,
+                    ld["r_w"],
+                    ld["r_s"],
+                    ld["r_b"],
+                    transpose=True,
+                    group_size=ld["r_gs"],
+                    bits=ld["r_bits"],
+                    mode="affine",
+                )
+                + bias_f32
+            )
+        else:
+            r_w_f32 = ld["r_w_f32"] if ld.get("r_w_f32") is not None else ld["r_w"].astype(mx.float32)
+            rl = mx.matmul(pn_f32, r_w_f32.T) + bias_f32
+        inds, scores = self._route_c(rl.reshape(-1, self.num_local_experts))
+        return pn, inds, scores
+
     def _make_swa_additive_mask(self, l_q: int, kv_len: int, dtype: Any) -> Any:
         """Build `Apple10` SWA-128 additive mask in `dtype` (or `'causal'` when `kv_len <= swa`)."""
         import mlx.core as mx
@@ -961,12 +1014,12 @@ class FastGptOssModel:
         cold_meta_len = max(1, max_cold) * 3
         ntok_arr = mx.array([n_tok], dtype=mx.uint32)
 
-        tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = self.kernels["moe_build_tiles"](
-            inputs=[inds_2d.astype(mx.uint32), scores_2d.astype(mx.float16), ntok_arr],
+        tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = self.kernels["moe_build_tiles"](  # guard: allow-fp32
+            inputs=[inds_2d.astype(mx.uint32), scores_2d.astype(mx.float32), ntok_arr],
             grid=(32, 1, 1),
             threadgroup=(32, 1, 1),
             output_shapes=[(n_assign,), (n_assign,), (n_assign,), (hot_meta_len,), (cold_meta_len,), (2,)],
-            output_dtypes=[mx.uint32, mx.uint32, mx.float16, mx.uint32, mx.uint32, mx.uint32],
+            output_dtypes=[mx.uint32, mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32],
         )
         mid = self.kernels["moe_batch_gu_unified"](
             inputs=[pn_2d, tok_idx, ld["gu_w"], ld["gu_s"], ld["gu_bias"], hot_meta, cold_meta, meta_counts],
@@ -975,12 +1028,12 @@ class FastGptOssModel:
             output_shapes=[(n_assign, self.d_ff)],
             output_dtypes=[mx.float16],
         )[0]
-        y_slots = self.kernels["moe_batch_dn_unified"](
+        y_slots = self.kernels["moe_batch_dn_unified"](  # guard: allow-fp32
             inputs=[mid, slot_idx, rweights, ld["dn_w"], ld["dn_s"], ld["dn_bias"], hot_meta, cold_meta, meta_counts],
             grid=((self.H // 16) * 128, grid_y, 1),
             threadgroup=(128, 1, 1),
             output_shapes=[(n_tok, 4, self.H)],
-            output_dtypes=[mx.float16],
+            output_dtypes=[mx.float32],
         )[0]
         return self.kernels["moe_reduce4_resid_bf16"](
             inputs=[y_slots, h_2d],
@@ -1158,9 +1211,7 @@ class FastGptOssModel:
                     o_out = qmm(att_1d, ld["o_w"], ld["o_s"], ld["o_b"], transpose=True, group_size=ld["o_gs"], bits=ld["o_bits"], mode="affine") + ld["o_bias"]
                     h = self._add_resid_bf16_c(h, o_out)
 
-                    pn = self.rms_f16(h, ld["pa_ln"])
-                    rl = qmm(pn, ld["r_w"], ld["r_s"], ld["r_b"], transpose=True, group_size=ld["r_gs"], bits=ld["r_bits"], mode="affine") + ld["r_bias"]
-                    inds, scores = self._route_c(rl[0])
+                    pn, inds, scores = self._route_f32(h, ld)
                     exp_ids = inds[0].astype(mx.uint32)
                     gu = gmm(pn.reshape(1, 1, 1, self.H), ld["gu_w"], ld["gu_s"], None, rhs_indices=exp_ids, transpose=True, group_size=32, bits=4, mode="mxfp4")
                     act = self._swiglu_c(gu.reshape(4, 2 * self.d_ff), ld["gu_bias"][exp_ids]).reshape(4, 1, 1, self.d_ff)
@@ -1225,18 +1276,7 @@ class FastGptOssModel:
                 )
                 h = self._add_resid_bf16_c(h, o_out)
 
-                pn = self.rms_f16(h, ld["pa_ln"])
-                rl = self._linear(
-                    pn,
-                    ld["r_w"],
-                    ld["r_s"],
-                    ld["r_b"],
-                    is_quant=ld["r_quant"],
-                    bits=ld["r_bits"],
-                    group_size=ld["r_gs"],
-                    bias=ld["r_bias"],
-                )
-                inds, scores = self._route_c(rl[0])
+                pn, inds, scores = self._route_f32(h, ld)
                 exp_ids = inds[0].astype(mx.uint32)
                 gu = mx.gather_qmm(  # guard: allow-lhs-indices guard: allow-unsorted-qmm
                     pn.reshape(1, 1, 1, self.H),
@@ -1339,18 +1379,7 @@ class FastGptOssModel:
             )
             h = self._add_resid_bf16_c(h, o_out)
 
-            pn = self.rms_f16(h, ld["pa_ln"])
-            rl = self._linear(
-                pn,
-                ld["r_w"],
-                ld["r_s"],
-                ld["r_b"],
-                is_quant=ld["r_quant"],
-                bits=ld["r_bits"],
-                group_size=ld["r_gs"],
-                bias=ld["r_bias"],
-            )
-            inds, scores = self._route_c(rl)
+            pn, inds, scores = self._route_f32(h, ld)
             h = self._moe_forward(
                 pn.reshape(l_seq, self.H),
                 h.reshape(l_seq, self.H),
@@ -1588,18 +1617,7 @@ class FastGptOssModel:
                 )
                 h_all = self._add_resid_bf16_c(h_all, o_out)
 
-                pn = self.rms_f16(h_all, ld["pa_ln"])
-                rl = self._linear(
-                    pn,
-                    ld["r_w"],
-                    ld["r_s"],
-                    ld["r_b"],
-                    is_quant=ld["r_quant"],
-                    bits=ld["r_bits"],
-                    group_size=ld["r_gs"],
-                    bias=ld["r_bias"],
-                )
-                inds, scores = self._route_c(rl)
+                pn, inds, scores = self._route_f32(h_all, ld)
                 h_all = self._moe_forward(pn, h_all, inds, scores, ld)
 
             end_indices = mx.array([offs[i + 1] - 1 for i in range(len(sub_lens))], dtype=mx.int32)
@@ -1778,18 +1796,7 @@ class FastGptOssModel:
                 )
                 h_all = self._add_resid_bf16_c(h_all, o_out)
 
-                pn = self.rms_f16(h_all, ld["pa_ln"])
-                rl = self._linear(
-                    pn,
-                    ld["r_w"],
-                    ld["r_s"],
-                    ld["r_b"],
-                    is_quant=ld["r_quant"],
-                    bits=ld["r_bits"],
-                    group_size=ld["r_gs"],
-                    bias=ld["r_bias"],
-                )
-                inds, scores = self._route_c(rl)
+                pn, inds, scores = self._route_f32(h_all, ld)
                 h_all = self._moe_forward(pn, h_all, inds, scores, ld)
 
             end_indices = mx.array([offs[i + 1] - 1 for i in range(len(sub_lens))], dtype=mx.int32)
@@ -1930,18 +1937,7 @@ class FastGptOssModel:
             )
             h = self._add_resid_bf16_c(h, o_out)
 
-            pn = self.rms_f16(h, ld["pa_ln"])
-            rl = self._linear(
-                pn,
-                ld["r_w"],
-                ld["r_s"],
-                ld["r_b"],
-                is_quant=ld["r_quant"],
-                bits=ld["r_bits"],
-                group_size=ld["r_gs"],
-                bias=ld["r_bias"],
-            )
-            inds, scores = self._route_c(rl)
+            pn, inds, scores = self._route_f32(h, ld)
             h = self._moe_forward(pn, h, inds, scores, ld)
 
         batch_cache["dec_cnt"] = dec_cnt + 1

@@ -1002,12 +1002,12 @@ def test_metal4_kernels_and_batch_parity_gpu(tmp_path: Path) -> None:
     inds, scores = m._route_c(rl)
     n_assign = b_moe * 4
     max_hot = max(1, (n_assign // 9) + 1)
-    tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = m.kernels["moe_build_tiles"](
-        inputs=[inds.astype(mx.uint32), scores.astype(mx.float16), mx.array([b_moe], dtype=mx.uint32)],
+    tok_idx, slot_idx, rweights, hot_meta, cold_meta, meta_counts = m.kernels["moe_build_tiles"](  # guard: allow-fp32
+        inputs=[inds.astype(mx.uint32), scores.astype(mx.float32), mx.array([b_moe], dtype=mx.uint32)],
         grid=(32, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(n_assign,), (n_assign,), (n_assign,), (max_hot * 3,), (32 * 3,), (2,)],
-        output_dtypes=[mx.uint32, mx.uint32, mx.float16, mx.uint32, mx.uint32, mx.uint32],
+        output_dtypes=[mx.uint32, mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32],
     )
     mid = m.kernels["moe_batch_gu_unified"](
         inputs=[pn, tok_idx, ld0["gu_w"], ld0["gu_s"], ld0["gu_bias"], hot_meta, cold_meta, meta_counts],
@@ -1016,12 +1016,12 @@ def test_metal4_kernels_and_batch_parity_gpu(tmp_path: Path) -> None:
         output_shapes=[(n_assign, m.d_ff)],
         output_dtypes=[mx.float16],
     )[0]
-    ys = m.kernels["moe_batch_dn_unified"](
+    ys = m.kernels["moe_batch_dn_unified"](  # guard: allow-fp32
         inputs=[mid, slot_idx, rweights, ld0["dn_w"], ld0["dn_s"], ld0["dn_bias"], hot_meta, cold_meta, meta_counts],
         grid=((m.H // 16) * 128, max_hot + m.num_local_experts, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(b_moe, 4, m.H)],
-        output_dtypes=[mx.float16],
+        output_dtypes=[mx.float32],
     )[0]
     h_got = m.kernels["moe_reduce4_resid_bf16"](
         inputs=[ys, h_in],
@@ -2676,6 +2676,72 @@ def test_unconstrained_two_phase_reasoning_budget_and_seam_polish_cpu(
             assert it_bat.token_ids == it_b1.token_ids
     finally:
         mx.set_default_device(prev_dev)
+
+
+def test_gpt_oss_route_f32_fp64_parity_cpu() -> None:
+    """CPU unit test: `_linear` quantized+bias parity and `_route_f32` exact float64 parity."""
+    import mlx.core as mx
+    from fast_gpt_oss.model import FastGptOssModel, _get_compiled_route
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        m = FastGptOssModel.__new__(FastGptOssModel)
+        m._route_c = _get_compiled_route(4)
+        rng = np.random.default_rng(7)
+        x = mx.array(rng.normal(0.0, 0.25, size=(4, 64)).astype(np.float32)).astype(mx.bfloat16)
+        w_f = mx.array(rng.normal(0.0, 0.25, size=(64, 64)).astype(np.float32)).astype(mx.bfloat16)
+        wq, sq, bq = mx.quantize(w_f, group_size=64, bits=4, mode="affine")
+        bias = mx.array(rng.normal(0.0, 0.05, size=(64,)).astype(np.float32)).astype(mx.bfloat16)
+
+        ref = mx.quantized_matmul(x, wq, sq, bq, transpose=True, group_size=64, bits=4, mode="affine") + bias
+        got_lin = m._linear(x, wq, sq, bq, is_quant=True, bits=4, group_size=64, bias=bias)
+        mx.eval(ref, got_lin)
+        np.testing.assert_allclose(np.array(got_lin.astype(mx.float32)), np.array(ref.astype(mx.float32)), rtol=0, atol=0)
+
+        # Verify `_route_f32` matches float64 reference on tied/near-tied bfloat16 hidden inputs
+        m._kernels = None
+        m.eps = 1e-5
+        m.num_local_experts = 8
+        m.top_k = 4
+        m.H = 64
+        pa_ln = mx.ones((64,), dtype=mx.bfloat16)
+        r_w = mx.array(rng.normal(0.0, 0.5, size=(8, 64)).astype(np.float32)).astype(mx.bfloat16)
+        r_bias = mx.array(rng.normal(0.0, 0.1, size=(8,)).astype(np.float32)).astype(mx.bfloat16)
+        h = mx.array(rng.normal(0.0, 1.0, size=(3, 64)).astype(np.float32)).astype(mx.bfloat16)
+        ld = {
+            "pa_ln": pa_ln,
+            "r_quant": False,
+            "r_w": r_w,
+            "r_w_f32": r_w.astype(mx.float32),
+            "r_bias": r_bias,
+            "r_bias_f32": r_bias.astype(mx.float32),
+        }
+        pn, inds, scores = m._route_f32(h, ld)
+        mx.eval(pn, inds, scores)
+        assert pn.dtype == mx.float16
+        assert scores.dtype == mx.float32
+
+        # Float64 reference RMSNorm + linear + top-4 softmax
+        h64 = np.array(h.astype(mx.float32), dtype=np.float64)
+        rms = np.sqrt(np.mean(h64 * h64, axis=-1, keepdims=True) + 1e-5)
+        pn64 = h64 / rms
+        rl64 = pn64 @ np.array(r_w.astype(mx.float32), dtype=np.float64).T + np.array(r_bias.astype(mx.float32), dtype=np.float64)
+        exp_order = np.argsort(-rl64, axis=-1, kind="stable")[:, :4]
+        top_logits = np.take_along_axis(rl64, exp_order, axis=-1)
+        top_logits -= top_logits.max(axis=-1, keepdims=True)
+        w64 = np.exp(top_logits) / np.exp(top_logits).sum(axis=-1, keepdims=True)
+        # `_route_c` returns top-k indices via argpartition; compare sorted sets + per-expert weights
+        inds_np = np.array(inds)
+        scores_np = np.array(scores)
+        for row in range(inds_np.shape[0]):
+            ord_got = np.argsort(inds_np[row])
+            ord_exp = np.argsort(exp_order[row])
+            np.testing.assert_array_equal(inds_np[row, ord_got], exp_order[row, ord_exp])
+            np.testing.assert_allclose(scores_np[row, ord_got], w64[row, ord_exp], rtol=1e-5, atol=1e-5)
+    finally:
+        mx.set_default_device(prev_dev)
+
 
 
 

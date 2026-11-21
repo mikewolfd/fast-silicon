@@ -176,3 +176,22 @@ def test_grammar_helper_flexible_json_caps_runaway_whitespace_cpu() -> None:
         assert m_ok.validate_tokens([tid])
         assert m_ok.consume_token(tid)
     assert m_ok.is_accepting()
+
+    # Rollback on WhitespaceGuardedMatcher must roll back BOTH the inner matcher and the whitespace guard.
+    m_rb = gh_cap8.new_matcher()
+    assert isinstance(m_rb, WhitespaceGuardedMatcher)
+    assert m_rb.try_consume_tokens([brace_l, sp_id, nl_id, sp_id]) == 4
+    assert m_rb.whitespace_guard.run == 3
+    m_rb.rollback(2)
+    assert m_rb.whitespace_guard.run == 1
+    m_rb.rollback(1)
+    assert m_rb.whitespace_guard.run == 0
+
+    # Strict compact mode (`whitespace_flexible=False`): rejects leading whitespace before `{`, strips via upfront_ff.
+    assert gh_compact.upfront_ff
+    decoded_up = tok.decode(gh_compact.upfront_ff)
+    assert decoded_up.lstrip() == decoded_up and decoded_up.startswith("{")
+    fresh_compact_m = gh_compact._llguidance.LLMatcher(gh_compact.ltok, gh_compact.gram)
+    assert fresh_compact_m.validate_tokens([sp_id]) == 0
+    assert fresh_compact_m.validate_tokens([nl_id]) == 0
+    assert fresh_compact_m.validate_tokens([brace_l]) == 1

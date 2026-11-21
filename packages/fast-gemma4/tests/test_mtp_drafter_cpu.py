@@ -47,6 +47,14 @@ def test_should_use_mtp_drafter_strict_batch_gate() -> None:
         assert should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True, apple10_nax=False) is False
         assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=True) is False
 
+    # Constrained (has_grammar=True) Apple9 cap: strictly 1 <= B <= 2 (B>=3 rolling dense wins); Apple10: B == 1.
+    for b in (1, 2):
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False, has_grammar=True) is True
+    for b in (3, 4, 8):
+        assert should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=False, has_grammar=True) is False
+    assert should_use_mtp_drafter(sentinel, False, 1, 0.0, apple10_nax=True, has_grammar=True) is True
+    assert should_use_mtp_drafter(sentinel, False, 2, 0.0, apple10_nax=True, has_grammar=True) is False
+
 
 def test_recommended_mtp_draft_k_and_hard_gate() -> None:
     assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=False) == 4
@@ -243,6 +251,213 @@ def test_engine_mtp_drafter_default_auto_vs_explicit_disable_and_eager_cpu(tmp_p
     assert eng_path._mtp_drafter_auto is False
     assert eng_path.mtp_drafter is not None
     assert eager_calls == [DEFAULT_MTP_DRAFTER_REPO, custom_dir]
+
+
+def test_constrained_mtp_walker_dfs_prompt_lookup_and_rollback_invariance_cpu() -> None:
+    """Verify `_ConstrainedMtpWalker` mixes FF reach, prompt-lookup, top-M DFS candidates and restores matcher state."""
+    from fast_gemma4.mtp_drafter import _ConstrainedMtpWalker
+    from fast_gemma4.speculative import build_ngram_table
+
+    class _SeqGrammarMatcher:
+        def __init__(self, target_seq: list[int], ff_map: dict[int, list[int]]) -> None:
+            self._target = target_seq
+            self._ff_map = ff_map
+            self.pos = 0
+
+        def compute_ff_tokens(self) -> list[int]:
+            return list(self._ff_map.get(self.pos, []))
+
+        def try_consume_tokens(self, toks: list[int]) -> int:
+            cnt = 0
+            for t in toks:
+                if self.pos < len(self._target) and int(t) == self._target[self.pos]:
+                    self.pos += 1
+                    cnt += 1
+                else:
+                    break
+            return cnt
+
+        def rollback(self, count: int) -> None:
+            self.pos = max(0, self.pos - int(count))
+
+        def is_stopped(self) -> bool:
+            return self.pos >= len(self._target)
+
+        def is_accepting(self) -> bool:
+            return self.pos == len(self._target)
+
+    # Target sequence: [10(draft cand[1]), 11(FF), 12(FF), 20(prompt lookup after 11,12), 21(draft), 22(closing accept)]
+    prompt = [1, 2, 11, 12, 20, 99, 100]
+    t3, t2 = build_ngram_table(prompt)
+    matcher = _SeqGrammarMatcher([10, 11, 12, 20, 21, 22], ff_map={1: [11, 12]})
+    walker = _ConstrainedMtpWalker(matcher, vocab_size=128, stop_token_ids=frozenset({0}), t3=t3, t2=t2)
+
+    # Note step 0 has invalid top-1 (55) and valid candidate (10); FF [11,12] auto-reaches; step 1 prompt lookup
+    # recovers 20 even when drafter candidate lists don't contain 20!
+    cands = [
+        [55, 10, 77],
+        [88, 21, 66],
+        [99, 22, 44],
+    ]
+    path = walker.build_draft(cands, ctx=[5, 6], max_draft=6)
+    assert path == [10, 11, 12, 20, 21, 22]
+    # Exact rollback invariance: matcher position must remain 0 after DFS probing!
+    assert matcher.pos == 0
+
+
+def test_engine_per_doc_grammars_mtp_dispatch_gate_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `generate_batch(..., per_doc_grammars=...)` routes `B==1` Apple10 / `B<=4` Apple9 via MTP and keeps `B>=5` dense."""
+    import fast_gemma4.engine as eng_mod
+    from fast_gemma4.engine import FastGemma4Engine
+
+    class _DummyMatcher:
+        def __init__(self, tok_seq: list[int]) -> None:
+            self._toks = tok_seq
+            self._idx = 0
+
+        def validate_tokens(self, toks: list[int]) -> int:
+            return 1 if (self._idx < len(self._toks) and toks[0] == self._toks[self._idx]) else 0
+
+        def consume_token(self, tok: int) -> bool:
+            self._idx += 1
+            return True
+
+        def consume_tokens(self, toks: list[int]) -> bool:
+            self._idx += len(toks)
+            return True
+
+        def compute_ff_tokens(self) -> list[int]:
+            return []
+
+        def is_stopped(self) -> bool:
+            return self._idx >= len(self._toks)
+
+        def is_accepting(self) -> bool:
+            return self._idx >= len(self._toks)
+
+        def pick_mask(self, _logits: np.ndarray) -> int:
+            return int(self._toks[self._idx])
+
+    class _StubGrammar:
+        def __init__(self, toks: list[int]) -> None:
+            self.upfront_ff: list[int] = []
+            self._toks = toks
+
+        def new_matcher(self) -> _DummyMatcher:
+            return _DummyMatcher(self._toks)
+
+        def validate_token_sequence(self, _full_ids: list[int]) -> bool:
+            return True
+
+    class _StubTok:
+        bos_token_id = 2
+        stop_token_ids = frozenset({1})
+
+        def decode(self, _ids: list[int], skip_special_tokens: bool = True) -> str:
+            return '{"ok":true}'
+
+    class _StubModel:
+        hidden_size = 1536
+        n_kv_heads = 1
+        window_size = 512
+
+        def make_slot_cache(self, _pkv: dict, **_kw: object) -> dict:
+            return {"_last_x_in": mx.zeros((1, 1, 4), dtype=mx.float32)}
+
+        def prefill_slots_lazy_lg(self, sufs: list[list[int]], _slots: list[int], _cache: dict, **_kw: object) -> tuple:
+            b = len(sufs)
+            return (
+                mx.zeros((b, 1, 4), dtype=mx.float32),
+                mx.zeros((b,), dtype=mx.int32),
+                [len(s) for s in sufs],
+            )
+
+    mtp_calls: list[dict[str, object]] = []
+    roll_calls: list[dict[str, object]] = []
+
+    def _fake_mtp(model, drafter, stop_ids, grammar, init_lg, init_off, cache, B, **kw):
+        mtp_calls.append({"B": B, "per_doc_grammars": kw.get("per_doc_grammars"), "doc_prompts": kw.get("doc_prompts")})
+        return {
+            "decode_sec": 0.01,
+            "gen_toks": [[10, 11] for _ in range(B)],
+            "valid_schemas": [True] * B,
+            "tot_out_tok": 2 * B,
+            "ff_tokens": 0,
+            "speculative_backend": "mtp",
+            "mtp_rounds": 1,
+            "mtp_accepted": B,
+            "mtp_proposed": B,
+        }
+
+    def _fake_rolling(model, stop_ids, grammar, pkv, sufs, **kw):
+        roll_calls.append({"n": len(sufs), "per_doc_grammars": kw.get("per_doc_grammars")})
+        n = len(sufs)
+        return {
+            "prefill_sec": 0.01,
+            "decode_sec": 0.01,
+            "gen_toks": [[10, 11] for _ in range(n)],
+            "valid_schemas": [True] * n,
+            "tot_out_tok": 2 * n,
+            "ff_tokens": 0,
+            "llm_steps": 1,
+            "ff_early14_steps": 0,
+            "mask_fallbacks": 0,
+        }
+
+    monkeypatch.setattr(eng_mod, "run_decode_mtp", _fake_mtp)
+    monkeypatch.setattr(eng_mod, "run_decode_rolling", _fake_rolling)
+
+    import threading
+
+    def _make_engine(apple10: bool) -> FastGemma4Engine:
+        e = FastGemma4Engine.__new__(FastGemma4Engine)
+        e.model = _StubModel()  # type: ignore[assignment]
+        e.tokenizer = _StubTok()  # type: ignore[assignment]
+        e.mtp_drafter = object()  # type: ignore[assignment]
+        e._mtp_drafter_auto = False
+        e._mtp_drafter_auto_attempted = True
+        e.default_mode = "gpu"
+        e.profile = "auto"
+        e.ane_available = False
+        e.default_max_b_slots = 64
+        e._host_hw = {"supports_apple10": apple10, "gpu_family": "Apple10" if apple10 else "Apple9"}
+        e._host_ram_gib = 24.0 if apple10 else 48.0
+        e.silicon_policy = None
+        e._gpu_lock = threading.Lock()
+        e.kv_i8 = False
+        e.resolve_call_kv_i8 = lambda **_kw: False  # type: ignore[assignment]
+        e.encode_prompts = lambda ps, **_kw: [[2, 3, 4] for _ in ps]  # type: ignore[assignment]
+        e.get_prefix_kv = lambda _sys: {"l_sys": 1}  # type: ignore[assignment]
+        e._maybe_get_ane_ring = lambda *_a, **_kw: None  # type: ignore[assignment]
+        e.resolve_runtime_ane_ring_variant = lambda *_a, **_kw: "fp16"  # type: ignore[assignment]
+        e._effective_ane_ring_variant = lambda: "fp16"  # type: ignore[assignment]
+        return e
+
+    g_list_4 = [_StubGrammar([10, 11]) for _ in range(4)]
+    # Apple10: B=1 uses MTP with per_doc_grammars; B=2..4 stays dense (rolling)!
+    e_a10 = _make_engine(apple10=True)
+    res_a10_b1 = e_a10.generate_batch(["p0"], per_doc_grammars=[g_list_4[0]], max_tokens=8, temperature=0.0)
+    assert len(mtp_calls) == 1 and mtp_calls[0]["B"] == 1
+    assert mtp_calls[0]["per_doc_grammars"] is not None
+    assert res_a10_b1.stats.get("valid_schema_count") == 1
+
+    res_a10_b4 = e_a10.generate_batch(["p"] * 4, per_doc_grammars=g_list_4, max_tokens=8, temperature=0.0)
+    assert len(mtp_calls) == 1 and len(roll_calls) == 1 and roll_calls[0]["n"] == 4
+    assert res_a10_b4.stats.get("valid_schema_count") == 4
+
+    # Apple9 constrained: B=2 uses MTP with per_doc_grammars; B=4 and B=5 stay dense (rolling)!
+    e_a9 = _make_engine(apple10=False)
+    res_a9_b2 = e_a9.generate_batch(["p"] * 2, per_doc_grammars=g_list_4[:2], max_tokens=8, temperature=0.0)
+    assert len(mtp_calls) == 2 and mtp_calls[1]["B"] == 2
+    assert res_a9_b2.stats.get("valid_schema_count") == 2
+
+    res_a9_b4 = e_a9.generate_batch(["p"] * 4, per_doc_grammars=g_list_4, max_tokens=8, temperature=0.0)
+    assert len(mtp_calls) == 2 and len(roll_calls) == 2 and roll_calls[1]["n"] == 4
+    assert res_a9_b4.stats.get("valid_schema_count") == 4
+
+    res_a9_b5 = e_a9.generate_batch(["p"] * 5, per_doc_grammars=g_list_4 + [None], max_tokens=8, temperature=0.0)
+    assert len(mtp_calls) == 2 and len(roll_calls) == 3 and roll_calls[2]["n"] == 5
+    assert res_a9_b5.stats.get("valid_schema_count") == 5
 
 
 def test_mtp_drafter_b1_parity_and_b8_gate_gpu() -> None:

@@ -122,9 +122,12 @@ uint lane = thread_index_in_simdgroup;
 
 const device bfloat16_t* xp = X + (size_t)row * {H}u;
 float ss = 0.0f;
+{{
+#pragma clang fp reassociate(off)
 for (uint i = tid; i < {H}u; i += 128u) {{
   float v = float(xp[i]);
   ss += v * v;
+}}
 }}
 float ws = simd_sum(ss);
 threadgroup float tg_s[4];
@@ -136,6 +139,41 @@ float inv = rsqrt(tot * (1.0f / {float(H):.1f}f) + Params[0]);
 device half* op = Out + (size_t)row * {H}u;
 for (uint i = tid; i < {H}u; i += 128u) {{
   op[i] = half(float(xp[i]) * inv * float(W[i]));
+}}
+""",
+        },
+        "rmsnorm_bf16_to_f16_f32": {
+            "input_names": ["X", "W", "Params"],
+            "output_names": ["OutF16", "OutF32"],
+            "header": hdr,
+            "source": f"""
+uint row = threadgroup_position_in_grid.x;
+uint tid = thread_index_in_threadgroup;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+const device bfloat16_t* xp = X + (size_t)row * {H}u;
+float ss = 0.0f;
+{{
+#pragma clang fp reassociate(off)
+for (uint i = tid; i < {H}u; i += 128u) {{
+  float v = float(xp[i]);
+  ss += v * v;
+}}
+}}
+float ws = simd_sum(ss);
+threadgroup float tg_s[4];
+if (lane == 0u) tg_s[sg] = ws;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+float tot = tg_s[0] + tg_s[1] + tg_s[2] + tg_s[3];
+float inv = rsqrt(tot * (1.0f / {float(H):.1f}f) + Params[0]);
+
+device half* op16 = OutF16 + (size_t)row * {H}u;
+device float* op32 = OutF32 + (size_t)row * {H}u;
+for (uint i = tid; i < {H}u; i += 128u) {{
+  float val = float(xp[i]) * inv * float(W[i]);
+  op16[i] = half(val);
+  op32[i] = val;
 }}
 """,
         },
@@ -765,7 +803,7 @@ for (uint i = lane; i < N; i += 32u) {{
   uint pos = atomic_fetch_add_explicit(&acnts[e], 1u, memory_order_relaxed);
   TokIdx[pos]   = i >> 2;
   SlotIdx[pos]  = i;
-  RWeights[pos] = half(Scores[i]);
+  RWeights[pos] = float(Scores[i]);
 }}
 simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1073,7 +1111,7 @@ if (ty < nh) {{
       if (r < m_cnt) {{
         float val = (cD[i] + float(Bd[b_base + c])) * float(RWeights[m_start + r]);
         uint slot = SlotIdx[m_start + r];
-        YSlots[(size_t)slot * {H}u + col0 + c] = half(val);
+        YSlots[(size_t)slot * {H}u + col0 + c] = val;
       }}
     }}
   }}
@@ -1143,7 +1181,7 @@ if (ty < nh) {{
         if (lane == 0u) {{
           float val = (ds + bdv) * float(RWeights[m_start + r]);
           uint slot = SlotIdx[m_start + r];
-          YSlots[(size_t)slot * {H}u + col] = half(val);
+          YSlots[(size_t)slot * {H}u + col] = val;
         }}
       }}
     }}
@@ -1159,9 +1197,9 @@ if (ty < nh) {{
 uint col4 = thread_position_in_grid.x;
 uint b = thread_position_in_grid.y;
 if (col4 >= {H // 4}u) return;
-const device half4* Y4 = (const device half4*)YSlots;
+const device float4* Y4 = (const device float4*)YSlots;
 size_t s0 = ((size_t)b * 4u) * {H // 4}u + col4;
-float4 acc = float4(Y4[s0]) + float4(Y4[s0 + {H // 4}u]) + float4(Y4[s0 + {2 * (H // 4)}u]) + float4(Y4[s0 + {3 * (H // 4)}u]);
+float4 acc = Y4[s0] + Y4[s0 + {H // 4}u] + Y4[s0 + {2 * (H // 4)}u] + Y4[s0 + {3 * (H // 4)}u];
 size_t hb = (size_t)b * {H}u + col4 * 4u;
 HOut[hb + 0u] = bfloat16_t(float(H[hb + 0u]) + acc.x);
 HOut[hb + 1u] = bfloat16_t(float(H[hb + 1u]) + acc.y);

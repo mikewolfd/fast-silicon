@@ -166,3 +166,73 @@ def test_helper_hands_each_document_its_own_matcher_in_admission_order() -> None
     assert compiled == ["beta", "alpha|gamma", "beta"]
     assert again.upfront_ff_for_doc(1) == list(again.get_grammar_entry("alpha|gamma")[1])
     assert again.validate_token_sequence(gh_std.upfront_ff) in (True, False)
+
+
+def test_sync_matcher_rollback_and_empty_consume_preserves_sync_cpu() -> None:
+    """Verify `SyncMatcher.rollback(n)` and `try_consume_tokens([])` (`n == 0`) keep `kind_m` and `std_m` aligned."""
+
+    class _FakeLLMatcher:
+        def __init__(self, reject_tokens: set[int] | None = None) -> None:
+            self.tokens: list[int] = []
+            self.reject_tokens = reject_tokens or set()
+
+        def try_consume_tokens(self, toks: list[int]) -> int:
+            taken = 0
+            for t in toks:
+                if t in self.reject_tokens:
+                    break
+                self.tokens.append(int(t))
+                taken += 1
+            return taken
+
+        def consume_token(self, tok: int) -> bool:
+            if tok in self.reject_tokens:
+                return False
+            self.tokens.append(int(tok))
+            return True
+
+        def consume_tokens(self, toks: list[int]) -> bool:
+            for t in toks:
+                if not self.consume_token(t):
+                    return False
+            return True
+
+        def rollback(self, count: int) -> None:
+            if count > 0:
+                del self.tokens[-count:]
+
+        def compute_ff_tokens(self) -> list[int]:
+            return []
+
+        def is_stopped(self) -> bool:
+            return False
+
+        def is_accepting(self) -> bool:
+            return False
+
+    kind_m = _FakeLLMatcher(reject_tokens={99})
+    std_m = _FakeLLMatcher()
+    sm = SyncMatcher(kind_m, std_m)
+
+    # n == 0 on invalid token must NOT clear `_synced`.
+    assert sm.try_consume_tokens([99, 1]) == 0
+    assert sm.consume_tokens([10, 11]) is True
+    assert kind_m.tokens == [10, 11]
+    assert std_m.tokens == [10, 11]
+
+    # Empty `try_consume_tokens([])` preserves `_synced` too.
+    assert sm.try_consume_tokens([]) == 0
+    assert sm.consume_token(12) is True
+    assert kind_m.tokens == [10, 11, 12]
+    assert std_m.tokens == [10, 11, 12]
+
+    # Partial consume + full rollback restores both matchers and preserves `_synced`.
+    assert sm.try_consume_tokens([13, 99]) == 1
+    assert kind_m.tokens == [10, 11, 12, 13]
+    assert std_m.tokens == [10, 11, 12, 13]
+    sm.rollback(1)
+    assert kind_m.tokens == [10, 11, 12]
+    assert std_m.tokens == [10, 11, 12]
+    assert sm.consume_token(14) is True
+    assert kind_m.tokens == [10, 11, 12, 14]
+    assert std_m.tokens == [10, 11, 12, 14]
