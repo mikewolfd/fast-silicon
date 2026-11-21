@@ -1184,3 +1184,193 @@ def test_batched_varlen_waves_and_multifunction_plan_inspect_cpu(monkeypatch: py
     assert "if inspect_placement and not use_multifunction:" in build_src
     assert "@available(macOS 15.0, *)" in runner_src
     assert 'std::strcmp(function_name, "main") != 0' in runner_src
+
+
+def test_state_dtype_normalization_and_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fast_pplx.gpu import normalize_state_dtype
+
+    monkeypatch.delenv("FAST_PPLX_STATE_DTYPE", raising=False)
+    assert normalize_state_dtype() == "float32"
+    assert normalize_state_dtype(state_fp32=False) == "bfloat16"
+    assert normalize_state_dtype("fp32") == "float32"
+    assert normalize_state_dtype("BF16") == "bfloat16"
+    assert normalize_state_dtype("i8") == "int8"
+
+    monkeypatch.setenv("FAST_PPLX_STATE_DTYPE", "i8")
+    assert normalize_state_dtype() == "int8"
+    assert normalize_state_dtype("float32") == "float32"
+
+    with pytest.raises(ValueError, match="Unsupported state_dtype"):
+        normalize_state_dtype("fp8_e4m3")
+
+    monkeypatch.setenv("FAST_PPLX_STATE_DTYPE", "invalid_dtype")
+    with pytest.raises(ValueError, match="Unsupported state_dtype"):
+        normalize_state_dtype()
+
+
+def test_block32_int8_state_codec_cpu_roundtrip_and_nonfinite_guard() -> None:
+    from fast_pplx.gpu import (
+        dequantize_gdn_state_i8,
+        gated_delta_update,
+        quantize_gdn_state_i8,
+    )
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        rng = np.random.default_rng(42)
+        st_np = rng.normal(0.0, 0.35, (2, 4, 8, 128)).astype(np.float32)
+        st_np[0, 1, 2, 17] = np.nan
+        st_np[1, 3, 5, 99] = np.inf
+        st_mx = mx.array(st_np)
+
+        codes, scales = quantize_gdn_state_i8(st_mx)
+        mx.eval(codes, scales)
+        assert codes.dtype == mx.int8
+        assert scales.dtype == mx.bfloat16
+        assert codes.shape == (2, 4, 8, 128)
+        assert scales.shape == (2, 4, 8, 4)
+
+        fp32_bytes = st_np.nbytes
+        i8_bytes = codes.nbytes + scales.nbytes
+        assert i8_bytes * 3 < fp32_bytes
+
+        restored = dequantize_gdn_state_i8(codes, scales, out_dtype=mx.float32)
+        mx.eval(restored)
+        restored_np = np.asarray(restored, dtype=np.float32)
+        sc_u16 = np.asarray(scales.view(mx.uint16), dtype=np.uint16)
+        # Non-finite blocks emit 0x7fc0 quiet NaN scales and restore entire 32-element block to NaN
+        assert sc_u16[0, 1, 2, 0] == 0x7FC0
+        assert sc_u16[1, 3, 5, 3] == 0x7FC0
+        assert np.all(np.isnan(restored_np[0, 1, 2, 0:32]))
+        assert np.all(np.isnan(restored_np[1, 3, 5, 96:128]))
+
+        # All other blocks remain finite and closely match input
+        clean_mask = np.ones_like(st_np, dtype=bool)
+        clean_mask[0, 1, 2, 0:32] = False
+        clean_mask[1, 3, 5, 96:128] = False
+        c_got = restored_np[clean_mask]
+        c_ref = st_np[clean_mask]
+        assert np.all(np.isfinite(c_got))
+        cos = float(np.dot(c_got, c_ref) / (np.linalg.norm(c_got) * np.linalg.norm(c_ref)))
+        assert cos >= 0.9999
+
+        empty_c, empty_s = quantize_gdn_state_i8(mx.zeros((0, 4, 8, 128), dtype=mx.float32))
+        mx.eval(empty_c, empty_s)
+        assert empty_c.shape == (0, 4, 8, 128) and empty_s.shape == (0, 4, 8, 4)
+        empty_r = dequantize_gdn_state_i8(empty_c, empty_s)
+        mx.eval(empty_r)
+        assert empty_r.shape == (0, 4, 8, 128)
+
+        # CPU gated_delta_update fallback supports float32, bfloat16, and int8 tuple state roundtrips
+        q = mx.array(rng.normal(0.0, 0.15, (1, 12, 4, 64)).astype(np.float32))
+        k = mx.array(rng.normal(0.0, 0.15, (1, 12, 4, 64)).astype(np.float32))
+        v = mx.array(rng.normal(0.0, 0.25, (1, 12, 4, 64)).astype(np.float32))
+        a = mx.array(rng.normal(-0.4, 0.3, (1, 12, 4)).astype(np.float32))
+        b = mx.array(rng.normal(-0.2, 0.3, (1, 12, 4)).astype(np.float32))
+        A_log = mx.full((4,), -2.0, dtype=mx.float32)
+        dt_bias = mx.full((4,), -1.0, dtype=mx.float32)
+
+        y_f32, s_f32 = gated_delta_update(q, k, v, a, b, A_log, dt_bias, use_kernel=False, state_dtype="float32")
+        y_bf16, s_bf16 = gated_delta_update(q, k, v, a, b, A_log, dt_bias, use_kernel=False, state_dtype="bfloat16")
+        y_i8_1, s_i8_1 = gated_delta_update(
+            q[:, :6], k[:, :6], v[:, :6], a[:, :6], b[:, :6], A_log, dt_bias, use_kernel=False, state_dtype="int8"
+        )
+        y_i8_2, s_i8_2 = gated_delta_update(
+            q[:, 6:], k[:, 6:], v[:, 6:], a[:, 6:], b[:, 6:], A_log, dt_bias, state=s_i8_1, use_kernel=False, state_dtype="int8"
+        )
+        y_i8 = mx.concatenate([y_i8_1, y_i8_2], axis=1)
+        mx.eval(y_f32, s_f32, y_bf16, s_bf16, y_i8, s_i8_2[0], s_i8_2[1])
+        assert s_bf16.dtype == mx.bfloat16
+        assert isinstance(s_i8_2, tuple) and s_i8_2[0].dtype == mx.int8 and s_i8_2[1].dtype == mx.bfloat16
+
+        yf = np.asarray(y_f32, dtype=np.float32).ravel()
+        yi = np.asarray(y_i8, dtype=np.float32).ravel()
+        yb = np.asarray(y_bf16, dtype=np.float32).ravel()
+        assert float(np.dot(yf, yi) / (np.linalg.norm(yf) * np.linalg.norm(yi))) >= 0.9999
+        assert float(np.dot(yf, yb) / (np.linalg.norm(yf) * np.linalg.norm(yb))) >= 0.9999
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_cpu_fallback_norms_mlp_and_gdn_non32_and_empty_shapes() -> None:
+    from fast_pplx.gpu import PplxGatedDeltaNet, PplxGatedRMSNorm, PplxMLP, PplxRMSNorm
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        # Non-32 dims exercise pure MLX fallbacks cleanly on CPU
+        rms = PplxRMSNorm(24, eps=1e-6)
+        grms = PplxGatedRMSNorm(24, eps=1e-6)
+        x = mx.ones((2, 3, 24), dtype=mx.float32) * 0.5
+        gate = mx.ones((2, 3, 24), dtype=mx.float32) * 0.25
+        y_rms = rms(x)
+        y_grms = grms(x, gate)
+        mx.eval(y_rms, y_grms)
+        assert y_rms.shape == (2, 3, 24) and y_grms.shape == (2, 3, 24)
+
+        cfg = PplxConfig(
+            hidden_size=24,
+            intermediate_size=14,
+            num_hidden_layers=1,
+            layer_types=("linear_attention",),
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            rope_dim=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            vocab_size=64,
+        )
+        mlp = PplxMLP(cfg)
+        y_mlp = mlp(mx.ones((1, 4, 24), dtype=mx.float32))
+        mx.eval(y_mlp)
+        assert y_mlp.shape == (1, 4, 24)
+
+        gdn = PplxGatedDeltaNet(cfg, state_dtype="float32")
+        gdn.use_kernel = False
+        y_short = gdn(mx.ones((1, 2, 24), dtype=mx.float32) * 0.1)
+        mx.eval(y_short)
+        assert y_short.shape == (1, 2, 24)
+        assert np.all(np.isfinite(np.asarray(y_short, dtype=np.float32)))
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_engine_forwards_state_dtype_and_benchmark_parser_accepts_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+    import fast_pplx.engine as eng_mod
+
+    seen: dict[str, object] = {}
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+
+    class _FakeGPU:
+        def __init__(self, **kw: object) -> None:
+            seen.update(kw)
+            self.config = DEFAULT_PPLX_CONFIG
+            self.tokenizer = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+            self.max_seq_len = 32768
+            self.dim = DEFAULT_PPLX_CONFIG.embedding_dim
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(eng_mod, "FastPplxGPU", _FakeGPU)
+    eng = eng_mod.FastPplx(mode="gpu", state_dtype="int8", enable_ane=False)
+    try:
+        assert seen["state_dtype"] == "int8"
+    finally:
+        eng.close()
+
+    bench_path = Path(__file__).resolve().parents[1] / "scripts" / "benchmark.py"
+    spec = importlib.util.spec_from_file_location("fast_pplx_bench_cli", bench_path)
+    assert spec is not None and spec.loader is not None
+    bench_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench_mod)
+    args = bench_mod.build_parser().parse_args(["speed", "--state-dtype", "int8"])
+    assert args.state_dtype == "int8"

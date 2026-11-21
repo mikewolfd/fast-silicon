@@ -344,3 +344,201 @@ def test_gpu_varlen_packed_btree_gdn_and_mx_fast_parity() -> None:
                     else:
                         c_val = float(np.dot(ctx_batched[di][ci], ctx_single[ci]))
                         assert c_val >= 0.9998, f"Varlen contextual doc {di} chunk {ci} cos={c_val}"
+
+
+@pytest.mark.gpu_ane
+def test_gpu_gdn_staged_tiles_segmented_conv_carry_norms_and_nonfinite() -> None:
+    from fast_pplx.config import PplxConfig
+    from fast_pplx.gpu import (
+        PplxGatedDeltaNet,
+        PplxGatedRMSNorm,
+        PplxMLP,
+        PplxRMSNorm,
+        gated_delta_update,
+        normalize_qk,
+    )
+
+    with _gpu_validation_lock():
+        mx.random.seed(2026)
+        B, T, Hk, Hv, Dk, Dv = 2, 256, 16, 16, 128, 128
+        seg_np = np.zeros((B, T), dtype=np.uint8)
+        seg_np[0, 0] = 2
+        seg_np[0, 1:90] = 1
+        seg_np[0, 90] = 2
+        seg_np[0, 91:220] = 1
+        seg_np[1, 10] = 2
+        seg_np[1, 11:250] = 1
+        seg_mx = mx.array(seg_np)
+        st0 = mx.random.normal((B, Hv, Dv, Dk)).astype(mx.float32) * 0.1
+        A_log = mx.full((Hv,), -2.0, dtype=mx.float32)
+        dt_bias = mx.full((Hv,), -1.0, dtype=mx.float32)
+
+        for act_dt in (mx.float16, mx.bfloat16):
+            q = mx.random.normal((B, T, Hk, Dk)).astype(act_dt)
+            k = mx.random.normal((B, T, Hk, Dk)).astype(act_dt)
+            v = (mx.random.normal((B, T, Hv, Dv)) * 0.25).astype(act_dt)
+            a = (mx.random.normal((B, T, Hv)) * 0.2).astype(act_dt)
+            b = (mx.random.normal((B, T, Hv)) * 0.2).astype(act_dt)
+            q, k = normalize_qk(q, k, inv_scale=Dk**-0.5, eps=1e-6)
+
+            y_ref, s_ref = gated_delta_update(
+                q, k, v, a, b, A_log, dt_bias, state=st0, seg_flags=seg_mx, use_kernel=False
+            )
+            mx.eval(y_ref, s_ref)
+            yr = np.asarray(y_ref.astype(mx.float32)).ravel()
+            sr = np.asarray(s_ref).ravel()
+
+            for tile_rows in (8, 16, 24):
+                y_k, s_k = gated_delta_update(
+                    q, k, v, a, b, A_log, dt_bias, state=st0, seg_flags=seg_mx, use_kernel=True, tile_rows=tile_rows
+                )
+                mx.eval(y_k, s_k)
+                yk = np.asarray(y_k.astype(mx.float32)).ravel()
+                sk = np.asarray(s_k).ravel()
+                y_cos = float(np.dot(yk, yr) / (np.linalg.norm(yk) * np.linalg.norm(yr)))
+                s_cos = float(np.dot(sk, sr) / (np.linalg.norm(sk) * np.linalg.norm(sr)))
+                assert y_cos >= 0.9998, f"tile_rows={tile_rows} dt={act_dt} y_cos={y_cos}"
+                assert s_cos >= 0.9998, f"tile_rows={tile_rows} dt={act_dt} s_cos={s_cos}"
+
+        # Non-finite NaN & Inf injection must propagate (never zeroed/clamped)
+        v_bad = np.asarray((mx.random.normal((1, 16, Hv, Dv)) * 0.2).astype(mx.float16))
+        v_bad[0, 3, 2, 7] = np.nan
+        v_inf = v_bad.copy()
+        v_inf[0, 3, 2, 7] = np.inf
+        q1 = (mx.random.normal((1, 16, Hk, Dk)) * 0.1).astype(mx.float16)
+        k1 = (mx.random.normal((1, 16, Hk, Dk)) * 0.1).astype(mx.float16)
+        a1 = mx.zeros((1, 16, Hv), dtype=mx.float16)
+        b1 = mx.zeros((1, 16, Hv), dtype=mx.float16)
+        y_nan, _ = gated_delta_update(q1, k1, mx.array(v_bad), a1, b1, A_log, dt_bias, use_kernel=True, tile_rows=16)
+        y_inf, _ = gated_delta_update(q1, k1, mx.array(v_inf), a1, b1, A_log, dt_bias, use_kernel=True, tile_rows=16)
+        mx.eval(y_nan, y_inf)
+        assert np.isnan(np.asarray(y_nan.astype(mx.float32))[0, 3, 2, 7])
+        assert not np.isfinite(np.asarray(y_inf.astype(mx.float32))[0, 3, 2, 7])
+
+        # Fused RMSNorm, GatedRMSNorm, SwiGLU split, and multi-slice Apple9 conv-carry parity
+        cfg = PplxConfig(
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=1,
+            layer_types=("linear_attention",),
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=128,
+            rope_dim=32,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+            vocab_size=64,
+        )
+        rms = PplxRMSNorm(1024)
+        grms = PplxGatedRMSNorm(1024)
+        rms.weight = mx.random.normal((1024,)).astype(mx.float32) * 0.3 + 1.0
+        grms.weight = mx.random.normal((1024,)).astype(mx.float32) * 0.3 + 1.0
+        x_in = mx.random.normal((2, 19, 1024)).astype(mx.float16)
+        z_in = mx.random.normal((2, 19, 1024)).astype(mx.float16)
+        y_rms_k = rms(x_in)
+        y_rms_ref = mx.fast.rms_norm(x_in.astype(mx.float32), rms.weight, 1e-6).astype(mx.float16)
+        y_grms_k = grms(x_in, z_in)
+        y_grms_ref = (mx.fast.rms_norm(x_in.astype(mx.float32), grms.weight, 1e-6) * mx.sigmoid(z_in.astype(mx.float32)) * z_in.astype(mx.float32)).astype(mx.float16)
+        mx.eval(y_rms_k, y_rms_ref, y_grms_k, y_grms_ref)
+        assert float(mx.max(mx.abs(y_rms_k.astype(mx.float32) - y_rms_ref.astype(mx.float32))).item()) <= 1e-2
+        assert float(mx.max(mx.abs(y_grms_k.astype(mx.float32) - y_grms_ref.astype(mx.float32))).item()) <= 2e-2
+
+        mlp = PplxMLP(cfg)
+        y_mlp_k = mlp._run_slice(x_in)
+        gate_up = mlp.gate_up_proj(x_in)
+        g_ref, u_ref = mx.split(gate_up, [cfg.intermediate_size], axis=-1)
+        act_ref = (g_ref.astype(mx.float32) * mx.sigmoid(g_ref.astype(mx.float32)) * u_ref.astype(mx.float32)).astype(x_in.dtype)
+        y_mlp_ref = mlp.down_proj(act_ref)
+        mx.eval(y_mlp_k, y_mlp_ref)
+        assert float(mx.max(mx.abs(y_mlp_k.astype(mx.float32) - y_mlp_ref.astype(mx.float32))).item()) <= 2e-2
+
+        # Empty T=0 gated_delta_update and short S=1, 2, 3, 64 multi-slice conv carry vs use_kernel=False reference
+        y_t0, s_t0 = gated_delta_update(
+            mx.zeros((1, 0, Hk, Dk), dtype=mx.float16),
+            mx.zeros((1, 0, Hk, Dk), dtype=mx.float16),
+            mx.zeros((1, 0, Hv, Dv), dtype=mx.float16),
+            mx.zeros((1, 0, Hv), dtype=mx.float16),
+            mx.zeros((1, 0, Hv), dtype=mx.float16),
+            A_log,
+            dt_bias,
+            use_kernel=True,
+        )
+        mx.eval(y_t0, s_t0)
+        assert y_t0.shape == (1, 0, Hv, Dv) and s_t0.shape == (1, Hv, Dv, Dk)
+
+        gdn_k = PplxGatedDeltaNet(cfg)
+        gdn_ref = PplxGatedDeltaNet(cfg)
+        gdn_ref.use_kernel = False
+        gdn_ref.update(gdn_k.parameters())
+        mx.eval(gdn_k.parameters(), gdn_ref.parameters())
+        for slen in (1, 2, 3, 64):
+            xs = mx.random.normal((2, slen, 1024)).astype(mx.float16) * 0.2
+            cs0 = mx.random.normal((2, 3, gdn_k.conv_dim)).astype(mx.float16) * 0.2
+            yk_s, csk, rsk = gdn_k._run_step(xs, cs0, None, None, keep_conv_state_fp32=True)
+            yr_s, csr, rsr = gdn_ref._run_step(xs, cs0, None, None, keep_conv_state_fp32=True)
+            mx.eval(yk_s, csk, rsk, yr_s, csr, rsr)
+            assert csk.dtype == mx.float32
+            assert float(mx.max(mx.abs(csk - csr)).item()) <= 2e-3
+            assert float(mx.max(mx.abs(yk_s.astype(mx.float32) - yr_s.astype(mx.float32))).item()) <= 2e-3
+
+
+@pytest.mark.gpu_ane
+def test_gpu_block32_int8_state_codec_and_end_to_end_parity() -> None:
+    from fast_pplx.gpu import dequantize_gdn_state_i8, gated_delta_update, quantize_gdn_state_i8
+
+    snap = _require_cached_weights()
+    with _gpu_validation_lock():
+        # 1. Metal Block-32 INT8 state encode/decode parity + NaN/Inf isolation
+        rng = np.random.default_rng(77)
+        st_np = rng.normal(0.0, 0.25, (2, 16, 128, 128)).astype(np.float32)
+        st_np[0, 2, 10, 35] = np.nan
+        st_np[1, 5, 20, 100] = -np.inf
+        codes, scales = quantize_gdn_state_i8(mx.array(st_np))
+        restored = dequantize_gdn_state_i8(codes, scales, out_dtype=mx.float32)
+        mx.eval(codes, scales, restored)
+        assert codes.nbytes + scales.nbytes < st_np.nbytes // 3
+        r_np = np.asarray(restored, dtype=np.float32)
+        assert np.all(np.isnan(r_np[0, 2, 10, 32:64]))
+        assert np.all(np.isnan(r_np[1, 5, 20, 96:128]))
+        clean = np.ones_like(st_np, dtype=bool)
+        clean[0, 2, 10, 32:64] = False
+        clean[1, 5, 20, 96:128] = False
+        cos = float(np.dot(r_np[clean], st_np[clean]) / (np.linalg.norm(r_np[clean]) * np.linalg.norm(st_np[clean])))
+        assert cos >= 0.9999
+
+        # 2. Metal gated_delta_update state_dtype="int8" carried chunked parity vs FP32
+        mx.random.seed(99)
+        q = mx.random.normal((1, 256, 16, 128)).astype(mx.float16) * 0.1
+        k = mx.random.normal((1, 256, 16, 128)).astype(mx.float16) * 0.1
+        v = mx.random.normal((1, 256, 16, 128)).astype(mx.float16) * 0.2
+        a = mx.random.normal((1, 256, 16)).astype(mx.float16) * 0.2
+        b = mx.random.normal((1, 256, 16)).astype(mx.float16) * 0.2
+        A_log = mx.full((16,), -2.0, dtype=mx.float32)
+        dt_bias = mx.full((16,), -1.0, dtype=mx.float32)
+
+        yf_a, sf_a = gated_delta_update(q[:, :128], k[:, :128], v[:, :128], a[:, :128], b[:, :128], A_log, dt_bias, state_dtype="float32")
+        yf_b, _ = gated_delta_update(q[:, 128:], k[:, 128:], v[:, 128:], a[:, 128:], b[:, 128:], A_log, dt_bias, state=sf_a, state_dtype="float32")
+        yi_a, si_a = gated_delta_update(q[:, :128], k[:, :128], v[:, :128], a[:, :128], b[:, :128], A_log, dt_bias, state_dtype="int8")
+        yi_b, si_b = gated_delta_update(q[:, 128:], k[:, 128:], v[:, 128:], a[:, 128:], b[:, 128:], A_log, dt_bias, state=si_a, state_dtype="int8")
+        mx.eval(yf_a, yf_b, yi_a, yi_b, si_b[0], si_b[1])
+        assert isinstance(si_b, tuple) and si_b[0].dtype == mx.int8 and si_b[1].dtype == mx.bfloat16
+        yf_all = np.asarray(mx.concatenate([yf_a, yf_b], axis=1).astype(mx.float32)).ravel()
+        yi_all = np.asarray(mx.concatenate([yi_a, yi_b], axis=1).astype(mx.float32)).ravel()
+        assert float(np.dot(yf_all, yi_all) / (np.linalg.norm(yf_all) * np.linalg.norm(yi_all))) >= 0.9999
+
+        # 3. End-to-end real-weight FastPplxGPU state_dtype="int8" parity (including S=4096 streamed boundary)
+        docs = [
+            "Short ocean current passage.",
+            "Ceramic oxide ionic conductivity across garnet grain boundaries. " * 25,
+            "Bidirectional gated delta recurrence maintains orthogonal state across long contexts. " * 260,
+        ]
+        with FastPplxGPU(model_dir=snap, dtype="float16", state_dtype="float32", use_mapped_embedding=True, local_files_only=True) as g_f32:
+            v_f32 = g_f32.encode_documents(docs, batch_size=2, max_length=4096, output_dtype="float32", normalize=True)
+        with FastPplxGPU(model_dir=snap, dtype="float16", state_dtype="int8", use_mapped_embedding=True, local_files_only=True) as g_i8:
+            assert g_i8.state_dtype_name == "int8"
+            v_i8 = g_i8.encode_documents(docs, batch_size=2, max_length=4096, output_dtype="float32", normalize=True)
+        cos_e2e = np.sum(v_f32 * v_i8, axis=-1)
+        assert float(np.min(cos_e2e)) >= 0.9999, f"End-to-end int8 vs float32 state drift: {cos_e2e}"

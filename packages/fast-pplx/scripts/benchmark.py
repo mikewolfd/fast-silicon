@@ -2177,6 +2177,12 @@ def _add_shared_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--home", default=None, help="Override FAST_PPLX_HOME")
     p.add_argument("--model-dir", default=None, help="Override HF/staged model directory")
     p.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    p.add_argument(
+        "--state-dtype",
+        choices=("float32", "bfloat16", "int8"),
+        default=None,
+        help="Optional GDN recurrent state format override (sets FAST_PPLX_STATE_DTYPE)",
+    )
     p.add_argument("--dimensions", type=int, default=None, help="Optional Matryoshka output width")
     p.add_argument("--no-mapped-embedding", action="store_true", help="Put embed_tokens on GPU instead of mmap")
     p.add_argument("--enable-tf32", action="store_true", help="Opt into MLX_ENABLE_TF32=1 (default: 0 for IEEE FP32 exactness)")
@@ -2278,6 +2284,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "state_dtype", None):
+        os.environ["FAST_PPLX_STATE_DTYPE"] = str(args.state_dtype)
     if getattr(args, "enable_tf32", False):
         os.environ["MLX_ENABLE_TF32"] = "1"
     else:

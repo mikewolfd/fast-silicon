@@ -19,7 +19,7 @@ Combines:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from functools import partial
+from functools import lru_cache, partial
 import inspect
 import os
 from pathlib import Path
@@ -67,12 +67,51 @@ _EMBED_TENSOR_CANDIDATES = (
 )
 
 _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
+_GDN_TILE_ROWS_DEFAULT = 16
+_GDN_TILE_ROWS = max(
+    8,
+    min(24, int(os.environ.get("FAST_PPLX_GDN_TILE_ROWS", str(_GDN_TILE_ROWS_DEFAULT)))),
+)
 _USE_MX_FAST_GDN = (
     hasattr(mx.fast, "gated_delta_update")
     and os.environ.get("FAST_PPLX_DISABLE_MX_FAST_GDN", "0") != "1"
 )
+_CACHED_IS_APPLE10_HOST: bool | None = None
+
+
+def _is_apple10_gdn_host() -> bool:
+    global _CACHED_IS_APPLE10_HOST
+    if _CACHED_IS_APPLE10_HOST is None:
+        _CACHED_IS_APPLE10_HOST = bool(_detect_gpu_family_info().get("is_apple10", False))
+    return _CACHED_IS_APPLE10_HOST
 _ENABLE_VARLEN_PACK = os.environ.get("FAST_PPLX_VARLEN_PACK", "1") != "0"
 _ARCH_GEN_RE = re.compile(r"g(\d+)", re.IGNORECASE)
+
+_VALID_STATE_DTYPES = ("float32", "bfloat16", "int8")
+_STATE_DTYPE_ALIASES = {
+    "fp32": "float32",
+    "float32": "float32",
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+    "i8": "int8",
+    "int8": "int8",
+}
+
+
+def normalize_state_dtype(state_dtype: str | None = None, *, state_fp32: bool = True) -> str:
+    """Resolve canonical GDN recurrent state format (`'float32'`, `'bfloat16'`, or `'int8'`)."""
+    if state_dtype is None:
+        env_sd = os.environ.get("FAST_PPLX_STATE_DTYPE", "").strip()
+        if env_sd:
+            state_dtype = env_sd
+        else:
+            return "float32" if state_fp32 else "bfloat16"
+    key = str(state_dtype).strip().lower()
+    if key not in _STATE_DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported state_dtype {state_dtype!r}; expected one of {_VALID_STATE_DTYPES}"
+        )
+    return _STATE_DTYPE_ALIASES[key]
 
 
 def _sdpa_supports_force_fused() -> bool:
@@ -324,251 +363,759 @@ def _make_gated_delta_kernel(has_mask: bool = False):
     )
 
 
-def _make_gated_delta_packed_kernel():
+def _make_gated_delta_staged_kernel(*, segmented: bool = False, state_i8: bool = False):
+    """Threadgroup-staged GdnDecodeShared kernel (128 threads, TG_DV=16, configurable TILE_ROWS).
+
+    Supports FP32/BF16/FP16 dense recurrent state or Block-32 INT8 ``state_code_quad``
+    compressed recurrent state, optional sequence segment flags (``0=pad/skip``, ``1=valid``,
+    ``2=doc_start_reset``), ``#pragma clang fp reassociate(off)``, and Splash bitwise finite checks.
+    """
     if not mx.metal.is_available():
         return None
-    source = r"""
-        constexpr int lanes_per_row = 4;
-        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
-        static_assert(Dk >= 16 && (Dk % (lanes_per_row * 4)) == 0, "Dk must be a positive multiple of 16");
-        constexpr int values_per_lane = Dk / lanes_per_row;
-        constexpr int partials_per_lane = values_per_lane / 4;
-        static_assert(partials_per_lane >= 1, "partials_per_lane must be >= 1");
 
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / Hv;
-        auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
+    seg_decl = "threadgroup uint8_t sh_f[TILE_ROWS];" if segmented else ""
+    flg_ptr = "auto flg_base = flags + b_idx * T;" if segmented else ""
+    seg_load = (
+        "if (int(tid) < tile_rows) { sh_f[tid] = flg_base[t_base + int(tid)]; }"
+        if segmented
+        else ""
+    )
+    seg_open = (
+        """
+            uint8_t flg = sh_f[r];
+            if (flg == 0) {
+              if (lane_in_row == 0 && rdv < Dv) {
+                y_row[rdv] = static_cast<InT>(0);
+              }
+            } else {
+              if (flg == 2) {
+                #pragma unroll
+                for (int pb = 0; pb < kQuads; ++pb) {
+                  st[pb] = float4(0.0f);
+                }
+              }
+        """
+        if segmented
+        else "{"
+    )
 
-        auto lane = thread_index_in_simdgroup;
-        auto row_in_simdgroup = lane / lanes_per_row;
-        auto lane_in_row = lane & (lanes_per_row - 1);
-        auto row_group = thread_position_in_grid.y;
-        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
-
-        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
-        y += (b_idx * T * Hv + hv_idx) * Dv;
-
-        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-
-        float state[values_per_lane];
-        for (int i = 0; i < values_per_lane; ++i) {
-          state[i] = static_cast<float>(i_state[i]);
+    if state_i8:
+        state_load_block = """
+        if (rdv < Dv) {
+          auto rc = state_codes_in + (n * Dv + rdv) * Dk;
+          auto rs = state_scales_in + (n * Dv + rdv) * kQuads;
+          #pragma unroll
+          for (int pb = 0; pb < kQuads; ++pb) {
+            bfloat sc_bf = rs[pb];
+            ushort sc_bits = as_type<ushort>(sc_bf);
+            bool sc_finite = (sc_bits & 0x7f80u) < 0x7f80u;
+            int d0 = pb * 32 + int(lane_in_row) * 4;
+            if (sc_finite) {
+              float sc = float(sc_bf);
+              st[pb] = float4(
+                  static_cast<float>(rc[d0 + 0]) * sc,
+                  static_cast<float>(rc[d0 + 1]) * sc,
+                  static_cast<float>(rc[d0 + 2]) * sc,
+                  static_cast<float>(rc[d0 + 3]) * sc);
+            } else {
+              st[pb] = float4(as_type<float>(0x7fc00000u));
+            }
+          }
+        } else {
+          #pragma unroll
+          for (int pb = 0; pb < kQuads; ++pb) {
+            st[pb] = float4(0.0f);
+          }
         }
-
-        auto g_ = g + b_idx * T * Hv;
-        auto beta_ = beta + b_idx * T * Hv;
-
-        for (int t = 0; t < T; ++t) {
-          float gt = static_cast<float>(g_[hv_idx]);
-
-          float part[partials_per_lane];
+        """
+        state_store_block = """
+        if (rdv < Dv) {
+          auto wc = state_codes_out + (n * Dv + rdv) * Dk;
+          auto ws = state_scales_out + (n * Dv + rdv) * kQuads;
           #pragma unroll
-          for (int pb = 0; pb < partials_per_lane; ++pb) {
-            float acc = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-              int e = pb * 4 + i;
-              state[e] = state[e] * gt;
-              acc += state[e] * static_cast<float>(k_[e]);
+          for (int pb = 0; pb < kQuads; ++pb) {
+            float4 v4 = st[pb];
+            uint m0 = as_type<uint>(v4.x) & 0x7fffffffu;
+            uint m1 = as_type<uint>(v4.y) & 0x7fffffffu;
+            uint m2 = as_type<uint>(v4.z) & 0x7fffffffu;
+            uint m3 = as_type<uint>(v4.w) & 0x7fffffffu;
+            uint mag = max(max(m0, m1), max(m2, m3));
+            mag = max(mag, simd_shuffle_xor(mag, 1));
+            mag = max(mag, simd_shuffle_xor(mag, 2));
+            mag = max(mag, simd_shuffle_xor(mag, 4));
+            bfloat sc_bf = (mag < 0x7f800000u)
+                ? bfloat(as_type<float>(mag) * (1.0f / 127.0f))
+                : as_type<bfloat>(ushort(0x7fc0));
+            if (lane_in_row == 0) {
+              ws[pb] = sc_bf;
             }
-            part[pb] = acc;
-          }
-          #pragma unroll
-          for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
-            #pragma unroll
-            for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
-              part[p] += part[p + stride];
-            }
-          }
-          float kv_mem = part[0];
-          kv_mem += simd_shuffle_xor(kv_mem, 1);
-          kv_mem += simd_shuffle_xor(kv_mem, 2);
-
-          auto delta =
-              (static_cast<float>(v_[dv_idx]) - kv_mem) *
-              static_cast<float>(beta_[hv_idx]);
-
-          #pragma unroll
-          for (int pb = 0; pb < partials_per_lane; ++pb) {
-            float acc = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-              int e = pb * 4 + i;
-              state[e] = state[e] + static_cast<float>(k_[e]) * delta;
-              acc += state[e] * static_cast<float>(q_[e]);
-            }
-            part[pb] = acc;
-          }
-          #pragma unroll
-          for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
-            #pragma unroll
-            for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
-              part[p] += part[p + stride];
+            float sc_f = float(sc_bf);
+            bool ok = (mag < 0x7f800000u) && (sc_f > 0.0f);
+            int d0 = pb * 32 + int(lane_in_row) * 4;
+            if (ok) {
+              wc[d0 + 0] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v4.x, sc_f)), -127.0f, 127.0f));
+              wc[d0 + 1] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v4.y, sc_f)), -127.0f, 127.0f));
+              wc[d0 + 2] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v4.z, sc_f)), -127.0f, 127.0f));
+              wc[d0 + 3] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v4.w, sc_f)), -127.0f, 127.0f));
+            } else {
+              wc[d0 + 0] = static_cast<int8_t>(0);
+              wc[d0 + 1] = static_cast<int8_t>(0);
+              wc[d0 + 2] = static_cast<int8_t>(0);
+              wc[d0 + 3] = static_cast<int8_t>(0);
             }
           }
-          float out = part[0];
-          out += simd_shuffle_xor(out, 1);
-          out += simd_shuffle_xor(out, 2);
-          if (lane_in_row == 0) {
-            y[dv_idx] = static_cast<InT>(out);
-          }
-
-          q_ += Hk * Dk;
-          k_ += Hk * Dk;
-          v_ += Hv * Dv;
-          y += Hv * Dv;
-          g_ += Hv;
-          beta_ += Hv;
         }
-
-        for (int i = 0; i < values_per_lane; ++i) {
-          o_state[i] = static_cast<StT>(state[i]);
+        """
+        input_names = ["q", "k", "v", "g", "beta", "state_codes_in", "state_scales_in", "T_arr"]
+        output_names = ["y", "state_codes_out", "state_scales_out"]
+        kname = f"pplx_gated_delta_staged{'_seg' if segmented else ''}_i8"
+    else:
+        state_load_block = """
+        if (rdv < Dv) {
+          auto rs = state_in + (n * Dv + rdv) * Dk;
+          #pragma unroll
+          for (int pb = 0; pb < kQuads; ++pb) {
+            int d0 = pb * 32 + int(lane_in_row) * 4;
+            st[pb] = float4(
+                static_cast<float>(rs[d0 + 0]),
+                static_cast<float>(rs[d0 + 1]),
+                static_cast<float>(rs[d0 + 2]),
+                static_cast<float>(rs[d0 + 3]));
+          }
+        } else {
+          #pragma unroll
+          for (int pb = 0; pb < kQuads; ++pb) {
+            st[pb] = float4(0.0f);
+          }
         }
+        """
+        state_store_block = """
+        if (rdv < Dv) {
+          auto ws = state_out + (n * Dv + rdv) * Dk;
+          #pragma unroll
+          for (int pb = 0; pb < kQuads; ++pb) {
+            int d0 = pb * 32 + int(lane_in_row) * 4;
+            float4 v4 = st[pb];
+            ws[d0 + 0] = static_cast<StT>(v4.x);
+            ws[d0 + 1] = static_cast<StT>(v4.y);
+            ws[d0 + 2] = static_cast<StT>(v4.z);
+            ws[d0 + 3] = static_cast<StT>(v4.w);
+          }
+        }
+        """
+        input_names = ["q", "k", "v", "g", "beta", "state_in", "T_arr"]
+        output_names = ["y", "state_out"]
+        kname = f"pplx_gated_delta_staged{'_seg' if segmented else ''}"
+
+    if segmented:
+        input_names.append("flags")
+
+    source = f"""
+        #pragma clang fp reassociate(off)
+        constexpr int kThreads = 128;
+        constexpr int kLanesPerRow = 8;
+        constexpr int kSgs = kThreads / 32;
+        constexpr int kRowsPerSg = 32 / kLanesPerRow;
+        static_assert(Dk >= 32 && (Dk % 32) == 0, "Dk must be a positive multiple of 32");
+        constexpr int kQuads = Dk / 32;
+        static_assert(TG_DV == kSgs * kRowsPerSg, "TG_DV must equal 16");
+
+        int T = int(T_arr[0]);
+        uint tid = thread_position_in_grid.x;
+        uint row_tile = thread_position_in_grid.y;
+        uint n = thread_position_in_grid.z;
+        uint b_idx = n / Hv;
+        uint hv_idx = n % Hv;
+        uint hk_idx = hv_idx / (Hv / Hk);
+
+        uint sg = tid >> 5;
+        uint lane = tid & 31u;
+        uint row_in_sg = lane / kLanesPerRow;
+        uint lane_in_row = lane & (kLanesPerRow - 1u);
+
+        threadgroup InT sh_q[TILE_ROWS * Dk];
+        threadgroup InT sh_k[TILE_ROWS * Dk];
+        threadgroup InT sh_v[TILE_ROWS * TG_DV];
+        threadgroup float sh_g[TILE_ROWS];
+        threadgroup float sh_b[TILE_ROWS];
+        {seg_decl}
+
+        auto q_base = q + (b_idx * T * Hk + hk_idx) * Dk;
+        auto k_base = k + (b_idx * T * Hk + hk_idx) * Dk;
+        auto v_base = v + (b_idx * T * Hv + hv_idx) * Dv;
+        auto y_base = y + (b_idx * T * Hv + hv_idx) * Dv;
+        auto g_base = g + b_idx * T * Hv + hv_idx;
+        auto b_base = beta + b_idx * T * Hv + hv_idx;
+        {flg_ptr}
+
+        int ldv = int(sg) * kRowsPerSg + int(row_in_sg);
+        int rdv = int(row_tile) * TG_DV + ldv;
+        float4 st[kQuads];
+        {state_load_block}
+
+        int total_qk_stride = Hk * Dk;
+        int total_vy_stride = Hv * Dv;
+        int dv_tile_base = int(row_tile) * TG_DV;
+        constexpr int kQkVecs = Dk / 4;
+        constexpr int kVVecs = TG_DV / 4;
+
+        for (int t_base = 0; t_base < T; t_base += TILE_ROWS) {{
+          int tile_rows = min(TILE_ROWS, T - t_base);
+          int total_qk4 = tile_rows * kQkVecs;
+          for (int idx4 = int(tid); idx4 < total_qk4; idx4 += kThreads) {{
+            int r = idx4 / kQkVecs;
+            int d = (idx4 - r * kQkVecs) * 4;
+            int src_off = (t_base + r) * total_qk_stride + d;
+            int dst_off = r * Dk + d;
+            sh_q[dst_off + 0] = q_base[src_off + 0];
+            sh_q[dst_off + 1] = q_base[src_off + 1];
+            sh_q[dst_off + 2] = q_base[src_off + 2];
+            sh_q[dst_off + 3] = q_base[src_off + 3];
+            sh_k[dst_off + 0] = k_base[src_off + 0];
+            sh_k[dst_off + 1] = k_base[src_off + 1];
+            sh_k[dst_off + 2] = k_base[src_off + 2];
+            sh_k[dst_off + 3] = k_base[src_off + 3];
+          }}
+          int total_v4 = tile_rows * kVVecs;
+          for (int idx4 = int(tid); idx4 < total_v4; idx4 += kThreads) {{
+            int r = idx4 / kVVecs;
+            int dv_off = (idx4 - r * kVVecs) * 4;
+            int grdv = dv_tile_base + dv_off;
+            int dst_off = r * TG_DV + dv_off;
+            if (grdv + 3 < Dv) {{
+              int src_off = (t_base + r) * total_vy_stride + grdv;
+              sh_v[dst_off + 0] = v_base[src_off + 0];
+              sh_v[dst_off + 1] = v_base[src_off + 1];
+              sh_v[dst_off + 2] = v_base[src_off + 2];
+              sh_v[dst_off + 3] = v_base[src_off + 3];
+            }} else {{
+              #pragma unroll
+              for (int j = 0; j < 4; ++j) {{
+                sh_v[dst_off + j] = (grdv + j < Dv)
+                    ? v_base[(t_base + r) * total_vy_stride + grdv + j]
+                    : static_cast<InT>(0);
+              }}
+            }}
+          }}
+          if (int(tid) < tile_rows) {{
+            sh_g[tid] = static_cast<float>(g_base[(t_base + int(tid)) * Hv]);
+            sh_b[tid] = static_cast<float>(b_base[(t_base + int(tid)) * Hv]);
+          }}
+          {seg_load}
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          for (int r = 0; r < tile_rows; ++r) {{
+            auto y_row = y_base + (t_base + r) * total_vy_stride;
+            {seg_open}
+            float gt = sh_g[r];
+            float bt = sh_b[r];
+            const threadgroup InT* kr_ptr = sh_k + r * Dk;
+            const threadgroup InT* qr_ptr = sh_q + r * Dk;
+            float v_val = static_cast<float>(sh_v[r * TG_DV + ldv]);
+
+            float4 k_reg[kQuads];
+            float4 q_reg[kQuads];
+            float4 kv_sum4 = float4(0.0f);
+            #pragma unroll
+            for (int pb = 0; pb < kQuads; ++pb) {{
+              int d0 = pb * 32 + int(lane_in_row) * 4;
+              k_reg[pb] = float4(
+                  static_cast<float>(kr_ptr[d0 + 0]),
+                  static_cast<float>(kr_ptr[d0 + 1]),
+                  static_cast<float>(kr_ptr[d0 + 2]),
+                  static_cast<float>(kr_ptr[d0 + 3]));
+              q_reg[pb] = float4(
+                  static_cast<float>(qr_ptr[d0 + 0]),
+                  static_cast<float>(qr_ptr[d0 + 1]),
+                  static_cast<float>(qr_ptr[d0 + 2]),
+                  static_cast<float>(qr_ptr[d0 + 3]));
+              st[pb] *= gt;
+              kv_sum4 += st[pb] * k_reg[pb];
+            }}
+            float kv_mem = (kv_sum4.x + kv_sum4.y) + (kv_sum4.z + kv_sum4.w);
+            kv_mem += simd_shuffle_xor(kv_mem, 1);
+            kv_mem += simd_shuffle_xor(kv_mem, 2);
+            kv_mem += simd_shuffle_xor(kv_mem, 4);
+
+            float delta = (v_val - kv_mem) * bt;
+
+            float4 out_sum4 = float4(0.0f);
+            #pragma unroll
+            for (int pb = 0; pb < kQuads; ++pb) {{
+              st[pb] += k_reg[pb] * delta;
+              out_sum4 += st[pb] * q_reg[pb];
+            }}
+            float out_val = (out_sum4.x + out_sum4.y) + (out_sum4.z + out_sum4.w);
+            out_val += simd_shuffle_xor(out_val, 1);
+            out_val += simd_shuffle_xor(out_val, 2);
+            out_val += simd_shuffle_xor(out_val, 4);
+
+            if (lane_in_row == 0 && rdv < Dv) {{
+              y_row[rdv] = static_cast<InT>(out_val);
+            }}
+            }}
+          }}
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        {state_store_block}
     """
     return mx.fast.metal_kernel(
-        name="pplx_gated_delta_step_packed_btree",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
-        output_names=["y", "state_out"],
+        name=kname,
+        input_names=input_names,
+        output_names=output_names,
         source=source,
     )
 
 
-def _make_gated_delta_packed_seg_kernel():
-    """4-lane binary-tree packed GDN kernel supporting `flags` (`0=pad/skip`, `1=valid`, `2=doc_start_reset`)."""
+def _make_gdn_state_quantize_i8_kernel():
     if not mx.metal.is_available():
         return None
     source = r"""
-        constexpr int lanes_per_row = 4;
-        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
-        static_assert(Dk >= 16 && (Dk % (lanes_per_row * 4)) == 0, "Dk must be a positive multiple of 16");
-        constexpr int values_per_lane = Dk / lanes_per_row;
-        constexpr int partials_per_lane = values_per_lane / 4;
-        static_assert(partials_per_lane >= 1, "partials_per_lane must be >= 1");
+        #pragma clang fp reassociate(off)
+        int rows = int(Rows_arr[0]);
+        constexpr int kQuads = Dk / 32;
+        uint tid = thread_position_in_grid.x;
+        uint row_tile = thread_position_in_grid.y;
+        uint sg = tid >> 5;
+        uint lane = tid & 31u;
+        int row = int(row_tile) * 16 + int(sg) * 4 + int(lane >> 3);
+        int lane_in_row = int(lane & 7u);
+        if (row >= rows) return;
 
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / Hv;
-        auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
-
-        auto lane = thread_index_in_simdgroup;
-        auto row_in_simdgroup = lane / lanes_per_row;
-        auto lane_in_row = lane & (lanes_per_row - 1);
-        auto row_group = thread_position_in_grid.y;
-        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
-
-        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
-        y += (b_idx * T * Hv + hv_idx) * Dv;
-
-        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-
-        float state[values_per_lane];
-        for (int i = 0; i < values_per_lane; ++i) {
-          state[i] = static_cast<float>(i_state[i]);
-        }
-
-        auto g_ = g + b_idx * T * Hv;
-        auto beta_ = beta + b_idx * T * Hv;
-        auto flg_ = flags + b_idx * T;
-
-        for (int t = 0; t < T; ++t) {
-          uint8_t flg = flg_[t];
-          if (flg == 0) {
-            if (lane_in_row == 0) {
-              y[dv_idx] = static_cast<InT>(0);
-            }
-          } else {
-            if (flg == 2) {
-              #pragma unroll
-              for (int i = 0; i < values_per_lane; ++i) {
-                state[i] = 0.0f;
-              }
-            }
-            float gt = static_cast<float>(g_[hv_idx]);
-
-            float part[partials_per_lane];
-            #pragma unroll
-            for (int pb = 0; pb < partials_per_lane; ++pb) {
-              float acc = 0.0f;
-              #pragma unroll
-              for (int i = 0; i < 4; ++i) {
-                int e = pb * 4 + i;
-                state[e] = state[e] * gt;
-                acc += state[e] * static_cast<float>(k_[e]);
-              }
-              part[pb] = acc;
-            }
-            #pragma unroll
-            for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
-              #pragma unroll
-              for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
-                part[p] += part[p + stride];
-              }
-            }
-            float kv_mem = part[0];
-            kv_mem += simd_shuffle_xor(kv_mem, 1);
-            kv_mem += simd_shuffle_xor(kv_mem, 2);
-
-            auto delta =
-                (static_cast<float>(v_[dv_idx]) - kv_mem) *
-                static_cast<float>(beta_[hv_idx]);
-
-            #pragma unroll
-            for (int pb = 0; pb < partials_per_lane; ++pb) {
-              float acc = 0.0f;
-              #pragma unroll
-              for (int i = 0; i < 4; ++i) {
-                int e = pb * 4 + i;
-                state[e] = state[e] + static_cast<float>(k_[e]) * delta;
-                acc += state[e] * static_cast<float>(q_[e]);
-              }
-              part[pb] = acc;
-            }
-            #pragma unroll
-            for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
-              #pragma unroll
-              for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
-                part[p] += part[p + stride];
-              }
-            }
-            float out = part[0];
-            out += simd_shuffle_xor(out, 1);
-            out += simd_shuffle_xor(out, 2);
-            if (lane_in_row == 0) {
-              y[dv_idx] = static_cast<InT>(out);
-            }
+        auto src = state + row * Dk;
+        auto wc = codes + row * Dk;
+        auto ws = scales + row * kQuads;
+        #pragma unroll
+        for (int pb = 0; pb < kQuads; ++pb) {
+          int d0 = pb * 32 + lane_in_row * 4;
+          float v0 = static_cast<float>(src[d0 + 0]);
+          float v1 = static_cast<float>(src[d0 + 1]);
+          float v2 = static_cast<float>(src[d0 + 2]);
+          float v3 = static_cast<float>(src[d0 + 3]);
+          uint mag = max(
+              max(as_type<uint>(v0) & 0x7fffffffu, as_type<uint>(v1) & 0x7fffffffu),
+              max(as_type<uint>(v2) & 0x7fffffffu, as_type<uint>(v3) & 0x7fffffffu));
+          mag = max(mag, simd_shuffle_xor(mag, 1));
+          mag = max(mag, simd_shuffle_xor(mag, 2));
+          mag = max(mag, simd_shuffle_xor(mag, 4));
+          bfloat sc_bf = (mag < 0x7f800000u)
+              ? bfloat(as_type<float>(mag) * (1.0f / 127.0f))
+              : as_type<bfloat>(ushort(0x7fc0));
+          if (lane_in_row == 0) {
+            ws[pb] = sc_bf;
           }
-
-          q_ += Hk * Dk;
-          k_ += Hk * Dk;
-          v_ += Hv * Dv;
-          y += Hv * Dv;
-          g_ += Hv;
-          beta_ += Hv;
-        }
-
-        for (int i = 0; i < values_per_lane; ++i) {
-          o_state[i] = static_cast<StT>(state[i]);
+          float sc_f = float(sc_bf);
+          bool ok = (mag < 0x7f800000u) && (sc_f > 0.0f);
+          if (ok) {
+            wc[d0 + 0] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v0, sc_f)), -127.0f, 127.0f));
+            wc[d0 + 1] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v1, sc_f)), -127.0f, 127.0f));
+            wc[d0 + 2] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v2, sc_f)), -127.0f, 127.0f));
+            wc[d0 + 3] = static_cast<int8_t>(clamp(precise::rint(precise::divide(v3, sc_f)), -127.0f, 127.0f));
+          } else {
+            wc[d0 + 0] = static_cast<int8_t>(0);
+            wc[d0 + 1] = static_cast<int8_t>(0);
+            wc[d0 + 2] = static_cast<int8_t>(0);
+            wc[d0 + 3] = static_cast<int8_t>(0);
+          }
         }
     """
     return mx.fast.metal_kernel(
-        name="pplx_gated_delta_step_packed_seg_btree",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T", "flags"],
-        output_names=["y", "state_out"],
+        name="pplx_gdn_state_quantize_i8",
+        input_names=["state", "Rows_arr"],
+        output_names=["codes", "scales"],
+        source=source,
+    )
+
+
+def _make_gdn_state_dequantize_i8_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        #pragma clang fp reassociate(off)
+        int rows = int(Rows_arr[0]);
+        constexpr int kQuads = Dk / 32;
+        uint tid = thread_position_in_grid.x;
+        uint row_tile = thread_position_in_grid.y;
+        uint sg = tid >> 5;
+        uint lane = tid & 31u;
+        int row = int(row_tile) * 16 + int(sg) * 4 + int(lane >> 3);
+        int lane_in_row = int(lane & 7u);
+        if (row >= rows) return;
+
+        auto rc = codes + row * Dk;
+        auto rs = scales + row * kQuads;
+        auto dst = state + row * Dk;
+        #pragma unroll
+        for (int pb = 0; pb < kQuads; ++pb) {
+          bfloat sc_bf = rs[pb];
+          ushort sc_bits = as_type<ushort>(sc_bf);
+          bool sc_finite = (sc_bits & 0x7f80u) < 0x7f80u;
+          float sc_f = sc_finite ? float(sc_bf) : as_type<float>(0x7fc00000u);
+          int d0 = pb * 32 + lane_in_row * 4;
+          if (sc_finite) {
+            dst[d0 + 0] = static_cast<OutT>(static_cast<float>(rc[d0 + 0]) * sc_f);
+            dst[d0 + 1] = static_cast<OutT>(static_cast<float>(rc[d0 + 1]) * sc_f);
+            dst[d0 + 2] = static_cast<OutT>(static_cast<float>(rc[d0 + 2]) * sc_f);
+            dst[d0 + 3] = static_cast<OutT>(static_cast<float>(rc[d0 + 3]) * sc_f);
+          } else {
+            OutT qnan = static_cast<OutT>(sc_f);
+            dst[d0 + 0] = qnan;
+            dst[d0 + 1] = qnan;
+            dst[d0 + 2] = qnan;
+            dst[d0 + 3] = qnan;
+          }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_gdn_state_dequantize_i8",
+        input_names=["codes", "scales", "Rows_arr"],
+        output_names=["state"],
+        source=source,
+    )
+
+
+def _make_conv_silu_qknorm_kernel():
+    """Fused T-parallel causal Conv1d(K=4)+SiLU+L2 QK-norm with Apple9-safe carry ordering."""
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        #pragma clang fp reassociate(off)
+        constexpr int kHeadsQ = Hk;
+        constexpr int kKeyDim = Hk * Dk;
+        constexpr int kValDim = Hv * Dv;
+        constexpr int kConvDim = 2 * kKeyDim + kValDim;
+        constexpr int kQKTiles = 2 * kHeadsQ;
+        constexpr int kSgs = Dk / 32;
+        static_assert(Dk >= 32 && (Dk % 32) == 0 && kSgs <= 8, "Dk must be 32..256 and multiple of 32");
+
+        int T = int(T_arr[0]);
+        int n_tblks = int(NBlk_arr[0]);
+        uint lane_c = thread_position_in_grid.x;
+        uint tile = thread_position_in_grid.y;
+        uint bz = thread_position_in_grid.z;
+        uint b_idx = bz / uint(n_tblks);
+        int t_start = int(bz - b_idx * uint(n_tblks)) * T_BLK;
+        int t_end = min(T, t_start + T_BLK);
+        uint sg = lane_c >> 5;
+        uint lane_in_sg = lane_c & 31u;
+
+        int ch = -1;
+        bool is_qk = false;
+        bool is_q = false;
+        if (int(tile) < kHeadsQ) {
+          ch = int(tile) * Dk + int(lane_c);
+          is_qk = true;
+          is_q = true;
+        } else if (int(tile) < kQKTiles) {
+          int kt = int(tile) - kHeadsQ;
+          ch = kKeyDim + kt * Dk + int(lane_c);
+          is_qk = true;
+        } else {
+          int vt = int(tile) - kQKTiles;
+          int voff = vt * Dk + int(lane_c);
+          if (voff < kValDim) {
+            ch = 2 * kKeyDim + voff;
+          }
+        }
+
+        threadgroup float sg_red[8];
+
+        // Apple9 macOS 26.6 guard: load conv carry & weights BEFORE loop, store ONLY AFTER loop.
+        float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f;
+        if (ch >= 0) {
+          auto cw = conv_w + ch * 4;
+          w0 = static_cast<float>(cw[0]);
+          w1 = static_cast<float>(cw[1]);
+          w2 = static_cast<float>(cw[2]);
+          w3 = static_cast<float>(cw[3]);
+
+          auto st_in_b = conv_state_in + b_idx * 3 * kConvDim + ch;
+          auto xb = x + b_idx * T * kConvDim + ch;
+          int t0 = t_start - 3;
+          int t1 = t_start - 2;
+          int t2 = t_start - 1;
+          c0 = (t0 < 0) ? static_cast<float>(st_in_b[(3 + t0) * kConvDim]) : static_cast<float>(xb[t0 * kConvDim]);
+          c1 = (t1 < 0) ? static_cast<float>(st_in_b[(3 + t1) * kConvDim]) : static_cast<float>(xb[t1 * kConvDim]);
+          c2 = (t2 < 0) ? static_cast<float>(st_in_b[(3 + t2) * kConvDim]) : static_cast<float>(xb[t2 * kConvDim]);
+        }
+
+        float q_sc = float(inv_scale[0]);
+        float eps_v = 1e-6f;
+        bool write_state = (t_end == T) && (ch >= 0);
+
+        for (int t = t_start; t < t_end; ++t) {
+          float val = 0.0f;
+          if (ch >= 0) {
+            float xt = static_cast<float>(x[(b_idx * T + t) * kConvDim + ch]);
+            float acc = c0 * w0 + c1 * w1 + c2 * w2 + xt * w3;
+            c0 = c1;
+            c1 = c2;
+            c2 = xt;
+            float sig = 1.0f / (1.0f + exp(-acc));
+            val = acc * sig;
+          }
+          if (is_qk) {
+            float sq = val * val;
+            float s_sq = simd_sum(sq);
+            if (lane_in_sg == 0) {
+              sg_red[sg] = s_sq;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float tot_sq = 0.0f;
+            #pragma unroll
+            for (int s = 0; s < kSgs; ++s) {
+              tot_sq += sg_red[s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint sq_bits = as_type<uint>(tot_sq);
+            bool sq_finite = (sq_bits & 0x7f800000u) < 0x7f800000u;
+            float inv_n = sq_finite ? rsqrt(tot_sq + eps_v) : as_type<float>(0x7fc00000u);
+            float normed = val * inv_n * (is_q ? q_sc : 1.0f);
+            if (is_q) {
+              q_out[(b_idx * T + t) * kKeyDim + int(tile) * Dk + int(lane_c)] = static_cast<InT>(normed);
+            } else {
+              k_out[(b_idx * T + t) * kKeyDim + (int(tile) - kHeadsQ) * Dk + int(lane_c)] = static_cast<InT>(normed);
+            }
+          } else if (ch >= 0) {
+            int voff = ch - 2 * kKeyDim;
+            v_out[(b_idx * T + t) * kValDim + voff] = static_cast<InT>(val);
+          }
+        }
+
+        if (write_state) {
+          auto st_out_b = conv_state_out + b_idx * 3 * kConvDim + ch;
+          st_out_b[0 * kConvDim] = static_cast<StOutT>(c0);
+          st_out_b[1 * kConvDim] = static_cast<StOutT>(c1);
+          st_out_b[2 * kConvDim] = static_cast<StOutT>(c2);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_conv_silu_qknorm_tpar",
+        input_names=["x", "conv_state_in", "conv_w", "inv_scale", "T_arr", "NBlk_arr"],
+        output_names=["q_out", "k_out", "v_out", "conv_state_out"],
+        source=source,
+    )
+
+
+def _make_rms_norm_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        #pragma clang fp reassociate(off)
+        uint row = thread_position_in_grid.y;
+        uint tid = thread_position_in_grid.x;
+        constexpr int kStep = 32;
+        constexpr int kVec = D / kStep;
+        uint base = row * D;
+        float xr[kVec];
+        float sq = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          uint d = uint(i) * uint(kStep) + tid;
+          float v = static_cast<float>(x[base + d]);
+          xr[i] = v;
+          sq += v * v;
+        }
+        float tot = simd_sum(sq);
+        uint bits = as_type<uint>(tot);
+        bool fin = (bits & 0x7f800000u) < 0x7f800000u;
+        float inv = fin ? rsqrt(tot * (1.0f / float(D)) + float(eps_arr[0])) : as_type<float>(0x7fc00000u);
+        #pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          uint d = uint(i) * uint(kStep) + tid;
+          out[base + d] = static_cast<T>((xr[i] * inv) * static_cast<float>(w[d]));
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_rms_norm_f32",
+        input_names=["x", "w", "eps_arr"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _make_gated_rms_norm_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        #pragma clang fp reassociate(off)
+        uint row = thread_position_in_grid.y;
+        uint tid = thread_position_in_grid.x;
+        constexpr int kVec = D / 32;
+        uint base = row * D;
+        float xreg[kVec];
+        float zreg[kVec];
+        float wreg[kVec];
+        float sq_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          uint d = uint(i) * 32u + tid;
+          float xv = static_cast<float>(x[base + d]);
+          float zv = static_cast<float>(z[base + d]);
+          float wv = static_cast<float>(w[d]);
+          xreg[i] = xv;
+          zreg[i] = zv;
+          wreg[i] = wv;
+          sq_sum += xv * xv;
+        }
+        float tot_sq = simd_sum(sq_sum);
+        uint sq_bits = as_type<uint>(tot_sq);
+        bool finite_sq = (sq_bits & 0x7f800000u) < 0x7f800000u;
+        float inv_rms = finite_sq ? rsqrt(tot_sq * (1.0f / float(D)) + float(eps_arr[0]))
+                                  : as_type<float>(0x7fc00000u);
+        #pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          uint d = uint(i) * 32u + tid;
+          float zv = zreg[i];
+          float sig = 1.0f / (1.0f + exp(-zv));
+          float silu_z = zv * sig;
+          out[base + d] = static_cast<T>(xreg[i] * inv_rms * wreg[i] * silu_z);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_gated_rms_norm_f32",
+        input_names=["x", "z", "w", "eps_arr"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _make_swiglu_split_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        #pragma clang fp reassociate(off)
+        uint row = thread_position_in_grid.y;
+        uint col4 = thread_position_in_grid.x;
+        uint h4 = H / 4u;
+        if (col4 >= h4) return;
+
+        uint base = row * (2u * H) + col4 * 4u;
+        float g0 = static_cast<float>(gate_up[base + 0u]);
+        float g1 = static_cast<float>(gate_up[base + 1u]);
+        float g2 = static_cast<float>(gate_up[base + 2u]);
+        float g3 = static_cast<float>(gate_up[base + 3u]);
+
+        float u0 = static_cast<float>(gate_up[base + H + 0u]);
+        float u1 = static_cast<float>(gate_up[base + H + 1u]);
+        float u2 = static_cast<float>(gate_up[base + H + 2u]);
+        float u3 = static_cast<float>(gate_up[base + H + 3u]);
+
+        uint obase = row * H + col4 * 4u;
+        out[obase + 0u] = static_cast<T>((g0 / (1.0f + exp(-g0))) * u0);
+        out[obase + 1u] = static_cast<T>((g1 / (1.0f + exp(-g1))) * u1);
+        out[obase + 2u] = static_cast<T>((g2 / (1.0f + exp(-g2))) * u2);
+        out[obase + 3u] = static_cast<T>((g3 / (1.0f + exp(-g3))) * u3);
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_swiglu_split_x4",
+        input_names=["gate_up"],
+        output_names=["out"],
         source=source,
     )
 
 
 _GATED_DELTA_KERNEL = _make_gated_delta_kernel(has_mask=False)
 _GATED_DELTA_KERNEL_MASKED = _make_gated_delta_kernel(has_mask=True)
-_GATED_DELTA_KERNEL_PACKED = _make_gated_delta_packed_kernel()
-_GATED_DELTA_KERNEL_PACKED_SEG = _make_gated_delta_packed_seg_kernel()
+_GATED_DELTA_KERNEL_STAGED = _make_gated_delta_staged_kernel(segmented=False, state_i8=False)
+_GATED_DELTA_KERNEL_STAGED_SEG = _make_gated_delta_staged_kernel(segmented=True, state_i8=False)
+_GATED_DELTA_KERNEL_STAGED_I8 = _make_gated_delta_staged_kernel(segmented=False, state_i8=True)
+_GATED_DELTA_KERNEL_STAGED_SEG_I8 = _make_gated_delta_staged_kernel(segmented=True, state_i8=True)
+_GDN_STATE_QUANTIZE_I8_KERNEL = _make_gdn_state_quantize_i8_kernel()
+_GDN_STATE_DEQUANTIZE_I8_KERNEL = _make_gdn_state_dequantize_i8_kernel()
+_CONV_SILU_QKNORM_KERNEL = _make_conv_silu_qknorm_kernel()
+_RMS_NORM_KERNEL = _make_rms_norm_kernel()
+_GATED_RMS_NORM_KERNEL = _make_gated_rms_norm_kernel()
+_SWIGLU_SPLIT_KERNEL = _make_swiglu_split_kernel()
+
+
+def quantize_gdn_state_i8(state: mx.array) -> tuple[mx.array, mx.array]:
+    """Compress recurrent GDN state ``(..., Dk)`` into Block-32 INT8 codes + BF16 scales.
+
+    Uses Splash's ``state_code_quad`` non-finite preservation: any Block-32 quad containing
+    ``Inf`` or ``NaN`` encodes to a quiet-``NaN`` bfloat16 scale (``0x7fc0``) and zero codes
+    so dequantization restores every element of that block as ``NaN``.
+    """
+    if state.ndim < 1 or state.shape[-1] < 32 or state.shape[-1] % 32 != 0:
+        raise ValueError(f"Expected last dim >= 32 divisible by 32, got shape {state.shape}")
+    Dk = int(state.shape[-1])
+    k_quads = Dk // 32
+    codes_shape = tuple(int(d) for d in state.shape)
+    scales_shape = (*codes_shape[:-1], k_quads)
+    if state.size == 0:
+        return mx.zeros(codes_shape, dtype=mx.int8), mx.zeros(scales_shape, dtype=mx.bfloat16)
+
+    rows = int(state.size // Dk)
+    if (
+        _GDN_STATE_QUANTIZE_I8_KERNEL is not None
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    ):
+        codes, scales = _GDN_STATE_QUANTIZE_I8_KERNEL(
+            inputs=[state.reshape(rows, Dk), mx.array([rows], dtype=mx.int32)],
+            template=[("InT", state.dtype), ("Dk", Dk)],
+            grid=(128, (rows + 15) // 16, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[codes_shape, scales_shape],
+            output_dtypes=[mx.int8, mx.bfloat16],
+        )
+        return codes, scales
+
+    st_np = np.asarray(state.astype(mx.float32), dtype=np.float32).reshape(rows, k_quads, 32)
+    finite_blk = np.all(np.isfinite(st_np), axis=-1)
+    amax = np.where(finite_blk, np.max(np.abs(st_np), axis=-1), 0.0).astype(np.float32)
+    scales_f32 = np.where(finite_blk, amax * (1.0 / 127.0), np.nan).astype(np.float32)
+    scales_bf16 = mx.array(scales_f32, dtype=mx.bfloat16)
+    scales_rounded = np.asarray(scales_bf16.astype(mx.float32), dtype=np.float32)[..., None]
+    valid = finite_blk[..., None] & (scales_rounded > 0.0)
+    denom = np.where(valid, scales_rounded, 1.0)
+    scaled = np.where(valid, st_np / denom, 0.0)
+    codes_np = np.clip(np.rint(scaled), -127.0, 127.0).astype(np.int8)
+    return mx.array(codes_np.reshape(codes_shape), dtype=mx.int8), scales_bf16.reshape(scales_shape)
+
+
+def dequantize_gdn_state_i8(
+    codes: mx.array,
+    scales: mx.array,
+    *,
+    out_dtype: Any = mx.float32,
+) -> mx.array:
+    """Restore Block-32 INT8 ``(codes, scales)`` GDN recurrent state to ``out_dtype``."""
+    if codes.ndim < 1 or codes.shape[-1] < 32 or codes.shape[-1] % 32 != 0:
+        raise ValueError(f"Expected codes last dim divisible by 32, got {codes.shape}")
+    Dk = int(codes.shape[-1])
+    k_quads = Dk // 32
+    expected_scales_shape = (*tuple(int(d) for d in codes.shape[:-1]), k_quads)
+    if tuple(int(d) for d in scales.shape) != expected_scales_shape:
+        raise ValueError(f"Expected scales shape {expected_scales_shape}, got {scales.shape}")
+    if codes.size == 0:
+        return mx.zeros(codes.shape, dtype=out_dtype)
+
+    rows = int(codes.size // Dk)
+    scales_bf16 = scales if scales.dtype == mx.bfloat16 else scales.astype(mx.bfloat16)
+    if (
+        _GDN_STATE_DEQUANTIZE_I8_KERNEL is not None
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    ):
+        return _GDN_STATE_DEQUANTIZE_I8_KERNEL(  # guard: allow-fp32
+            inputs=[codes.reshape(rows, Dk), scales_bf16.reshape(rows, k_quads), mx.array([rows], dtype=mx.int32)],
+            template=[("OutT", out_dtype), ("Dk", Dk)],
+            grid=(128, (rows + 15) // 16, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[codes.shape],
+            output_dtypes=[out_dtype],
+        )[0]
+
+    sc_u16 = np.asarray(scales_bf16.view(mx.uint16), dtype=np.uint16).reshape(rows, k_quads, 1)
+    sc_fin = (sc_u16 & np.uint16(0x7F80)) < np.uint16(0x7F80)
+    sc_f32 = np.asarray(scales_bf16.astype(mx.float32), dtype=np.float32).reshape(rows, k_quads, 1)
+    c_f32 = np.asarray(codes, dtype=np.float32).reshape(rows, k_quads, 32)
+    restored = np.where(sc_fin, c_f32 * np.where(sc_fin, sc_f32, 0.0), np.nan).reshape(codes.shape)
+    return mx.array(restored.astype(np.float32), dtype=out_dtype)
 
 
 @mx.compile
@@ -639,6 +1186,16 @@ def gated_delta_ops(
     return mx.stack(ys, axis=1), state
 
 
+def _effective_gdn_tile_rows(dk: int, input_type: Any, tile_rows: int | None) -> int:
+    req = _GDN_TILE_ROWS if tile_rows is None else int(tile_rows)
+    if req < 4 or req > 24:
+        raise ValueError(f"Unsupported GDN tile_rows {req!r}; expected 4..24")
+    elem_bytes = 4 if input_type == mx.float32 else 2
+    per_row_bytes = (2 * dk + 16) * elem_bytes + 9
+    max_rows = max(4, (28672 // per_row_bytes // 4) * 4)
+    return min(req, max_rows)
+
+
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
@@ -647,49 +1204,108 @@ def gated_delta_update(
     b: mx.array,
     A_log: mx.array,
     dt_bias: mx.array,
-    state: mx.array | None = None,
+    state: mx.array | tuple[mx.array, mx.array] | None = None,
     mask: mx.array | None = None,
     *,
     seg_flags: mx.array | None = None,
     use_kernel: bool = True,
     state_fp32: bool = True,
-) -> tuple[mx.array, mx.array]:
-    """Run GatedDeltaNet recurrence keeping ``q, k, v`` in activation dtype and ``state`` in FP32."""
+    state_dtype: str | None = None,
+    tile_rows: int | None = None,
+) -> tuple[mx.array, mx.array | tuple[mx.array, mx.array]]:
+    """Run GatedDeltaNet recurrence keeping ``q, k, v`` in activation dtype and configurable ``state_dtype``."""
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     has_carried_state = state is not None
-    if state is None:
-        B, _, Hk, Dk = q.shape
-        Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32 if state_fp32 else q.dtype)
-    elif state_fp32 and state.dtype != mx.float32:
-        state = state.astype(mx.float32)
+
+    if state_dtype is not None or os.environ.get("FAST_PPLX_STATE_DTYPE", "").strip():
+        resolved_state_dtype = normalize_state_dtype(state_dtype, state_fp32=state_fp32)
+    else:
+        resolved_state_dtype = "float32" if state_fp32 else "legacy_non_fp32"
+
+    is_i8 = resolved_state_dtype == "int8"
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    input_type = q.dtype
+
+    if is_i8:
+        if state is None:
+            codes_in = mx.zeros((B, Hv, Dv, Dk), dtype=mx.int8)
+            scales_in = mx.zeros((B, Hv, Dv, Dk // 32), dtype=mx.bfloat16)
+        elif isinstance(state, tuple):
+            codes_in, scales_in = state
+        else:
+            codes_in, scales_in = quantize_gdn_state_i8(state)
+        state_out_target_dtype = None
+        dense_state = None
+    else:
+        if resolved_state_dtype == "float32":
+            state_out_target_dtype = mx.float32
+        elif resolved_state_dtype == "bfloat16":
+            state_out_target_dtype = mx.bfloat16
+        else:
+            state_out_target_dtype = (
+                state.dtype
+                if (state is not None and not isinstance(state, tuple))
+                else q.dtype
+            )
+        if state is None:
+            dense_state = mx.zeros((B, Hv, Dv, Dk), dtype=state_out_target_dtype)
+        elif isinstance(state, tuple):
+            dense_state = dequantize_gdn_state_i8(
+                state[0], state[1], out_dtype=state_out_target_dtype
+            )
+        elif state.dtype != state_out_target_dtype:
+            dense_state = state.astype(state_out_target_dtype)
+        else:
+            dense_state = state
+        codes_in = None
+        scales_in = None
+
+    if T == 0 or B == 0:
+        out_empty = mx.zeros((B, T, Hv, Dv), dtype=input_type)
+        if is_i8:
+            assert codes_in is not None and scales_in is not None
+            return out_empty, (codes_in, scales_in)
+        assert dense_state is not None
+        return out_empty, dense_state
 
     if (
         not use_kernel
         or _GATED_DELTA_KERNEL is None
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
-        or k.shape[-1] < 32
-        or k.shape[-1] % 32 != 0
+        or Dk < 32
+        or Dk % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state.astype(mx.float32), mask, seg_flags=seg_flags)
+        if is_i8:
+            assert codes_in is not None and scales_in is not None
+            st_f32 = dequantize_gdn_state_i8(codes_in, scales_in, out_dtype=mx.float32)
+            out_y, out_st_f32 = gated_delta_ops(q, k, v, g, beta, st_f32, mask, seg_flags=seg_flags)
+            return out_y, quantize_gdn_state_i8(out_st_f32)
+        assert dense_state is not None
+        out_y, out_st_f32 = gated_delta_ops(
+            q, k, v, g, beta, dense_state.astype(mx.float32), mask, seg_flags=seg_flags
+        )
+        assert state_out_target_dtype is not None
+        if out_st_f32.dtype != state_out_target_dtype:
+            out_st_f32 = out_st_f32.astype(state_out_target_dtype)
+        return out_y, out_st_f32
 
-    B, T, Hk, Dk = k.shape
-    Hv, Dv = v.shape[2:]
-    input_type = q.dtype
-    state_type = state.dtype
-
-    # 1. Native C++ mlx 0.32.4 mx.fast.gated_delta_update for single-pass unpadded FP16 2D batches (T <= 2048).
-    #    For T > 2048, bfloat16 (7-bit mantissa), or streamed multi-slice handoffs (has_carried_state=True),
-    #    _GATED_DELTA_KERNEL_PACKED keeps recurrent state strictly in FP32 registers.
+    # 1. Native C++ mlx mx.fast.gated_delta_update on Apple10 hosts for single-pass unmasked/unsegmented FP16 (T <= 2048).
+    #    For carried state (has_carried_state=True), T > 2048, BF16, masked/segmented batches, INT8 state, or Apple9 (M4),
+    #    GdnDecodeShared keeps recurrent state strictly in FP32 registers and beats mx.fast on Apple9 (1.69 ms vs 1.96 ms).
     if (
         not has_carried_state
+        and not is_i8
+        and state_out_target_dtype == mx.float32
+        and tile_rows is None
         and T <= 2048
         and input_type == mx.float16
         and mask is None
         and seg_flags is None
         and _USE_MX_FAST_GDN
+        and _is_apple10_gdn_host()
         and g.ndim == 3
         and Dk >= 32
         and Dk % 32 == 0
@@ -697,37 +1313,94 @@ def gated_delta_update(
         and Dv % 32 == 0
     ):
         out_y, out_state = mx.fast.gated_delta_update(q, k, v, g, beta)
-        if state_fp32 and out_state.dtype != mx.float32:
+        if out_state.dtype != mx.float32:
             out_state = out_state.astype(mx.float32)
         return out_y, out_state
 
-    # 2. 4-lane binary-tree packed kernel for BOTH unmasked AND masked / 1D varlen packed batches!
-    btree_shape_ok = (
-        g.ndim == 3
-        and Dk >= 32
-        and Dk % 32 == 0
-        and Dv % 8 == 0
-        and _ENABLE_GDN_PACKED
+    # 2. Threadgroup-staged GdnDecodeShared Metal kernel (128 threads, TG_DV=16, TILE_ROWS=16 default).
+    staged_shape_ok = g.ndim == 3 and Dk >= 32 and Dk % 32 == 0 and _ENABLE_GDN_PACKED
+    eff_flags = (
+        seg_flags.astype(mx.uint8)
+        if seg_flags is not None
+        else (mask.astype(mx.uint8) if mask is not None else None)
     )
-    if mask is None and seg_flags is None and btree_shape_ok and _GATED_DELTA_KERNEL_PACKED is not None:
-        kernel = _GATED_DELTA_KERNEL_PACKED
-        inputs = [q, k, v, g, beta, state, T]
-        grid = (32, Dv // 8, B * Hv)
-        threadgroup = (32, 2, 1)
-    elif (seg_flags is not None or mask is not None) and btree_shape_ok and _GATED_DELTA_KERNEL_PACKED_SEG is not None:
-        eff_flags = seg_flags.astype(mx.uint8) if seg_flags is not None else mask.astype(mx.uint8)
-        kernel = _GATED_DELTA_KERNEL_PACKED_SEG
-        inputs = [q, k, v, g, beta, state, T, eff_flags]
-        grid = (32, Dv // 8, B * Hv)
-        threadgroup = (32, 2, 1)
-    elif mask is not None and _GATED_DELTA_KERNEL_MASKED is not None:
+    is_seg = eff_flags is not None
+
+    if is_i8:
+        kernel = _GATED_DELTA_KERNEL_STAGED_SEG_I8 if is_seg else _GATED_DELTA_KERNEL_STAGED_I8
+        if kernel is None or not staged_shape_ok:
+            assert codes_in is not None and scales_in is not None
+            st_f32 = dequantize_gdn_state_i8(codes_in, scales_in, out_dtype=mx.float32)
+            out_y, out_st_f32 = gated_delta_ops(q, k, v, g, beta, st_f32, mask, seg_flags=seg_flags)
+            return out_y, quantize_gdn_state_i8(out_st_f32)
+        eff_tile_rows = _effective_gdn_tile_rows(Dk, input_type, tile_rows)
+        assert codes_in is not None and scales_in is not None
+        T_arr = mx.array([T], dtype=mx.int32)
+        inputs = [q, k, v, g, beta, codes_in, scales_in, T_arr]
+        if is_seg:
+            inputs.append(eff_flags)
+        out_y, codes_out, scales_out = kernel(
+            inputs=inputs,
+            template=[
+                ("InT", input_type),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+                ("TILE_ROWS", eff_tile_rows),
+                ("TG_DV", 16),
+            ],
+            grid=(128, (Dv + 15) // 16, B * Hv),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(B, T, Hv, Dv), codes_in.shape, scales_in.shape],
+            output_dtypes=[input_type, mx.int8, mx.bfloat16],
+        )
+        return out_y, (codes_out, scales_out)
+
+    assert dense_state is not None and state_out_target_dtype is not None
+    state_type = dense_state.dtype
+    staged_kernel = _GATED_DELTA_KERNEL_STAGED_SEG if is_seg else _GATED_DELTA_KERNEL_STAGED
+    if staged_shape_ok and staged_kernel is not None:
+        eff_tile_rows = _effective_gdn_tile_rows(Dk, input_type, tile_rows)
+        T_arr = mx.array([T], dtype=mx.int32)
+        inputs = [q, k, v, g, beta, dense_state, T_arr]
+        if is_seg:
+            inputs.append(eff_flags)
+        out_y, out_state = staged_kernel(  # guard: allow-fp32
+            inputs=inputs,
+            template=[
+                ("InT", input_type),
+                ("StT", state_type),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+                ("TILE_ROWS", eff_tile_rows),
+                ("TG_DV", 16),
+            ],
+            grid=(128, (Dv + 15) // 16, B * Hv),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(B, T, Hv, Dv), dense_state.shape],
+            output_dtypes=[input_type, state_type],
+        )
+        return out_y, out_state
+
+    if seg_flags is not None:
+        out_y, out_st_f32 = gated_delta_ops(
+            q, k, v, g, beta, dense_state.astype(mx.float32), mask, seg_flags=seg_flags
+        )
+        if out_st_f32.dtype != state_out_target_dtype:
+            out_st_f32 = out_st_f32.astype(state_out_target_dtype)
+        return out_y, out_st_f32
+
+    if mask is not None and _GATED_DELTA_KERNEL_MASKED is not None:
         kernel = _GATED_DELTA_KERNEL_MASKED
-        inputs = [q, k, v, g, beta, state, T, mask]
+        inputs = [q, k, v, g, beta, dense_state, T, mask]
         grid = (32, Dv, B * Hv)
         threadgroup = (32, 4, 1)
     else:
         kernel = _GATED_DELTA_KERNEL
-        inputs = [q, k, v, g, beta, state, T]
+        inputs = [q, k, v, g, beta, dense_state, T]
         grid = (32, Dv, B * Hv)
         threadgroup = (32, 4, 1)
 
@@ -744,7 +1417,7 @@ def gated_delta_update(
         ],
         grid=grid,
         threadgroup=threadgroup,
-        output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_shapes=[(B, T, Hv, Dv), dense_state.shape],
         output_dtypes=[input_type, state_type],
     )
     return out_y, out_state
@@ -764,6 +1437,28 @@ class PplxRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
+        D = int(x.shape[-1])
+        if (
+            _RMS_NORM_KERNEL is not None
+            and x.size > 0
+            and D >= 32
+            and D % 32 == 0
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        ):
+            rows = int(x.size // D)
+            return _RMS_NORM_KERNEL(
+                inputs=[
+                    x.reshape(rows, D),
+                    self.weight,
+                    mx.array([float(self.eps)], dtype=mx.float32),
+                ],
+                template=[("T", x.dtype), ("WgtT", self.weight.dtype), ("D", D)],
+                grid=(32, rows, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[x.shape],
+                output_dtypes=[x.dtype],
+            )[0]
         w_f32 = self.weight if self.weight.dtype == mx.float32 else self.weight.astype(mx.float32)
         out_f32 = mx.fast.rms_norm(x.astype(mx.float32), w_f32, self.eps)
         return out_f32.astype(x.dtype)
@@ -778,6 +1473,31 @@ class PplxGatedRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        D = int(x.shape[-1])
+        if (
+            _GATED_RMS_NORM_KERNEL is not None
+            and x.size > 0
+            and x.shape == gate.shape
+            and D >= 32
+            and D % 32 == 0
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        ):
+            rows = int(x.size // D)
+            gate_in = gate if gate.dtype == x.dtype else gate.astype(x.dtype)
+            return _GATED_RMS_NORM_KERNEL(
+                inputs=[
+                    x.reshape(rows, D),
+                    gate_in.reshape(rows, D),
+                    self.weight,
+                    mx.array([float(self.eps)], dtype=mx.float32),
+                ],
+                template=[("T", x.dtype), ("WgtT", self.weight.dtype), ("D", D)],
+                grid=(32, rows, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[x.shape],
+                output_dtypes=[x.dtype],
+            )[0]
         x_f32 = x.astype(mx.float32)
         g_f32 = gate.astype(mx.float32)
         w_f32 = self.weight.astype(mx.float32)
@@ -977,9 +1697,9 @@ class PplxAttention(nn.Module):
 
 
 class PplxGatedDeltaNet(nn.Module):
-    """Linear-attention GatedDeltaNet layer with fused `in_proj_all`, causal Conv1d, and FP32 state streaming."""
+    """Linear-attention GatedDeltaNet layer with fused `in_proj_all`, causal Conv1d, and configurable state streaming."""
 
-    def __init__(self, cfg: PplxConfig) -> None:
+    def __init__(self, cfg: PplxConfig, *, state_dtype: str | None = None) -> None:
         super().__init__()
         self.num_k_heads = cfg.linear_num_key_heads
         self.num_v_heads = cfg.linear_num_value_heads
@@ -991,6 +1711,7 @@ class PplxGatedDeltaNet(nn.Module):
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.total_in_dim = self.conv_dim + self.value_dim + 2 * self.num_v_heads
         self.inv_scale = float(self.head_k_dim) ** -0.5
+        self.state_dtype = normalize_state_dtype(state_dtype)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
@@ -1010,12 +1731,12 @@ class PplxGatedDeltaNet(nn.Module):
         self,
         x_slice: mx.array,
         conv_state: mx.array,
-        rec_state: mx.array | None,
+        rec_state: mx.array | tuple[mx.array, mx.array] | None,
         mask_slice: mx.array | None,
         *,
         seg_flags_slice: mx.array | None = None,
         keep_conv_state_fp32: bool = False,
-    ) -> tuple[mx.array, mx.array, mx.array]:
+    ) -> tuple[mx.array, mx.array, mx.array | tuple[mx.array, mx.array]]:
         B, S_sub, _ = x_slice.shape
 
         proj = self.in_proj_all(x_slice)
@@ -1025,18 +1746,70 @@ class PplxGatedDeltaNet(nn.Module):
         mixed_qkv, z_flat, b_slice, a_slice = mx.split(proj, [s_qkv, s_z, s_b], axis=-1)
         z = z_flat.reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
 
-        conv_prefix = conv_state if conv_state.dtype == mixed_qkv.dtype else conv_state.astype(mixed_qkv.dtype)
-        conv_in = mx.concatenate([conv_prefix, mixed_qkv], axis=1)
-        tail = conv_in[:, -(self.conv_kernel_size - 1) :, :]
-        new_conv_state = tail.astype(mx.float32) if keep_conv_state_fp32 else tail
-        conv_out = nn.silu(self.conv1d(conv_in))
+        conv_w = self.conv1d.weight.squeeze(-1)
+        use_fused_conv = (
+            self.use_kernel
+            and _CONV_SILU_QKNORM_KERNEL is not None
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+            and B > 0
+            and S_sub > 0
+            and self.conv_kernel_size == 4
+            and getattr(self.conv1d, "bias", None) is None
+            and 32 <= self.head_k_dim <= 256
+            and self.head_k_dim % 32 == 0
+            and conv_w.shape == (self.conv_dim, 4)
+            and conv_state.shape == (B, 3, self.conv_dim)
+        )
+        if use_fused_conv:
+            t_blk = 32
+            n_blks = (S_sub + t_blk - 1) // t_blk
+            tiles = 2 * self.num_k_heads + (self.value_dim + self.head_k_dim - 1) // self.head_k_dim
+            conv_out_dtype = mx.float32 if keep_conv_state_fp32 else mixed_qkv.dtype
+            q, k, v, new_conv_state = _CONV_SILU_QKNORM_KERNEL(  # guard: allow-fp32
+                inputs=[
+                    mixed_qkv,
+                    conv_state,
+                    conv_w,
+                    mx.array([float(self.inv_scale)], dtype=mx.float32),
+                    mx.array([S_sub], dtype=mx.int32),
+                    mx.array([n_blks], dtype=mx.int32),
+                ],
+                template=[
+                    ("InT", mixed_qkv.dtype),
+                    ("StInT", conv_state.dtype),
+                    ("StOutT", conv_out_dtype),
+                    ("WgtT", conv_w.dtype),
+                    ("Dk", self.head_k_dim),
+                    ("Dv", self.head_v_dim),
+                    ("Hk", self.num_k_heads),
+                    ("Hv", self.num_v_heads),
+                    ("T_BLK", t_blk),
+                ],
+                grid=(self.head_k_dim, tiles, B * n_blks),
+                threadgroup=(self.head_k_dim, 1, 1),
+                output_shapes=[
+                    (B, S_sub, self.num_k_heads, self.head_k_dim),
+                    (B, S_sub, self.num_k_heads, self.head_k_dim),
+                    (B, S_sub, self.num_v_heads, self.head_v_dim),
+                    (B, 3, self.conv_dim),
+                ],
+                output_dtypes=[mixed_qkv.dtype, mixed_qkv.dtype, mixed_qkv.dtype, conv_out_dtype],
+            )
+        else:
+            conv_prefix = conv_state if conv_state.dtype == mixed_qkv.dtype else conv_state.astype(mixed_qkv.dtype)
+            conv_in = mx.concatenate([conv_prefix, mixed_qkv], axis=1)
+            tail = conv_in[:, -(self.conv_kernel_size - 1) :, :]
+            new_conv_state = tail.astype(mx.float32) if keep_conv_state_fp32 else tail
+            conv_out = nn.silu(self.conv1d(conv_in))
 
-        q_flat, k_flat, v_flat = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
-        q = q_flat.reshape(B, S_sub, self.num_k_heads, self.head_k_dim)
-        k = k_flat.reshape(B, S_sub, self.num_k_heads, self.head_k_dim)
-        v = v_flat.reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
+            q_flat, k_flat, v_flat = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
+            q = q_flat.reshape(B, S_sub, self.num_k_heads, self.head_k_dim)
+            k = k_flat.reshape(B, S_sub, self.num_k_heads, self.head_k_dim)
+            v = v_flat.reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
 
-        q, k = normalize_qk(q, k, inv_scale=self.inv_scale, eps=1e-6)
+            q, k = normalize_qk(q, k, inv_scale=self.inv_scale, eps=1e-6)
+
         out, new_rec_state = gated_delta_update(
             q,
             k,
@@ -1049,7 +1822,7 @@ class PplxGatedDeltaNet(nn.Module):
             mask=mask_slice,
             seg_flags=seg_flags_slice,
             use_kernel=self.use_kernel,
-            state_fp32=True,
+            state_dtype=self.state_dtype,
         )
         normed = self.norm(out, z).reshape(B, S_sub, self.value_dim)
         return self.out_proj(normed), new_conv_state, new_rec_state
@@ -1081,11 +1854,7 @@ class PplxGatedDeltaNet(nn.Module):
             )
             return out
 
-        # Keep rec_state in FP32 so S > 2048 chunk handoffs never suffer FP16/BF16 state truncation.
-        rec_state: mx.array | None = mx.zeros(
-            (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32
-        )
-
+        rec_state: mx.array | tuple[mx.array, mx.array] | None = None
         conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=mx.float32)
         outs: list[mx.array] = []
         for s0, s1 in tile_aligned_slices(S, slice_len=_GDN_SLICE_LEN, min_tail=_GDN_SLICE_LEN):
@@ -1099,7 +1868,8 @@ class PplxGatedDeltaNet(nn.Module):
                 seg_flags_slice=flags_slice,
                 keep_conv_state_fp32=True,
             )
-            mx.async_eval(y_slice, conv_state, rec_state)
+            rec_eval = rec_state if isinstance(rec_state, tuple) else (rec_state,)
+            mx.async_eval(y_slice, conv_state, *rec_eval)
             outs.append(y_slice)
         return mx.concatenate(outs, axis=1)
 
@@ -1115,7 +1885,26 @@ class PplxMLP(nn.Module):
 
     def _run_slice(self, x: mx.array) -> mx.array:
         gate_up = self.gate_up_proj(x)
-        gate, up = mx.split(gate_up, [self.intermediate_size], axis=-1)
+        h = self.intermediate_size
+        rows = gate_up.size // (2 * h) if h > 0 else 0
+        if (
+            _SWIGLU_SPLIT_KERNEL is not None
+            and rows > 0
+            and h >= 4
+            and h % 4 == 0
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        ):
+            act = _SWIGLU_SPLIT_KERNEL(
+                inputs=[gate_up.reshape(rows, 2 * h)],
+                template=[("T", gate_up.dtype), ("H", h)],
+                grid=(((h // 4 + 31) // 32) * 32, rows, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(*x.shape[:-1], h)],
+                output_dtypes=[gate_up.dtype],
+            )[0]
+            return self.down_proj(act)
+        gate, up = mx.split(gate_up, [h], axis=-1)
         return self.down_proj(nn.silu(gate) * up)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -1137,6 +1926,7 @@ class PplxDecoderLayer(nn.Module):
         is_linear: bool,
         *,
         gpu_family: Mapping[str, Any] | None = None,
+        state_dtype: str | None = None,
     ) -> None:
         super().__init__()
         self.is_linear = is_linear
@@ -1144,7 +1934,7 @@ class PplxDecoderLayer(nn.Module):
         self.post_attention_layernorm = PplxRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = PplxMLP(cfg)
         if is_linear:
-            self.linear_attn = PplxGatedDeltaNet(cfg)
+            self.linear_attn = PplxGatedDeltaNet(cfg, state_dtype=state_dtype)
         else:
             self.self_attn = PplxAttention(cfg, gpu_family=gpu_family)
 
@@ -1174,16 +1964,19 @@ class PplxModel(nn.Module):
         *,
         has_embed_module: bool = True,
         gpu_family: Mapping[str, Any] | None = None,
+        state_dtype: str | None = None,
     ) -> None:
         super().__init__()
         self.config = cfg
         self.gpu_family = _detect_gpu_family_info() if gpu_family is None else dict(gpu_family)
+        self.state_dtype = normalize_state_dtype(state_dtype)
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size) if has_embed_module else None
         self.layers = [
             PplxDecoderLayer(
                 cfg,
                 is_linear=(cfg.layer_types[i] == "linear_attention"),
                 gpu_family=self.gpu_family,
+                state_dtype=self.state_dtype,
             )
             for i in range(cfg.num_hidden_layers)
         ]
@@ -1428,6 +2221,7 @@ class FastPplxGPU:
         *,
         model_dir: str | Path | None = None,
         dtype: str = "float16",
+        state_dtype: str | None = None,
         use_mapped_embedding: bool = True,
         cache_limit_mb: int = 512,
         local_files_only: bool = True,
@@ -1439,12 +2233,13 @@ class FastPplxGPU:
 
         self.paths = resolve_paths(home)
         self.dtype_name = dtype
+        self.state_dtype_name = normalize_state_dtype(state_dtype)
         self.act_dtype = mx.float16 if dtype == "float16" else mx.bfloat16
         self.use_mapped_embedding = bool(use_mapped_embedding)
         self.cache_limit_mb = int(cache_limit_mb)
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
-        self.runtime_telemetry = get_mlx_runtime_telemetry()
+        self.runtime_telemetry = {**get_mlx_runtime_telemetry(), "state_dtype": self.state_dtype_name}
 
         set_mlx_cache_limit(self.cache_limit_mb)
         self._prev_wired_limit: int | None = _apply_recommended_wired_limit()
@@ -1504,6 +2299,7 @@ class FastPplxGPU:
                 self.config,
                 has_embed_module=(not using_mapped),
                 gpu_family=_detect_gpu_family_info(),
+                state_dtype=self.state_dtype_name,
             )
 
             if kind == "dir":
@@ -2122,10 +2918,13 @@ __all__ = [
     "PplxModel",
     "PplxRMSNorm",
     "compute_g",
+    "dequantize_gdn_state_i8",
     "gated_delta_ops",
     "gated_delta_update",
     "get_mlx_runtime_telemetry",
     "normalize_qk",
+    "normalize_state_dtype",
+    "quantize_gdn_state_i8",
     "set_mlx_cache_limit",
     "tile_aligned_slices",
     "wired_limit_scope",
