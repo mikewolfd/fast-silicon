@@ -27,11 +27,6 @@ import platform
 import re
 from typing import Any, Iterator, Mapping, Sequence
 
-# Default MLX_ENABLE_TF32=0 before importing mlx.core so FP32 projections and reference
-# paths stay exact IEEE FP32 across M4 (Apple9) and M5 (Apple10 NAX) unless explicitly overridden.
-_TF32_WAS_USER_SET = "MLX_ENABLE_TF32" in os.environ
-os.environ.setdefault("MLX_ENABLE_TF32", "0")
-
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -72,6 +67,11 @@ _EMBED_TENSOR_CANDIDATES = (
 )
 
 _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
+_USE_MX_FAST_GDN = (
+    hasattr(mx.fast, "gated_delta_update")
+    and os.environ.get("FAST_PPLX_DISABLE_MX_FAST_GDN", "0") != "1"
+)
+_ENABLE_VARLEN_PACK = os.environ.get("FAST_PPLX_VARLEN_PACK", "1") != "0"
 _ARCH_GEN_RE = re.compile(r"g(\d+)", re.IGNORECASE)
 
 
@@ -150,10 +150,11 @@ def _detect_gpu_family_info(
 def get_mlx_runtime_telemetry() -> dict[str, Any]:
     """Return active MLX precision, TF32, and Apple9/Apple10 dispatch telemetry."""
     fam = _detect_gpu_family_info()
+    tf32_env = os.environ.get("MLX_ENABLE_TF32")
     return {
         "mlx_version": str(getattr(mx, "__version__", "unknown")),
-        "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "0"),
-        "mlx_enable_tf32_source": "env" if _TF32_WAS_USER_SET else "default_0",
+        "mlx_enable_tf32": tf32_env,
+        "mlx_enable_tf32_source": "env" if tf32_env is not None else "mlx_default",
         "mlx_metal_no_nax": os.environ.get("MLX_METAL_NO_NAX", "0"),
         "device_name": fam["device_name"],
         "architecture": fam["architecture"],
@@ -436,9 +437,138 @@ def _make_gated_delta_packed_kernel():
     )
 
 
+def _make_gated_delta_packed_seg_kernel():
+    """4-lane binary-tree packed GDN kernel supporting `flags` (`0=pad/skip`, `1=valid`, `2=doc_start_reset`)."""
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        static_assert(Dk >= 16 && (Dk % (lanes_per_row * 4)) == 0, "Dk must be a positive multiple of 16");
+        constexpr int values_per_lane = Dk / lanes_per_row;
+        constexpr int partials_per_lane = values_per_lane / 4;
+        static_assert(partials_per_lane >= 1, "partials_per_lane must be >= 1");
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto row_group = thread_position_in_grid.y;
+        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
+
+        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+        y += (b_idx * T * Hv + hv_idx) * Dv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+        float state[values_per_lane];
+        for (int i = 0; i < values_per_lane; ++i) {
+          state[i] = static_cast<float>(i_state[i]);
+        }
+
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+        auto flg_ = flags + b_idx * T;
+
+        for (int t = 0; t < T; ++t) {
+          uint8_t flg = flg_[t];
+          if (flg == 0) {
+            if (lane_in_row == 0) {
+              y[dv_idx] = static_cast<InT>(0);
+            }
+          } else {
+            if (flg == 2) {
+              #pragma unroll
+              for (int i = 0; i < values_per_lane; ++i) {
+                state[i] = 0.0f;
+              }
+            }
+            float gt = static_cast<float>(g_[hv_idx]);
+
+            float part[partials_per_lane];
+            #pragma unroll
+            for (int pb = 0; pb < partials_per_lane; ++pb) {
+              float acc = 0.0f;
+              #pragma unroll
+              for (int i = 0; i < 4; ++i) {
+                int e = pb * 4 + i;
+                state[e] = state[e] * gt;
+                acc += state[e] * static_cast<float>(k_[e]);
+              }
+              part[pb] = acc;
+            }
+            #pragma unroll
+            for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
+              #pragma unroll
+              for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
+                part[p] += part[p + stride];
+              }
+            }
+            float kv_mem = part[0];
+            kv_mem += simd_shuffle_xor(kv_mem, 1);
+            kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+            auto delta =
+                (static_cast<float>(v_[dv_idx]) - kv_mem) *
+                static_cast<float>(beta_[hv_idx]);
+
+            #pragma unroll
+            for (int pb = 0; pb < partials_per_lane; ++pb) {
+              float acc = 0.0f;
+              #pragma unroll
+              for (int i = 0; i < 4; ++i) {
+                int e = pb * 4 + i;
+                state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+                acc += state[e] * static_cast<float>(q_[e]);
+              }
+              part[pb] = acc;
+            }
+            #pragma unroll
+            for (int stride = 1; stride < partials_per_lane; stride <<= 1) {
+              #pragma unroll
+              for (int p = 0; p + stride < partials_per_lane; p += (stride << 1)) {
+                part[p] += part[p + stride];
+              }
+            }
+            float out = part[0];
+            out += simd_shuffle_xor(out, 1);
+            out += simd_shuffle_xor(out, 2);
+            if (lane_in_row == 0) {
+              y[dv_idx] = static_cast<InT>(out);
+            }
+          }
+
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="pplx_gated_delta_step_packed_seg_btree",
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T", "flags"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
 _GATED_DELTA_KERNEL = _make_gated_delta_kernel(has_mask=False)
 _GATED_DELTA_KERNEL_MASKED = _make_gated_delta_kernel(has_mask=True)
 _GATED_DELTA_KERNEL_PACKED = _make_gated_delta_packed_kernel()
+_GATED_DELTA_KERNEL_PACKED_SEG = _make_gated_delta_packed_seg_kernel()
 
 
 @mx.compile
@@ -467,6 +597,7 @@ def _gated_delta_step_ops(
     if mask is not None:
         m = mx.expand_dims(mask, axis=(1, 2, 3))
         state = mx.where(m, state, old_state)
+        y = mx.where(mask[:, None, None], y, mx.zeros_like(y))
     return y.astype(q.dtype), state
 
 
@@ -478,6 +609,7 @@ def gated_delta_ops(
     beta: mx.array,
     state: mx.array | None = None,
     mask: mx.array | None = None,
+    seg_flags: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -488,6 +620,12 @@ def gated_delta_ops(
         k = mx.repeat(k, repeat_factor, -2)
     ys = []
     for t in range(T):
+        if seg_flags is not None:
+            flg_t = seg_flags[:, t]
+            state = mx.where((flg_t == 2)[:, None, None, None], mx.zeros_like(state), state)
+            step_mask = flg_t != 0
+        else:
+            step_mask = None if mask is None else mask[:, t]
         y, state = _gated_delta_step_ops(
             q[:, t],
             k[:, t],
@@ -495,7 +633,7 @@ def gated_delta_ops(
             g[:, t],
             beta[:, t],
             state,
-            None if mask is None else mask[:, t],
+            step_mask,
         )
         ys.append(y)
     return mx.stack(ys, axis=1), state
@@ -512,12 +650,14 @@ def gated_delta_update(
     state: mx.array | None = None,
     mask: mx.array | None = None,
     *,
+    seg_flags: mx.array | None = None,
     use_kernel: bool = True,
     state_fp32: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Run GatedDeltaNet recurrence keeping ``q, k, v`` in activation dtype and ``state`` in FP32."""
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
+    has_carried_state = state is not None
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
@@ -533,24 +673,51 @@ def gated_delta_update(
         or k.shape[-1] < 32
         or k.shape[-1] % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state.astype(mx.float32), mask)
+        return gated_delta_ops(q, k, v, g, beta, state.astype(mx.float32), mask, seg_flags=seg_flags)
 
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
-    packed_eligible = (
-        mask is None
+
+    # 1. Native C++ mlx 0.32.4 mx.fast.gated_delta_update for single-pass unpadded FP16 2D batches (T <= 2048).
+    #    For T > 2048, bfloat16 (7-bit mantissa), or streamed multi-slice handoffs (has_carried_state=True),
+    #    _GATED_DELTA_KERNEL_PACKED keeps recurrent state strictly in FP32 registers.
+    if (
+        not has_carried_state
+        and T <= 2048
+        and input_type == mx.float16
+        and mask is None
+        and seg_flags is None
+        and _USE_MX_FAST_GDN
         and g.ndim == 3
         and Dk >= 32
         and Dk % 32 == 0
+        and Dv >= 32
+        and Dv % 32 == 0
+    ):
+        out_y, out_state = mx.fast.gated_delta_update(q, k, v, g, beta)
+        if state_fp32 and out_state.dtype != mx.float32:
+            out_state = out_state.astype(mx.float32)
+        return out_y, out_state
+
+    # 2. 4-lane binary-tree packed kernel for BOTH unmasked AND masked / 1D varlen packed batches!
+    btree_shape_ok = (
+        g.ndim == 3
+        and Dk >= 32
+        and Dk % 32 == 0
         and Dv % 8 == 0
-        and _GATED_DELTA_KERNEL_PACKED is not None
         and _ENABLE_GDN_PACKED
     )
-    if packed_eligible:
+    if mask is None and seg_flags is None and btree_shape_ok and _GATED_DELTA_KERNEL_PACKED is not None:
         kernel = _GATED_DELTA_KERNEL_PACKED
         inputs = [q, k, v, g, beta, state, T]
+        grid = (32, Dv // 8, B * Hv)
+        threadgroup = (32, 2, 1)
+    elif (seg_flags is not None or mask is not None) and btree_shape_ok and _GATED_DELTA_KERNEL_PACKED_SEG is not None:
+        eff_flags = seg_flags.astype(mx.uint8) if seg_flags is not None else mask.astype(mx.uint8)
+        kernel = _GATED_DELTA_KERNEL_PACKED_SEG
+        inputs = [q, k, v, g, beta, state, T, eff_flags]
         grid = (32, Dv // 8, B * Hv)
         threadgroup = (32, 2, 1)
     elif mask is not None and _GATED_DELTA_KERNEL_MASKED is not None:
@@ -619,8 +786,51 @@ class PplxGatedRMSNorm(nn.Module):
         return out_f32.astype(x.dtype)
 
 
+@partial(mx.compile, shapeless=True)
+def _fused_qk_rms_norm(qk: mx.array, qk_weight: mx.array, eps: float) -> mx.array:
+    normed_f32 = mx.fast.rms_norm(qk.astype(mx.float32), None, eps) * qk_weight
+    return normed_f32.astype(qk.dtype)
+
+
+@mx.compile
+def _apply_custom_partial_rope(
+    qk_hsd: mx.array,
+    rope_cos: mx.array,
+    rope_sin: mx.array,
+    rope_dim: int,
+) -> mx.array:
+    half = rope_dim // 2
+    x1 = qk_hsd[..., :half]
+    x2 = qk_hsd[..., half:rope_dim]
+    rest = qk_hsd[..., rope_dim:]
+    o1 = x1 * rope_cos - x2 * rope_sin
+    o2 = x2 * rope_cos + x1 * rope_sin
+    return mx.concatenate([o1, o2, rest], axis=-1)
+
+
+@mx.compile
+def _build_varlen_mask_and_rope(
+    doc_ids_mx: mx.array,
+    pos_ids_mx: mx.array,
+    cos_tbl_mx: mx.array,
+    sin_tbl_mx: mx.array,
+    zero_val: mx.array,
+    neg_val: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    t_len = doc_ids_mx.shape[1]
+    idx = mx.arange(t_len, dtype=mx.int32)
+    d_col = doc_ids_mx[:, None, :, None]
+    d_row = doc_ids_mx[:, None, None, :]
+    same_doc = (d_col >= 0) & (d_col == d_row)
+    pad_diag = (d_col < 0) & (idx[None, None, :, None] == idx[None, None, None, :])
+    sdpa_mask = mx.where(same_doc | pad_diag, zero_val, neg_val)
+    rope_cos = cos_tbl_mx[pos_ids_mx][:, None, :, :]
+    rope_sin = sin_tbl_mx[pos_ids_mx][:, None, :, :]
+    return sdpa_mask, rope_cos, rope_sin
+
+
 class PplxAttention(nn.Module):
-    """Bidirectional grouped-query attention with output gating, partial RoPE, and Apple9/Apple10 dispatch."""
+    """Bidirectional grouped-query attention with output gating, fused [Q,K] norm+RoPE, and Apple9/Apple10 dispatch."""
 
     def __init__(
         self,
@@ -634,6 +844,7 @@ class PplxAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.rope_dim = cfg.rope_dim
         self.rope_theta = float(cfg.rope_theta)
+        self.rms_norm_eps = float(cfg.rms_norm_eps)
         self.scale = float(cfg.head_dim) ** -0.5
 
         fam = _detect_gpu_family_info() if gpu_family is None else dict(gpu_family)
@@ -650,6 +861,21 @@ class PplxAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self._qk_src_ids: tuple[int, int] | None = None
+        self._qk_norm_weight_cache: mx.array | None = None
+
+    def _get_qk_norm_weight(self) -> mx.array:
+        qw = self.q_norm.weight
+        kw = self.k_norm.weight
+        cur_ids = (id(qw), id(kw))
+        if self._qk_norm_weight_cache is None or self._qk_src_ids != cur_ids:
+            qw_f32 = qw if qw.dtype == mx.float32 else qw.astype(mx.float32)
+            kw_f32 = kw if kw.dtype == mx.float32 else kw.astype(mx.float32)
+            q_rep = mx.broadcast_to(qw_f32[None, :], (self.num_heads, self.head_dim))
+            k_rep = mx.broadcast_to(kw_f32[None, :], (self.num_kv_heads, self.head_dim))
+            self._qk_norm_weight_cache = mx.concatenate([q_rep, k_rep], axis=0)[None, None, :, :]
+            self._qk_src_ids = cur_ids
+        return self._qk_norm_weight_cache
 
     def _run_sdpa(
         self,
@@ -694,6 +920,9 @@ class PplxAttention(nn.Module):
         self,
         x: mx.array,
         sdpa_mask: mx.array | str | None = None,
+        *,
+        rope_cos: mx.array | None = None,
+        rope_sin: mx.array | None = None,
     ) -> mx.array:
         B, S, _ = x.shape
         qkv = self.qkv_proj(x)
@@ -706,26 +935,23 @@ class PplxAttention(nn.Module):
         queries, gate = mx.split(q_and_gate, 2, axis=-1)
         gate = gate.reshape(B, S, self.num_heads * self.head_dim)
 
-        queries = self.q_norm(queries).swapaxes(1, 2)
-        keys = self.k_norm(keys.reshape(B, S, self.num_kv_heads, self.head_dim)).swapaxes(1, 2)
+        keys_4d = keys.reshape(B, S, self.num_kv_heads, self.head_dim)
+        qk = mx.concatenate([queries, keys_4d], axis=2)
+        qk_hsd = _fused_qk_rms_norm(qk, self._get_qk_norm_weight(), self.rms_norm_eps).swapaxes(1, 2)
         values = values.reshape(B, S, self.num_kv_heads, self.head_dim).swapaxes(1, 2)
 
-        queries = mx.fast.rope(
-            queries,
-            self.rope_dim,
-            traditional=False,
-            base=self.rope_theta,
-            scale=1.0,
-            offset=0,
-        )
-        keys = mx.fast.rope(
-            keys,
-            self.rope_dim,
-            traditional=False,
-            base=self.rope_theta,
-            scale=1.0,
-            offset=0,
-        )
+        if rope_cos is not None and rope_sin is not None:
+            qk_rope = _apply_custom_partial_rope(qk_hsd, rope_cos, rope_sin, self.rope_dim)
+        else:
+            qk_rope = mx.fast.rope(
+                qk_hsd,
+                self.rope_dim,
+                traditional=False,
+                base=self.rope_theta,
+                scale=1.0,
+                offset=0,
+            )
+        queries, keys = mx.split(qk_rope, [self.num_heads], axis=1)
 
         if S <= _STREAMED_SEQ_THRESHOLD or sdpa_mask == "causal":
             attn_out = self._run_sdpa(queries, keys, values, sdpa_mask)
@@ -751,7 +977,7 @@ class PplxAttention(nn.Module):
 
 
 class PplxGatedDeltaNet(nn.Module):
-    """Linear-attention GatedDeltaNet layer with causal Conv1d and FP32 state-carried streaming."""
+    """Linear-attention GatedDeltaNet layer with fused `in_proj_all`, causal Conv1d, and FP32 state streaming."""
 
     def __init__(self, cfg: PplxConfig) -> None:
         super().__init__()
@@ -763,6 +989,7 @@ class PplxGatedDeltaNet(nn.Module):
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_kernel_size = cfg.linear_conv_kernel_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
+        self.total_in_dim = self.conv_dim + self.value_dim + 2 * self.num_v_heads
         self.inv_scale = float(self.head_k_dim) ** -0.5
 
         self.conv1d = nn.Conv1d(
@@ -772,10 +999,7 @@ class PplxGatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             bias=False,
         )
-        self.in_proj_qkv = nn.Linear(cfg.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(cfg.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(cfg.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(cfg.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_all = nn.Linear(cfg.hidden_size, self.total_in_dim, bias=False)
         self.dt_bias = mx.ones((self.num_v_heads,), dtype=mx.float32)
         self.A_log = mx.zeros((self.num_v_heads,), dtype=mx.float32)
         self.norm = PplxGatedRMSNorm(self.head_v_dim, eps=cfg.rms_norm_eps)
@@ -785,18 +1009,21 @@ class PplxGatedDeltaNet(nn.Module):
     def _run_step(
         self,
         x_slice: mx.array,
-        a_slice: mx.array,
-        b_slice: mx.array,
         conv_state: mx.array,
-        rec_state: mx.array,
+        rec_state: mx.array | None,
         mask_slice: mx.array | None,
         *,
+        seg_flags_slice: mx.array | None = None,
         keep_conv_state_fp32: bool = False,
     ) -> tuple[mx.array, mx.array, mx.array]:
         B, S_sub, _ = x_slice.shape
 
-        mixed_qkv = self.in_proj_qkv(x_slice)
-        z = self.in_proj_z(x_slice).reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
+        proj = self.in_proj_all(x_slice)
+        s_qkv = self.conv_dim
+        s_z = s_qkv + self.value_dim
+        s_b = s_z + self.num_v_heads
+        mixed_qkv, z_flat, b_slice, a_slice = mx.split(proj, [s_qkv, s_z, s_b], axis=-1)
+        z = z_flat.reshape(B, S_sub, self.num_v_heads, self.head_v_dim)
 
         conv_prefix = conv_state if conv_state.dtype == mixed_qkv.dtype else conv_state.astype(mixed_qkv.dtype)
         conv_in = mx.concatenate([conv_prefix, mixed_qkv], axis=1)
@@ -820,6 +1047,7 @@ class PplxGatedDeltaNet(nn.Module):
             self.dt_bias,
             state=rec_state,
             mask=mask_slice,
+            seg_flags=seg_flags_slice,
             use_kernel=self.use_kernel,
             state_fp32=True,
         )
@@ -830,36 +1058,45 @@ class PplxGatedDeltaNet(nn.Module):
         self,
         x: mx.array,
         ssm_mask: mx.array | None = None,
+        *,
+        seg_flags: mx.array | None = None,
     ) -> mx.array:
         B, S, _ = x.shape
-        if ssm_mask is not None:
+        if seg_flags is not None:
+            zero_val = mx.array(0.0, dtype=x.dtype)
+            x = mx.where((seg_flags != 0)[..., None], x, zero_val)
+        elif ssm_mask is not None:
             zero_val = mx.array(0.0, dtype=x.dtype)
             x = mx.where(ssm_mask[..., None], x, zero_val)
 
-        # Narrow projections (N=16) depend on M-tile rounding, so evaluate once whole before slicing.
-        a_all = self.in_proj_a(x)
-        b_all = self.in_proj_b(x)
-        # Keep rec_state in FP32 so S > 2048 chunk handoffs never suffer FP16/BF16 state truncation.
-        rec_state = mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32)
         if S <= _STREAMED_SEQ_THRESHOLD:
             conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
             out, _, _ = self._run_step(
-                x, a_all, b_all, conv_state, rec_state, ssm_mask, keep_conv_state_fp32=False
+                x,
+                conv_state,
+                None,
+                ssm_mask,
+                seg_flags_slice=seg_flags,
+                keep_conv_state_fp32=False,
             )
             return out
 
+        # Keep rec_state in FP32 so S > 2048 chunk handoffs never suffer FP16/BF16 state truncation.
+        rec_state: mx.array | None = mx.zeros(
+            (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32
+        )
+
         conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=mx.float32)
-        mx.async_eval(a_all, b_all)
         outs: list[mx.array] = []
         for s0, s1 in tile_aligned_slices(S, slice_len=_GDN_SLICE_LEN, min_tail=_GDN_SLICE_LEN):
             mask_slice = None if ssm_mask is None else ssm_mask[:, s0:s1]
+            flags_slice = None if seg_flags is None else seg_flags[:, s0:s1]
             y_slice, conv_state, rec_state = self._run_step(
                 x[:, s0:s1, :],
-                a_all[:, s0:s1, :],
-                b_all[:, s0:s1, :],
                 conv_state,
                 rec_state,
                 mask_slice,
+                seg_flags_slice=flags_slice,
                 keep_conv_state_fp32=True,
             )
             mx.async_eval(y_slice, conv_state, rec_state)
@@ -916,13 +1153,16 @@ class PplxDecoderLayer(nn.Module):
         h: mx.array,
         *,
         ssm_mask: mx.array | None = None,
+        seg_flags: mx.array | None = None,
         sdpa_mask: mx.array | str | None = None,
+        rope_cos: mx.array | None = None,
+        rope_sin: mx.array | None = None,
     ) -> mx.array:
         x_in = self.input_layernorm(h)
         if self.is_linear:
-            r = self.linear_attn(x_in, ssm_mask=ssm_mask)
+            r = self.linear_attn(x_in, ssm_mask=ssm_mask, seg_flags=seg_flags)
         else:
-            r = self.self_attn(x_in, sdpa_mask=sdpa_mask)
+            r = self.self_attn(x_in, sdpa_mask=sdpa_mask, rope_cos=rope_cos, rope_sin=rope_sin)
         h = h + r
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -950,12 +1190,31 @@ class PplxModel(nn.Module):
         self.norm = PplxRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.contextual_projection = nn.Linear(cfg.hidden_size, cfg.embedding_dim, bias=False)
 
+    def load_weights(self, file_or_weights: Any, strict: bool = True) -> "PplxModel":
+        if not isinstance(file_or_weights, (str, Path)):
+            w_dict = dict(file_or_weights) if not isinstance(file_or_weights, Mapping) else dict(file_or_weights.items())
+            for i in range(self.config.num_hidden_layers):
+                gdn_p = f"layers.{i}.linear_attn"
+                unfused = (
+                    f"{gdn_p}.in_proj_qkv.weight",
+                    f"{gdn_p}.in_proj_z.weight",
+                    f"{gdn_p}.in_proj_b.weight",
+                    f"{gdn_p}.in_proj_a.weight",
+                )
+                if all(k in w_dict for k in unfused):
+                    w_dict[f"{gdn_p}.in_proj_all.weight"] = mx.concatenate([w_dict.pop(k) for k in unfused], axis=0)
+            return super().load_weights(list(w_dict.items()), strict=strict)
+        return super().load_weights(file_or_weights, strict=strict)
+
     def forward_hidden(
         self,
         hidden: mx.array,
         *,
         ssm_mask: mx.array | None = None,
+        seg_flags: mx.array | None = None,
         sdpa_mask: mx.array | str | None = None,
+        rope_cos: mx.array | None = None,
+        rope_sin: mx.array | None = None,
         return_trace: bool = False,
     ) -> mx.array | tuple[mx.array, list[mx.array]]:
         trace: list[mx.array] = []
@@ -964,7 +1223,14 @@ class PplxModel(nn.Module):
         h = hidden
         is_streamed = hidden.shape[1] > _STREAMED_SEQ_THRESHOLD
         for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, ssm_mask=ssm_mask, sdpa_mask=sdpa_mask)
+            h = layer(
+                h,
+                ssm_mask=ssm_mask,
+                seg_flags=seg_flags,
+                sdpa_mask=sdpa_mask,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+            )
             if is_streamed:
                 # Pipeline asynchronously per layer and only bound peak memory every 4 layers.
                 if (layer_idx + 1) % _STREAMED_SYNC_STRIDE == 0:
@@ -1041,8 +1307,21 @@ def _canonicalize_weights(
 
         normalized[key] = val
 
-    # Fuse q_proj + k_proj + v_proj -> qkv_proj and gate_proj + up_proj -> gate_up_proj idempotently.
+    # Fuse linear_attn in_proj_{qkv,z,b,a} -> in_proj_all, q_proj + k_proj + v_proj -> qkv_proj,
+    # and gate_proj + up_proj -> gate_up_proj idempotently.
     for i in range(num_layers):
+        gdn_prefix = f"layers.{i}.linear_attn"
+        in_projs = (
+            f"{gdn_prefix}.in_proj_qkv.weight",
+            f"{gdn_prefix}.in_proj_z.weight",
+            f"{gdn_prefix}.in_proj_b.weight",
+            f"{gdn_prefix}.in_proj_a.weight",
+        )
+        if all(k in normalized for k in in_projs):
+            normalized[f"{gdn_prefix}.in_proj_all.weight"] = mx.concatenate(
+                [normalized.pop(k) for k in in_projs], axis=0
+            )
+
         attn_prefix = f"layers.{i}.self_attn"
         qkvs = (f"{attn_prefix}.q_proj.weight", f"{attn_prefix}.k_proj.weight", f"{attn_prefix}.v_proj.weight")
         if all(k in normalized for k in qkvs):
@@ -1344,6 +1623,250 @@ class FastPplxGPU:
             clear_mlx_arena(256)
         return out
 
+    def _can_pack_varlen_1d(self) -> bool:
+        return (
+            _ENABLE_VARLEN_PACK
+            and type(self).forward_hidden is FastPplxGPU.forward_hidden
+            and isinstance(getattr(self, "model", None), PplxModel)
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        )
+
+    def _ensure_varlen_rope_table(self, max_pos: int) -> tuple[mx.array, mx.array]:
+        cached_mx = getattr(self, "_varlen_rope_mx", None)
+        if cached_mx is not None and int(cached_mx[0].shape[0]) >= max_pos:
+            return cached_mx
+        cap = max(max_pos, _STREAMED_SEQ_THRESHOLD)
+        inv_freq = 1.0 / (
+            float(self.config.rope_theta) ** (np.arange(0, self.config.rope_dim, 2, dtype=np.float64) / self.config.rope_dim)
+        )
+        ang = np.arange(cap, dtype=np.float64)[:, None] * inv_freq[None, :]
+        cos_mx = mx.array(np.cos(ang).astype(np.float32), dtype=self.act_dtype)
+        sin_mx = mx.array(np.sin(ang).astype(np.float32), dtype=self.act_dtype)
+        mx.eval(cos_mx, sin_mx)
+        self._varlen_rope_mx = (cos_mx, sin_mx)
+        return cos_mx, sin_mx
+
+    def _pack_varlen_token_bins(
+        self,
+        token_lists: Sequence[Sequence[int]],
+        *,
+        spans_list: Sequence[Sequence[tuple[int, int]]] | None = None,
+        max_packed_tokens: int | None = None,
+        align_to: int = 64,
+    ) -> list[dict[str, Any]]:
+        """FFD-pack variable-length docs into `1024 / 2048` 1D lanes with `conv_gap` isolation."""
+        conv_gap = max(3, int(self.config.linear_conv_kernel_dim) - 1)
+        pad_id = int(self.tokenizer.pad_id)
+        hard_max = _STREAMED_SEQ_THRESHOLD if max_packed_tokens is None else int(max_packed_tokens)
+        short_lane_cap = min(1024, hard_max) if max_packed_tokens is None else int(max_packed_tokens)
+
+        indexed: list[tuple[int, list[int], list[tuple[int, int]]]] = []
+        for idx, row in enumerate(token_lists):
+            ids = list(row)
+            if not ids:
+                continue
+            sp = [(0, len(ids))] if spans_list is None else [(int(a), int(b)) for a, b in spans_list[idx]]
+            indexed.append((idx, ids, sp))
+
+        # Sort descending by token length for tight First-Fit Decreasing (FFD) bin packing.
+        indexed.sort(key=lambda item: len(item[1]), reverse=True)
+
+        open_bins: list[dict[str, Any]] = []
+        finalized: list[dict[str, Any]] = []
+
+        for orig_idx, ids, spans in indexed:
+            ln = len(ids)
+            if ln > hard_max:
+                finalized.append(
+                    {
+                        "single_unpacked": True,
+                        "orig_indices": [orig_idx],
+                        "doc_spans_counts": [len(spans)],
+                        "token_ids": np.asarray(ids, dtype=np.int32),
+                        "flat_spans": spans,
+                    }
+                )
+                continue
+
+            placed = False
+            for b in open_bins:
+                st = b["cursor"] + conv_gap
+                if st + ln <= b["cap"]:
+                    b["entries"].append((orig_idx, st, ids, spans))
+                    b["cursor"] = st + ln
+                    placed = True
+                    break
+            if not placed:
+                bin_cap = short_lane_cap if ln <= short_lane_cap else hard_max
+                open_bins.append(
+                    {
+                        "entries": [(orig_idx, 0, ids, spans)],
+                        "cursor": ln,
+                        "cap": bin_cap,
+                    }
+                )
+
+        only_one_short_doc = len(open_bins) == 1 and len(open_bins[0]["entries"]) == 1
+        for b in open_bins:
+            entries = b["entries"]
+            if only_one_short_doc:
+                orig_idx, _, ids, spans = entries[0]
+                finalized.append(
+                    {
+                        "single_unpacked": True,
+                        "orig_indices": [orig_idx],
+                        "doc_spans_counts": [len(spans)],
+                        "token_ids": np.asarray(ids, dtype=np.int32),
+                        "flat_spans": spans,
+                    }
+                )
+                continue
+
+            used = int(b["cursor"])
+            t_cap = min(int(b["cap"]), max(align_to, ((used + align_to - 1) // align_to) * align_to))
+            tok_arr = np.full((t_cap,), pad_id, dtype=np.int32)
+            doc_arr = np.full((t_cap,), -1, dtype=np.int32)
+            pos_arr = np.zeros((t_cap,), dtype=np.int32)
+            flg_arr = np.zeros((t_cap,), dtype=np.uint8)
+            orig_indices: list[int] = []
+            doc_spans_counts: list[int] = []
+            flat_spans: list[tuple[int, int]] = []
+
+            for d_slot, (orig_idx, st, ids, spans) in enumerate(entries):
+                ln = len(ids)
+                tok_arr[st : st + ln] = np.asarray(ids, dtype=np.int32)
+                doc_arr[st : st + ln] = d_slot
+                pos_arr[st : st + ln] = np.arange(ln, dtype=np.int32)
+                flg_arr[st : st + ln] = 1
+                if d_slot > 0:
+                    flg_arr[st] = 2  # Reset FP32 GDN state at document boundary
+                orig_indices.append(orig_idx)
+                doc_spans_counts.append(len(spans))
+                for s0, s1 in spans:
+                    if s1 > s0:
+                        flat_spans.append((st + s0, st + min(s1, ln)))
+                    else:
+                        flat_spans.append((0, 0))
+
+            finalized.append(
+                {
+                    "single_unpacked": False,
+                    "orig_indices": orig_indices,
+                    "doc_spans_counts": doc_spans_counts,
+                    "token_ids": tok_arr,
+                    "doc_ids": doc_arr,
+                    "pos_ids": pos_arr,
+                    "seg_flags": flg_arr,
+                    "flat_spans": flat_spans,
+                }
+            )
+        return finalized
+
+    def _run_varlen_bins(
+        self,
+        bins: Sequence[dict[str, Any]],
+        *,
+        max_wave_tokens: int = 8192,
+    ) -> list[np.ndarray]:
+        """Execute varlen packed bins in `[B_bins, T_wave]` waves to saturate all GPU cores."""
+        n_bins = len(bins)
+        if n_bins == 0:
+            return []
+        out_per_bin: list[np.ndarray | None] = [None] * n_bins
+        packed_items: list[tuple[int, dict[str, Any]]] = []
+
+        for b_idx, bin_spec in enumerate(bins):
+            flat_spans: list[tuple[int, int]] = bin_spec["flat_spans"]
+            if not flat_spans:
+                out_per_bin[b_idx] = np.zeros((0, self.dim), dtype=np.float32)
+            elif bin_spec["single_unpacked"]:
+                tok_2d = bin_spec["token_ids"][None, :]
+                hidden = self.forward_hidden(tok_2d, None)
+                span_arr = np.asarray(flat_spans, dtype=np.int32)[None, :, :]
+                out_per_bin[b_idx] = self._project_span_pool(hidden, span_arr)[0]
+            else:
+                packed_items.append((b_idx, bin_spec))
+
+        if not packed_items:
+            return [r if r is not None else np.zeros((0, self.dim), dtype=np.float32) for r in out_per_bin]
+
+        # Sort descending by t_cap so uniform-width bins (e.g. 8 x 1024) batch with zero inter-lane pad.
+        packed_items.sort(key=lambda item: int(item[1]["token_ids"].shape[0]), reverse=True)
+        pad_id = int(self.tokenizer.pad_id)
+        zero_val = mx.array(0.0, dtype=self.act_dtype)
+        neg_val = mx.array(-65504.0 if self.dtype_name == "float16" else -1e9, dtype=self.act_dtype)
+
+        p_pos = 0
+        total_p = len(packed_items)
+        while p_pos < total_p:
+            t_wave = int(packed_items[p_pos][1]["token_ids"].shape[0])
+            max_b = max(1, min(self.max_batch_size, max_wave_tokens // max(1, t_wave)))
+            wave: list[tuple[int, dict[str, Any]]] = [packed_items[p_pos]]
+            p_pos += 1
+            while p_pos < total_p and len(wave) < max_b:
+                cand_t = int(packed_items[p_pos][1]["token_ids"].shape[0])
+                rem_after = total_p - (p_pos + 1)
+                # Avoid inflating many 1024-tok lanes into a 2048-tok wave, while absorbing a single orphan tail.
+                if cand_t < (t_wave * 3) // 4 and not (rem_after == 0 and t_wave <= 1024):
+                    break
+                wave.append(packed_items[p_pos])
+                p_pos += 1
+
+            b_w = len(wave)
+            uniform_t = all(int(spec["token_ids"].shape[0]) == t_wave for _, spec in wave)
+            if uniform_t:
+                tok_2d = np.stack([spec["token_ids"] for _, spec in wave], axis=0)
+                doc_2d = np.stack([spec["doc_ids"] for _, spec in wave], axis=0)
+                pos_2d = np.stack([spec["pos_ids"] for _, spec in wave], axis=0)
+                flg_2d = np.stack([spec["seg_flags"] for _, spec in wave], axis=0)
+            else:
+                tok_2d = np.full((b_w, t_wave), pad_id, dtype=np.int32)
+                doc_2d = np.full((b_w, t_wave), -1, dtype=np.int32)
+                pos_2d = np.zeros((b_w, t_wave), dtype=np.int32)
+                flg_2d = np.zeros((b_w, t_wave), dtype=np.uint8)
+                for w_i, (_, spec) in enumerate(wave):
+                    bt = int(spec["token_ids"].shape[0])
+                    tok_2d[w_i, :bt] = spec["token_ids"]
+                    doc_2d[w_i, :bt] = spec["doc_ids"]
+                    pos_2d[w_i, :bt] = spec["pos_ids"]
+                    flg_2d[w_i, :bt] = spec["seg_flags"]
+
+            max_pos_req = int(pos_2d.max()) + 1
+            cos_mx, sin_mx = self._ensure_varlen_rope_table(max_pos_req)
+            sdpa_mask, rope_cos, rope_sin = _build_varlen_mask_and_rope(
+                mx.array(doc_2d, dtype=mx.int32),
+                mx.array(pos_2d, dtype=mx.int32),
+                cos_mx,
+                sin_mx,
+                zero_val,
+                neg_val,
+            )
+            hidden = self.model.forward_hidden(
+                self._embed_inputs(tok_2d),
+                seg_flags=mx.array(flg_2d, dtype=mx.uint8),
+                sdpa_mask=sdpa_mask,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+            )
+
+            max_sp = max(1, *(len(spec["flat_spans"]) for _, spec in wave))
+            span_arr = np.zeros((b_w, max_sp, 2), dtype=np.int32)
+            for w_i, (_, spec) in enumerate(wave):
+                f_sp = spec["flat_spans"]
+                if f_sp:
+                    span_arr[w_i, : len(f_sp)] = np.asarray(f_sp, dtype=np.int32)
+
+            proj_3d = self._project_span_pool(hidden, span_arr)
+            for w_i, (orig_b_idx, spec) in enumerate(wave):
+                n_sp = len(spec["flat_spans"])
+                out_per_bin[orig_b_idx] = proj_3d[w_i, :n_sp]
+
+        return [r if r is not None else np.zeros((0, self.dim), dtype=np.float32) for r in out_per_bin]
+
+    def _run_varlen_bin(self, bin_spec: dict[str, Any]) -> np.ndarray:
+        return self._run_varlen_bins([bin_spec])[0]
+
     def _format_output(
         self,
         projected: np.ndarray,
@@ -1389,17 +1912,25 @@ class FastPplxGPU:
             return np.zeros((0, target_dim), dtype=np_dt)
 
         lengths = np.array([len(row) for row in token_lists], dtype=np.int64)
-        order = np.argsort(lengths, kind="stable")
         bs = max(1, min(int(batch_size), self.max_batch_size))
         proj_all = np.zeros((n, self.dim), dtype=np.float32)
 
-        for start in range(0, n, bs):
-            idxs = order[start : start + bs]
-            rows = [token_lists[int(i)] for i in idxs]
-            input_ids, attention_mask = self.tokenizer.pad(rows)
-            hidden = self.forward_hidden(input_ids, attention_mask)
-            proj_batch = self._project_mean_pool(hidden, attention_mask)
-            proj_all[idxs] = proj_batch
+        # Use 1D varlen sequence packing when batch has multiple unequal-length docs (avoids pad waste + mask fallback).
+        has_varlen = n > 1 and int(lengths.min()) != int(lengths.max())
+        if has_varlen and self._can_pack_varlen_1d():
+            bins = self._pack_varlen_token_bins(token_lists)
+            for bin_spec, proj_bin in zip(bins, self._run_varlen_bins(bins), strict=True):
+                for pos_i, orig_idx in enumerate(bin_spec["orig_indices"]):
+                    proj_all[int(orig_idx)] = proj_bin[pos_i]
+        else:
+            order = np.argsort(lengths, kind="stable")
+            for start in range(0, n, bs):
+                idxs = order[start : start + bs]
+                rows = [token_lists[int(i)] for i in idxs]
+                input_ids, attention_mask = self.tokenizer.pad(rows)
+                hidden = self.forward_hidden(input_ids, attention_mask)
+                proj_batch = self._project_mean_pool(hidden, attention_mask)
+                proj_all[idxs] = proj_batch
 
         clear_mlx_arena(256)
         return self._format_output(
@@ -1508,32 +2039,57 @@ class FastPplxGPU:
         if not encoded_docs:
             return []
         lengths = np.array([len(item[0]) for item in encoded_docs], dtype=np.int64)
-        order = np.argsort(lengths, kind="stable")
         bs = max(1, min(int(batch_size), self.max_batch_size))
         results: list[np.ndarray | None] = [None] * len(encoded_docs)
 
-        for start in range(0, len(encoded_docs), bs):
-            idxs = order[start : start + bs]
-            rows = [encoded_docs[int(i)][0] for i in idxs]
-            spans_list = [encoded_docs[int(i)][1] for i in idxs]
-            input_ids, attention_mask = self.tokenizer.pad(rows)
-            max_c = max(1, *(len(s) for s in spans_list))
-            span_arr = np.zeros((len(idxs), max_c, 2), dtype=np.int32)
-            for row_i, sp in enumerate(spans_list):
-                for col_j, (t0, t1) in enumerate(sp):
-                    span_arr[row_i, col_j] = (t0, t1)
+        has_varlen = len(encoded_docs) > 1 and int(lengths.min()) != int(lengths.max())
+        if has_varlen and self._can_pack_varlen_1d():
+            tok_lists = [item[0] for item in encoded_docs]
+            all_spans = [item[1] for item in encoded_docs]
+            for orig_i, (ids, sp) in enumerate(encoded_docs):
+                if len(ids) == 0:
+                    results[orig_i] = self._format_output(
+                        np.zeros((len(sp), self.dim), dtype=np.float32),
+                        dimensions=dimensions,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+            bins = self._pack_varlen_token_bins(tok_lists, spans_list=all_spans)
+            for bin_spec, proj_bin in zip(bins, self._run_varlen_bins(bins), strict=True):
+                cur = 0
+                for orig_idx, n_sp in zip(bin_spec["orig_indices"], bin_spec["doc_spans_counts"], strict=True):
+                    doc_proj = proj_bin[cur : cur + n_sp]
+                    cur += n_sp
+                    results[int(orig_idx)] = self._format_output(
+                        doc_proj,
+                        dimensions=dimensions,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
+        else:
+            order = np.argsort(lengths, kind="stable")
+            for start in range(0, len(encoded_docs), bs):
+                idxs = order[start : start + bs]
+                rows = [encoded_docs[int(i)][0] for i in idxs]
+                spans_list = [encoded_docs[int(i)][1] for i in idxs]
+                input_ids, attention_mask = self.tokenizer.pad(rows)
+                max_c = max(1, *(len(s) for s in spans_list))
+                span_arr = np.zeros((len(idxs), max_c, 2), dtype=np.int32)
+                for row_i, sp in enumerate(spans_list):
+                    for col_j, (t0, t1) in enumerate(sp):
+                        span_arr[row_i, col_j] = (t0, t1)
 
-            hidden = self.forward_hidden(input_ids, attention_mask)
-            proj = self._project_span_pool(hidden, span_arr)
-            for row_i, orig_idx in enumerate(idxs):
-                n_chunks = len(spans_list[row_i])
-                doc_proj = proj[row_i, :n_chunks]
-                results[int(orig_idx)] = self._format_output(
-                    doc_proj,
-                    dimensions=dimensions,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
+                hidden = self.forward_hidden(input_ids, attention_mask)
+                proj = self._project_span_pool(hidden, span_arr)
+                for row_i, orig_idx in enumerate(idxs):
+                    n_chunks = len(spans_list[row_i])
+                    doc_proj = proj[row_i, :n_chunks]
+                    results[int(orig_idx)] = self._format_output(
+                        doc_proj,
+                        dimensions=dimensions,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                    )
 
         clear_mlx_arena(256)
         return [r for r in results if r is not None]

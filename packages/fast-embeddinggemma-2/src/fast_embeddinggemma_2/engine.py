@@ -29,8 +29,21 @@ from .gpu import (
     fast_pack_cost_aware,
     make_rope_tables_np,
 )
-from .paths import require_runtime_paths
+from .paths import (
+    MmapTokenTable,
+    load_or_mmap_token_table,
+    require_runtime_paths,
+    resolve_openinfinity_dir,
+    resolve_paths,
+)
 from .tokenizer import FastEmbeddingGemma2Tokenizer
+
+_MULTIFUNCTION_CANDIDATES: tuple[str, ...] = (
+    "emb2_ane_w8.mlmodelc",
+    "emb2_ane_multifunction.mlmodelc",
+)
+
+_OPENINFINITY_CAPS: tuple[int, ...] = (32, 48, 64, 128, 256, 512)
 
 _ANE_BUNDLES: tuple[tuple[int, str, int], ...] = (
     (32, "emb2_pk_s32_w8.mlmodelc", 1),
@@ -156,18 +169,43 @@ def _allow_hetero3_cpu_worker(
     cpu_sme_available: bool,
     llm_coexec: bool = False,
 ) -> bool:
-    """Gate 3-way CPU-SME bursts away from small/medium batches and LLM co-execution."""
-    if not cpu_sme_available or llm_coexec:
-        return False
-    if os.environ.get("FAST_SILICON_LLM_COEXEC") == "1":
-        return False
-    return (n_docs >= HETERO3_CPU_MIN_DOCS) or (total_toks >= HETERO3_CPU_MIN_TOKS)
+    """Retired: 3-way CPU-SME (`hetero3`) slowed OCR backfill +13.6%; heterogeneous mode routes strictly 2-way GPU+ANE."""
+    _ = (n_docs, total_toks, cpu_sme_available, llm_coexec)
+    return False
 
 
 def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(dylib_path))
     lib.emb2_pk_load_units.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.emb2_pk_load_units.restype = ctypes.c_void_p
+    if hasattr(lib, "emb2_pk_load_units_fn"):
+        lib.emb2_pk_load_units_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.emb2_pk_load_units_fn.restype = ctypes.c_void_p
+    if hasattr(lib, "emb2_oi_load_embed"):
+        lib.emb2_oi_load_embed.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.emb2_oi_load_embed.restype = ctypes.c_void_p
+        lib.emb2_oi_exec_embed.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.emb2_oi_exec_embed.restype = ctypes.c_double
+        lib.emb2_oi_free.argtypes = [ctypes.c_void_p]
+        lib.emb2_oi_free.restype = None
     lib.emb2_pk_submit_queue.argtypes = [
         ctypes.c_void_p,
         ctypes.c_int,
@@ -208,6 +246,16 @@ def _load_coreml_lib(dylib_path: Path) -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.emb2_get_plan_counts.restype = ctypes.c_int
+    if hasattr(lib, "emb2_get_plan_counts_fn"):
+        lib.emb2_get_plan_counts_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.emb2_get_plan_counts_fn.restype = ctypes.c_int
     if hasattr(lib, "emb2_last_error"):
         lib.emb2_last_error.argtypes = []
         lib.emb2_last_error.restype = ctypes.c_char_p
@@ -245,6 +293,43 @@ def _load_io_lib(dylib_path: Path) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     lib.emb2_prep_batch.restype = None
+    if hasattr(lib, "emb2_prep_batch_i8"):
+        lib.emb2_prep_batch_i8.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint16,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.emb2_prep_batch_i8.restype = None
+    if hasattr(lib, "emb2_gather_scaled_i8"):
+        lib.emb2_gather_scaled_i8.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_float,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.emb2_gather_scaled_i8.restype = None
     lib.emb2_pool_project_batch.argtypes = [
         ctypes.c_int,
         ctypes.c_void_p,
@@ -317,6 +402,7 @@ class FastEmbeddingGemma2:
         self,
         *,
         home: str | Path | None = None,
+        openinfinity_dir: str | Path | None = None,
         default_mode: str = "hetero",
         warmup: bool = True,
         enable_ane: bool = True,
@@ -328,8 +414,18 @@ class FastEmbeddingGemma2:
         llm_coexec: bool = False,
     ) -> None:
         self.dim = resolve_embedding_dim(dimensions, max_dim=EMBED_DIM)
-        self.paths = require_runtime_paths(home, require_ane=False)
-        self.tokenizer = FastEmbeddingGemma2Tokenizer(self.paths.tokenizer_json)
+        self._openinfinity_dir: Path | None = Path(openinfinity_dir).expanduser().resolve() if openinfinity_dir else None
+        if self._openinfinity_dir is not None:
+            self.paths = resolve_paths(home)
+            oi_text_dir = self._openinfinity_dir / "text" if (self._openinfinity_dir / "text").is_dir() else self._openinfinity_dir
+            oi_tok = oi_text_dir / "tokenizer.json"
+            if not oi_tok.is_file():
+                oi_tok = self.paths.tokenizer_json
+            self.tokenizer = FastEmbeddingGemma2Tokenizer(oi_tok)
+        else:
+            self.paths = require_runtime_paths(home, require_ane=False)
+            self.tokenizer = FastEmbeddingGemma2Tokenizer(self.paths.tokenizer_json)
+
         self._gpu: FastEmbeddingGemma2GPU | None = None
         self._gpu_init_lock = threading.Lock()
         self._mlx_cache_limit_mb = mlx_cache_limit_mb
@@ -343,19 +439,22 @@ class FastEmbeddingGemma2:
         self._io: ctypes.CDLL | None = None
         self.ane_handles: dict[int, int] = {}
         self.cpu_handles: dict[int, int] = {}
+        self._oi_handles: dict[int, int] = {}
         self._ane_bundle_paths: dict[int, Path] = {}
+        self._ane_bundle_fns: dict[int, str | None] = {}
         self.ane_plan_stats: dict[int, dict[str, int]] = {}
         self._handle_locks: dict[tuple[str, int], threading.Lock] = {}
         self.ane_available = False
         self.cpu_sme_available = False
 
+        self._token_table: MmapTokenTable | None = None
         self._emb_scaled_np: np.ndarray | None = None
         self._emb_proj_T32_np: np.ndarray | None = None
         self._c256_np: np.ndarray | None = None
         self._s256_np: np.ndarray | None = None
         self._c512_np: np.ndarray | None = None
         self._s512_np: np.ndarray | None = None
-        self._neg_inf_u16 = int(np.float16(-10000.0).view(np.uint16))
+        self._neg_inf_u16 = int(np.float16(-40000.0).view(np.uint16))
 
         self._query_scratch: CoreMLScratch | None = None
         self._ane_scratch: CoreMLScratch | None = None
@@ -365,35 +464,54 @@ class FastEmbeddingGemma2:
         self._corpus_lock = threading.Lock()
         self.last_stats: dict[str, int] | None = None
 
-        eff_enable_cpu = bool(enable_cpu_sme) or (default_mode in ("cpu", "hetero3"))
+        # Retire hetero3 CPU-SME 3rd leg; only enable CPU bundles for explicit standalone mode="cpu".
+        eff_enable_cpu = bool(enable_cpu_sme) and (default_mode == "cpu")
         if eff_enable_cpu:
-            # Cap Accelerate BLAS concurrency to <= 2 SME2 units if caller did not set a lower cap.
             cur_blas = os.environ.get("VECLIB_MAXIMUM_THREADS")
             if not cur_blas or (cur_blas.isdigit() and int(cur_blas) > MAX_CPU_SME_THREADS):
                 os.environ["VECLIB_MAXIMUM_THREADS"] = str(MAX_CPU_SME_THREADS)
 
-        # Skip eager Metal GPU weight/kernel initialization when default_mode is pure ANE or pure CPU.
-        if default_mode not in ("ane", "cpu"):
-            _ = self.gpu
+        if self._openinfinity_dir is not None:
+            self._init_openinfinity(self._openinfinity_dir, verify_plan=verify_ane_plan)
+            if default_mode not in ("ane", "cpu") and self.paths.weights_npz.exists():
+                _ = self.gpu
+        else:
+            # Skip eager Metal GPU weight/kernel initialization when default_mode is pure ANE or pure CPU.
+            if default_mode not in ("ane", "cpu"):
+                _ = self.gpu
 
-        if (
-            (enable_ane or eff_enable_cpu)
-            and self.paths.coreml_dylib.exists()
-            and self.paths.io_dylib.exists()
-            and self.paths.ane_models_dir.exists()
-        ):
-            self._init_coreml(
-                enable_ane=enable_ane,
-                enable_cpu_sme=eff_enable_cpu,
-                verify_plan=verify_ane_plan,
-            )
+            if (
+                (enable_ane or eff_enable_cpu)
+                and self.paths.coreml_dylib.exists()
+                and self.paths.io_dylib.exists()
+                and self.paths.ane_models_dir.exists()
+            ):
+                self._init_coreml(
+                    enable_ane=enable_ane,
+                    enable_cpu_sme=eff_enable_cpu,
+                    verify_plan=verify_ane_plan,
+                )
 
         self.default_mode = self._resolve_mode(default_mode)
-        if self.default_mode not in ("ane", "cpu") and self._gpu is None:
+        if self.default_mode not in ("ane", "cpu") and self._gpu is None and self.paths.weights_npz.exists():
             _ = self.gpu
 
         if warmup:
             self.warmup()
+
+    @classmethod
+    def from_openinfinity(
+        cls,
+        model_dir: str | Path | None = None,
+        *,
+        local_files_only: bool = True,
+        default_mode: str = "ane",
+        warmup: bool = False,
+        **kwargs: Any,
+    ) -> "FastEmbeddingGemma2":
+        """Instantiate zero-compile ANE engine from prebuilt `OpenInfinity/embeddinggemma-2-coreml-int8`."""
+        oi_dir = resolve_openinfinity_dir(model_dir, local_files_only=local_files_only)
+        return cls(openinfinity_dir=oi_dir, default_mode=default_mode, warmup=warmup, **kwargs)
 
     def _ensure_memory_hygiene(self) -> None:
         if self._memory_hygiene_applied:
@@ -410,33 +528,38 @@ class FastEmbeddingGemma2:
             with self._gpu_init_lock:
                 if self._gpu is None:
                     self._ensure_memory_hygiene()
-                    self._gpu = FastEmbeddingGemma2GPU(self.paths.weights_npz)
+                    if self._token_table is None:
+                        self._token_table = load_or_mmap_token_table(self.paths.weights_npz, io_lib=self._io)
+                    self._gpu = FastEmbeddingGemma2GPU(
+                        self.paths.weights_npz,
+                        token_table=self._token_table,
+                    )
         return self._gpu
 
     @gpu.setter
     def gpu(self, value: Any) -> None:
         self._gpu = value
 
+    @property
+    def _has_gpu_weights(self) -> bool:
+        return self._gpu is not None or self.paths.weights_npz.is_file()
+
     def _resolve_dim(self, dimensions: int | None) -> int:
         return resolve_embedding_dim(dimensions, max_dim=EMBED_DIM, default_dim=self.dim)
 
     def _resolve_mode(self, mode: str) -> str:
-        # Canonical mode naming aligned with fast-bge-small:
-        #   "hetero" (and backward-compat alias "hetero2") -> 2-way GPU + ANE
-        #   "hetero3" -> explicit opt-in 3-way GPU + ANE + CPU-SME (gated on batch size / no LLM coexec)
-        if mode in ("hetero", "hetero2"):
+        # Canonical 2-way heterogeneous execution ("hetero", "hetero2", and retired alias "hetero3" -> 2-way GPU + ANE)
+        if mode in ("hetero", "hetero2", "hetero3"):
+            if getattr(self, "_oi_handles", None) and not self._has_gpu_weights:
+                return "ane"
             return "hetero" if self.ane_available else "gpu"
-        if mode == "hetero3":
-            if self.ane_available and self.cpu_sme_available:
-                return "hetero3"
-            if self.ane_available:
-                return "hetero"
-            if self.cpu_sme_available:
-                return "hetero3"
-            return "gpu"
         if mode == "ane" and not self.ane_available:
             raise RuntimeError(
                 f"ANE requested but CoreML runner dylibs or .mlmodelc bundles are missing under {self.paths.home}"
+            )
+        if mode == "gpu" and getattr(self, "_oi_handles", None) and not self._has_gpu_weights:
+            raise FileNotFoundError(
+                f"mode='gpu' requested on OpenInfinity engine without exported GPU weights at {self.paths.weights_npz}"
             )
         if mode == "cpu" and not self.cpu_sme_available:
             raise RuntimeError(
@@ -448,7 +571,9 @@ class FastEmbeddingGemma2:
 
     def _load_coreml_host_tables(self) -> None:
         if self._gpu is not None:
-            self._emb_scaled_np = np.ascontiguousarray(np.array(self._gpu.embed_scaled))
+            self._token_table = self._gpu.token_table
+            self._token_table.bind_io_lib(self._io)
+            self._emb_scaled_np = None
             self._emb_proj_T32_np = np.ascontiguousarray(np.array(self._gpu.emb_proj_wT32))
             self._c256_np = np.ascontiguousarray(np.array(self._gpu.c256))
             self._s256_np = np.ascontiguousarray(np.array(self._gpu.s256))
@@ -456,30 +581,98 @@ class FastEmbeddingGemma2:
             self._s512_np = np.ascontiguousarray(np.array(self._gpu.s512))
             return
 
-        # Pure-NumPy table loading so mode="ane"/"cpu" never initializes Metal GPU weights.
+        # Clean-page mmap token table + pure-NumPy projection/RoPE tables so mode="ane"/"cpu" never touches GPU.
+        if self._token_table is None:
+            self._token_table = load_or_mmap_token_table(self.paths.weights_npz, io_lib=self._io)
+        else:
+            self._token_table.bind_io_lib(self._io)
+        self._emb_scaled_np = None
         with np.load(self.paths.weights_npz) as raw:
-            emb_f16 = raw["embed_tokens"].astype(np.float16)
-            self._emb_scaled_np = np.ascontiguousarray(
-                (emb_f16.astype(np.float32) * np.float32(HIDDEN_SIZE ** 0.5)).astype(np.float16)
-            )
             proj_raw = raw["emb_proj"]
             proj_2d = proj_raw[:, :, 0, 0] if proj_raw.ndim == 4 else proj_raw
             self._emb_proj_T32_np = np.ascontiguousarray(proj_2d.astype(np.float32).T)
         self._c256_np, self._s256_np, self._c512_np, self._s512_np = make_rope_tables_np(MAX_SEQ_LEN)
+
+    def _init_openinfinity(self, oi_root: Path, *, verify_plan: bool = True) -> None:
+        if not (self.paths.coreml_dylib.exists() and self.paths.io_dylib.exists()):
+            raise FileNotFoundError(
+                f"Missing native runner libraries under {self.paths.build_dir}. Run `make native`."
+            )
+        coreml = _load_coreml_lib(self.paths.coreml_dylib)
+        io_lib = _load_io_lib(self.paths.io_dylib)
+        text_dir = oi_root / "text" if (oi_root / "text").is_dir() else oi_root
+        mlmodelc = text_dir / "EmbeddingGemma2Text.mlmodelc"
+        if not mlmodelc.exists():
+            raise FileNotFoundError(f"Missing EmbeddingGemma2Text.mlmodelc in {text_dir}")
+
+        self._token_table = load_or_mmap_token_table(oi_root, io_lib=io_lib)
+        self._emb_scaled_np = None
+
+        for cap in _OPENINFINITY_CAPS:
+            fn_name = f"embed_{cap}"
+            pd = 1 if cap == 32 else 4
+            h = coreml.emb2_oi_load_embed(
+                str(mlmodelc).encode("utf-8"),
+                fn_name.encode("utf-8"),
+                cap,
+                pd,
+                0,
+            )
+            if h:
+                self._oi_handles[cap] = h
+                self._ane_bundle_paths[cap] = mlmodelc
+                self._ane_bundle_fns[cap] = fn_name
+                self._handle_locks[("oi", cap)] = threading.Lock()
+
+        if not self._oi_handles:
+            raise RuntimeError(f"Failed to load OpenInfinity functions from {mlmodelc}: {_coreml_err_detail(coreml)}")
+
+        self._coreml = coreml
+        self._io = io_lib
+        self.ane_available = True
+        if verify_plan:
+            self.inspect_ane_plans(warn_on_cpu_fallback=True)
 
     def _init_coreml(self, *, enable_ane: bool, enable_cpu_sme: bool, verify_plan: bool = True) -> None:
         coreml = _load_coreml_lib(self.paths.coreml_dylib)
         io_lib = _load_io_lib(self.paths.io_dylib)
 
         if enable_ane:
+            mf_path: Path | None = None
+            if hasattr(coreml, "emb2_pk_load_units_fn"):
+                for mf_name in _MULTIFUNCTION_CANDIDATES:
+                    cand = self.paths.ane_models_dir / mf_name
+                    if cand.exists():
+                        mf_path = cand
+                        break
+
             for seq_len, fname, pd in _ANE_BUNDLES:
-                p = self.paths.ane_models_dir / fname
-                if not p.exists():
-                    continue
-                h = coreml.emb2_pk_load_units(str(p).encode("utf-8"), seq_len, pd, 0)
-                if h:
+                h = None
+                chosen_path: Path | None = None
+                chosen_fn: str | None = None
+                if mf_path is not None:
+                    fn_name = f"emb2_pk_s{seq_len}"
+                    h = coreml.emb2_pk_load_units_fn(
+                        str(mf_path).encode("utf-8"),
+                        fn_name.encode("utf-8"),
+                        seq_len,
+                        pd,
+                        0,
+                    )
+                    if h:
+                        chosen_path = mf_path
+                        chosen_fn = fn_name
+                if not h:
+                    p = self.paths.ane_models_dir / fname
+                    if p.exists():
+                        h = coreml.emb2_pk_load_units(str(p).encode("utf-8"), seq_len, pd, 0)
+                        if h:
+                            chosen_path = p
+                            chosen_fn = None
+                if h and chosen_path is not None:
                     self.ane_handles[seq_len] = h
-                    self._ane_bundle_paths[seq_len] = p
+                    self._ane_bundle_paths[seq_len] = chosen_path
+                    self._ane_bundle_fns[seq_len] = chosen_fn
                     self._handle_locks[("ane", seq_len)] = threading.Lock()
 
         if enable_cpu_sme:
@@ -510,18 +703,30 @@ class FastEmbeddingGemma2:
         plans: dict[int, dict[str, int]] = {}
         if not self.ane_available or self._coreml is None or not hasattr(self._coreml, "emb2_get_plan_counts"):
             return plans
+        has_fn = hasattr(self._coreml, "emb2_get_plan_counts_fn")
         for seq_len in sorted(self._ane_bundle_paths):
             model_path = self._ane_bundle_paths[seq_len]
+            fn_name = self._ane_bundle_fns.get(seq_len)
             ane_c = ctypes.c_int(0)
             gpu_c = ctypes.c_int(0)
             cpu_c = ctypes.c_int(0)
-            rc = self._coreml.emb2_get_plan_counts(
-                str(model_path).encode("utf-8"),
-                0,
-                ctypes.byref(ane_c),
-                ctypes.byref(gpu_c),
-                ctypes.byref(cpu_c),
-            )
+            if fn_name and has_fn:
+                rc = self._coreml.emb2_get_plan_counts_fn(
+                    str(model_path).encode("utf-8"),
+                    fn_name.encode("utf-8"),
+                    0,
+                    ctypes.byref(ane_c),
+                    ctypes.byref(gpu_c),
+                    ctypes.byref(cpu_c),
+                )
+            else:
+                rc = self._coreml.emb2_get_plan_counts(
+                    str(model_path).encode("utf-8"),
+                    0,
+                    ctypes.byref(ane_c),
+                    ctypes.byref(gpu_c),
+                    ctypes.byref(cpu_c),
+                )
             if rc != 0:
                 if warn_on_cpu_fallback:
                     warnings.warn(
@@ -549,8 +754,17 @@ class FastEmbeddingGemma2:
                 coreml.emb2_pk_free(h)
             for h in getattr(self, "cpu_handles", {}).values():
                 coreml.emb2_pk_free(h)
+            if hasattr(coreml, "emb2_oi_free"):
+                for h in getattr(self, "_oi_handles", {}).values():
+                    coreml.emb2_oi_free(h)
             self.ane_handles.clear()
             self.cpu_handles.clear()
+            if hasattr(self, "_oi_handles"):
+                self._oi_handles.clear()
+        tbl = getattr(self, "_token_table", None)
+        if tbl is not None:
+            tbl.close()
+            self._token_table = None
         self.ane_available = False
         self.cpu_sme_available = False
         prev = getattr(self, "_prev_wired_limit", None)
@@ -578,7 +792,6 @@ class FastEmbeddingGemma2:
         scratch: CoreMLScratch,
     ) -> tuple[int, int, int, list[int]]:
         assert self._io is not None
-        assert self._emb_scaled_np is not None
         assert self._c256_np is not None and self._s256_np is not None
         assert self._c512_np is not None and self._s512_np is not None
 
@@ -615,26 +828,69 @@ class FastEmbeddingGemma2:
                 cur += ll
             span_offsets[n + 1] = sp_i
 
-        self._io.emb2_prep_batch(
-            N,
-            S,
-            self._emb_scaled_np.ctypes.data,
-            self._c256_np.ctypes.data,
-            self._s256_np.ctypes.data,
-            self._c512_np.ctypes.data,
-            self._s512_np.ctypes.data,
-            ids.ctypes.data,
-            pos.ctypes.data,
-            span_offsets.ctypes.data,
-            spans_se.ctypes.data,
-            self._neg_inf_u16,
-            scratch.h_all.ctypes.data,
-            scratch.b_all.ctypes.data,
-            scratch.cs_all.ctypes.data,
-            scratch.ss_all.ctypes.data,
-            scratch.cf_all.ctypes.data,
-            scratch.sf_all.ctypes.data,
-        )
+        max_pos = int(self._c256_np.shape[0])
+        if self._token_table is not None:
+            vocab_sz = int(self._token_table.vocab_size)
+        elif self._emb_scaled_np is not None:
+            vocab_sz = int(self._emb_scaled_np.shape[0])
+        else:
+            vocab_sz = 262144
+
+        if N * S > 0:
+            oob_tok = (ids < -1) | (ids >= vocab_sz)
+            if np.any(oob_tok):
+                ids[oob_tok] = -1
+            oob_pos = (pos < 0) | (pos >= max_pos)
+            if np.any(oob_pos):
+                np.clip(pos, 0, max_pos - 1, out=pos)
+
+        if self._token_table is not None and hasattr(self._io, "emb2_prep_batch_i8"):
+            self._io.emb2_prep_batch_i8(
+                N,
+                S,
+                self._token_table.emb_i8.ctypes.data,
+                self._token_table.scale_f16.ctypes.data,
+                vocab_sz,
+                max_pos,
+                float(self._token_table.embed_scale),
+                self._c256_np.ctypes.data,
+                self._s256_np.ctypes.data,
+                self._c512_np.ctypes.data,
+                self._s512_np.ctypes.data,
+                ids.ctypes.data,
+                pos.ctypes.data,
+                span_offsets.ctypes.data,
+                spans_se.ctypes.data,
+                self._neg_inf_u16,
+                scratch.h_all.ctypes.data,
+                scratch.b_all.ctypes.data,
+                scratch.cs_all.ctypes.data,
+                scratch.ss_all.ctypes.data,
+                scratch.cf_all.ctypes.data,
+                scratch.sf_all.ctypes.data,
+            )
+        else:
+            assert self._emb_scaled_np is not None
+            self._io.emb2_prep_batch(
+                N,
+                S,
+                self._emb_scaled_np.ctypes.data,
+                self._c256_np.ctypes.data,
+                self._s256_np.ctypes.data,
+                self._c512_np.ctypes.data,
+                self._s512_np.ctypes.data,
+                ids.ctypes.data,
+                pos.ctypes.data,
+                span_offsets.ctypes.data,
+                spans_se.ctypes.data,
+                self._neg_inf_u16,
+                scratch.h_all.ctypes.data,
+                scratch.b_all.ctypes.data,
+                scratch.cs_all.ctypes.data,
+                scratch.ss_all.ctypes.data,
+                scratch.cf_all.ctypes.data,
+                scratch.sf_all.ctypes.data,
+            )
         return N, tot_docs, real_toks, doc_idxs
 
     def _finish_coreml_lanes(
@@ -703,6 +959,8 @@ class FastEmbeddingGemma2:
             return
         if self.default_mode == "cpu" and self.cpu_sme_available:
             return
+        if getattr(self, "_oi_handles", None) and not self._has_gpu_weights:
+            return
         with self._gpu_lock:
             self.gpu.encode_single([2, 3250, 236787, 7293, 1109, 1816, 236787, 1])
             if prewarm_gpu_shapes:
@@ -721,6 +979,50 @@ class FastEmbeddingGemma2:
                         _maybe_clear_mlx_arena(256)
                 mx.synchronize()
 
+    def _exec_openinfinity_docs(
+        self,
+        docs: Sequence[tuple[int, Sequence[int]]],
+        out_dest: np.ndarray,
+        eff_dim: int,
+    ) -> int:
+        assert self._coreml is not None and self._token_table is not None
+        by_cap: dict[int, list[tuple[int, Sequence[int]]]] = {}
+        real_toks = 0
+        for idx, tok in docs:
+            sl = len(tok)
+            real_toks += sl
+            chosen_cap = 512
+            for cap in _OPENINFINITY_CAPS:
+                if sl <= cap and cap in self._oi_handles:
+                    chosen_cap = cap
+                    break
+            by_cap.setdefault(chosen_cap, []).append((idx, tok))
+
+        for cap, group in by_cap.items():
+            N = len(group)
+            ids_np = np.full((N, cap), -1, dtype=np.int32)
+            msk_np = np.zeros((N, cap), dtype=np.float16)
+            doc_idxs: list[int] = []
+            for i, (idx, tok) in enumerate(group):
+                ll = min(len(tok), cap)
+                ids_np[i, :ll] = tok[:ll]
+                msk_np[i, :ll] = 1.0
+                doc_idxs.append(idx)
+            emb_f16 = self._token_table.gather_scaled_f16(ids_np)
+            out_768 = np.empty((N, EMBED_DIM), dtype=np.float32)
+            with self._handle_locks[("oi", cap)]:
+                ms = self._coreml.emb2_oi_exec_embed(
+                    self._oi_handles[cap],
+                    N,
+                    emb_f16.ctypes.data,
+                    msk_np.ctypes.data,
+                    out_768.ctypes.data,
+                )
+                if ms < 0.0:
+                    raise RuntimeError(f"emb2_oi_exec_embed(S={cap}) failed: {_coreml_err_detail(self._coreml)}")
+            out_dest[doc_idxs] = truncate_and_normalize(out_768, eff_dim) if eff_dim < EMBED_DIM else out_768
+        return real_toks
+
     def encode_query(
         self,
         token_ids: Sequence[int] | np.ndarray,
@@ -737,6 +1039,10 @@ class FastEmbeddingGemma2:
         sl = int(arr.shape[0])
 
         if prefer_ane and self.ane_available and sl <= self.ane_query_max_len:
+            if getattr(self, "_oi_handles", None):
+                out = np.empty((1, eff_dim), dtype=np.float32)
+                self._exec_openinfinity_docs([(0, arr)], out, eff_dim)
+                return out[0]
             assert self._query_scratch is not None
             for cap in _QUERY_CAPS:
                 if sl <= cap and cap in self.ane_handles:
@@ -748,6 +1054,10 @@ class FastEmbeddingGemma2:
             raise ValueError(
                 f"Strict ANE mode cannot encode query of length {sl} (max ANE length is {self.ane_query_max_len}); "
                 "use mode='hetero'/'gpu' or truncate to <=512 tokens."
+            )
+        if getattr(self, "_oi_handles", None) and not self._has_gpu_weights:
+            raise ValueError(
+                f"OpenInfinity ANE bundles cap at {self.ane_query_max_len} tokens (got {sl}) and GPU weights are not staged at {self.paths.weights_npz}."
             )
 
         with self._gpu_lock:
@@ -852,6 +1162,40 @@ class FastEmbeddingGemma2:
         total_toks = sum(len(t) for _, t in seqs)
 
         with self._corpus_lock:
+            if getattr(self, "_oi_handles", None) and eff_mode in ("ane", "hetero", "hetero2", "hetero3"):
+                max_oi_cap = max(self._oi_handles)
+                over_oi = [s for s in seqs if len(s[1]) > max_oi_cap]
+                if over_oi:
+                    if eff_mode == "ane" and not allow_gpu_overflow:
+                        raise ValueError(
+                            f"mode='ane' received {len(over_oi)} sequence(s) longer than {max_oi_cap} tokens; "
+                            "OpenInfinity ANE functions cap at 512 tokens."
+                        )
+                    if not self._has_gpu_weights:
+                        raise ValueError(
+                            f"OpenInfinity ANE functions cap at {max_oi_cap} tokens (got {len(over_oi)} longer sequence(s)) "
+                            f"and GPU weights are not staged at {self.paths.weights_npz}."
+                        )
+                le_oi = [s for s in seqs if len(s[1]) <= max_oi_cap]
+                ane_rt = self._exec_openinfinity_docs(le_oi, outs, eff_dim) if le_oi else 0
+                gpu_rt = 0
+                if over_oi:
+                    with self._gpu_lock:
+                        for ml, chk in build_over_chunks(over_oi):
+                            rt, _, di, cur_o = self.gpu.exec_over(ml, chk, dimensions=eff_dim)
+                            mx.eval(cur_o)
+                            outs[di] = np.asarray(cur_o, dtype=np.float32)
+                            gpu_rt += rt
+                self.last_stats = {
+                    "gpu_toks": gpu_rt,
+                    "ane_toks": ane_rt,
+                    "cpu_toks": 0,
+                    "gpu_docs": len(over_oi),
+                    "ane_docs": len(le_oi),
+                    "cpu_docs": 0,
+                }
+                return outs
+
             by_b, over = fast_pack_cost_aware(seqs, ANE_MS_COST)
             over_q = build_over_chunks(over)
             if len(over_q) > 0 and eff_mode in ("ane", "cpu") and not allow_gpu_overflow:
@@ -862,19 +1206,9 @@ class FastEmbeddingGemma2:
                 )
 
             qlock = threading.Lock()
-            use_ane = eff_mode in ("hetero", "hetero2", "hetero3", "ane") and self.ane_available
-            if eff_mode == "cpu":
-                use_cpu = self.cpu_sme_available
-            elif eff_mode == "hetero3":
-                use_cpu = _allow_hetero3_cpu_worker(
-                    n,
-                    total_toks,
-                    cpu_sme_available=self.cpu_sme_available,
-                    llm_coexec=getattr(self, "llm_coexec", False),
-                )
-            else:
-                use_cpu = False
-            use_gpu = eff_mode in ("hetero", "hetero2", "hetero3", "gpu") or (len(over_q) > 0)
+            use_ane = eff_mode in ("hetero", "hetero2", "ane") and bool(self.ane_handles)
+            use_cpu = (eff_mode == "cpu") and self.cpu_sme_available
+            use_gpu = eff_mode in ("hetero", "hetero2", "gpu") or (len(over_q) > 0)
 
             stats = {"gpu": 0, "ane": 0, "cpu": 0, "gpu_docs": 0, "ane_docs": 0, "cpu_docs": 0}
             errors: list[BaseException] = []
@@ -932,7 +1266,7 @@ class FastEmbeddingGemma2:
                         if prev_o is not None and prev_idxs is not None:
                             outs[prev_idxs] = np.asarray(prev_o, dtype=np.float32)
                         mx.synchronize()
-                        _maybe_clear_mlx_arena(256)
+                        _maybe_clear_mlx_arena(self._mlx_cache_limit_mb or 512)
                 except BaseException as exc:
                     errors.append(exc)
 

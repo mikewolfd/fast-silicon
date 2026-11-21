@@ -8,7 +8,12 @@ from pathlib import Path
 from fast_shared.hf import resolve_hf_model_dir
 from fast_shared.paths import resolve_home_dir
 
-DEFAULT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
+DEFAULT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+FALLBACK_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
+
+
+def _is_complete_model_dir(path: Path) -> bool:
+    return (path / "config.json").is_file() and any(path.glob("*.safetensors"))
 
 
 @dataclass(frozen=True)
@@ -27,12 +32,53 @@ class GptOssPaths:
     ) -> Path:
         if model_dir is not None:
             p = Path(model_dir).expanduser().resolve()
+            if _is_complete_model_dir(p):
+                return p
+            if local_files_only and (
+                "gpt-oss-20b-MXFP4-Q8" in str(model_dir) or "gpt-oss-20b-MXFP4-Q8" in str(p)
+            ):
+                if _is_complete_model_dir(self.local_hf_dir):
+                    return self.local_hf_dir
+                try:
+                    fb = resolve_hf_model_dir(None, FALLBACK_HF_REPO, local_files_only=True)
+                    if _is_complete_model_dir(fb):
+                        return fb
+                except Exception:
+                    pass
             if not (p / "config.json").exists():
                 raise FileNotFoundError(f"Missing config.json in model_dir={p}")
+            if not any(p.glob("*.safetensors")):
+                raise FileNotFoundError(f"Missing *.safetensors in model_dir={p}")
             return p
-        if (self.local_hf_dir / "config.json").exists() and any(self.local_hf_dir.glob("*.safetensors")):
+        if _is_complete_model_dir(self.local_hf_dir):
             return self.local_hf_dir
-        return resolve_hf_model_dir(None, repo_id, local_files_only=local_files_only)
+
+        primary_err: Exception | None = None
+        cand: Path | None = None
+        try:
+            cand = resolve_hf_model_dir(None, repo_id, local_files_only=local_files_only)
+        except Exception as exc:
+            primary_err = exc
+
+        if cand is not None and (not local_files_only or _is_complete_model_dir(cand) or repo_id != DEFAULT_HF_REPO):
+            return cand
+
+        if local_files_only and repo_id == DEFAULT_HF_REPO:
+            try:
+                fb = resolve_hf_model_dir(None, FALLBACK_HF_REPO, local_files_only=True)
+                if _is_complete_model_dir(fb):
+                    return fb
+            except Exception:
+                pass
+
+        if primary_err is not None:
+            raise primary_err
+        if cand is not None:
+            raise FileNotFoundError(
+                f"Incomplete local snapshot for {repo_id} at {cand} (missing config.json or *.safetensors) "
+                f"and fallback {FALLBACK_HF_REPO} is unavailable."
+            )
+        raise FileNotFoundError(f"Unable to resolve model directory for repo_id={repo_id!r}")
 
     def resolve_tokenizer_json(
         self,
@@ -69,4 +115,4 @@ def resolve_paths(home: str | Path | None = None) -> GptOssPaths:
     )
 
 
-__all__ = ["DEFAULT_HF_REPO", "GptOssPaths", "resolve_paths"]
+__all__ = ["DEFAULT_HF_REPO", "FALLBACK_HF_REPO", "GptOssPaths", "resolve_paths"]

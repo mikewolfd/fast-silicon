@@ -445,8 +445,8 @@ def test_paths_artifacts_marker_and_dylib_mtime_freshness(tmp_path: Path, monkey
     monkeypatch.delenv("FAST_DECISION_MODELS_HOME", raising=False)
     monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
     monkeypatch.setattr(paths_mod, "__file__", str(fake_file))
-    # Without `artifacts/`, must fall back to `~/.cache/fast-decision-models`, NOT stop on pyproject.toml/native!
-    assert paths_mod.resolve_home() == (Path("~/.cache") / "fast-decision-models").expanduser().resolve()
+    # Without `artifacts/`, must fall back to `$HOME/.cache/fast-decision-models`, NOT stop on pyproject.toml/native!
+    assert paths_mod.resolve_home() == (Path.home() / ".cache" / "fast-decision-models").resolve()
 
     # Once `artifacts/` exists, resolve_home picks the checkout!
     (fake_pkg / "artifacts").mkdir()
@@ -552,12 +552,20 @@ def test_kev_vectorized_masks_cache_limits_and_zero_clone_gdn_gpu() -> None:
     assert m_st.dtype == mx.bfloat16 and m_st.shape == (3, 1, s_max, s_max)
     ref_st = np.full((3, 1, s_max, s_max), -1e9, dtype=np.float32)
     for bi, pl in enumerate(pad_lens):
+        for qt in range(pl):
+            ref_st[bi, 0, qt, qt] = 0.0
         for qt in range(pl, s_max):
             ref_st[bi, 0, qt, pl : qt + 1] = 0.0
     np.testing.assert_array_equal(
         np.asarray(m_st.astype(mx.float32)),
         np.asarray(mx.array(ref_st).astype(mx.bfloat16).astype(mx.float32)),
     )
+    m_st_f16 = _build_state_attn_mask(mx, pad_lens, s_max, mx.float16)
+    m_st_f16_np = np.asarray(m_st_f16.astype(mx.float32))
+    assert np.isfinite(m_st_f16_np).all()
+    assert float(m_st_f16_np.min()) == -65504.0
+    assert float(m_st_f16_np[1, 0, 0, 0]) == 0.0
+    assert float(m_st_f16_np[2, 0, 4, 4]) == 0.0
 
     owner_pads = [0, 3, 3, 5]
     max_br = 6
@@ -1049,3 +1057,687 @@ def test_encode_kev_questions_pure_cpu_and_backend_parity(tmp_path: Path) -> Non
         encode_kev_questions(tok, state, questions, max_state_tokens=0)
     with pytest.raises(ValueError, match="max_branch_tokens"):
         encode_kev_questions(tok, state, questions, max_branch_tokens=2)
+
+
+def test_v2_exports_paths_and_stdlib_isolation_cpu() -> None:
+    """Verify v2 exports (`Kev4bMlxBackend`, `LayaMlxGpuBackend`, `LayaHeteroEngine`) & zero stdlib leak."""
+    import fast_decision_models as fdm
+    from fast_decision_models import paths as paths_mod
+
+    src_dir = _repo_root() / "src"
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(src_dir)!r}); "
+        "import fast_decision_models, fast_decision_models.paths, fast_decision_models.scorers, "
+        "fast_decision_models.laya_ane, fast_decision_models.laya_hetero, fast_decision_models.kev_mlx; "
+        "banned = {'numpy', 'mlx', 'tokenizers', 'fast_shared', 'huggingface_hub', 'coremltools', 'torch'}; "
+        "leaked = sorted(banned.intersection(sys.modules)); "
+        "assert not leaked, f'Unexpected non-stdlib imports: {leaked}'; "
+        "print('OK')"
+    )
+    proc = subprocess.run([sys.executable, "-B", "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "OK"
+
+    assert paths_mod.DEFAULT_KEV_08B_MLX_REPO == "AbstractFramework/kev-0.8b-mlx-8bit"
+    assert paths_mod.DEFAULT_KEV_4B_MLX_REPO == "AbstractFramework/kev-4b-mlx-4bit"
+    assert paths_mod.DEFAULT_KEV_4B_ADAPTER_REPO == "jaredpalmer/kev-4b"
+    assert paths_mod.DEFAULT_LAYA_NMTZ_COREML_REPO == "NMTZ/laya-typed-decisions-421m-coreml-ane"
+    assert hasattr(paths_mod, "resolve_kev_4b_dir")
+
+    for sym in ("Kev4bMlxBackend", "KevMlxBackend", "LayaMlxGpuBackend", "LayaHeteroEngine"):
+        assert sym in fdm.__all__, f"Missing {sym} in fast_decision_models.__all__"
+        assert getattr(fdm, sym) is not None
+
+
+def test_laya_default_buckets_and_multifunction_builder_cpu(tmp_path: Path) -> None:
+    """Verify 6-bucket `S=(64,128,192,256,384,512)` defaults + split-head `einsum`, `layer_norm`, `marker_map` & multifunction."""
+    from fast_decision_models import builder as fdm_builder
+
+    assert fdm_builder.DEFAULT_LAYA_SEQ_LENS == (64, 128, 192, 256, 384, 512)
+
+    ct = pytest.importorskip("coremltools")
+    from fast_shared.ir_dtype_guard import check_coreml_model
+
+    h, inter, heads, n_layers = 64, 128, 4, 2
+    enc_cfg = {
+        "hidden_size": h,
+        "intermediate_size": inter,
+        "num_hidden_layers": n_layers,
+        "num_attention_heads": heads,
+        "local_attention": 16,
+        "norm_eps": 1e-5,
+        "layer_types": ["full_attention", "sliding_attention"],
+        "rope_parameters": {
+            "full_attention": {"rope_theta": 160000.0},
+            "sliding_attention": {"rope_theta": 10000.0},
+        },
+    }
+    rng = np.random.default_rng(29)
+    w_np: dict[str, np.ndarray] = {
+        "encoder.embeddings.norm.weight": np.ones((h,), dtype=np.float32),
+        "encoder.final_norm.weight": np.ones((h,), dtype=np.float32),
+        "scorer.0.weight": np.ones((h,), dtype=np.float32),
+        "scorer.0.bias": np.zeros((h,), dtype=np.float32),
+        "scorer.1.weight": (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32),
+        "scorer.1.bias": np.zeros((h,), dtype=np.float32),
+        "scorer.3.weight": (rng.normal(0.0, 0.02, size=(1, h))).astype(np.float32),
+        "scorer.3.bias": np.zeros((1,), dtype=np.float32),
+    }
+    for i in range(n_layers):
+        px = f"encoder.layers.{i}."
+        if i > 0:
+            w_np[px + "attn_norm.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[px + "mlp_norm.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[px + "attn.Wqkv.weight"] = (rng.normal(0.0, 0.02, size=(3 * h, h))).astype(np.float32)
+        w_np[px + "attn.Wo.weight"] = (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32)
+        w_np[px + "mlp.Wi.weight"] = (rng.normal(0.0, 0.02, size=(2 * inter, h))).astype(np.float32)
+        w_np[px + "mlp.Wo.weight"] = (rng.normal(0.0, 0.02, size=(h, inter))).astype(np.float32)
+    for hi in range(2):
+        hp = f"head.layers.{hi}."
+        w_np[hp + "norm1.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[hp + "norm1.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "norm2.weight"] = np.ones((h,), dtype=np.float32)
+        w_np[hp + "norm2.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "self_attn.in_proj_weight"] = (rng.normal(0.0, 0.02, size=(3 * h, h))).astype(np.float32)
+        w_np[hp + "self_attn.in_proj_bias"] = np.zeros((3 * h,), dtype=np.float32)
+        w_np[hp + "self_attn.out_proj.weight"] = (rng.normal(0.0, 0.02, size=(h, h))).astype(np.float32)
+        w_np[hp + "self_attn.out_proj.bias"] = np.zeros((h,), dtype=np.float32)
+        w_np[hp + "linear1.weight"] = (rng.normal(0.0, 0.02, size=(inter, h))).astype(np.float32)
+        w_np[hp + "linear1.bias"] = np.zeros((inter,), dtype=np.float32)
+        w_np[hp + "linear2.weight"] = (rng.normal(0.0, 0.02, size=(h, inter))).astype(np.float32)
+        w_np[hp + "linear2.bias"] = np.zeros((h,), dtype=np.float32)
+
+    pkg_64 = fdm_builder._build_laya_seq_mlpackage(64, w_np, enc_cfg, tmp_path / "pkgs", guard_ir=True)
+    spec = ct.utils.load_spec(str(pkg_64))
+    fn = spec.mlProgram.functions["main"]
+    in_shapes = {i.name: [d.constant.size for d in i.type.tensorType.dimensions] for i in fn.inputs}
+    assert in_shapes["marker_map"] == [1, 64, 1, 32]
+    blk = fn.block_specializations[fn.opset]
+    op_types = [op.type for op in blk.operations]
+    assert "einsum" in op_types
+    assert "layer_norm" in op_types
+    assert "matmul" not in op_types  # Split-head einsum eliminates all 4D reshape+matmul ops!
+    for op in blk.operations:
+        if op.type == "gelu":
+            mode_arg = op.inputs["mode"].arguments[0]
+            # Mode is either immediate "EXACT" or a const bound to "EXACT"
+            if mode_arg.value.WhichOneof("value") == "immediateValue":
+                assert list(mode_arg.value.immediateValue.tensor.strings.values) == ["EXACT"]
+
+    pkg_128 = fdm_builder._build_laya_seq_mlpackage(128, w_np, enc_cfg, tmp_path / "pkgs", guard_ir=True)
+    mf_pkg = fdm_builder._save_laya_multifunction_mlpackage(
+        {64: pkg_64, 128: pkg_128},
+        tmp_path / "laya_typed_w8.mlpackage",
+        default_seq_len=128,
+    )
+    mf_spec = ct.utils.load_spec(str(mf_pkg))
+    fn_names = sorted(mf_spec.mlProgram.functions.keys())
+    assert fn_names == ["s128", "s64"]
+
+
+def test_laya_hetero_work_stealing_and_ane_sidecar_cpu() -> None:
+    """Verify `LayaHeteroEngine` keeps `0` GPU ops in `mode='ane'` and steals long->GPU / short->ANE in `mode='hetero'`."""
+    from fast_decision_models.laya_hetero import LayaHeteroEngine
+
+    gpu_seen_lens: list[list[int]] = []
+    ane_seen_lens: list[list[int]] = []
+
+    class _FakeAne:
+        max_len = 512
+        head_max_len = 192
+        pad_id = 0
+
+        def encode_item(self, state, qdef, *, max_len=None, on_truncate="warn"):
+            n = int(state)
+            return {"ids": [1] * n, "markers": [1, 2], "qtype": 2, "k": 2, "truncated": False, "original_state_tokens": n}
+
+        def score_choice_batch(self, items, *, temperature_override=None):
+            ane_seen_lens.append([len(it["ids"]) for it in items])
+            return [[0.25, 0.75] for _ in items]
+
+        def score_noul_batch(self, items):
+            ane_seen_lens.append([len(it["ids"]) for it in items])
+            return [0.75 for _ in items]
+
+        def close(self):
+            pass
+
+    class _FakeGpu:
+        def score_choice_batch(self, items, *, temperature_override=None):
+            gpu_seen_lens.append([len(it["ids"]) for it in items])
+            return [[0.25, 0.75] for _ in items]
+
+        def score_noul_batch(self, items):
+            gpu_seen_lens.append([len(it["ids"]) for it in items])
+            return [0.75 for _ in items]
+
+        def close(self):
+            pass
+
+    # 1. mode="ane" (LLM sidecar triage) must NOT instantiate GPU backend (0 GPU bytes/ops)
+    ane_only = LayaHeteroEngine(mode="ane", ane_backend=_FakeAne(), gpu_backend=None)
+    assert ane_only.gpu_backend is None
+    items_short = [{"ids": [1] * 80, "markers": [1, 2], "qtype": 2, "k": 2}]
+    assert ane_only.score_noul_batch(items_short) == [0.75]
+    assert len(gpu_seen_lens) == 0 and len(ane_seen_lens) == 1
+    ane_only.close()
+
+    # 2. mode="hetero" (standalone backfill) steals longest >=256 from head onto GPU and shortest <=256 from tail onto ANE
+    ane_seen_lens.clear()
+    gpu_seen_lens.clear()
+    hetero = LayaHeteroEngine(
+        mode="hetero",
+        profile="backfill",
+        ane_backend=_FakeAne(),
+        gpu_backend=_FakeGpu(),
+        gpu_batch_size=4,
+        ane_batch_size=4,
+    )
+    mixed_items = [
+        {"ids": [1] * ln, "markers": [1, 2], "qtype": 0, "k": 3}
+        for ln in (64, 480, 96, 420, 128, 384, 160, 320, 192, 500, 72, 460)
+    ]
+    probs = hetero.score_choice_batch(mixed_items)
+    assert len(probs) == len(mixed_items)
+    assert all(p == [0.25, 0.75] for p in probs)
+    assert len(gpu_seen_lens) >= 1 and len(ane_seen_lens) >= 1
+    # GPU starts at head (max length 500), ANE starts at tail (min length 64)
+    assert max(max(b) for b in gpu_seen_lens) == 500
+    assert min(min(b) for b in ane_seen_lens) == 64
+    hetero.close()
+
+    # 3. Verify _build_laya_packed_batch_tensors builds 2D (B, S) position_ids (never 1D B*S!) & BF16 -1e4 masks
+    from fast_decision_models.laya_hetero import _build_laya_packed_batch_tensors, _pack_laya_segments
+
+    class _CpuMaskMx:
+        int32 = np.int32
+        bfloat16 = np.dtype("uint16")  # distinct sentinel dtype verifying mask uses mx.bfloat16, never float32!
+
+        @staticmethod
+        def array(x, dtype=None):
+            if dtype is _CpuMaskMx.bfloat16:
+                return np.asarray(x, dtype=np.float16)
+            return np.asarray(x, dtype=dtype)
+
+        @staticmethod
+        def abs(x):
+            return np.abs(x)
+
+        @staticmethod
+        def where(cond, a, b):
+            return np.where(cond, a, b)
+
+    sample_encs = [
+        {"ids": [10, 11, 12, 13, 14], "markers": [1, 3], "qtype": 0, "k": 2},
+        {"ids": [20, 21, 22, 23], "markers": [1, 2], "qtype": 2, "k": 2},
+        {"ids": [30, 31, 32], "markers": [1], "qtype": 1, "k": 1},
+    ]
+    lanes = _pack_laya_segments(sample_encs, [0, 1, 2], lane_cap=16)
+    assert len(lanes) == 1 and len(lanes[0]) == 3
+    ids_2d, pos_2d, qt_2d, full_m, swa_m, m_meta = _build_laya_packed_batch_tensors(
+        _CpuMaskMx, np, sample_encs, lanes, pad_id=0, local_half_win=2
+    )
+    assert pos_2d.ndim == 2 and pos_2d.shape == (1, 32)
+    # Segment 0 (len 5), Segment 1 (len 4), Segment 2 (len 3) each reset position_ids to 0!
+    assert pos_2d[0, :12].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1, 2]
+    assert full_m.shape == (1, 1, 32, 32) and full_m.dtype == np.float16
+    assert swa_m.shape == (1, 1, 32, 32) and swa_m.dtype == np.float16
+    # Cross-segment attention (pos 0 in seg0 -> pos 5 in seg1) is masked (-10000.0), zero cross-doc leakage!
+    assert float(full_m[0, 0, 0, 5]) == -10000.0
+    assert float(full_m[0, 0, 0, 4]) == 0.0
+    # SWA window (half_win=2): within seg0, pos 0 -> pos 4 (|0-4|=4 > 2) is masked in swa_m!
+    assert float(swa_m[0, 0, 0, 4]) == -10000.0
+    assert float(swa_m[0, 0, 0, 2]) == 0.0
+
+
+def test_kev_horizontal_fusion_mixed_4b_quant_and_one_pass_gpu(tmp_path: Path) -> None:
+    """Verify horizontal linear fusion (`9 -> 3`), mixed `4b/8b g32` Kev-4B loader, `gated_delta_update`, & 1-pass GPU head."""
+    from fast_decision_models._common import acquire_hw_lock
+    import json
+    import mlx.core as mx
+    import mlx.nn as nn
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from fast_decision_models.kev_mlx import KEV_SPECIAL_TOKENS, Kev4bMlxBackend, _build_qwen35_backbone
+
+    with acquire_hw_lock("test_kev_horizontal_fusion_4b_gpu"):
+        # Build a miniature Kev-4B-topology checkpoint (`Hk != Hv`: Hk=2, Hv=4, Dk=128, Dv=128, g32 mixed 4-bit + 8-bit GDN!)
+        hidden_size = 256
+        inter_size = 512
+        vocab_size = 64
+        text_cfg = {
+            "hidden_size": hidden_size,
+            "intermediate_size": inter_size,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": vocab_size,
+            "eos_token_id": 1,
+            "full_attention_interval": 4,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "rope_parameters": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+        }
+        mx.random.seed(7)
+        bf16_weights: dict[str, mx.array] = {
+            "model.embed_tokens.weight": (mx.random.normal((vocab_size, hidden_size)) * 0.02).astype(mx.bfloat16),
+            "model.norm.weight": mx.ones((hidden_size,), dtype=mx.bfloat16),
+        }
+        key_dim = 2 * 128
+        val_dim = 4 * 128
+        conv_dim = 2 * key_dim + val_dim
+        for li in range(4):
+            px = f"model.layers.{li}."
+            bf16_weights[px + "input_layernorm.weight"] = mx.ones((hidden_size,), dtype=mx.bfloat16)
+            bf16_weights[px + "post_attention_layernorm.weight"] = mx.ones((hidden_size,), dtype=mx.bfloat16)
+            bf16_weights[px + "mlp.gate_proj.weight"] = (mx.random.normal((inter_size, hidden_size)) * 0.02).astype(mx.bfloat16)
+            bf16_weights[px + "mlp.up_proj.weight"] = (mx.random.normal((inter_size, hidden_size)) * 0.02).astype(mx.bfloat16)
+            bf16_weights[px + "mlp.down_proj.weight"] = (mx.random.normal((hidden_size, inter_size)) * 0.02).astype(mx.bfloat16)
+            if (li + 1) % 4 != 0:
+                bf16_weights[px + "linear_attn.conv1d.weight"] = (mx.random.normal((conv_dim, 4, 1)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "linear_attn.in_proj_qkv.weight"] = (mx.random.normal((conv_dim, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "linear_attn.in_proj_z.weight"] = (mx.random.normal((val_dim, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "linear_attn.in_proj_b.weight"] = (mx.random.normal((4, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "linear_attn.in_proj_a.weight"] = (mx.random.normal((4, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "linear_attn.dt_bias"] = mx.ones((4,), dtype=mx.bfloat16)
+                bf16_weights[px + "linear_attn.A_log"] = mx.zeros((4,), dtype=mx.bfloat16)
+                bf16_weights[px + "linear_attn.norm.weight"] = mx.ones((128,), dtype=mx.float32)  # F32 like HF release!
+                bf16_weights[px + "linear_attn.out_proj.weight"] = (mx.random.normal((hidden_size, val_dim)) * 0.02).astype(mx.bfloat16)
+            else:
+                bf16_weights[px + "self_attn.q_proj.weight"] = (mx.random.normal((4 * 64 * 2, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "self_attn.k_proj.weight"] = (mx.random.normal((2 * 64, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "self_attn.v_proj.weight"] = (mx.random.normal((2 * 64, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "self_attn.o_proj.weight"] = (mx.random.normal((4 * 64, hidden_size)) * 0.02).astype(mx.bfloat16)
+                bf16_weights[px + "self_attn.q_norm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+                bf16_weights[px + "self_attn.k_norm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+
+        # Save in AbstractFramework Kev-4B mixed 4-bit g32 + 8-bit g32 GDN format (`language_model.model.*`)
+        af_dir = tmp_path / "kev_4b_af"
+        af_dir.mkdir(parents=True)
+        af_tensors: dict[str, mx.array] = {}
+        quant_dict: dict[str, Any] = {"bits": 4, "group_size": 32, "mode": "affine"}
+        for k, v in bf16_weights.items():
+            af_k = "language_model." + k
+            if k.endswith(".weight") and v.ndim == 2:
+                stem = af_k[: -len(".weight")]
+                bits = 8 if ".linear_attn." in k else 4
+                wq, sc, bi = mx.quantize(v, group_size=32, bits=bits)
+                af_tensors[stem + ".weight"] = wq
+                af_tensors[stem + ".scales"] = sc
+                af_tensors[stem + ".biases"] = bi
+                quant_dict[stem] = {"bits": bits, "group_size": 32}
+            else:
+                af_tensors[af_k] = v
+        mx.eval(af_tensors)
+        mx.save_safetensors(str(af_dir / "model.safetensors"), af_tensors)
+
+        head_tensors = {
+            "q.weight": (mx.random.normal((32, hidden_size)) * 0.05).astype(mx.float32),
+            "q.bias": mx.zeros((32,), dtype=mx.float32),
+            "k.weight": (mx.random.normal((32, hidden_size)) * 0.05).astype(mx.float32),
+            "k.bias": mx.zeros((32,), dtype=mx.float32),
+        }
+        mx.eval(head_tensors)
+        mx.save_safetensors(str(af_dir / "head.safetensors"), head_tensors)
+        (af_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5", "text_config": text_cfg, "quantization": quant_dict}),
+            encoding="utf-8",
+        )
+        (af_dir / "decision.json").write_text(
+            json.dumps({"temperature": 2.1, "head_file": "head.safetensors", "delimiters": list(KEV_SPECIAL_TOKENS)}),
+            encoding="utf-8",
+        )
+        vocab = {f"w{i}": i for i in range(50)}
+        vocab["<unk>"] = 0
+        tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.add_special_tokens(list(KEV_SPECIAL_TOKENS))
+        tok.save(str(af_dir / "tokenizer.json"))
+
+        with Kev4bMlxBackend(af_dir, batch_docs=4, prefix_cache_mb=None) as kev4:
+            # Verify horizontal fusion (`in_proj_all`, `qkv_proj`, `gate_up_proj`) & preserved 8-bit GDN / 4-bit MLP!
+            gdn_blk = kev4.backbone.layers[0].linear_attn
+            fa_blk = kev4.backbone.layers[3].self_attn
+            mlp_blk = kev4.backbone.layers[0].mlp
+            assert hasattr(gdn_blk, "in_proj_all") and isinstance(gdn_blk.in_proj_all, nn.QuantizedLinear)
+            assert gdn_blk.in_proj_all.bits == 8 and gdn_blk.in_proj_all.group_size == 32
+            assert hasattr(fa_blk, "qkv_proj") and isinstance(fa_blk.qkv_proj, nn.QuantizedLinear)
+            assert fa_blk.qkv_proj.bits == 4 and fa_blk.qkv_proj.group_size == 32
+            assert hasattr(mlp_blk, "gate_up_proj") and isinstance(mlp_blk.gate_up_proj, nn.QuantizedLinear)
+            assert mlp_blk.gate_up_proj.bits == 4 and mlp_blk.gate_up_proj.group_size == 32
+
+            # Verify 1-pass single-question B=1 vs B=3 (exact & padded) parity!
+            qdef = {"type": "choice", "instructions": "w2 w3", "criteria": ["w4", "w5 w6", "w7"]}
+            items = [("w10 w11 w12", [qdef]), ("w13 w14 w15 w16 w17", [qdef]), ("w18 w19", [qdef])]
+            b1_outs = [kev4.score_multi_states([it], batch_docs=1)[0][0] for it in items]
+            b3_outs = [r[0] for r in kev4.score_multi_states(items, batch_docs=4)]
+            for (p1, z1), (p3, z3) in zip(b1_outs, b3_outs):
+                np.testing.assert_allclose(p1, p3, atol=5e-3)
+                np.testing.assert_allclose(z1, z3, atol=2e-2)
+
+            # Also verify `cache=None` 1-pass matches 2-pass multi-branch on identical question!
+            two_q = kev4.score_multi_states([("w10 w11 w12", [qdef, qdef])], batch_docs=1)[0]
+            np.testing.assert_allclose(b1_outs[0][0], two_q[0][0], atol=5e-3)
+            np.testing.assert_allclose(two_q[0][0], two_q[1][0], atol=1e-5)
+
+
+def test_laya_mlx_gpu_packed512_and_marker_scorer_parity_gpu(tmp_path: Path) -> None:
+    """Verify `LayaMlxGpuBackend` `Packed-512` segment-isolated packing matches unpacked single-item scoring."""
+    from fast_decision_models._common import acquire_hw_lock
+    import json
+    import mlx.core as mx
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from fast_decision_models.laya_hetero import LayaMlxGpuBackend
+
+    with acquire_hw_lock("test_laya_mlx_gpu_packed512"):
+        laya_src = tmp_path / "tiny_laya"
+        (laya_src / "encoder").mkdir(parents=True)
+        (laya_src / "tokenizer").mkdir(parents=True)
+        h, inter, heads, n_layers, vocab_sz = 128, 256, 4, 3, 64
+        enc_cfg = {
+            "hidden_size": h,
+            "intermediate_size": inter,
+            "num_hidden_layers": n_layers,
+            "num_attention_heads": heads,
+            "local_attention": 16,
+            "norm_eps": 1e-5,
+            "vocab_size": vocab_sz,
+            "layer_types": ["full_attention", "sliding_attention", "full_attention"],
+            "rope_parameters": {
+                "full_attention": {"rope_theta": 160000.0},
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+        }
+        (laya_src / "encoder" / "config.json").write_text(json.dumps(enc_cfg), encoding="utf-8")
+        (laya_src / "rl_agent_config.json").write_text(
+            json.dumps({"head_max_len": 128, "temperature": [1.0, 1.0, 1.0]}),
+            encoding="utf-8",
+        )
+        vocab = {f"tok{i}": i for i in range(1, vocab_sz - 4)}
+        vocab.update({"[UNK]": 0, "[CLS]": 60, "[SEP]": 61, "[PAD]": 62, "[MASK]": 63})
+        tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.save(str(laya_src / "tokenizer" / "tokenizer.json"))
+
+        mx.random.seed(31)
+        tensors: dict[str, mx.array] = {
+            "encoder.embeddings.tok_embeddings.weight": (mx.random.normal((vocab_sz, h)) * 0.05).astype(mx.float16),
+            "encoder.embeddings.norm.weight": mx.ones((h,), dtype=mx.float16),
+            "encoder.final_norm.weight": mx.ones((h,), dtype=mx.float16),
+            "type_emb.weight": (mx.random.normal((3, h)) * 0.05).astype(mx.float16),
+            "scorer.0.weight": mx.ones((h,), dtype=mx.float16),
+            "scorer.0.bias": mx.zeros((h,), dtype=mx.float16),
+            "scorer.1.weight": (mx.random.normal((h, h)) * 0.05).astype(mx.float16),
+            "scorer.1.bias": mx.zeros((h,), dtype=mx.float16),
+            "scorer.3.weight": (mx.random.normal((1, h)) * 0.05).astype(mx.float16),
+            "scorer.3.bias": mx.zeros((1,), dtype=mx.float16),
+        }
+        for i in range(n_layers):
+            px = f"encoder.layers.{i}."
+            if i > 0:
+                tensors[px + "attn_norm.weight"] = mx.ones((h,), dtype=mx.float16)
+            tensors[px + "mlp_norm.weight"] = mx.ones((h,), dtype=mx.float16)
+            tensors[px + "attn.Wqkv.weight"] = (mx.random.normal((3 * h, h)) * 0.04).astype(mx.float16)
+            tensors[px + "attn.Wo.weight"] = (mx.random.normal((h, h)) * 0.04).astype(mx.float16)
+            tensors[px + "mlp.Wi.weight"] = (mx.random.normal((2 * inter, h)) * 0.04).astype(mx.float16)
+            tensors[px + "mlp.Wo.weight"] = (mx.random.normal((h, inter)) * 0.04).astype(mx.float16)
+        for hi in range(2):
+            hp = f"head.layers.{hi}."
+            tensors[hp + "norm1.weight"] = mx.ones((h,), dtype=mx.float16)
+            tensors[hp + "norm1.bias"] = mx.zeros((h,), dtype=mx.float16)
+            tensors[hp + "norm2.weight"] = mx.ones((h,), dtype=mx.float16)
+            tensors[hp + "norm2.bias"] = mx.zeros((h,), dtype=mx.float16)
+            tensors[hp + "self_attn.in_proj_weight"] = (mx.random.normal((3 * h, h)) * 0.04).astype(mx.float16)
+            tensors[hp + "self_attn.in_proj_bias"] = mx.zeros((3 * h,), dtype=mx.float16)
+            tensors[hp + "self_attn.out_proj.weight"] = (mx.random.normal((h, h)) * 0.04).astype(mx.float16)
+            tensors[hp + "self_attn.out_proj.bias"] = mx.zeros((h,), dtype=mx.float16)
+            tensors[hp + "linear1.weight"] = (mx.random.normal((inter * 2, h)) * 0.04).astype(mx.float16)
+            tensors[hp + "linear1.bias"] = mx.zeros((inter * 2,), dtype=mx.float16)
+            tensors[hp + "linear2.weight"] = (mx.random.normal((h, inter * 2)) * 0.04).astype(mx.float16)
+            tensors[hp + "linear2.bias"] = mx.zeros((h,), dtype=mx.float16)
+        mx.eval(tensors)
+        mx.save_safetensors(str(laya_src / "model.safetensors"), tensors)
+
+        with LayaMlxGpuBackend(laya_src, batch_size=4, pack_seq_len=512) as gpu_eng:
+            encs = [
+                gpu_eng.encode_item(
+                    " ".join(f"tok{(i + j) % 40 + 1}" for j in range(12 + i * 7)),
+                    {"type": "choice" if i % 2 == 0 else "noul", "instructions": "tok2 tok3", "criteria": ["tok4", "tok5", "tok6"] if i % 2 == 0 else {"false": "tok7", "true": "tok8"}},
+                    on_truncate="ignore",
+                )
+                for i in range(6)
+            ]
+            single_probs = [gpu_eng.score_choice_batch([e])[0] for e in encs]
+            packed_probs = gpu_eng.score_choice_batch(encs)
+            for s_p, pk_p in zip(single_probs, packed_probs):
+                np.testing.assert_allclose(s_p, pk_p, atol=8e-3)
+
+
+def test_offline_local_files_only_bad_laya_src_and_noul_qtype_parity_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `local_files_only` / `HF_HUB_OFFLINE=1`, explicit bad `laya_src_dir` error, and `LayaAneBackend` `qtype=2` parity."""
+    import ctypes
+    import fast_shared.hf as shared_hf
+    from fast_decision_models.kev_mlx import Kev08bMlxBackend
+    from fast_decision_models.laya_ane import LayaAneBackend
+    from fast_decision_models.laya_hetero import LayaHeteroEngine, LayaMlxGpuBackend
+
+    hf_calls: list[tuple[str, bool]] = []
+
+    def _fake_resolve_hf(_explicit: object, repo_id: str, *, local_files_only: bool = False, **_kw: object) -> Path:
+        hf_calls.append((repo_id, bool(local_files_only)))
+        raise FileNotFoundError(f"uncached repo {repo_id} (local_files_only={local_files_only})")
+
+    monkeypatch.setattr(shared_hf, "resolve_hf_model_dir", _fake_resolve_hf)
+
+    # 1. Explicit non-existent or non-Laya directory passed to LayaMlxGpuBackend MUST raise FileNotFoundError without HF fallback
+    with pytest.raises(FileNotFoundError):
+        LayaMlxGpuBackend(tmp_path / "does_not_exist")
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        LayaMlxGpuBackend(empty_dir)
+    assert hf_calls == []
+
+    # 2. ANE bundle dir (`laya_typed_emb_f16.npz` present) falls back to DEFAULT_LAYA_REPO respecting `local_files_only=True`
+    ane_dir = tmp_path / "ane_bundle_dir"
+    ane_dir.mkdir()
+    (ane_dir / "laya_typed_emb_f16.npz").write_bytes(b"stub")
+    with pytest.raises(FileNotFoundError):
+        LayaMlxGpuBackend(ane_dir, local_files_only=True)
+    assert hf_calls == [("convaiinnovations/laya-typed-decisions", True)]
+
+    # 3. `HF_HUB_OFFLINE=1` honored across LayaAneBackend, LayaHeteroEngine, and Kev08bMlxBackend (never calls local_files_only=False)
+    hf_calls.clear()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("FAST_DECISION_MODELS_KEV_DIR", str(tmp_path / "artifacts" / "kev_08b"))
+    fake_dylib = tmp_path / "fake.dylib"
+    fake_dylib.write_bytes(b"stub")
+    monkeypatch.setattr(LayaAneBackend, "_bind_native_lib", lambda self: None)
+    with pytest.raises(FileNotFoundError):
+        LayaAneBackend(tmp_path / "no_local_ane", fake_dylib, auto_prebuilt=True)
+    with pytest.raises(FileNotFoundError):
+        LayaHeteroEngine(tmp_path / "no_local_ane", fake_dylib, mode="ane")
+    with pytest.raises(FileNotFoundError):
+        Kev08bMlxBackend(None, auto_prebuilt=True, local_files_only=False)
+    assert len(hf_calls) >= 3
+    assert all(is_local is True for _, is_local in hf_calls)
+
+    # 4. `LayaAneBackend.score_noul_batch` enforces `qtype=2` even when item was encoded with `qtype != 2`
+    seen_qtypes: list[int] = []
+
+    class _FakeLib:
+        def laya_ane_max_markers(self, _h: object) -> int:
+            return 80
+
+        def laya_ane_exec_markers_batch(
+            self,
+            _h: object,
+            n_items: int,
+            _ids_ptr: int,
+            _vl_ptr: int,
+            qt_ptr: int,
+            _mp_ptr: int,
+            _mc_ptr: int,
+            stride: int,
+            out_ptr: int,
+            _async_flag: int,
+        ) -> float:
+            qts = (ctypes.c_int32 * n_items).from_address(qt_ptr)
+            seen_qtypes.extend(int(qts[i]) for i in range(n_items))
+            out_arr = (ctypes.c_float * (n_items * stride)).from_address(out_ptr)
+            for i in range(n_items):
+                out_arr[i * stride + 0] = -0.5
+                out_arr[i * stride + 1] = 1.5
+            return 0.001
+
+    import threading
+
+    ane_mock = LayaAneBackend.__new__(LayaAneBackend)
+    ane_mock._np = np
+    ane_mock._exec_lock = threading.Lock()
+    ane_mock._lib = _FakeLib()
+    ane_mock._has_last_error = False
+    ane_mock.pad_id = 0
+    ane_mock.seq_buckets = (64,)
+    ane_mock._handles = {64: 1}
+    ane_mock.temperature = [1.0, 1.0, 1.0]
+    ane_mock.temperature_by_options = {}
+    res_noul = ane_mock.score_noul_batch([{"ids": [1, 2, 3, 4], "markers": [1, 2], "qtype": 0}])
+    assert len(res_noul) == 1 and res_noul[0] > 0.8
+    assert seen_qtypes == [2]
+
+
+def test_kev_mixed_prefix_length_cold_warm_zero_diff_gpu(tmp_path: Path) -> None:
+    """Verify mixed-prefix-length `b8` (`64`-tok and `128`-tok prefixes) achieves strict `0.0` cold vs warm diff."""
+    from fast_decision_models._common import acquire_hw_lock
+    import json
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from fast_decision_models.kev_mlx import KEV_SPECIAL_TOKENS, KevMlxBackend
+    from fast_decision_models.prefix_tree import PrefixTree
+
+    with acquire_hw_lock("test_kev_mixed_prefix_zero_diff"):
+        snap = tmp_path / "tiny_kev_mixed_p"
+        snap.mkdir(parents=True)
+        vocab = {f"w{i}": i + 1 for i in range(48)}
+        vocab["<pad>"] = 0
+        for idx_sp, sp in enumerate(KEV_SPECIAL_TOKENS, start=50):
+            vocab[sp] = idx_sp
+        tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<pad>"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.save(str(snap / "tokenizer.json"))
+
+        cfg = {
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "full_attention_interval": 2,
+                "layer_types": ["linear_attention", "full_attention"],
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 64,
+                "eos_token_id": 0,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "rope_parameters": {"partial_rotary_factor": 0.5, "rope_theta": 10000.0},
+            },
+            "quantization": {"bits": 8, "group_size": 32},
+        }
+        (snap / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        (snap / "decision.json").write_text(
+            json.dumps({"temperature": 0.25, "special_tokens": list(KEV_SPECIAL_TOKENS)}),
+            encoding="utf-8",
+        )
+
+        mx.random.seed(19)
+        raw_t: dict[str, mx.array] = {"model.norm.weight": mx.ones((64,), dtype=mx.bfloat16)}
+        emb = nn.Embedding(64, 64)
+        nn.quantize(emb, bits=8, group_size=32)
+        for k, v in tree_flatten(emb.parameters()):
+            raw_t[f"model.embed_tokens.{k}"] = v
+
+        def _add_qlin(prefix: str, in_d: int, out_d: int) -> None:
+            lin = nn.Linear(in_d, out_d, bias=False)
+            nn.quantize(lin, bits=8, group_size=32)
+            for k, v in tree_flatten(lin.parameters()):
+                raw_t[f"{prefix}.{k}"] = v
+
+        raw_t["model.layers.0.input_layernorm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+        raw_t["model.layers.0.post_attention_layernorm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+        _add_qlin("model.layers.0.linear_attn.in_proj_qkv", 64, 192)
+        _add_qlin("model.layers.0.linear_attn.in_proj_z", 64, 64)
+        raw_t["model.layers.0.linear_attn.in_proj_b.weight"] = (mx.random.normal((2, 64)) * 0.05).astype(mx.bfloat16)
+        raw_t["model.layers.0.linear_attn.in_proj_a.weight"] = (mx.random.normal((2, 64)) * 0.05).astype(mx.bfloat16)
+        raw_t["model.layers.0.linear_attn.conv1d.weight"] = (mx.random.normal((192, 1, 4)) * 0.05).astype(mx.bfloat16)
+        raw_t["model.layers.0.linear_attn.dt_bias"] = mx.zeros((2,), dtype=mx.bfloat16)
+        raw_t["model.layers.0.linear_attn.A_log"] = mx.zeros((2,), dtype=mx.float32)
+        raw_t["model.layers.0.linear_attn.norm.weight"] = mx.ones((32,), dtype=mx.bfloat16)
+        _add_qlin("model.layers.0.linear_attn.out_proj", 64, 64)
+        _add_qlin("model.layers.0.mlp.gate_proj", 64, 128)
+        _add_qlin("model.layers.0.mlp.up_proj", 64, 128)
+        _add_qlin("model.layers.0.mlp.down_proj", 128, 64)
+
+        raw_t["model.layers.1.input_layernorm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+        raw_t["model.layers.1.post_attention_layernorm.weight"] = mx.ones((64,), dtype=mx.bfloat16)
+        _add_qlin("model.layers.1.self_attn.q_proj", 64, 128)
+        _add_qlin("model.layers.1.self_attn.k_proj", 64, 32)
+        _add_qlin("model.layers.1.self_attn.v_proj", 64, 32)
+        _add_qlin("model.layers.1.self_attn.o_proj", 64, 64)
+        raw_t["model.layers.1.self_attn.q_norm.weight"] = mx.ones((32,), dtype=mx.bfloat16)
+        raw_t["model.layers.1.self_attn.k_norm.weight"] = mx.ones((32,), dtype=mx.bfloat16)
+        _add_qlin("model.layers.1.mlp.gate_proj", 64, 128)
+        _add_qlin("model.layers.1.mlp.up_proj", 64, 128)
+        _add_qlin("model.layers.1.mlp.down_proj", 128, 64)
+
+        mx.eval(raw_t)
+        mx.save_safetensors(str(snap / "model.safetensors"), raw_t)
+        head_t = {
+            "q.weight": (mx.random.normal((64, 64)) * 0.1).astype(mx.float32),
+            "q.bias": mx.zeros((64,), dtype=mx.float32),
+            "k.weight": (mx.random.normal((64, 64)) * 0.1).astype(mx.float32),
+            "k.bias": mx.zeros((64,), dtype=mx.float32),
+        }
+        mx.eval(head_t)
+        mx.save_safetensors(str(snap / "head.safetensors"), head_t)
+
+        tree = PrefixTree(chunk_tokens=64, byte_budget=64 << 20)
+        with KevMlxBackend(snap, batch_docs=8, prefix_tree=tree) as eng:
+            qdef = {"type": "noul", "instructions": "w1 w2", "criteria": {"false": "w3", "true": "w4"}}
+            pref_short = " ".join(f"w{(j % 30) + 1}" for j in range(72))  # aligned_p = 64
+            pref_long = " ".join(f"w{(j % 30) + 10}" for j in range(138))  # aligned_p = 128
+            pairs = [
+                *((f"{pref_short} w{5 + k} w{6 + k}", [qdef]) for k in range(5)),
+                *((f"{pref_long} w{15 + k} w{16 + k} w{17 + k}", [qdef]) for k in range(3)),
+            ]
+            cold = eng.score_multi_states(pairs, batch_docs=8)
+            warm = eng.score_multi_states(pairs, batch_docs=8)
+            max_prob_diff = max(
+                abs(cp - wp)
+                for c_doc, w_doc in zip(cold, warm)
+                for (c_pr, _), (w_pr, _) in zip(c_doc, w_doc)
+                for cp, wp in zip(c_pr, w_pr)
+            )
+            max_logit_diff = max(
+                abs(cl - wl)
+                for c_doc, w_doc in zip(cold, warm)
+                for (_, c_lg), (_, w_lg) in zip(c_doc, w_doc)
+                for cl, wl in zip(c_lg, w_lg)
+            )
+            assert max_prob_diff == 0.0
+            assert max_logit_diff == 0.0
+
+

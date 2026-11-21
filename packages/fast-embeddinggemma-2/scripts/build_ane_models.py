@@ -8,16 +8,44 @@ Reads `artifacts/weights/embeddinggemma_2_f16.npz`. Requires `coremltools>=8.0`
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
+import sys
+import tempfile
+import time
+from typing import Sequence
 
 import numpy as np
+
+try:
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
+except ModuleNotFoundError:  # pragma: no cover - standalone invocation without editable install
+    _shared_src = Path(__file__).resolve().parents[2] / "fast-shared" / "src"
+    if _shared_src.is_dir() and str(_shared_src) not in sys.path:
+        sys.path.insert(0, str(_shared_src))
+    from fast_shared.parallel_coreml import (
+        atomic_publish_dir,
+        compile_buckets_parallel,
+        default_compile_jobs,
+    )
 
 FULL_LAYERS = {5, 11, 17, 23}
 DEFAULT_ANE_SEQS = (32, 64, 128, 192, 256, 320, 384, 448, 512)
 DEFAULT_CPU_SEQS = (256, 384, 512)
 CPU_FP32_SKIP_OPS = "reduce_mean,rsqrt,gelu,softmax,add,sub,mul,transpose,reshape,split,concat"
 FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)  # 2^-14 = 6.103515625e-5 ANE normal floor
+MULTIFUNCTION_BUNDLE_NAME = "emb2_ane_w8.mlmodelc"
+_WORKER_NPZ_CACHE: dict[tuple[str, int], dict[str, np.ndarray]] = {}
+
+
+def emb2_function_name(seq_len: int) -> str:
+    """Canonical multifunction entry name for an EmbeddingGemma-2 ANE sequence bucket."""
+    return f"emb2_pk_s{int(seq_len)}"
 
 
 def repo_root() -> Path:
@@ -25,26 +53,27 @@ def repo_root() -> Path:
 
 
 def _compile_and_install(mlmodel, out_dir: Path, name: str) -> Path:
-    pkg_dir = out_dir / "_tmp_packages"
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    pkg = pkg_dir / f"{name}.mlpackage"
-    if pkg.exists():
-        shutil.rmtree(pkg)
-    mlmodel.save(str(pkg))
-
     import coremltools as ct
 
-    compiled_tmp = ct.utils.compile_model(str(pkg))
-    dst = out_dir / f"{name}.mlmodelc"
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.move(compiled_tmp, str(dst))
-    shutil.rmtree(pkg, ignore_errors=True)
-    return dst
+    out_mlmodelc = out_dir / f"{name}.mlmodelc"
+    with tempfile.TemporaryDirectory(prefix=f"{name}_") as tmp_dir:
+        pkg = Path(tmp_dir) / f"{name}.mlpackage"
+        mlmodel.save(str(pkg))
+        compiled_tmp = Path(ct.utils.compile_model(str(pkg)))
+        try:
+            atomic_publish_dir(compiled_tmp, out_mlmodelc, move=True)
+        except Exception:
+            shutil.rmtree(compiled_tmp, ignore_errors=True)
+            raise
+    return out_mlmodelc
 
 
-def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path:
-    """Build conv1x1 + W8 ANE-optimized packed sequence bundle (`emb2_pk_s{S}_w8.mlmodelc`)."""
+def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path, *, allow_over_512: bool = False) -> Path:
+    """Build conv1x1 + W8 ANE-optimized packed sequence bundle (`emb2_pk_s{S}_w8.mlmodelc`, S <= 512)."""
+    if int(S) > 512 and not allow_over_512:
+        raise ValueError(
+            f"ANE EmbeddingGemma-2 buckets must stay <= 512 tokens (got S={S}); S>=1024 wires >2 GB neural memory."
+        )
     import coremltools as ct
     from coremltools.converters.mil import Builder as mb
     import coremltools.optimize.coreml as cto
@@ -165,7 +194,106 @@ def build_ane_packed_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path
             global_config=cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity="per_channel")
         ),
     )
+    if out_dir.suffix == ".mlpackage":
+        m_w8.save(str(out_dir))
+        return out_dir
     return _compile_and_install(m_w8, out_dir, f"emb2_pk_s{S}_w8")
+
+
+def _load_worker_weights(npz_path_str: str) -> dict[str, np.ndarray]:
+    npz_p = Path(npz_path_str)
+    cache_key = (str(npz_p), npz_p.stat().st_mtime_ns)
+    w = _WORKER_NPZ_CACHE.get(cache_key)
+    if w is None:
+        with np.load(npz_p) as npz_obj:
+            w = {k: npz_obj[k] for k in npz_obj.files}
+        _WORKER_NPZ_CACHE.clear()
+        _WORKER_NPZ_CACHE[cache_key] = w
+    return w
+
+
+def _save_ane_mlpackage_task(task: tuple[str, str, int]) -> tuple[str, str]:
+    npz_path_str, tmp_dir_str, seq_len = task
+    w = _load_worker_weights(npz_path_str)
+    fn_name = emb2_function_name(seq_len)
+    pkg_path = Path(tmp_dir_str) / f"{fn_name}.mlpackage"
+    build_ane_packed_w8(int(seq_len), w, pkg_path)
+    return fn_name, str(pkg_path)
+
+
+def _compile_ane_bucket_task(task: tuple[str, str, int]) -> str:
+    npz_path_str, out_dir_str, seq_len = task
+    w = _load_worker_weights(npz_path_str)
+    return str(build_ane_packed_w8(int(seq_len), w, Path(out_dir_str)))
+
+
+def build_ane_multifunction_w8(
+    weights_npz: Path,
+    out_dir: Path,
+    seq_lens: Sequence[int] = DEFAULT_ANE_SEQS,
+    *,
+    jobs: int | None = None,
+    bundle_name: str = MULTIFUNCTION_BUNDLE_NAME,
+) -> Path:
+    """Build all W8A16 ANE buckets in parallel and merge into one shared-weight multifunction `.mlmodelc` (~147 MB)."""
+    if not seq_lens:
+        raise ValueError("At least one sequence length is required.")
+    if any(int(s) > 512 for s in seq_lens):
+        raise ValueError(
+            f"Multifunction ANE seq_lens must stay <= 512 to avoid wiring >2 GB neural memory, got {tuple(seq_lens)}"
+        )
+    import coremltools as ct
+    out_dir.mkdir(parents=True, exist_ok=True)
+    eff_jobs = default_compile_jobs(jobs)
+    out_mlmodelc = out_dir / bundle_name
+
+    t0 = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="emb2_mf_stage_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        tasks = [(str(weights_npz.resolve()), str(tmp_root), int(s)) for s in seq_lens]
+        results = compile_buckets_parallel(
+            tasks,
+            _save_ane_mlpackage_task,
+            max_workers=eff_jobs,
+            label_fn=lambda t: emb2_function_name(t[2]),
+            extra_sys_paths=(Path(__file__).resolve().parent,),
+        )
+
+        desc = ct.utils.MultiFunctionDescriptor()
+        default_fn: str | None = None
+        for res in results:
+            fn_name, pkg_path_str = res.value
+            desc.add_function(pkg_path_str, "main", fn_name)
+            if default_fn is None:
+                default_fn = fn_name
+        assert default_fn is not None
+        desc.default_function_name = default_fn
+
+        merged_pkg = tmp_root / "emb2_merged.mlpackage"
+        ct.utils.save_multifunction(desc, str(merged_pkg))
+        compiled_tmp = Path(ct.utils.compile_model(str(merged_pkg)))
+        try:
+            atomic_publish_dir(compiled_tmp, out_mlmodelc, move=True)
+        except Exception:
+            shutil.rmtree(compiled_tmp, ignore_errors=True)
+            raise
+
+    for s in seq_lens:
+        link_p = out_dir / f"emb2_pk_s{int(s)}_w8.mlmodelc"
+        if link_p == out_mlmodelc:
+            continue
+        if link_p.exists() or link_p.is_symlink():
+            if link_p.is_symlink() or link_p.is_file():
+                link_p.unlink()
+            else:
+                shutil.rmtree(link_p)
+        os.symlink(out_mlmodelc.name, link_p)
+
+    print(
+        f"Built multifunction {bundle_name} ({len(seq_lens)} functions) in {time.perf_counter() - t0:.2f}s -> {out_mlmodelc}",
+        flush=True,
+    )
+    return out_mlmodelc
 
 
 def build_cpu_mix_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path:
@@ -279,33 +407,51 @@ def build_cpu_mix_w8(S: int, w: dict[str, np.ndarray], out_dir: Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build EmbeddingGemma-2 ANE + CPU-SME CoreML bundles.")
+    parser = argparse.ArgumentParser(description="Build EmbeddingGemma-2 W8A16 multifunction ANE CoreML bundle.")
     parser.add_argument("--home", type=Path, default=repo_root())
-    parser.add_argument("--mode", choices=("all", "ane", "cpu"), default="all")
+    parser.add_argument("--mode", choices=("ane", "all", "cpu"), default="ane")
     parser.add_argument("--seq-lens", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--separate-buckets",
+        action="store_true",
+        help="Emit individual emb2_pk_s{S}_w8.mlmodelc directories instead of unified emb2_ane_w8.mlmodelc.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help=f"Parallel CoreML worker processes (default: min(4, cpu_count)={default_compile_jobs()}).",
+    )
     args = parser.parse_args()
 
     home = args.home.resolve()
     weights_npz = home / "artifacts" / "weights" / "embeddinggemma_2_f16.npz"
     out_dir = home / "artifacts" / "ane_models"
     out_dir.mkdir(parents=True, exist_ok=True)
-    w = dict(np.load(weights_npz))
+    eff_jobs = default_compile_jobs(args.jobs)
 
     if args.mode in ("all", "ane"):
         seqs = tuple(args.seq_lens) if args.seq_lens else DEFAULT_ANE_SEQS
-        for s in seqs:
-            dst = build_ane_packed_w8(s, w, out_dir)
-            print(f"Built {dst}")
+        if args.separate_buckets:
+            tasks = [(str(weights_npz.resolve()), str(out_dir.resolve()), int(s)) for s in seqs]
+            results = compile_buckets_parallel(
+                tasks,
+                _compile_ane_bucket_task,
+                max_workers=eff_jobs,
+                label_fn=lambda t: f"emb2_pk_s{t[2]}_w8",
+                extra_sys_paths=(Path(__file__).resolve().parent,),
+            )
+            for res in results:
+                print(f"Built {res.value}")
+        else:
+            build_ane_multifunction_w8(weights_npz, out_dir, seqs, jobs=eff_jobs)
 
     if args.mode in ("all", "cpu"):
+        w = dict(np.load(weights_npz))
         seqs = tuple(args.seq_lens) if args.seq_lens else DEFAULT_CPU_SEQS
         for s in seqs:
             dst = build_cpu_mix_w8(s, w, out_dir)
             print(f"Built {dst}")
-
-    tmp_pkg = out_dir / "_tmp_packages"
-    if tmp_pkg.exists():
-        shutil.rmtree(tmp_pkg, ignore_errors=True)
 
 
 if __name__ == "__main__":

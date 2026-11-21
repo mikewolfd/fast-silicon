@@ -14,8 +14,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -37,13 +39,17 @@ from .ir_dtype_guard import (
 FP16_MIN_NORMAL = float(np.finfo(np.float16).tiny)  # 2^-14 = 6.103515625e-5
 DEFAULT_BLOCK_SIZE = 32
 VALID_COREAI_PRESETS: tuple[str, ...] = ("fp16", "w8", "w4", "w4_per_block", "fp4_fp8")
+_QWEN35_SMALL_GDN_RE = re.compile(
+    r"(?:qwen\s*3[._-]?5|kev)[._\s-]*(?:0[._]?8|2)\s*b(?![0-9a-z])",
+    re.IGNORECASE,
+)
 
 _PRESET_NOMINAL_BITS: dict[str, float] = {
     "fp16": 16.0,
     "w8": 8.0,
     "w4": 4.0,
     "w4_per_block": 4.0,
-    "fp4_fp8": 8.0,
+    "fp4_fp8": 4.0,
 }
 
 
@@ -164,6 +170,21 @@ def inspect_coreml_bundle_placement(
     )
 
 
+def _is_qwen35_small_gdn_model(model_name: str | None) -> bool:
+    """Return True when `model_name` identifies Qwen3.5-{0.8B, 2B} / Kev-0.8B GDN models."""
+    if not model_name:
+        return False
+    return bool(_QWEN35_SMALL_GDN_RE.search(str(model_name)))
+
+
+def _has_gdn_module_exclusion(excluded_modules: Sequence[str]) -> bool:
+    for mod in excluded_modules:
+        low = str(mod).lower()
+        if "linear_attn" in low or "gated_delta" in low or "gdn" in low:
+            return True
+    return False
+
+
 def build_coreai_opt_config(
     *,
     preset: str = "w4_per_block",
@@ -174,44 +195,41 @@ def build_coreai_opt_config(
     weight_shapes: Mapping[str, tuple[int, ...]] | None = None,
     block_axis: int = 1,
     os_version: str | None = None,
+    model_name: str | None = None,
     allow_experimental_coreml_w4_block: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Build a Pattern-7 & export-backend guarded `coreai_opt.quantization.QuantizerConfig`."""
-    import torch
-    from coreai_opt import ExportBackend
-    from coreai_opt.quantization import (
-        ModuleQuantizerConfig,
-        QuantizationSpec,
-        QuantizerConfig,
-    )
-
     preset_norm = preset.strip().lower()
     if preset_norm not in VALID_COREAI_PRESETS:
         raise ValueError(f"Unsupported preset={preset!r}; choose from {VALID_COREAI_PRESETS}")
 
     backend_norm = export_backend.strip().lower()
-    if backend_norm == "coreml":
-        eb = ExportBackend.CoreML
-    elif backend_norm == "coreai":
-        eb = ExportBackend.CoreAI
-    elif backend_norm == "torch":
-        eb = ExportBackend.Torch
-    else:
+    if backend_norm not in ("coreml", "coreai", "torch"):
         raise ValueError(f"Unsupported export_backend={export_backend!r}")
 
     probe = probe_core_ai_support(
         hw={"system": "Darwin", "machine": "arm64", "macos_version": os_version} if os_version else None
     )
-    if preset_norm == "w4_per_block" and eb == ExportBackend.CoreML and not allow_experimental_coreml_w4_block:
+    if preset_norm == "w4_per_block" and backend_norm == "coreml" and not allow_experimental_coreml_w4_block:
         raise ValueError(
             "preset='w4_per_block' on export_backend='coreml' produces corrupted CoreML logits and CPU "
             "fallback on ios18.conv (use preset='w8' for CoreML, preset='w4_per_block' with "
             "export_backend='coreai', or pass allow_experimental_coreml_w4_block=True)"
         )
-    if preset_norm == "fp4_fp8" and eb == ExportBackend.CoreML:
+    if preset_norm == "fp4_fp8" and backend_norm == "coreml":
         raise ValueError("preset='fp4_fp8' requires export_backend='coreai' (CoreML target does not support FP4/FP8)")
     if preset_norm == "fp4_fp8" and os_version is not None and not probe["fp4_fp8_preset_eligible"]:
         raise ValueError(f"preset='fp4_fp8' requires macOS 27.2+, detected {os_version!r}")
+    if (
+        preset_norm == "fp4_fp8"
+        and _is_qwen35_small_gdn_model(model_name)
+        and not _has_gdn_module_exclusion(excluded_modules)
+    ):
+        raise ValueError(
+            f"Blanket preset='fp4_fp8' is blocked on {model_name!r} (Qwen3.5-{{0.8B, 2B}}) because "
+            "per-tensor FP8 activation quantization overflows GatedDeltaNet (GDN) layers to 100% NaN; "
+            "keep activations in BF16 or exclude linear_attn/GDN modules."
+        )
 
     checked_dtypes = list(requested_dtypes)
     if not checked_dtypes:
@@ -231,6 +249,21 @@ def build_coreai_opt_config(
             f"not on export_backend={backend_norm!r}."
         )
 
+    import torch
+    from coreai_opt import ExportBackend
+    from coreai_opt.quantization import (
+        ModuleQuantizerConfig,
+        QuantizationSpec,
+        QuantizerConfig,
+    )
+
+    if backend_norm == "coreml":
+        eb = ExportBackend.CoreML
+    elif backend_norm == "coreai":
+        eb = ExportBackend.CoreAI
+    else:
+        eb = ExportBackend.Torch
+
     eff_excluded = set(excluded_modules)
     skipped_non_divisible: dict[str, tuple[int, int]] = {}
     if preset_norm == "w4_per_block" and weight_shapes is not None:
@@ -240,22 +273,56 @@ def build_coreai_opt_config(
             skipped_non_divisible = bad
             eff_excluded.update(bad.keys())
 
+    eff_weight_dtype: str | None = None
+    eff_activation_dtype: str | None = None
     if preset_norm == "fp16":
         cfg = QuantizerConfig()
+        eff_weight_dtype = "float16"
     elif preset_norm == "w8":
         cfg = QuantizerConfig.presets.w8()
+        eff_weight_dtype = "int8"
     elif preset_norm == "w4":
         cfg = QuantizerConfig.presets.w4()
+        eff_weight_dtype = "int4"
     elif preset_norm == "w4_per_block":
         cfg = QuantizerConfig.presets.w4_per_block(block_size=int(block_size), axis=block_axis)
+        eff_weight_dtype = "int4"
     else:
-        cfg = QuantizerConfig().set_global(
-            ModuleQuantizerConfig(
-                op_state_spec={"weight": QuantizationSpec(dtype=torch.float8_e4m3fn)},
-                op_input_spec={"*": None},
-                op_output_spec={"*": None},
-            )
-        )
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+
+        w_spec: Any = None
+        if fp4_dtype is not None:
+            try:
+                w_spec = QuantizationSpec(dtype=fp4_dtype)
+                eff_weight_dtype = str(fp4_dtype)
+            except (TypeError, ValueError):
+                w_spec = None
+        if w_spec is None and fp8_dtype is not None:
+            w_spec = QuantizationSpec(dtype=fp8_dtype)
+            eff_weight_dtype = str(fp8_dtype)
+
+        act_spec: Any = None
+        if fp8_dtype is not None:
+            try:
+                act_spec = QuantizationSpec(dtype=fp8_dtype)
+                eff_activation_dtype = str(fp8_dtype)
+            except (TypeError, ValueError):
+                act_spec = None
+
+        mod_kw: dict[str, Any] = {
+            "op_state_spec": {"weight": w_spec},
+            "op_input_spec": {"*": act_spec},
+            "op_output_spec": {"*": act_spec},
+        }
+        try:
+            mod_params = inspect.signature(ModuleQuantizerConfig).parameters
+            if "kv_cache_spec" in mod_params and act_spec is not None:
+                mod_kw["kv_cache_spec"] = act_spec
+        except (TypeError, ValueError):
+            pass
+
+        cfg = QuantizerConfig().set_global(ModuleQuantizerConfig(**mod_kw))
 
     # Graph mode validates module_name_configs entries strictly as ModuleQuantizerConfig (None raises AttributeError).
     noop_mod_cfg = ModuleQuantizerConfig(
@@ -273,6 +340,8 @@ def build_coreai_opt_config(
         "excluded_modules": sorted(eff_excluded),
         "skipped_non_divisible": {k: list(v) for k, v in skipped_non_divisible.items()},
         "checked_dtypes": [str(x) for x in checked_dtypes],
+        "weight_dtype": eff_weight_dtype,
+        "activation_dtype": eff_activation_dtype,
     }
     return cfg, meta
 
@@ -324,6 +393,7 @@ def run_coreai_opt_calibration_and_export(
         requested_dtypes=requested_dtypes,
         weight_shapes=weight_shapes,
         block_axis=block_axis,
+        model_name=model_name,
         allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
     )
 

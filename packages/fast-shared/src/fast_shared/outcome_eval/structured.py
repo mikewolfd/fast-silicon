@@ -11,7 +11,6 @@ import time
 from typing import Any, Mapping, Sequence
 import unicodedata
 
-import jsonschema
 import numpy as np
 
 from .chat_reasoning import repeat_4gram_rate
@@ -285,11 +284,196 @@ def _score_node(pred: Any, gold: Any, schema: Mapping[str, Any], root: Mapping[s
     return 1.0 if pred == gold else 0.0
 
 
-def validate_against_jsonschema(obj: Any, schema_obj: Mapping[str, Any]) -> bool:
-    """Validate ``obj`` against ``schema_obj`` via ``jsonschema`` (returns ``False`` on any violation)."""
-    try:
-        jsonschema.validate(instance=obj, schema=dict(schema_obj))
+def _json_equal(lhs: Any, rhs: Any) -> bool:
+    """JSON value equality distinguishing booleans from numeric 0/1."""
+    if isinstance(lhs, bool) != isinstance(rhs, bool):
+        return False
+    if isinstance(lhs, list) and isinstance(rhs, list):
+        return len(lhs) == len(rhs) and all(_json_equal(a, b) for a, b in zip(lhs, rhs))
+    if isinstance(lhs, Mapping) and isinstance(rhs, Mapping):
+        return set(lhs.keys()) == set(rhs.keys()) and all(_json_equal(lhs[k], rhs[k]) for k in lhs)
+    return bool(lhs == rhs)
+
+
+def _matches_json_type(val: Any, type_name: str) -> bool:
+    if type_name == "null":
+        return val is None
+    if type_name == "boolean":
+        return isinstance(val, bool)
+    if type_name == "integer":
+        return isinstance(val, int) and not isinstance(val, bool)
+    if type_name == "number":
+        return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val))
+    if type_name == "string":
+        return isinstance(val, str)
+    if type_name == "array":
+        return isinstance(val, list)
+    if type_name == "object":
+        return isinstance(val, Mapping)
+    return False
+
+
+def _resolve_json_pointer(ref: str, root: Mapping[str, Any]) -> tuple[bool, Any]:
+    if ref == "#":
+        return True, root
+    if not ref.startswith("#/"):
+        return False, None
+    cur: Any = root
+    for raw_part in ref[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, Mapping) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return False, None
+    return True, cur
+
+
+def _validate_jsonschema_fallback(
+    val: Any,
+    node: Any,
+    root: Mapping[str, Any],
+    *,
+    _depth: int = 0,
+) -> bool:
+    """Pure-Python Draft-7 / Draft-2020-12 JSON Schema validator when optional `jsonschema` is absent."""
+    if _depth > 128:
+        return False
+    if isinstance(node, bool):
+        return node
+    if not isinstance(node, Mapping):
         return True
+
+    if "$ref" in node and isinstance(node["$ref"], str):
+        ok_ref, target = _resolve_json_pointer(node["$ref"], root)
+        if not ok_ref or not _validate_jsonschema_fallback(val, target, root, _depth=_depth + 1):
+            return False
+        siblings = {k: v for k, v in node.items() if k != "$ref"}
+        if siblings:
+            return _validate_jsonschema_fallback(val, siblings, root, _depth=_depth + 1)
+        return True
+
+    if "allOf" in node:
+        subs = node["allOf"]
+        if not isinstance(subs, list) or not all(
+            _validate_jsonschema_fallback(val, s, root, _depth=_depth + 1) for s in subs
+        ):
+            return False
+    if "anyOf" in node:
+        subs = node["anyOf"]
+        if not isinstance(subs, list) or not any(
+            _validate_jsonschema_fallback(val, s, root, _depth=_depth + 1) for s in subs
+        ):
+            return False
+    if "oneOf" in node:
+        subs = node["oneOf"]
+        if not isinstance(subs, list):
+            return False
+        matches = sum(1 for s in subs if _validate_jsonschema_fallback(val, s, root, _depth=_depth + 1))
+        if matches != 1:
+            return False
+    if "not" in node:
+        if _validate_jsonschema_fallback(val, node["not"], root, _depth=_depth + 1):
+            return False
+
+    if "const" in node and not _json_equal(val, node["const"]):
+        return False
+    if "enum" in node:
+        opts = node["enum"]
+        if not isinstance(opts, list) or not any(_json_equal(val, cand) for cand in opts):
+            return False
+
+    if "type" in node:
+        t_spec = node["type"]
+        if isinstance(t_spec, str):
+            if not _matches_json_type(val, t_spec):
+                return False
+        elif isinstance(t_spec, list):
+            if not any(_matches_json_type(val, str(t)) for t in t_spec):
+                return False
+        else:
+            return False
+
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if not math.isfinite(float(val)):
+            return False
+        if "minimum" in node and val < node["minimum"]:
+            return False
+        if "maximum" in node and val > node["maximum"]:
+            return False
+        if isinstance(node.get("exclusiveMinimum"), (int, float)) and val <= node["exclusiveMinimum"]:
+            return False
+        if isinstance(node.get("exclusiveMaximum"), (int, float)) and val >= node["exclusiveMaximum"]:
+            return False
+
+    if isinstance(val, str):
+        if "minLength" in node and len(val) < int(node["minLength"]):
+            return False
+        if "maxLength" in node and len(val) > int(node["maxLength"]):
+            return False
+        if "pattern" in node and not re.search(str(node["pattern"]), val):
+            return False
+
+    if isinstance(val, list):
+        if "minItems" in node and len(val) < int(node["minItems"]):
+            return False
+        if "maxItems" in node and len(val) > int(node["maxItems"]):
+            return False
+        if "items" in node:
+            it_spec = node["items"]
+            if isinstance(it_spec, (Mapping, bool)):
+                if not all(_validate_jsonschema_fallback(el, it_spec, root, _depth=_depth + 1) for el in val):
+                    return False
+            elif isinstance(it_spec, list):
+                for el, sub_s in zip(val, it_spec):
+                    if not _validate_jsonschema_fallback(el, sub_s, root, _depth=_depth + 1):
+                        return False
+
+    if isinstance(val, Mapping):
+        req = node.get("required")
+        if isinstance(req, list):
+            for rk in req:
+                if rk not in val:
+                    return False
+        if "minProperties" in node and len(val) < int(node["minProperties"]):
+            return False
+        if "maxProperties" in node and len(val) > int(node["maxProperties"]):
+            return False
+        props = node.get("properties")
+        prop_map = props if isinstance(props, Mapping) else {}
+        has_ap = "additionalProperties" in node
+        ap_spec = node.get("additionalProperties", True)
+        for k, v in val.items():
+            if k in prop_map:
+                if not _validate_jsonschema_fallback(v, prop_map[k], root, _depth=_depth + 1):
+                    return False
+            elif has_ap:
+                if ap_spec is False:
+                    return False
+                if isinstance(ap_spec, (Mapping, bool)) and not _validate_jsonschema_fallback(
+                    v, ap_spec, root, _depth=_depth + 1
+                ):
+                    return False
+    return True
+
+
+def validate_against_jsonschema(obj: Any, schema_obj: Mapping[str, Any]) -> bool:
+    """Validate ``obj`` against ``schema_obj`` via ``jsonschema`` or pure-Python Draft-7/2020-12 fallback."""
+    try:
+        import jsonschema as _js_mod
+    except ImportError:
+        _js_mod = None
+
+    sch = dict(schema_obj)
+    if _js_mod is not None:
+        try:
+            _js_mod.validate(instance=obj, schema=sch)
+            return True
+        except Exception:
+            return False
+    try:
+        return _validate_jsonschema_fallback(obj, sch, sch)
     except Exception:
         return False
 
@@ -459,6 +643,7 @@ def build_bfcl_response_schema(functions: Sequence[Mapping[str, Any]]) -> dict[s
             "tool_calls": {
                 "type": "array",
                 "items": item_schema,
+                "maxItems": 8,
             }
         },
         "required": ["tool_calls"],
@@ -822,11 +1007,16 @@ def evaluate_jsonschemabench_compiler(
     *,
     llguidance_tokenizer: Any | None = None,
     whitespace_flexible: bool = False,
+    coerce_one_of: bool = True,
 ) -> dict[str, Any]:
     """Measure ``llguidance`` Grammar Compilation Time (GCT p50/p99 ms), keyword coverage, and ``ff_q`` jumps."""
     import llguidance
 
-    compiler = llguidance.JsonCompiler(separators=(",", ":"), whitespace_flexible=whitespace_flexible)
+    compiler = llguidance.JsonCompiler(
+        separators=(",", ":"),
+        whitespace_flexible=whitespace_flexible,
+        coerce_one_of=bool(coerce_one_of),
+    )
     gct_ms: list[float] = []
     compile_ok = 0
     upfront_ff_counts: list[int] = []

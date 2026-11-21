@@ -863,11 +863,11 @@ def test_p2_p3_paths_fingerprint_resolve_home_and_drain_slack_cpu(tmp_path: Path
         resolved_h = resolve_home()
     assert resolved_h == (art_root / "fast-gemma4").resolve()
 
-    # Without FAST_ARTIFACTS_ROOT, falls back to ~/.cache/fast-gemma4 (NOT bare source package!)
+    # Without FAST_ARTIFACTS_ROOT, falls back to user cache dir (NOT bare source package!)
     monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
     with patch.object(fg4_paths, "__file__", str(fake_file)):
         resolved_cache = resolve_home()
-    assert resolved_cache == (Path("~/.cache") / "fast-gemma4").expanduser().resolve()
+    assert resolved_cache == (Path.home() / ".cache" / "fast-gemma4").resolve()
 
     # 3. `k <= 16` / `drain_slack` guard in forward_early14_slot & forward_ff_jump_slot
     m = FastGemma4Model.__new__(FastGemma4Model)

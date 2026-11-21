@@ -1,18 +1,26 @@
-"""Pure-ANE `W8A16` typed-question scorer for `convaiinnovations/laya-typed-decisions`."""
+"""Pure-ANE `W8A16` / zero-compile `NMTZ` typed-question scorer for `convaiinnovations/laya-typed-decisions`."""
 
 from __future__ import annotations
 
 import ctypes
 import json
 from pathlib import Path
+import struct
 import threading
 from typing import Any, Callable, Literal, Mapping
 import warnings
 
 from ._common import softmax_2, softmax_vec
-from .paths import ensure_laya_dylib, resolve_laya_dir
+from .paths import (
+    DEFAULT_LAYA_NMTZ_COREML_REPO,
+    DEFAULT_LAYA_REPO,
+    ensure_laya_dylib,
+    resolve_laya_dir,
+)
 
 _QTYPES = {"choice": 0, "score": 1, "noul": 2}
+_CANDIDATE_SEQ_LENS: tuple[int, ...] = (64, 128, 192, 256, 384, 512, 640, 1024)
+_NMTZ_SEQ_LENS: tuple[int, ...] = (192, 384, 512, 640)
 
 # Compute unit mode constants aligned 1:1 with `fast_shared::ComputeMode` & `laya_ane_runner.h`.
 COMPUTE_MODE_CPU_AND_ANE = 0
@@ -23,6 +31,38 @@ COMPUTE_MODE_ALL = 2
 def _tok_id_or_default(tok: Any, piece: str, default: int) -> int:
     tid = tok.token_to_id(piece)
     return default if tid is None else int(tid)
+
+
+def _read_safetensors_fp16_pair_cpu(sf_path: Path) -> tuple[Any, Any]:
+    """Read `tok_embeddings.weight` & `type_emb.weight` as contiguous FP16 NumPy arrays with zero Metal/GPU alloc."""
+    import numpy as np
+
+    with open(sf_path, "rb") as fp:
+        raw_h = fp.read(8)
+        if len(raw_h) < 8:
+            raise ValueError(f"Truncated safetensors file: {sf_path}")
+        h_len = struct.unpack("<Q", raw_h)[0]
+        hdr = json.loads(fp.read(h_len).decode("utf-8"))
+        data_off = 8 + h_len
+
+        def _read_f16(key: str) -> Any:
+            info = hdr[key]
+            dt_tag = str(info["dtype"]).upper()
+            shape = tuple(int(d) for d in info["shape"])
+            start, end = int(info["data_offsets"][0]), int(info["data_offsets"][1])
+            fp.seek(data_off + start)
+            buf = fp.read(end - start)
+            if dt_tag == "F16":
+                return np.ascontiguousarray(np.frombuffer(buf, dtype="<f2").reshape(shape).copy(), dtype=np.float16)
+            if dt_tag == "F32":
+                return np.ascontiguousarray(np.frombuffer(buf, dtype="<f4").reshape(shape).astype(np.float16))
+            if dt_tag == "BF16":
+                u16 = np.frombuffer(buf, dtype="<u2")
+                f32 = (u16.astype(np.uint32) << 16).view(np.float32).reshape(shape)
+                return np.ascontiguousarray(f32.astype(np.float16))
+            raise ValueError(f"Unsupported embedding dtype {dt_tag!r} in {sf_path}")
+
+        return _read_f16("encoder.embeddings.tok_embeddings.weight"), _read_f16("type_emb.weight")
 
 
 class LayaTokenizerHelper:
@@ -149,12 +189,7 @@ class LayaTokenizerHelper:
         max_len: int | None = None,
         on_truncate: Literal["warn", "error", "ignore"] = "warn",
     ) -> dict[str, Any]:
-        """Encode one typed question (`noul`, `choice`, `score`) + state into token ids & option markers.
-
-        `Laya-Typed-421M` ANE buckets are fixed at `S <= 512` (`self.max_len`). When the encoded
-        question + state exceeds `eff_max`, `on_truncate` controls behavior (`"warn"` emits a
-        `UserWarning`, `"error"` raises `ValueError`, `"ignore"` truncates silently).
-        """
+        """Encode one typed question (`noul`, `choice`, `score`) + state into token ids & option markers."""
         if on_truncate not in ("warn", "error", "ignore"):
             raise ValueError(f"Unsupported on_truncate={on_truncate!r}; expected 'warn', 'error', or 'ignore'.")
         eff_max = min(self.max_len, int(max_len)) if max_len is not None else self.max_len
@@ -231,7 +266,7 @@ class LayaTokenizerHelper:
 
 
 class LayaAneBackend(LayaTokenizerHelper):
-    """Zero-GPU CoreML ANE `W8A16` runner (`S=256` & `S=512` buckets, `[1585, 0, 0]` ops on ANE)."""
+    """Zero-GPU CoreML ANE runner supporting 6-bucket multifunction W8, legacy 256/512 W8, & prebuilt `NMTZ` CoreML."""
 
     @classmethod
     def from_tokenizer_only(
@@ -254,6 +289,63 @@ class LayaAneBackend(LayaTokenizerHelper):
             head_max_len_cap=head_max_len_cap,
         )
 
+    def _bind_native_lib(self) -> None:
+        lib = ctypes.CDLL(str(self.dylib_path))
+        lib.laya_ane_compile_mlpackage.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.laya_ane_compile_mlpackage.restype = ctypes.c_int
+        lib.laya_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        lib.laya_ane_inspect_plan_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.laya_ane_load_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.laya_ane_load_fn.restype = ctypes.c_void_p
+        lib.laya_ane_max_markers.argtypes = [ctypes.c_void_p]
+        lib.laya_ane_max_markers.restype = ctypes.c_int
+        lib.laya_ane_exec_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.laya_ane_exec_batch.restype = ctypes.c_double
+        lib.laya_ane_exec_markers_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.laya_ane_exec_markers_batch.restype = ctypes.c_double
+        self._has_last_error = hasattr(lib, "laya_ane_last_error")
+        if self._has_last_error:
+            lib.laya_ane_last_error.argtypes = [ctypes.c_void_p]
+            lib.laya_ane_last_error.restype = ctypes.c_char_p
+        lib.laya_ane_free.argtypes = [ctypes.c_void_p]
+        self._lib = lib
+
     def __init__(
         self,
         laya_dir: Path | str | None = None,
@@ -261,92 +353,223 @@ class LayaAneBackend(LayaTokenizerHelper):
         *,
         pipe_depth: int = 4,
         compute_mode: int = COMPUTE_MODE_CPU_AND_ANE,
+        auto_prebuilt: bool = True,
+        local_files_only: bool = False,
+        nmtz_repo_id: str = DEFAULT_LAYA_NMTZ_COREML_REPO,
+        laya_src_repo_id: str = DEFAULT_LAYA_REPO,
+        max_len: int = 512,
     ) -> None:
+        import os
         import numpy as np
 
         self._np = np
         self._exec_lock = threading.Lock()
+        self._handles: dict[int, Any] = {}
+        self._bucket_sources: dict[int, tuple[Path, str]] = {}
+        eff_offline = bool(local_files_only) or (
+            os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+        )
         resolved_dir = Path(laya_dir).expanduser().resolve() if laya_dir is not None else resolve_laya_dir()
         self.dylib_path = (
             Path(dylib_path).expanduser().resolve() if dylib_path is not None else ensure_laya_dylib()
         )
         self.pipe_depth = max(1, int(pipe_depth))
         self.compute_mode = int(compute_mode)
+        self._bind_native_lib()
 
-        cfg = json.loads((resolved_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
-        tok_path = resolved_dir / "tokenizer" / "tokenizer.json"
-        super().__init__(tok_path, rl_agent_config=cfg, laya_dir=resolved_dir, max_len=512)
-        assert self.laya_dir is not None
+        has_local_mf = (resolved_dir / "laya_typed_w8.mlmodelc").is_dir()
+        has_local_s512 = (resolved_dir / "laya_typed_s512_w8.mlmodelc").exists()
+        use_nmtz = False
 
-        emb = np.load(self.laya_dir / "laya_typed_emb_f16.npz")
-        self._word_f16 = np.ascontiguousarray(emb["word_f16"])
-        self._type_f16 = np.ascontiguousarray(emb["type_f16"])
+        if has_local_mf or has_local_s512:
+            cfg = json.loads((resolved_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
+            enc_cfg_p = resolved_dir / "encoder_config.json"
+            enc_cfg = json.loads(enc_cfg_p.read_text(encoding="utf-8")) if enc_cfg_p.is_file() else {}
+            local_half = int(enc_cfg.get("local_attention", 128)) // 2
+            tok_path = resolved_dir / "tokenizer" / "tokenizer.json"
+            super().__init__(tok_path, rl_agent_config=cfg, laya_dir=resolved_dir, max_len=max_len)
+
+            emb = np.load(resolved_dir / "laya_typed_emb_f16.npz")
+            self._word_f16 = np.ascontiguousarray(emb["word_f16"])
+            self._type_f16 = np.ascontiguousarray(emb["type_f16"])
+            self.artifact_source = "local_multifunction_w8" if has_local_mf else "local_per_bucket_w8"
+        elif auto_prebuilt:
+            import shutil
+            from fast_shared.hf import resolve_hf_model_dir
+
+            snap_nmtz: Path | None = None
+            nmtz_hub_snaps = (
+                Path.home()
+                / ".cache"
+                / "huggingface"
+                / "hub"
+                / f"models--{nmtz_repo_id.replace('/', '--')}"
+                / "snapshots"
+            )
+            if nmtz_hub_snaps.is_dir():
+                for cand_s in sorted(nmtz_hub_snaps.iterdir()):
+                    if (cand_s / "L512" / "model.mlpackage").is_dir():
+                        snap_nmtz = cand_s
+            if snap_nmtz is None:
+                if eff_offline:
+                    snap_nmtz = resolve_hf_model_dir(None, nmtz_repo_id, local_files_only=True)
+                else:
+                    try:
+                        snap_nmtz = resolve_hf_model_dir(None, nmtz_repo_id, local_files_only=True)
+                    except Exception:
+                        snap_nmtz = resolve_hf_model_dir(None, nmtz_repo_id, local_files_only=False)
+
+            if eff_offline:
+                snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=True)
+            else:
+                try:
+                    snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=True)
+                except Exception:
+                    snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=False)
+
+            cfg = json.loads((snap_src / "rl_agent_config.json").read_text(encoding="utf-8"))
+            enc_cfg = json.loads((snap_src / "encoder" / "config.json").read_text(encoding="utf-8"))
+            local_half = int(enc_cfg.get("local_attention", 128)) // 2
+            tok_path = snap_src / "tokenizer" / "tokenizer.json"
+            super().__init__(tok_path, rl_agent_config=cfg, laya_dir=snap_src, max_len=max_len)
+
+            self._word_f16, self._type_f16 = _read_safetensors_fp16_pair_cpu(snap_src / "model.safetensors")
+            self.artifact_source = "nmtz_prebuilt_ane"
+            use_nmtz = True
+        else:
+            raise FileNotFoundError(
+                f"Missing ANE bundle {resolved_dir / 'laya_typed_s512_w8.mlmodelc'}. "
+                "Run 'decision-models setup-weights --build-laya-ane'."
+            )
+
         H = int(self._word_f16.shape[1])
         vocab_sz = int(self._word_f16.shape[0])
 
-        self._lib = ctypes.CDLL(str(self.dylib_path))
-        self._lib.laya_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        self._lib.laya_ane_load.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
-        self._lib.laya_ane_load.restype = ctypes.c_void_p
-        self._lib.laya_ane_exec_batch.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        self._lib.laya_ane_exec_batch.restype = ctypes.c_double
-        self._has_last_error = hasattr(self._lib, "laya_ane_last_error")
-        if self._has_last_error:
-            self._lib.laya_ane_last_error.argtypes = [ctypes.c_void_p]
-            self._lib.laya_ane_last_error.restype = ctypes.c_char_p
-        self._lib.laya_ane_free.argtypes = [ctypes.c_void_p]
+        try:
+            if use_nmtz:
+                import os
+                import shutil
 
-        mc_s256_raw = self.laya_dir / "laya_typed_s256_w8.mlmodelc"
-        mc_s512_raw = self.laya_dir / "laya_typed_s512_w8.mlmodelc"
-        self._mc_s256 = mc_s256_raw.resolve() if mc_s256_raw.exists() else mc_s256_raw
-        self._mc_s512 = mc_s512_raw.resolve() if mc_s512_raw.exists() else mc_s512_raw
-        if not self._mc_s512.exists():
-            raise FileNotFoundError(
-                f"Missing ANE bundle {self._mc_s512}. Run 'decision-models setup-weights --build-laya-ane'."
-            )
+                repo_slug = nmtz_repo_id.replace("/", "--")
+                shared_mc_dir = (
+                    Path.home() / ".cache" / "fast-silicon" / "coreml_compiled" / repo_slug / snap_nmtz.name
+                )
+                cache_mc_dir = (
+                    Path.home() / ".cache" / "fast-decision-models" / "nmtz_compiled" / snap_nmtz.name
+                )
+                cache_mc_dir.mkdir(parents=True, exist_ok=True)
+                for s_len in _NMTZ_SEQ_LENS:
+                    if s_len > max(512, self.max_len):
+                        continue
+                    pkg_p = snap_nmtz / f"L{s_len}" / "model.mlpackage"
+                    if not pkg_p.is_dir():
+                        continue
+                    shared_mc = shared_mc_dir / f"L{s_len}__model.mlmodelc"
+                    if shared_mc.is_dir() and (
+                        (shared_mc / "model.mil").is_file() or (shared_mc / "coremldata.bin").is_file()
+                    ):
+                        dst_mc = shared_mc
+                    else:
+                        dst_mc = cache_mc_dir / f"L{s_len}.mlmodelc"
+                    if not (dst_mc / "model.mil").is_file() and not (dst_mc / "coremldata.bin").is_file():
+                        # Resolve HF Hub blob symlinks via hardlinks before CoreML compilation
+                        mat_pkg = cache_mc_dir / f".stage_L{s_len}_{os.getpid()}.mlpackage"
+                        if mat_pkg.exists():
+                            shutil.rmtree(mat_pkg, ignore_errors=True)
+                        try:
+                            for root_d, _, files_d in os.walk(pkg_p):
+                                rel_d = Path(root_d).relative_to(pkg_p)
+                                (mat_pkg / rel_d).mkdir(parents=True, exist_ok=True)
+                                for fn_d in files_d:
+                                    s_f = (Path(root_d) / fn_d).resolve()
+                                    d_f = mat_pkg / rel_d / fn_d
+                                    try:
+                                        os.link(s_f, d_f)
+                                    except OSError:
+                                        shutil.copy2(s_f, d_f)
+                            rc = self._lib.laya_ane_compile_mlpackage(
+                                str(mat_pkg).encode("utf-8"), str(dst_mc).encode("utf-8")
+                            )
+                        finally:
+                            shutil.rmtree(mat_pkg, ignore_errors=True)
+                        if rc != 0:
+                            raise RuntimeError(f"Failed to compile NMTZ CoreML package {pkg_p}")
+                    h_ptr = self._lib.laya_ane_load_fn(
+                        str(dst_mc).encode("utf-8"),
+                        b"main",
+                        H,
+                        s_len,
+                        local_half,
+                        self.pipe_depth,
+                        self.compute_mode,
+                        self._word_f16.ctypes.data,
+                        vocab_sz,
+                        self._type_f16.ctypes.data,
+                        int(self.pad_id),
+                    )
+                    if h_ptr:
+                        self._handles[s_len] = h_ptr
+                        self._bucket_sources[s_len] = (dst_mc, "main")
+            elif has_local_mf:
+                mf_mc = (resolved_dir / "laya_typed_w8.mlmodelc").resolve()
+                for s_len in _CANDIDATE_SEQ_LENS:
+                    fn_str = f"s{s_len}"
+                    # Check if multifunction bundle exposes `s{s_len}` cleanly
+                    counts = (ctypes.c_int * 3)()
+                    self._lib.laya_ane_inspect_plan_fn(
+                        str(mf_mc).encode("utf-8"), fn_str.encode("utf-8"), self.compute_mode, counts
+                    )
+                    if int(counts[0]) + int(counts[1]) + int(counts[2]) <= 0:
+                        continue
+                    h_ptr = self._lib.laya_ane_load_fn(
+                        str(mf_mc).encode("utf-8"),
+                        fn_str.encode("utf-8"),
+                        H,
+                        s_len,
+                        local_half,
+                        self.pipe_depth,
+                        self.compute_mode,
+                        self._word_f16.ctypes.data,
+                        vocab_sz,
+                        self._type_f16.ctypes.data,
+                        int(self.pad_id),
+                    )
+                    if h_ptr:
+                        self._handles[s_len] = h_ptr
+                        self._bucket_sources[s_len] = (mf_mc, fn_str)
+            else:
+                for s_len in _CANDIDATE_SEQ_LENS:
+                    raw_mc = resolved_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
+                    if not raw_mc.exists():
+                        continue
+                    mc_res = raw_mc.resolve()
+                    fn_str = f"s{s_len}" if mc_res.name == "laya_typed_w8.mlmodelc" else "main"
+                    h_ptr = self._lib.laya_ane_load_fn(
+                        str(mc_res).encode("utf-8"),
+                        fn_str.encode("utf-8"),
+                        H,
+                        s_len,
+                        local_half,
+                        self.pipe_depth,
+                        self.compute_mode,
+                        self._word_f16.ctypes.data,
+                        vocab_sz,
+                        self._type_f16.ctypes.data,
+                        int(self.pad_id),
+                    )
+                    if h_ptr:
+                        self._handles[s_len] = h_ptr
+                        self._bucket_sources[s_len] = (mc_res, fn_str)
 
-        self._h512 = self._lib.laya_ane_load(
-            str(self._mc_s512).encode("utf-8"),
-            H,
-            512,
-            self.pipe_depth,
-            self.compute_mode,
-            self._word_f16.ctypes.data,
-            vocab_sz,
-            self._type_f16.ctypes.data,
-        )
-        if not self._h512:
-            raise RuntimeError(f"Failed to load ANE bundle {self._mc_s512}")
+            if not self._handles:
+                raise RuntimeError(f"Failed to load any Laya ANE CoreML buckets from {resolved_dir}")
 
-        self._h256 = None
-        if self._mc_s256.exists():
-            self._h256 = self._lib.laya_ane_load(
-                str(self._mc_s256).encode("utf-8"),
-                H,
-                256,
-                self.pipe_depth,
-                self.compute_mode,
-                self._word_f16.ctypes.data,
-                vocab_sz,
-                self._type_f16.ctypes.data,
-            )
+            self.seq_buckets: tuple[int, ...] = tuple(sorted(self._handles.keys()))
+            self._h256 = self._handles.get(256)
+            self._h512 = self._handles.get(512)
+        except Exception:
+            self.close()
+            raise
 
     def __enter__(self) -> "LayaAneBackend":
         return self
@@ -355,83 +578,169 @@ class LayaAneBackend(LayaTokenizerHelper):
         self.close()
 
     def inspect_compute_plans(self) -> dict[str, tuple[int, int, int]]:
-        """Return `{bucket: (ane_ops, gpu_ops, cpu_ops)}` from `MLComputePlan`."""
+        """Return `{bucket: (ane_ops, gpu_ops, cpu_ops)}` from `MLComputePlan` across all loaded buckets."""
         plans: dict[str, tuple[int, int, int]] = {}
-        for tag, mc in (("s256", self._mc_s256), ("s512", self._mc_s512)):
-            if mc.exists():
+        for s_len in self.seq_buckets:
+            mc_path, fn_name = self._bucket_sources[s_len]
+            if mc_path.exists():
                 counts = (ctypes.c_int * 3)()
-                self._lib.laya_ane_inspect_plan(str(mc.resolve()).encode("utf-8"), self.compute_mode, counts)
-                plans[tag] = (int(counts[0]), int(counts[1]), int(counts[2]))
+                self._lib.laya_ane_inspect_plan_fn(
+                    str(mc_path).encode("utf-8"),
+                    fn_name.encode("utf-8"),
+                    self.compute_mode,
+                    counts,
+                )
+                plans[f"s{s_len}"] = (int(counts[0]), int(counts[1]), int(counts[2]))
         return plans
 
-    def _exec_bucket(self, bucket_items: list[dict[str, Any]], S: int, handle: Any) -> Any:
+    def _select_bucket(self, seq_len: int) -> int:
+        for b in self.seq_buckets:
+            if seq_len <= b:
+                return b
+        return self.seq_buckets[-1]
+
+    def _exec_bucket_markers(
+        self,
+        bucket_items: list[dict[str, Any]],
+        S: int,
+        handle: Any,
+        *,
+        qtype_override: int | None = None,
+    ) -> list[list[float]]:
         np = self._np
         N = len(bucket_items)
+        max_m_hw = int(self._lib.laya_ane_max_markers(handle))
+        chunk_m = max_m_hw if max_m_hw > 0 else max(32, max((len(it["markers"]) for it in bucket_items), default=1))
+
         ids_np = np.full((N, S), self.pad_id, dtype=np.int32)
         vl_np = np.zeros((N,), dtype=np.int32)
         qt_np = np.zeros((N,), dtype=np.int32)
+        valid_markers_per_item: list[list[int]] = []
         for i, it in enumerate(bucket_items):
             ln = min(S, len(it["ids"]))
             ids_np[i, :ln] = it["ids"][:ln]
             vl_np[i] = ln
-            qt_np[i] = it["qtype"]
-        out_pos = np.empty((N, S), dtype=np.float32)
-        with self._exec_lock:
-            dt = self._lib.laya_ane_exec_batch(
-                handle,
-                N,
-                ids_np.ctypes.data,
-                vl_np.ctypes.data,
-                qt_np.ctypes.data,
-                out_pos.ctypes.data,
-                1 if N > 1 else 0,
-            )
-            if dt < 0.0:
-                err_msg = ""
-                if self._has_last_error:
-                    raw = self._lib.laya_ane_last_error(handle)
-                    if raw:
-                        err_msg = raw.decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"Laya ANE CoreML prediction failed (bucket S={S}, N={N}): {err_msg or 'unknown error'}"
+            qt_np[i] = int(qtype_override) if qtype_override is not None else int(it["qtype"])
+            valid_markers_per_item.append([int(m) for m in it["markers"] if int(m) < S])
+
+        max_k_all = max((len(vm) for vm in valid_markers_per_item), default=0)
+        if max_k_all == 0:
+            return [[] for _ in bucket_items]
+
+        if max_k_all <= chunk_m:
+            mp_np = np.zeros((N, chunk_m), dtype=np.int32)
+            mc_np = np.zeros((N,), dtype=np.int32)
+            for i, vm in enumerate(valid_markers_per_item):
+                if vm:
+                    mp_np[i, : len(vm)] = vm
+                    mc_np[i] = len(vm)
+            out_m = np.zeros((N, chunk_m), dtype=np.float32)
+            with self._exec_lock:
+                dt = self._lib.laya_ane_exec_markers_batch(
+                    handle,
+                    N,
+                    ids_np.ctypes.data,
+                    vl_np.ctypes.data,
+                    qt_np.ctypes.data,
+                    mp_np.ctypes.data,
+                    mc_np.ctypes.data,
+                    chunk_m,
+                    out_m.ctypes.data,
+                    1 if N > 1 else 0,
                 )
-        return out_pos
+                if dt < 0.0:
+                    err_msg = ""
+                    if self._has_last_error:
+                        raw = self._lib.laya_ane_last_error(handle)
+                        if raw:
+                            err_msg = raw.decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Laya ANE CoreML prediction failed (bucket S={S}, N={N}): {err_msg or 'unknown error'}"
+                    )
+            return [[float(x) for x in out_m[i, : len(valid_markers_per_item[i])].tolist()] for i in range(N)]
+
+        # Rare >32-option fallback: slice option markers into `chunk_m`-wide passes without dropping options
+        acc_logits: list[list[float]] = [[] for _ in range(N)]
+        for m0 in range(0, max_k_all, chunk_m):
+            active = [i for i, vm in enumerate(valid_markers_per_item) if len(vm) > m0]
+            n_act = len(active)
+            sub_ids = np.ascontiguousarray(ids_np[active])
+            sub_vl = np.ascontiguousarray(vl_np[active])
+            sub_qt = np.ascontiguousarray(qt_np[active])
+            mp_np = np.zeros((n_act, chunk_m), dtype=np.int32)
+            mc_np = np.zeros((n_act,), dtype=np.int32)
+            for a_i, orig_i in enumerate(active):
+                sl = valid_markers_per_item[orig_i][m0 : m0 + chunk_m]
+                mp_np[a_i, : len(sl)] = sl
+                mc_np[a_i] = len(sl)
+            out_m = np.zeros((n_act, chunk_m), dtype=np.float32)
+            with self._exec_lock:
+                dt = self._lib.laya_ane_exec_markers_batch(
+                    handle,
+                    n_act,
+                    sub_ids.ctypes.data,
+                    sub_vl.ctypes.data,
+                    sub_qt.ctypes.data,
+                    mp_np.ctypes.data,
+                    mc_np.ctypes.data,
+                    chunk_m,
+                    out_m.ctypes.data,
+                    1 if n_act > 1 else 0,
+                )
+                if dt < 0.0:
+                    raise RuntimeError(f"Laya ANE multi-chunk marker pass failed (bucket S={S})")
+            for a_i, orig_i in enumerate(active):
+                cnt = int(mc_np[a_i])
+                acc_logits[orig_i].extend(float(x) for x in out_m[a_i, :cnt].tolist())
+        return acc_logits
 
     def _score_buckets(
         self,
         encoded_items: list[dict[str, Any]],
-        row_fn: Callable[[Any, dict[str, Any], int], Any],
+        row_fn: Callable[[list[float], dict[str, Any]], Any],
         *,
         default_factory: Callable[[], Any],
+        qtype_override: int | None = None,
     ) -> list[Any]:
         if not encoded_items:
             return []
         results = [default_factory() for _ in encoded_items]
-        idx_256: list[int] = []
-        idx_512: list[int] = []
+        by_bucket: dict[int, list[int]] = {s: [] for s in self.seq_buckets}
         for idx, it in enumerate(encoded_items):
-            if self._h256 is not None and len(it["ids"]) <= 256:
-                idx_256.append(idx)
-            else:
-                idx_512.append(idx)
-        for indices, S_lim, handle in ((idx_256, 256, self._h256), (idx_512, 512, self._h512)):
-            if not indices or handle is None:
+            b_len = self._select_bucket(len(it["ids"]))
+            by_bucket[b_len].append(idx)
+
+        for s_lim in self.seq_buckets:
+            indices = by_bucket[s_lim]
+            if not indices:
                 continue
-            out_mat = self._exec_bucket([encoded_items[i] for i in indices], S_lim, handle)
+            handle = self._handles[s_lim]
+            raw_marker_logits = self._exec_bucket_markers(
+                [encoded_items[i] for i in indices],
+                s_lim,
+                handle,
+                qtype_override=qtype_override,
+            )
             for b_i, orig_i in enumerate(indices):
-                results[orig_i] = row_fn(out_mat[b_i], encoded_items[orig_i], S_lim)
+                results[orig_i] = row_fn(raw_marker_logits[b_i], encoded_items[orig_i])
         return results
 
     def score_noul_batch(self, encoded_items: list[dict[str, Any]]) -> list[float]:
-        """Execute ANE inference across `S=256` / `S=512` buckets and return `P(true)` per item."""
+        """Execute ANE inference across tightest available buckets and return `P(true)` per item."""
         temp = self._resolve_temperature(2, 2)
 
-        def _row_p_true(row_arr: Any, item: dict[str, Any], _s_lim: int) -> float:
-            mk = item["markers"]
-            _, p1 = softmax_2(float(row_arr[mk[0]]), float(row_arr[mk[1]]), temp)
+        def _row_p_true(marker_logits: list[float], _item: dict[str, Any]) -> float:
+            if len(marker_logits) < 2:
+                return 0.5
+            _, p1 = softmax_2(marker_logits[0], marker_logits[1], temp)
             return p1
 
-        return self._score_buckets(encoded_items, _row_p_true, default_factory=lambda: 0.5)
+        return self._score_buckets(
+            encoded_items,
+            _row_p_true,
+            default_factory=lambda: 0.5,
+            qtype_override=2,
+        )
 
     def score_choice_batch(
         self,
@@ -441,13 +750,12 @@ class LayaAneBackend(LayaTokenizerHelper):
     ) -> list[list[float]]:
         """Execute ANE `Choice(K)` / `Score(K)` inference and return calibrated option probabilities."""
 
-        def _row_probs(row_arr: Any, item: dict[str, Any], S_lim: int) -> list[float]:
-            valid_mk = [m for m in item["markers"] if m < S_lim]
-            k = len(valid_mk)
+        def _row_probs(marker_logits: list[float], item: dict[str, Any]) -> list[float]:
+            k = len(marker_logits)
             if k == 0:
                 return []
             t_val = self._resolve_temperature(int(item["qtype"]), k, temperature_override)
-            return softmax_vec([float(row_arr[m]) for m in valid_mk], t_val, min_temp=0.05)
+            return softmax_vec(marker_logits, t_val, min_temp=0.05)
 
         return self._score_buckets(encoded_items, _row_probs, default_factory=list)
 
@@ -461,13 +769,15 @@ class LayaAneBackend(LayaTokenizerHelper):
         return self.score_choice_batch(encoded_items, temperature_override=temperature_override)
 
     def close(self) -> None:
-        """Release native CoreML handles."""
-        if getattr(self, "_h256", None):
-            self._lib.laya_ane_free(self._h256)
-            self._h256 = None
-        if getattr(self, "_h512", None):
-            self._lib.laya_ane_free(self._h512)
-            self._h512 = None
+        """Release all native CoreML bucket handles."""
+        handles = getattr(self, "_handles", None)
+        if handles:
+            for s_len in list(handles.keys()):
+                h_ptr = handles.pop(s_len, None)
+                if h_ptr:
+                    self._lib.laya_ane_free(h_ptr)
+        self._h256 = None
+        self._h512 = None
 
 
 __all__ = [

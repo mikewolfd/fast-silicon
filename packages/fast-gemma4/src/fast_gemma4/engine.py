@@ -28,7 +28,7 @@ from .ane_pipeline import (
     is_w8_bundle_calibrated,
 )
 from .grammar import DEFAULT_MAX_WHITESPACE_RUN, GrammarHelper
-from .model import FastGemma4Model
+from .model import FastGemma4Model, _next_pow2
 from .mtp_drafter import (
     DEFAULT_MTP_DRAFTER_REPO,
     DEFAULT_MTP_TOP_K,
@@ -36,6 +36,7 @@ from .mtp_drafter import (
     _resolve_apple10_nax,
     resolve_mtp_drafter_dir,
     run_decode_mtp,
+    select_mtp_drafter_repo,
     should_use_mtp_drafter,
 )
 from .paths import Gemma4Paths, resolve_paths
@@ -59,6 +60,7 @@ class GenerationItem:
     valid_json: bool
     valid_schema: bool
     finish_reason: str
+    telemetry: list[dict[str, float]] | None = None
 
 
 @dataclass
@@ -225,7 +227,9 @@ def _select_auto_ane_ring_variant(
 
 
 class FastGemma4Engine:
-    """Thread-safe hardware-limit Gemma-4 E2B/E4B engine for Apple Silicon (M4 / M5+)."""
+    """Thread-safe hardware-limit Gemma-4 E2B/E4B/12B/26B-A4B/31B engine for Apple Silicon (M4 / M5+)."""
+
+    DEFAULT_CACHE_LIMIT_BYTES: int = 256 * 1024 * 1024
 
     def __init__(
         self,
@@ -233,13 +237,15 @@ class FastGemma4Engine:
         home: str | Path | None = None,
         model_dir: str | Path | None = None,
         default_mode: str = "auto",
+        profile: str = "auto",
         ane_variant: str = "fp16",
         ane_ring_variant: str = "auto",
         vocab_out: int | None = None,
+        allow_english_vocab_prune: bool = False,
         lm_head_mode: str = "q4",
-        mlp_dtype: str = "bfloat16",
+        mlp_dtype: str = "auto",
         use_mpp: bool = True,
-        kv_i8: bool = True,
+        kv_i8: bool | str = "auto",
         vec4_reduce: bool = True,
         mpp_m32_cutoff: int = 96,
         use_fused_softcap_argmax: bool = True,
@@ -255,16 +261,31 @@ class FastGemma4Engine:
     ) -> None:
         if default_mode not in ("auto", "gpu", "hetero"):
             raise ValueError(f"Unsupported default_mode={default_mode!r}")
+        if profile not in ("auto", "interactive", "throughput"):
+            raise ValueError(f"Unsupported profile={profile!r}")
         if ane_variant not in ("fp16", "w8", "auto"):
             raise ValueError(f"Unsupported ane_variant={ane_variant!r}")
         if ane_ring_variant not in ("fp16", "w8", "auto"):
             raise ValueError(f"Unsupported ane_ring_variant={ane_ring_variant!r}")
+        if not isinstance(kv_i8, bool) and str(kv_i8).strip().lower() != "auto":
+            raise ValueError(f"Unsupported kv_i8={kv_i8!r}; expected bool or 'auto'")
 
+        self.profile = profile
+        self._kv_i8_requested: bool | str = kv_i8
         self._host_ram_gib = _host_ram_gib()
         self._is_low_ram = 0.0 < self._host_ram_gib < 32.0
         self._allow_ane_on_low_ram = bool(allow_ane_on_low_ram)
         self.default_max_b_slots = int(max_b_slots) if max_b_slots is not None else (128 if self._is_low_ram else 256)
         eff_prefix_cache = (2 if self._is_low_ram else 8) if max_prefix_cache is None else int(max_prefix_cache)
+
+        # Bound MLX buffer allocator cache to 256 MB (`16.9 GB -> ~5.5 GB` RSS hygiene; restored in close()).
+        self._prev_cache_limit: int | None = None
+        set_cl = getattr(mx, "set_cache_limit", None)
+        if callable(set_cl):
+            try:
+                self._prev_cache_limit = int(set_cl(self.DEFAULT_CACHE_LIMIT_BYTES))
+            except Exception:
+                self._prev_cache_limit = None
 
         # Pin Metal wired working set cleanly (restored in close()) to eliminate macOS swap/page-fault jitter.
         self._prev_wired_limit: int | None = None
@@ -278,98 +299,131 @@ class FastGemma4Engine:
             except Exception:
                 self._prev_wired_limit = None
 
-        self.paths: Gemma4Paths = resolve_paths(home)
-        self.model = FastGemma4Model(
-            paths=self.paths,
-            model_dir=model_dir,
-            mlp_dtype=mlp_dtype,
-            vocab_out=vocab_out,
-            use_mpp=use_mpp,
-            lm_head_mode=lm_head_mode,
-            local_files_only=local_files_only,
-            kv_i8=kv_i8,
-            vec4_reduce=vec4_reduce,
-            mpp_m32_cutoff=mpp_m32_cutoff,
-            use_fused_softcap_argmax=use_fused_softcap_argmax,
-        )
-        self.tokenizer = FastGemma4Tokenizer(self.model.tokenizer_json)
-        is_e4b = (
-            getattr(self.model, "hidden_size", 1536) >= 2560
-            or getattr(self.model, "num_layers", 35) >= 42
-            or getattr(self.model, "n_kv_heads", 1) >= 2
-        )
-        self.model_name = "google/gemma-4-E4B-it" if is_e4b else "google/gemma-4-E2B-it"
-        self.default_mode = default_mode
-        self.ane_variant = ane_variant
-        self.max_prefix_cache = max(1, eff_prefix_cache)
+        try:
+            self.paths: Gemma4Paths = resolve_paths(home)
+            model_kwargs: dict[str, Any] = {
+                "paths": self.paths,
+                "model_dir": model_dir,
+                "mlp_dtype": mlp_dtype,
+                "vocab_out": vocab_out,
+                "use_mpp": use_mpp,
+                "lm_head_mode": lm_head_mode,
+                "local_files_only": local_files_only,
+                "kv_i8": kv_i8,
+                "vec4_reduce": vec4_reduce,
+                "mpp_m32_cutoff": mpp_m32_cutoff,
+                "use_fused_softcap_argmax": use_fused_softcap_argmax,
+            }
+            if allow_english_vocab_prune:
+                model_kwargs["allow_english_vocab_prune"] = True
+            self.model = FastGemma4Model(**model_kwargs)
+            self.tokenizer = FastGemma4Tokenizer(self.model.tokenizer_json)
+            if bool(getattr(self.model, "enable_moe", False)):
+                self.model_name = "google/gemma-4-26B-A4B-it"
+            elif getattr(self.model, "hidden_size", 1536) >= 5120 or getattr(self.model, "num_layers", 35) >= 60:
+                self.model_name = "google/gemma-4-31B-it"
+            elif (
+                getattr(self.model, "hidden_size", 1536) >= 2560
+                or getattr(self.model, "num_layers", 35) >= 42
+                or getattr(self.model, "n_kv_heads", 1) >= 2
+            ):
+                self.model_name = "google/gemma-4-E4B-it"
+            else:
+                self.model_name = "google/gemma-4-E2B-it"
+            self.default_mode = default_mode
+            self.ane_variant = ane_variant
+            self.max_prefix_cache = max(1, eff_prefix_cache)
 
-        self._gpu_lock = threading.Lock()
-        self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
-        self._grammar_cache: dict[tuple[str, bool | None, int], GrammarHelper] = {}
-        self._ane_runner: AnePrefixRunner | None = None
-        self._ane_ring_runner: AnePrefixRunner | None = None
-        self._ane_ring_checked: bool = False
-        self._ane_ring_bundle: Path | None = None
-        self._w_emb: np.ndarray | None = None
-        self._w_pli14: np.ndarray | None = None
-        self._ane_workers: dict[tuple[int, ...], AnePrefixWorker] = {}
-        self._ane_rings: dict[tuple[int, ...], AsyncHybridPrefillRing] = {}
-        self._local_files_only = bool(local_files_only)
+            self._gpu_lock = threading.Lock()
+            self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
+            self._grammar_cache: dict[tuple[str, bool | None, int], GrammarHelper] = {}
+            self._ane_runner: AnePrefixRunner | None = None
+            self._ane_ring_runner: AnePrefixRunner | None = None
+            self._ane_ring_checked: bool = False
+            self._ane_ring_bundle: Path | None = None
+            self._w_emb: np.ndarray | None = None
+            self._w_pli14: np.ndarray | None = None
+            self._ane_workers: dict[tuple[int, ...], AnePrefixWorker] = {}
+            self._ane_rings: dict[tuple[int, ...], AsyncHybridPrefillRing] = {}
+            self._local_files_only = bool(local_files_only)
 
-        exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
-        # Default hybrid prefill ring to dynamic "auto" (calibrated W8 on <=24 GB, FP16 on >24 GB or when uncalibrated/missing).
-        self._ane_ring_variant_requested = ane_ring_variant
-        self._host_hw: dict[str, Any] | None = None
-        self.silicon_policy: Any | None = None
-        if ane_ring_variant == "auto":
-            self._host_hw = _probe_host_hardware_safe()
-            self.ane_ring_variant, self.silicon_policy = _select_auto_ane_ring_variant(
-                self.paths,
-                model_dir=self.model.model_dir,
-                local_files_only=local_files_only,
-                exit_layer=exit_layer,
-                hw=self._host_hw,
-                fallback_ram_gib=self._host_ram_gib,
-            )
-        else:
-            self.ane_ring_variant = ane_ring_variant
+            exit_layer = getattr(self.model, "first_kv_shared", 15) - 1
+            self._ane_ring_variant_requested = ane_ring_variant
+            self._host_hw: dict[str, Any] | None = None
+            self.silicon_policy: Any | None = None
+            if ane_ring_variant == "auto":
+                self._host_hw = _probe_host_hardware_safe()
+                self.ane_ring_variant, self.silicon_policy = _select_auto_ane_ring_variant(
+                    self.paths,
+                    model_dir=self.model.model_dir,
+                    local_files_only=local_files_only,
+                    exit_layer=exit_layer,
+                    hw=self._host_hw,
+                    fallback_ram_gib=self._host_ram_gib,
+                )
+            else:
+                self.ane_ring_variant = ane_ring_variant
 
-        eff_var = "fp16" if ane_variant == "auto" else ane_variant
-        bundle = self.paths.resolve_ane_bundle(
-            eff_var, model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
-        )
-        if bundle is None and eff_var != "fp16":
+            eff_var = "fp16" if ane_variant == "auto" else ane_variant
             bundle = self.paths.resolve_ane_bundle(
-                "fp16", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
+                eff_var, model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
             )
-        if bundle is None and eff_var != "w8":
-            bundle = self.paths.resolve_ane_bundle(
-                "w8", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
-            )
-        self._ane_bundle = bundle
-        low_ram_ane_disabled = self._is_low_ram and not self._allow_ane_on_low_ram and default_mode != "hetero"
-        self.ane_available = bool(
-            (not low_ram_ane_disabled) and bundle is not None and self.paths.lib_ane_prefix.exists()
-        )
-
-        self.mtp_drafter: Gemma4MtpDrafter | None = None
-        self.mtp_draft_k: int | None = None if mtp_draft_k is None else int(mtp_draft_k)
-        self._mtp_top_k: int = int(mtp_top_k)
-        self._mtp_drafter_auto: bool = False
-        self._mtp_drafter_auto_attempted: bool = False
-        if isinstance(mtp_drafter, str) and mtp_drafter.strip().lower() == "auto":
-            self._mtp_drafter_auto = True
-        elif mtp_drafter:
-            drafter_ref: str | Path = DEFAULT_MTP_DRAFTER_REPO if mtp_drafter is True else mtp_drafter
-            self.mtp_drafter = Gemma4MtpDrafter(
-                self.model,
-                drafter_ref,
-                top_k=self._mtp_top_k,
-                local_files_only=local_files_only,
+            if bundle is None and eff_var != "fp16":
+                bundle = self.paths.resolve_ane_bundle(
+                    "fp16", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
+                )
+            if bundle is None and eff_var != "w8":
+                bundle = self.paths.resolve_ane_bundle(
+                    "w8", model_dir=self.model.model_dir, local_files_only=local_files_only, exit_layer=exit_layer
+                )
+            self._ane_bundle = bundle
+            low_ram_ane_disabled = self._is_low_ram and not self._allow_ane_on_low_ram and default_mode != "hetero"
+            self.ane_available = bool(
+                (not low_ram_ane_disabled) and bundle is not None and self.paths.lib_ane_prefix.exists()
             )
 
-        if warmup:
-            self.warmup(enable_ane=warmup_ane)
+            self.mtp_drafter: Gemma4MtpDrafter | None = None
+            self.mtp_draft_k: int | None = None if mtp_draft_k is None else int(mtp_draft_k)
+            self._mtp_top_k: int = int(mtp_top_k)
+            self._mtp_drafter_auto: bool = False
+            self._mtp_drafter_auto_attempted: bool = False
+            if isinstance(mtp_drafter, str) and mtp_drafter.strip().lower() == "auto":
+                self._mtp_drafter_auto = True
+            elif mtp_drafter:
+                drafter_ref: str | Path = select_mtp_drafter_repo(self.model) if mtp_drafter is True else mtp_drafter
+                self.mtp_drafter = Gemma4MtpDrafter(
+                    self.model,
+                    drafter_ref,
+                    top_k=self._mtp_top_k,
+                    local_files_only=local_files_only,
+                )
+
+            if warmup:
+                self.warmup(enable_ane=warmup_ane)
+        except BaseException:
+            self.close()
+            raise
+
+    def resolve_call_kv_i8(
+        self,
+        *,
+        has_schema: bool,
+        kv_i8_override: bool | str | None = None,
+        require_ane_ring: bool = False,
+    ) -> bool:
+        """Resolve `kv_i8='auto'` per call: `False` on unconstrained/reasoning, `True` on schema extraction."""
+        if isinstance(kv_i8_override, bool):
+            return kv_i8_override
+        if kv_i8_override is not None and str(kv_i8_override).strip().lower() == "auto":
+            return True if require_ane_ring else bool(has_schema)
+        req = getattr(self, "_kv_i8_requested", None)
+        if isinstance(req, bool):
+            return req
+        if req is not None and str(req).strip().lower() == "auto":
+            return True if require_ane_ring else bool(has_schema)
+        if getattr(self.model, "kv_i8_mode", "explicit") == "auto":
+            return True if require_ane_ring else bool(has_schema)
+        return bool(getattr(self.model, "kv_i8", False))
 
     def release_ane_resources(self) -> None:
         """Close native ANE runners and free the ~2.68 GiB host FP16 ANE embedding/PLE tables."""
@@ -400,6 +454,23 @@ class FastGemma4Engine:
         self.mtp_drafter = None
         self._mtp_drafter_auto_attempted = False
         self.release_ane_resources()
+        model = getattr(self, "model", None)
+        if model is not None:
+            if hasattr(model, "release_lazy_bf16_mlp_weights"):
+                model.release_lazy_bf16_mlp_weights()
+            if getattr(model, "_ple_mmap_i8", None) is not None:
+                model._ple_mmap_i8 = None  # type: ignore[attr-defined]
+            if getattr(model, "_ple_mmap_scales", None) is not None:
+                model._ple_mmap_scales = None  # type: ignore[attr-defined]
+        prev_cl = getattr(self, "_prev_cache_limit", None)
+        if prev_cl is not None:
+            set_cl = getattr(mx, "set_cache_limit", None)
+            if callable(set_cl):
+                try:
+                    set_cl(prev_cl)
+                except Exception:
+                    pass
+            self._prev_cache_limit = None
         prev_wl = getattr(self, "_prev_wired_limit", None)
         if prev_wl is not None:
             set_wl = getattr(mx, "set_wired_limit", None)
@@ -409,6 +480,8 @@ class FastGemma4Engine:
                 except Exception:
                     pass
             self._prev_wired_limit = None
+        if callable(getattr(mx, "clear_cache", None)):
+            mx.clear_cache()
 
     def _ensure_ane_ready(self) -> tuple[AnePrefixRunner, np.ndarray, np.ndarray]:
         if not self.ane_available or self._ane_bundle is None:
@@ -421,13 +494,16 @@ class FastGemma4Engine:
 
     def warmup(self, *, enable_ane: bool = False) -> None:
         with self._gpu_lock:
-            toks = [self.tokenizer.bos_token_id, 14937, 4818, 12375]
+            emb_rows = int(getattr(getattr(self.model, "embed_tokens", None), "weight", np.zeros((262144,))).shape[0])
+            raw_toks = [self.tokenizer.bos_token_id, 14937, 4818, 12375]
+            toks = [int(t) % max(1, emb_rows) for t in raw_toks]
+            min_swa = _next_pow2(max(512, int(getattr(self.model, "window_size", 512))))
             pkv = self.model.prefill_prefix(toks[:2])
-            cache = self.model.make_batch_cache(pkv, batch_size=1, doc_cap_full=64, swa_ring_cap=512)
+            cache = self.model.make_batch_cache(pkv, batch_size=1, doc_cap_full=64, swa_ring_cap=min_swa)
             lg, ob = self.model.prefill_suffix_batch([toks[2:]], cache, group_size=1)
             mx.eval(lg, ob)
             del cache
-            sc = self.model.make_slot_cache(pkv, batch_size=2, doc_cap_full=64, swa_ring_cap=512)
+            sc = self.model.make_slot_cache(pkv, batch_size=2, doc_cap_full=64, swa_ring_cap=min_swa)
             xs, am, _ = self.model.prefill_slots_lazy_lg([toks[2:], toks[2:]], [0, 1], sc, group_size=2)
             mx.eval(xs, am)
             if self.model.kv_i8:
@@ -438,6 +514,8 @@ class FastGemma4Engine:
                     mx.array([0], dtype=mx.int32),
                 )
             del sc
+            if callable(getattr(mx, "clear_cache", None)):
+                mx.clear_cache()
             if enable_ane and self.ane_available:
                 self._ensure_ane_ready()
 
@@ -582,7 +660,7 @@ class FastGemma4Engine:
         ):
             return None
         try:
-            drafter_dir = resolve_mtp_drafter_dir(DEFAULT_MTP_DRAFTER_REPO, local_files_only=True)
+            drafter_dir = resolve_mtp_drafter_dir(select_mtp_drafter_repo(self.model), local_files_only=True)
         except Exception:
             return None
         if drafter_dir is None:
@@ -757,8 +835,15 @@ class FastGemma4Engine:
         mode: str | None = None,
         speculative: bool | None = None,
         use_chat_template: bool = True,
+        enable_thinking: bool = False,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
         whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
+        kv_i8: bool | str | None = None,
+        profile: str | None = None,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
     ) -> GenerationItem:
         res = self.generate_batch(
             [prompt],
@@ -771,8 +856,15 @@ class FastGemma4Engine:
             mode=mode,
             speculative=speculative,
             use_chat_template=use_chat_template,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            reasoning_budget=reasoning_budget,
             whitespace_flexible=whitespace_flexible,
             max_whitespace_run=max_whitespace_run,
+            kv_i8=kv_i8,
+            profile=profile,
+            collect_telemetry=collect_telemetry,
+            collect_valid_lse=collect_valid_lse,
         )
         return res.items[0]
 
@@ -793,22 +885,34 @@ class FastGemma4Engine:
         gh: Any = None,
         per_doc_grammars: Sequence[Any] | None = None,
         sort_by_length: bool = True,
-        kv_i8: bool | None = None,
+        kv_i8: bool | str | None = None,
         use_ane_ring: bool | str = False,
         ane_cohort_size: int = 16,
         enable_ff_jump: bool = True,
         override_memory_cap: bool = False,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
         **_compat_kwargs: Any,
     ) -> dict[str, Any]:
         """Thread-safe GPU (+ optional Hybrid ANE) rolling decode entrypoint."""
         with self._gpu_lock:
             pkv = self.get_prefix_kv(sys_ids)
-            eff_kv_i8 = self.model.kv_i8 if kv_i8 is None else bool(kv_i8)
+            has_schema = (gh is not None) or (
+                per_doc_grammars is not None and any(g is not None for g in per_doc_grammars)
+            )
+            _, req_ane = _parse_use_ane_ring(use_ane_ring)
+            eff_kv_i8 = self.resolve_call_kv_i8(
+                has_schema=has_schema,
+                kv_i8_override=kv_i8,
+                require_ane_ring=req_ane,
+            )
             eff_b_slots = (
                 int(B_slots)
                 if override_memory_cap
                 else min(int(B_slots), int(getattr(self, "default_max_b_slots", 256)))
             )
+            min_swa = _next_pow2(max(512, int(getattr(self.model, "window_size", 512))))
+            eff_swa_cap = max(int(swa_ring_cap), min_swa)
             ring = self._maybe_get_ane_ring(
                 sys_ids,
                 pkv,
@@ -817,6 +921,10 @@ class FastGemma4Engine:
                 kv_i8=eff_kv_i8,
                 ane_cohort_size=ane_cohort_size,
             )
+            extra_kw: dict[str, Any] = {}
+            if collect_telemetry or collect_valid_lse:
+                extra_kw["collect_telemetry"] = bool(collect_telemetry)
+                extra_kw["collect_valid_lse"] = bool(collect_valid_lse)
             return run_decode_rolling(
                 self.model,
                 self.tokenizer.stop_token_ids,
@@ -826,7 +934,7 @@ class FastGemma4Engine:
                 max_tokens=max_tokens,
                 b_slots=eff_b_slots,
                 refill_min=refill_min,
-                swa_ring_cap=swa_ring_cap,
+                swa_ring_cap=eff_swa_cap,
                 group_size=group_size,
                 temperature=temperature,
                 top_p=top_p,
@@ -840,6 +948,7 @@ class FastGemma4Engine:
                 ane_cohort_size=ane_cohort_size,
                 enable_ff_jump=enable_ff_jump,
                 ane_ring_variant=self._effective_ane_ring_variant(),
+                **extra_kw,
             )
 
     def generate_batch(
@@ -858,12 +967,18 @@ class FastGemma4Engine:
         compact: bool = True,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
         whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
         use_ane_ring: bool | str = "auto",
         ane_cohort_size: int = 16,
         enable_ff_jump: bool = True,
+        kv_i8: bool | str | None = None,
+        profile: str | None = None,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
     ) -> GenerationBatchResult:
         if not prompts:
             return GenerationBatchResult(items=[], stats={"docs_per_sec": 0.0, "decode_tok_s": 0.0})
@@ -875,6 +990,19 @@ class FastGemma4Engine:
         if eff_mode not in ("auto", "gpu", "hetero"):
             raise ValueError(f"Unsupported mode={eff_mode!r}")
 
+        eff_profile = str(profile if profile is not None else getattr(self, "profile", "auto")).strip().lower()
+        if eff_profile in ("throughput", "backfill") and speculative is None:
+            eff_spec: bool | None = False
+        else:
+            eff_spec = speculative
+
+        eff_thinking = bool(enable_thinking)
+        if not eff_thinking and json_schema is None and per_doc_grammars is None:
+            if reasoning_effort is not None and str(reasoning_effort).strip().lower() not in ("", "none", "skip", "off", "0"):
+                eff_thinking = True
+            elif reasoning_budget is not None and int(reasoning_budget) > 0:
+                eff_thinking = True
+
         with self._gpu_lock:
             mx.reset_peak_memory()
             t_all0 = time.perf_counter()
@@ -883,7 +1011,7 @@ class FastGemma4Engine:
                 prompts,
                 system_prompt=system_prompt,
                 use_chat_template=use_chat_template,
-                enable_thinking=enable_thinking,
+                enable_thinking=eff_thinking,
             )
             grammar = (
                 self.get_grammar(
@@ -910,6 +1038,16 @@ class FastGemma4Engine:
                         )
                     else:
                         resolved_grammars.append(g_spec)
+
+            has_schema = (grammar is not None) or (
+                resolved_grammars is not None and any(g is not None for g in resolved_grammars)
+            )
+            _, req_ane_batch = _parse_use_ane_ring(use_ane_ring)
+            eff_kv_i8 = self.resolve_call_kv_i8(
+                has_schema=has_schema,
+                kv_i8_override=kv_i8,
+                require_ane_ring=req_ane_batch,
+            )
 
             def _upfront_for(i_doc: int) -> list[int]:
                 if resolved_grammars is not None:
@@ -944,12 +1082,13 @@ class FastGemma4Engine:
 
             n_docs = len(prompts)
             max_suf = max(len(s) for s in suf_all)
+            min_swa = _next_pow2(max(512, int(getattr(self.model, "window_size", 512))))
             ring_for_batch = self._maybe_get_ane_ring(
                 sys_ids,
                 pkv,
                 suf_all,
                 use_ane_ring=use_ane_ring,
-                kv_i8=bool(self.model.kv_i8),
+                kv_i8=eff_kv_i8,
                 ane_cohort_size=ane_cohort_size,
                 mode=eff_mode,
             )
@@ -967,6 +1106,7 @@ class FastGemma4Engine:
             waves = [list(range(i0, min(n_docs, i0 + wave_bs))) for i0 in range(0, n_docs, wave_bs)]
 
             all_gen_toks: list[list[int]] = [[] for _ in range(n_docs)]
+            all_telemetry: list[list[dict[str, float]] | None] = [None for _ in range(n_docs)]
             tot_pre_sec = 0.0
             tot_dec_sec = 0.0
             tot_out_toks = 0
@@ -974,6 +1114,7 @@ class FastGemma4Engine:
             any_spec_used = False
             rolling_used = False
             used_ane_ring_flag = False
+            actual_kv_i8_used = False
             roll_valid_schemas: list[bool] | None = None
             extra_roll_stats: dict[str, Any] = {}
 
@@ -984,7 +1125,7 @@ class FastGemma4Engine:
                     use_ane=use_ane,
                     batch_w=Bw,
                     temperature=temperature,
-                    speculative=speculative,
+                    speculative=eff_spec,
                 )
                 if mtp_drafter is not None:
                     any_spec_used = True
@@ -1001,7 +1142,7 @@ class FastGemma4Engine:
                         draft_k=getattr(self, "mtp_draft_k", None),
                         enable_ff_jump=enable_ff_jump,
                     )
-                use_spec = should_use_speculative(speculative, use_ane, Bw, temperature)
+                use_spec = should_use_speculative(eff_spec, use_ane, Bw, temperature)
                 if use_spec:
                     any_spec_used = True
                     w_prompts = [full_prompts[idx] for idx in w_indices]
@@ -1030,7 +1171,7 @@ class FastGemma4Engine:
                     top_p=top_p,
                     seed=seed,
                     compact=compact,
-                    tail_handoff_b=0 if speculative is False else 4,
+                    tail_handoff_b=0 if eff_spec is False else 4,
                     doc_prompts=[suf_all[idx] for idx in w_indices],
                     enable_ff_jump=enable_ff_jump,
                 )
@@ -1045,7 +1186,10 @@ class FastGemma4Engine:
                     Bw = len(w_docs)
                     sufs_w = [suf_all[i] for i in w_docs]
                     cap_full = max(max(len(s) for s in sufs_w) + max_tokens + 64, 128)
-                    wave_swa_cap = 512 if (speculative is False or cap_full <= self.model.window_size) else 1024
+                    wave_swa_cap = max(
+                        min_swa,
+                        512 if (eff_spec is False or cap_full <= self.model.window_size) else 1024,
+                    )
                     cache = self.model.make_batch_cache(
                         pkv, batch_size=Bw, doc_cap_full=cap_full, swa_ring_cap=wave_swa_cap
                     )
@@ -1092,35 +1236,84 @@ class FastGemma4Engine:
             elif (
                 ring_for_batch is None
                 and resolved_grammars is None
+                and not collect_telemetry
+                and not collect_valid_lse
                 and (
                     should_use_mtp_drafter(
                         True if self._has_mtp_drafter_candidate() else None,
                         False,
                         min(n_docs, wave_bs),
                         temperature,
-                        speculative=speculative,
+                        speculative=eff_spec,
                         apple10_nax=self._engine_apple10_nax(),
                     )
-                    or should_use_speculative(speculative, False, min(n_docs, wave_bs), temperature)
+                    or should_use_speculative(eff_spec, False, min(n_docs, wave_bs), temperature)
                 )
             ):
+                can_slot_mtp = hasattr(self.model, "make_slot_cache") and hasattr(
+                    self.model, "prefill_slots_lazy_lg"
+                )
                 for w_docs in waves:
                     Bw = len(w_docs)
                     sufs_w = [suf_all[i] for i in w_docs]
                     cap_full = max(max(len(s) for s in sufs_w) + max_tokens + 64, 128)
-                    wave_swa_cap = 512 if cap_full <= self.model.window_size else 1024
-                    cache = self.model.make_batch_cache(
-                        pkv, batch_size=Bw, doc_cap_full=cap_full, swa_ring_cap=wave_swa_cap
+                    mtp_drafter_w = self._maybe_ensure_mtp_drafter(
+                        use_ane=False,
+                        batch_w=Bw,
+                        temperature=temperature,
+                        speculative=eff_spec,
                     )
-                    tp0 = time.perf_counter()
-                    lg0, ob0 = self.model.prefill_suffix_batch(
-                        sufs_w,
-                        cache,
-                        group_size=8 if Bw <= 32 else 16,
-                        apply_softcap=True,
-                    )
-                    tot_pre_sec += time.perf_counter() - tp0
-                    dec_res = _decode_wave(w_docs, lg0, ob0, cache)
+                    if mtp_drafter_w is not None and can_slot_mtp:
+                        any_spec_used = True
+                        actual_kv_i8_used = eff_kv_i8
+                        mtp_swa_cap = max(min_swa, 1024 if cap_full > self.model.window_size else min_swa)
+                        cache = self.model.make_slot_cache(
+                            pkv,
+                            batch_size=Bw,
+                            doc_cap_full=cap_full,
+                            swa_ring_cap=mtp_swa_cap,
+                            kv_i8=eff_kv_i8,
+                        )
+                        tp0 = time.perf_counter()
+                        x_or_lg0, am0, next_offs = self.model.prefill_slots_lazy_lg(
+                            sufs_w,
+                            list(range(Bw)),
+                            cache,
+                            group_size=8 if Bw <= 32 else 16,
+                            return_logits=(grammar is not None),
+                        )
+                        ob0 = mx.array(next_offs, dtype=mx.int32)
+                        tot_pre_sec += time.perf_counter() - tp0
+                        dec_res = run_decode_mtp(
+                            self.model,
+                            mtp_drafter_w,
+                            self.tokenizer.stop_token_ids,
+                            grammar,
+                            x_or_lg0,
+                            ob0,
+                            cache,
+                            Bw,
+                            max_tokens=max_tokens,
+                            draft_k=getattr(self, "mtp_draft_k", None),
+                            enable_ff_jump=enable_ff_jump,
+                            init_am=am0,
+                        )
+                    else:
+                        wave_swa_cap = max(
+                            min_swa, 512 if cap_full <= self.model.window_size else 1024
+                        )
+                        cache = self.model.make_batch_cache(
+                            pkv, batch_size=Bw, doc_cap_full=cap_full, swa_ring_cap=wave_swa_cap
+                        )
+                        tp0 = time.perf_counter()
+                        lg0, ob0 = self.model.prefill_suffix_batch(
+                            sufs_w,
+                            cache,
+                            group_size=8 if Bw <= 32 else 16,
+                            apply_softcap=True,
+                        )
+                        tot_pre_sec += time.perf_counter() - tp0
+                        dec_res = _decode_wave(w_docs, lg0, ob0, cache)
                     tot_dec_sec += dec_res["decode_sec"]
                     tot_out_toks += dec_res["tot_out_tok"]
                     tot_ff_toks += dec_res["ff_tokens"]
@@ -1152,16 +1345,22 @@ class FastGemma4Engine:
                     mx.clear_cache()
             else:
                 rolling_used = True
+                actual_kv_i8_used = eff_kv_i8
                 roll_slots = max(1, wave_bs)
-                roll_swa_cap = (
+                roll_swa_cap = max(
+                    min_swa,
                     1024
                     if (
                         enable_ff_jump
                         and n_docs <= 4
                         and (max_suf + max_tokens + 64) > self.model.window_size
                     )
-                    else 512
+                    else 512,
                 )
+                roll_extra_kw: dict[str, Any] = {}
+                if collect_telemetry or collect_valid_lse:
+                    roll_extra_kw["collect_telemetry"] = bool(collect_telemetry)
+                    roll_extra_kw["collect_valid_lse"] = bool(collect_valid_lse)
                 roll_res = run_decode_rolling(
                     self.model,
                     self.tokenizer.stop_token_ids,
@@ -1174,15 +1373,20 @@ class FastGemma4Engine:
                     temperature=temperature,
                     top_p=top_p,
                     seed=seed,
-                    kv_i8=self.model.kv_i8,
+                    kv_i8=eff_kv_i8,
                     per_doc_grammars=resolved_grammars,
                     use_ane_ring=use_ane_ring if ring_for_batch is not None else False,
                     ane_ring=ring_for_batch,
                     ane_cohort_size=ane_cohort_size,
                     enable_ff_jump=enable_ff_jump,
                     ane_ring_variant=self._effective_ane_ring_variant(),
+                    **roll_extra_kw,
                 )
                 all_gen_toks = roll_res["gen_toks"]
+                roll_telem = roll_res.get("telemetry")
+                if roll_telem is not None:
+                    for idx_t in range(min(n_docs, len(roll_telem))):
+                        all_telemetry[idx_t] = roll_telem[idx_t]
                 roll_valid_schemas = roll_res.get("valid_schemas")
                 tot_pre_sec = roll_res["prefill_sec"]
                 tot_dec_sec = roll_res["decode_sec"]
@@ -1242,6 +1446,7 @@ class FastGemma4Engine:
                         valid_json=is_json,
                         valid_schema=is_schema,
                         finish_reason=finish_reason,
+                        telemetry=all_telemetry[idx],
                     )
                 )
 
@@ -1252,7 +1457,7 @@ class FastGemma4Engine:
                 "mode_requested": eff_mode,
                 "mode_used": "hetero_ane_gpu" if (use_ane or used_ane_ring_flag) else "gpu",
                 "rolling": rolling_used,
-                "kv_i8": self.model.kv_i8 if rolling_used else False,
+                "kv_i8": actual_kv_i8_used,
                 "speculative": any_spec_used,
                 "docs": n_docs,
                 "waves": 1 if rolling_used else len(waves),

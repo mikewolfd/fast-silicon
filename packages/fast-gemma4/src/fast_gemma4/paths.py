@@ -13,6 +13,11 @@ from fast_shared.hf import resolve_hf_model_dir
 from fast_shared.paths import resolve_home_dir
 
 DEFAULT_HF_REPO = "lmstudio-community/gemma-4-E2B-it-MLX-4bit"
+QAT_E2B_REPO = "google/gemma-4-E2B-it-qat-q4_0-unquantized"
+QAT_E4B_REPO = "google/gemma-4-E4B-it-qat-q4_0-unquantized"
+QAT_MOBILE_E2B_REPO = "mlx-community/gemma-4-E2B-it-qat-mobile"
+QAT_MOBILE_E4B_REPO = "mlx-community/gemma-4-E4B-it-qat-mobile"
+MOE_26B_MXFP4_REPO = "mlx-community/gemma-4-26b-a4b-it-mxfp4"
 
 
 def _package_root() -> Path:
@@ -28,7 +33,7 @@ def resolve_home(home: str | Path | None = None) -> Path:
       3. Editable checkout root with staged artifacts (`ane_models`/`weights`/`models`/`tokenizer`/`hf_model`).
       4. `FAST_ARTIFACTS_ROOT` environment variable (`<root>/fast-gemma4` or `<root>`).
       5. Sibling checkout (`../fast-gemma4`) when imported from `fast-silicon/packages/fast-gemma4`.
-      6. `~/.cache/fast-gemma4`.
+      6. User cache directory (`$HOME/.cache/fast-gemma4`).
     """
     return resolve_home_dir(
         __file__,
@@ -102,7 +107,24 @@ class Gemma4Paths:
         local_files_only: bool = True,
     ) -> Path:
         if model_dir is not None:
-            p = Path(model_dir).expanduser().resolve()
+            cand = Path(model_dir).expanduser()
+            if cand.exists():
+                p = cand.resolve()
+                if not (p / "config.json").exists():
+                    raise FileNotFoundError(f"Missing config.json in model_dir={p}")
+                return p
+            if (
+                isinstance(model_dir, str)
+                and not cand.is_absolute()
+                and not model_dir.startswith(("./", "../"))
+                and model_dir.count("/") == 1
+                and all(part.strip() for part in model_dir.split("/"))
+            ):
+                try:
+                    return resolve_hf_model_dir(None, model_dir, local_files_only=local_files_only)
+                except Exception:
+                    pass
+            p = cand.resolve()
             if not (p / "config.json").exists():
                 raise FileNotFoundError(f"Missing config.json in model_dir={p}")
             return p

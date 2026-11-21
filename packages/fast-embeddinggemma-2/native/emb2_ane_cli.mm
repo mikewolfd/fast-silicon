@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -127,18 +128,52 @@ std::string default_home_dir() {
     if (const char* env = std::getenv("FAST_EMBEDDINGGEMMA2_HOME")) {
         if (env[0] != '\0') return std::string(env);
     }
+    namespace fs = std::filesystem;
+    const std::string cache_name = "fast-embeddinggemma-2";
+    fs::path pkg_dir;
     char exe_buf[4096];
     uint32_t sz = sizeof(exe_buf);
     if (_NSGetExecutablePath(exe_buf, &sz) == 0) {
         char real_buf[4096];
         if (realpath(exe_buf, real_buf)) {
-            char* d1 = dirname(real_buf);
-            std::string dir(d1);
-            char* d2 = dirname(const_cast<char*>(dir.c_str()));
-            if (d2) return std::string(d2);
+            pkg_dir = fs::path(real_buf).parent_path().parent_path();
+            if (fs::exists(pkg_dir / "artifacts")) {
+                return pkg_dir.string();
+            }
         }
     }
-    return ".";
+    if (const char* art_env = std::getenv("FAST_ARTIFACTS_ROOT")) {
+        if (art_env[0] != '\0') {
+            fs::path art_root(art_env);
+            if (fs::exists(art_root / cache_name / "artifacts") || !fs::exists(art_root / "artifacts")) {
+                return (art_root / cache_name).string();
+            }
+            return art_root.string();
+        }
+    }
+    if (!pkg_dir.empty()) {
+        std::vector<fs::path> sibs;
+        if (pkg_dir.parent_path().filename() == "packages") {
+            sibs.push_back(pkg_dir.parent_path().parent_path().parent_path() / cache_name);
+        }
+        if (pkg_dir.filename() != cache_name) {
+            sibs.push_back(pkg_dir.parent_path() / cache_name);
+        }
+        for (const auto& sib : sibs) {
+            if (fs::exists(sib / "artifacts")) {
+                return sib.string();
+            }
+        }
+    }
+    if (const char* home_env = std::getenv("HOME")) {
+        if (home_env[0] != '\0') {
+            fs::path cache_dir = fs::path(home_env) / ".cache" / cache_name;
+            if (fs::exists(cache_dir / "artifacts") || pkg_dir.empty()) {
+                return cache_dir.string();
+            }
+        }
+    }
+    return pkg_dir.empty() ? "." : pkg_dir.string();
 }
 
 void build_rope_tables_f16(
@@ -232,24 +267,32 @@ int main(int argc, char** argv) {
     }
 
     const int sl = std::min<int>(static_cast<int>(tokens.size()), 512);
-    const int ane_caps[] = {32, 128, 256, 384, 512};
+    const std::string npz_path = home + "/artifacts/weights/embeddinggemma_2_f16.npz";
+    const std::string ane_dir = home + "/artifacts/ane_models";
+    const bool is_cpu = (compute_mode == static_cast<int>(fast_shared::ComputeMode::kCpuOnly));
+    const std::string mf_path = ane_dir + "/emb2_ane_w8.mlmodelc";
+    const bool has_mf = !is_cpu && std::ifstream(mf_path + "/coremldata.bin").good();
+
+    const int ane_caps[] = {32, 64, 128, 192, 256, 320, 384, 448, 512};
     int chosen_s = 512;
     if (forced_seq > 0) {
         chosen_s = forced_seq;
     } else {
         for (int c : ane_caps) {
-            if (sl <= c) {
+            if (sl > c) continue;
+            const std::string cand_bkt = is_cpu
+                ? (ane_dir + "/emb2_cpu_s" + std::to_string(c) + "_mix_w8.mlmodelc")
+                : (ane_dir + "/emb2_pk_s" + std::to_string(c) + "_w8.mlmodelc");
+            if (has_mf || std::ifstream(cand_bkt + "/coremldata.bin").good()) {
                 chosen_s = c;
                 break;
             }
         }
     }
 
-    const std::string npz_path = home + "/artifacts/weights/embeddinggemma_2_f16.npz";
-    const std::string ane_dir = home + "/artifacts/ane_models";
-    const std::string model_path = (compute_mode == static_cast<int>(fast_shared::ComputeMode::kCpuOnly))
+    const std::string model_path = is_cpu
         ? (ane_dir + "/emb2_cpu_s" + std::to_string(chosen_s) + "_mix_w8.mlmodelc")
-        : (ane_dir + "/emb2_pk_s" + std::to_string(chosen_s) + "_w8.mlmodelc");
+        : (has_mf ? mf_path : (ane_dir + "/emb2_pk_s" + std::to_string(chosen_s) + "_w8.mlmodelc"));
 
     std::ifstream ifs(npz_path, std::ios::binary | std::ios::ate);
     if (!ifs) {
@@ -298,7 +341,10 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> c256, s256, c512, s512;
     build_rope_tables_f16(chosen_s, c256, s256, c512, s512);
 
-    void* handle = emb2_pk_load_units(model_path.c_str(), chosen_s, pipe_depth, compute_mode);
+    std::string fn_name = "emb2_pk_s" + std::to_string(chosen_s);
+    void* handle = has_mf
+        ? emb2_pk_load_units_fn(model_path.c_str(), fn_name.c_str(), chosen_s, pipe_depth, compute_mode)
+        : emb2_pk_load_units(model_path.c_str(), chosen_s, pipe_depth, compute_mode);
     if (!handle) {
         fprintf(stderr, "Failed to load CoreML model: %s\n", model_path.c_str());
         return 1;
@@ -335,7 +381,7 @@ int main(int argc, char** argv) {
     std::vector<float> scratch_pooled(static_cast<size_t>(iters) * 512);
     std::vector<float> out_embs(static_cast<size_t>(iters) * 768);
 
-    const float16_t neg_inf_val = static_cast<float16_t>(-10000.0f);
+    const float16_t neg_inf_val = static_cast<float16_t>(-40000.0f);
     uint16_t neg_inf_u16 = 0;
     memcpy(&neg_inf_u16, &neg_inf_val, 2);
 

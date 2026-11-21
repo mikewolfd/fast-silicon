@@ -71,9 +71,72 @@ _GEMMA4_TEST_HF_REPOS: tuple[str, ...] = (
     "mlx-community/gemma-4-E2B-it-qat-4bit",
 )
 _GPT_OSS_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
+_GPT_OSS_PREBUILT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q8"
 _LAYA_HF_REPO = "convaiinnovations/laya-typed-decisions"
 _KEV_ADAPTER_HF_REPO = "jaredpalmer/kev-0.8b"
 _KEV_BASE_HF_REPO = "Qwen/Qwen3.5-0.8B-Base"
+
+VETTED_PREBUILT_HF_REPOS: dict[str, tuple[str, ...]] = {
+    "bge-small": (
+        "BAAI/bge-small-en-v1.5",
+        "sidekickd/bge-small-en-v1.5-coreml",
+    ),
+    "embeddinggemma-2": (
+        "OpenInfinity/embeddinggemma-2-coreml-int8",
+    ),
+    "pplx": (
+        "perplexity-ai/pplx-embed-v2-context-0.6b",
+    ),
+    "decision-models": (
+        "NMTZ/laya-typed-decisions-421m-coreml-ane",
+        "AbstractFramework/kev-0.8b-mlx-8bit",
+        "AbstractFramework/kev-4b-mlx-4bit",
+    ),
+    "gemma4": (
+        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+        "google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
+    ),
+    "gpt-oss": (
+        _GPT_OSS_PREBUILT_HF_REPO,
+    ),
+}
+
+_PREBUILT_APPROX_GB: dict[str, float] = {
+    "bge-small": 0.35,
+    "embeddinggemma-2": 0.29,
+    "pplx": 2.38,
+    "decision-models": 4.90,
+    "gemma4": 10.40,
+    "gpt-oss": 12.10,
+}
+
+
+def resolve_prebuilt_hf_repos(package: str) -> tuple[str, ...]:
+    """Return vetted zero-compile Hugging Face repositories for ``package``."""
+    key = _PACKAGE_ALIASES.get(package.strip().lower())
+    if key is None or key not in VETTED_PREBUILT_HF_REPOS:
+        raise ValueError(f"Unknown package {package!r}; choose from: {', '.join(PACKAGE_ORDER)}")
+    return VETTED_PREBUILT_HF_REPOS[key]
+
+
+def pull_prebuilt_package(
+    package: str,
+    *,
+    local_files_only: bool = False,
+    downloader: Callable[..., str | Path] | None = None,
+) -> dict[str, Path]:
+    """Auto-pull vetted zero-compile prebuilt HF snapshots for ``package``."""
+    repos = resolve_prebuilt_hf_repos(package)
+    if downloader is None:
+        from huggingface_hub import snapshot_download
+
+        dl_fn: Callable[..., str | Path] = snapshot_download
+    else:
+        dl_fn = downloader
+    return {
+        repo_id: Path(dl_fn(repo_id=repo_id, local_files_only=local_files_only))
+        for repo_id in repos
+    }
 
 
 @dataclass(frozen=True)
@@ -125,7 +188,7 @@ def _resolve_target_home(
     if target_mode == "in-repo":
         return (REPO_ROOT / "packages" / pkg_dir_name).resolve()
     if target_mode == "cache":
-        return (Path("~/.cache") / pkg_dir_name).expanduser().resolve()
+        return (Path.home() / ".cache" / pkg_dir_name).resolve()
     if target_mode != "auto":
         raise ValueError(f"Unsupported target mode {target_mode!r}; expected auto|in-repo|cache")
 
@@ -503,20 +566,20 @@ def _plan_gpt_oss(
     python_exe: str,
 ) -> PackagePlan:
     art = home / "artifacts"
-    hf_cached = hf_checker(_GPT_OSS_HF_REPO)
+    hf_cached = hf_checker(_GPT_OSS_PREBUILT_HF_REPO) or hf_checker(_GPT_OSS_HF_REPO)
     local_hf_ok = (art / "hf_model" / "config.json").is_file() and any((art / "hf_model").glob("*.safetensors"))
     vocab_ok = (art / "vocab" / "o200k_remap_131072.npz").is_file() and (art / "tokenizer" / "tokenizer.json").is_file()
     actions = [
         StepAction(
             kind="subprocess",
-            label="gpt-oss: download 20B-MXFP4-Q4 + build o200k_remap_131072",
+            label="gpt-oss: download 20B-MXFP4-Q8/Q4 + build o200k_remap_131072",
             needed=force or not (vocab_ok and (hf_cached or local_hf_ok)),
             reason=(
                 "forced"
                 if force
                 else ("present" if (vocab_ok and (hf_cached or local_hf_ok)) else "missing HF checkpoint or o200k remap")
             ),
-            repo_id=_GPT_OSS_HF_REPO,
+            repo_id=_GPT_OSS_PREBUILT_HF_REPO,
             command=(
                 python_exe,
                 "-m",
@@ -532,8 +595,36 @@ def _plan_gpt_oss(
         package="gpt-oss",
         target_home=home,
         approx_size_gb=12.0,
-        hf_repos=(_GPT_OSS_HF_REPO,),
+        hf_repos=(_GPT_OSS_PREBUILT_HF_REPO, _GPT_OSS_HF_REPO),
         actions=tuple(actions),
+    )
+
+
+def _plan_prebuilt_package(
+    pkg: str,
+    home: Path,
+    *,
+    force: bool,
+    hf_checker: Callable[[str], bool],
+) -> PackagePlan:
+    repos = VETTED_PREBUILT_HF_REPOS[pkg]
+    actions = tuple(
+        StepAction(
+            kind="hf_snapshot",
+            label=f"{pkg}: pull prebuilt zero-compile HF snapshot ({repo_id})",
+            needed=force or not hf_checker(repo_id),
+            reason="forced" if force else ("cached" if hf_checker(repo_id) else "missing HF cache"),
+            repo_id=repo_id,
+            requires_coreml=False,
+        )
+        for repo_id in repos
+    )
+    return PackagePlan(
+        package=pkg,
+        target_home=home,
+        approx_size_gb=_PREBUILT_APPROX_GB.get(pkg, 1.0),
+        hf_repos=repos,
+        actions=actions,
     )
 
 
@@ -543,6 +634,7 @@ def build_setup_plan(
     target_mode: str = "auto",
     artifacts_root: Path | None = None,
     force: bool = False,
+    prebuilt: bool = False,
     skip_native: bool = False,
     skip_ane: bool = False,
     skip_test_extras: bool = False,
@@ -597,7 +689,9 @@ def build_setup_plan(
             artifacts_root=artifacts_root,
             paths_module=pmod,
         )
-        if pkg == "bge-small":
+        if prebuilt:
+            plans.append(_plan_prebuilt_package(pkg, home, force=force, hf_checker=hf_checker))
+        elif pkg == "bge-small":
             plans.append(_plan_bge_small(home, force=force, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe))
         elif pkg == "embeddinggemma-2":
             plans.append(
@@ -700,13 +794,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--target",
         choices=("auto", "in-repo", "cache"),
         default="auto",
-        help="Artifact destination root (`auto` uses existing checkout/sibling/~/.cache layout; default=auto)",
+        help="Artifact destination root (`auto` uses existing checkout/sibling/<home>/.cache layout; default=auto)",
     )
     parser.add_argument(
         "--artifacts-root",
         type=Path,
         default=None,
         help="Custom root directory (`<root>/fast-<pkg>/artifacts`) overriding --target",
+    )
+    parser.add_argument(
+        "--prebuilt",
+        action="store_true",
+        help="Zero-compile mode: pull vetted prebuilt HF checkpoints/CoreML bundles without local compilation",
     )
     parser.add_argument("--skip-native", action="store_true", help="Skip `make native` and `cpu-query` builds")
     parser.add_argument("--skip-ane", action="store_true", help="Skip CoreML `.mlmodelc` compilation steps")
@@ -737,6 +836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_mode=args.target,
         artifacts_root=art_root,
         force=bool(args.force),
+        prebuilt=bool(args.prebuilt),
         skip_native=bool(args.skip_native),
         skip_ane=bool(args.skip_ane),
         skip_test_extras=bool(args.skip_test_extras),
@@ -746,6 +846,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.json:
             payload: dict[str, Any] = {
                 "dry_run": True,
+                "prebuilt": bool(args.prebuilt),
                 "packages": list(packages),
                 "target": args.target,
                 "native_actions": [asdict(a) for a in native_actions],

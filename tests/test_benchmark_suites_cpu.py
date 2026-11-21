@@ -1273,3 +1273,356 @@ def test_llm_worker_merges_final_telemetry_before_gate_and_grpo_error_capture(
     assert grpo_out["grpo_step_overlap"]["status"] == "failed"
     assert grpo_out["grpo_step_overlap"]["returncode"] == 2
     assert "critic exploded" in grpo_out["grpo_step_overlap"]["reason"]
+
+
+def test_hp04_coreai_cache_probe_gpt_oss_ungate_budgets_and_grouping_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    opb = _load_script("test_hp04_opb", "_outcome_public_backends.py")
+    out = _load_script("test_hp04_out", "benchmark_outcomes.py")
+
+    # 1. CoreAI cache path included via Path.home() (zero literal tilde-slash)
+    coreai_cache = opb.resolve_coreai_cache_dir()
+    assert coreai_cache == Path.home() / "Library" / "Caches" / "coreai-cache"
+    assert (chr(126) + "/") not in Path(opb.__file__).read_text(encoding="utf-8")
+
+    # 2. GPT-OSS-20B un-gated on 24 GB Base M5 (>= 23.0 GB), gated on 16 GB under group token
+    monkeypatch.setattr(out, "collect_env_telemetry", lambda: {"mem_gb": 24.0})
+    assert out.main(["run", "--dry-run", "--packages", "all"]) == 0
+    plan_24 = json.loads(capsys.readouterr().out)
+    assert "fast-gpt-oss" in plan_24["packages"]
+
+    monkeypatch.setattr(out, "collect_env_telemetry", lambda: {"mem_gb": 16.0})
+    assert out.main(["run", "--dry-run", "--packages", "all"]) == 0
+    plan_16 = json.loads(capsys.readouterr().out)
+    assert "fast-gpt-oss" not in plan_16["packages"]
+
+    # 3. MXFP4-Q8 preferred over MXFP4-Q4 in _STOCK_HF_REPOS
+    assert opb._STOCK_HF_REPOS["public-gpt-oss"][0] == "mlx-community/gpt-oss-20b-MXFP4-Q8"
+    assert "mlx-community/gpt-oss-20b-MXFP4-Q4" in opb._STOCK_HF_REPOS["public-gpt-oss"]
+
+    # 4. Stock finish_length_count checks raw token length BEFORE stripping <|channel|>analysis<|message|>
+    raw_truncated = "<|channel|>analysis<|message|>" + ("tok " * 62) + "<|channel|>final<|message|>short"
+    clean_tx, hit_len, raw_cnt = opb._extract_harmony_final_and_length(
+        raw_truncated,
+        encode_fn=lambda s: s.split(),
+        eff_max=64,
+    )
+    assert clean_tx == "short"
+    assert raw_cnt >= 63 and hit_len is True
+
+    raw_stopped = "<|channel|>analysis<|message|>brief<|channel|>final<|message|>done<|return|>"
+    clean_ok, hit_ok, _ = opb._extract_harmony_final_and_length(
+        raw_stopped,
+        encode_fn=lambda s: s.split(),
+        eff_max=64,
+    )
+    assert clean_ok == "done" and hit_ok is False
+
+    # 5. RewardBench-2 (4x) and RAGTruth (<=6x) shared-prefix grouping preserves deterministic item order
+    rt_sample = [
+        {"id": "0", "context": "P_long " * 20, "query": "Q1", "output": "a"},
+        {"id": "1", "context": "P_short", "query": "Q2", "output": "b"},
+        {"id": "2", "context": "P_long " * 20, "query": "Q1", "output": "c"},
+        {"id": "3", "context": "P_short", "query": "Q2", "output": "d"},
+    ]
+    order_rt, inv_rt = out._group_shared_prefix_indices(
+        rt_sample,
+        key_fn=lambda it: (it["context"], it["query"]),
+        max_group_size=6,
+        length_fn=lambda it: len(it["context"]) + len(it["query"]),
+    )
+    # Sibling items sharing (context, query) must be adjacent in grouped order
+    assert order_rt in ([1, 3, 0, 2], [0, 2, 1, 3])
+    scored_grouped = [f"score_{idx}" for idx in order_rt]
+    restored = [scored_grouped[inv_rt[orig_i]] for orig_i in range(len(rt_sample))]
+    assert restored == ["score_0", "score_1", "score_2", "score_3"]
+
+    # 6. CoreAiGemma4Backend OS gate (< 27.2 raises FileNotFoundError -> SKIP in benchmark_outcomes)
+    with pytest.raises(FileNotFoundError, match="27.2"):
+        opb.CoreAiGemma4Backend(macos_version="26.6")
+
+    # 7. CoreAiQwen35Backend & pplx ctx_max_len=2048 + GPT-OSS budgeted reasoning in _run_llm_worker
+    opb_src = Path(opb.__file__).read_text(encoding="utf-8")
+    assert '"--repetition-penalty", "1.05"' in opb_src or "'--repetition-penalty', '1.05'" in opb_src
+    assert "<|endoftext|>" in opb_src
+    assert "np.arange(cur_len, dtype=np.int32).reshape(1, cur_len)" in opb_src
+
+    out_src = Path(out.__file__).read_text(encoding="utf-8")
+    assert "ctx_max_len = 2048" in out_src
+    assert "reasoning_budget=96" in out_src
+    assert "reasoning_budget=192" in out_src
+    assert "reasoning_budget=384" in out_src
+    assert "reasoning_budget=64" in out_src
+
+    # 8. #347 checks: structured.py maxItems=8 + coerce_one_of=True, fast-gemma4 mlp_dtype=auto & kv_i8=False,
+    #    benchmark_monorepo.py <=24GB fast-gpt-oss --batches 1,8,16, and CoreAiQwen35Backend enable_thinking=False
+    from fast_shared.outcome_eval.structured import build_bfcl_response_schema, evaluate_jsonschemabench_compiler
+
+    bf_sch = build_bfcl_response_schema([{"name": "ping", "parameters": {"type": "object", "properties": {}}}])
+    assert bf_sch["properties"]["tool_calls"]["maxItems"] == 8
+    oneof_items = [{"id": "oneof_case", "json_schema": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}]
+    jsb_res = evaluate_jsonschemabench_compiler(oneof_items)
+    assert jsb_res["compiled_ok"] == 1 and jsb_res["compile_success_rate"] == 1.0
+
+    def_flags = out._parse_extra_flags([])
+    assert def_flags.mlp_dtype == "auto"
+    assert def_flags.kv_i8 is None and def_flags.no_kv_i8 is False
+    assert def_flags.batch_size is None
+
+    mono = _load_script("test_hp04_mono", "benchmark_monorepo.py")
+    mono_parser = mono.build_parser()
+    mono_args = mono_parser.parse_args([])
+    gpt_spec = mono._SPEC_BY_NAME["fast-gpt-oss"]
+    assert mono._effective_bench_args(gpt_spec, mono_args, host_mem_gb=24.0) == ["bench", "--batches", "1,8,16", "--local-files-only"]
+    assert mono._effective_bench_args(gpt_spec, mono_args, host_mem_gb=48.0) == ["bench", "--batches", "8,64,128", "--local-files-only"]
+    assert '"enable_thinking": eff_think' in opb_src
+
+
+def test_capabilities_qlora_24gb_gate_and_authentic_modernbert_packed_rope_cpu() -> None:
+    import numpy as np
+
+    mx = pytest.importorskip("mlx.core")
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    cap = _load_script("test_cap_hp04", "benchmark_capabilities.py")
+
+    # 1. QLoRA 24 GB vs 48 GB policy: ckpt_tokens == 512, BF16 baseline gated to >= 36.0 GB
+    pol_24 = cap.select_qlora_policy(24.0)
+    pol_48 = cap.select_qlora_policy(48.0)
+    assert pol_24["ckpt_tokens"] == 512 and pol_24["run_bf16_baseline"] is False
+    assert pol_48["ckpt_tokens"] == 512 and pol_48["run_bf16_baseline"] is True
+
+    # 2. Authentic ModernBERT-large architecture + per-segment RoPE reset on Packed-512 (CPU stream)
+    with mx.stream(mx.cpu):
+        mx.random.seed(11)
+        # Small hidden/layer scale of the exact _ModernBertLargeValidator class for sub-second CPU grad check,
+        # plus structural check of default 28L, RoPE 160_000 / 10_000, local_attention=128, biasless LayerNorm, 2L head + scorer
+        full_spec = cap._ModernBertLargeValidator(
+            vocab=128, hidden=64, n_heads=4, d_ff=128, n_layers=28, freeze_below=18, head_ff=128
+        )
+        assert len(full_spec.layers) == 28
+        assert full_spec.layers[0].attn_norm is None
+        assert isinstance(full_spec.layers[1].attn_norm, nn.LayerNorm)
+        assert "bias" not in full_spec.layers[1].attn_norm
+        assert full_spec.layers[0].rope_theta == 160_000.0
+        assert full_spec.layers[1].rope_theta == 10_000.0
+        assert full_spec.local_attention == 128
+        assert len(full_spec.head_layers) == 2
+
+        full_spec.set_dtype(mx.float32)
+        mx.eval(full_spec.parameters())
+
+        seqs = [
+            np.array([101, 11, 12, 13, 14, 15, 16, 102], dtype=np.int32),
+            np.array([101, 21, 22, 23, 24, 25, 102], dtype=np.int32),
+        ]
+        markers = [[1, 3], [1, 3]]
+        qtypes = np.array([0, 2], dtype=np.int32)
+        labels = np.array([1, 0], dtype=np.int32)
+
+        unpacked, packed = cap._prepare_modernbert_step_pair(
+            seqs, markers, qtypes, labels, pack_cap=32, local_attention=128, dtype=mx.float32
+        )
+        # Verify per-segment position reset in Packed-512
+        pos_np = np.asarray(packed["position_ids"])[0]
+        assert list(pos_np[:8]) == list(range(8))
+        assert list(pos_np[8:15]) == list(range(7))
+
+        def _loss_fn(m, batch):
+            h_f = m.forward_frozen(batch["input_ids"], batch["position_ids"], batch["mask_full"], batch["mask_local"])
+            logits = m.forward_upper(
+                h_f,
+                batch["position_ids"],
+                batch["mask_full"],
+                batch["mask_local"],
+                batch["qtypes"],
+                batch["marker_positions"],
+                fp32_head=True,
+            )
+            return mx.mean(nn.losses.cross_entropy(logits, batch["labels"]))
+
+        vg = nn.value_and_grad(full_spec, _loss_fn)
+        lu, gu = vg(full_spec, unpacked)
+        lp, gp = vg(full_spec, packed)
+        mx.eval(lu, gu, lp, gp)
+        assert abs(float(lu.item()) - float(lp.item())) < 1e-5
+        fu, fp = dict(tree_flatten(gu)), dict(tree_flatten(gp))
+        dot = sum(float(mx.sum(fu[k] * fp[k]).item()) for k in fu if k in fp)
+        nu = sum(float(mx.sum(fu[k] ** 2).item()) for k in fu if k in fp)
+        np_ = sum(float(mx.sum(fp[k] ** 2).item()) for k in fu if k in fp)
+        cos = dot / max((nu * np_) ** 0.5, 1e-12)
+        assert cos > 0.9999
+
+
+def test_jsonschema_fallback_without_jsonschema_package_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fast_shared.outcome_eval.structured import validate_against_jsonschema
+
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+
+    schema = {
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "minLength": 2, "maxLength": 6},
+                    "qty": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["code", "qty"],
+                "additionalProperties": False,
+            }
+        },
+        "definitions": {
+            "Tag": {"enum": ["alpha", "beta", 1]}
+        },
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "order"},
+                    "note": {"type": ["string", "null"]},
+                    "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "tag": {"$ref": "#/definitions/Tag"},
+                    "choice": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+                    "either": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {"$ref": "#/$defs/Item"},
+                    },
+                },
+                "required": ["kind", "score", "items"],
+                "additionalProperties": False,
+            }
+        ],
+    }
+
+    valid_obj = {
+        "kind": "order",
+        "note": None,
+        "score": 0.75,
+        "tag": "alpha",
+        "choice": 42,
+        "either": True,
+        "items": [{"code": "AB1", "qty": 5}],
+    }
+    assert validate_against_jsonschema(valid_obj, schema) is True
+
+    # Reject bool for integer/number and 1 vs True in enum/const
+    assert validate_against_jsonschema({**valid_obj, "score": True}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": [{"code": "AB1", "qty": True}]}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "tag": True}, schema) is False
+
+    # Reject extra key, missing required, minItems/maxItems, minLength/maxLength, minimum/maximum
+    assert validate_against_jsonschema({**valid_obj, "extra": 1}, schema) is False
+    assert validate_against_jsonschema({k: v for k, v in valid_obj.items() if k != "score"}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": []}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": [{"code": "AB", "qty": 1}] * 4}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": [{"code": "A", "qty": 1}]}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": [{"code": "ABCDEFG", "qty": 1}]}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "items": [{"code": "AB", "qty": 0}]}, schema) is False
+    assert validate_against_jsonschema({**valid_obj, "choice": True}, schema) is False
+
+
+def test_coreai_gemma4_llm_runner_bundle_preference_and_telemetry_parsing_cpu(tmp_path: Path) -> None:
+    opb = _load_script("test_coreai_g4_fix_mod", "_outcome_public_backends.py")
+
+    # 1. Create fake coreai tree with llm-runner binary + both 4-input mlboydaisuke and 2-input mikedoise bundles
+    ca_root = tmp_path / "coreai_repo"
+    ca_py = ca_root / "sub" / "venv" / "bin_py"
+    ca_py.parent.mkdir(parents=True)
+    ca_py.write_text("#!/bin/sh\n", encoding="utf-8")
+    llm_runner = ca_root / ".build" / "out" / "Products" / "Release" / "llm-runner"
+    llm_runner.parent.mkdir(parents=True)
+    llm_runner.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    mlboy_dir = tmp_path / "mlboydaisuke_gemma4"
+    (mlboy_dir / "z_second.aimodel").mkdir(parents=True)
+    (mlboy_dir / "a_first.aimodel").mkdir(parents=True)
+
+    mike_dir = tmp_path / "mikedoise_gemma4_4bit"
+    (mike_dir / "text.aimodel").mkdir(parents=True)
+    (mike_dir / "metadata.json").write_text(json.dumps({"per_layer_embeddings": "ple.safetensors"}), encoding="utf-8")
+
+    snaps = {
+        "mlboydaisuke/gemma-4-E2B-CoreAI": mlboy_dir,
+        "mikedoise/gemma-4-E2B-it-coreai-4bit-128k-text": mike_dir,
+    }
+    sel_bdir, sel_aim_dir, llm_run_s, lbl = opb._select_coreai_gemma4_bundle(
+        ca_py,
+        resolve_snap_fn=lambda repo: snaps.get(repo),
+        resolve_bundle_fn=lambda _rel: None,
+    )
+    assert sel_bdir == mike_dir
+    assert sel_aim_dir == mike_dir
+    assert llm_run_s == str(llm_runner)
+    assert lbl == "coreai_gemma4_e2b_4bit"
+
+    # Fallback to mlboydaisuke when mikedoise is absent uses deterministic sorted .aimodel discovery
+    sel_b2, sel_aim2, _, lbl2 = opb._select_coreai_gemma4_bundle(
+        ca_py,
+        resolve_snap_fn=lambda repo: mlboy_dir if repo == "mlboydaisuke/gemma-4-E2B-CoreAI" else None,
+        resolve_bundle_fn=lambda _rel: None,
+    )
+    assert sel_b2 == mlboy_dir and sel_aim2 == mlboy_dir and lbl2 == "coreai_gemma4_e2b_qat"
+
+    # 2. Parse llm-runner stdout/stderr: cold Model Load subtracted from infer_ms, max_rss_gb + peak_footprint_gb + error
+    stdout_ok = (
+        "Loading model...\n"
+        "Generating...\n"
+        "Answer: B\n"
+        "Done\n"
+        "Performance Summary:\n"
+        "  Model Load: 107250.5ms\n"
+        "  Prefill: 80.0ms, 16 tokens (200.0 tok/s)\n"
+        "  Generation: 180.0ms, 10 tokens (55.5 tok/s)\n"
+    )
+    stderr_ok = (
+        "      3450000000  maximum resident set size\n"
+        "      2850000000  peak memory footprint\n"
+    )
+    parsed_ok = opb._parse_coreai_llm_runner_result(stdout_ok, stderr_ok, 0, 107520.5)
+    assert parsed_ok["ok"] is True
+    assert parsed_ok["text"] == "Answer: B"
+    assert parsed_ok["gen_tokens"] == 10
+    assert parsed_ok["model_load_ms"] == pytest.approx(107250.5)
+    assert parsed_ok["infer_ms"] == pytest.approx(270.0)
+    assert parsed_ok["peak_footprint_gb"] == pytest.approx(2.85)
+    assert parsed_ok["max_rss_gb"] == pytest.approx(3.45)
+
+    daemon_ns: dict[str, object] = {}
+    exec(compile(opb._COREAI_DAEMON_PREAMBLE, "<_COREAI_DAEMON_PREAMBLE>", "exec"), daemon_ns)
+    telem_cls = daemon_ns["_DaemonTelemetry"]
+    apply_fn = daemon_ns["_apply_runner_telemetry"]
+    telem = telem_cls([mike_dir])  # type: ignore[operator]
+    apply_fn(telem, None, parsed_ok)  # type: ignore[operator]
+    pay = telem.payload(final=True)
+    assert pay["cold_warm_latency"]["cold_load_ms"] == pytest.approx(107250.5)
+    assert pay["cold_warm_latency"]["cold_first_infer_ms"] == pytest.approx(270.0)
+    assert pay["external_peak_gb"] == pytest.approx(2.85)
+    assert pay["max_rss_gb"] == pytest.approx(3.45)
+
+    # 3. _CoreAiSubprocessClient._merge_response + benchmark_outcomes._merge_daemon_telemetry preserve max_rss_gb & external_peak_gb
+    stub_client = object.__new__(opb._CoreAiSubprocessClient)
+    stub_client._telemetry = {"peak_gb": 0.0, "four_bucket_metrics": {}, "cold_warm_latency": {}, "profiler_available": False}
+    stub_client._merge_response({"max_rss_gb": 3.45, "external_peak_gb": 1.29})
+    client_telem = stub_client.telemetry()
+    assert client_telem["max_rss_gb"] == pytest.approx(3.45)
+    assert client_telem["external_peak_gb"] == pytest.approx(1.29)
+
+    out_mod = _load_script("test_coreai_g4_out_mod", "benchmark_outcomes.py")
+    diag_check: dict[str, object] = {}
+    out_mod._merge_daemon_telemetry({"phys_footprint_gb": 0.1, "peak_footprint_gb": 0.1, "combined_with_model_mapped_gb": 0.1}, diag_check, client_telem)
+    assert diag_check["max_rss_gb"] == pytest.approx(3.45)
+    assert diag_check["external_peak_gb"] == pytest.approx(1.29)
+
+    parsed_err = opb._parse_coreai_llm_runner_result("", "Fatal error: Expected 2 inputs, got 4\n", 1, 50.0)
+    assert parsed_err["ok"] is False
+    assert "Expected 2 inputs, got 4" in parsed_err["error"]
+
+    opb_src = Path(opb.__file__).read_text(encoding="utf-8")
+    assert "timeout=600" in opb_src
+
+

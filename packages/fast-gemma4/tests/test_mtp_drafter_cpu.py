@@ -264,7 +264,28 @@ def test_mtp_drafter_b1_parity_and_b8_gate_gpu() -> None:
 
     HW_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with HW_LOCK_PATH.open("a+") as lock_f:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        acquired_lock = False
+        try:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired_lock = True
+        except BlockingIOError:
+            import os
+            import subprocess
+
+            anc: set[int] = set()
+            pid = os.getpid()
+            while pid > 1 and pid not in anc:
+                anc.add(pid)
+                ppid_s = subprocess.check_output(["ps", "-o", "ppid=", "-p", str(pid)], text=True).strip()
+                pid = int(ppid_s) if ppid_s else 0
+            holders = {
+                int(x)
+                for x in subprocess.check_output(["lsof", "-t", str(HW_LOCK_PATH)], text=True).split()
+                if x.strip().isdigit()
+            }
+            if not ((anc - {os.getpid()}) & holders):
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                acquired_lock = True
         # Use kv_i8=False so plain rolling (`speculative=False`) and MTP (`make_batch_cache`) share identical BF16 KV.
         eng = FastGemma4Engine(default_mode="gpu", kv_i8=False, mtp_drafter=drafter_dir, warmup=False)
         try:
@@ -329,4 +350,5 @@ def test_mtp_drafter_b1_parity_and_b8_gate_gpu() -> None:
         finally:
             eng.close()
             mx.clear_cache()
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            if acquired_lock:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)

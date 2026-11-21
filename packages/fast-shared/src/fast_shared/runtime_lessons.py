@@ -29,26 +29,51 @@ training, and RLVR workflows (100% pure Python + NumPy, zero GPU/ANE execution o
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
+import ctypes
 from dataclasses import dataclass
 import math
-from typing import Any
+import platform
+import re
+import subprocess
+import threading
+from typing import Any, Literal
 
 import numpy as np
 
 from .hw_check import parse_version_tuple, probe_host_hardware, supports_apple10_nax
 
+ProfileMode = Literal["backfill", "interactive"]
+ThermalLevel = Literal["nominal", "fair", "serious", "critical"]
+
 WIRED_MEMORY_CEILING_FRACTION: float = 0.80
 MIN_SHARED_PREFIX_TOKENS: int = 32
 MASK_NEG_VAL_FP16: float = -65504.0
+DEFAULT_MLX_CACHE_LIMIT_MB: int = 256
 VALID_WORKLOADS: tuple[str, ...] = ("extraction", "qlora", "encoder_train", "grpo")
 VALID_MTP_MODES: tuple[str, ...] = ("auto", "on", "off")
+VALID_PROFILES: tuple[str, ...] = ("backfill", "interactive")
 APPLE10_FUSED_SWA_SDPA_SEQ_LENS: tuple[int, ...] = (384, 512)
 
 _TIGHT_CAP_THRESHOLD_GB: float = 15.0
 _HIGH_CAP_THRESHOLD_GB: float = 26.0
 _GRPO_ANE_RESERVE_GB: float = 1.2
 _MTP_DRAFTER_ESTIMATED_MB: float = 150.0
+
+
+class _ImplicitBackfillProfile(str):
+    """Sentinel default `'backfill'` string distinguishing omitted vs explicit `profile` kwargs."""
+
+
+_DEFAULT_PROFILE: Any = _ImplicitBackfillProfile("backfill")
+
+
+def _normalize_profile(profile: str | None, *, default: str = "backfill") -> str:
+    raw = default if profile is None else str(profile).strip().lower()
+    if raw not in VALID_PROFILES:
+        raise ValueError(f"Unsupported profile={profile!r}; choose from {VALID_PROFILES}")
+    return raw
 
 
 def _validate_positive_finite(name: str, value: float) -> float:
@@ -832,12 +857,15 @@ def select_speculative_policy(
     temperature: float = 0.0,
     use_ane: bool = False,
     apple10_nax: bool | None = None,
+    profile: ProfileMode | None = None,
 ) -> SpeculativePolicy:
     """Select safe MTP speculative drafting and prefix-tree KV verification policy for Apple Silicon.
 
     Encodes our empirical Apple9/Apple10 NAX thresholds:
-      - ``B == 1`` (greedy GPU decode): ``mtp_enabled = bool(enable_mtp)`` with ``draft_k=3``
-        (with grammar) or ``draft_k=4`` (free-text).
+      - ``profile == "backfill"`` (when explicitly selected): disables ``B=1`` MTP speculative
+        drafting so backfill corpora never pay drafter weight residency or verify overhead.
+      - ``B == 1`` (greedy GPU decode in interactive regime): ``mtp_enabled = bool(enable_mtp)``
+        with ``draft_k=3`` (with grammar) or ``draft_k=4`` (free-text).
       - ``2 <= B <= 4``: chipset-aware — when ``apple10_nax=False`` (``Apple9`` M4), allows
         ``mtp_enabled=True, draft_k=2`` (keeping ``M = B*(K+1) <= 12 < 16``); when
         ``apple10_nax=True`` (``Apple10+`` M5 NAX) or unspecified (``None``, NAX-safe default),
@@ -860,8 +888,13 @@ def select_speculative_policy(
     if min_pfx < 1:
         raise ValueError(f"min_shared_prefix_tokens must be >= 1, got {min_shared_prefix_tokens!r}")
     temp = _validate_non_negative_finite("temperature", temperature)
+    prof_norm = None if profile is None else _normalize_profile(profile)
 
-    if not enable_mtp:
+    if prof_norm == "backfill":
+        mtp_enabled = False
+        mtp_draft_k = 0
+        mtp_reason = "MTP speculative/drafter gated off under profile='backfill'."
+    elif not enable_mtp:
         mtp_enabled = False
         mtp_draft_k = 0
         mtp_reason = "MTP disabled by caller (enable_mtp=False)."
@@ -1151,6 +1184,7 @@ class HostSiliconProfile:
     qlora_pack_len: int
     qlora_grad_accum: int
     has_calibrated_ane_w8: bool
+    mlx_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB
 
     @property
     def has_nax(self) -> bool:
@@ -1179,6 +1213,7 @@ class HostSiliconProfile:
             "ram_tier": self.ram_tier,
             "memory_limit_gb": self.memory_limit_gb,
             "cache_limit_gb": self.cache_limit_gb,
+            "mlx_cache_limit_mb": self.mlx_cache_limit_mb,
             "wired_ceiling_gb": self.wired_ceiling_gb,
             "effective_cap_gb": self.effective_cap_gb,
             "extraction_batch_size": self.extraction_batch_size,
@@ -1245,6 +1280,8 @@ class DynamicExecutionPlan:
     speculative: SpeculativePolicy
     budget: SiliconBudget
     reason: str
+    profile: str = "backfill"
+    mlx_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB
 
     @property
     def draft_k(self) -> int:
@@ -1259,6 +1296,7 @@ class DynamicExecutionPlan:
     def to_dict(self) -> dict[str, Any]:
         """Serialize execution plan to a JSON-friendly dictionary."""
         return {
+            "profile": self.profile,
             "workload": self.workload,
             "batch_size": self.batch_size,
             "seq_len": self.seq_len,
@@ -1284,6 +1322,7 @@ class DynamicExecutionPlan:
             "ram_tier": self.ram_tier,
             "memory_limit_gb": self.memory_limit_gb,
             "cache_limit_gb": self.cache_limit_gb,
+            "mlx_cache_limit_mb": self.mlx_cache_limit_mb,
             "wired_ceiling_gb": self.wired_ceiling_gb,
             "effective_cap_gb": self.effective_cap_gb,
             "extraction_batch_size": self.extraction_batch_size,
@@ -1468,6 +1507,8 @@ class DynamicSiliconPolicy:
     def __init__(
         self,
         *,
+        profile: ProfileMode = _DEFAULT_PROFILE,
+        mlx_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB,
         hw: Mapping[str, Any] | None = None,
         host_mem_gb: float | None = None,
         metal_working_set_gb: float | None = None,
@@ -1479,6 +1520,11 @@ class DynamicSiliconPolicy:
         has_calibrated_ane_w8: bool = False,
         promoted_coreai_targets: Iterable[tuple[str, int]] | None = None,
     ) -> None:
+        self._explicit_profile: bool = not isinstance(profile, _ImplicitBackfillProfile)
+        self.profile: str = _normalize_profile(profile)
+        if isinstance(mlx_cache_limit_mb, bool) or int(mlx_cache_limit_mb) < 0:
+            raise ValueError(f"mlx_cache_limit_mb must be a non-negative integer, got {mlx_cache_limit_mb!r}")
+        self.mlx_cache_limit_mb: int = int(mlx_cache_limit_mb)
         self.host: HostSiliconProfile = _resolve_host_profile(
             hw=hw,
             host_mem_gb=host_mem_gb,
@@ -1499,6 +1545,26 @@ class DynamicSiliconPolicy:
             )
             for wl in VALID_WORKLOADS
         }
+
+    @property
+    def b1_speculative_budget_enabled(self) -> bool:
+        """Return True when `B=1` speculative/drafter budget is enabled (`profile == 'interactive'`)."""
+        return self.profile == "interactive"
+
+    @property
+    def drafter_budget_mb(self) -> float:
+        """Estimated MTP drafter memory budget (`0.0` in `'backfill'`, `150.0` in `'interactive'`)."""
+        return _MTP_DRAFTER_ESTIMATED_MB if self.profile == "interactive" else 0.0
+
+    def apply_mlx_cache_limit(self) -> int | None:
+        """Apply `self.mlx_cache_limit_mb` (`256 MiB` default) via `set_mlx_cache_limit`."""
+        from .embeddings import set_mlx_cache_limit
+
+        return set_mlx_cache_limit(self.mlx_cache_limit_mb)
+
+    def poll_thermal_state(self) -> "ThermalStateSnapshot":
+        """Poll host macOS thermal state for sustained multi-hour backfill pacing."""
+        return poll_macos_thermal_state()
 
     @property
     def promoted_coreai_targets(self) -> frozenset[tuple[str, int]]:
@@ -1529,7 +1595,7 @@ class DynamicSiliconPolicy:
     def resolve(
         self,
         *,
-        batch_size: int = 1,
+        batch_size: int | None = None,
         seq_len: int = 512,
         workload: str = "extraction",
         shared_prefix_tokens: int = 0,
@@ -1541,9 +1607,19 @@ class DynamicSiliconPolicy:
         use_ane: bool = False,
         model_name: str | None = None,
         coreai_promotion_passed: bool = False,
+        profile: ProfileMode | None = None,
     ) -> DynamicExecutionPlan:
         """Resolve a per-call :class:`DynamicExecutionPlan` for the given batch and sequence shape."""
-        bsz = int(batch_size)
+        eff_profile = self.profile if profile is None else _normalize_profile(profile)
+        profile_gated: ProfileMode | None = (
+            eff_profile  # type: ignore[assignment]
+            if (profile is not None or self._explicit_profile)
+            else None
+        )
+        if batch_size is None:
+            bsz = self.host.extraction_batch_size if eff_profile == "backfill" else 1
+        else:
+            bsz = int(batch_size)
         if bsz < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
         slen = int(seq_len)
@@ -1566,10 +1642,11 @@ class DynamicSiliconPolicy:
             temperature=temperature,
             use_ane=use_ane,
             apple10_nax=self.host.apple10_nax,
+            profile=profile_gated,
         )
 
-        # Lazy drafter loading under mtp_mode="auto": pure B>=8 batch jobs pay 0 MB drafter RAM.
-        if not req_mtp:
+        # Lazy drafter loading under mtp_mode="auto": backfill & B>=8 batch jobs pay 0 MB drafter RAM.
+        if profile_gated == "backfill" or not req_mtp:
             should_load_drafter = False
         elif mode_norm == "on":
             should_load_drafter = True
@@ -1607,8 +1684,8 @@ class DynamicSiliconPolicy:
         )
 
         reason = (
-            f"host={self.host.gpu_family} (nax={self.host.apple10_nax}, ram={self.host.host_mem_gb:.0f}GB "
-            f"tier={self.host.ram_tier}, os={self.host.macos_version or 'unknown'}); "
+            f"profile={eff_profile}; host={self.host.gpu_family} (nax={self.host.apple10_nax}, "
+            f"ram={self.host.host_mem_gb:.0f}GB tier={self.host.ram_tier}, os={self.host.macos_version or 'unknown'}); "
             f"B={bsz}, S={slen}, scheduler={scheduler}, decoder={spec.decoder_mode}, "
             f"ane_backend={preferred_ane_backend} (promoted={promoted}); {spec.reason}"
         )
@@ -1655,6 +1732,8 @@ class DynamicSiliconPolicy:
             speculative=spec,
             budget=budget,
             reason=reason,
+            profile=eff_profile,
+            mlx_cache_limit_mb=self.mlx_cache_limit_mb,
         )
 
     def __call__(self, **kwargs: Any) -> DynamicExecutionPlan:
@@ -1675,6 +1754,8 @@ def resolve_dynamic_execution_plan(
     use_ane: bool = False,
     model_name: str | None = None,
     coreai_promotion_passed: bool = False,
+    profile: ProfileMode | None = None,
+    mlx_cache_limit_mb: int = DEFAULT_MLX_CACHE_LIMIT_MB,
     hw: Mapping[str, Any] | None = None,
     host_mem_gb: float | None = None,
     metal_working_set_gb: float | None = None,
@@ -1687,18 +1768,22 @@ def resolve_dynamic_execution_plan(
     promoted_coreai_targets: Iterable[tuple[str, int]] | None = None,
 ) -> DynamicExecutionPlan:
     """One-shot dynamic execution planner (probes ``probe_host_hardware()`` when host args are ``None``)."""
-    policy = DynamicSiliconPolicy(
-        hw=hw,
-        host_mem_gb=host_mem_gb,
-        metal_working_set_gb=metal_working_set_gb,
-        macos_version=macos_version,
-        apple10_nax=apple10_nax,
-        gpu_family=gpu_family,
-        chip_brand=chip_brand,
-        mlx_enable_tf32=mlx_enable_tf32,
-        has_calibrated_ane_w8=has_calibrated_ane_w8,
-        promoted_coreai_targets=promoted_coreai_targets,
-    )
+    policy_kw: dict[str, Any] = {
+        "mlx_cache_limit_mb": mlx_cache_limit_mb,
+        "hw": hw,
+        "host_mem_gb": host_mem_gb,
+        "metal_working_set_gb": metal_working_set_gb,
+        "macos_version": macos_version,
+        "apple10_nax": apple10_nax,
+        "gpu_family": gpu_family,
+        "chip_brand": chip_brand,
+        "mlx_enable_tf32": mlx_enable_tf32,
+        "has_calibrated_ane_w8": has_calibrated_ane_w8,
+        "promoted_coreai_targets": promoted_coreai_targets,
+    }
+    if profile is not None:
+        policy_kw["profile"] = profile
+    policy = DynamicSiliconPolicy(**policy_kw)
     return policy.resolve(
         batch_size=batch_size,
         seq_len=seq_len,
@@ -1712,14 +1797,358 @@ def resolve_dynamic_execution_plan(
         use_ane=use_ane,
         model_name=model_name,
         coreai_promotion_passed=coreai_promotion_passed,
+        profile=profile,
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Persistent Cross-Batch Hetero2 (GPU Head + ANE Tail) Work-Stealing Queue
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HeteroWorkItem:
+    """One length-tagged work item inside a :class:`Hetero2WorkStealingQueue`."""
+
+    seq_id: int
+    orig_index: int
+    seq_len: int
+    payload: Any
+
+
+class Hetero2WorkStealingQueue:
+    """Thread-safe persistent double-ended queue for 2-way `GPU + ANE` (`hetero2`) work-stealing.
+
+    Longest sequences sit at the head (left) so GPU batches maximize tile saturation, while ANE
+    workers steal shortest sequences (`<= max_seq_len`) from the tail (right) concurrently.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._deque: deque[HeteroWorkItem] = deque()
+        self._next_seq_id: int = 0
+        self.gpu_items_completed: int = 0
+        self.ane_items_completed: int = 0
+        self.gpu_tokens_completed: int = 0
+        self.ane_tokens_completed: int = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._deque)
+
+    @property
+    def gpu_share_actual(self) -> float:
+        with self._lock:
+            tot = self.gpu_tokens_completed + self.ane_tokens_completed
+            return float(self.gpu_tokens_completed) / float(tot) if tot > 0 else 0.0
+
+    def enqueue_batch(
+        self,
+        items: Sequence[Any],
+        *,
+        lengths: Sequence[int] | None = None,
+    ) -> list[int]:
+        """Enqueue a batch of items, keeping the persistent deque sorted longest-first (head) to shortest (tail)."""
+        if lengths is not None and len(lengths) != len(items):
+            raise ValueError(f"lengths ({len(lengths)}) must match items ({len(items)})")
+        if not items:
+            return []
+
+        with self._lock:
+            seq_ids: list[int] = []
+            combined: list[HeteroWorkItem] = list(self._deque)
+            for idx, payload in enumerate(items):
+                if lengths is not None:
+                    slen = max(1, int(lengths[idx]))
+                elif hasattr(payload, "__len__"):
+                    slen = max(1, len(payload))
+                else:
+                    slen = 1
+                sid = self._next_seq_id
+                self._next_seq_id += 1
+                seq_ids.append(sid)
+                combined.append(HeteroWorkItem(seq_id=sid, orig_index=idx, seq_len=slen, payload=payload))
+            combined.sort(key=lambda w: (-w.seq_len, w.seq_id))
+            self._deque = deque(combined)
+            return seq_ids
+
+    def pop_gpu_batch(
+        self,
+        max_items: int = 32,
+        *,
+        max_tokens: int | None = None,
+    ) -> list[HeteroWorkItem]:
+        """Steal up to `max_items` (and optional `max_tokens` budget) longest items from the head."""
+        cap = max(1, int(max_items))
+        tok_cap = int(max_tokens) if max_tokens is not None and int(max_tokens) > 0 else None
+        out: list[HeteroWorkItem] = []
+        tok_acc = 0
+        with self._lock:
+            while self._deque and len(out) < cap:
+                nxt = self._deque[0]
+                if tok_cap is not None and out and (tok_acc + nxt.seq_len) > tok_cap:
+                    break
+                item = self._deque.popleft()
+                out.append(item)
+                tok_acc += item.seq_len
+            self.gpu_items_completed += len(out)
+            self.gpu_tokens_completed += tok_acc
+        return out
+
+    def pop_ane_item(self, *, max_seq_len: int | None = 512) -> HeteroWorkItem | None:
+        """Steal one shortest item from the tail if `seq_len <= max_seq_len`, else `None`."""
+        with self._lock:
+            if not self._deque:
+                return None
+            tail = self._deque[-1]
+            if max_seq_len is not None and tail.seq_len > int(max_seq_len):
+                return None
+            item = self._deque.pop()
+            self.ane_items_completed += 1
+            self.ane_tokens_completed += item.seq_len
+            return item
+
+    def pop_ane_batch(
+        self,
+        max_items: int = 1,
+        *,
+        max_seq_len: int | None = 512,
+    ) -> list[HeteroWorkItem]:
+        """Steal up to `max_items` shortest items (`<= max_seq_len`) from the tail."""
+        cap = max(1, int(max_items))
+        out: list[HeteroWorkItem] = []
+        for _ in range(cap):
+            it = self.pop_ane_item(max_seq_len=max_seq_len)
+            if it is None:
+                break
+            out.append(it)
+        return out
+
+    def run_concurrent(
+        self,
+        items: Sequence[Any],
+        *,
+        gpu_fn: Callable[[list[HeteroWorkItem]], Sequence[Any]],
+        ane_fn: Callable[[list[HeteroWorkItem]], Sequence[Any]] | None = None,
+        lengths: Sequence[int] | None = None,
+        gpu_batch_size: int = 32,
+        gpu_max_tokens: int | None = None,
+        ane_batch_size: int = 1,
+        ane_max_seq_len: int | None = 512,
+        ane_workers: int = 1,
+    ) -> list[Any]:
+        """Drain `items` concurrently across GPU (head) and ANE (tail), restoring exact input order."""
+        n = len(items)
+        if n == 0:
+            return []
+        seq_ids = self.enqueue_batch(items, lengths=lengths)
+        slot_by_sid = {sid: idx for idx, sid in enumerate(seq_ids)}
+        results: list[Any] = [None] * n
+        res_lock = threading.Lock()
+        errors: list[BaseException] = []
+
+        def _store(batch: list[HeteroWorkItem], outs: Sequence[Any]) -> None:
+            if len(outs) != len(batch):
+                raise RuntimeError(f"Hetero worker returned {len(outs)} outputs for batch of {len(batch)}.")
+            with res_lock:
+                for wi, val in zip(batch, outs):
+                    pos = slot_by_sid.get(wi.seq_id)
+                    if pos is not None:
+                        results[pos] = val
+
+        def _ane_loop() -> None:
+            assert ane_fn is not None
+            try:
+                while not errors:
+                    batch = self.pop_ane_batch(ane_batch_size, max_seq_len=ane_max_seq_len)
+                    if not batch:
+                        return
+                    _store(batch, ane_fn(batch))
+            except BaseException as exc:
+                with res_lock:
+                    errors.append(exc)
+
+        threads: list[threading.Thread] = []
+        if ane_fn is not None and int(ane_workers) > 0:
+            for _ in range(int(ane_workers)):
+                t = threading.Thread(target=_ane_loop, daemon=True)
+                t.start()
+                threads.append(t)
+
+        try:
+            while not errors:
+                batch = self.pop_gpu_batch(gpu_batch_size, max_tokens=gpu_max_tokens)
+                if not batch:
+                    break
+                _store(batch, gpu_fn(batch))
+        except BaseException as exc:
+            with res_lock:
+                errors.append(exc)
+        finally:
+            for t in threads:
+                t.join(timeout=10.0)
+
+        if errors:
+            raise errors[0]
+        return results
+
+
+# ---------------------------------------------------------------------------
+# 7. macOS Thermal State Polling Helper (Foundation ctypes + pmset Fallback)
+# ---------------------------------------------------------------------------
+
+_THERMAL_LEVEL_BY_RAW: dict[int, ThermalLevel] = {
+    0: "nominal",
+    1: "fair",
+    2: "serious",
+    3: "critical",
+}
+_PMSET_SPEED_LIMIT_RE = re.compile(r"CPU_Speed_Limit\s*=\s*(\d+)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ThermalStateSnapshot:
+    """macOS `NSProcessInfo.thermalState` snapshot and backfill pacing recommendation."""
+
+    raw_state: int
+    level: ThermalLevel
+    source: str
+    throttle_recommended: bool
+    recommended_batch_scale: float
+    cooldown_sleep_sec: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "raw_state": self.raw_state,
+            "level": self.level,
+            "source": self.source,
+            "throttle_recommended": self.throttle_recommended,
+            "recommended_batch_scale": self.recommended_batch_scale,
+            "cooldown_sleep_sec": self.cooldown_sleep_sec,
+        }
+
+
+def _read_foundation_thermal_state() -> int | None:
+    """Query `[[NSProcessInfo processInfo] thermalState]` via arm64-safe `ctypes` prototypes."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        ctypes.CDLL("/System/Library/Frameworks/Foundation.framework/Foundation")
+
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+
+        cls_ptr = objc.objc_getClass(b"NSProcessInfo")
+        if not cls_ptr:
+            return None
+        sel_proc = objc.sel_registerName(b"processInfo")
+        sel_therm = objc.sel_registerName(b"thermalState")
+        if not sel_proc or not sel_therm:
+            return None
+
+        msg_ptr = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        if not msg_ptr:
+            return None
+        send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(msg_ptr)
+        send_long = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)(msg_ptr)
+
+        proc_info = send_id(cls_ptr, sel_proc)
+        if not proc_info:
+            return None
+        raw = int(send_long(proc_info, sel_therm))
+        return max(0, min(3, raw))
+    except Exception:
+        return None
+
+
+def _read_pmset_thermal_output() -> str | None:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        proc = subprocess.run(
+            ["pmset", "-g", "therm"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except Exception:
+        pass
+    return None
+
+
+def _snapshot_from_raw_thermal(raw: int, source: str) -> ThermalStateSnapshot:
+    clamped = max(0, min(3, int(raw)))
+    level = _THERMAL_LEVEL_BY_RAW[clamped]
+    if clamped <= 1:
+        return ThermalStateSnapshot(
+            raw_state=clamped,
+            level=level,
+            source=source,
+            throttle_recommended=False,
+            recommended_batch_scale=1.0,
+            cooldown_sleep_sec=0.0,
+        )
+    if clamped == 2:
+        return ThermalStateSnapshot(
+            raw_state=2,
+            level="serious",
+            source=source,
+            throttle_recommended=True,
+            recommended_batch_scale=0.5,
+            cooldown_sleep_sec=0.05,
+        )
+    return ThermalStateSnapshot(
+        raw_state=3,
+        level="critical",
+        source=source,
+        throttle_recommended=True,
+        recommended_batch_scale=0.25,
+        cooldown_sleep_sec=0.25,
+    )
+
+
+def poll_macos_thermal_state() -> ThermalStateSnapshot:
+    """Poll macOS thermal state via `Foundation` (`NSProcessInfo.thermalState`) or `pmset -g therm` fallback."""
+    raw = _read_foundation_thermal_state()
+    if raw is not None:
+        return _snapshot_from_raw_thermal(raw, "foundation")
+
+    pmset_out = _read_pmset_thermal_output()
+    if pmset_out:
+        m = _PMSET_SPEED_LIMIT_RE.search(pmset_out)
+        if m is not None:
+            speed = int(m.group(1))
+            if speed <= 50:
+                return _snapshot_from_raw_thermal(3, "pmset")
+            if speed < 85:
+                return _snapshot_from_raw_thermal(2, "pmset")
+            if speed < 100:
+                return _snapshot_from_raw_thermal(1, "pmset")
+            return _snapshot_from_raw_thermal(0, "pmset")
+        low = pmset_out.lower()
+        if "sleeping" in low or "critical" in low:
+            return _snapshot_from_raw_thermal(3, "pmset")
+        if "thermal warning" in low and "no thermal warning" not in low:
+            return _snapshot_from_raw_thermal(2, "pmset")
+        return _snapshot_from_raw_thermal(0, "pmset")
+
+    return _snapshot_from_raw_thermal(0, "fallback")
 
 
 __all__ = [
     "APPLE10_FUSED_SWA_SDPA_SEQ_LENS",
+    "DEFAULT_MLX_CACHE_LIMIT_MB",
     "DisaggregatedCriticBudget",
     "DynamicExecutionPlan",
     "DynamicSiliconPolicy",
+    "Hetero2WorkStealingQueue",
+    "HeteroWorkItem",
     "HostSiliconProfile",
     "MASK_NEG_VAL_FP16",
     "MIN_SHARED_PREFIX_TOKENS",
@@ -1727,15 +2156,20 @@ __all__ = [
     "PackedSegmentSpan",
     "PackedSequenceBin",
     "PackedSequenceResult",
+    "ProfileMode",
     "SiliconBudget",
     "SpeculativePolicy",
+    "ThermalLevel",
+    "ThermalStateSnapshot",
     "VALID_MTP_MODES",
+    "VALID_PROFILES",
     "VALID_WORKLOADS",
     "WIRED_MEMORY_CEILING_FRACTION",
     "build_block_diagonal_mask",
     "find_common_prefix_len",
     "pack_encoder_batches",
     "pack_sequences_ffd",
+    "poll_macos_thermal_state",
     "recommend_silicon_budget",
     "resolve_dynamic_execution_plan",
     "select_speculative_policy",

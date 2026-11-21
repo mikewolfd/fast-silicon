@@ -111,7 +111,11 @@ bool inspect_stage_plan_counts_once(
     PlanCounts counts{};
     MLModelStructureProgram* prog = captured.modelStructure.program;
     if (prog != nil) {
-        MLModelStructureProgramFunction* main_fn = prog.functions[@"main"];
+        NSString* fn_key = cfg.functionName != nil ? cfg.functionName : @"main";
+        MLModelStructureProgramFunction* main_fn = prog.functions[fn_key];
+        if (main_fn == nil && prog.functions.count > 0) {
+            main_fn = prog.functions.allValues.firstObject;
+        }
         if (main_fn != nil) {
             for (MLModelStructureProgramOperation* op in main_fn.block.operations) {
                 ++counts.total_ops;
@@ -411,8 +415,9 @@ const char* pplx_ane_last_error(void) {
     return tl_last_error.c_str();
 }
 
-void* pplx_ane_load_stages(
+void* pplx_ane_load_stages_fn(
     const char* const* model_paths,
+    const char* function_name,
     int num_stages,
     int seq_len,
     int hidden_dim,
@@ -452,6 +457,11 @@ void* pplx_ane_load_stages(
 
         MLModelConfiguration* cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = map_compute_units(compute_units);
+        if (function_name && function_name[0] != '\0' && std::strcmp(function_name, "main") != 0) {
+            if (@available(macOS 15.0, *)) {
+                cfg.functionName = [NSString stringWithUTF8String:function_name];
+            }
+        }
 
         const char* allow_fb_env = std::getenv("FAST_PPLX_ALLOW_ANE_FALLBACK");
         const bool require_pure_ane =
@@ -522,6 +532,27 @@ void* pplx_ane_load_stages(
         runner->q = dispatch_queue_create("fast_pplx.ane.runner", DISPATCH_QUEUE_CONCURRENT);
         return runner;
     }
+}
+
+void* pplx_ane_load_stages(
+    const char* const* model_paths,
+    int num_stages,
+    int seq_len,
+    int hidden_dim,
+    int chunk_size,
+    int rope_half,
+    int pipe_depth,
+    int compute_units) {
+    return pplx_ane_load_stages_fn(
+        model_paths,
+        nullptr,
+        num_stages,
+        seq_len,
+        hidden_dim,
+        chunk_size,
+        rope_half,
+        pipe_depth,
+        compute_units);
 }
 
 int pplx_ane_acquire_slot(void* runner_ptr, PplxSlotBuffers* out_bufs) {
@@ -704,8 +735,9 @@ double pplx_ane_exec(
     return pplx_ane_wait(job);
 }
 
-int pplx_ane_inspect_plan(
+int pplx_ane_inspect_plan_fn(
     const char* model_path,
+    const char* function_name,
     int compute_units,
     char* out_json_buf,
     int buf_len) {
@@ -719,6 +751,11 @@ int pplx_ane_inspect_plan(
         NSURL* url = [NSURL fileURLWithPath:path];
         MLModelConfiguration* cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = map_compute_units(compute_units);
+        if (function_name && function_name[0] != '\0' && std::strcmp(function_name, "main") != 0) {
+            if (@available(macOS 15.0, *)) {
+                cfg.functionName = [NSString stringWithUTF8String:function_name];
+            }
+        }
 
         PlanCounts plan{};
         std::string plan_err;
@@ -745,6 +782,14 @@ int pplx_ane_inspect_plan(
             plan.other_ops);
         return (written >= 0 && written < buf_len) ? written : -1;
     }
+}
+
+int pplx_ane_inspect_plan(
+    const char* model_path,
+    int compute_units,
+    char* out_json_buf,
+    int buf_len) {
+    return pplx_ane_inspect_plan_fn(model_path, nullptr, compute_units, out_json_buf, buf_len);
 }
 
 void pplx_ane_free(void* runner_ptr) {

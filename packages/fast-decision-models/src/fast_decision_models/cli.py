@@ -10,9 +10,10 @@ from typing import Any
 
 from ._common import acquire_hw_lock
 from .builder import add_setup_weights_arguments, run_build_args
-from .kev_mlx import Kev08bMlxBackend
+from .kev_mlx import Kev08bMlxBackend, Kev4bMlxBackend
 from .laya_ane import LayaAneBackend
-from .paths import ensure_laya_dylib, resolve_kev_dir, resolve_laya_dir
+from .laya_hetero import LayaHeteroEngine, LayaMlxGpuBackend
+from .paths import ensure_laya_dylib, resolve_kev_4b_dir, resolve_kev_dir, resolve_laya_dir
 
 _SAMPLE_ITEMS = [
     (
@@ -80,8 +81,14 @@ def _cmd_score(args: argparse.Namespace) -> int:
 
     with acquire_hw_lock(f"cli_score_{args.backend}"):
         t0 = time.perf_counter()
-        if args.backend == "laya-ane":
-            laya = LayaAneBackend(resolve_laya_dir(args.laya_dir, artifacts_dir=args.artifacts_dir))
+        if args.backend in ("laya-ane", "laya-gpu", "laya-hetero"):
+            laya_dir = resolve_laya_dir(args.laya_dir, artifacts_dir=args.artifacts_dir)
+            if args.backend == "laya-ane":
+                laya: Any = LayaAneBackend(laya_dir)
+            elif args.backend == "laya-gpu":
+                laya = LayaMlxGpuBackend(args.laya_dir, batch_size=1)
+            else:
+                laya = LayaHeteroEngine(laya_dir=laya_dir, mode="hetero", profile="backfill")
             try:
                 enc = laya.encode_item(args.state, qdef)
                 if args.type == "noul":
@@ -90,7 +97,7 @@ def _cmd_score(args: argparse.Namespace) -> int:
                 else:
                     probs = laya.score_choice_batch([enc])[0]
                 payload: dict[str, Any] = {
-                    "backend": "laya-ane",
+                    "backend": args.backend,
                     "type": args.type,
                     "tokens": len(enc["ids"]),
                     "probs": probs,
@@ -99,9 +106,27 @@ def _cmd_score(args: argparse.Namespace) -> int:
                     payload["p_true"] = probs[1]
             finally:
                 laya.close()
+        elif args.backend == "kev-4b":
+            kev4 = Kev4bMlxBackend(
+                resolve_kev_4b_dir(args.kev_dir, artifacts_dir=args.artifacts_dir) if args.kev_dir else None,
+                quant_mode=args.kev_quant,
+                batch_docs=1,
+            )
+            try:
+                probs, logits = kev4.score_multi_states([(args.state, [qdef])])[0][0]
+                payload = {
+                    "backend": f"kev-4b-{kev4.quant_mode}",
+                    "type": args.type,
+                    "probs": probs,
+                    "logits": logits,
+                }
+                if args.type == "noul" and len(probs) >= 2:
+                    payload["p_true"] = probs[1]
+            finally:
+                kev4.close()
         else:
             kev = Kev08bMlxBackend(
-                resolve_kev_dir(args.kev_dir, artifacts_dir=args.artifacts_dir),
+                resolve_kev_dir(args.kev_dir, artifacts_dir=args.artifacts_dir) if args.kev_dir else None,
                 quant_mode=args.kev_quant,
                 batch_docs=1,
             )
@@ -136,10 +161,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     checked = 0
     if args.backend in ("all", "laya-ane"):
         laya_dir = resolve_laya_dir(args.laya_dir, artifacts_dir=args.artifacts_dir)
-        if not (laya_dir / "laya_typed_s512_w8.mlmodelc").exists():
-            if args.backend == "laya-ane":
-                raise FileNotFoundError(f"Missing Laya ANE bundles in {laya_dir}")
-            print(f"[SKIP] Laya-Typed ANE bundles not found in {laya_dir}")
+        has_local = (laya_dir / "laya_typed_s512_w8.mlmodelc").exists() or (laya_dir / "laya_typed_w8.mlmodelc").is_dir()
+        if not has_local and args.backend == "all":
+            print(f"[SKIP] Laya-Typed local ANE bundles not found in {laya_dir}")
         else:
             with acquire_hw_lock("cli_verify_laya"):
                 dylib_p = ensure_laya_dylib()
@@ -160,13 +184,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     if args.backend in ("all", "kev-0.8b"):
         kev_dir = resolve_kev_dir(args.kev_dir, artifacts_dir=args.artifacts_dir)
-        if not (kev_dir / "kev_meta.json").exists() and not (kev_dir / "kev_meta_w8.json").exists():
-            if args.backend == "kev-0.8b":
-                raise FileNotFoundError(f"Missing Kev-0.8B artifacts in {kev_dir}")
-            print(f"[SKIP] Kev-0.8B artifacts not found in {kev_dir}")
+        has_local_kev = (kev_dir / "kev_meta.json").exists() or (kev_dir / "kev_meta_w8.json").exists()
+        if not has_local_kev and args.backend == "all":
+            print(f"[SKIP] Kev-0.8B local artifacts not found in {kev_dir}")
         else:
             with acquire_hw_lock("cli_verify_kev"):
-                kev = Kev08bMlxBackend(kev_dir, quant_mode=args.kev_quant, batch_docs=4)
+                kev = Kev08bMlxBackend(kev_dir if has_local_kev else None, quant_mode=args.kev_quant, batch_docs=4)
                 try:
                     pairs = [(st, [qd]) for st, qd, _ in _SAMPLE_ITEMS]
                     single = [kev.score_multi_states_noul([pair], batch_docs=1)[0][0][0] for pair in pairs]
@@ -192,7 +215,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 
     if args.backend in ("all", "laya-ane"):
         laya_dir = resolve_laya_dir(args.laya_dir, artifacts_dir=args.artifacts_dir)
-        if (laya_dir / "laya_typed_s512_w8.mlmodelc").exists():
+        if (laya_dir / "laya_typed_s512_w8.mlmodelc").exists() or (laya_dir / "laya_typed_w8.mlmodelc").is_dir():
             with acquire_hw_lock("cli_bench_laya"):
                 laya = LayaAneBackend(laya_dir, ensure_laya_dylib(), pipe_depth=4)
                 try:
@@ -210,11 +233,32 @@ def _cmd_bench(args: argparse.Namespace) -> int:
                 finally:
                     laya.close()
 
+    if args.backend in ("all", "laya-hetero"):
+        laya_dir = resolve_laya_dir(args.laya_dir, artifacts_dir=args.artifacts_dir)
+        if args.backend == "laya-hetero" or (laya_dir / "laya_typed_s512_w8.mlmodelc").exists():
+            with acquire_hw_lock("cli_bench_laya_hetero"):
+                het = LayaHeteroEngine(laya_dir=laya_dir, mode="hetero", profile="backfill")
+                try:
+                    encs = [het.encode_item(st, qd) for st, qd in items]
+                    _ = het.score_noul_batch(encs[: min(4, len(encs))])
+                    t0 = time.perf_counter()
+                    _ = het.score_noul_batch(encs)
+                    dt = time.perf_counter() - t0
+                    results["laya_hetero"] = {
+                        "n_questions": len(encs),
+                        "elapsed_sec": round(dt, 4),
+                        "ms_per_question": round((dt * 1e3) / len(encs), 2),
+                        "q_per_sec": round(len(encs) / max(dt, 1e-9), 2),
+                    }
+                finally:
+                    het.close()
+
     if args.backend in ("all", "kev-0.8b"):
         kev_dir = resolve_kev_dir(args.kev_dir, artifacts_dir=args.artifacts_dir)
-        if (kev_dir / "kev_meta.json").exists() or (kev_dir / "kev_meta_w8.json").exists():
+        if (kev_dir / "kev_meta.json").exists() or (kev_dir / "kev_meta_w8.json").exists() or args.backend == "kev-0.8b":
             with acquire_hw_lock("cli_bench_kev"):
-                kev = Kev08bMlxBackend(kev_dir, quant_mode=args.kev_quant, batch_docs=args.batch_docs)
+                has_local = (kev_dir / "kev_meta.json").exists() or (kev_dir / "kev_meta_w8.json").exists()
+                kev = Kev08bMlxBackend(kev_dir if has_local else None, quant_mode=args.kev_quant, batch_docs=args.batch_docs)
                 try:
                     pairs = [(st, [qd]) for st, qd in items]
                     _ = kev.score_multi_states_noul(pairs[: min(2, len(pairs))])
@@ -245,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     sw.set_defaults(func=run_build_args)
 
     sc = sub.add_parser("score", help="Score one typed question (noul, choice, score) against a state")
-    sc.add_argument("--backend", choices=("laya-ane", "kev-0.8b"), default="kev-0.8b")
+    sc.add_argument("--backend", choices=("laya-ane", "laya-gpu", "laya-hetero", "kev-0.8b", "kev-4b"), default="kev-0.8b")
     sc.add_argument("--type", choices=("noul", "choice", "score"), default="noul")
     sc.add_argument("--question", required=True)
     sc.add_argument("--criteria", default=None, help="JSON object/array or comma-separated options")
@@ -253,7 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--artifacts-dir", default=None)
     sc.add_argument("--laya-dir", default=None)
     sc.add_argument("--kev-dir", default=None)
-    sc.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="auto")
+    sc.add_argument("--kev-quant", choices=("auto", "w8", "w4", "bf16"), default="auto")
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(func=_cmd_score)
 
@@ -262,17 +306,17 @@ def build_parser() -> argparse.ArgumentParser:
     vf.add_argument("--artifacts-dir", default=None)
     vf.add_argument("--laya-dir", default=None)
     vf.add_argument("--kev-dir", default=None)
-    vf.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="auto")
+    vf.add_argument("--kev-quant", choices=("auto", "w8", "w4", "bf16"), default="auto")
     vf.set_defaults(func=_cmd_verify)
 
-    bn = sub.add_parser("bench", help="Benchmark ANE and/or MLX W8 throughput on synthetic typed queries")
-    bn.add_argument("--backend", choices=("all", "laya-ane", "kev-0.8b"), default="all")
+    bn = sub.add_parser("bench", help="Benchmark ANE, Hetero, and/or MLX throughput on synthetic typed queries")
+    bn.add_argument("--backend", choices=("all", "laya-ane", "laya-hetero", "kev-0.8b"), default="all")
     bn.add_argument("--n", type=int, default=24)
     bn.add_argument("--batch-docs", type=int, default=8)
     bn.add_argument("--artifacts-dir", default=None)
     bn.add_argument("--laya-dir", default=None)
     bn.add_argument("--kev-dir", default=None)
-    bn.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="auto")
+    bn.add_argument("--kev-quant", choices=("auto", "w8", "w4", "bf16"), default="auto")
     bn.set_defaults(func=_cmd_bench)
     return p
 

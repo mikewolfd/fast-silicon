@@ -390,31 +390,86 @@ class ContextualTokenizer:
         self,
         chunks: Sequence[str],
         *,
-        context_tokens: int = 2048,
+        max_context_tokens: int = 2048,
+        context_tokens: int | None = None,
+        header_text: str | None = None,
+        repeat_header_tokens: int | Sequence[int] | None = None,
     ) -> list[list[str]]:
-        """Greedily pack ordered document chunks into contextual windows <= `context_tokens`.
+        """Greedily pack ordered document chunks into contextual windows <= `max_context_tokens`.
 
         Mirrors ``evals/vidore.py`` / ``evals/conteb.py`` two-knob contextual packing:
         accounts for ``[D] `` prefix tokens once per window plus one ``<|chunk_sep|>``
         token between adjacent chunks, without ever splitting an individual chunk.
+        Supports optional header-anchoring via ``header_text`` (prepended to every window)
+        or ``repeat_header_tokens`` (repeats the leading header tokens of ``chunks[0]`` or
+        an explicit token sequence at the start of subsequent windows ``w >= 1``).
         """
         if not chunks:
             return []
-        limit = int(context_tokens)
+        raw_limit = max_context_tokens if context_tokens is None else context_tokens
+        limit = int(raw_limit)
         if limit <= 0:
-            raise ValueError(f"context_tokens must be positive, got {context_tokens}")
+            raise ValueError(f"max_context_tokens must be positive, got {raw_limit}")
 
         prefix_len = max(1, len(self._tokenizer.encode(self.config.document_prefix, add_special_tokens=False).ids))
         encs = self._tokenizer.encode_batch(list(chunks), add_special_tokens=False)
+
+        anchor_w0: str | None = None
+        anchor_w0_cost = 0
+        anchor_subseq: str | None = None
+        anchor_subseq_cost = 0
+
+        if header_text is not None and header_text.strip():
+            hdr_str = header_text.strip()
+            hdr_len = len(self._tokenizer.encode(hdr_str, add_special_tokens=False).ids)
+            anchor_subseq = hdr_str
+            anchor_subseq_cost = hdr_len + 1
+            if chunks[0].strip() != hdr_str:
+                anchor_w0 = hdr_str
+                anchor_w0_cost = hdr_len + 1
+        elif repeat_header_tokens is not None:
+            if isinstance(repeat_header_tokens, int):
+                n_rep = int(repeat_header_tokens)
+                if n_rep < 0:
+                    raise ValueError("repeat_header_tokens must be non-negative")
+                if n_rep > 0 and encs[0].ids:
+                    rep_ids = list(encs[0].ids[:n_rep])
+                    rep_str = self._tokenizer.decode(rep_ids, skip_special_tokens=False).strip()
+                    if rep_str:
+                        rep_len = len(self._tokenizer.encode(rep_str, add_special_tokens=False).ids)
+                        anchor_subseq = rep_str
+                        anchor_subseq_cost = rep_len + 1
+            else:
+                rep_ids = [int(t) for t in repeat_header_tokens]
+                if rep_ids:
+                    rep_str = self._tokenizer.decode(rep_ids, skip_special_tokens=False).strip()
+                    if rep_str:
+                        rep_len = len(self._tokenizer.encode(rep_str, add_special_tokens=False).ids)
+                        anchor_subseq = rep_str
+                        anchor_subseq_cost = rep_len + 1
+
         windows: list[list[str]] = [[]]
         used = prefix_len
+        if anchor_w0 is not None and prefix_len + anchor_w0_cost + len(encs[0].ids) <= limit:
+            windows[0].append(anchor_w0)
+            used += anchor_w0_cost - 1
+
         for chunk, enc in zip(chunks, encs, strict=True):
+            c_len = len(enc.ids)
             sep_cost = 1 if windows[-1] else 0
-            cost = len(enc.ids) + sep_cost
+            cost = c_len + sep_cost
             if windows[-1] and used + cost > limit:
-                windows.append([])
-                used = prefix_len
-                cost = len(enc.ids)
+                # Only split when current window already has at least one body chunk (not just anchor_w0).
+                has_body = len(windows[-1]) > (1 if (len(windows) == 1 and anchor_w0 is not None and windows[0][:1] == [anchor_w0]) else 0)
+                if has_body:
+                    windows.append([])
+                    used = prefix_len
+                    if anchor_subseq is not None and prefix_len + anchor_subseq_cost + c_len <= limit:
+                        windows[-1].append(anchor_subseq)
+                        used += anchor_subseq_cost - 1
+                        cost = c_len + 1
+                    else:
+                        cost = c_len
             windows[-1].append(chunk)
             used += cost
         return windows
@@ -424,13 +479,17 @@ class ContextualTokenizer:
         text: str,
         *,
         chunk_tokens: int = 256,
-        context_tokens: int = 2048,
+        max_context_tokens: int = 2048,
+        context_tokens: int | None = None,
         overlap: int = 32,
+        header_text: str | None = None,
+        repeat_header_tokens: int | Sequence[int] | None = None,
     ) -> list[tuple[list[str], list[tuple[int, int]]]]:
-        """Split `text` into <= `chunk_tokens` pieces and pack them into <= `context_tokens` windows.
+        """Split `text` into <= `chunk_tokens` pieces and pack them into <= `max_context_tokens` windows.
 
         Returns ``[(window_chunks, [(char_start, char_end), ...]), ...]``.
         """
+        eff_ctx = max_context_tokens if context_tokens is None else int(context_tokens)
         raw_pieces = self.chunk_text(
             text,
             max_chunk_tokens=int(chunk_tokens),
@@ -439,13 +498,32 @@ class ContextualTokenizer:
         )
         texts = [text[c0:c1] for _, c0, c1 in raw_pieces]
         offsets = [(c0, c1) for _, c0, c1 in raw_pieces]
-        windows = self.group_chunks_by_context_windows(texts, context_tokens=context_tokens)
+        windows = self.group_chunks_by_context_windows(
+            texts,
+            max_context_tokens=eff_ctx,
+            header_text=header_text,
+            repeat_header_tokens=repeat_header_tokens,
+        )
         grouped: list[tuple[list[str], list[tuple[int, int]]]] = []
         cursor = 0
         for win in windows:
-            span_slice = offsets[cursor : cursor + len(win)]
-            grouped.append((win, span_slice))
-            cursor += len(win)
+            # Check whether window starts with an injected header anchor before texts[cursor]
+            if (
+                (header_text is not None or repeat_header_tokens is not None)
+                and cursor < len(texts)
+                and len(win) >= 2
+                and win[0] != texts[cursor]
+                and win[1] == texts[cursor]
+            ):
+                n_body = len(win) - 1
+                hdr_end = min(len(text), offsets[0][0] + len(win[0])) if offsets else 0
+                span_slice = [(offsets[0][0] if offsets else 0, hdr_end), *offsets[cursor : cursor + n_body]]
+                grouped.append((win, span_slice))
+                cursor += n_body
+            else:
+                span_slice = offsets[cursor : cursor + len(win)]
+                grouped.append((win, span_slice))
+                cursor += len(win)
         return grouped
 
 

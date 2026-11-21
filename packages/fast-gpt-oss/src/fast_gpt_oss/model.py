@@ -6,25 +6,27 @@ Provides:
     test shapes.
   - Pure CPU/NumPy helpers (`make_yarn_rope_np`, `infer_affine_quant_spec`,
     `pack_gpt_oss_layer_tensors`, `prune_lm_head_tensors`) testable without GPU contention.
-  - `FastGptOssModel`: lazy Metal kernel compilation via `kernels.build_kernels()`,
-    single-copy strided QKV & Expert Gate+Up packing, asymmetric output-vocab pruning,
-    `B=1` decode & prefill, `compute_shared_prefix` (`L_sys >= 0`), `alloc_batch_cache`,
-    `prefill_batch_suffixes`, `decode_step_batch` (`Hydragen v2` + circular SWA +
-    Zero-Sync Metal 4 Hybrid MoE), `compact_batch_cache`, `extract_b1_cache`, and
-    `clone_b1_cache_from_prefix`.
+  - `FastGptOssModel`: streamed per-shard safetensors loading (`mx.clear_cache()` per shard),
+    retained cold `lm_head` fallback (`_cold_lm_head` + `compute_full_logits_1d`),
+    Apple10 (`M5 NAX`) `n_tok >= 2` `mx.gather_qmm(..., lhs_indices=..., sorted_indices=True)`
+    and `mx.fast.scaled_dot_product_attention(..., sinks=...)` routing, Apple9 Metal 4
+    `Hot-MPP / Cold-QMV` + `swa128_prefill_mma` fast paths, and `append_batch_suffixes`
+    for zero-recompute two-phase batched budgeted reasoning.
 """
 
 from __future__ import annotations
 
+import gc
 import glob
 import json
 import math
 import os
 import platform
 import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 import warnings
 
 import numpy as np
@@ -67,6 +69,39 @@ def _detect_m5_nax_moe(mx: Any) -> bool:
 
 def _f32_to_u32(val: float) -> int:
     return int(np.array([val], dtype=np.float32).view(np.uint32)[0])
+
+
+def _peek_all_checkpoint_keys(model_dir: Path, shards: Sequence[str]) -> set[str] | None:
+    """Inspect expected tensor keys from `model.safetensors.index.json` or binary headers (0 tensor bytes read)."""
+    idx_file = model_dir / "model.safetensors.index.json"
+    if idx_file.is_file():
+        try:
+            data = json.loads(idx_file.read_text(encoding="utf-8"))
+            wm = data.get("weight_map")
+            if isinstance(wm, dict) and wm:
+                return set(str(k) for k in wm.keys())
+        except Exception:
+            pass
+
+    keys: set[str] = set()
+    try:
+        for sp in shards:
+            with open(sp, "rb") as fp:
+                hdr_raw = fp.read(8)
+                if len(hdr_raw) != 8:
+                    return None
+                hdr_len = struct.unpack("<Q", hdr_raw)[0]
+                if hdr_len <= 0 or hdr_len > (64 << 20):
+                    return None
+                hdr = json.loads(fp.read(hdr_len).decode("utf-8"))
+                if not isinstance(hdr, dict):
+                    return None
+                for k in hdr.keys():
+                    if k != "__metadata__":
+                        keys.add(str(k))
+        return keys if keys else None
+    except Exception:
+        return None
 
 
 def make_yarn_rope_np(
@@ -414,6 +449,9 @@ def prune_lm_head_tensors(
 
 _COMPILED_SWIGLU_CACHE: dict[tuple[float, float], Any] = {}
 _COMPILED_ROUTE_CACHE: dict[int, Any] = {}
+_COMPILED_ADD_RESID_BF16: Any = None
+_COMPILED_B1_MOE_COMBINE: Any = None
+_COMPILED_NAX_MOE_COMBINE: Any = None
 
 
 def _get_compiled_swiglu(limit: float = 7.0, alpha: float = 1.702):
@@ -451,8 +489,47 @@ def _get_compiled_route(k: int = 4):
     return fn
 
 
+def _get_compiled_add_resid_bf16():
+    global _COMPILED_ADD_RESID_BF16
+    if _COMPILED_ADD_RESID_BF16 is None:
+        import mlx.core as mx
+
+        def _fn(h: Any, delta: Any) -> Any:
+            return h + delta.astype(mx.bfloat16)
+
+        _COMPILED_ADD_RESID_BF16 = mx.compile(_fn)
+    return _COMPILED_ADD_RESID_BF16
+
+
+def _get_compiled_b1_moe_combine():
+    global _COMPILED_B1_MOE_COMBINE
+    if _COMPILED_B1_MOE_COMBINE is None:
+        import mlx.core as mx
+
+        def _fn(h: Any, dn: Any, dn_bias_e: Any, scores: Any) -> Any:
+            weighted = (dn[:, 0, :] + dn_bias_e) * scores[0, :, None]
+            return h + weighted.sum(axis=0).reshape(1, 1, -1).astype(mx.bfloat16)
+
+        _COMPILED_B1_MOE_COMBINE = mx.compile(_fn)
+    return _COMPILED_B1_MOE_COMBINE
+
+
+def _get_compiled_nax_moe_combine():
+    global _COMPILED_NAX_MOE_COMBINE
+    if _COMPILED_NAX_MOE_COMBINE is None:
+        import mlx.core as mx
+
+        def _fn(h_2d: Any, y_2d: Any, dn_bias_e: Any, inv_i: Any, scores_2d: Any) -> Any:
+            yw = (y_2d + dn_bias_e)[inv_i].reshape(h_2d.shape[0], 4, h_2d.shape[1])
+            acc = mx.sum(yw.astype(mx.float32) * scores_2d[..., None].astype(mx.float32), axis=-2)
+            return h_2d + acc.astype(mx.bfloat16)
+
+        _COMPILED_NAX_MOE_COMBINE = mx.compile(_fn)
+    return _COMPILED_NAX_MOE_COMBINE
+
+
 class FastGptOssModel:
-    """Bare-metal MLX + Metal 4 MPP model implementation for `openai/gpt-oss-20b`."""
+    """Bare-metal MLX + Metal 4 MPP / Apple10 NAX model implementation for `openai/gpt-oss-20b`."""
 
     def __init__(
         self,
@@ -499,104 +576,13 @@ class FastGptOssModel:
         )
         self.mscale_arr = mx.array([self.rope_mscale], dtype=mx.float32)
 
-        w: dict[str, Any] = {}
-        shards = sorted(glob.glob(str(Path(self.model_dir) / "*.safetensors")))
-        if not shards:
-            raise FileNotFoundError(f"No .safetensors files found in {self.model_dir}")
-        for p in shards:
-            w.update(mx.load(p))
-
-        self.emb_w = w["model.embed_tokens.weight"]
-        emb_s_raw = w.get("model.embed_tokens.scales")
-        self.emb_quant, self.emb_bits, self.emb_gs = infer_affine_quant_spec(
-            tuple(self.emb_w.shape),
-            tuple(emb_s_raw.shape) if emb_s_raw is not None else None,
-            self.H,
+        self._cold_lm_head: dict[str, Any] | None = None
+        self._last_hf_2d: Any | None = None
+        self._load(
+            vocab_out=vocab_out,
+            vocab_remap_npz=vocab_remap_npz,
+            tokenizer_json_path=tokenizer_json_path,
         )
-        self.emb_s = emb_s_raw.astype(mx.float16) if self.emb_quant else None
-        self.emb_b = w["model.embed_tokens.biases"].astype(mx.float16) if self.emb_quant else None
-        self.final_norm = w["model.norm.weight"].astype(mx.bfloat16)
-
-        lm_w = w["lm_head.weight"]
-        lm_s_raw = w.get("lm_head.scales")
-        self.lm_quant, self.lm_bits, self.lm_gs = infer_affine_quant_spec(
-            tuple(lm_w.shape),
-            tuple(lm_s_raw.shape) if lm_s_raw is not None else None,
-            self.H,
-        )
-        lm_s = lm_s_raw.astype(mx.float16) if self.lm_quant else None
-        lm_b = w["lm_head.biases"].astype(mx.float16) if self.lm_quant else None
-
-        self.full_vocab_size = int(lm_w.shape[0])
-        kept_ids: np.ndarray | None = None
-        if vocab_out and 0 < int(vocab_out) < self.full_vocab_size:
-            target_v = int(vocab_out)
-            npz_p = Path(vocab_remap_npz) if vocab_remap_npz is not None else None
-            tok_json = Path(tokenizer_json_path) if tokenizer_json_path else Path(self.model_dir) / "tokenizer.json"
-            if npz_p is not None and npz_p.is_file():
-                cached_kept = np.asarray(np.load(npz_p)["kept_old_ids"], dtype=np.int32)
-                if len(cached_kept) == target_v:
-                    kept_ids = cached_kept
-            if kept_ids is None and tok_json.exists():
-                remap = O200kVocabRemapper.load_or_build(
-                    tok_json,
-                    cache_npz_path=vocab_remap_npz,
-                    target_size=target_v,
-                    full_vocab_size=self.full_vocab_size,
-                )
-                kept_ids = remap.kept_old_ids
-            elif kept_ids is None:
-                warnings.warn(
-                    f"Skipping lm_head vocab pruning to {target_v} (missing tokenizer.json={tok_json} "
-                    f"and matching vocab_remap_npz={vocab_remap_npz}); retaining full vocab={self.full_vocab_size}.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            if kept_ids is not None:
-                valid_mask = (kept_ids >= 0) & (kept_ids < self.full_vocab_size)
-                if not bool(np.all(valid_mask)):
-                    kept_ids = kept_ids[valid_mask]
-                if len(kept_ids) == 0:
-                    kept_ids = None
-
-        self.lm_w, self.lm_s, self.lm_b, self.new_to_old, self.old_to_new = prune_lm_head_tensors(
-            lm_w,
-            lm_s,
-            lm_b,
-            kept_ids,
-        )
-        if not self.lm_quant:
-            self.lm_w = self.lm_w.astype(mx.float16)
-        self.vocab_n = int(self.lm_w.shape[0])
-
-        self.layers: list[dict[str, Any]] = []
-        to_eval: list[Any] = [
-            self.emb_w,
-            self.final_norm,
-            self.lm_w,
-            self.rope_freqs,
-            self.eps_arr,
-            self.mscale_arr,
-        ]
-        for arr in (self.emb_s, self.emb_b, self.lm_s, self.lm_b):
-            if arr is not None:
-                to_eval.append(arr)
-
-        for i in range(self.num_layers):
-            ld = pack_gpt_oss_layer_tensors(
-                w,
-                i,
-                self.layer_types[i],
-                self.H,
-                self.q_dim,
-                f16_dtype=mx.float16,
-                f32_dtype=mx.float32,
-                bf16_dtype=mx.bfloat16,
-            )
-            self.layers.append(ld)
-            to_eval.extend(v for v in ld.values() if isinstance(v, mx.array))
-        mx.eval(*to_eval)
-        del w
 
         # Infer actual MoE intermediate_size from packed down_proj if config omitted it.
         dn_s0 = self.layers[0]["dn_s"]
@@ -611,6 +597,9 @@ class FastGptOssModel:
 
         self._swiglu_c = _get_compiled_swiglu(self.config.swiglu_limit, self.config.swiglu_alpha)
         self._route_c = _get_compiled_route(self.num_experts_per_tok)
+        self._add_resid_bf16_c = _get_compiled_add_resid_bf16()
+        self._b1_moe_combine_c = _get_compiled_b1_moe_combine()
+        self._nax_moe_combine_c = _get_compiled_nax_moe_combine()
         self._is_m5_nax_moe = _detect_m5_nax_moe(mx)
         self._moe_hot_threshold = 12 if self._is_m5_nax_moe else 8
         self._moe_tile_chunk_tokens = 256
@@ -623,6 +612,195 @@ class FastGptOssModel:
         self._kernels: dict[str, Any] | None = None
         if compile_kernels:
             self._ensure_kernels()
+
+    def _resolve_kept_vocab_ids(
+        self,
+        *,
+        vocab_out: int | None,
+        vocab_remap_npz: str | Path | None,
+        tokenizer_json_path: str | Path | None,
+    ) -> np.ndarray | None:
+        if not (vocab_out and 0 < int(vocab_out) < self.full_vocab_size):
+            return None
+        target_v = int(vocab_out)
+        kept_ids: np.ndarray | None = None
+        npz_p = Path(vocab_remap_npz) if vocab_remap_npz is not None else None
+        tok_json = Path(tokenizer_json_path) if tokenizer_json_path else Path(self.model_dir) / "tokenizer.json"
+        if npz_p is not None and npz_p.is_file():
+            cached_kept = np.asarray(np.load(npz_p)["kept_old_ids"], dtype=np.int32)
+            if len(cached_kept) == target_v:
+                kept_ids = cached_kept
+        if kept_ids is None and tok_json.exists():
+            remap = O200kVocabRemapper.load_or_build(
+                tok_json,
+                cache_npz_path=vocab_remap_npz,
+                target_size=target_v,
+                full_vocab_size=self.full_vocab_size,
+            )
+            kept_ids = remap.kept_old_ids
+        elif kept_ids is None:
+            warnings.warn(
+                f"Skipping lm_head vocab pruning to {target_v} (missing tokenizer.json={tok_json} "
+                f"and matching vocab_remap_npz={vocab_remap_npz}); retaining full vocab={self.full_vocab_size}.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if kept_ids is not None:
+            valid_mask = (kept_ids >= 0) & (kept_ids < self.full_vocab_size)
+            if not bool(np.all(valid_mask)):
+                kept_ids = kept_ids[valid_mask]
+            if len(kept_ids) == 0:
+                kept_ids = None
+        return kept_ids
+
+    def _load(
+        self,
+        *,
+        vocab_out: int | None,
+        vocab_remap_npz: str | Path | None,
+        tokenizer_json_path: str | Path | None,
+    ) -> None:
+        """Stream safetensors shards one file at a time, releasing raw tensors + `mx.clear_cache()` per shard."""
+        import mlx.core as mx
+
+        mdir = Path(self.model_dir)
+        shards = sorted(glob.glob(str(mdir / "*.safetensors")))
+        if not shards:
+            raise FileNotFoundError(f"No .safetensors files found in {self.model_dir}")
+
+        all_keys = _peek_all_checkpoint_keys(mdir, shards)
+        embed_keys = {k for k in all_keys if k.startswith("model.embed_tokens.")} if all_keys else set()
+        lm_keys = {k for k in all_keys if k.startswith("lm_head.")} if all_keys else set()
+        layer_keys = [
+            ({k for k in all_keys if k.startswith(f"model.layers.{i}.")} if all_keys else set())
+            for i in range(self.num_layers)
+        ]
+
+        pending: dict[str, Any] = {}
+        emb_loaded = False
+        norm_loaded = False
+        lm_loaded = False
+        layers_by_idx: dict[int, dict[str, Any]] = {}
+
+        for s_idx, shard_path in enumerate(shards):
+            is_last = s_idx == (len(shards) - 1)
+            shard_tensors = mx.load(shard_path)
+            pending.update(shard_tensors)
+            del shard_tensors
+            shard_eval: list[Any] = []
+
+            if not emb_loaded and "model.embed_tokens.weight" in pending:
+                if (embed_keys and embed_keys.issubset(pending)) or is_last:
+                    self.emb_w = pending.pop("model.embed_tokens.weight")
+                    emb_s_raw = pending.pop("model.embed_tokens.scales", None)
+                    emb_b_raw = pending.pop("model.embed_tokens.biases", None)
+                    self.emb_quant, self.emb_bits, self.emb_gs = infer_affine_quant_spec(
+                        tuple(self.emb_w.shape),
+                        tuple(emb_s_raw.shape) if emb_s_raw is not None else None,
+                        self.H,
+                    )
+                    self.emb_s = emb_s_raw.astype(mx.float16) if self.emb_quant and emb_s_raw is not None else None
+                    self.emb_b = emb_b_raw.astype(mx.float16) if self.emb_quant and emb_b_raw is not None else None
+                    shard_eval.append(self.emb_w)
+                    if self.emb_s is not None:
+                        shard_eval.append(self.emb_s)
+                    if self.emb_b is not None:
+                        shard_eval.append(self.emb_b)
+                    emb_loaded = True
+
+            if not norm_loaded and "model.norm.weight" in pending:
+                self.final_norm = pending.pop("model.norm.weight").astype(mx.bfloat16)
+                shard_eval.append(self.final_norm)
+                norm_loaded = True
+
+            if not lm_loaded and "lm_head.weight" in pending:
+                if (lm_keys and lm_keys.issubset(pending)) or is_last:
+                    lm_w = pending.pop("lm_head.weight")
+                    lm_s_raw = pending.pop("lm_head.scales", None)
+                    lm_b_raw = pending.pop("lm_head.biases", None)
+                    self.lm_quant, self.lm_bits, self.lm_gs = infer_affine_quant_spec(
+                        tuple(lm_w.shape),
+                        tuple(lm_s_raw.shape) if lm_s_raw is not None else None,
+                        self.H,
+                    )
+                    lm_s = lm_s_raw.astype(mx.float16) if self.lm_quant and lm_s_raw is not None else None
+                    lm_b = lm_b_raw.astype(mx.float16) if self.lm_quant and lm_b_raw is not None else None
+                    del lm_s_raw, lm_b_raw
+
+                    self.full_vocab_size = int(lm_w.shape[0])
+                    kept_ids = self._resolve_kept_vocab_ids(
+                        vocab_out=vocab_out,
+                        vocab_remap_npz=vocab_remap_npz,
+                        tokenizer_json_path=tokenizer_json_path,
+                    )
+                    self.lm_w, self.lm_s, self.lm_b, self.new_to_old, self.old_to_new = prune_lm_head_tensors(
+                        lm_w,
+                        lm_s,
+                        lm_b,
+                        kept_ids,
+                    )
+                    if not self.lm_quant:
+                        self.lm_w = self.lm_w.astype(mx.float16)
+                    self.vocab_n = int(self.lm_w.shape[0])
+
+                    if self.vocab_n < self.full_vocab_size:
+                        cold_ids = np.flatnonzero(self.old_to_new < 0).astype(np.int32)
+                        cw = _gather_rows(lm_w, cold_ids)
+                        if not self.lm_quant:
+                            cw = cw.astype(mx.float16)
+                        cs = _gather_rows(lm_s, cold_ids) if lm_s is not None else None
+                        cb = _gather_rows(lm_b, cold_ids) if lm_b is not None else None
+                        self._cold_lm_head = {"w": cw, "s": cs, "b": cb, "ids": cold_ids}
+                        shard_eval.append(cw)
+                        if cs is not None:
+                            shard_eval.append(cs)
+                        if cb is not None:
+                            shard_eval.append(cb)
+                    else:
+                        self._cold_lm_head = None
+
+                    del lm_w, lm_s, lm_b
+                    shard_eval.append(self.lm_w)
+                    if self.lm_s is not None:
+                        shard_eval.append(self.lm_s)
+                    if self.lm_b is not None:
+                        shard_eval.append(self.lm_b)
+                    lm_loaded = True
+
+            for li in range(self.num_layers):
+                if li in layers_by_idx:
+                    continue
+                pref = f"model.layers.{li}."
+                if layer_keys[li]:
+                    ready = layer_keys[li].issubset(pending)
+                else:
+                    ready = is_last and (pref + "self_attn.q_proj.weight") in pending
+                if not ready:
+                    continue
+                ld = pack_gpt_oss_layer_tensors(
+                    pending,
+                    li,
+                    self.layer_types[li],
+                    self.H,
+                    self.q_dim,
+                    f16_dtype=mx.float16,
+                    f32_dtype=mx.float32,
+                    bf16_dtype=mx.bfloat16,
+                )
+                for k_drop in [k for k in pending.keys() if k.startswith(pref)]:
+                    del pending[k_drop]
+                layers_by_idx[li] = ld
+                shard_eval.extend(v for v in ld.values() if isinstance(v, mx.array))
+
+            if shard_eval:
+                mx.eval(*shard_eval)  # guard: allow-eval
+            del shard_eval
+            gc.collect()
+            mx.clear_cache()
+
+        pending.clear()
+        self.layers = [layers_by_idx[i] for i in range(self.num_layers)]
+        mx.eval(self.rope_freqs, self.eps_arr, self.mscale_arr)
 
     def _ensure_kernels(self) -> dict[str, Any]:
         if self._kernels is None:
@@ -659,6 +837,40 @@ class FastGptOssModel:
             out = out + bias
         return out
 
+    def compute_full_logits_1d(
+        self,
+        pruned_logits_1d: np.ndarray,
+        *,
+        row_idx: int = 0,
+        hf_2d: Any | None = None,
+    ) -> np.ndarray | None:
+        """Reconstruct full `[full_vocab_size]` logits lazily using `_cold_lm_head` on cold grammar misses."""
+        import mlx.core as mx
+
+        if len(pruned_logits_1d) >= self.full_vocab_size:
+            return np.asarray(pruned_logits_1d, dtype=np.float32)
+        cold = self._cold_lm_head
+        if cold is None:
+            return None
+        src_hf = hf_2d if hf_2d is not None else self._last_hf_2d
+        if src_hf is None:
+            return None
+        hf_row = src_hf.reshape(-1, self.H)[row_idx : row_idx + 1]
+        cold_lg = self._linear(
+            hf_row,
+            cold["w"],
+            cold["s"],
+            cold["b"],
+            is_quant=self.lm_quant,
+            bits=self.lm_bits,
+            group_size=self.lm_gs,
+        )
+        mx.eval(cold_lg)
+        full = np.full(self.full_vocab_size, -1e9, dtype=np.float32)
+        full[self.new_to_old] = np.asarray(pruned_logits_1d, dtype=np.float32)
+        full[cold["ids"]] = np.asarray(cold_lg.reshape(-1).astype(mx.float32))
+        return full
+
     def embed(self, tokens: Any) -> Any:
         import mlx.core as mx
 
@@ -677,9 +889,11 @@ class FastGptOssModel:
     def rms_f16(self, h: Any, w: Any) -> Any:
         import mlx.core as mx
 
+        if self._kernels is None:
+            return mx.fast.rms_norm(h, w, self.eps).astype(mx.float16)
         shape = h.shape
         n_tok = int(math.prod(shape[:-1]))
-        out = self.kernels["rmsnorm_bf16_to_f16"](
+        out = self._kernels["rmsnorm_bf16_to_f16"](
             inputs=[h.reshape(n_tok, self.H), w, self.eps_arr],
             grid=(n_tok * 128, 1, 1),
             threadgroup=(128, 1, 1),
@@ -687,6 +901,44 @@ class FastGptOssModel:
             output_dtypes=[mx.float16],
         )[0]
         return out.reshape(shape)
+
+    def _make_swa_additive_mask(self, l_q: int, kv_len: int, dtype: Any) -> Any:
+        """Build `Apple10` SWA-128 additive mask in `dtype` (or `'causal'` when `kv_len <= swa`)."""
+        import mlx.core as mx
+
+        if kv_len <= self.swa:
+            return "causal"
+        swa_offset = kv_len - l_q
+        q_pos = mx.arange(swa_offset, swa_offset + l_q, dtype=mx.int32)[:, None]
+        k_pos = mx.arange(kv_len, dtype=mx.int32)[None, :]
+        diff = q_pos - k_pos
+        valid = (diff >= 0) & (diff < self.swa)
+        return mx.where(valid, mx.array(0.0, dtype=dtype), mx.array(-40000.0, dtype=dtype))
+
+    def _swa_prefill_attn(self, q: Any, k_att: Any, v_att: Any, ld: dict[str, Any]) -> Any:
+        """Route `Apple10` (`NAX`) SWA prefill to `mx.fast.scaled_dot_product_attention(..., sinks=...)`
+        while keeping `Apple9` M4 `swa128_prefill_mma` intact."""
+        import mlx.core as mx
+
+        l_q = int(q.shape[2])
+        kv_len = int(k_att.shape[2])
+        if self._is_m5_nax_moe or self._kernels is None:
+            swa_mask = self._make_swa_additive_mask(l_q, kv_len, q.dtype)
+            return mx.fast.scaled_dot_product_attention(
+                q, k_att, v_att, scale=self.scale, mask=swa_mask, sinks=ld["sinks_f16"]
+            )
+        swa_offset = kv_len - l_q
+        p_arr = mx.array([l_q, kv_len, swa_offset, self.swa, self.scale_u32], dtype=mx.uint32)
+        q_c = mx.contiguous(q)
+        k_c = mx.contiguous(k_att)
+        v_c = mx.contiguous(v_att)
+        return self.kernels["swa128_prefill_mma"](
+            inputs=[q_c, k_c, v_c, ld["sinks_f32"], p_arr],
+            grid=(((l_q + 7) // 8) * 256, self.n_kv, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(1, self.n_q, l_q, self.hd)],
+            output_dtypes=[mx.float16],
+        )[0]
 
     def _moe_tile_mpp_chunk(
         self,
@@ -696,7 +948,7 @@ class FastGptOssModel:
         scores_2d: Any,
         ld: dict[str, Any],
     ) -> Any:
-        """Single-launch Hybrid Hot-MPP + Cold-QMV MoE residual update with tight cold grid."""
+        """Single-launch Hybrid Hot-MPP + Cold-QMV MoE residual update with tight cold grid (`Apple9` fast path)."""
         import mlx.core as mx
 
         n_tok = int(pn_2d.shape[0])
@@ -746,42 +998,48 @@ class FastGptOssModel:
         scores_2d: Any,
         ld: dict[str, Any],
     ) -> Any:
-        """M5 NAX large-token sorted `gather_qmm` path (gated strictly to Apple10 + macOS>=26.2 + MLX>=0.31.2)."""
+        """Apple10 (`M5 NAX`) sorted `gather_qmm` MoE path (`n_tok >= 2`, `lhs_indices = ord_i // 4`, `-75%` gather writes)."""
         import mlx.core as mx
 
         n_tok = int(pn_2d.shape[0])
         fl = inds_2d.reshape(-1)
         ord_i = mx.argsort(fl)
         inv_i = mx.argsort(ord_i)
-        inds_e = fl[ord_i]
-        hx = pn_2d.reshape(-1, 1, self.H)[ord_i // 4]
-        gu = mx.gather_qmm(  # guard: allow-lhs-indices
-            hx,
+        sorted_exp = fl[ord_i].astype(mx.uint32)
+        lhs_idx = (ord_i // 4).astype(mx.uint32)
+        gu = mx.gather_qmm(
+            pn_2d.reshape(n_tok, 1, self.H),
             ld["gu_w"],
             ld["gu_s"],
-            rhs_indices=inds_e,
+            lhs_indices=lhs_idx,
+            rhs_indices=sorted_exp,
             transpose=True,
             group_size=32,
             bits=4,
             mode="mxfp4",
             sorted_indices=True,
         )
-        act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), ld["gu_bias"][inds_e]).reshape(
-            *gu.shape[:-1], self.d_ff
+        gu_bias = ld["gu_bias"][sorted_exp]
+        if gu_bias.dtype != gu.dtype:
+            gu_bias = gu_bias.astype(gu.dtype)
+        act = self._swiglu_c(gu.reshape(-1, 2 * self.d_ff), gu_bias).reshape(
+            4 * n_tok, 1, self.d_ff
         )
         y = mx.gather_qmm(  # guard: allow-lhs-indices
             act,
             ld["dn_w"],
             ld["dn_s"],
-            rhs_indices=inds_e,
+            rhs_indices=sorted_exp,
             transpose=True,
             group_size=32,
             bits=4,
             mode="mxfp4",
             sorted_indices=True,
         )
-        y = (y.reshape(-1, self.H) + ld["dn_bias"][inds_e])[inv_i].reshape(n_tok, 4, self.H)
-        return h_2d + mx.sum(y * scores_2d[..., None].astype(mx.float32), axis=-2).astype(mx.bfloat16)
+        dn_bias = ld["dn_bias"][sorted_exp]
+        if dn_bias.dtype != y.dtype:
+            dn_bias = dn_bias.astype(y.dtype)
+        return self._nax_moe_combine_c(h_2d, y.reshape(-1, self.H), dn_bias, inv_i, scores_2d)
 
     def _moe_forward(
         self,
@@ -791,11 +1049,11 @@ class FastGptOssModel:
         scores_2d: Any,
         ld: dict[str, Any],
     ) -> Any:
-        """Unified multi-token MoE residual update: chunked tile-table MPP or gated M5 NAX path."""
+        """Unified multi-token MoE residual update: M5 NAX `n_tok >= 2` or Apple9 chunked tile-table MPP."""
         import mlx.core as mx
 
         n_tok = int(pn_2d.shape[0])
-        if self._is_m5_nax_moe and n_tok >= 512:
+        if (self._is_m5_nax_moe and n_tok >= 2) or self._kernels is None:
             return self._moe_gather_qmm_nax(pn_2d, h_2d, inds_2d, scores_2d, ld)
 
         chunk = int(self._moe_tile_chunk_tokens)
@@ -859,12 +1117,11 @@ class FastGptOssModel:
             if self._fast_all_quant:
                 qmm = mx.quantized_matmul
                 gmm = mx.gather_qmm
-                rn = mx.fast.rms_norm
                 sdpa = mx.fast.scaled_dot_product_attention
                 mscale_f = self.rope_mscale
                 mscale_arr = mx.array(mscale_f, dtype=mx.float16) if mscale_f != 1.0 else None
                 for li, ld in enumerate(self.layers):
-                    xn = rn(h, ld["in_ln"], self.eps).astype(mx.float16)
+                    xn = self.rms_f16(h, ld["in_ln"])
                     qkv = qmm(xn, ld["qkv_w"], ld["qkv_s"], ld["qkv_b"], transpose=True, group_size=ld["qkv_gs"], bits=ld["qkv_bits"], mode="affine") + ld["qkv_bias"]
                     q, k, v = mx.split(qkv, self.qkv_split_idx, axis=-1)
                     q = q.reshape(1, 1, self.n_q, self.hd).transpose(0, 2, 1, 3)
@@ -899,22 +1156,23 @@ class FastGptOssModel:
                     att = sdpa(q, k_att, v_att, scale=self.scale, mask=None, sinks=ld["sinks_f16"])
                     att_1d = att.transpose(0, 2, 1, 3).reshape(1, 1, self.q_dim)
                     o_out = qmm(att_1d, ld["o_w"], ld["o_s"], ld["o_b"], transpose=True, group_size=ld["o_gs"], bits=ld["o_bits"], mode="affine") + ld["o_bias"]
-                    h = h + o_out.astype(mx.bfloat16)
+                    h = self._add_resid_bf16_c(h, o_out)
 
-                    pn = rn(h, ld["pa_ln"], self.eps).astype(mx.float16)
+                    pn = self.rms_f16(h, ld["pa_ln"])
                     rl = qmm(pn, ld["r_w"], ld["r_s"], ld["r_b"], transpose=True, group_size=ld["r_gs"], bits=ld["r_bits"], mode="affine") + ld["r_bias"]
                     inds, scores = self._route_c(rl[0])
                     exp_ids = inds[0].astype(mx.uint32)
                     gu = gmm(pn.reshape(1, 1, 1, self.H), ld["gu_w"], ld["gu_s"], None, rhs_indices=exp_ids, transpose=True, group_size=32, bits=4, mode="mxfp4")
                     act = self._swiglu_c(gu.reshape(4, 2 * self.d_ff), ld["gu_bias"][exp_ids]).reshape(4, 1, 1, self.d_ff)
-                    dn = gmm(act, ld["dn_w"], ld["dn_s"], None, lhs_indices=self._lidx4, rhs_indices=exp_ids, transpose=True, group_size=32, bits=4, mode="mxfp4") + ld["dn_bias"][exp_ids][:, None, :]
-                    h = h + (dn[:, 0, :] * scores[0, :, None].astype(mx.float16)).sum(axis=0).reshape(1, 1, self.H).astype(mx.bfloat16)
+                    dn = gmm(act, ld["dn_w"], ld["dn_s"], None, lhs_indices=self._lidx4, rhs_indices=exp_ids, transpose=True, group_size=32, bits=4, mode="mxfp4")
+                    h = self._b1_moe_combine_c(h, dn, ld["dn_bias"][exp_ids], scores)
 
-                hf = rn(h, self.final_norm, self.eps).astype(mx.float16)
+                hf = self.rms_f16(h, self.final_norm)
+                self._last_hf_2d = hf.reshape(-1, self.H)
                 return qmm(hf, self.lm_w, self.lm_s, self.lm_b, transpose=True, group_size=self.lm_gs, bits=self.lm_bits, mode="affine")
 
             for li, ld in enumerate(self.layers):
-                xn = mx.fast.rms_norm(h, ld["in_ln"], self.eps).astype(mx.float16)
+                xn = self.rms_f16(h, ld["in_ln"])
                 qkv = self._linear(
                     xn,
                     ld["qkv_w"],
@@ -965,9 +1223,9 @@ class FastGptOssModel:
                     group_size=ld["o_gs"],
                     bias=ld["o_bias"],
                 )
-                h = h + o_out.astype(mx.bfloat16)
+                h = self._add_resid_bf16_c(h, o_out)
 
-                pn = mx.fast.rms_norm(h, ld["pa_ln"], self.eps).astype(mx.float16)
+                pn = self.rms_f16(h, ld["pa_ln"])
                 rl = self._linear(
                     pn,
                     ld["r_w"],
@@ -994,26 +1252,22 @@ class FastGptOssModel:
                 act = self._swiglu_c(gu.reshape(4, 2 * self.d_ff), ld["gu_bias"][exp_ids]).reshape(
                     4, 1, 1, self.d_ff
                 )
-                dn = (
-                    mx.gather_qmm(  # guard: allow-unsorted-qmm
-                        act,
-                        ld["dn_w"],
-                        ld["dn_s"],
-                        None,
-                        lhs_indices=self._lidx4,
-                        rhs_indices=exp_ids,
-                        transpose=True,
-                        group_size=32,
-                        bits=4,
-                        mode="mxfp4",
-                    )
-                    + ld["dn_bias"][exp_ids][:, None, :]
+                dn = mx.gather_qmm(  # guard: allow-unsorted-qmm
+                    act,
+                    ld["dn_w"],
+                    ld["dn_s"],
+                    None,
+                    lhs_indices=self._lidx4,
+                    rhs_indices=exp_ids,
+                    transpose=True,
+                    group_size=32,
+                    bits=4,
+                    mode="mxfp4",
                 )
-                h = h + (dn[:, 0, :] * scores[0, :, None].astype(mx.float16)).sum(axis=0).reshape(
-                    1, 1, self.H
-                ).astype(mx.bfloat16)
+                h = self._b1_moe_combine_c(h, dn, ld["dn_bias"][exp_ids], scores)
 
-            hf = mx.fast.rms_norm(h, self.final_norm, self.eps).astype(mx.float16)
+            hf = self.rms_f16(h, self.final_norm)
+            self._last_hf_2d = hf.reshape(-1, self.H)
             return self._linear(
                 hf,
                 self.lm_w,
@@ -1070,20 +1324,7 @@ class FastGptOssModel:
                 lc["v"][:, :, :n_tail, :] = v_att[:, :, -n_tail:, :]
                 lc["pos"] = end_pos
                 lc["idx"] = n_tail
-
-                kv_len = int(k_att.shape[2])
-                swa_offset = kv_len - l_seq
-                p_arr = mx.array([l_seq, kv_len, swa_offset, self.swa, self.scale_u32], dtype=mx.uint32)
-                q_c = mx.contiguous(q)
-                k_c = mx.contiguous(k_att)
-                v_c = mx.contiguous(v_att)
-                att = self.kernels["swa128_prefill_mma"](
-                    inputs=[q_c, k_c, v_c, ld["sinks_f32"], p_arr],
-                    grid=(((l_seq + 7) // 8) * 256, self.n_kv, 1),
-                    threadgroup=(256, 1, 1),
-                    output_shapes=[(1, self.n_q, l_seq, self.hd)],
-                    output_dtypes=[mx.float16],
-                )[0]
+                att = self._swa_prefill_attn(q, k_att, v_att, ld)
 
             att_flat = att.transpose(0, 2, 1, 3).reshape(1, l_seq, self.q_dim)
             o_out = self._linear(
@@ -1096,7 +1337,7 @@ class FastGptOssModel:
                 group_size=ld["o_gs"],
                 bias=ld["o_bias"],
             )
-            h = h + o_out.astype(mx.bfloat16)
+            h = self._add_resid_bf16_c(h, o_out)
 
             pn = self.rms_f16(h, ld["pa_ln"])
             rl = self._linear(
@@ -1119,6 +1360,7 @@ class FastGptOssModel:
             ).reshape(1, l_seq, self.H)
 
         hf = self.rms_f16(h[:, -1:, :] if last_only else h, self.final_norm)
+        self._last_hf_2d = hf.reshape(-1, self.H)[-1:]
         return self._linear(
             hf,
             self.lm_w,
@@ -1261,7 +1503,9 @@ class FastGptOssModel:
         b_tot = len(suffix_lists)
         l_sys = int(batch_cache["L_sys"])
         suf_lens = [len(s) for s in suffix_lists]
+        batch_cache["suf_max"] = max(suf_lens) if suf_lens else 0
         last_logits = []
+        last_hfs = []
 
         for b0 in range(0, b_tot, chunk_docs):
             b1 = min(b_tot, b0 + chunk_docs)
@@ -1270,7 +1514,6 @@ class FastGptOssModel:
             flat_ids: list[int] = []
             for x in sub:
                 flat_ids.extend(x)
-            total_tok = len(flat_ids)
             h_all = self.embed(mx.array(flat_ids, dtype=mx.int32))
 
             offs = [0]
@@ -1329,18 +1572,7 @@ class FastGptOssModel:
                         bc_l["v_swa"][b_glob : b_glob + 1, :, self.swa - n_tail : self.swa, :] = v_att[
                             :, :, -n_tail:, :
                         ]
-                        kv_len = int(k_att.shape[2])
-                        p_arr = mx.array([ln, kv_len, swa_sys_len, self.swa, self.scale_u32], dtype=mx.uint32)
-                        q_c = mx.contiguous(q)
-                        k_c = mx.contiguous(k_att)
-                        v_c = mx.contiguous(v_att)
-                        att_b = self.kernels["swa128_prefill_mma"](
-                            inputs=[q_c, k_c, v_c, ld["sinks_f32"], p_arr],
-                            grid=(((ln + 7) // 8) * 256, self.n_kv, 1),
-                            threadgroup=(256, 1, 1),
-                            output_shapes=[(1, self.n_q, ln, self.hd)],
-                            output_dtypes=[mx.float16],
-                        )[0]
+                        att_b = self._swa_prefill_attn(q, k_att, v_att, ld)
                     att_chunks.append(att_b.transpose(0, 2, 1, 3).reshape(ln, self.q_dim))
 
                 att_all = mx.concatenate(att_chunks, axis=0)
@@ -1354,7 +1586,7 @@ class FastGptOssModel:
                     group_size=ld["o_gs"],
                     bias=ld["o_bias"],
                 )
-                h_all = h_all + o_out.astype(mx.bfloat16)
+                h_all = self._add_resid_bf16_c(h_all, o_out)
 
                 pn = self.rms_f16(h_all, ld["pa_ln"])
                 rl = self._linear(
@@ -1381,18 +1613,214 @@ class FastGptOssModel:
                 bits=self.lm_bits,
                 group_size=self.lm_gs,
             )
-            eval_bufs = [lg]
+            eval_bufs = [lg, hf]
             for layer_c in batch_cache["layers"]:
                 eval_bufs.append(layer_c.get("k_suf", layer_c.get("k_swa")))
                 eval_bufs.append(layer_c.get("v_suf", layer_c.get("v_swa")))
-            mx.eval(*eval_bufs)
+            mx.eval(*eval_bufs)  # guard: allow-eval
             last_logits.append(lg)
+            last_hfs.append(hf)
 
+        self._last_hf_2d = mx.concatenate(last_hfs, axis=0)
         batch_cache["suf_lens_arr"] = mx.array(suf_lens, dtype=mx.uint32)
         batch_cache["swa_init_lens_arr"] = mx.array(
             [min(self.swa, l_sys + ln) for ln in suf_lens], dtype=mx.uint32
         )
         batch_cache["rope_pos_arr"] = mx.array([l_sys + ln for ln in suf_lens], dtype=mx.int32)
+        mx.eval(
+            batch_cache["suf_lens_arr"],
+            batch_cache["swa_init_lens_arr"],
+            batch_cache["rope_pos_arr"],
+        )
+        return mx.concatenate(last_logits, axis=0)
+
+    def append_batch_suffixes(
+        self,
+        extra_lists: list[list[int]],
+        batch_cache: dict[str, Any],
+        *,
+        p1_done_steps: Sequence[int] | None = None,
+        saved_swa: Sequence[list[tuple[Any, Any]] | None] | None = None,
+        chunk_docs: int = 8,
+    ) -> Any:
+        """Append Phase-1->Phase-2 transition + upfront-FF tokens onto `batch_cache` without prefix/suffix recompute."""
+        import mlx.core as mx
+
+        b_tot = len(extra_lists)
+        l_sys = int(batch_cache["L_sys"])
+        suf_max_prev = int(batch_cache["suf_max"])
+        dec_cnt_prev = int(batch_cache["dec_cnt"])
+        prev_suf_lens = [int(x) for x in batch_cache["suf_lens_arr"].tolist()]
+        prev_swa_init = [int(x) for x in batch_cache["swa_init_lens_arr"].tolist()]
+        done_steps = [
+            int(p1_done_steps[b]) if p1_done_steps is not None else dec_cnt_prev
+            for b in range(b_tot)
+        ]
+        base_suf_lens = [prev_suf_lens[b] + done_steps[b] for b in range(b_tot)]
+
+        # Order each slot's chronological SWA window & compact full-layer Phase-1 decode KV onto suffix tail.
+        swa_ordered: dict[tuple[int, int], tuple[Any | None, Any | None]] = {}
+        swa_ord = 0
+        compact_eval: list[Any] = []
+        for li, bc_l in enumerate(batch_cache["layers"]):
+            if bc_l["is_full"]:
+                for b in range(b_tot):
+                    d_b = done_steps[b]
+                    s_b = prev_suf_lens[b]
+                    if d_b > 0 and s_b != suf_max_prev:
+                        k_seg = mx.array(bc_l["k_suf"][b : b + 1, :, suf_max_prev : suf_max_prev + d_b, :])
+                        v_seg = mx.array(bc_l["v_suf"][b : b + 1, :, suf_max_prev : suf_max_prev + d_b, :])
+                        mx.eval(k_seg, v_seg)  # guard: allow-eval
+                        bc_l["k_suf"][b : b + 1, :, s_b : s_b + d_b, :] = k_seg
+                        bc_l["v_suf"][b : b + 1, :, s_b : s_b + d_b, :] = v_seg
+                compact_eval.extend((bc_l["k_suf"], bc_l["v_suf"]))
+            else:
+                for b in range(b_tot):
+                    if saved_swa is not None and saved_swa[b] is not None:
+                        swa_ordered[(li, b)] = saved_swa[b][swa_ord]  # type: ignore[index]
+                    else:
+                        d_b = done_steps[b]
+                        valid_b = min(self.swa, prev_swa_init[b] + d_b)
+                        if valid_b > 0:
+                            ring_idx = mx.arange(d_b - valid_b, d_b, dtype=mx.int32) % self.swa
+                            kp = mx.take(bc_l["k_swa"][b : b + 1], ring_idx, axis=2)
+                            vp = mx.take(bc_l["v_swa"][b : b + 1], ring_idx, axis=2)
+                            swa_ordered[(li, b)] = (kp, vp)
+                            compact_eval.extend((kp, vp))
+                        else:
+                            swa_ordered[(li, b)] = (None, None)
+                swa_ord += 1
+        if compact_eval:
+            mx.eval(*compact_eval)
+
+        last_logits = []
+        last_hfs = []
+        for b0 in range(0, b_tot, chunk_docs):
+            b1 = min(b_tot, b0 + chunk_docs)
+            sub = extra_lists[b0:b1]
+            sub_lens = [len(x) for x in sub]
+            flat_ids: list[int] = []
+            for x in sub:
+                flat_ids.extend(x)
+            h_all = self.embed(mx.array(flat_ids, dtype=mx.int32))
+
+            offs = [0]
+            for ln in sub_lens:
+                offs.append(offs[-1] + ln)
+
+            for li, ld in enumerate(self.layers):
+                bc_l = batch_cache["layers"][li]
+                xn = self.rms_f16(h_all, ld["in_ln"])
+                qkv = self._linear(
+                    xn,
+                    ld["qkv_w"],
+                    ld["qkv_s"],
+                    ld["qkv_b"],
+                    is_quant=ld["qkv_quant"],
+                    bits=ld["qkv_bits"],
+                    group_size=ld["qkv_gs"],
+                    bias=ld["qkv_bias"],
+                )
+
+                att_chunks = []
+                for idx_b, ln in enumerate(sub_lens):
+                    b_glob = b0 + idx_b
+                    base_ln = base_suf_lens[b_glob]
+                    s_tok, e_tok = offs[idx_b], offs[idx_b + 1]
+                    qkv_b = qkv[s_tok:e_tok]
+                    q, k, v = mx.split(qkv_b, self.qkv_split_idx, axis=-1)
+                    q = q.reshape(1, ln, self.n_q, self.hd).transpose(0, 2, 1, 3)
+                    k = k.reshape(1, ln, self.n_kv, self.hd).transpose(0, 2, 1, 3)
+                    v = v.reshape(1, ln, self.n_kv, self.hd).transpose(0, 2, 1, 3)
+                    q, k = self._apply_rope(q, k, offset=l_sys + base_ln)
+
+                    if bc_l["is_full"]:
+                        end_ln = base_ln + ln
+                        bc_l["k_suf"][b_glob : b_glob + 1, :, base_ln:end_ln, :] = k
+                        bc_l["v_suf"][b_glob : b_glob + 1, :, base_ln:end_ln, :] = v
+                        k_suf_b = bc_l["k_suf"][b_glob : b_glob + 1, :, :end_ln, :]
+                        v_suf_b = bc_l["v_suf"][b_glob : b_glob + 1, :, :end_ln, :]
+                        if l_sys > 0 and bc_l["k_sys"] is not None:
+                            k_att = mx.concatenate([bc_l["k_sys"][None, ...], k_suf_b], axis=2)
+                            v_att = mx.concatenate([bc_l["v_sys"][None, ...], v_suf_b], axis=2)
+                        else:
+                            k_att, v_att = k_suf_b, v_suf_b
+                        att_b = mx.fast.scaled_dot_product_attention(
+                            q, k_att, v_att, scale=self.scale, mask="causal", sinks=ld["sinks_f16"]
+                        )
+                    else:
+                        k_pre, v_pre = swa_ordered[(li, b_glob)]
+                        if k_pre is not None and v_pre is not None:
+                            k_att = mx.concatenate([k_pre, k], axis=2)
+                            v_att = mx.concatenate([v_pre, v], axis=2)
+                        else:
+                            k_att, v_att = k, v
+                        n_tail = min(int(k_att.shape[2]), self.swa)
+                        bc_l["k_swa"][b_glob : b_glob + 1, :, self.swa - n_tail : self.swa, :] = k_att[
+                            :, :, -n_tail:, :
+                        ]
+                        bc_l["v_swa"][b_glob : b_glob + 1, :, self.swa - n_tail : self.swa, :] = v_att[
+                            :, :, -n_tail:, :
+                        ]
+                        att_b = self._swa_prefill_attn(q, k_att, v_att, ld)
+                    att_chunks.append(att_b.transpose(0, 2, 1, 3).reshape(ln, self.q_dim))
+
+                att_all = mx.concatenate(att_chunks, axis=0)
+                o_out = self._linear(
+                    att_all,
+                    ld["o_w"],
+                    ld["o_s"],
+                    ld["o_b"],
+                    is_quant=ld["o_quant"],
+                    bits=ld["o_bits"],
+                    group_size=ld["o_gs"],
+                    bias=ld["o_bias"],
+                )
+                h_all = self._add_resid_bf16_c(h_all, o_out)
+
+                pn = self.rms_f16(h_all, ld["pa_ln"])
+                rl = self._linear(
+                    pn,
+                    ld["r_w"],
+                    ld["r_s"],
+                    ld["r_b"],
+                    is_quant=ld["r_quant"],
+                    bits=ld["r_bits"],
+                    group_size=ld["r_gs"],
+                    bias=ld["r_bias"],
+                )
+                inds, scores = self._route_c(rl)
+                h_all = self._moe_forward(pn, h_all, inds, scores, ld)
+
+            end_indices = mx.array([offs[i + 1] - 1 for i in range(len(sub_lens))], dtype=mx.int32)
+            hf = self.rms_f16(h_all[end_indices], self.final_norm)
+            lg = self._linear(
+                hf,
+                self.lm_w,
+                self.lm_s,
+                self.lm_b,
+                is_quant=self.lm_quant,
+                bits=self.lm_bits,
+                group_size=self.lm_gs,
+            )
+            eval_bufs = [lg, hf]
+            for layer_c in batch_cache["layers"]:
+                eval_bufs.append(layer_c.get("k_suf", layer_c.get("k_swa")))
+                eval_bufs.append(layer_c.get("v_suf", layer_c.get("v_swa")))
+            mx.eval(*eval_bufs)  # guard: allow-eval
+            last_logits.append(lg)
+            last_hfs.append(hf)
+
+        self._last_hf_2d = mx.concatenate(last_hfs, axis=0)
+        new_suf_lens = [base_suf_lens[b] + len(extra_lists[b]) for b in range(b_tot)]
+        batch_cache["suf_max"] = max(new_suf_lens) if new_suf_lens else 0
+        batch_cache["dec_cnt"] = 0
+        batch_cache["swa_write"] = 0
+        batch_cache["suf_lens_arr"] = mx.array(new_suf_lens, dtype=mx.uint32)
+        batch_cache["swa_init_lens_arr"] = mx.array(
+            [min(self.swa, l_sys + ln) for ln in new_suf_lens], dtype=mx.uint32
+        )
+        batch_cache["rope_pos_arr"] = mx.array([l_sys + ln for ln in new_suf_lens], dtype=mx.int32)
         mx.eval(
             batch_cache["suf_lens_arr"],
             batch_cache["swa_init_lens_arr"],
@@ -1407,7 +1835,7 @@ class FastGptOssModel:
         samp_indices: Any | None = None,
         skip_lm_head: bool = False,
     ) -> Any:
-        """True batched `B=1..256+` decode step using Hydragen v2 + SWA-128 + Hybrid Metal 4 MoE."""
+        """True batched `B=1..256+` decode step using Hydragen v2 + SWA-128 + Hybrid Metal 4 / NAX MoE."""
         import mlx.core as mx
 
         b_sz = int(batch_cache["B"])
@@ -1500,7 +1928,7 @@ class FastGptOssModel:
                 group_size=ld["o_gs"],
                 bias=ld["o_bias"],
             )
-            h = h + o_out.astype(mx.bfloat16)
+            h = self._add_resid_bf16_c(h, o_out)
 
             pn = self.rms_f16(h, ld["pa_ln"])
             rl = self._linear(
@@ -1521,10 +1949,12 @@ class FastGptOssModel:
         batch_cache["rope_pos_arr"] = rope_pos_arr + 1
 
         if skip_lm_head:
+            self._last_hf_2d = None
             return None
 
         h_head = h[samp_indices] if samp_indices is not None else h
         hf = self.rms_f16(h_head, self.final_norm)
+        self._last_hf_2d = hf
         return self._linear(
             hf,
             self.lm_w,

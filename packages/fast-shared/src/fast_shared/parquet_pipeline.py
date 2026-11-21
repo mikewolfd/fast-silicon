@@ -1,17 +1,19 @@
-"""Streaming sharded Parquet embedding pipeline optimized for Apple Silicon."""
+"""Streaming sharded Parquet & optional Lance embedding pipeline optimized for Apple Silicon."""
 
 from __future__ import annotations
 
+import argparse
 from contextlib import ExitStack
 from dataclasses import dataclass
 import glob
+import importlib.util
 import json
 import os
 from pathlib import Path
 import queue
 import threading
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -20,9 +22,39 @@ import pyarrow.parquet as pq
 
 from .bench import clear_mlx_arena, wired_limit
 from .embeddings import accepts_kwarg, resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
+from .hw_check import probe_host_hardware
 
 DEFAULT_TEXT_COLUMNS = ("body", "page_text", "text", "content")
+_SUPPORTED_DTYPES = ("float32", "float16", "int8")
 _MANIFEST_FILENAME = ".embed_manifest.json"
+
+
+def _import_lance() -> Any | None:
+    try:
+        import lance  # type: ignore[import-not-found]
+
+        return lance
+    except ImportError:
+        return None
+
+
+LANCE_AVAILABLE: bool = importlib.util.find_spec("lance") is not None
+
+
+@dataclass(frozen=True)
+class CorpusBackfillConfig:
+    """10M-document scale defaults (`d512 int8`, uncompressed vector columns, macro-window length sort)."""
+
+    dtype: str = "int8"
+    mrl_dim: int | None = 512
+    sort_macro_window: bool = True
+    macro_window_tokens: int | None = None
+    use_wired_limit: bool = True
+    compression: str = "zstd"
+    batch_rows: int = 4096
+    encode_batch_rows: int = 4096
+    shard_rows: int = 65536
+    sink_format: str | None = None
 
 
 @dataclass
@@ -41,6 +73,26 @@ class ParquetEmbedSummary:
     @property
     def rows_per_sec(self) -> float:
         return self.rows_emitted / self.elapsed_seconds if self.elapsed_seconds > 0 else 0.0
+
+
+def resolve_macro_window_tokens(
+    macro_window_tokens: int | None = None,
+    *,
+    host_mem_gb: float | None = None,
+) -> int:
+    """Auto-size token budget per global length-sorted macro-window (`1M` on `<=24 GB`, `2M` on `>=36 GB`)."""
+    if macro_window_tokens is not None:
+        val = int(macro_window_tokens)
+        if val <= 0:
+            raise ValueError(f"macro_window_tokens must be positive, got {macro_window_tokens!r}")
+        return val
+    mem = host_mem_gb
+    if mem is None:
+        try:
+            mem = float(probe_host_hardware().get("mem_gb") or 24.0)
+        except Exception:
+            mem = 24.0
+    return 2_000_000 if float(mem) >= 36.0 else 1_000_000
 
 
 def resolve_input_files(input_path: str | Path) -> list[Path]:
@@ -125,12 +177,74 @@ def _iter_source_batches(
                 return
 
 
-def _make_vector_array(vecs_f32: np.ndarray, dim: int, dtype: str) -> pa.Array:
+def _quantize_symmetric_int8(vecs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize L2-normalized float32 embeddings to symmetric `int8` + per-row `float16` `embedding_scale`."""
+    arr = np.asarray(vecs)
+    if arr.dtype == np.int8:
+        q = np.ascontiguousarray(arr, dtype=np.int8)
+        scales = np.full((q.shape[0],), np.float16(1.0 / 127.0), dtype=np.float16)
+        return q, scales
+    f32 = np.ascontiguousarray(arr, dtype=np.float32)
+    if f32.shape[0] == 0:
+        return np.empty(f32.shape, dtype=np.int8), np.empty((0,), dtype=np.float16)
+    norms = np.linalg.norm(f32, axis=-1, keepdims=True)
+    normed = np.where(norms > 1e-12, f32 / np.maximum(norms, 1e-12), np.float32(0.0))
+    absmax = np.max(np.abs(normed), axis=-1)
+    raw_scale = np.where(absmax > 1e-12, absmax / np.float32(127.0), np.float32(1.0 / 127.0))
+    scales_f16 = raw_scale.astype(np.float16)
+    eff_scale = np.where(scales_f16.astype(np.float32) > 1e-12, scales_f16.astype(np.float32), np.float32(1.0 / 127.0))
+    q_i8 = np.clip(np.rint(normed / eff_scale[:, None]), -127.0, 127.0).astype(np.int8)
+    return np.ascontiguousarray(q_i8, dtype=np.int8), scales_f16
+
+
+def _make_vector_array(vecs: np.ndarray, dim: int, dtype: str) -> tuple[pa.Array, pa.Array | None]:
+    if dtype == "int8":
+        q_i8, scales_f16 = _quantize_symmetric_int8(vecs)
+        flat_i8 = q_i8.reshape(-1)
+        vec_arr = pa.FixedSizeListArray.from_arrays(pa.array(flat_i8, type=pa.int8()), dim)
+        scale_arr = pa.array(scales_f16, type=pa.float16())
+        return vec_arr, scale_arr
     if dtype == "float16":
-        flat = vecs_f32.astype(np.float16).reshape(-1)
-        return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float16()), dim)
-    flat = np.ascontiguousarray(vecs_f32, dtype=np.float32).reshape(-1)
-    return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float32()), dim)
+        flat = vecs.astype(np.float16).reshape(-1)
+        return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float16()), dim), None
+    flat = np.ascontiguousarray(vecs, dtype=np.float32).reshape(-1)
+    return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float32()), dim), None
+
+
+def _append_vector_columns(meta_tbl: pa.Table, vecs: np.ndarray, *, dim: int, dtype: str) -> pa.Table:
+    vec_arr, scale_arr = _make_vector_array(vecs, dim=dim, dtype=dtype)
+    out_tbl = meta_tbl.append_column("vector", vec_arr)
+    if scale_arr is not None:
+        out_tbl = out_tbl.append_column("embedding_scale", scale_arr)
+    return out_tbl
+
+
+def _resolve_parquet_compression(
+    schema: pa.Schema,
+    compression: str | Mapping[str, str] | None,
+) -> str | dict[str, str]:
+    """Never waste Zstd CPU compressing dense float/int8 vector columns; keep Zstd on text/metadata."""
+    if compression is None:
+        return "NONE"
+    if isinstance(compression, Mapping):
+        norm_map = {str(k): str(v).upper() for k, v in compression.items()}
+        default_codec = norm_map.get("*", "ZSTD")
+        out: dict[str, str] = {}
+        for name in schema.names:
+            if name in norm_map:
+                out[name] = norm_map[name]
+            elif name in ("vector", "embedding") and ("embedding" in norm_map or "vector" in norm_map):
+                out[name] = norm_map.get("embedding", norm_map.get("vector", "NONE"))
+            else:
+                out[name] = default_codec
+        return out
+    codec = str(compression).strip()
+    if codec.lower() in ("none", "uncompressed"):
+        return "NONE"
+    return {
+        name: ("NONE" if name in ("vector", "embedding") else codec)
+        for name in schema.names
+    }
 
 
 def _prepare_batch_rows(
@@ -196,19 +310,10 @@ def _prepare_batch_rows(
         meta_table = pa.Table.from_batches([rb]).select(meta_cols)
         return meta_table, tok_lists
 
-    expanded_row_idx: list[int] = []
-    expanded_tok_lists: list[list[int]] = []
-    page_numbers: list[int] = []
-    chunk_indices: list[int] = []
-    char_starts: list[int] = []
-    char_ends: list[int] = []
-    tok_counts: list[int] = []
-    chunk_texts: list[str] = []
-
     meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
+    all_units: list[tuple[int, int, str]] = []
     for i in range(rb.num_rows):
         t = raw_texts[i] if isinstance(raw_texts[i], str) else ""
-        units: list[tuple[int, str]] = []
         if per_ocr_page and offsets_col is not None and ocr_pages_col is not None:
             raw_bytes = t.encode("utf-8")
             po = offsets_col[i] or []
@@ -222,50 +327,84 @@ def _prepare_batch_rows(
                     b1 = total_b if (pidx + 1 >= n_pages) else max(b0, min(total_b, int(po[pidx + 1])))
                     seg = raw_bytes[b0:b1].decode("utf-8", errors="replace")
                     if seg.strip() or not skip_empty:
-                        units.append((int(pnum), seg))
+                        all_units.append((i, int(pnum), seg))
         elif ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
             seg = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
             if seg or not skip_empty:
-                units.append((-1, seg))
+                all_units.append((i, -1, seg))
         else:
             if t.strip() or not skip_empty:
-                units.append((-1, t))
+                all_units.append((i, -1, t))
 
-        c_idx = 0
-        for pnum, unit_text in units:
-            if chunk:
-                win_list = tokenizer.chunk_text(
-                    unit_text,
+    if not all_units:
+        empty = pa.Table.from_batches([rb.slice(0, 0)]).select(meta_only_cols)
+        return empty, []
+
+    expanded_row_idx: list[int] = []
+    expanded_tok_lists: list[list[int]] = []
+    page_numbers: list[int] = []
+    chunk_indices: list[int] = []
+    char_starts: list[int] = []
+    char_ends: list[int] = []
+    tok_counts: list[int] = []
+    chunk_texts: list[str] = []
+
+    row_chunk_counter: dict[int, int] = {}
+    unit_texts = [u_txt for _, _, u_txt in all_units]
+
+    if chunk:
+        if hasattr(tokenizer, "chunk_texts_batch"):
+            unit_windows = tokenizer.chunk_texts_batch(
+                unit_texts,
+                max_body_tokens=max_body_tokens,
+                overlap=overlap,
+                prefix=eff_prefix,
+                max_chunk_tokens=max_chunk_tokens,
+            )
+        else:
+            unit_windows = [
+                tokenizer.chunk_text(
+                    u_txt,
                     max_body_tokens=max_body_tokens,
                     overlap=overlap,
                     prefix=eff_prefix,
                     max_chunk_tokens=max_chunk_tokens,
                 )
-                for win_ids, c0, c1 in win_list:
-                    expanded_row_idx.append(i)
-                    expanded_tok_lists.append(win_ids)
-                    if per_ocr_page:
-                        page_numbers.append(pnum)
-                    chunk_indices.append(c_idx)
-                    char_starts.append(c0)
-                    char_ends.append(c1)
-                    tok_counts.append(len(win_ids))
-                    if include_chunk_text:
-                        chunk_texts.append(unit_text[c0:c1])
-                    c_idx += 1
-            else:
-                ids = tokenizer.encode(unit_text, prefix=eff_prefix, max_length=max_encode_length)
-                expanded_row_idx.append(i)
-                expanded_tok_lists.append(ids)
+                for u_txt in unit_texts
+            ]
+        for (row_i, pnum, unit_text), win_list in zip(all_units, unit_windows):
+            c_idx = row_chunk_counter.get(row_i, 0)
+            for win_ids, c0, c1 in win_list:
+                expanded_row_idx.append(row_i)
+                expanded_tok_lists.append(win_ids)
                 if per_ocr_page:
                     page_numbers.append(pnum)
                 chunk_indices.append(c_idx)
-                char_starts.append(0)
-                char_ends.append(len(unit_text))
-                tok_counts.append(len(ids))
+                char_starts.append(c0)
+                char_ends.append(c1)
+                tok_counts.append(len(win_ids))
                 if include_chunk_text:
-                    chunk_texts.append(unit_text)
+                    chunk_texts.append(unit_text[c0:c1])
                 c_idx += 1
+            row_chunk_counter[row_i] = c_idx
+    else:
+        if hasattr(tokenizer, "encode_batch"):
+            encoded_units = tokenizer.encode_batch(unit_texts, prefix=eff_prefix, max_length=max_encode_length)
+        else:
+            encoded_units = [tokenizer.encode(u_txt, prefix=eff_prefix, max_length=max_encode_length) for u_txt in unit_texts]
+        for (row_i, pnum, unit_text), ids in zip(all_units, encoded_units):
+            c_idx = row_chunk_counter.get(row_i, 0)
+            expanded_row_idx.append(row_i)
+            expanded_tok_lists.append(ids)
+            if per_ocr_page:
+                page_numbers.append(pnum)
+            chunk_indices.append(c_idx)
+            char_starts.append(0)
+            char_ends.append(len(unit_text))
+            tok_counts.append(len(ids))
+            if include_chunk_text:
+                chunk_texts.append(unit_text)
+            row_chunk_counter[row_i] = c_idx + 1
 
     if not expanded_row_idx:
         empty = pa.Table.from_batches([rb.slice(0, 0)]).select(meta_only_cols)
@@ -338,6 +477,14 @@ def _save_manifest(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+def _expected_arrow_val_type(expected_dtype: str) -> pa.DataType:
+    if expected_dtype == "int8":
+        return pa.int8()
+    if expected_dtype == "float16":
+        return pa.float16()
+    return pa.float32()
+
+
 def _shard_matches_expected(
     shard_path: Path,
     *,
@@ -350,7 +497,6 @@ def _shard_matches_expected(
 ) -> bool:
     if not shard_path.is_file():
         return False
-    # If a manifest exists and records a conflicting run configuration, do not blindly resume.
     if manifest and isinstance(manifest.get("config"), dict) and manifest["config"] != run_config:
         return False
     manifest_shards = manifest.get("shards") if isinstance(manifest.get("shards"), dict) else {}
@@ -370,18 +516,51 @@ def _shard_matches_expected(
         sch = pf.schema_arrow
         if "vector" not in sch.names:
             return False
+        if expected_dtype == "int8" and "embedding_scale" not in sch.names:
+            return False
         vec_type = sch.field("vector").type
-        exp_val_type = pa.float16() if expected_dtype == "float16" else pa.float32()
+        exp_val_type = _expected_arrow_val_type(expected_dtype)
         if not pa.types.is_fixed_size_list(vec_type):
             return False
         if vec_type.list_size != expected_dim or vec_type.value_type != exp_val_type:
             return False
-        actual_meta_cols = [n for n in sch.names if n != "vector"]
+        actual_meta_cols = [n for n in sch.names if n not in ("vector", "embedding_scale")]
         if actual_meta_cols != expected_meta_cols:
             return False
         return True
     except Exception:
         return False
+
+
+def _normalize_truncated(vecs: np.ndarray, dim: int) -> np.ndarray:
+    """Truncate embeddings to `[:dim]` and L2-normalize (preserving native `int8` pass-through)."""
+    arr = np.asarray(vecs)
+    if arr.dtype == np.int8:
+        return np.ascontiguousarray(arr[..., :dim], dtype=np.int8)
+    sub = truncate_and_normalize(arr, dim)
+    if sub.shape[0] == 0:
+        return sub
+    norms = np.linalg.norm(sub, axis=-1, keepdims=True)
+    return np.ascontiguousarray(sub / np.maximum(norms, 1e-12), dtype=np.float32)
+
+
+def _partition_macro_windows(tok_lists: Sequence[Sequence[int]], budget_tokens: int) -> list[tuple[int, int]]:
+    n = len(tok_lists)
+    if n == 0:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = 0
+    used = 0
+    for idx in range(n):
+        tlen = max(1, len(tok_lists[idx]))
+        if idx > start and (used + tlen) > budget_tokens:
+            spans.append((start, idx))
+            start = idx
+            used = tlen
+        else:
+            used += tlen
+    spans.append((start, n))
+    return spans
 
 
 def embed_parquet(
@@ -412,50 +591,81 @@ def embed_parquet(
     add_query_prefix: bool = False,
     add_document_prefix: bool = False,
     dimensions: int | None = None,
-    compression: str = "zstd",
+    mrl_dim: int | None = None,
+    truncate_dim: int | None = None,
+    compression: str | Mapping[str, str] = "zstd",
     resume: bool = False,
     limit: int | None = None,
     progress_every: int = 1,
     mlx_cache_limit_mb: int | None = 512,
-    use_wired_limit: bool = False,
+    use_wired_limit: bool = True,
+    sort_macro_window: bool = True,
+    macro_window_tokens: int | None = None,
+    sink_format: str | None = None,
+    _clamp_mrl_dim: bool = False,
 ) -> ParquetEmbedSummary:
-    """Prepare source batches, encode capped chunk batches, and write Parquet.
-
-    batch_rows limits source rows read at once; encode_batch_rows limits each
-    model call after chunk expansion; shard_rows controls stored output rows.
-    Source record size and chunk expansion still affect preparation memory.
-    """
-    if dtype not in ("float32", "float16"):
-        raise ValueError(f"Unsupported vector dtype {dtype!r}; expected 'float32' or 'float16'")
+    """Prepare source batches, length-sort token-budgeted macro-windows, and stream Parquet or Lance."""
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported vector dtype {dtype!r}; expected one of {_SUPPORTED_DTYPES}")
     for name, value in (("batch_rows", batch_rows), ("encode_batch_rows", encode_batch_rows), ("shard_rows", shard_rows)):
         if value <= 0:
             raise ValueError(f"{name} must be positive")
 
+    dim_candidates = [d for d in (dimensions, mrl_dim, truncate_dim) if d is not None]
+    if len(set(dim_candidates)) > 1:
+        raise ValueError(
+            f"Conflicting dimension overrides: dimensions={dimensions!r}, mrl_dim={mrl_dim!r}, truncate_dim={truncate_dim!r}"
+        )
+    req_dim: Any = dim_candidates[0] if dim_candidates else None
+
     default_dim = int(getattr(engine, "dim"))
     max_dim = int(getattr(engine, "max_dim", default_dim))
     supports_dims = bool(getattr(engine, "supports_dimensions", False))
+    if _clamp_mrl_dim and isinstance(req_dim, (int, np.integer)) and not isinstance(req_dim, bool):
+        if int(req_dim) > max_dim or not supports_dims:
+            req_dim = default_dim if not supports_dims else min(int(req_dim), max_dim)
+
     dim = resolve_embedding_dim(
-        dimensions,
+        req_dim,
         max_dim=max_dim,
         default_dim=default_dim,
         supports_dimensions=supports_dims,
     )
-    corpus_kw: dict[str, Any] = {"mode": mode}
-    if dimensions is not None and accepts_kwarg(engine.encode_corpus, "dimensions"):
+    encode_fn = getattr(engine, "encode_corpus", None) or getattr(engine, "encode_tokens")
+    corpus_kw: dict[str, Any] = {}
+    if accepts_kwarg(encode_fn, "mode"):
+        corpus_kw["mode"] = mode
+    if req_dim is not None and accepts_kwarg(encode_fn, "dimensions"):
         corpus_kw["dimensions"] = dim
+
+    eff_macro_tokens = resolve_macro_window_tokens(macro_window_tokens)
     engine_max_length = int(getattr(engine, "max_seq_len", 512))
     max_encode_length = int(max_length if max_length is not None else engine_max_length)
     if max_encode_length <= 0 or max_encode_length > engine_max_length:
         raise ValueError(f"max_length must be positive and no greater than the engine limit ({engine_max_length})")
     if max_chunk_tokens <= 0 or (chunk and max_chunk_tokens > engine_max_length):
         raise ValueError(f"max_chunk_tokens must be positive and no greater than the engine limit ({engine_max_length}) when chunking")
+
+    out_p = Path(output_path).expanduser().resolve()
+    eff_sink = (sink_format or ("lance" if out_p.suffix.lower() == ".lance" else "parquet")).strip().lower()
+    if eff_sink not in ("parquet", "lance"):
+        raise ValueError(f"Unsupported sink_format {sink_format!r}; expected 'parquet' or 'lance'")
+    lance_mod = None
+    if eff_sink == "lance":
+        lance_mod = _import_lance()
+        if lance_mod is None:
+            raise RuntimeError(
+                "Lance sink requested (`sink_format='lance'` or `.lance` output suffix), "
+                "but optional dependency `pylance` (`import lance`) is not installed."
+            )
+
     files = resolve_input_files(input_path)
     first_schema = pq.ParquetFile(files[0]).schema_arrow
     eff_text_col = resolve_text_column(first_schema, text_col)
 
-    out_p = Path(output_path).expanduser().resolve()
-    single_file_mode = out_p.suffix.lower() == ".parquet"
-    if single_file_mode:
+    lance_mode = eff_sink == "lance"
+    single_file_mode = (not lance_mode) and (out_p.suffix.lower() == ".parquet")
+    if single_file_mode or lance_mode:
         out_p.parent.mkdir(parents=True, exist_ok=True)
     else:
         out_p.mkdir(parents=True, exist_ok=True)
@@ -484,7 +694,7 @@ def embed_parquet(
         "input_files": [[f.name, f.stat().st_size] for f in files],
     }
     manifest_path = out_p / _MANIFEST_FILENAME
-    manifest = _load_manifest(manifest_path) if (not single_file_mode and resume) else {}
+    manifest = _load_manifest(manifest_path) if (not single_file_mode and not lance_mode and resume) else {}
     manifest_shards: dict[str, Any] = (
         dict(manifest.get("shards", {}))
         if (manifest.get("config") == run_config and isinstance(manifest.get("shards"), dict))
@@ -545,6 +755,7 @@ def embed_parquet(
 
     single_writer: pq.ParquetWriter | None = None
     tmp_single_path = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
+    lance_created = False
     shard_idx = 0
     pending_meta_parts: list[pa.Table] = []
     pending_meta_rows = 0
@@ -559,7 +770,7 @@ def embed_parquet(
     writer_stop = threading.Event()
 
     def _writer_worker() -> None:
-        nonlocal single_writer
+        nonlocal single_writer, lance_created
         try:
             while not writer_stop.is_set():
                 try:
@@ -569,19 +780,26 @@ def embed_parquet(
                 if w_item is None:
                     break
                 kind = w_item[0]
-                if kind == "single":
+                if kind == "lance":
                     _, m_tbl, vecs = w_item
-                    vec_arr = _make_vector_array(vecs, dim=dim, dtype=dtype)
-                    out_tbl = m_tbl.append_column("vector", vec_arr)
+                    out_tbl = _append_vector_columns(m_tbl, vecs, dim=dim, dtype=dtype)
+                    assert lance_mod is not None
+                    w_mode = "append" if lance_created else "create"
+                    lance_mod.write_dataset(out_tbl, str(out_p), mode=w_mode)
+                    lance_created = True
+                elif kind == "single":
+                    _, m_tbl, vecs = w_item
+                    out_tbl = _append_vector_columns(m_tbl, vecs, dim=dim, dtype=dtype)
                     if single_writer is None:
-                        single_writer = pq.ParquetWriter(tmp_single_path, out_tbl.schema, compression=compression)
+                        col_comp = _resolve_parquet_compression(out_tbl.schema, compression)
+                        single_writer = pq.ParquetWriter(tmp_single_path, out_tbl.schema, compression=col_comp)
                     single_writer.write_table(out_tbl)
                 else:
                     _, m_slice, vecs, shard_path, tmp_shard, n_shard_toks = w_item
-                    vec_arr = _make_vector_array(vecs, dim=dim, dtype=dtype)
-                    out_tbl = m_slice.append_column("vector", vec_arr)
+                    out_tbl = _append_vector_columns(m_slice, vecs, dim=dim, dtype=dtype)
+                    col_comp = _resolve_parquet_compression(out_tbl.schema, compression)
                     try:
-                        pq.write_table(out_tbl, tmp_shard, compression=compression)
+                        pq.write_table(out_tbl, tmp_shard, compression=col_comp)
                         os.replace(tmp_shard, shard_path)
                         with manifest_lock:
                             manifest_shards[shard_path.name] = {
@@ -616,17 +834,40 @@ def embed_parquet(
             except queue.Full:
                 continue
 
-    def encode_rows(tok_lists: list[list[int]]) -> np.ndarray:
-        if len(tok_lists) <= encode_batch_rows:
-            out_vecs = truncate_and_normalize(engine.encode_corpus(tok_lists, **corpus_kw), dim)
+    def _encode_sorted_chunk(sub_toks: list[list[int]]) -> np.ndarray:
+        if len(sub_toks) <= encode_batch_rows:
+            out_vecs = _normalize_truncated(encode_fn(sub_toks, **corpus_kw), dim)
             clear_mlx_arena(256)
             return out_vecs
-        vecs = np.empty((len(tok_lists), dim), dtype=np.float32)
-        for start in range(0, len(tok_lists), encode_batch_rows):
-            end = min(start + encode_batch_rows, len(tok_lists))
-            vecs[start:end] = truncate_and_normalize(engine.encode_corpus(tok_lists[start:end], **corpus_kw), dim)
+        first = _normalize_truncated(encode_fn(sub_toks[:encode_batch_rows], **corpus_kw), dim)
+        clear_mlx_arena(256)
+        vecs = np.empty((len(sub_toks), dim), dtype=first.dtype)
+        vecs[:encode_batch_rows] = first
+        for start in range(encode_batch_rows, len(sub_toks), encode_batch_rows):
+            end = min(start + encode_batch_rows, len(sub_toks))
+            vecs[start:end] = _normalize_truncated(encode_fn(sub_toks[start:end], **corpus_kw), dim)
             clear_mlx_arena(256)
         return vecs
+
+    def encode_rows(tok_lists: list[list[int]]) -> np.ndarray:
+        if not tok_lists:
+            return np.empty((0, dim), dtype=np.float32)
+        if not sort_macro_window or len(tok_lists) <= 1:
+            return _encode_sorted_chunk(tok_lists)
+
+        macro_spans = _partition_macro_windows(tok_lists, eff_macro_tokens)
+        out_all: np.ndarray | None = None
+        for w_start, w_end in macro_spans:
+            win_toks = tok_lists[w_start:w_end]
+            order = sorted(range(len(win_toks)), key=lambda idx: len(win_toks[idx]))
+            sorted_toks = [win_toks[idx] for idx in order]
+            sorted_vecs = _encode_sorted_chunk(sorted_toks)
+            if out_all is None:
+                out_all = np.empty((len(tok_lists), dim), dtype=sorted_vecs.dtype)
+            for sorted_i, orig_local_i in enumerate(order):
+                out_all[w_start + orig_local_i] = sorted_vecs[sorted_i]
+        assert out_all is not None
+        return out_all
 
     def write_shard_slice(meta_slice: pa.Table, tok_slice: list[list[int]]) -> None:
         nonlocal shard_idx, rows_emitted, total_tokens
@@ -702,7 +943,12 @@ def embed_parquet(
                 _, meta_tbl, tok_lists = item
                 batch_num += 1
 
-                if single_file_mode:
+                if lance_mode:
+                    vecs = encode_rows(tok_lists)
+                    rows_emitted += len(tok_lists)
+                    total_tokens += sum(len(x) for x in tok_lists)
+                    _enqueue_write(("lance", meta_tbl, vecs))
+                elif single_file_mode:
                     vecs = encode_rows(tok_lists)
                     rows_emitted += len(tok_lists)
                     total_tokens += sum(len(x) for x in tok_lists)
@@ -721,7 +967,7 @@ def embed_parquet(
                         flush=True,
                     )
 
-            if not single_file_mode:
+            if not single_file_mode and not lance_mode:
                 drain_shards(final=True)
 
             _enqueue_write(None)
@@ -733,11 +979,22 @@ def embed_parquet(
                 if rows_emitted > 0 and tmp_single_path is not None and tmp_single_path.exists():
                     os.replace(tmp_single_path, out_p)
                 else:
+                    extra_fields = [pa.field("vector", pa.list_(_expected_arrow_val_type(dtype), dim))]
+                    if dtype == "int8":
+                        extra_fields.append(pa.field("embedding_scale", pa.float16()))
                     empty_schema = pa.schema(
-                        [f for f in first_schema if f.name != eff_text_col or not drop_text_col]
-                        + [pa.field("vector", pa.list_(pa.float16() if dtype == "float16" else pa.float32(), dim))]
+                        [f for f in first_schema if f.name != eff_text_col or not drop_text_col] + extra_fields
                     )
-                    pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_p, compression=compression)
+                    col_comp = _resolve_parquet_compression(empty_schema, compression)
+                    pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_p, compression=col_comp)
+            elif lance_mode and rows_emitted == 0 and lance_mod is not None:
+                extra_fields = [pa.field("vector", pa.list_(_expected_arrow_val_type(dtype), dim))]
+                if dtype == "int8":
+                    extra_fields.append(pa.field("embedding_scale", pa.float16()))
+                empty_schema = pa.schema(
+                    [f for f in first_schema if f.name != eff_text_col or not drop_text_col] + extra_fields
+                )
+                lance_mod.write_dataset(pa.Table.from_pylist([], schema=empty_schema), str(out_p), mode="create")
         finally:
             writer_stop.set()
             try:
@@ -759,3 +1016,64 @@ def embed_parquet(
         elapsed_seconds=elapsed,
         output_path=out_p,
     )
+
+
+def build_backfill_cli_parser(
+    parser: argparse.ArgumentParser | None = None,
+    *,
+    default_config: CorpusBackfillConfig | None = None,
+    mode_choices: Sequence[str] = ("auto", "gpu", "ane", "hetero", "hetero2"),
+    default_mode: str = "hetero",
+) -> argparse.ArgumentParser:
+    """Build 10M-doc scale corpus backfill CLI parser (`--dtype int8 --mrl-dim 512` default; `--dtype float32` one flag away)."""
+    cfg = default_config or CorpusBackfillConfig()
+    p = parser if parser is not None else argparse.ArgumentParser(description="10M-doc scale corpus embedding backfill.")
+    p.add_argument("--input", required=True, help="Parquet file, directory of .parquet files, or glob")
+    p.add_argument("--output", required=True, help="Output .parquet/.lance path or shard directory")
+    p.add_argument("--dtype", choices=_SUPPORTED_DTYPES, default=cfg.dtype, help="Vector storage dtype (default: int8; pass --dtype float32 for full precision)")
+    p.add_argument("--mrl-dim", "--truncate-dim", dest="mrl_dim", type=int, default=cfg.mrl_dim, help="Matryoshka output width (default: 512; pass 0 for full model dim)")
+    p.add_argument("--mode", choices=tuple(mode_choices), default=default_mode)
+    p.add_argument("--sink-format", choices=("parquet", "lance"), default=cfg.sink_format)
+    p.add_argument("--batch-rows", type=int, default=cfg.batch_rows)
+    p.add_argument("--encode-batch-rows", type=int, default=cfg.encode_batch_rows)
+    p.add_argument("--shard-rows", type=int, default=cfg.shard_rows)
+    p.add_argument("--macro-window-tokens", type=int, default=cfg.macro_window_tokens)
+    p.add_argument("--no-sort-macro-window", action="store_true")
+    p.add_argument("--chunk", action="store_true")
+    p.add_argument("--max-chunk-tokens", type=int, default=512)
+    p.add_argument("--overlap", type=int, default=51)
+    p.add_argument("--compression", default=cfg.compression)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--progress-every", type=int, default=1)
+    return p
+
+
+def run_corpus_backfill(
+    engine: Any,
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    config: CorpusBackfillConfig | None = None,
+    **overrides: Any,
+) -> ParquetEmbedSummary:
+    """Execute `embed_parquet` with 10M-doc `CorpusBackfillConfig` defaults (`d512 int8`, uncompressed vectors)."""
+    cfg = config or CorpusBackfillConfig()
+    eff_mrl = overrides.pop("mrl_dim", cfg.mrl_dim)
+    if eff_mrl is not None and int(eff_mrl) <= 0:
+        eff_mrl = None
+    kw: dict[str, Any] = {
+        "dtype": cfg.dtype,
+        "mrl_dim": eff_mrl,
+        "sort_macro_window": cfg.sort_macro_window,
+        "macro_window_tokens": cfg.macro_window_tokens,
+        "use_wired_limit": cfg.use_wired_limit,
+        "compression": cfg.compression,
+        "batch_rows": cfg.batch_rows,
+        "encode_batch_rows": cfg.encode_batch_rows,
+        "shard_rows": cfg.shard_rows,
+        "sink_format": cfg.sink_format,
+        "_clamp_mrl_dim": True,
+    }
+    kw.update(overrides)
+    return embed_parquet(engine, input_path, output_path, **kw)

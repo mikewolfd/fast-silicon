@@ -211,6 +211,42 @@ def _qlora_regime_report(
     return report
 
 
+_PREQUANT_GEMMA4_REPOS: tuple[str, ...] = (
+    "mlx-community/gemma-4-e2b-it-8bit",
+    "lmstudio-community/gemma-4-E2B-it-MLX-4bit",
+    "mlx-community/gemma-4-e2b-it-4bit",
+    "mlx-community/gemma-4-E2B-it-qat-4bit",
+)
+
+
+def select_qlora_policy(mem_gb: float) -> dict[str, Any]:
+    """Select wired-safe QLoRA packing, checkpointing (`ckpt_tokens=512`), and `<36 GB` BF16 gating."""
+    from fast_shared.runtime_lessons import recommend_silicon_budget
+
+    eff_mem = max(16.0, float(mem_gb or 24.0))
+    budget = recommend_silicon_budget(eff_mem, workload="qlora")
+    raw_ckpt = int(budget.ckpt_tokens)
+    ckpt_tokens = 512 if raw_ckpt <= 0 else min(512, max(256, raw_ckpt))
+    if eff_mem >= 20.0:
+        ckpt_tokens = 512
+    return {
+        "pack_tokens": int(budget.seq_pack_len),
+        "grad_accum": int(budget.grad_accum),
+        "ckpt_tokens": ckpt_tokens,
+        "memory_limit_gb": float(budget.memory_limit_gb),
+        "cache_limit_gb": float(budget.cache_limit_gb),
+        "run_bf16_baseline": float(mem_gb or 0.0) >= 36.0,
+    }
+
+
+def _resolve_prequant_gemma4_snapshot() -> Path | None:
+    for repo in _PREQUANT_GEMMA4_REPOS:
+        snap = resolve_hf_snapshot(repo)
+        if snap is not None:
+            return snap
+    return None
+
+
 def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str, Any]:
     import mlx.core as mx
     import mlx.nn as nn
@@ -236,43 +272,61 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         unwrap_kv_shared_lora_modules,
     )
 
-    base_snap = resolve_hf_snapshot("mlx-community/gemma-4-e2b-it-bf16")
-    if base_snap is None:
-        return {"suite": "qlora-packing", "status": "skipped", "reason": "missing mlx-community/gemma-4-e2b-it-bf16"}
+    pol = select_qlora_policy(host_mem_gb)
+    run_bf16_baseline = bool(pol["run_bf16_baseline"])
+    prequant_snap = _resolve_prequant_gemma4_snapshot()
+    bf16_snap = resolve_hf_snapshot("mlx-community/gemma-4-e2b-it-bf16") if run_bf16_baseline else None
 
-    low_ram = 0 < host_mem_gb <= 28.5
+    if not run_bf16_baseline:
+        # Gate the 10.24 GB BF16 checkpoint strictly off on < 36 GB hosts to prevent Metal OOM.
+        if prequant_snap is None:
+            return {
+                "suite": "qlora-packing",
+                "status": "skipped",
+                "reason": "missing pre-quantized Gemma-4 E2B 4-bit/8-bit snapshot (<36 GB host skips 10.24 GB BF16)",
+            }
+        tok_snap = prequant_snap
+    else:
+        tok_snap = prequant_snap or bf16_snap
+        if tok_snap is None:
+            return {"suite": "qlora-packing", "status": "skipped", "reason": "missing Gemma-4 E2B snapshot"}
+
+    low_ram = not run_bf16_baseline
     max_rec = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
     mem_cap = (max_rec if max_rec > 0 else int(18.5 * (1024**3))) if low_ram else int(36.0 * (1024**3))
     mx.set_memory_limit(mem_cap)
-    mx.set_cache_limit((128 if low_ram else 512) * 1024 * 1024)
+    mx.set_cache_limit(256 * 1024 * 1024)
 
     fg4_home = resolve_pkg_home("fast-gemma4", "FAST_GEMMA4_HOME")
     fix_dir = fg4_home / "tests" / "fixtures"
     sys_txt = (fix_dir / "sys_extract_v1.txt").read_text(encoding="utf-8").strip()
     raw_docs = json.loads((fix_dir / "sample_docs_8.json").read_text(encoding="utf-8"))
-    tokenizer = load_tokenizer(base_snap)
+    tokenizer = load_tokenizer(tok_snap)
     num_lora_layers = 23
+    ckpt_toks = int(pol["ckpt_tokens"])
+    pack_tok_bench = int(pol["pack_tokens"])
 
-    def _load_lora(*, qlora_8bit: bool, seed: int = 42) -> tuple[Any, int]:
+    def _load_lora(*, snap_path: Path, qlora_quant: bool, seed: int = 42) -> tuple[Any, int]:
         mx.random.seed(seed)
-        mdl, _ = load_model(base_snap, strict=False)
+        mdl, _ = load_model(snap_path, strict=False)
         for attr in ("vision_tower", "audio_tower", "embed_vision", "embed_audio", "multi_modal_projector"):
             if hasattr(mdl, attr):
                 setattr(mdl, attr, None)
         gc.collect()
         mx.clear_cache()
-        if qlora_8bit:
-            quantize_frozen_trunk_8bit(mdl, group_size=64, bits=8, quantize_ple_embedding=True, quantize_embed_tokens=False)
+        if qlora_quant:
+            quantize_frozen_trunk_8bit(mdl, group_size=64, bits=8, quantize_ple_embedding=True, quantize_embed_tokens=True)
             mx.eval(mdl.parameters())
             gc.collect()
             mx.clear_cache()
         mdl.freeze()
         mx.random.seed(seed)
         linear_to_lora_layers(mdl, num_layers=num_lora_layers, config={"rank": 24, "scale": 2.0, "dropout": 0.0})
-        if qlora_8bit:
-            cast_lora_adapters_dtype(mdl, mx.bfloat16)
+        cast_lora_adapters_dtype(mdl, mx.bfloat16)
         unwrap_kv_shared_lora_modules(mdl)
         mx.eval(mdl.parameters())
+        gc.collect()
+        mx.clear_cache()
         return mdl, len(mdl.layers) - num_lora_layers
 
     def _frozen_legacy(mdl: Any, inp: Any, first_l: int) -> tuple[Any, ...]:
@@ -324,54 +378,14 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         )
 
     def _to_host_f32_tree(gtree: Any) -> Any:
-        # Host NumPy copy prevents 24 GB unified-memory hosts from holding two simultaneous Metal gradient trees.
         return tree_map(lambda x: np.asarray(x.astype(mx.float32)).copy(), gtree)
 
     def _np_tree_to_mx(ntree: Any) -> Any:
         return tree_map(lambda x: mx.array(x), ntree)
 
-    pairs = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=12, sys_repeat=1)
-    pairs_long_sys = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=8, sys_repeat=4)
-
-    # Step-0 parity: unpacked BF16 vs packed BF16 (B=1 on <=28GB hosts to stay strictly under 19 GB Metal limit)
-    mdl_bf16, first_l = _load_lora(qlora_8bit=False, seed=42)
-    vg_leg = nn.value_and_grad(mdl_bf16, _tail_legacy)
-    vg_pck = nn.value_and_grad(mdl_bf16, compute_packed_tail_ce_loss)
-
-    sub_p = pairs[: (1 if low_ram else 2)]
-    pack_tok_bench = 1280 if low_ram else 2048
-    max_in = max(len(f) - 1 for f, _ in sub_p)
-    inp_u = mx.array([f[:-1] + [0] * (max_in - (len(f) - 1)) for f, _ in sub_p], dtype=mx.int32)
-    spans_u = [(pl - 1, len(f) - 1) for f, pl in sub_p]
-    y_u = mx.array([tok_id for f, pl in sub_p for tok_id in f[pl:]], dtype=mx.int32)
-
-    hu, mu, iu, pu = _frozen_legacy(mdl_bf16, inp_u, first_l)
-    lu, gu = vg_leg(mdl_bf16, hu, mu, iu, pu, spans_u, y_u, first_l, low_ram, False)
-    mx.eval(lu, gu)
-    loss_u = float(lu.item())
-    gu_np = _to_host_f32_tree(gu)
-    del lu, gu, hu, mu, iu, pu
-    gc.collect()
-    mx.clear_cache()
-
-    pbin = pack_examples_to_bin(sub_p, pack_tokens=pack_tok_bench, pad_to_fixed=True, loss_norm="token")
-    hp, mp, ip, pp, rtp = run_frozen_prefix_packed(mdl_bf16, pbin, first_l)
-    lp, gp = vg_pck(
-        mdl_bf16, hp, mp, ip, pp, rtp, pbin.ans_indices, pbin.y_flat, None, first_l,
-        use_ckpt=low_ram, chunk_size=256, compiled_ce=True,
-    )
-    mx.eval(lp, gp)
-    loss_p = float(lp.item())
-    gp_np = _to_host_f32_tree(gp)
-    del lp, gp, hp, mp, ip, pp, rtp
-    gc.collect()
-    mx.clear_cache()
-
-    cos_pack, min_cos_pack, _ = grad_tree_cosine(_np_tree_to_mx(gu_np), _np_tree_to_mx(gp_np))
-    del gu_np
-
     def _run_regime(
         mdl: Any,
+        first_l: int,
         pair_list: list[tuple[list[int], int]],
         *,
         pack_tokens: int,
@@ -467,65 +481,494 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         mx.clear_cache()
         return {**counts, "elapsed_seconds": dt, "peak_gb": round(pk_gb, 3), "peak_gib": round(pk_gib, 3)}
 
-    # Stock baseline A on BF16 model (unpacked, uncompiled)
-    ckpt_bf16 = 256 if low_ram else 2200
-    a_runs = [_run_regime(mdl_bf16, pairs, pack_tokens=0, pad_mult=1, shared_sys=False, compiled=False, ckpt_toks=ckpt_bf16) for _ in range(2)]
-    del mdl_bf16
+    pairs = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=12, sys_repeat=1)
+    pairs_long_sys = _qlora_pairs(raw_docs, sys_txt, tokenizer, n_docs=8, sys_repeat=4)
+    sub_p = pairs[: (1 if low_ram else 2)]
+    max_in = max(len(f) - 1 for f, _ in sub_p)
+    inp_u = mx.array([f[:-1] + [0] * (max_in - (len(f) - 1)) for f, _ in sub_p], dtype=mx.int32)
+    spans_u = [(pl - 1, len(f) - 1) for f, pl in sub_p]
+    y_u = mx.array([tok_id for f, pl in sub_p for tok_id in f[pl:]], dtype=mx.int32)
+    pbin = pack_examples_to_bin(sub_p, pack_tokens=pack_tok_bench, pad_to_fixed=True, loss_norm="token")
+
+    cos_q8: float | None = None
+    if run_bf16_baseline and bf16_snap is not None:
+        mdl_bf16, first_l_bf16 = _load_lora(snap_path=bf16_snap, qlora_quant=False, seed=42)
+        vg_leg = nn.value_and_grad(mdl_bf16, _tail_legacy)
+        vg_pck = nn.value_and_grad(mdl_bf16, compute_packed_tail_ce_loss)
+
+        hu, mu, iu, pu = _frozen_legacy(mdl_bf16, inp_u, first_l_bf16)
+        lu, gu = vg_leg(mdl_bf16, hu, mu, iu, pu, spans_u, y_u, first_l_bf16, True, False)
+        mx.eval(lu, gu)
+        loss_u = float(lu.item())
+        gu_np = _to_host_f32_tree(gu)
+        del lu, gu, hu, mu, iu, pu
+        gc.collect()
+        mx.clear_cache()
+
+        hp, mp, ip, pp, rtp = run_frozen_prefix_packed(mdl_bf16, pbin, first_l_bf16)
+        lp, gp = vg_pck(
+            mdl_bf16, hp, mp, ip, pp, rtp, pbin.ans_indices, pbin.y_flat, None, first_l_bf16,
+            use_ckpt=True, chunk_size=256, compiled_ce=True,
+        )
+        mx.eval(lp, gp)
+        loss_p = float(lp.item())
+        gp_np = _to_host_f32_tree(gp)
+        del lp, gp, hp, mp, ip, pp, rtp
+        gc.collect()
+        mx.clear_cache()
+
+        cos_pack, min_cos_pack, _ = grad_tree_cosine(_np_tree_to_mx(gu_np), _np_tree_to_mx(gp_np))
+        del gu_np
+
+        a_runs = [
+            _run_regime(
+                mdl_bf16, first_l_bf16, pairs, pack_tokens=0, pad_mult=1, shared_sys=False, compiled=False, ckpt_toks=ckpt_toks
+            )
+            for _ in range(2)
+        ]
+        stock_regime_key = "stock_bf16_unpacked"
+        stock_desc = "Unpacked BF16"
+        del mdl_bf16
+        gc.collect()
+        mx.clear_cache()
+
+        q_snap = prequant_snap if prequant_snap is not None else bf16_snap
+        mdl_q, first_l_q = _load_lora(snap_path=q_snap, qlora_quant=(prequant_snap is None), seed=42)
+        hp8, mp8, ip8, pp8, rtp8 = run_frozen_prefix_packed(mdl_q, pbin, first_l_q)
+        vg_q8 = nn.value_and_grad(mdl_q, compute_packed_tail_ce_loss)
+        lq8, gq8 = vg_q8(
+            mdl_q, hp8, mp8, ip8, pp8, rtp8, pbin.ans_indices, pbin.y_flat, None, first_l_q,
+            use_ckpt=True, chunk_size=256, compiled_ce=True,
+        )
+        mx.eval(lq8, gq8)
+        gq8_np = _to_host_f32_tree(gq8)
+        cos_q8_val, _, _ = grad_tree_cosine(_np_tree_to_mx(gp_np), _np_tree_to_mx(gq8_np))
+        cos_q8 = float(cos_q8_val)
+        del lq8, gq8, hp8, mp8, ip8, pp8, rtp8, gp_np, gq8_np
+        gc.collect()
+        mx.clear_cache()
+    else:
+        assert prequant_snap is not None
+        mdl_q, first_l_q = _load_lora(snap_path=prequant_snap, qlora_quant=False, seed=42)
+        vg_leg_q = nn.value_and_grad(mdl_q, _tail_legacy)
+        vg_pck_q = nn.value_and_grad(mdl_q, compute_packed_tail_ce_loss)
+
+        hu, mu, iu, pu = _frozen_legacy(mdl_q, inp_u, first_l_q)
+        lu, gu = vg_leg_q(mdl_q, hu, mu, iu, pu, spans_u, y_u, first_l_q, True, False)
+        mx.eval(lu, gu)
+        loss_u = float(lu.item())
+        gu_np = _to_host_f32_tree(gu)
+        del lu, gu, hu, mu, iu, pu
+        gc.collect()
+        mx.clear_cache()
+
+        hp, mp, ip, pp, rtp = run_frozen_prefix_packed(mdl_q, pbin, first_l_q)
+        lp, gp = vg_pck_q(
+            mdl_q, hp, mp, ip, pp, rtp, pbin.ans_indices, pbin.y_flat, None, first_l_q,
+            use_ckpt=True, chunk_size=256, compiled_ce=True,
+        )
+        mx.eval(lp, gp)
+        loss_p = float(lp.item())
+        gp_np = _to_host_f32_tree(gp)
+        del lp, gp, hp, mp, ip, pp, rtp
+        gc.collect()
+        mx.clear_cache()
+
+        cos_pack, min_cos_pack, _ = grad_tree_cosine(_np_tree_to_mx(gu_np), _np_tree_to_mx(gp_np))
+        del gu_np, gp_np
+        gc.collect()
+        mx.clear_cache()
+
+        a_runs = [
+            _run_regime(
+                mdl_q, first_l_q, pairs, pack_tokens=0, pad_mult=1, shared_sys=False, compiled=False, ckpt_toks=ckpt_toks
+            )
+            for _ in range(2)
+        ]
+        stock_regime_key = "stock_qlora_unpacked"
+        stock_desc = "Unpacked pre-quantized QLoRA"
+        gc.collect()
+        mx.clear_cache()
+
+    b_pack_runs = [
+        _run_regime(
+            mdl_q, first_l_q, pairs, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=False, compiled=True, ckpt_toks=ckpt_toks
+        )
+        for _ in range(2)
+    ]
     gc.collect()
     mx.clear_cache()
-
-    # Optimized QLoRA 8-bit g64 model
-    mdl_q8, first_l = _load_lora(qlora_8bit=True, seed=42)
-    hp8, mp8, ip8, pp8, rtp8 = run_frozen_prefix_packed(mdl_q8, pbin, first_l)
-    vg_q8 = nn.value_and_grad(mdl_q8, compute_packed_tail_ce_loss)
-    lq8, gq8 = vg_q8(
-        mdl_q8, hp8, mp8, ip8, pp8, rtp8, pbin.ans_indices, pbin.y_flat, None, first_l,
-        use_ckpt=low_ram, chunk_size=256, compiled_ce=True,
-    )
-    mx.eval(lq8, gq8)
-    gq8_np = _to_host_f32_tree(gq8)
-    cos_q8, _, _ = grad_tree_cosine(_np_tree_to_mx(gp_np), _np_tree_to_mx(gq8_np))
-    del lq8, gq8, hp8, mp8, ip8, pp8, rtp8, gp_np, gq8_np
+    b_sys_runs = [
+        _run_regime(
+            mdl_q, first_l_q, pairs_long_sys, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=True, compiled=True, ckpt_toks=ckpt_toks
+        )
+        for _ in range(2)
+    ]
+    del mdl_q
     gc.collect()
     mx.clear_cache()
-
-    ckpt_q8 = 512 if low_ram else 4096
-    b_pack_runs = [_run_regime(mdl_q8, pairs, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=False, compiled=True, ckpt_toks=ckpt_q8) for _ in range(2)]
-    b_sys_runs = [_run_regime(mdl_q8, pairs_long_sys, pack_tokens=pack_tok_bench, pad_mult=64, shared_sys=True, compiled=True, ckpt_toks=ckpt_q8) for _ in range(2)]
 
     stock = _qlora_regime_report(pairs, a_runs, prompt_copies=1, pack_tokens=0)
     packed = _qlora_regime_report(pairs, b_pack_runs, prompt_copies=1, pack_tokens=pack_tok_bench)
     shared = _qlora_regime_report(pairs_long_sys, b_sys_runs, prompt_copies=4, pack_tokens=pack_tok_bench)
 
+    parity_payload: dict[str, Any] = {
+        "packed_vs_unpacked_loss_diff": round(abs(loss_p - loss_u), 6),
+        "packed_vs_unpacked_grad_cos": round(float(cos_pack), 6),
+        "packed_min_tensor_cos": round(float(min_cos_pack), 6),
+        "qlora_8bit_vs_bf16_grad_cos": round(float(cos_q8), 6) if cos_q8 is not None else None,
+    }
     return {
         "suite": "qlora-packing",
         "status": "ok",
+        "policy": pol,
         "fast_metric": (
-            f"Packed 8-bit {packed['supervised_tokens_per_sec']:,.1f} supervised tokens/s on the same {packed['examples']} examples. "
+            f"Packed QLoRA ({pack_tok_bench}) {packed['supervised_tokens_per_sec']:,.1f} supervised tokens/s on the same {packed['examples']} examples. "
             f"The separate shared-prefix run uses {shared['examples']} examples with four copies of the instructions."
         ),
-        "stock_baseline": f"Unpacked BF16 {stock['supervised_tokens_per_sec']:,.1f} supervised tokens/s",
-        "speedup_vs_stock": round(packed["supervised_tokens_per_sec"] / stock["supervised_tokens_per_sec"], 2),
-        "comparison": "Packed 8-bit vs unpacked BF16 on identical input and answer IDs. The separate shared-prefix pass uses eight examples with four copies of the instructions. It has no matched baseline.",
+        "stock_baseline": f"{stock_desc} {stock['supervised_tokens_per_sec']:,.1f} supervised tokens/s",
+        "speedup_vs_stock": round(packed["supervised_tokens_per_sec"] / max(stock["supervised_tokens_per_sec"], 1e-6), 2),
+        "comparison": (
+            f"Packed QLoRA (ckpt_tokens={ckpt_toks}) vs {stock_desc.lower()} on identical input and answer IDs. "
+            "The separate shared-prefix pass uses eight examples with four copies of the instructions."
+        ),
         "measurement": "Two consecutive timed passes per regime after optimizer warmup. Each elapsed time counts training on those examples. Optimizer steps can differ by packing. tok_s counts logical input positions, including reused prefixes. peak_gb records decimal GB (1e9 bytes) of MLX allocations; peak_gib records GiB.",
-        "peak_gb": packed["peak_gb"], "stock_peak_gb": stock["peak_gb"],
-        "parity": {
-            "packed_vs_unpacked_loss_diff": round(abs(loss_p - loss_u), 6),
-            "packed_vs_unpacked_grad_cos": round(float(cos_pack), 6),
-            "packed_min_tensor_cos": round(float(min_cos_pack), 6),
-            "qlora_8bit_vs_bf16_grad_cos": round(float(cos_q8), 6),
-        },
+        "peak_gb": packed["peak_gb"],
+        "stock_peak_gb": stock["peak_gb"],
+        "parity": parity_payload,
         "regimes": {
-            "stock_bf16_unpacked": stock,
-            f"qlora_8bit_packed_{pack_tok_bench}": packed,
-            "qlora_8bit_shared_sys_kv": {**shared, "matched_baseline": None},
+            stock_regime_key: stock,
+            f"qlora_packed_{pack_tok_bench}": packed,
+            "qlora_shared_sys_kv": {**shared, "matched_baseline": None},
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# 2. ModernBERT-421M Validator Fine-Tuning (`freeze<18`)
+# 2. Authentic ModernBERT-large (`421M`, `28L`, `freeze<18`) Validator Fine-Tuning
 # ---------------------------------------------------------------------------
+
+try:
+    import mlx.core as _mb_mx
+    import mlx.nn as _mb_nn
+
+    _MbModuleBase: Any = _mb_nn.Module
+except Exception:  # pragma: no cover
+    _mb_mx = None  # type: ignore[assignment]
+    _mb_nn = None  # type: ignore[assignment]
+    _MbModuleBase = object
+
+
+class _ModernBertBlock(_MbModuleBase):  # type: ignore[misc]
+    """Authentic ModernBERT encoder block (`attn_norm=None` at L0, biasless LayerNorm, exact GeGLU, 2D RoPE)."""
+
+    def __init__(
+        self,
+        layer_idx: int,
+        *,
+        hidden: int = 1024,
+        n_heads: int = 16,
+        d_ff: int = 2624,
+        local_attention: int = 128,
+    ) -> None:
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+        self.is_global = (self.layer_idx % 3) == 0
+        self.rope_theta = 160_000.0 if self.is_global else 10_000.0
+        self.local_attention = int(local_attention)
+        self.n_heads = int(n_heads)
+        self.head_dim = int(hidden) // int(n_heads)
+        self.scale = self.head_dim**-0.5
+        self.attn_norm = None if self.layer_idx == 0 else _mb_nn.LayerNorm(hidden, eps=1e-5, bias=False)
+        self.wqkv = _mb_nn.Linear(hidden, 3 * hidden, bias=False)
+        self.wo = _mb_nn.Linear(hidden, hidden, bias=False)
+        self.mlp_norm = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=False)
+        self.wi = _mb_nn.Linear(hidden, 2 * d_ff, bias=False)
+        self.wd = _mb_nn.Linear(d_ff, hidden, bias=False)
+
+    def _apply_2d_rope(self, q: Any, k: Any, position_ids: Any) -> tuple[Any, Any]:
+        # 2D (B, S) position_ids supporting per-segment RoPE resets on Packed-512 (avoids upstream 1D B*S bug).
+        inv_freq = 1.0 / (
+            self.rope_theta ** (_mb_mx.arange(0, self.head_dim, 2, dtype=_mb_mx.float32) / float(self.head_dim))
+        )
+        angles = position_ids[:, None, :, None].astype(_mb_mx.float32) * inv_freq[None, None, None, :]
+        cos = _mb_mx.cos(angles).astype(q.dtype)
+        sin = _mb_mx.sin(angles).astype(q.dtype)
+        q0, q1 = _mb_mx.split(q, 2, axis=-1)
+        k0, k1 = _mb_mx.split(k, 2, axis=-1)
+        qr = _mb_mx.concatenate([q0 * cos - q1 * sin, q1 * cos + q0 * sin], axis=-1)
+        kr = _mb_mx.concatenate([k0 * cos - k1 * sin, k1 * cos + k0 * sin], axis=-1)
+        return qr, kr
+
+    def __call__(self, x: Any, position_ids: Any, mask_4d: Any) -> Any:
+        B, S, H = x.shape
+        xa = x if self.attn_norm is None else self.attn_norm(x)
+        qkv = self.wqkv(xa).reshape(B, S, 3, self.n_heads, self.head_dim)
+        q = qkv[:, :, 0].transpose(0, 2, 1, 3)
+        k = qkv[:, :, 1].transpose(0, 2, 1, 3)
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+        q, k = self._apply_2d_rope(q, k, position_ids)
+        att = _mb_mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask_4d.astype(q.dtype))
+        x = x + self.wo(att.transpose(0, 2, 1, 3).reshape(B, S, H))
+        val, gate = _mb_mx.split(self.wi(self.mlp_norm(x)), 2, axis=-1)
+        return x + self.wd(_mb_nn.gelu(val) * gate)
+
+
+class _LayaDecisionHeadLayer(_MbModuleBase):  # type: ignore[misc]
+    """2-layer post-norm/pre-norm Transformer decision head matching `convaiinnovations/laya-typed-decisions`."""
+
+    def __init__(self, hidden: int = 1024, n_heads: int = 16, head_ff: int = 2048) -> None:
+        super().__init__()
+        self.n_heads = int(n_heads)
+        self.head_dim = int(hidden) // int(n_heads)
+        self.scale = self.head_dim**-0.5
+        self.norm1 = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=True)
+        self.in_proj = _mb_nn.Linear(hidden, 3 * hidden, bias=True)
+        self.out_proj = _mb_nn.Linear(hidden, hidden, bias=True)
+        self.norm2 = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=True)
+        self.linear1 = _mb_nn.Linear(hidden, head_ff, bias=True)
+        self.linear2 = _mb_nn.Linear(head_ff, hidden, bias=True)
+
+    def __call__(self, x: Any, mask_full: Any) -> Any:
+        B, S, H = x.shape
+        qkv = self.in_proj(self.norm1(x)).reshape(B, S, 3, self.n_heads, self.head_dim)
+        q = qkv[:, :, 0].transpose(0, 2, 1, 3)
+        k = qkv[:, :, 1].transpose(0, 2, 1, 3)
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+        att = _mb_mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask_full.astype(q.dtype))
+        x = x + self.out_proj(att.transpose(0, 2, 1, 3).reshape(B, S, H))
+        return x + self.linear2(_mb_nn.relu(self.linear1(self.norm2(x))))
+
+
+class _ModernBertLargeValidator(_MbModuleBase):  # type: ignore[misc]
+    """Authentic ModernBERT-large (`28L`, global/local RoPE `160K`/`10K`, `local_attention=128`, 2L head + scorer)."""
+
+    def __init__(
+        self,
+        vocab: int = 50368,
+        hidden: int = 1024,
+        n_heads: int = 16,
+        d_ff: int = 2624,
+        n_layers: int = 28,
+        freeze_below: int = 18,
+        head_ff: int = 2048,
+        scorer_hidden: int | None = None,
+        local_attention: int = 128,
+    ) -> None:
+        super().__init__()
+        self.hidden = int(hidden)
+        self.freeze_below = int(freeze_below)
+        self.local_attention = int(local_attention)
+        sc_dim = int(scorer_hidden) if scorer_hidden is not None else int(hidden)
+        self.tok_emb = _mb_nn.Embedding(vocab, hidden)
+        self.emb_norm = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=False)
+        self.layers = [
+            _ModernBertBlock(
+                i,
+                hidden=hidden,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                local_attention=local_attention,
+            )
+            for i in range(n_layers)
+        ]
+        self.final_norm = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=False)
+        self.type_emb = _mb_nn.Embedding(3, hidden)
+        self.head_layers = [_LayaDecisionHeadLayer(hidden=hidden, n_heads=n_heads, head_ff=head_ff) for _ in range(2)]
+        self.sc_norm = _mb_nn.LayerNorm(hidden, eps=1e-5, bias=True)
+        self.sc_l1 = _mb_nn.Linear(hidden, sc_dim, bias=True)
+        self.sc_l2 = _mb_nn.Linear(sc_dim, 1, bias=True)
+
+    def forward_frozen(self, input_ids: Any, position_ids: Any, mask_full: Any, mask_local: Any) -> Any:
+        h = self.emb_norm(self.tok_emb(input_ids))
+        for i in range(self.freeze_below):
+            lyr = self.layers[i]
+            m = mask_full if lyr.is_global else mask_local
+            h = lyr(h, position_ids, m)
+        return _mb_mx.stop_gradient(h)
+
+    def forward_upper(
+        self,
+        h: Any,
+        position_ids: Any,
+        mask_full: Any,
+        mask_local: Any,
+        qtypes: Any,
+        marker_positions: Any,
+        *,
+        fp32_head: bool = False,
+    ) -> Any:
+        for i in range(self.freeze_below, len(self.layers)):
+            lyr = self.layers[i]
+            m = mask_full if lyr.is_global else mask_local
+            h = lyr(h, position_ids, m)
+        hn = self.final_norm(h) + self.type_emb(qtypes)
+        for hl in self.head_layers:
+            hn = hl(hn, mask_full)
+        B, S, H = hn.shape
+        n_items, k_opts = marker_positions.shape
+        gathered = _mb_mx.take(hn.reshape(B * S, H), marker_positions.reshape(-1), axis=0).reshape(n_items, k_opts, H)
+        if fp32_head:
+            gathered = gathered.astype(_mb_mx.float32)
+        sc = self.sc_l2(_mb_nn.gelu(self.sc_l1(self.sc_norm(gathered)))).squeeze(-1)
+        return sc
+
+
+def _build_modernbert_2d_masks_np(
+    seg: np.ndarray,
+    pos: np.ndarray,
+    *,
+    local_attention: int = 128,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build NaN-safe 4D `[B, 1, S, S]` global and local SWA boolean masks (`pad` attends only to self diagonal)."""
+    B, S = seg.shape
+    same_seg = (seg[:, :, None] == seg[:, None, :]) & (seg[:, :, None] >= 0)
+    diag = np.eye(S, dtype=np.bool_)[None, :, :]
+    pad_self = (seg[:, :, None] < 0) & diag
+    full_ok = same_seg | pad_self
+    half_win = max(1, int(local_attention) // 2)
+    within_win = np.abs(pos[:, :, None] - pos[:, None, :]) <= half_win
+    local_ok = (same_seg & within_win) | pad_self
+    return full_ok[:, None, :, :], local_ok[:, None, :, :]
+
+
+def _prepare_modernbert_step_pair(
+    seqs: Sequence[np.ndarray],
+    markers: Sequence[Sequence[int]],
+    qtypes: np.ndarray,
+    labels: np.ndarray,
+    *,
+    pack_cap: int = 512,
+    local_attention: int = 128,
+    dtype: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build matched unpacked vs FFD-packed (`Packed-512`) batches with 2D per-segment RoPE reset and BF16 masks."""
+    import mlx.core as mx
+
+    eff_dtype = mx.bfloat16 if dtype is None else dtype
+    zero_val = mx.array(0.0, dtype=eff_dtype)
+    neg_val = mx.array(-3e4, dtype=eff_dtype)
+
+    n_items = len(seqs)
+    k_opts = len(markers[0]) if markers else 2
+    max_raw = max(len(s) for s in seqs)
+    max_l = max(8, int(math.ceil(max_raw / 32.0) * 32)) if max_raw > 16 else max_raw
+
+    # 1. Unpacked batch
+    u_ids = np.zeros((n_items, max_l), dtype=np.int32)
+    u_pos = np.zeros((n_items, max_l), dtype=np.int32)
+    u_seg = np.full((n_items, max_l), -1, dtype=np.int32)
+    u_qt = np.zeros((n_items, max_l), dtype=np.int32)
+    u_mark = np.zeros((n_items, k_opts), dtype=np.int32)
+    for idx, s in enumerate(seqs):
+        L = len(s)
+        u_ids[idx, :L] = s
+        u_pos[idx, :L] = np.arange(L, dtype=np.int32)
+        u_seg[idx, :L] = idx
+        u_qt[idx, :L] = int(qtypes[idx])
+        for opt_j, m_off in enumerate(markers[idx]):
+            u_mark[idx, opt_j] = idx * max_l + int(m_off)
+    u_full_ok, u_loc_ok = _build_modernbert_2d_masks_np(u_seg, u_pos, local_attention=local_attention)
+    unpacked = {
+        "input_ids": mx.array(u_ids),
+        "position_ids": mx.array(u_pos),
+        "mask_full": mx.where(mx.array(u_full_ok), zero_val, neg_val),
+        "mask_local": mx.where(mx.array(u_loc_ok), zero_val, neg_val),
+        "qtypes": mx.array(u_qt),
+        "marker_positions": mx.array(u_mark),
+        "labels": mx.array(np.asarray(labels, dtype=np.int32)),
+    }
+
+    # 2. FFD Packed-512 batch with per-segment position_ids reset (0..L-1)
+    bins: list[list[tuple[int, np.ndarray]]] = []
+    used: list[int] = []
+    for idx in sorted(range(n_items), key=lambda k: -len(seqs[k])):
+        s = seqs[idx]
+        for bi in range(len(bins)):
+            if used[bi] + len(s) <= pack_cap:
+                bins[bi].append((idx, s))
+                used[bi] += len(s)
+                break
+        else:
+            bins.append([(idx, s)])
+            used.append(len(s))
+
+    nb = len(bins)
+    p_ids = np.zeros((nb, pack_cap), dtype=np.int32)
+    p_pos = np.zeros((nb, pack_cap), dtype=np.int32)
+    p_seg = np.full((nb, pack_cap), -1, dtype=np.int32)
+    p_qt = np.zeros((nb, pack_cap), dtype=np.int32)
+    p_mark = np.zeros((n_items, k_opts), dtype=np.int32)
+    for bi, bitems in enumerate(bins):
+        cur = 0
+        for orig_i, s in bitems:
+            L = len(s)
+            p_ids[bi, cur : cur + L] = s
+            p_pos[bi, cur : cur + L] = np.arange(L, dtype=np.int32)
+            p_seg[bi, cur : cur + L] = orig_i
+            p_qt[bi, cur : cur + L] = int(qtypes[orig_i])
+            for opt_j, m_off in enumerate(markers[orig_i]):
+                p_mark[orig_i, opt_j] = bi * pack_cap + cur + int(m_off)
+            cur += L
+    p_full_ok, p_loc_ok = _build_modernbert_2d_masks_np(p_seg, p_pos, local_attention=local_attention)
+    packed = {
+        "input_ids": mx.array(p_ids),
+        "position_ids": mx.array(p_pos),
+        "mask_full": mx.where(mx.array(p_full_ok), zero_val, neg_val),
+        "mask_local": mx.where(mx.array(p_loc_ok), zero_val, neg_val),
+        "qtypes": mx.array(p_qt),
+        "marker_positions": mx.array(p_mark),
+        "labels": mx.array(np.asarray(labels, dtype=np.int32)),
+    }
+    return unpacked, packed
+
+
+def _maybe_load_laya_weights_into_validator(mdl: _ModernBertLargeValidator, raw_w: Mapping[str, Any]) -> None:
+    """Populate `_ModernBertLargeValidator` with authentic `convaiinnovations/laya-typed-decisions` weights."""
+    pairs: list[tuple[str, Any]] = [
+        ("tok_emb.weight", raw_w["encoder.embeddings.tok_embeddings.weight"]),
+        ("emb_norm.weight", raw_w["encoder.embeddings.norm.weight"]),
+        ("final_norm.weight", raw_w["encoder.final_norm.weight"]),
+        ("type_emb.weight", raw_w["type_emb.weight"]),
+        ("sc_norm.weight", raw_w["scorer.0.weight"]),
+        ("sc_norm.bias", raw_w["scorer.0.bias"]),
+        ("sc_l1.weight", raw_w["scorer.1.weight"]),
+        ("sc_l1.bias", raw_w["scorer.1.bias"]),
+        ("sc_l2.weight", raw_w["scorer.3.weight"]),
+        ("sc_l2.bias", raw_w["scorer.3.bias"]),
+    ]
+    for i in range(len(mdl.layers)):
+        px = f"encoder.layers.{i}."
+        if i > 0:
+            pairs.append((f"layers.{i}.attn_norm.weight", raw_w[px + "attn_norm.weight"]))
+        pairs.extend(
+            [
+                (f"layers.{i}.wqkv.weight", raw_w[px + "attn.Wqkv.weight"]),
+                (f"layers.{i}.wo.weight", raw_w[px + "attn.Wo.weight"]),
+                (f"layers.{i}.mlp_norm.weight", raw_w[px + "mlp_norm.weight"]),
+                (f"layers.{i}.wi.weight", raw_w[px + "mlp.Wi.weight"]),
+                (f"layers.{i}.wd.weight", raw_w[px + "mlp.Wo.weight"]),
+            ]
+        )
+    for hi in range(len(mdl.head_layers)):
+        hp = f"head.layers.{hi}."
+        pairs.extend(
+            [
+                (f"head_layers.{hi}.norm1.weight", raw_w[hp + "norm1.weight"]),
+                (f"head_layers.{hi}.norm1.bias", raw_w[hp + "norm1.bias"]),
+                (f"head_layers.{hi}.in_proj.weight", raw_w[hp + "self_attn.in_proj_weight"]),
+                (f"head_layers.{hi}.in_proj.bias", raw_w[hp + "self_attn.in_proj_bias"]),
+                (f"head_layers.{hi}.out_proj.weight", raw_w[hp + "self_attn.out_proj.weight"]),
+                (f"head_layers.{hi}.out_proj.bias", raw_w[hp + "self_attn.out_proj.bias"]),
+                (f"head_layers.{hi}.norm2.weight", raw_w[hp + "norm2.weight"]),
+                (f"head_layers.{hi}.norm2.bias", raw_w[hp + "norm2.bias"]),
+                (f"head_layers.{hi}.linear1.weight", raw_w[hp + "linear1.weight"]),
+                (f"head_layers.{hi}.linear1.bias", raw_w[hp + "linear1.bias"]),
+                (f"head_layers.{hi}.linear2.weight", raw_w[hp + "linear2.weight"]),
+                (f"head_layers.{hi}.linear2.bias", raw_w[hp + "linear2.bias"]),
+            ]
+        )
+    mdl.load_weights(pairs, strict=True)
 
 
 def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
@@ -534,114 +977,60 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.optimizers as optim
     from mlx.utils import tree_flatten
 
-    class _MbBlock(nn.Module):
-        def __init__(self, hidden: int = 1024, n_heads: int = 16, d_ff: int = 2624) -> None:
-            super().__init__()
-            self.n_heads = n_heads
-            self.head_dim = hidden // n_heads
-            self.scale = self.head_dim**-0.5
-            self.attn_norm = nn.RMSNorm(hidden, eps=1e-5)
-            self.wqkv = nn.Linear(hidden, 3 * hidden, bias=False)
-            self.wo = nn.Linear(hidden, hidden, bias=False)
-            self.mlp_norm = nn.RMSNorm(hidden, eps=1e-5)
-            self.wi = nn.Linear(hidden, 2 * d_ff, bias=False)
-            self.wd = nn.Linear(d_ff, hidden, bias=False)
-
-        def __call__(self, x: Any, mask_4d: Any) -> Any:
-            B, S, H = x.shape
-            qkv = self.wqkv(self.attn_norm(x)).reshape(B, S, 3, self.n_heads, self.head_dim)
-            q, k, v = qkv[:, :, 0].transpose(0, 2, 1, 3), qkv[:, :, 1].transpose(0, 2, 1, 3), qkv[:, :, 2].transpose(0, 2, 1, 3)
-            att = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask_4d)
-            x = x + self.wo(att.transpose(0, 2, 1, 3).reshape(B, S, H))
-            g, u = mx.split(self.wi(self.mlp_norm(x)), 2, axis=-1)
-            return x + self.wd(nn.gelu_approx(g) * u)
-
-    class _MbValidator(nn.Module):
-        def __init__(self, vocab: int = 50368, hidden: int = 1024, n_layers: int = 28, freeze_below: int = 18, n_tasks: int = 12) -> None:
-            super().__init__()
-            self.freeze_below = freeze_below
-            self.tok_emb = nn.Embedding(vocab, hidden)
-            self.emb_norm = nn.RMSNorm(hidden, eps=1e-5)
-            self.layers = [_MbBlock(hidden=hidden) for _ in range(n_layers)]
-            self.final_norm = nn.RMSNorm(hidden, eps=1e-5)
-            self.head_norm = nn.LayerNorm(hidden)
-            self.head_proj = nn.Linear(hidden, n_tasks)
-
-        def forward_frozen(self, input_ids: Any, mask_4d: Any) -> Any:
-            h = self.emb_norm(self.tok_emb(input_ids))
-            for i in range(self.freeze_below):
-                h = self.layers[i](h, mask_4d)
-            return mx.stop_gradient(h)
-
-        def forward_upper(self, h: Any, mask_4d: Any, cls_positions: Any, *, fp32_head: bool = False) -> Any:
-            for i in range(self.freeze_below, len(self.layers)):
-                h = self.layers[i](h, mask_4d)
-            hn = self.final_norm(h)
-            B, S, H = hn.shape
-            pooled = mx.take(hn.reshape(B * S, H), cls_positions, axis=0)
-            if fp32_head:
-                pooled = pooled.astype(mx.float32)
-            return self.head_proj(self.head_norm(pooled))
+    mx.set_cache_limit(256 * 1024 * 1024)
+    laya_snap = resolve_hf_snapshot("convaiinnovations/laya-typed-decisions")
+    raw_laya_w: dict[str, Any] | None = None
+    head_ff = 2048
+    scorer_hidden = 1024
+    local_attn = 128
+    weights_source = "random_init"
+    if laya_snap is not None and (laya_snap / "model.safetensors").is_file():
+        raw_laya_w = mx.load(str(laya_snap / "model.safetensors"))
+        head_ff = int(raw_laya_w["head.layers.0.linear1.weight"].shape[0])
+        scorer_hidden = int(raw_laya_w["scorer.1.weight"].shape[0])
+        enc_cfg_path = laya_snap / "encoder" / "config.json"
+        if enc_cfg_path.is_file():
+            enc_cfg = json.loads(enc_cfg_path.read_text(encoding="utf-8"))
+            local_attn = int(enc_cfg.get("local_attention", 128))
+        weights_source = "convaiinnovations/laya-typed-decisions"
 
     rng = np.random.default_rng(42)
-    n_steps, items_per_step, pack_cap = 8, 16, 512
+    n_steps, items_per_step, pack_cap, k_opts = 8, 16, 512, 4
     total_items = n_steps * items_per_step
-    u_mlx, p_mlx = [], []
-    zero_bf16 = mx.array(0.0, dtype=mx.bfloat16)
-    neg_bf16 = mx.array(-1e4, dtype=mx.bfloat16)
+    u_mlx: list[dict[str, Any]] = []
+    p_mlx: list[dict[str, Any]] = []
 
     for _ in range(n_steps):
         lens = rng.integers(88, 212, size=items_per_step).tolist()
         seqs = [rng.integers(4, 50000, size=int(L), dtype=np.int32) for L in lens]
+        markers: list[list[int]] = []
         for s in seqs:
-            s[0], s[-1] = 101, 102
-        labels = rng.integers(0, 2, size=(items_per_step, 12)).astype(np.float32)
+            s[0], s[-1] = 50281, 50282
+            step_m = max(2, (len(s) - 4) // k_opts)
+            markers.append([1 + j * step_m for j in range(k_opts)])
+        qtypes = rng.integers(0, 3, size=items_per_step, dtype=np.int32)
+        labels = rng.integers(0, k_opts, size=items_per_step, dtype=np.int32)
+        u_step, p_step = _prepare_modernbert_step_pair(
+            seqs, markers, qtypes, labels, pack_cap=pack_cap, local_attention=local_attn, dtype=mx.bfloat16
+        )
+        u_mlx.append(u_step)
+        p_mlx.append(p_step)
 
-        max_l = int(math.ceil(max(lens) / 32.0) * 32)
-        pad_ids = np.zeros((items_per_step, max_l), dtype=np.int32)
-        valid = np.zeros((items_per_step, max_l), dtype=np.bool_)
-        for idx, s in enumerate(seqs):
-            pad_ids[idx, : len(s)] = s
-            valid[idx, : len(s)] = True
-        m2d = valid[:, None, :] & valid[:, :, None]
-        m_u = mx.where(mx.array(m2d[:, None, :, :]), zero_bf16, neg_bf16)
-        u_mlx.append((mx.array(pad_ids), m_u, mx.array(np.arange(items_per_step, dtype=np.int32) * max_l), mx.array(labels)))
-
-        bins: list[list[tuple[int, np.ndarray]]] = []
-        used: list[int] = []
-        for idx in sorted(range(items_per_step), key=lambda k: -len(seqs[k])):
-            s = seqs[idx]
-            for bi in range(len(bins)):
-                if used[bi] + len(s) <= pack_cap:
-                    bins[bi].append((idx, s))
-                    used[bi] += len(s)
-                    break
-            else:
-                bins.append([(idx, s)])
-                used.append(len(s))
-        nb = len(bins)
-        p_ids = np.zeros((nb, pack_cap), dtype=np.int32)
-        seg = np.full((nb, pack_cap), -1, dtype=np.int32)
-        cls_p = np.zeros(items_per_step, dtype=np.int32)
-        for bi, bitems in enumerate(bins):
-            cur = 0
-            for orig_i, s in bitems:
-                L = len(s)
-                p_ids[bi, cur : cur + L] = s
-                seg[bi, cur : cur + L] = orig_i
-                cls_p[orig_i] = bi * pack_cap + cur
-                cur += L
-        same_seg = (seg[:, :, None] == seg[:, None, :]) & (seg[:, :, None] >= 0)
-        m_p = mx.where(mx.array(same_seg[:, None, :, :]), zero_bf16, neg_bf16)
-        p_mlx.append((mx.array(p_ids), m_p, mx.array(cls_p), mx.array(labels)))
-
-    def _init_mdl(*, fp32_head: bool) -> _MbValidator:
+    def _init_mdl(*, fp32_head: bool) -> _ModernBertLargeValidator:
         mx.random.seed(7)
-        m = _MbValidator(freeze_below=18)
+        m = _ModernBertLargeValidator(
+            freeze_below=18,
+            head_ff=head_ff,
+            scorer_hidden=scorer_hidden,
+            local_attention=local_attn,
+        )
+        if raw_laya_w is not None:
+            _maybe_load_laya_weights_into_validator(m, raw_laya_w)
         m.set_dtype(mx.bfloat16)
         if fp32_head:
-            m.head_norm.set_dtype(mx.float32)
-            m.head_proj.set_dtype(mx.float32)
+            m.sc_norm.set_dtype(mx.float32)
+            m.sc_l1.set_dtype(mx.float32)
+            m.sc_l2.set_dtype(mx.float32)
         m.freeze(recurse=False)
         m.tok_emb.freeze()
         m.emb_norm.freeze()
@@ -652,23 +1041,49 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
 
     mdl_bf16 = _init_mdl(fp32_head=False)
     mdl_a = _init_mdl(fp32_head=True)
+    del raw_laya_w
+    gc.collect()
+    mx.clear_cache()
 
-    def _loss_bf16(m: _MbValidator, hi: Any, mi: Any, ci: Any, yi: Any) -> Any:
-        lg = m.forward_upper(hi, mi, ci, fp32_head=False).astype(mx.float32)
-        return mx.mean(nn.losses.binary_cross_entropy(lg, yi, with_logits=True))
+    def _loss_bf16(
+        m: _ModernBertLargeValidator,
+        hi: Any,
+        pos_i: Any,
+        mf_i: Any,
+        ml_i: Any,
+        qt_i: Any,
+        mk_i: Any,
+        yi: Any,
+    ) -> Any:
+        lg = m.forward_upper(hi, pos_i, mf_i, ml_i, qt_i, mk_i, fp32_head=False).astype(mx.float32)
+        return mx.mean(nn.losses.cross_entropy(lg, yi))
 
-    def _loss_a(m: _MbValidator, hi: Any, mi: Any, ci: Any, yi: Any) -> Any:
-        lg = m.forward_upper(hi, mi, ci, fp32_head=True)
-        return mx.mean(nn.losses.binary_cross_entropy(lg, yi, with_logits=True))
+    def _loss_a(
+        m: _ModernBertLargeValidator,
+        hi: Any,
+        pos_i: Any,
+        mf_i: Any,
+        ml_i: Any,
+        qt_i: Any,
+        mk_i: Any,
+        yi: Any,
+    ) -> Any:
+        lg = m.forward_upper(hi, pos_i, mf_i, ml_i, qt_i, mk_i, fp32_head=True)
+        return mx.mean(nn.losses.cross_entropy(lg, yi))
 
     vg_bf16 = nn.value_and_grad(mdl_bf16, _loss_bf16)
     vg_a = nn.value_and_grad(mdl_a, _loss_a)
 
-    # Step-0 parity
-    hu0 = mdl_bf16.forward_frozen(u_mlx[0][0], u_mlx[0][1])
-    hp0 = mdl_bf16.forward_frozen(p_mlx[0][0], p_mlx[0][1])
-    lu0, gu0 = vg_bf16(mdl_bf16, hu0, u_mlx[0][1], u_mlx[0][2], u_mlx[0][3])
-    lp0, gp0 = vg_bf16(mdl_bf16, hp0, p_mlx[0][1], p_mlx[0][2], p_mlx[0][3])
+    # Step-0 parity: unpacked vs Packed-512 with per-segment RoPE reset + local_attention=128
+    b_u0, b_p0 = u_mlx[0], p_mlx[0]
+    hu0 = mdl_bf16.forward_frozen(b_u0["input_ids"], b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"])
+    hp0 = mdl_bf16.forward_frozen(b_p0["input_ids"], b_p0["position_ids"], b_p0["mask_full"], b_p0["mask_local"])
+    lu0, gu0 = vg_bf16(
+        mdl_bf16, hu0, b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"], b_u0["qtypes"], b_u0["marker_positions"], b_u0["labels"]
+    )
+    lp0, gp0 = vg_bf16(
+        mdl_bf16, hp0, b_p0["position_ids"], b_p0["mask_full"], b_p0["mask_local"], b_p0["qtypes"], b_p0["marker_positions"], b_p0["labels"]
+    )
     mx.eval(lu0, gu0, lp0, gp0)
     f1, f2 = dict(tree_flatten(gu0)), dict(tree_flatten(gp0))
     dot = sum(float(mx.sum(f1[k].astype(mx.float32) * f2[k].astype(mx.float32)).item()) for k in f1 if k in f2)
@@ -680,19 +1095,24 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     gc.collect()
     mx.clear_cache()
 
-    cached_p = []
-    for pids, mp, ci, yi in p_mlx:
-        hf = mdl_bf16.forward_frozen(pids, mp)
-        mx.eval(hf)
-        cached_p.append((hf, mp, ci, yi))
+    # Explicitly time cold L0..17 frozen-feature cache build across all packed steps
+    _ = mdl_bf16.forward_frozen(b_p0["input_ids"], b_p0["position_ids"], b_p0["mask_full"], b_p0["mask_local"])
     mx.synchronize()
+    t_cache0 = time.perf_counter()
+    cached_p: list[dict[str, Any]] = []
+    for bp in p_mlx:
+        hf = mdl_bf16.forward_frozen(bp["input_ids"], bp["position_ids"], bp["mask_full"], bp["mask_local"])
+        mx.eval(hf)
+        cached_p.append({**bp, "cached_h": hf})
+    mx.synchronize()
+    cold_cache_build_sec = time.perf_counter() - t_cache0
 
-    def _make_compiled_step(m: _MbValidator) -> tuple[Any, list[Any]]:
+    def _make_compiled_step(m: _ModernBertLargeValidator) -> tuple[Any, list[Any]]:
         opt = optim.AdamW(learning_rate=2e-4, weight_decay=0.01)
         st = [m.state, opt.state]
 
-        def _raw_step(hi: Any, mi: Any, ci: Any, yi: Any) -> Any:
-            l_val, g_val = vg_bf16(m, hi, mi, ci, yi)
+        def _raw_step(hi: Any, pos_i: Any, mf_i: Any, ml_i: Any, qt_i: Any, mk_i: Any, yi: Any) -> Any:
+            l_val, g_val = vg_bf16(m, hi, pos_i, mf_i, ml_i, qt_i, mk_i, yi)
             opt.update(m, g_val)
             return l_val
 
@@ -700,16 +1120,20 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
 
     def _run_stock_a() -> dict[str, float]:
         opt = optim.AdamW(learning_rate=2e-4, weight_decay=0.01)
-        hf0 = mdl_a.forward_frozen(u_mlx[0][0], u_mlx[0][1])
-        lw, gw = vg_a(mdl_a, hf0, u_mlx[0][1], u_mlx[0][2], u_mlx[0][3])
+        hf0 = mdl_a.forward_frozen(b_u0["input_ids"], b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"])
+        lw, gw = vg_a(
+            mdl_a, hf0, b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"], b_u0["qtypes"], b_u0["marker_positions"], b_u0["labels"]
+        )
         opt.update(mdl_a, gw)
         mx.eval(lw, mdl_a.parameters(), opt.state)
         mx.synchronize()
         mx.reset_peak_memory()
         t0 = time.perf_counter()
-        for pids, mu, ci, yi in u_mlx:
-            hf = mdl_a.forward_frozen(pids, mu)
-            lv, gv = vg_a(mdl_a, hf, mu, ci, yi)
+        for bu in u_mlx:
+            hf = mdl_a.forward_frozen(bu["input_ids"], bu["position_ids"], bu["mask_full"], bu["mask_local"])
+            lv, gv = vg_a(
+                mdl_a, hf, bu["position_ids"], bu["mask_full"], bu["mask_local"], bu["qtypes"], bu["marker_positions"], bu["labels"]
+            )
             opt.update(mdl_a, gv)
             mx.eval(lv, mdl_a.parameters(), opt.state)
         mx.synchronize()
@@ -717,28 +1141,40 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
         peak_bytes = float(mx.get_peak_memory())
         return {
             "items_s": total_items / max(dt, 1e-9),
+            "elapsed_sec": dt,
             "peak_gb": peak_bytes / 1e9,
             "peak_gib": peak_bytes / (1024**3),
         }
 
-    def _run_compiled(batches: list[Any], *, pre_cached: bool) -> dict[str, float]:
+    def _run_compiled(batches: list[dict[str, Any]], *, pre_cached: bool) -> dict[str, float]:
         step_fn, st = _make_compiled_step(mdl_bf16)
         b0 = batches[0]
-        hf0 = b0[0] if pre_cached else mdl_bf16.forward_frozen(b0[0], b0[1])
-        lw = step_fn(hf0, b0[1], b0[2], b0[3])
+        hf0 = (
+            b0["cached_h"]
+            if pre_cached
+            else mdl_bf16.forward_frozen(b0["input_ids"], b0["position_ids"], b0["mask_full"], b0["mask_local"])
+        )
+        lw = step_fn(hf0, b0["position_ids"], b0["mask_full"], b0["mask_local"], b0["qtypes"], b0["marker_positions"], b0["labels"])
         mx.eval(lw, st)
         mx.synchronize()
         mx.reset_peak_memory()
         t0 = time.perf_counter()
         for item in batches:
-            hf = item[0] if pre_cached else mdl_bf16.forward_frozen(item[0], item[1])
-            lv = step_fn(hf, item[1], item[2], item[3])
+            hf = (
+                item["cached_h"]
+                if pre_cached
+                else mdl_bf16.forward_frozen(item["input_ids"], item["position_ids"], item["mask_full"], item["mask_local"])
+            )
+            lv = step_fn(
+                hf, item["position_ids"], item["mask_full"], item["mask_local"], item["qtypes"], item["marker_positions"], item["labels"]
+            )
             mx.eval(lv, st)
         mx.synchronize()
         dt = time.perf_counter() - t0
         peak_bytes = float(mx.get_peak_memory())
         return {
             "items_s": total_items / max(dt, 1e-9),
+            "elapsed_sec": dt,
             "peak_gb": peak_bytes / 1e9,
             "peak_gib": peak_bytes / (1024**3),
         }
@@ -760,6 +1196,7 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     med = {
         k: {
             "items_s": round(float(statistics.median(x["items_s"] for x in v)), 2),
+            "elapsed_sec": round(float(statistics.median(x["elapsed_sec"] for x in v)), 4),
             "peak_gb": round(float(statistics.median(x["peak_gb"] for x in v)), 3),
             "peak_gib": round(float(statistics.median(x["peak_gib"] for x in v)), 3),
         }
@@ -768,13 +1205,26 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     base_ips = med["stock_unpacked_fp32_head"]["items_s"]
     p512_ips = med["packed_512"]["items_s"]
     cached_ips = med["packed_512_cached_L0_17"]["items_s"]
+    cached_ep_sec = max(1e-9, float(med["packed_512_cached_L0_17"]["elapsed_sec"]))
+    ep1_incl_ips = round(total_items / max(cold_cache_build_sec + cached_ep_sec, 1e-9), 2)
+    amort_3ep_ips = round((3 * total_items) / max(cold_cache_build_sec + 3.0 * cached_ep_sec, 1e-9), 2)
+    amort_5ep_ips = round((5 * total_items) / max(cold_cache_build_sec + 5.0 * cached_ep_sec, 1e-9), 2)
     return {
         "suite": "encoder-finetune",
         "status": "ok",
-        "fast_metric": f"Packed-512 {p512_ips:.1f} items/s (cached L0..17 {cached_ips:.1f} items/s)",
+        "weights_source": weights_source,
+        "fast_metric": (
+            f"Packed-512 {p512_ips:.1f} items/s (cached L0..17 warm {cached_ips:.1f} items/s; "
+            f"cold build {cold_cache_build_sec:.2f}s, 3-ep amortized {amort_3ep_ips:.1f} items/s)"
+        ),
         "stock_baseline": f"Stock MLX unpacked: {base_ips:.1f} items/s",
         "speedup_vs_stock": round(p512_ips / max(base_ips, 1e-6), 2),
         "cached_speedup_vs_stock": round(cached_ips / max(base_ips, 1e-6), 2),
+        "amortized_3ep_speedup_vs_stock": round(amort_3ep_ips / max(base_ips, 1e-6), 2),
+        "cold_cache_build_sec": round(cold_cache_build_sec, 4),
+        "epoch1_with_cache_build_items_s": ep1_incl_ips,
+        "amortized_3ep_items_s": amort_3ep_ips,
+        "amortized_5ep_items_s": amort_5ep_ips,
         "peak_gb": med["packed_512"]["peak_gb"],
         "stock_peak_gb": med["stock_unpacked_fp32_head"]["peak_gb"],
         "parity": {"abs_loss_diff": round(loss_diff, 6), "grad_cosine": round(grad_cos, 6)},

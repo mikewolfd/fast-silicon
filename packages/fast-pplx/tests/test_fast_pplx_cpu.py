@@ -556,6 +556,8 @@ def test_resolve_home_checks_artifacts_and_fallbacks(tmp_path: Path, monkeypatch
 
 def test_tf32_telemetry_chip_gated_attention_and_fp32_norms(tmp_path: Path) -> None:
     import os
+    import subprocess
+    import sys
     from fast_pplx.gpu import (
         FastPplxGPU,
         PplxAttention,
@@ -565,9 +567,24 @@ def test_tf32_telemetry_chip_gated_attention_and_fp32_norms(tmp_path: Path) -> N
         normalize_qk,
     )
 
-    assert os.environ.get("MLX_ENABLE_TF32") == "0"
+    # Importing fast_pplx / fast_pplx.gpu / fast_pplx.cli must NEVER force MLX_ENABLE_TF32=0 globally.
+    clean_env = {k: v for k, v in os.environ.items() if k != "MLX_ENABLE_TF32"}
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, fast_pplx, fast_pplx.gpu, fast_pplx.cli; "
+            "assert os.environ.get('MLX_ENABLE_TF32') is None, os.environ.get('MLX_ENABLE_TF32')",
+        ],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, f"fast_pplx polluted MLX_ENABLE_TF32 on import: {probe.stderr}"
+
     tel = get_mlx_runtime_telemetry()
-    assert tel["mlx_enable_tf32"] == "0"
+    assert "mlx_enable_tf32" in tel
     assert "is_apple10" in tel and "sdpa_slice_len" in tel
 
     # Apple9 (M4 Pro) -> 512; Apple10 (M5 26.2+) -> 1024; M5 pre-26.2 -> 512
@@ -939,3 +956,231 @@ def test_max_length_validation_and_hetero2_contextual_work_stealing_cpu(tmp_path
         assert st["gpu_stolen_items"] >= 4
         assert st["ane_items"] > 0
         assert st["ane_items"] + st["gpu_items"] == len(docs)
+
+
+def test_horizontal_fusion_in_proj_all_and_qk_rope_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-P1.1: Fuse in_proj_{qkv,z,b,a} -> in_proj_all [8224, 1024] and [Q, K] norm + RoPE."""
+    from fast_pplx.gpu import PplxAttention, PplxGatedDeltaNet
+
+    gdn_default = PplxGatedDeltaNet(DEFAULT_PPLX_CONFIG)
+    assert hasattr(gdn_default, "in_proj_all")
+    assert gdn_default.in_proj_all.weight.shape == (8224, 1024)
+    assert not hasattr(gdn_default, "in_proj_a")
+    assert not hasattr(gdn_default, "in_proj_b")
+
+    raw = {
+        "contextual_projection.weight": mx.eye(8, dtype=mx.float32),
+        "language_model.layers.0.linear_attn.in_proj_qkv.weight": mx.ones((12, 8), dtype=mx.float16),
+        "language_model.layers.0.linear_attn.in_proj_z.weight": mx.full((4, 8), 2.0, dtype=mx.float16),
+        "language_model.layers.0.linear_attn.in_proj_b.weight": mx.full((2, 8), 3.0, dtype=mx.float16),
+        "language_model.layers.0.linear_attn.in_proj_a.weight": mx.full((2, 8), 4.0, dtype=mx.float16),
+    }
+    items, _ = _canonicalize_weights(raw, num_layers=1, act_dtype=mx.float16, include_embed=False)
+    wmap = dict(items)
+    assert "layers.0.linear_attn.in_proj_all.weight" in wmap
+    assert wmap["layers.0.linear_attn.in_proj_all.weight"].shape == (20, 8)
+    assert "layers.0.linear_attn.in_proj_a.weight" not in wmap
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        cfg = PplxConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rope_dim=8,
+            layer_types=("linear_attention", "full_attention"),
+        )
+        attn = PplxAttention(cfg)
+        attn.q_norm.weight = mx.linspace(0.8, 1.2, 32, dtype=mx.float32)
+        attn.k_norm.weight = mx.linspace(0.9, 1.1, 32, dtype=mx.float32)
+        mx.eval(attn.parameters())
+
+        rope_calls = {"n": 0}
+        orig_rope = mx.fast.rope
+
+        def _spy_rope(*args, **kwargs):
+            rope_calls["n"] += 1
+            return orig_rope(*args, **kwargs)
+
+        monkeypatch.setattr(mx.fast, "rope", _spy_rope)
+        x = mx.random.normal((2, 9, 64)).astype(mx.float16)
+        y = attn(x)
+        mx.eval(y)
+        assert rope_calls["n"] == 1, f"Expected 1 fused [Q,K] RoPE call per layer, got {rope_calls['n']}"
+        assert y.shape == (2, 9, 64)
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_context_window_header_anchoring_and_single_tokenization_parquet_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M-P1.1: Default max_context_tokens=2048 + header anchoring + zero double-tokenization in Parquet."""
+    import inspect
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.parquet_pipeline import embed_contextual_parquet
+
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+
+    sig = inspect.signature(tok.group_chunks_by_context_windows)
+    assert "max_context_tokens" in sig.parameters
+    assert sig.parameters["max_context_tokens"].default == 2048
+
+    chunks = ["hello world", "chunk one two", "hello chunk one", "world two one", "chunk two hello"]
+    wins_hdr = tok.group_chunks_by_context_windows(chunks, max_context_tokens=12, header_text="hello")
+    assert len(wins_hdr) >= 2
+    for w in wins_hdr:
+        assert w[0] == "hello"
+        assert len(tok.encode_contextual_document(w, return_spans=False)) <= 12
+
+    wins_rep = tok.group_chunks_by_context_windows(chunks, max_context_tokens=12, repeat_header_tokens=1)
+    assert len(wins_rep) >= 2
+    assert wins_rep[1][0] == "hello"
+    for w in wins_rep:
+        assert len(tok.encode_contextual_document(w, return_spans=False)) <= 12
+
+    # Verify embed_contextual_parquet does NOT double-call encode_contextual_document per window
+    orig_enc = tok.encode_contextual_document
+    enc_calls = {"n": 0}
+
+    def _count_enc(*args, **kwargs):
+        enc_calls["n"] += 1
+        return orig_enc(*args, **kwargs)
+
+    monkeypatch.setattr(tok, "encode_contextual_document", _count_enc)
+
+    class _MockGPU:
+        max_seq_len = 32768
+
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
+            d = dimensions or 1024
+            return [np.ones((len(spans), d), dtype=np.float32) * 0.5 for _, spans in docs]
+
+        def close(self):
+            pass
+
+    in_pq = tmp_path / "single_enc_in.parquet"
+    out_pq = tmp_path / "single_enc_out.parquet"
+    doc_text = " ".join(["hello world chunk one two"] * 8)
+    expected_windows = len(tok.chunk_and_group_document(doc_text, chunk_tokens=10, context_tokens=20, overlap=2))
+    enc_calls["n"] = 0
+    pq.write_table(pa.table({"doc_id": ["d0"], "text": [doc_text]}), in_pq)
+
+    with FastPplx(home=tmp_path, mode="gpu", _gpu_backend=_MockGPU(), _tokenizer=tok) as eng:
+        summary = embed_contextual_parquet(
+            eng, in_pq, out_pq, chunk_tokens=10, context_tokens=20, overlap=2, dimensions=16
+        )
+    assert summary.rows_emitted >= expected_windows
+    assert enc_calls["n"] == expected_windows, (
+        f"Expected 1x encode_contextual_document per window ({expected_windows}), got {enc_calls['n']}"
+    )
+
+
+def test_batched_varlen_waves_and_multifunction_plan_inspect_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify [B_bins, T_wave] varlen wave batching, GPU mask/RoPE helper, and per-function ANE plan inspection."""
+    import fast_pplx.gpu as pplx_gpu_mod
+    from fast_pplx.gpu import FastPplxGPU, PplxModel, _build_varlen_mask_and_rope
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(77)
+        cfg = PplxConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            rope_dim=16,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            layer_types=("linear_attention", "full_attention"),
+        )
+        model = PplxModel(cfg, has_embed_module=True)
+        model.layers[0].linear_attn.use_kernel = False
+        mx.eval(model.parameters())
+
+        # Direct check on _build_varlen_mask_and_rope
+        doc_mx = mx.array([[0, 0, -1, 1, 1, -1]], dtype=mx.int32)
+        pos_mx = mx.array([[0, 1, 0, 0, 1, 0]], dtype=mx.int32)
+        cos_mx = mx.ones((16, 8), dtype=mx.float16)
+        sin_mx = mx.zeros((16, 8), dtype=mx.float16)
+        msk, rc, rs = _build_varlen_mask_and_rope(
+            doc_mx, pos_mx, cos_mx, sin_mx, mx.array(0.0, dtype=mx.float16), mx.array(-65504.0, dtype=mx.float16)
+        )
+        mx.eval(msk, rc, rs)
+        msk_np = np.array(msk[0, 0], dtype=np.float32)
+        assert msk_np[0, 1] == 0.0 and msk_np[0, 3] == -65504.0
+        assert msk_np[2, 2] == 0.0 and msk_np[2, 0] == -65504.0
+        assert rc.shape == (1, 1, 6, 8) and rs.shape == (1, 1, 6, 8)
+
+        # Verify _run_varlen_bins groups multiple packed bins into ONE [B_bins, T_wave] forward_hidden call
+        gpu = FastPplxGPU.__new__(FastPplxGPU)
+        gpu.config = cfg
+        gpu.model = model
+        proj_dim = int(model.contextual_projection.weight.shape[0])
+        gpu.dim = proj_dim
+        gpu.max_seq_len = 2048
+        gpu.max_batch_size = 8
+        gpu.dtype_name = "float32"
+        gpu.act_dtype = mx.float32
+        gpu._mapped_embed = None
+        gpu.tokenizer = SimpleNamespace(pad_id=0)
+
+        fwd_shapes: list[tuple[int, int]] = []
+        orig_fwd = model.forward_hidden
+
+        def _spy_fwd(h, *a, **kw):
+            fwd_shapes.append((int(h.shape[0]), int(h.shape[1])))
+            return orig_fwd(h, *a, **kw)
+
+        monkeypatch.setattr(model, "forward_hidden", _spy_fwd)
+
+        tok_lists = [
+            [5, 6, 7, 8, 9, 10, 11, 12],
+            [13, 14, 15, 16, 17, 18, 19],
+            [20, 21, 22, 23, 24, 25],
+            [26, 27, 28, 29, 30],
+            [31, 32, 33, 34],
+            [35, 36, 37],
+        ]
+        bins = gpu._pack_varlen_token_bins(tok_lists, max_packed_tokens=20, align_to=8)
+        assert len(bins) >= 2
+        proj_bins = gpu._run_varlen_bins(bins, max_wave_tokens=256)
+        assert len(fwd_shapes) == 1 and fwd_shapes[0][0] == len(bins), f"Expected 1 batched wave, got {fwd_shapes}"
+
+        packed_out = np.zeros((len(tok_lists), proj_dim), dtype=np.float32)
+        for b_spec, p_b in zip(bins, proj_bins, strict=True):
+            for pi, oi in enumerate(b_spec["orig_indices"]):
+                packed_out[oi] = p_b[pi]
+        packed_norm = packed_out / np.linalg.norm(packed_out, axis=-1, keepdims=True)
+
+        singles = []
+        for row in tok_lists:
+            h_s = orig_fwd(model.embed_tokens(mx.array([row], dtype=mx.int32)))
+            p_s = gpu._project_span_pool(h_s, np.array([[[0, len(row)]]], dtype=np.int32))[0, 0]
+            singles.append(p_s / np.linalg.norm(p_s))
+        singles_arr = np.stack(singles, axis=0)
+        assert float(np.min(np.sum(packed_norm * singles_arr, axis=-1))) >= 0.9999
+    finally:
+        mx.set_default_device(prev_dev)
+
+    pkg_root = Path(__file__).resolve().parents[1]
+    cli_src = (pkg_root / "src" / "fast_pplx" / "cli.py").read_text(encoding="utf-8")
+    build_src = (pkg_root / "scripts" / "build_ane_models.py").read_text(encoding="utf-8")
+    runner_src = (pkg_root / "native" / "pplx_coreml_runner.mm").read_text(encoding="utf-8")
+    assert "_discover_ane_stage_specs" in cli_src
+    assert "pplx_ane_inspect_plan_fn" in cli_src
+    assert "if inspect_placement and not use_multifunction:" in build_src
+    assert "@available(macOS 15.0, *)" in runner_src
+    assert 'std::strcmp(function_name, "main") != 0' in runner_src

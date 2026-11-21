@@ -81,26 +81,108 @@ def test_native_include_and_paths(tmp_path: Path, monkeypatch) -> None:
     assert resolve_home_dir(__file__, env_var="TEST_SHARED_HOME", cache_name="x") == tmp_path.resolve()
 
 
-def test_mpp_matmul_kernel_compile_and_run() -> None:
-    mx.set_default_device(mx.gpu)
-    k = make_mpp_matmul_kernel("shared_test_mpp64", epilogue="none", tm=64, tn=64, sgs=4)
-    a = mx.ones((64, 64), dtype=mx.float16)
-    b = mx.ones((64, 64), dtype=mx.float16)
-    c = k(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(64, 64)], output_dtypes=[mx.float16])[0]
-    mx.eval(c)
-    assert np.allclose(np.array(c), 64.0)
+def _gpu_validation_lock():
+    from contextlib import contextmanager
+    import fcntl
+    import os
 
-    a_bf = mx.ones((128, 64), dtype=mx.bfloat16) * 0.5
-    wg = mx.ones((64, 64), dtype=mx.bfloat16)
-    wu = mx.ones((64, 64), dtype=mx.bfloat16)
-    wd = mx.ones((32, 64), dtype=mx.bfloat16)
-    ge = mpp_fused_geglu_bf16(a_bf, wg, wu)
-    mm = mpp_linear_bf16(ge, wd, tm=32, tn=32)
-    sp = fused_geglu_split(mx.concatenate([a_bf @ wg.T, a_bf @ wu.T], axis=-1))
-    mx.eval(ge, mm, sp)
-    assert ge.shape == (128, 64) and ge.dtype == mx.bfloat16
-    assert mm.shape == (128, 32) and mm.dtype == mx.bfloat16
-    assert np.allclose(np.array(ge.astype(mx.float32)), np.array(sp.astype(mx.float32)), atol=0.5, rtol=1e-2)
+    @contextmanager
+    def _ctx():
+        if os.environ.get("FAST_SILICON_GPU_LOCK_HELD") == "1":
+            yield
+            return
+        with open("/tmp/m4_gpu_validation.lock", "w", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            os.environ["FAST_SILICON_GPU_LOCK_HELD"] = "1"
+            try:
+                yield
+            finally:
+                os.environ.pop("FAST_SILICON_GPU_LOCK_HELD", None)
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    return _ctx()
+
+
+def test_mpp_matmul_kernel_compile_and_run() -> None:
+    with _gpu_validation_lock():
+        mx.set_default_device(mx.gpu)
+        k = make_mpp_matmul_kernel("shared_test_mpp64", epilogue="none", tm=64, tn=64, sgs=4)
+        a = mx.ones((64, 64), dtype=mx.float16)
+        b = mx.ones((64, 64), dtype=mx.float16)
+        c = k(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(64, 64)], output_dtypes=[mx.float16])[0]
+        mx.eval(c)
+        assert np.allclose(np.array(c), 64.0)
+
+        rng = np.random.default_rng(7)
+        a_np = rng.normal(0.0, 0.35, size=(64, 64)).astype(np.float16)
+        b_gu_np = rng.normal(0.0, 0.35, size=(128, 64)).astype(np.float16)
+        b_pli_np = rng.normal(0.0, 0.35, size=(64, 64)).astype(np.float16)
+        pli_np = rng.normal(0.0, 0.5, size=(64, 64)).astype(np.float16)
+
+        a_f16 = mx.array(a_np)
+        b_gu_f16 = mx.array(b_gu_np)
+        b_pli_f16 = mx.array(b_pli_np)
+        pli_f16 = mx.array(pli_np)
+
+        k_geglu_tanh = make_mpp_matmul_kernel("shared_test_geglu_tanh", epilogue="geglu_tanh", tm=64, tn=64, sgs=4)
+        k_geglu_erf = make_mpp_matmul_kernel("shared_test_geglu_erf", epilogue="geglu", tm=64, tn=64, sgs=4)
+        k_pli_tanh = make_mpp_matmul_kernel("shared_test_pli_tanh", epilogue="gelu_tanh_mul_pli", tm=64, tn=64, sgs=4)
+
+        out_geglu_tanh = k_geglu_tanh(
+            inputs=[a_f16, b_gu_f16],
+            grid=(128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(64, 64)],
+            output_dtypes=[mx.float16],
+        )[0]
+        out_geglu_erf = k_geglu_erf(
+            inputs=[a_f16, b_gu_f16],
+            grid=(128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(64, 64)],
+            output_dtypes=[mx.float16],
+        )[0]
+        out_pli_tanh = k_pli_tanh(
+            inputs=[a_f16, b_pli_f16, pli_f16],
+            grid=(128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(64, 64)],
+            output_dtypes=[mx.float16],
+        )[0]
+        mx.eval(out_geglu_tanh, out_geglu_erf, out_pli_tanh)
+
+        # Reference float32 gelu_pytorch_tanh: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        g_ref = a_np.astype(np.float32) @ b_gu_np[:64].astype(np.float32).T
+        u_ref = a_np.astype(np.float32) @ b_gu_np[64:].astype(np.float32).T
+        sqrt_2_over_pi = np.float32(np.sqrt(2.0 / np.pi))
+        geglu_tanh_ref = 0.5 * g_ref * (1.0 + np.tanh(sqrt_2_over_pi * (g_ref + 0.044715 * (g_ref**3)))) * u_ref
+
+        g_pli_ref = a_np.astype(np.float32) @ b_pli_np.astype(np.float32).T
+        pli_tanh_ref = (
+            0.5
+            * g_pli_ref
+            * (1.0 + np.tanh(sqrt_2_over_pi * (g_pli_ref + 0.044715 * (g_pli_ref**3))))
+            * pli_np.astype(np.float32)
+        )
+
+        assert np.allclose(np.array(out_geglu_tanh, dtype=np.float32), geglu_tanh_ref, atol=4e-3, rtol=4e-3)
+        assert np.allclose(np.array(out_pli_tanh, dtype=np.float32), pli_tanh_ref, atol=4e-3, rtol=4e-3)
+        # Verify geglu_tanh is closer to tanh reference than exact_erf geglu
+        err_tanh = float(np.max(np.abs(np.array(out_geglu_tanh, dtype=np.float32) - geglu_tanh_ref)))
+        err_erf = float(np.max(np.abs(np.array(out_geglu_erf, dtype=np.float32) - geglu_tanh_ref)))
+        assert err_tanh < err_erf
+
+        a_bf = mx.ones((128, 64), dtype=mx.bfloat16) * 0.5
+        wg = mx.ones((64, 64), dtype=mx.bfloat16)
+        wu = mx.ones((64, 64), dtype=mx.bfloat16)
+        wd = mx.ones((32, 64), dtype=mx.bfloat16)
+        ge = mpp_fused_geglu_bf16(a_bf, wg, wu)
+        mm = mpp_linear_bf16(ge, wd, tm=32, tn=32)
+        sp = fused_geglu_split(mx.concatenate([a_bf @ wg.T, a_bf @ wu.T], axis=-1))
+        mx.eval(ge, mm, sp)
+        assert ge.shape == (128, 64) and ge.dtype == mx.bfloat16
+        assert mm.shape == (128, 32) and mm.dtype == mx.bfloat16
+        assert np.allclose(np.array(ge.astype(mx.float32)), np.array(sp.astype(mx.float32)), atol=0.5, rtol=1e-2)
 
 
 def test_slice_ocr_pages_utf8() -> None:
@@ -1005,10 +1087,11 @@ def test_pipeline_resume_atomic_and_roll_slots_cpu(tmp_path: Path) -> None:
         shard_rows=1000,
     )
     assert sum1.docs_processed == n_docs
-    # roll_slots=256 must NOT be clamped to 128 in iter_batches or gen_kw["batch_size"]
-    assert eng1.calls[0]["n"] == 256 and eng1.calls[0]["batch_size"] == 256
+    # roll_slots=256 must NOT be clamped to 128 in gen_kw["batch_size"], and macro_window_rows=4096 feeds all 300 docs
+    assert eng1.calls[0]["n"] >= 256 and eng1.calls[0]["batch_size"] == 256
     shard0 = pq.read_table(out_dir / "part-00000.parquet")
     assert "finish_reason" in shard0.column_names
+    assert "extractconf_risk" in shard0.column_names
     assert shard0.column("finish_reason").to_pylist()[1] == "length"
 
     class _Pass2Engine:
@@ -1723,37 +1806,38 @@ def test_metal_mpp_guards_and_tail_tiles() -> None:
     assert "#include <metal_stdlib>" in mmpp.HEADER_SIMDGROUP
     assert "#include <metal_stdlib>" in mmpp.HEADER_MPP
 
-    # Tail-tile safety: non-multiple of 64 (M=50, N=50) must not crash or read OOB
-    mx.set_default_device(mx.gpu)
-    k_none = mmpp.make_mpp_matmul_kernel("shared_test_tail_none", epilogue="none", tm=64, tn=64, sgs=4)
-    a = mx.ones((50, 64), dtype=mx.float16)
-    b = mx.ones((50, 64), dtype=mx.float16)
-    c = k_none(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
-    mx.eval(c)
-    assert c.shape == (50, 50)
-    assert np.allclose(np.array(c), 64.0)
+    with _gpu_validation_lock():
+        # Tail-tile safety: non-multiple of 64 (M=50, N=50) must not crash or read OOB
+        mx.set_default_device(mx.gpu)
+        k_none = mmpp.make_mpp_matmul_kernel("shared_test_tail_none", epilogue="none", tm=64, tn=64, sgs=4)
+        a = mx.ones((50, 64), dtype=mx.float16)
+        b = mx.ones((50, 64), dtype=mx.float16)
+        c = k_none(inputs=[a, b], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
+        mx.eval(c)
+        assert c.shape == (50, 50)
+        assert np.allclose(np.array(c), 64.0)
 
-    # geglu epilogue uses exact_erf and matches reference on tail tile
-    k_geglu = mmpp.make_mpp_matmul_kernel("shared_test_tail_geglu", epilogue="geglu", tm=64, tn=64, sgs=4)
-    b_gu = mx.ones((100, 64), dtype=mx.float16) * 0.05
-    out_g = k_geglu(inputs=[a, b_gu], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
-    mx.eval(out_g)
-    assert out_g.shape == (50, 50)
-    assert np.isfinite(np.array(out_g)).all()
+        # geglu epilogue uses exact_erf and matches reference on tail tile
+        k_geglu = mmpp.make_mpp_matmul_kernel("shared_test_tail_geglu", epilogue="geglu", tm=64, tn=64, sgs=4)
+        b_gu = mx.ones((100, 64), dtype=mx.float16) * 0.05
+        out_g = k_geglu(inputs=[a, b_gu], grid=(128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(50, 50)], output_dtypes=[mx.float16])[0]
+        mx.eval(out_g)
+        assert out_g.shape == (50, 50)
+        assert np.isfinite(np.array(out_g)).all()
 
-    # metal_mpp_bf16 dtype / K-alignment / OS / Apple10 threshold fallback guards
-    x_fp16 = mx.ones((64, 64), dtype=mx.float16)
-    w_fp16 = mx.ones((64, 64), dtype=mx.float16)
-    out_fp16 = mmpp_bf.mpp_linear_bf16(x_fp16, w_fp16, min_m=16)
-    mx.eval(out_fp16)
-    assert out_fp16.dtype == mx.float16 and np.allclose(np.array(out_fp16), 64.0)
+        # metal_mpp_bf16 dtype / K-alignment / OS / Apple10 threshold fallback guards
+        x_fp16 = mx.ones((64, 64), dtype=mx.float16)
+        w_fp16 = mx.ones((64, 64), dtype=mx.float16)
+        out_fp16 = mmpp_bf.mpp_linear_bf16(x_fp16, w_fp16, min_m=16)
+        mx.eval(out_fp16)
+        assert out_fp16.dtype == mx.float16 and np.allclose(np.array(out_fp16), 64.0)
 
-    # Unaligned K=40 falls back cleanly without failing MPP
-    x_odd = mx.ones((32, 40), dtype=mx.bfloat16)
-    w_odd = mx.ones((32, 40), dtype=mx.bfloat16)
-    out_odd = mmpp_bf.mpp_linear_bf16(x_odd, w_odd, min_m=16)
-    mx.eval(out_odd)
-    assert out_odd.dtype == mx.bfloat16 and np.allclose(np.array(out_odd.astype(mx.float32)), 40.0)
+        # Unaligned K=40 falls back cleanly without failing MPP
+        x_odd = mx.ones((32, 40), dtype=mx.bfloat16)
+        w_odd = mx.ones((32, 40), dtype=mx.bfloat16)
+        out_odd = mmpp_bf.mpp_linear_bf16(x_odd, w_odd, min_m=16)
+        mx.eval(out_odd)
+        assert out_odd.dtype == mx.bfloat16 and np.allclose(np.array(out_odd.astype(mx.float32)), 40.0)
 
 
 def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
@@ -1993,9 +2077,9 @@ def test_bench_wired_limit_quiescence_dtypes_and_paths_cpu(tmp_path: Path, monke
 
     monkeypatch.delenv("TEST_FOO_HOME", raising=False)
     monkeypatch.delenv("FAST_ARTIFACTS_ROOT", raising=False)
-    # 1. No sibling artifacts & no FAST_ARTIFACTS_ROOT -> falls back to ~/.cache/fast-foo (not mono_pkg!)
+    # 1. No sibling artifacts & no FAST_ARTIFACTS_ROOT -> falls back to user .cache/fast-foo (not mono_pkg!)
     got_cache = resolve_home_dir(anchor, env_var="TEST_FOO_HOME", cache_name="fast-foo")
-    assert got_cache == (Path("~/.cache") / "fast-foo").expanduser().resolve()
+    assert got_cache == (Path.home() / ".cache" / "fast-foo").resolve()
 
     # 2. Sibling ../fast-foo with artifacts/ -> resolves to sibling!
     sib = tmp_path / "fast-foo"
@@ -2702,3 +2786,559 @@ def test_server_schema_key_batcher_whitespace_compact_and_raw_dispatch_cpu() -> 
         eng_gemma_raw, {"messages": [{"role": "user", "content": "g"}], "whitespace_flexible": True}
     )
     assert eng_gemma_raw.calls[-1][1]["whitespace_flexible"] is True
+
+
+def test_truncate_and_normalize_full_width_and_zero_safe_cpu() -> None:
+    raw = np.array([[3.0, 4.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    raw_copy = raw.copy()
+
+    # Full-width (eff_dim == arr.shape[-1]) and dim=None MUST L2-normalize without mutating input
+    norm_eq = truncate_and_normalize(raw, 4)
+    norm_none = truncate_and_normalize(raw, None)
+    assert np.array_equal(raw, raw_copy)
+    assert np.allclose(norm_eq[0], [0.6, 0.8, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(norm_none[0], [0.6, 0.8, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(norm_eq[1], 0.0, atol=1e-12)
+    assert np.all(np.isfinite(norm_eq))
+
+    # 1D vector at full width
+    v1 = np.array([6.0, 8.0], dtype=np.float16)
+    out1 = truncate_and_normalize(v1, 2)
+    assert out1.dtype == np.float32 and np.allclose(out1, [0.6, 0.8], atol=1e-6)
+
+
+def test_coreai_pipeline_fp4_fp8_specs_and_qwen35_small_gdn_ban_cpu(monkeypatch: Any) -> None:
+    import sys
+    import types
+    import fast_shared.coreai_pipeline as cap
+
+    # 1. Blanket fp4_fp8 on Qwen3.5-{0.8B, 2B} is hard-blocked with ValueError (even without torch installed)
+    for bad_model in ("Qwen/Qwen3.5-0.8B", "Qwen3.5-0.8B-Instruct", "Qwen3.5-2B", "qwen3_5_2b", "kev-0.8b"):
+        with pytest.raises(ValueError, match="fp4_fp8"):
+            cap.build_coreai_opt_config(
+                preset="fp4_fp8",
+                export_backend="coreai",
+                model_name=bad_model,
+                os_version="27.2.1",
+            )
+
+    # 2. Mock torch & coreai_opt to verify float4_e2m1fn_x2 weights + float8_e4m3fn activation specs on Qwen3.5-4B
+    class _FakeSpec:
+        def __init__(self, *, dtype: Any) -> None:
+            self.dtype = dtype
+
+    class _FakeModCfg:
+        def __init__(
+            self,
+            *,
+            op_state_spec: dict[str, Any] | None = None,
+            op_input_spec: dict[str, Any] | None = None,
+            op_output_spec: dict[str, Any] | None = None,
+        ) -> None:
+            self.op_state_spec = op_state_spec or {}
+            self.op_input_spec = op_input_spec or {}
+            self.op_output_spec = op_output_spec or {}
+
+    class _FakeQuantCfg:
+        def __init__(self) -> None:
+            self.global_cfg: Any = None
+            self.module_cfgs: dict[str, Any] = {}
+
+        def set_global(self, mcfg: Any) -> "_FakeQuantCfg":
+            self.global_cfg = mcfg
+            return self
+
+        def set_module_name(self, name: str, mcfg: Any) -> "_FakeQuantCfg":
+            self.module_cfgs[name] = mcfg
+            return self
+
+    class _FakeEB:
+        class _Item:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        CoreML = _Item("coreml")
+        CoreAI = _Item("coreai")
+        Torch = _Item("torch")
+
+    fake_torch = types.SimpleNamespace(
+        float4_e2m1fn_x2="torch.float4_e2m1fn_x2",
+        float8_e4m3fn="torch.float8_e4m3fn",
+        float16="torch.float16",
+    )
+    fake_qmod = types.SimpleNamespace(
+        ModuleQuantizerConfig=_FakeModCfg,
+        QuantizationSpec=_FakeSpec,
+        QuantizerConfig=_FakeQuantCfg,
+    )
+    fake_coreai_opt = types.SimpleNamespace(ExportBackend=_FakeEB, quantization=fake_qmod)
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "coreai_opt", fake_coreai_opt)
+    monkeypatch.setitem(sys.modules, "coreai_opt.quantization", fake_qmod)
+
+    cfg, meta = cap.build_coreai_opt_config(
+        preset="fp4_fp8",
+        export_backend="coreai",
+        model_name="Qwen/Qwen3.5-4B",
+        os_version="27.2.1",
+        excluded_modules=["lm_head"],
+    )
+    assert cfg.global_cfg is not None
+    assert cfg.global_cfg.op_state_spec["weight"].dtype == "torch.float4_e2m1fn_x2"
+    assert cfg.global_cfg.op_input_spec["*"].dtype == "torch.float8_e4m3fn"
+    assert cfg.global_cfg.op_output_spec["*"].dtype == "torch.float8_e4m3fn"
+    assert cfg.module_cfgs["lm_head"].op_state_spec == {"*": None}
+    assert meta["weight_dtype"] == "torch.float4_e2m1fn_x2"
+    assert meta["activation_dtype"] == "torch.float8_e4m3fn"
+
+
+def test_pipeline_llm_scale_defaults_resume_skip_io_macro_sort_and_extractconf_cpu(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import inspect
+    from types import SimpleNamespace
+    import fast_shared.pipeline_llm as pllm
+
+    # 1. Verify 10M-doc scale defaults on extract_parquet & extract_jsonl
+    sig_pq = inspect.signature(pllm.extract_parquet)
+    assert sig_pq.parameters["whitespace_flexible"].default is None
+    assert sig_pq.parameters["use_wired_limit"].default is True
+    assert sig_pq.parameters["skip_empty"].default is False
+    assert sig_pq.parameters["max_chars"].default is None
+    assert sig_pq.parameters["emit_extractconf"].default is True
+    assert sig_pq.parameters["macro_window_rows"].default == 4096
+
+    sig_jl = inspect.signature(pllm.extract_jsonl)
+    assert sig_jl.parameters["whitespace_flexible"].default is None
+    assert sig_jl.parameters["use_wired_limit"].default is True
+    assert sig_jl.parameters["emit_extractconf"].default is True
+
+    # 2. Checkpoint provenance.json compact wire detection vs default None (": ")
+    ckpt_compact = tmp_path / "ckpt_compact"
+    ckpt_compact.mkdir()
+    (ckpt_compact / "provenance.json").write_text(
+        json.dumps({"json_separators": [",", ":"]}),
+        encoding="utf-8",
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {"idx": {"type": "integer"}, "len": {"type": "integer"}},
+        "required": ["idx", "len"],
+    }
+
+    class _MacroEngine:
+        def __init__(self, model_dir: Path | None = None) -> None:
+            self.model_dir = model_dir
+            self.default_max_b_slots = 64
+            self.seen_batches: list[list[str]] = []
+            self.seen_kwargs: list[dict[str, Any]] = []
+
+        def generate_batch(self, prompts: list[str], **kwargs: Any) -> Any:
+            self.seen_batches.append(list(prompts))
+            self.seen_kwargs.append(dict(kwargs))
+            items = []
+            for p in prompts:
+                row_id = int(p.split("|", 1)[0])
+                is_uncertain = row_id == 3
+                items.append(
+                    SimpleNamespace(
+                        text=json.dumps({"idx": row_id, "len": len(p)}),
+                        parsed={"idx": row_id, "len": len(p)},
+                        valid_json=True,
+                        valid_schema=True,
+                        finish_reason="stop",
+                        prompt_tokens=max(1, len(p) // 4),
+                        completion_tokens=6,
+                        telemetry={
+                            "mean_h_pre": 2.6 if is_uncertain else 0.03,
+                            "mean_neg_log_z_valid": 3.2 if is_uncertain else 0.0,
+                            "mean_top2_margin": 0.05 if is_uncertain else 6.0,
+                        },
+                    )
+                )
+            return SimpleNamespace(
+                items=items,
+                stats={
+                    "docs": len(items),
+                    "valid_json_count": len(items),
+                    "valid_schema_count": len(items),
+                    "prompt_tokens": sum(it.prompt_tokens for it in items),
+                    "completion_tokens": 6 * len(items),
+                    "decode_sec": 0.01,
+                },
+            )
+
+    # Include >8000 char row (verifies max_chars=None does not truncate), empty row (skip_empty=False), and mixed lengths
+    long_body = "2|" + ("x" * 9500)
+    rows = [
+        {"id": 0, "body_text": "0|short"},
+        {"id": 1, "body_text": "   \n\t  "},  # deterministic skipped_empty row, 0 LLM calls!
+        {"id": 2, "body_text": long_body},
+        {"id": 3, "body_text": "3|" + ("y" * 400)},
+    ]
+    in_pq = tmp_path / "macro_in.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), in_pq, row_group_size=2)
+
+    out_dir = tmp_path / "macro_out"
+    eng_default = _MacroEngine()
+    summary = pllm.extract_parquet(
+        eng_default,
+        in_pq,
+        out_dir,
+        system_prompt="sys",
+        json_schema=schema,
+        shard_rows=100,
+    )
+    assert summary.docs_processed == 4
+    # Only the 3 non-empty rows went to LLM, sorted by length (longest first) inside the macro-window!
+    assert len(eng_default.seen_batches) == 1
+    sent = eng_default.seen_batches[0]
+    assert len(sent) == 3
+    assert [len(s) for s in sent] == sorted([len(s) for s in sent], reverse=True)
+    assert eng_default.seen_kwargs[0]["whitespace_flexible"] is None
+
+    # Output table preserves exact 1:1 input row order [0, 1, 2, 3] and full >8000 length!
+    out_tbl = pq.read_table(out_dir / "part-00000.parquet")
+    assert out_tbl.column("id").to_pylist() == [0, 1, 2, 3]
+    fr_list = out_tbl.column("finish_reason").to_pylist()
+    assert fr_list == ["stop", "skipped_empty", "stop", "stop"]
+    resp_list = out_tbl.column("response_text").to_pylist()
+    assert resp_list[1] == ""
+    assert json.loads(resp_list[2]) == {"idx": 2, "len": len(long_body)}
+    risks = out_tbl.column("extractconf_risk").to_pylist()
+    assert all(0.0 <= r <= 1.0 for r in risks)
+    assert risks[3] > risks[0]  # High telemetry conflict on row 3 produces higher risk than clean row 0
+
+    # 3. --resume skips reading/decompressing `body_text` on completed row groups!
+    cols_requested: list[list[str] | None] = []
+    orig_read_rg = pllm.pq.ParquetFile.read_row_group
+    orig_iter_batches = pllm.pq.ParquetFile.iter_batches
+
+    def _spy_read_rg(self_pf: Any, i: int, columns: Any = None, *a: Any, **kw: Any) -> Any:
+        if Path(getattr(self_pf, "where", in_pq)) == in_pq or "body_text" in self_pf.schema_arrow.names:
+            cols_requested.append(list(columns) if columns is not None else None)
+        return orig_read_rg(self_pf, i, columns=columns, *a, **kw)
+
+    def _spy_iter_batches(self_pf: Any, *a: Any, **kw: Any) -> Any:
+        if "body_text" in self_pf.schema_arrow.names:
+            cols = kw.get("columns")
+            cols_requested.append(list(cols) if cols is not None else None)
+        return orig_iter_batches(self_pf, *a, **kw)
+
+    monkeypatch.setattr(pllm.pq.ParquetFile, "read_row_group", _spy_read_rg)
+    monkeypatch.setattr(pllm.pq.ParquetFile, "iter_batches", _spy_iter_batches)
+
+    eng_resume = _MacroEngine()
+    resumed_sum = pllm.extract_parquet(
+        eng_resume,
+        in_pq,
+        out_dir,
+        system_prompt="sys",
+        json_schema=schema,
+        resume=True,
+    )
+    assert resumed_sum.docs_processed == 0
+    assert eng_resume.seen_batches == []
+    assert len(cols_requested) >= 1
+    assert all(c is not None and "body_text" not in c for c in cols_requested)
+    monkeypatch.undo()
+
+    # 4. Compact provenance.json flips whitespace_flexible=None -> False
+    eng_compact = _MacroEngine(model_dir=ckpt_compact)
+    in_jl = tmp_path / "compact.jsonl"
+    out_jl = tmp_path / "compact_out.jsonl"
+    in_jl.write_text('{"id": 0, "text": "0|hi"}\n', encoding="utf-8")
+    pllm.extract_jsonl(eng_compact, in_jl, out_jl, system_prompt="sys", json_schema=schema)
+    assert eng_compact.seen_kwargs[0]["whitespace_flexible"] is False
+    jl_row = json.loads(out_jl.read_text(encoding="utf-8").strip())
+    assert "extractconf_risk" in jl_row
+
+
+def test_runtime_lessons_profiles_hetero2_queue_thermal_and_sse_streaming_cpu(monkeypatch: Any) -> None:
+    import http.client
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from fast_shared.runtime_lessons import (
+        DynamicSiliconPolicy,
+        Hetero2WorkStealingQueue,
+        poll_macos_thermal_state,
+    )
+    from fast_shared.server import ManagedHTTPServer, OpenAIChatAdapter, iter_chat_sse_events, make_chat_handler
+
+    hw_m5 = {
+        "system": "Darwin",
+        "machine": "arm64",
+        "hw_model": "Mac17,2",
+        "brand": "Apple M5",
+        "gpu_family": "Apple10",
+        "supports_apple9": True,
+        "supports_apple10": True,
+        "supports_metal4": True,
+        "mem_gb": 24,
+        "macos_version": "27.2.1",
+        "mlx_enable_tf32": True,
+        "mlx_metal_no_nax": False,
+    }
+
+    # 1. DynamicSiliconPolicy profile="backfill" vs profile="interactive" & mlx_cache_limit_mb=256
+    pol_default = DynamicSiliconPolicy(hw=hw_m5)
+    assert pol_default.profile == "backfill"
+    assert pol_default.mlx_cache_limit_mb == 256
+    assert pol_default.drafter_budget_mb == 0.0
+
+    pol_bf = DynamicSiliconPolicy(hw=hw_m5, profile="backfill")
+    plan_bf = pol_bf.resolve(batch_size=1)
+    assert plan_bf.mtp_enabled is False
+    assert plan_bf.should_load_mtp_drafter is False
+    assert plan_bf.estimated_drafter_mem_mb == 0.0
+    assert plan_bf.mlx_cache_limit_mb == 256
+
+    pol_int = DynamicSiliconPolicy(hw=hw_m5, profile="interactive")
+    assert pol_int.profile == "interactive"
+    assert pol_int.drafter_budget_mb > 0.0
+    plan_int = pol_int.resolve(batch_size=1)
+    assert plan_int.mtp_enabled is True
+    assert plan_int.should_load_mtp_drafter is True
+    assert plan_int.estimated_drafter_mem_mb > 0.0
+
+    with pytest.raises(ValueError, match="profile"):
+        DynamicSiliconPolicy(hw=hw_m5, profile="invalid")  # type: ignore[arg-type]
+
+    # 2. Persistent Hetero2WorkStealingQueue: GPU steals longest from head, ANE steals shortest <= 512 from tail
+    wq = Hetero2WorkStealingQueue()
+    wq.enqueue_batch(["s32", "s1024", "s64", "s768", "s256"], lengths=[32, 1024, 64, 768, 256])
+    gpu_wave = wq.pop_gpu_batch(2)
+    assert [it.payload for it in gpu_wave] == ["s1024", "s768"]
+    ane_item = wq.pop_ane_item(max_seq_len=512)
+    assert ane_item is not None and ane_item.payload == "s32"
+    # Persistent across batches: remaining ["s256", "s64"] stay queued when a second batch arrives!
+    wq.enqueue_batch(["s2048", "s16"], lengths=[2048, 16])
+    assert wq.pop_gpu_batch(1)[0].payload == "s2048"
+    assert wq.pop_ane_item(max_seq_len=512).payload == "s16"  # type: ignore[union-attr]
+
+    # Order-preserving concurrent execution across GPU + ANE workers
+    wq_exec = Hetero2WorkStealingQueue()
+    inputs = [f"item-{i}" for i in range(12)]
+    lens = [64 + (i * 73) % 900 for i in range(12)]
+    results = wq_exec.run_concurrent(
+        inputs,
+        lengths=lens,
+        gpu_fn=lambda batch: [f"G:{x.payload}" for x in batch],
+        ane_fn=lambda batch: [f"A:{x.payload}" for x in batch],
+        gpu_batch_size=3,
+        ane_batch_size=1,
+        ane_max_seq_len=512,
+        ane_workers=2,
+    )
+    assert [r.split(":", 1)[1] for r in results] == inputs
+
+    # 3. macOS thermalState polling helper (live + pmset fallback)
+    live_therm = poll_macos_thermal_state()
+    assert live_therm.level in ("nominal", "fair", "serious", "critical")
+    assert 0 <= live_therm.raw_state <= 3
+
+    import fast_shared.runtime_lessons as rl
+    monkeypatch.setattr(rl, "_read_foundation_thermal_state", lambda: None)
+    monkeypatch.setattr(
+        rl,
+        "_read_pmset_thermal_output",
+        lambda: "Note: Thermal warning level has been recorded\n\tCPU_Speed_Limit \t= 65\n",
+    )
+    pmset_therm = poll_macos_thermal_state()
+    assert pmset_therm.source == "pmset"
+    assert pmset_therm.level in ("serious", "critical")
+    assert pmset_therm.throttle_recommended is True
+    monkeypatch.undo()
+
+    # 4. Real incremental SSE token streaming via `generate_chat_stream` + `ttft_ms` recording
+    second_tok_gate = threading.Event()
+
+    class _StreamCapableEngine:
+        model_name = "stream-llm"
+        ane_available = False
+        default_mode = "gpu"
+
+        def generate_batch(self, prompts: list[Any], **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                items=[SimpleNamespace(text="buffered", prompt_tokens=4, completion_tokens=1, finish_reason="stop")],
+                stats={"docs": 1},
+            )
+
+        def generate_chat_stream(self, messages: list[dict[str, Any]], **kwargs: Any):
+            yield {"delta": "Hello", "prompt_tokens": 5}
+            second_tok_gate.wait(timeout=2.0)
+            yield {"delta": " world", "completion_tokens": 2, "finish_reason": "stop"}
+
+    stream_eng = _StreamCapableEngine()
+    stream_adapter = OpenAIChatAdapter(stream_eng)
+    assert callable(getattr(stream_adapter, "generate_chat_stream", None))
+
+    with ManagedHTTPServer(make_chat_handler(stream_adapter), host="127.0.0.1", port=0) as srv:
+        conn = http.client.HTTPConnection(srv.host, srv.port, timeout=5)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps({
+                "model": "stream-llm",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 200
+        # Read role chunk + first token chunk BEFORE releasing `second_tok_gate`!
+        # If SSE were buffered, readline() here would block 2.0s until `second_tok_gate` timed out!
+        t_first_start = time.perf_counter()
+        seen_hello = False
+        while True:
+            line = resp.fp.readline().decode("utf-8")
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                payload = json.loads(line[len("data: ") :])
+                delta = payload["choices"][0].get("delta", {})
+                if delta.get("content") == "Hello":
+                    seen_hello = True
+                    break
+        first_wait_sec = time.perf_counter() - t_first_start
+        assert seen_hello is True
+        assert first_wait_sec < 0.5  # Proves true incremental streaming before completion finishes!
+
+        second_tok_gate.set()
+        rest = resp.read().decode("utf-8")
+        conn.close()
+        assert " world" in rest
+        assert "data: [DONE]" in rest
+        assert stream_adapter.last_stream_stats is not None
+        assert stream_adapter.last_stream_stats["ttft_ms"] >= 0.0
+
+    # Direct `iter_chat_sse_events` fallback on completed item still returns valid OpenAI chunks + ttft_ms
+    fb_stats: dict[str, Any] = {}
+    fb_events = list(
+        iter_chat_sse_events(
+            "m",
+            SimpleNamespace(text="ok", prompt_tokens=3, completion_tokens=1, finish_reason="stop"),
+            include_usage=True,
+            stats_out=fb_stats,
+        )
+    )
+    assert len(fb_events) == 3
+    assert fb_events[1]["choices"][0]["delta"]["content"] == "ok"
+    assert fb_events[-1]["usage"]["total_tokens"] == 4
+    assert "ttft_ms" in fb_stats
+
+
+def test_prune_optional_nullable_fields_and_qat_provenance_hook_cpu(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from fast_shared import prune_optional_nullable_fields, validate_json_against_schema
+    import fast_shared.pipeline_llm as pllm
+
+    full_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "title": {"type": "string"},
+            "subtitle": {"type": ["string", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "notes": {"type": ["string", "null"]},
+                },
+                "required": ["source"],
+            },
+        },
+        "required": ["id", "title", "meta"],
+    }
+
+    pruned = prune_optional_nullable_fields(full_schema)
+    # Original schema must not be mutated
+    assert set(full_schema["properties"].keys()) == {"id", "title", "subtitle", "tags", "meta"}
+    # Optional top-level ("subtitle", "tags") and nested ("notes") keys are pruned; required keys preserved
+    assert set(pruned["properties"].keys()) == {"id", "title", "meta"}
+    assert pruned["additionalProperties"] is False
+    assert set(pruned["properties"]["meta"]["properties"].keys()) == {"source"}
+    assert pruned["properties"]["meta"]["additionalProperties"] is False
+
+    # Instance matching pruned schema remains 100% valid against original unpruned schema!
+    sample_out = {"id": 1, "title": "Clean Output", "meta": {"source": "sensor"}}
+    validate_json_against_schema(sample_out, pruned)
+    validate_json_against_schema(sample_out, full_schema)
+
+    # Also supports OpenAI-style required nullable fields when prune_required_nullable=True
+    strict_nullable_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "opt_note": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "required": ["id", "opt_note"],
+    }
+    pruned_strict = prune_optional_nullable_fields(strict_nullable_schema, prune_required_nullable=True)
+    assert set(pruned_strict["properties"].keys()) == {"id"}
+    assert pruned_strict["required"] == ["id"]
+
+    # Pipeline opt-in `compact_optional_schema=True` and `provenance.json` hook
+    qat_ckpt = tmp_path / "qat_ckpt"
+    qat_ckpt.mkdir()
+    (qat_ckpt / "provenance.json").write_text(
+        json.dumps({"compact_optional_schema": True}),
+        encoding="utf-8",
+    )
+
+    class _SchemaSpyEngine:
+        def __init__(self, model_dir: Path | None = None) -> None:
+            self.model_dir = model_dir
+            self.seen_schemas: list[Any] = []
+
+        def generate_batch(self, prompts: list[str], **kwargs: Any) -> Any:
+            self.seen_schemas.append(kwargs.get("json_schema"))
+            items = [
+                SimpleNamespace(
+                    text=json.dumps(sample_out),
+                    parsed=sample_out,
+                    valid_json=True,
+                    valid_schema=True,
+                    finish_reason="stop",
+                    prompt_tokens=8,
+                    completion_tokens=6,
+                )
+                for _ in prompts
+            ]
+            return SimpleNamespace(items=items, stats={"docs": len(items), "valid_json_count": len(items), "valid_schema_count": len(items)})
+
+    in_pq = tmp_path / "qat_in.parquet"
+    pq.write_table(pa.table({"id": [1], "body_text": ["hello"]}), in_pq)
+
+    # Default (compact_optional_schema=False, no provenance hook): passes full_schema unchanged
+    eng_plain = _SchemaSpyEngine()
+    pllm.extract_parquet(eng_plain, in_pq, tmp_path / "out_plain.parquet", system_prompt="s", json_schema=full_schema)
+    assert set(eng_plain.seen_schemas[0]["properties"].keys()) == {"id", "title", "subtitle", "tags", "meta"}
+
+    # Opt-in flag compact_optional_schema=True: passes pruned schema
+    eng_opt = _SchemaSpyEngine()
+    pllm.extract_parquet(
+        eng_opt,
+        in_pq,
+        tmp_path / "out_opt.parquet",
+        system_prompt="s",
+        json_schema=full_schema,
+        compact_optional_schema=True,
+    )
+    assert set(eng_opt.seen_schemas[0]["properties"].keys()) == {"id", "title", "meta"}
+
+    # Checkpoint provenance.json hook (`"compact_optional_schema": true`): auto-prunes schema on both parquet & jsonl
+    eng_qat = _SchemaSpyEngine(model_dir=qat_ckpt)
+    pllm.extract_parquet(eng_qat, in_pq, tmp_path / "out_qat.parquet", system_prompt="s", json_schema=full_schema)
+    assert set(eng_qat.seen_schemas[0]["properties"].keys()) == {"id", "title", "meta"}
+
+    in_jl = tmp_path / "qat.jsonl"
+    in_jl.write_text('{"id": 1, "text": "hello"}\n', encoding="utf-8")
+    pllm.extract_jsonl(eng_qat, in_jl, tmp_path / "out_qat.jsonl", system_prompt="s", json_schema=full_schema)
+    assert set(eng_qat.seen_schemas[1]["properties"].keys()) == {"id", "title", "meta"}

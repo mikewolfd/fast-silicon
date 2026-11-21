@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <libgen.h>
@@ -254,20 +255,55 @@ std::string default_home_dir() {
     if (const char* env = std::getenv("FAST_BGE_SMALL_HOME")) {
         if (env[0] != '\0') return std::string(env);
     }
+    namespace fs = std::filesystem;
+    const std::string cache_name = "fast-bge-small";
+    fs::path pkg_dir;
     uint32_t sz = 0;
     _NSGetExecutablePath(nullptr, &sz);
     std::string exe(sz, '\0');
     if (_NSGetExecutablePath(exe.data(), &sz) == 0) {
-        std::vector<char> buf(exe.begin(), exe.end());
-        buf.push_back('\0');
-        char* d1 = dirname(buf.data());  // build/
-        std::string build_dir = d1 ? std::string(d1) : ".";
-        std::vector<char> buf2(build_dir.begin(), build_dir.end());
-        buf2.push_back('\0');
-        char* d2 = dirname(buf2.data());
-        if (d2) return std::string(d2);
+        char real_buf[4096];
+        if (realpath(exe.c_str(), real_buf)) {
+            pkg_dir = fs::path(real_buf).parent_path().parent_path();
+        } else {
+            pkg_dir = fs::path(exe.c_str()).parent_path().parent_path();
+        }
+        if (fs::exists(pkg_dir / "artifacts")) {
+            return pkg_dir.string();
+        }
     }
-    return ".";
+    if (const char* art_env = std::getenv("FAST_ARTIFACTS_ROOT")) {
+        if (art_env[0] != '\0') {
+            fs::path art_root(art_env);
+            if (fs::exists(art_root / cache_name / "artifacts") || !fs::exists(art_root / "artifacts")) {
+                return (art_root / cache_name).string();
+            }
+            return art_root.string();
+        }
+    }
+    if (!pkg_dir.empty()) {
+        std::vector<fs::path> sibs;
+        if (pkg_dir.parent_path().filename() == "packages") {
+            sibs.push_back(pkg_dir.parent_path().parent_path().parent_path() / cache_name);
+        }
+        if (pkg_dir.filename() != cache_name) {
+            sibs.push_back(pkg_dir.parent_path() / cache_name);
+        }
+        for (const auto& sib : sibs) {
+            if (fs::exists(sib / "artifacts")) {
+                return sib.string();
+            }
+        }
+    }
+    if (const char* home_env = std::getenv("HOME")) {
+        if (home_env[0] != '\0') {
+            fs::path cache_dir = fs::path(home_env) / ".cache" / cache_name;
+            if (fs::exists(cache_dir / "artifacts") || pkg_dir.empty()) {
+                return cache_dir.string();
+            }
+        }
+    }
+    return pkg_dir.empty() ? "." : pkg_dir.string();
 }
 
 void print_usage(const char* prog) {
@@ -392,17 +428,19 @@ int main(int argc, char** argv) {
 
     const int sl = static_cast<int>(tokens.size());
     const int caps[] = {24, 64, 128, 192, 256, 320, 384, 448, 512};
+    std::string mf_path = ane_dir + "/bge_ane_w8a16.mlmodelc";
+    bool has_mf = std::ifstream(mf_path + "/coremldata.bin").good();
     int chosen_cap = 512;
     if (forced_bucket > 0) {
         chosen_cap = forced_bucket;
     } else {
         for (int c : caps) {
             if (sl <= c) {
-                if (c == 256) {
+                if (c == 256 && !has_mf) {
                     // Use optional B=1 S=256 bundle if present; otherwise advance to 320.
-                    std::string p256 = ane_dir + "/bge_b1_s256_fp16.mlmodelc";
-                    std::ifstream chk(p256);
-                    if (!chk.good()) continue;
+                    std::string p256_w8 = ane_dir + "/bge_b1_s256_w8a16.mlmodelc/coremldata.bin";
+                    std::string p256_f16 = ane_dir + "/bge_b1_s256_fp16.mlmodelc/coremldata.bin";
+                    if (!std::ifstream(p256_w8).good() && !std::ifstream(p256_f16).good()) continue;
                 }
                 chosen_cap = c;
                 break;
@@ -410,12 +448,23 @@ int main(int argc, char** argv) {
         }
     }
 
-    char model_path[2048];
-    snprintf(model_path, sizeof(model_path), "%s/bge_b1_s%d_fp16.mlmodelc", ane_dir.c_str(), chosen_cap);
-    int bid = bge_ane_load_bucket(model_path, 1, chosen_cap, 1, 1);
+    int bid = -1;
+    if (has_mf) {
+        char fn_name[64];
+        snprintf(fn_name, sizeof(fn_name), "bge_b1_s%d", chosen_cap);
+        bid = bge_ane_load_bucket_fn(mf_path.c_str(), fn_name, 1, chosen_cap, 1, 1);
+    }
     if (bid < 0) {
-        fprintf(stderr, "Failed to load ANE bucket %s (err=%d: %s)\n", model_path, bid, bge_ane_last_error());
-        return 1;
+        char model_path[2048];
+        snprintf(model_path, sizeof(model_path), "%s/bge_b1_s%d_w8a16.mlmodelc", ane_dir.c_str(), chosen_cap);
+        if (!std::ifstream(std::string(model_path) + "/coremldata.bin").good()) {
+            snprintf(model_path, sizeof(model_path), "%s/bge_b1_s%d_fp16.mlmodelc", ane_dir.c_str(), chosen_cap);
+        }
+        bid = bge_ane_load_bucket(model_path, 1, chosen_cap, 1, 1);
+        if (bid < 0) {
+            fprintf(stderr, "Failed to load ANE bucket %s (err=%d: %s)\n", model_path, bid, bge_ane_last_error());
+            return 1;
+        }
     }
 
     float vec[384];

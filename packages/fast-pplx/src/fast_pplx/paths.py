@@ -116,7 +116,7 @@ def resolve_paths(
     anchor = Path(_anchor_file if _anchor_file is not None else __file__).resolve()
     pkg_root = anchor.parents[2] if len(anchor.parents) >= 3 else anchor.parent
     build_dir = root / "build"
-    if not explicit_or_env and not build_dir.is_dir() and (pkg_root / "build").is_dir():
+    if not explicit_or_env and (pkg_root / "build").is_dir():
         build_dir = pkg_root / "build"
 
     weights_dir = artifacts / "weights"

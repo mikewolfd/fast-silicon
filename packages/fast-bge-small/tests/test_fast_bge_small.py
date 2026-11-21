@@ -474,3 +474,145 @@ def test_vectorized_cpu_query_dylib_parity(engine: FastBgeSmall) -> None:
     assert dt >= 0.0 and np.all(np.isfinite(out))
     ref_gpu = engine.encode_query(toks, prefer_ane=False)
     assert float(np.dot(out, ref_gpu)) >= 0.9999
+
+
+def test_mpp_capability_gating_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-P1.2: Metal 4 MPP must check probe_metal_capabilities() before instantiating kernels."""
+    from fast_bge_small import gpu as bge_gpu
+
+    assert hasattr(bge_gpu, "should_use_fused_mpp")
+    assert bge_gpu.should_use_fused_mpp({"metal4": False, "macos_version": (26, 6)}) is False
+    assert bge_gpu.should_use_fused_mpp({"metal4": True, "macos_version": (15, 5)}) is False
+    assert bge_gpu.should_use_fused_mpp({"metal4": True, "macos_version": (26, 0)}) is True
+
+    # Simulate reloading/initializing MPP kernels on a non-Metal-4 host: must never call make_mpp_matmul_kernel.
+    called = False
+
+    def _boom(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise RuntimeError("make_mpp_matmul_kernel must not run when metal4=False")
+
+    monkeypatch.setattr(bge_gpu, "make_mpp_matmul_kernel", _boom)
+    kernels = bge_gpu._build_mpp_kernels({"metal4": False, "macos_version": (15, 4)})
+    assert called is False
+    assert kernels == (None, None, None)
+
+
+def test_ffd_length_sorted_packing_cpu() -> None:
+    """M-P1.2: Sequence packing must length-sort descending + FFD fill while preserving orig_idx."""
+    from fast_bge_small.gpu import _plan_packed_batches
+
+    # Arrival order would split into 3 bins: [300, 100] (400), [300] (300), [100] (100) at max_tokens=400;
+    # length-sorted FFD packs [300, 100] (400) and [300, 100] (400) into 2 exact bins!
+    seqs = [
+        [101] + [2000] * 98 + [102],   # idx 0: len 100
+        [101] + [2001] * 298 + [102],  # idx 1: len 300
+        [101] + [2002] * 98 + [102],   # idx 2: len 100
+        [101] + [2003] * 298 + [102],  # idx 3: len 300
+    ]
+    bins = _plan_packed_batches(seqs, max_tokens=400)
+    assert len(bins) == 2
+    seen_orig = sorted(oi for b in bins for oi, _ in b)
+    assert seen_orig == [0, 1, 2, 3]
+    for b in bins:
+        lens = [len(ids) for _, ids in b]
+        assert lens == sorted(lens, reverse=True)
+        assert sum(lens) == 400
+
+
+def test_clean_mmap_host_tables_cpu(tmp_path: Path) -> None:
+    """M-P1.2: Host wt0/pos tables materialize clean read-only memmaps shared across ANE and GPU."""
+    from fast_bge_small.paths import load_or_mmap_host_tables
+
+    rng = np.random.default_rng(42)
+    word = rng.standard_normal((64, 384)).astype(np.float16)
+    ttype = rng.standard_normal((2, 384)).astype(np.float16)
+    pos = rng.standard_normal((512, 384)).astype(np.float16)
+    npz_path = tmp_path / "bge_small_f16.npz"
+    np.savez(
+        npz_path,
+        **{
+            "embeddings.word_embeddings.weight": word,
+            "embeddings.token_type_embeddings.weight": ttype,
+            "embeddings.position_embeddings.weight": pos,
+        },
+    )
+
+    wt0_mm, pos_mm = load_or_mmap_host_tables(npz_path)
+    assert not (tmp_path / "bge_wt0_f16.bin").exists()
+    assert not (tmp_path / "bge_pos_f16.bin").exists()
+    assert isinstance(wt0_mm, np.memmap)
+    assert isinstance(pos_mm, np.memmap)
+    assert wt0_mm.flags.writeable is False
+    assert pos_mm.flags.writeable is False
+    expected_wt0 = (word + ttype[0:1]).astype(np.float16)
+    np.testing.assert_array_equal(np.asarray(wt0_mm), expected_wt0)
+    np.testing.assert_array_equal(np.asarray(pos_mm), pos)
+
+
+def test_w8a16_multifunction_builder_and_mask_literal_cpu() -> None:
+    """M-P1.2: ANE builder defaults include b1_s256, W8A16 symmetric quant, multifunction, and -40000.0 mask."""
+    import importlib.util
+
+    pkg_root = Path(__file__).resolve().parent.parent
+    script_path = pkg_root / "scripts" / "build_ane_models.py"
+    spec = importlib.util.spec_from_file_location("bge_build_ane_models_v2", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert (1, 256) in mod.PRODUCTION_BUCKETS
+    assert hasattr(mod, "build_multifunction_bundle")
+    assert mod.bge_function_name(1, 256) == "bge_b1_s256"
+    assert mod.bge_function_name(8, 256) == "bge_b8_s256"
+
+    src = script_path.read_text(encoding="utf-8")
+    assert "linear_symmetric" in src
+    assert "save_multifunction" in src
+
+    mm_src = (pkg_root / "native" / "bge_ane_runner.mm").read_text(encoding="utf-8")
+    assert "-40000.0f" in mm_src
+    assert "fp16_bits(-10000.0f)" not in mm_src
+    assert "@available(macOS 15.0, *)" in mm_src
+    assert 'std::strcmp(function_name, "main") != 0' in mm_src
+    assert "SemaphoreGuard" in mm_src
+    assert "bge_ane_free_bucket" in mm_src
+    assert "os.symlink(out_mlmodelc.name, link_p)" in src
+
+
+def test_single_layers_dropped_and_borrowed_tables(engine: FastBgeSmall) -> None:
+    """M-P1.2: GPU keeps transposed weights only for Layer 11 (-42 MB) and preserves unordered corpus order."""
+    assert set(engine.gpu._single_layers.keys()) == {11}
+
+    rng = np.random.default_rng(19)
+    # Interleave short and long sequences to exercise length-sorted FFD + orig_idx scatter in both gpu and hetero
+    toks = [
+        [101] + rng.integers(1000, 20000, size=int(sl)).tolist() + [102]
+        for sl in (22, 310, 14, 480, 95, 240, 18, 390, 60, 254, 12, 410)
+    ]
+    v_singles = np.stack([engine.encode_query(t, prefer_ane=False) for t in toks], axis=0)
+    v_gpu = engine.encode_corpus(toks, mode="gpu", gpu_max_tokens=1024)
+    assert float(np.min(np.sum(v_gpu * v_singles, axis=1))) >= 0.9998
+    if engine.ane_available:
+        v_het = engine.encode_corpus(toks, mode="hetero", gpu_max_tokens=1024, ane_chunk_docs=3)
+        assert float(np.min(np.sum(v_het * v_singles, axis=1))) >= 0.9995
+
+    # Out-of-bounds token IDs (< 0 or >= vocab_size) clamp safely to [UNK]=100 on GPU single & packed paths
+    ref_unk = engine.encode_query([101, 100, 100, 102], prefer_ane=False)
+    oob_single = engine.encode_query([101, -7, 999999, 102], prefer_ane=False)
+    assert float(np.dot(ref_unk, oob_single)) >= 0.9999
+    oob_corpus = engine.encode_corpus([[101, -7, 999999, 102], [101, 100, 100, 102]], mode="gpu")
+    assert float(np.dot(oob_corpus[0], oob_corpus[1])) >= 0.9999
+
+    # Lifecycle test: closing a temporary FastBgeSmall instance frees its buckets & mmaps without disturbing `engine`
+    with FastBgeSmall(warmup=False, verify_ane_plan=False) as temp_eng:
+        _ = temp_eng.encode_query([101, 2054, 2003, 102], prefer_ane=True)
+        owned_before = set(temp_eng._owned_bucket_ids)
+    assert len(temp_eng._owned_bucket_ids) == 0
+    assert temp_eng._wt0_f16 is None and temp_eng._pos_f16 is None
+    if engine.ane_available:
+        assert owned_before.isdisjoint(engine._owned_bucket_ids)
+        q_after = engine.encode_query([101, 2054, 2003, 102], prefer_ane=True)
+        assert q_after.shape == (384,) and np.all(np.isfinite(q_after))
+

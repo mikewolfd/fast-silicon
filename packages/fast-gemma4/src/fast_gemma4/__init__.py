@@ -12,11 +12,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_MAX_WHITESPACE_RUN": (".grammar", "DEFAULT_MAX_WHITESPACE_RUN"),
     "DEFAULT_MTP_DRAFTER_REPO": (".mtp_drafter", "DEFAULT_MTP_DRAFTER_REPO"),
     "DEFAULT_MTP_TOP_K": (".mtp_drafter", "DEFAULT_MTP_TOP_K"),
+    "DEFAULT_QAT_MTP_DRAFTER_REPO": (".mtp_drafter", "DEFAULT_QAT_MTP_DRAFTER_REPO"),
     "FastGemma4Engine": (".engine", "FastGemma4Engine"),
     "FastGemma4Model": (".model", "FastGemma4Model"),
     "FastGemma4OpenAIAdapter": (".server", "FastGemma4OpenAIAdapter"),
     "FastGemma4Server": (".server", "FastGemma4Server"),
     "FastGemma4Tokenizer": (".tokenizer", "FastGemma4Tokenizer"),
+    "GEMMA4_EOS_TOKEN_IDS": (".tokenizer", "GEMMA4_EOS_TOKEN_IDS"),
     "Gemma4MtpDrafter": (".mtp_drafter", "Gemma4MtpDrafter"),
     "Gemma4Paths": (".paths", "Gemma4Paths"),
     "GenerationBatchResult": (".engine", "GenerationBatchResult"),
@@ -38,18 +40,21 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "pack_checkpoint_dir": (".packager", "pack_checkpoint_dir"),
     "recommended_mtp_draft_k": (".mtp_drafter", "recommended_mtp_draft_k"),
     "resolve_paths": (".paths", "resolve_paths"),
+    "select_mtp_drafter_repo": (".mtp_drafter", "select_mtp_drafter_repo"),
+    "should_use_bf16_mpp_for_mlp": (".model", "should_use_bf16_mpp_for_mlp"),
     "should_use_mtp_drafter": (".mtp_drafter", "should_use_mtp_drafter"),
+    "singleton_quantized_linear": (".model", "singleton_quantized_linear"),
 }
 
 try:
     from .ane_pipeline import AnePrefixRunner, AnePrefixWorker
     from .engine import FastGemma4Engine, GenerationBatchResult, GenerationItem
     from .grammar import GrammarHelper
-    from .model import FastGemma4Model
+    from .model import FastGemma4Model, should_use_bf16_mpp_for_mlp, singleton_quantized_linear
     from .paths import DEFAULT_HF_REPO, Gemma4Paths, resolve_paths
     from .pipeline import ParquetExtractSummary, extract_jsonl, extract_parquet
     from .server import FastGemma4OpenAIAdapter, FastGemma4Server, make_gemma4_handler
-    from .tokenizer import FastGemma4Tokenizer, VocabRemapper, format_gemma4_chat
+    from .tokenizer import FastGemma4Tokenizer, GEMMA4_EOS_TOKEN_IDS, VocabRemapper, format_gemma4_chat
 except ModuleNotFoundError:
     # Allow the stdlib-only module (`fast_gemma4.per_doc_grammar`) to import
     # where mlx is not installed (`/usr/bin/python3 -B -I -S`).
@@ -74,11 +79,13 @@ __all__ = [
     "DEFAULT_MAX_WHITESPACE_RUN",
     "DEFAULT_MTP_DRAFTER_REPO",
     "DEFAULT_MTP_TOP_K",
+    "DEFAULT_QAT_MTP_DRAFTER_REPO",
     "FastGemma4Engine",
     "FastGemma4Model",
     "FastGemma4OpenAIAdapter",
     "FastGemma4Server",
     "FastGemma4Tokenizer",
+    "GEMMA4_EOS_TOKEN_IDS",
     "Gemma4MtpDrafter",
     "Gemma4Paths",
     "GenerationBatchResult",
@@ -100,5 +107,8 @@ __all__ = [
     "pack_checkpoint_dir",
     "recommended_mtp_draft_k",
     "resolve_paths",
+    "select_mtp_drafter_repo",
+    "should_use_bf16_mpp_for_mlp",
     "should_use_mtp_drafter",
+    "singleton_quantized_linear",
 ]

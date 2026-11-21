@@ -65,6 +65,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         sys_txt = Path(args.system_file).read_text(encoding="utf-8") if getattr(args, "system_file", None) else args.system
         schema_str = Path(args.schema).read_text(encoding="utf-8") if args.schema else None
         prompt: object = json.loads(Path(args.messages_json).read_text(encoding="utf-8")) if args.messages_json else args.prompt
+        eff_ws: bool | None = False if args.compact_json else getattr(args, "whitespace_flexible", None)
         item = eng.generate(
             prompt,  # type: ignore[arg-type]
             system_prompt=sys_txt,
@@ -72,7 +73,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             mode=args.mode,
-            whitespace_flexible=(not args.compact_json),
+            whitespace_flexible=eff_ws,
             enable_thinking=bool(args.enable_thinking),
             reasoning_effort=args.reasoning_effort,
             reasoning_budget=args.reasoning_budget,
@@ -304,7 +305,10 @@ def _cmd_bench(args: argparse.Namespace) -> int:
             "peak_gb": round(float(r1.stats["peak_gb"]), 2),
         }
 
-        for bs in [int(x) for x in args.batches.split(",") if x.strip()]:
+        raw_batches = args.batches or (
+            "8,16" if 0 < int(getattr(eng, "_host_memory_bytes", 0)) <= (26 << 30) else "8,64,128"
+        )
+        for bs in [int(x) for x in raw_batches.split(",") if x.strip()]:
             n = max(bs, len(base_prompts)) if bs >= len(base_prompts) else bs
             wave_prompts = [base_prompts[i % len(base_prompts)] for i in range(n)]
             rb = eng.generate_batch(
@@ -367,6 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--enable-thinking", action="store_true")
     gn.add_argument("--show-reasoning", action="store_true")
     gn.add_argument("--compact-json", action="store_true")
+    gn.add_argument("--whitespace-flexible", action=argparse.BooleanOptionalAction, default=None)
     gn.add_argument("--no-warmup", action="store_true")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=_cmd_generate)
@@ -377,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("output")
     ex.add_argument(
         "--system",
-        default="Extract structured metadata as one compact minified JSON matching the schema. Output raw JSON only.",
+        default="Extract structured metadata as JSON matching the schema. Output raw JSON only.",
     )
     ex.add_argument("--system-file", default=None)
     ex.add_argument("--schema", default=None)
@@ -388,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--mode", choices=("auto", "b1", "batched"), default="auto")
     ex.add_argument("--reasoning-effort", choices=("skip", "none", "low", "medium", "high"), default="skip")
     ex.add_argument("--reasoning-budget", type=int, default=None)
-    ex.add_argument("--whitespace-flexible", action="store_true")
+    ex.add_argument("--whitespace-flexible", action=argparse.BooleanOptionalAction, default=None)
     ex.add_argument("--no-warmup", action="store_true")
     ex.set_defaults(func=_cmd_extract)
 
@@ -398,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     pq_p.add_argument("output")
     pq_p.add_argument(
         "--system",
-        default="Extract structured metadata as one compact minified JSON matching the schema. Output raw JSON only.",
+        default="Extract structured metadata as JSON matching the schema. Output raw JSON only.",
     )
     pq_p.add_argument("--system-file", default=None)
     pq_p.add_argument("--schema", default=None)
@@ -414,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     pq_p.add_argument("--mode", choices=("auto", "b1", "batched"), default="auto")
     pq_p.add_argument("--reasoning-effort", choices=("skip", "none", "low", "medium", "high"), default="skip")
     pq_p.add_argument("--reasoning-budget", type=int, default=None)
-    pq_p.add_argument("--whitespace-flexible", action="store_true")
+    pq_p.add_argument("--whitespace-flexible", action=argparse.BooleanOptionalAction, default=None)
     pq_p.add_argument("--filter-ocr", action="store_true")
     pq_p.add_argument("--ocr-pages-only", action="store_true")
     pq_p.add_argument("--resume", action="store_true")
@@ -441,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     bn = sub.add_parser("bench", help="Benchmark B=1 vs Batched (Hydragen v2 + Metal 4 Hybrid MoE)")
     _add_common_model_args(bn)
-    bn.add_argument("--batches", default="8,64,128")
+    bn.add_argument("--batches", default=None)
     bn.add_argument("--max-tokens", type=int, default=512)
     bn.add_argument("--mode", choices=("auto", "b1", "batched"), default="auto")
     bn.add_argument("--no-warmup", action="store_true")

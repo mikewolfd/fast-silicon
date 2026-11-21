@@ -1,14 +1,17 @@
-"""High-throughput `openai/gpt-oss-20b` engine for Apple Silicon M4 Pro.
+"""High-throughput `openai/gpt-oss-20b` engine for Apple Silicon M4 & M5.
 
 Combines:
-  - `FastGptOssModel` (`MXFP4` + Affine-Q4, Metal 4 `MPP::matmul2d` Hybrid MoE,
-    Hydragen v2 zero-prefix-clone SDPA, circular SWA-128, asymmetric `o200k` vocab)
+  - `FastGptOssModel` (`MXFP4-Q8` default with offline `MXFP4-Q4` fallback, streamed
+    per-shard loading, Apple10 `NAX` + Apple9 Metal 4 `MPP::matmul2d` Hybrid MoE,
+    Hydragen v2 zero-prefix-clone SDPA, circular SWA-128, asymmetric `o200k` vocab
+    with `_cold_lm_head` fallback)
   - Shared-prefix LRU KV cache (`LCP` split across waves and repeat calls)
-  - Harmony multi-channel framing (`skip`, `none`, `low`, `medium`, `high` +
-    optional `reasoning_budget` phase transition injection)
-  - `fast_shared.grammar.GrammarHelper` with lazy 4-byte `int32` argmax fast-path,
-    upfront + per-step `compute_ff_tokens()` skipping, dynamic slot compaction,
-    and automatic `B=1` tail handoff (`extract_b1_cache` -> `forward_b1`).
+  - Canonical OpenAI Harmony multi-channel framing + persistent `in_final_channel`
+    stop tracking + two-phase batched budgeted reasoning (`wave_bs=8..128`)
+  - `fast_gpt_oss.grammar.GrammarHelper` defaulting to spaced `(", ", ": ")` JSON +
+    `WhitespaceGuard`, lazy 4-byte `int32` argmax fast-path, `-5.0` trailing 4-gram
+    repeat-loop breaker, upfront + per-step `compute_ff_tokens()` skipping, dynamic
+    slot compaction, and automatic `B=1` tail handoff (`extract_b1_cache` -> `forward_b1`).
 """
 
 from __future__ import annotations
@@ -26,13 +29,12 @@ import warnings
 import numpy as np
 
 from fast_shared.grammar import (
-    GrammarHelper,
     normalize_json_schema,
     sample_unconstrained,
     validate_json_against_schema,
 )
-from fast_shared.hf import resolve_hf_model_dir
 
+from .grammar import GrammarHelper
 from .model import FastGptOssModel
 from .paths import DEFAULT_HF_REPO, GptOssPaths, resolve_paths
 from .tokenizer import (
@@ -51,6 +53,10 @@ _EFFORT_DEFAULT_BUDGET = {
     "high": 128,
 }
 
+_REPEAT_4GRAM_WINDOW = 64
+_REPEAT_4GRAM_MIN_HITS = 2
+_REPEAT_4GRAM_PENALTY = 5.0
+
 
 @dataclass
 class GenerationItem:
@@ -63,12 +69,42 @@ class GenerationItem:
     valid_schema: bool
     finish_reason: str
     reasoning: str | None = None
+    telemetry: Any | None = None
 
 
 @dataclass
 class GenerationBatchResult:
     items: list[GenerationItem]
     stats: dict[str, Any] = field(default_factory=dict)
+
+
+def _find_repeated_4gram_penalties(
+    recent_ids: Sequence[int] | None,
+    *,
+    window: int = _REPEAT_4GRAM_WINDOW,
+    min_prior_hits: int = _REPEAT_4GRAM_MIN_HITS,
+    base_penalty: float = _REPEAT_4GRAM_PENALTY,
+) -> dict[int, float]:
+    """Return `{continuation_tok_id: penalty}` when trailing 3-gram has repeated `>= min_prior_hits` times."""
+    if not recent_ids or len(recent_ids) < (3 + min_prior_hits):
+        return {}
+    tail = recent_ids[-window:] if len(recent_ids) > window else recent_ids
+    n_tail = len(tail)
+    if n_tail < (3 + min_prior_hits):
+        return {}
+    a, b, c = int(tail[-3]), int(tail[-2]), int(tail[-1])
+    hits: dict[int, int] = {}
+    for i in range(n_tail - 3):
+        if int(tail[i]) == a and int(tail[i + 1]) == b and int(tail[i + 2]) == c:
+            d = int(tail[i + 3])
+            hits[d] = hits.get(d, 0) + 1
+    if not hits:
+        return {}
+    return {
+        d: float(base_penalty) * float(min(cnt - min_prior_hits + 1, 4))
+        for d, cnt in hits.items()
+        if cnt >= min_prior_hits
+    }
 
 
 def split_lcp_ids(prompt_ids_list: Sequence[Sequence[int]]) -> tuple[list[int], list[list[int]]]:
@@ -108,16 +144,7 @@ def resolve_reasoning_params(
     enable_thinking: bool,
     default_effort: str = "low",
 ) -> tuple[str, int]:
-    """Resolve effective `(reasoning_effort, analysis_budget)` for Harmony generation.
-
-    Rules:
-      - Open-ended chat (`has_schema=False`): defaults to `default_effort` (typically `"low"`),
-        unconstrained (`analysis_budget=0` unless caller passed an explicit `reasoning_budget > 0`).
-      - Schema-constrained extraction (`has_schema=True`): skips the analysis channel by
-        default (`"skip"`, `0`) so `llguidance` drives strict JSON immediately unless the
-        caller requested thinking (`enable_thinking=True`, explicit `reasoning_budget > 0`,
-        or explicit `reasoning_effort in ("low", "medium", "high")`).
-    """
+    """Resolve effective `(reasoning_effort, analysis_budget)` for Harmony generation."""
     if has_schema:
         req_bud = None if reasoning_budget is None else int(reasoning_budget)
         if req_bud is not None and req_bud <= 0:
@@ -188,7 +215,7 @@ def select_gpt_oss_plan(
         if mem_gib <= 26.0 and wb > mem_cap:
             warnings.warn(
                 f"Clamping wave batch_size from {wb} to {mem_cap} on {mem_gib:.1f} GiB unified-memory host "
-                f"to avoid OS swapout thrashing (gpt-oss-20b MXFP4 weights ~10.7 GiB).",
+                f"to avoid OS swapout thrashing (gpt-oss-20b MXFP4 weights ~11.3 GiB).",
                 UserWarning,
                 stacklevel=2,
             )
@@ -198,6 +225,8 @@ def select_gpt_oss_plan(
 
 class FastGptOssEngine:
     """Thread-safe hardware-limit `openai/gpt-oss-20b` inference engine."""
+
+    DEFAULT_CACHE_LIMIT_BYTES: int = 256 * 1024 * 1024
 
     def __init__(
         self,
@@ -229,10 +258,17 @@ class FastGptOssEngine:
 
         import mlx.core as mx
 
+        self._prev_cache_limit: int | None = None
         self._prev_wired_limit: int | None = None
         self._wired_limit_restored = False
         self._host_memory_bytes: int = 0
         self._max_rec_ws_bytes: int = 0
+        set_cache = getattr(mx, "set_cache_limit", None)
+        if callable(set_cache):
+            try:
+                self._prev_cache_limit = int(set_cache(self.DEFAULT_CACHE_LIMIT_BYTES))
+            except Exception:
+                self._prev_cache_limit = None
         try:
             dev_info = mx.device_info()
             self._host_memory_bytes = int(dev_info.get("memory_size", 0))
@@ -257,12 +293,13 @@ class FastGptOssEngine:
                 compile_kernels=True,
             )
             self._prefix_cache: OrderedDict[tuple[int, ...], dict[str, Any]] = OrderedDict()
-            self._grammar_cache: OrderedDict[tuple[str, bool], GrammarHelper] = OrderedDict()
+            self._grammar_cache: OrderedDict[tuple[str, bool | None, int | None], GrammarHelper] = OrderedDict()
             self._max_prefix_cache = max(1, int(max_prefix_cache_entries))
             self._max_grammar_cache = max(1, int(max_grammar_cache_entries))
 
+            self._final_channel_seq: tuple[int, ...] = self.tokenizer.final_channel_seq
+            self._start_assistant_seq: tuple[int, ...] = tuple(self.tokenizer.encode("<|start|>assistant"))
             self._trans_ids = self.tokenizer.encode("<|end|><|start|>assistant<|channel|>final<|message|>")
-            self._trans_after_end_ids = self.tokenizer.encode("<|start|>assistant<|channel|>final<|message|>")
             self._dummy_pad_id = int(self.tokenizer.encode(" ")[0]) if self.tokenizer.encode(" ") else 0
 
             if warmup:
@@ -271,10 +308,25 @@ class FastGptOssEngine:
             self._restore_wired_limit()
             raise
 
+    @property
+    def default_max_b_slots(self) -> int:
+        return recommended_max_wave_batch(getattr(self, "_host_memory_bytes", 0) or None)
+
     def _restore_wired_limit(self) -> None:
         if getattr(self, "_wired_limit_restored", True):
             return
         self._wired_limit_restored = True
+        prev_cl = getattr(self, "_prev_cache_limit", None)
+        if prev_cl is not None:
+            try:
+                import mlx.core as mx
+
+                set_cache = getattr(mx, "set_cache_limit", None)
+                if callable(set_cache):
+                    set_cache(prev_cl)
+            except Exception:
+                pass
+            self._prev_cache_limit = None
         prev = getattr(self, "_prev_wired_limit", None)
         if prev is not None:
             try:
@@ -313,6 +365,7 @@ class FastGptOssEngine:
             c = self.model.make_b1_cache(4)
             lg = self.model.forward_b1(mx.array([[self._dummy_pad_id, self._dummy_pad_id]], dtype=mx.int32), c, last_only=True)
             mx.eval(lg)
+            self.model._last_hf_2d = None
             del c, lg
             mx.clear_cache()
 
@@ -320,21 +373,24 @@ class FastGptOssEngine:
         self,
         json_schema: str | dict[str, Any] | Any | None,
         *,
-        whitespace_flexible: bool,
+        whitespace_flexible: bool | None = None,
+        max_whitespace_run: int | None = None,
     ) -> GrammarHelper | Any | None:
         if json_schema is None:
             return None
         if not isinstance(json_schema, (str, dict)):
             return json_schema
         schema_str = normalize_json_schema(json_schema)
-        key = (schema_str, bool(whitespace_flexible))
+        norm_ws: bool | None = None if whitespace_flexible is None else bool(whitespace_flexible)
+        key = (schema_str, norm_ws, max_whitespace_run)
         helper = self._grammar_cache.get(key)
         if helper is None:
             helper = GrammarHelper(
                 self.tokenizer,
                 schema_str,
                 new_to_old=self.model.new_to_old,
-                whitespace_flexible=whitespace_flexible,
+                whitespace_flexible=norm_ws,
+                max_whitespace_run=max_whitespace_run,
                 eos_token_id=self.tokenizer.return_token_id,
             )
             self._grammar_cache[key] = helper
@@ -343,6 +399,8 @@ class FastGptOssEngine:
         else:
             self._grammar_cache.move_to_end(key)
         return helper
+
+    get_grammar = _get_grammar
 
     def _get_or_compute_prefix(self, prefix_ids: list[int]) -> tuple[dict[str, Any], float, bool]:
         if len(prefix_ids) < self.min_prefix_cache_tokens:
@@ -435,6 +493,11 @@ class FastGptOssEngine:
     ) -> dict[str, Any]:
         import mlx.core as mx
 
+        hf_2d = getattr(self.model, "_last_hf_2d", None)
+        if hasattr(self.model, "_last_hf_2d"):
+            self.model._last_hf_2d = None
+        keep_hf = hf_2d if (has_grammar and hf_2d is not None and getattr(self.model, "_cold_lm_head", None) is not None) else None
+
         if self._should_use_gpu_top128(lg_2d, temperature=temperature, top_p=top_p):
             k_cand = 128
             lg_f32 = lg_2d.astype(mx.float32)
@@ -443,22 +506,37 @@ class FastGptOssEngine:
             lse_mx = mx.logsumexp(scaled, axis=-1)
             top_idx_mx = mx.argpartition(-scaled, kth=k_cand - 1, axis=-1)[:, :k_cand]
             top_scaled_mx = mx.take_along_axis(scaled, top_idx_mx, axis=-1)
-            mx.eval(top_idx_mx, top_scaled_mx, lse_mx)
+            if keep_hf is not None:
+                mx.eval(top_idx_mx, top_scaled_mx, lse_mx, keep_hf)
+            else:
+                mx.eval(top_idx_mx, top_scaled_mx, lse_mx)
             return {
                 "mode": "top128",
                 "lg_2d": lg_2d,
+                "hf_2d": keep_hf,
                 "top_idx_np": np.asarray(top_idx_mx, dtype=np.int32),
                 "top_scaled_np": np.asarray(top_scaled_mx, dtype=np.float32),
                 "lse_np": np.asarray(lse_mx, dtype=np.float32),
             }
 
         top1_mx = mx.argmax(lg_2d, axis=-1)
-        mx.eval(top1_mx)
+        if keep_hf is not None:
+            mx.eval(top1_mx, keep_hf)
+        else:
+            mx.eval(top1_mx)
         return {
             "mode": "top1",
             "lg_2d": lg_2d,
+            "hf_2d": keep_hf,
             "top1_cpu": top1_mx.tolist(),
         }
+
+    def _map_old_to_pruned_idx(self, old_tid: int, n2o: np.ndarray) -> int:
+        o2n = getattr(self.model, "old_to_new", None)
+        if o2n is not None and 0 <= old_tid < len(o2n) and n2o is self.model.new_to_old:
+            return int(o2n[old_tid])
+        matches = np.flatnonzero(n2o == int(old_tid))
+        return int(matches[0]) if matches.size > 0 else -1
 
     def _sample_row_from_eval(
         self,
@@ -471,13 +549,19 @@ class FastGptOssEngine:
         top_p: float,
         rng: np.random.Generator,
         stats_counters: dict[str, int] | None = None,
+        recent_ids: Sequence[int] | None = None,
     ) -> tuple[int, bool]:
         import mlx.core as mx
 
         lg_2d = eval_pack["lg_2d"]
         step_was_masked = [False]
+        penalties = _find_repeated_4gram_penalties(recent_ids)
+        n2o = getattr(grammar, "new_to_old", self.model.new_to_old) if grammar is not None else self.model.new_to_old
+        cached_row: list[np.ndarray | None] = [None]
 
         def _lazy_full_row() -> np.ndarray:
+            if cached_row[0] is not None:
+                return cached_row[0]
             if stats_counters is not None:
                 stats_counters["full_vocab_logit_copies"] = (
                     stats_counters.get("full_vocab_logit_copies", 0) + 1
@@ -486,10 +570,43 @@ class FastGptOssEngine:
                     stats_counters["unmasked_full_vocab_logit_copies"] = (
                         stats_counters.get("unmasked_full_vocab_logit_copies", 0) + 1
                     )
-            return np.array(lg_2d[row_idx].astype(mx.float32), copy=False)
+            arr = np.array(lg_2d[row_idx].astype(mx.float32), copy=bool(penalties))
+            if penalties:
+                for old_tid, pen in penalties.items():
+                    if len(arr) > len(n2o) and 0 <= old_tid < len(arr):
+                        arr[old_tid] -= pen
+                    else:
+                        pj = self._map_old_to_pruned_idx(old_tid, n2o)
+                        if 0 <= pj < len(arr):
+                            arr[pj] -= pen
+            cached_row[0] = arr
+            return arr
+
+        def _lazy_full_vocab_row() -> np.ndarray:
+            compute_fn = getattr(self.model, "compute_full_logits_1d", None)
+            if callable(compute_fn):
+                raw_pruned = np.array(lg_2d[row_idx].astype(mx.float32), copy=False)
+                full_arr = compute_fn(raw_pruned, row_idx=row_idx, hf_2d=eval_pack.get("hf_2d"))
+                if full_arr is not None:
+                    if penalties:
+                        full_arr = np.array(full_arr, copy=True)
+                        for old_tid, pen in penalties.items():
+                            if 0 <= old_tid < len(full_arr):
+                                full_arr[old_tid] -= pen
+                    return full_arr
+            return _lazy_full_row()
+
+        has_cold_head = getattr(self.model, "_cold_lm_head", None) is not None
+        full_logits_cb = _lazy_full_vocab_row if has_cold_head else None
 
         if eval_pack["mode"] == "top1":
             top1_new = int(eval_pack["top1_cpu"][row_idx])
+            if penalties:
+                top1_old = int(n2o[top1_new]) if 0 <= top1_new < len(n2o) else -1
+                if top1_old in penalties or temperature > 0.0:
+                    step_was_masked[0] = grammar is not None
+                    biased = _lazy_full_row()
+                    top1_new = int(np.argmax(biased))
             if grammar is not None:
                 step_was_masked[0] = True
                 return grammar.pick_valid_token(
@@ -500,6 +617,7 @@ class FastGptOssEngine:
                     top_p=top_p,
                     rng=rng,
                     fallback_to_full_vocab=True,
+                    full_logits_1d=full_logits_cb,
                 )
             if temperature <= 0.0:
                 return int(self.model.new_to_old[top1_new]), False
@@ -528,7 +646,10 @@ class FastGptOssEngine:
         m_max = float(s_sorted[0])
         s_kth = float(s_sorted[-1])
 
-        if np.isfinite(m_max) and np.isfinite(lse_val):
+        cand_old_all = n2o[idx_sorted]
+        has_top128_penalty = bool(penalties) and any(int(t) in penalties for t in cand_old_all)
+
+        if not has_top128_penalty and np.isfinite(m_max) and np.isfinite(lse_val):
             w_128 = np.exp(s_sorted - m_max)
             sum_top128 = float(w_128.sum())
             z_all = float(np.exp(lse_val - m_max))
@@ -538,12 +659,17 @@ class FastGptOssEngine:
             z_tail_hi = min(z_rem + 1e-6 * max(z_all, 1.0), tail_cap_kth)
 
             if grammar is not None:
-                n2o = getattr(grammar, "new_to_old", self.model.new_to_old)
-                cand_old = n2o[idx_sorted]
+                cand_old = cand_old_all
                 mask_owner = grammar if hasattr(grammar, "_mask_ptr") else getattr(grammar, "_gh_std", None)
                 if mask_owner is not None and hasattr(matcher, "unsafe_compute_mask_ptr"):
-                    matcher.unsafe_compute_mask_ptr(mask_owner._mask_ptr, mask_owner._mask_nbytes)
-                    cand_ok = ((mask_owner._mask_buf[cand_old >> 5] >> (cand_old & 31)) & 1) != 0
+                    lock_ctx = getattr(mask_owner, "_mask_lock", None)
+                    if lock_ctx is not None:
+                        with lock_ctx:
+                            matcher.unsafe_compute_mask_ptr(mask_owner._mask_ptr, mask_owner._mask_nbytes)
+                            cand_ok = ((mask_owner._mask_buf[cand_old >> 5] >> (cand_old & 31)) & 1) != 0
+                    else:
+                        matcher.unsafe_compute_mask_ptr(mask_owner._mask_ptr, mask_owner._mask_nbytes)
+                        cand_ok = ((mask_owner._mask_buf[cand_old >> 5] >> (cand_old & 31)) & 1) != 0
                 elif hasattr(matcher, "validate_tokens"):
                     cand_ok = np.array(
                         [bool(matcher.validate_tokens([int(t)])) for t in cand_old],
@@ -586,6 +712,7 @@ class FastGptOssEngine:
                     top_p=top_p,
                     rng=rng,
                     fallback_to_full_vocab=True,
+                    full_logits_1d=full_logits_cb,
                 )
 
             cum_w = np.cumsum(w_128)
@@ -605,6 +732,10 @@ class FastGptOssEngine:
                         )
                     return int(self.model.new_to_old[picked_new]), False
 
+        if has_top128_penalty:
+            step_was_masked[0] = grammar is not None
+            biased_row = _lazy_full_row()
+            top1_new = int(np.argmax(biased_row))
         if grammar is not None:
             return grammar.pick_valid_token(
                 matcher,
@@ -614,6 +745,7 @@ class FastGptOssEngine:
                 top_p=top_p,
                 rng=rng,
                 fallback_to_full_vocab=True,
+                full_logits_1d=full_logits_cb,
             )
         row_np = _lazy_full_row()
         return (
@@ -630,40 +762,55 @@ class FastGptOssEngine:
             False,
         )
 
-    def _sample_row_unconstrained(
+    def _advance_channel_and_check_stop(
         self,
-        logits_row_mx: Any,
-        top1_new: int,
-        *,
-        temperature: float,
-        top_p: float,
-        rng: np.random.Generator,
-    ) -> int:
-        import mlx.core as mx
+        tok_id: int,
+        out_ids: list[int],
+        in_final_channel: bool,
+    ) -> tuple[bool, bool]:
+        """Advance persistent per-slot `in_final_channel` state on `tok_id` (already appended to `out_ids`)
+        and return `(in_final_channel, should_stop)`."""
+        if not in_final_channel:
+            fseq = getattr(self, "_final_channel_seq", None) or getattr(self.tokenizer, "final_channel_seq", ())
+            n_f = len(fseq)
+            if n_f > 0 and tok_id == fseq[-1] and len(out_ids) >= n_f:
+                if tuple(out_ids[-n_f:]) == fseq:
+                    in_final_channel = True
+        if tok_id in self.tokenizer.analysis_stop_token_ids:
+            return in_final_channel, True
+        if in_final_channel and tok_id == self.tokenizer.end_token_id:
+            return in_final_channel, True
+        return in_final_channel, False
 
-        if temperature <= 0.0:
-            return int(self.model.new_to_old[top1_new])
-        logits_np = np.array(logits_row_mx.astype(mx.float32), copy=False)
-        return int(
-            sample_unconstrained(
-                logits_np,
-                self.model.new_to_old,
-                top1_new,
-                temperature=temperature,
-                top_p=top_p,
-                rng=rng,
-            )
-        )
+    def _strip_trailing_final_header(self, ids: list[int]) -> list[int]:
+        fseq = tuple(getattr(self, "_final_channel_seq", None) or getattr(self.tokenizer, "final_channel_seq", ()))
+        n_f = len(fseq)
+        if n_f <= 0 or len(ids) < n_f or tuple(ids[-n_f:]) != fseq:
+            return ids
+        trimmed = ids[:-n_f]
+        sa_seq = getattr(self, "_start_assistant_seq", None)
+        if sa_seq is None and hasattr(self.tokenizer, "encode"):
+            try:
+                sa_seq = tuple(self.tokenizer.encode("<|start|>assistant"))
+            except Exception:
+                sa_seq = ()
+        if sa_seq and len(trimmed) >= len(sa_seq) and tuple(trimmed[-len(sa_seq) :]) == tuple(sa_seq):
+            trimmed = trimmed[: -len(sa_seq)]
+        return trimmed
 
-    def _is_unconstrained_stop(self, tok_id: int, out_ids: list[int], started_in_final: bool) -> bool:
+    def _is_unconstrained_stop(self, tok_id: int, out_ids: list[int], in_final_channel: bool) -> bool:
         if tok_id in self.tokenizer.analysis_stop_token_ids:
             return True
         if tok_id == self.tokenizer.end_token_id:
-            if started_in_final:
+            if in_final_channel:
                 return True
-            tail = self.tokenizer.decode(out_ids[-32:], skip_special_tokens=False)
-            if "<|channel|>final<|message|>" in tail:
-                return True
+            fseq = getattr(self, "_final_channel_seq", None) or getattr(self.tokenizer, "final_channel_seq", ())
+            n_f = len(fseq)
+            if n_f > 0 and len(out_ids) >= n_f:
+                f0 = fseq[0]
+                for k in range(len(out_ids) - n_f, -1, -1):
+                    if out_ids[k] == f0 and tuple(out_ids[k : k + n_f]) == fseq:
+                        return True
         return False
 
     @staticmethod
@@ -691,7 +838,7 @@ class FastGptOssEngine:
         grammar: GrammarHelper | Any | None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
         doc_index: int = 0,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = None,
         shared_prefix: dict[str, Any] | None,
         prefix_len: int,
         max_tokens: int,
@@ -718,24 +865,30 @@ class FastGptOssEngine:
         samp_stats: dict[str, int] = {"top128_fast_hits": 0, "full_vocab_logit_copies": 0}
 
         t0 = time.perf_counter()
+        ff0_est = len(self._doc_upfront_ff(eff_grammar, doc_index)) if eff_grammar is not None else 0
+        max_out_cap = max(max_tokens, ff0_est) + len(getattr(self, "_trans_ids", ())) + 32
         if shared_prefix is not None and prefix_len > 0:
             c1 = self.model.clone_b1_cache_from_prefix(
-                shared_prefix, prefix_len + len(suf) + analysis_budget + max_tokens + 32
+                shared_prefix, prefix_len + len(suf) + analysis_budget + max_out_cap
             )
         else:
-            c1 = self.model.make_b1_cache(len(suf) + analysis_budget + max_tokens + 32)
+            c1 = self.model.make_b1_cache(len(suf) + analysis_budget + max_out_cap)
 
         t_dec0 = time.perf_counter()
         t_pp = 0.0
 
-        # Case 1: Schema-constrained with budgeted Harmony reasoning before final JSON.
-        if eff_grammar is not None and analysis_budget > 0:
+        # Case 1: Two-phase budgeted Harmony reasoning (`analysis_budget > 0`) for constrained & unconstrained!
+        if analysis_budget > 0 and not started_in_final:
             lg_2d = self.model.forward_b1(mx.array(suf, dtype=mx.int32)[None, :], c1, last_only=True)[0]
             eval_pack = self._eval_logits_for_sampling(lg_2d, temperature=temperature, top_p=top_p)
             t_pp = time.perf_counter() - t0
             t_dec0 = time.perf_counter()
 
-            closed_by_model = False
+            p1_ids: list[int] = []
+            pending_last_ana: int | None = None
+            already_in_final = False
+            stopped_in_p1 = False
+            out_ids: list[int] = []
             for _ in range(analysis_budget):
                 tok_orig, _ = self._sample_row_from_eval(
                     eval_pack,
@@ -746,55 +899,134 @@ class FastGptOssEngine:
                     top_p=top_p,
                     rng=rng,
                     stats_counters=samp_stats,
+                    recent_ids=p1_ids,
                 )
                 lg_2d = None
                 eval_pack = None  # type: ignore[assignment]
-                if tok_orig in self.tokenizer.final_stop_token_ids:
-                    closed_by_model = True
+                if eff_grammar is None and tok_orig == self.tokenizer.call_token_id:
+                    out_ids = [tok_orig]
+                    stopped_in_p1 = True
                     break
-                ana_ids.append(tok_orig)
+                if tok_orig in self.tokenizer.final_stop_token_ids:
+                    break
+                p1_ids.append(tok_orig)
+                in_fin_p1, _ = self._advance_channel_and_check_stop(tok_orig, p1_ids, False)
+                if in_fin_p1:
+                    p1_ids = self._strip_trailing_final_header(p1_ids)
+                    already_in_final = True
+                    pending_last_ana = tok_orig
+                    break
+                if len(p1_ids) >= analysis_budget:
+                    pending_last_ana = tok_orig
+                    break
                 steps += 1
                 lg_2d = self.model.forward_b1(mx.array([[tok_orig]], dtype=mx.int32), c1, last_only=True)[0]
                 eval_pack = self._eval_logits_for_sampling(lg_2d, temperature=temperature, top_p=top_p)
 
-            inj = list(self._trans_after_end_ids if closed_by_model else self._trans_ids)
-            matcher = self._new_doc_matcher(eff_grammar, doc_index)
-            ff0 = self._doc_upfront_ff(eff_grammar, doc_index)
-            if ff0:
-                ff_skipped += len(ff0)
-            chunk = inj + ff0
-            lg_2d = self.model.forward_b1(mx.array(chunk, dtype=mx.int32)[None, :], c1, last_only=True)[0]
-            eval_pack = self._eval_logits_for_sampling(lg_2d, temperature=temperature, top_p=top_p, has_grammar=True)
-            out_ids = list(ff0)
-            ff_ref = [ff_skipped]
-            out_ids, mask_hits, fallbacks, steps_json = self._finish_b1_grammar_loop(
-                c1,
-                eval_pack,
-                matcher,
-                eff_grammar,
-                out_ids,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                rng=rng,
-                mask_hits=mask_hits,
-                fallbacks=fallbacks,
-                ff_skipped_ref=ff_ref,
-                stats_counters=samp_stats,
-            )
-            ff_skipped = ff_ref[0]
+            ana_ids = p1_ids
+            if stopped_in_p1:
+                t_dec = time.perf_counter() - t_dec0
+                del c1
+                return {
+                    "out_ids": out_ids,
+                    "ana_ids": ana_ids,
+                    "two_phase_final": True,
+                    "ff_skipped": 0,
+                    "mask_hits": 0,
+                    "fallbacks": 0,
+                    "prefill_sec": t_pp,
+                    "decode_sec": t_dec,
+                    "steps": steps,
+                    "finished": True,
+                    "ff_lm_head_skipped_steps": 0,
+                    "top128_fast_hits": samp_stats["top128_fast_hits"],
+                    "full_vocab_logit_copies": samp_stats["full_vocab_logit_copies"],
+                    "unmasked_full_vocab_logit_copies": samp_stats.get("unmasked_full_vocab_logit_copies", 0),
+                }
+
+            inj_prefix = [pending_last_ana] if pending_last_ana is not None else []
+            trans_part = [] if already_in_final else list(self._trans_ids)
+            if eff_grammar is not None:
+                matcher = self._new_doc_matcher(eff_grammar, doc_index)
+                ff0 = self._doc_upfront_ff(eff_grammar, doc_index)
+                if ff0:
+                    ff_skipped += len(ff0)
+                chunk = inj_prefix + trans_part + ff0
+                lg_2d = self.model.forward_b1(mx.array(chunk, dtype=mx.int32)[None, :], c1, last_only=True)[0]
+                eval_pack = self._eval_logits_for_sampling(
+                    lg_2d, temperature=temperature, top_p=top_p, has_grammar=True
+                )
+                out_ids = list(ff0)
+                ff_ref = [ff_skipped]
+                out_ids, mask_hits, fallbacks, steps_p2 = self._finish_b1_grammar_loop(
+                    c1,
+                    eval_pack,
+                    matcher,
+                    eff_grammar,
+                    out_ids,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    rng=rng,
+                    mask_hits=mask_hits,
+                    fallbacks=fallbacks,
+                    ff_skipped_ref=ff_ref,
+                    stats_counters=samp_stats,
+                )
+                ff_skipped = ff_ref[0]
+                finished_p2 = bool(matcher.is_stopped())
+            else:
+                chunk = inj_prefix + trans_part
+                lg_2d = self.model.forward_b1(mx.array(chunk, dtype=mx.int32)[None, :], c1, last_only=True)[0]
+                eval_pack = self._eval_logits_for_sampling(
+                    lg_2d, temperature=temperature, top_p=top_p, has_grammar=False
+                )
+                out_ids = []
+                finished_p2 = False
+                in_final_p2 = True
+                steps_p2 = 0
+                while len(out_ids) < max_tokens:
+                    tok_orig, _ = self._sample_row_from_eval(
+                        eval_pack,
+                        0,
+                        grammar=None,
+                        matcher=None,
+                        temperature=temperature,
+                        top_p=top_p,
+                        rng=rng,
+                        stats_counters=samp_stats,
+                        recent_ids=out_ids,
+                    )
+                    lg_2d = None
+                    eval_pack = None  # type: ignore[assignment]
+                    out_ids.append(tok_orig)
+                    in_final_p2, should_stop = self._advance_channel_and_check_stop(
+                        tok_orig, out_ids, in_final_p2
+                    )
+                    if should_stop:
+                        finished_p2 = True
+                        break
+                    if len(out_ids) >= max_tokens:
+                        break
+                    lg_2d = self.model.forward_b1(mx.array([[tok_orig]], dtype=mx.int32), c1, last_only=True)[0]
+                    eval_pack = self._eval_logits_for_sampling(
+                        lg_2d, temperature=temperature, top_p=top_p, has_grammar=False
+                    )
+                    steps_p2 += 1
+
             t_dec = time.perf_counter() - t_dec0
             del c1
             return {
                 "out_ids": out_ids,
                 "ana_ids": ana_ids,
+                "two_phase_final": True,
                 "ff_skipped": ff_skipped,
                 "mask_hits": mask_hits,
                 "fallbacks": fallbacks,
                 "prefill_sec": t_pp,
                 "decode_sec": t_dec,
-                "steps": steps + steps_json,
-                "finished": bool(matcher.is_stopped()),
+                "steps": steps + steps_p2,
+                "finished": finished_p2,
                 "ff_lm_head_skipped_steps": 0,
                 "top128_fast_hits": samp_stats["top128_fast_hits"],
                 "full_vocab_logit_copies": samp_stats["full_vocab_logit_copies"],
@@ -854,6 +1086,7 @@ class FastGptOssEngine:
 
         out_ids = []
         finished = False
+        in_final = bool(started_in_final)
         while len(out_ids) < max_tokens:
             tok_orig, _ = self._sample_row_from_eval(
                 eval_pack,
@@ -864,11 +1097,13 @@ class FastGptOssEngine:
                 top_p=top_p,
                 rng=rng,
                 stats_counters=samp_stats,
+                recent_ids=out_ids,
             )
             lg_2d = None
             eval_pack = None  # type: ignore[assignment]
             out_ids.append(tok_orig)
-            if self._is_unconstrained_stop(tok_orig, out_ids, started_in_final):
+            in_final, should_stop = self._advance_channel_and_check_stop(tok_orig, out_ids, in_final)
+            if should_stop:
                 finished = True
                 break
             if len(out_ids) >= max_tokens:
@@ -927,6 +1162,7 @@ class FastGptOssEngine:
                 top_p=top_p,
                 rng=rng,
                 stats_counters=stats_counters,
+                recent_ids=out_ids,
             )
             cur_pack = None
             mask_hits += int(was_masked)
@@ -966,12 +1202,13 @@ class FastGptOssEngine:
         *,
         grammar: GrammarHelper | Any | None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = None,
         max_tokens: int,
         temperature: float,
         top_p: float,
         rng: np.random.Generator,
         started_in_final: bool,
+        analysis_budget: int = 0,
         chunk_docs: int = 8,
     ) -> dict[str, Any]:
         import mlx.core as mx
@@ -989,45 +1226,201 @@ class FastGptOssEngine:
         else:
             doc_grammars = [grammar] * b_sz
 
-        prefix_ids, base_sufs = split_lcp_ids(prompt_ids_wave)
+        prefix_ids, _ = split_lcp_ids(prompt_ids_wave)
         sp, prefix_sec, prefix_hit = self._get_or_compute_prefix(prefix_ids)
         l_sys = int(sp["L_sys"])
         suf_lists = [list(ids[l_sys:]) for ids in prompt_ids_wave] if l_sys > 0 else [list(ids) for ids in prompt_ids_wave]
 
         ff_q: list[deque[int]] = [deque() for _ in range(b_sz)]
         out_ids: list[list[int]] = [[] for _ in range(b_sz)]
+        ana_ids: list[list[int]] = [[] for _ in range(b_sz)]
         ff_skipped = [0] * b_sz
         mask_hits = [0] * b_sz
         finished_flags = [False] * b_sz
+        in_final_slots = [bool(started_in_final)] * b_sz
         matchers = [self._new_doc_matcher(doc_grammars[i], i) for i in range(b_sz)]
         samp_stats: dict[str, int] = {"top128_fast_hits": 0, "full_vocab_logit_copies": 0}
+        any_wave_grammar = any(g is not None for g in doc_grammars)
+        two_phase_budgeted = bool(analysis_budget > 0 and not started_in_final)
 
-        for i in range(b_sz):
-            g_i = doc_grammars[i]
-            if g_i is not None:
-                ff0 = self._doc_upfront_ff(g_i, i)
+        steps = 0
+        t_pp = 0.0
+        t_dec0 = time.perf_counter()
+
+        if two_phase_budgeted:
+            ff0_per_doc = [
+                self._doc_upfront_ff(doc_grammars[i], i) if doc_grammars[i] is not None else []
+                for i in range(b_sz)
+            ]
+            max_ff0 = max((len(f) for f in ff0_per_doc), default=0)
+            suf_max_alloc = max(len(s) for s in suf_lists) + analysis_budget + len(self._trans_ids) + max_ff0 + 4
+            bc = self.model.alloc_batch_cache(sp, B=b_sz, suf_max=suf_max_alloc, max_dec=max_tokens)
+
+            t_pp0 = time.perf_counter()
+            lg_p1 = self.model.prefill_batch_suffixes(suf_lists, bc, chunk_docs=chunk_docs)
+            eval_p1 = self._eval_logits_for_sampling(lg_p1, temperature=temperature, top_p=top_p, has_grammar=False)
+            t_pp = time.perf_counter() - t_pp0
+            t_dec0 = time.perf_counter()
+
+            p1_ids: list[list[int]] = [[] for _ in range(b_sz)]
+            p1_done_steps = [0] * b_sz
+            pending_last_ana: list[int | None] = [None] * b_sz
+            already_in_final = [False] * b_sz
+            already_stopped_p1 = [False] * b_sz
+            saved_swa: list[list[tuple[Any, Any]] | None] = [None] * b_sz
+            active_p1 = list(range(b_sz))
+
+            def _snapshot_slot_swa(slot_b: int) -> None:
+                layers_bc = bc.get("layers") or []
+                if not layers_bc or "swa_init_lens_arr" not in bc:
+                    return
+                d_b = int(bc.get("swa_write", 0))
+                init_b = int(bc["swa_init_lens_arr"][slot_b].item())
+                swa_cap = int(getattr(self.model, "swa", 128))
+                valid_b = min(swa_cap, init_b + d_b)
+                snaps: list[tuple[Any, Any]] = []
+                to_ev: list[Any] = []
+                for lc in layers_bc:
+                    if lc.get("is_full"):
+                        continue
+                    if valid_b > 0:
+                        ring_idx = mx.arange(d_b - valid_b, d_b, dtype=mx.int32) % swa_cap
+                        kp = mx.take(lc["k_swa"][slot_b : slot_b + 1], ring_idx, axis=2)
+                        vp = mx.take(lc["v_swa"][slot_b : slot_b + 1], ring_idx, axis=2)
+                        snaps.append((kp, vp))
+                        to_ev.extend((kp, vp))
+                    else:
+                        snaps.append((None, None))  # type: ignore[arg-type]
+                if to_ev:
+                    mx.eval(*to_ev)  # guard: allow-eval
+                saved_swa[slot_b] = snaps
+
+            for _ in range(analysis_budget):
+                next_active_p1: list[int] = []
+                next_feed_toks: list[int] = []
+                just_finished: list[int] = []
+                cur_dec_cnt = int(bc.get("dec_cnt", 0))
+
+                for r_i, orig_i in enumerate(active_p1):
+                    tok_a, _ = self._sample_row_from_eval(
+                        eval_p1,
+                        r_i,
+                        grammar=None,
+                        matcher=None,
+                        temperature=temperature,
+                        top_p=top_p,
+                        rng=rng,
+                        stats_counters=samp_stats,
+                        recent_ids=p1_ids[orig_i],
+                    )
+                    if doc_grammars[orig_i] is None and tok_a == self.tokenizer.call_token_id:
+                        p1_done_steps[orig_i] = cur_dec_cnt
+                        out_ids[orig_i].append(tok_a)
+                        finished_flags[orig_i] = True
+                        already_stopped_p1[orig_i] = True
+                        just_finished.append(orig_i)
+                        continue
+                    if tok_a in self.tokenizer.final_stop_token_ids:
+                        p1_done_steps[orig_i] = cur_dec_cnt
+                        just_finished.append(orig_i)
+                        continue
+                    p1_ids[orig_i].append(tok_a)
+                    in_fin_p1, _ = self._advance_channel_and_check_stop(tok_a, p1_ids[orig_i], False)
+                    if in_fin_p1:
+                        p1_ids[orig_i] = self._strip_trailing_final_header(p1_ids[orig_i])
+                        p1_done_steps[orig_i] = cur_dec_cnt
+                        pending_last_ana[orig_i] = tok_a
+                        already_in_final[orig_i] = True
+                        just_finished.append(orig_i)
+                        continue
+                    if len(p1_ids[orig_i]) >= analysis_budget:
+                        p1_done_steps[orig_i] = cur_dec_cnt
+                        pending_last_ana[orig_i] = tok_a
+                        just_finished.append(orig_i)
+                        continue
+                    next_active_p1.append(orig_i)
+                    next_feed_toks.append(tok_a)
+
+                lg_p1 = None
+                eval_p1 = None  # type: ignore[assignment]
+                if not next_active_p1:
+                    break
+                for done_i in just_finished:
+                    _snapshot_slot_swa(done_i)
+
+                padded_p1 = [self._dummy_pad_id] * b_sz
+                for orig_i, nt in zip(next_active_p1, next_feed_toks):
+                    padded_p1[orig_i] = nt
+                samp_idx_p1 = (
+                    mx.array(next_active_p1, dtype=mx.int32)
+                    if len(next_active_p1) < b_sz
+                    else None
+                )
+                lg_p1 = self.model.decode_step_batch(
+                    mx.array(padded_p1, dtype=mx.int32), bc, samp_indices=samp_idx_p1
+                )
+                eval_p1 = self._eval_logits_for_sampling(
+                    lg_p1, temperature=temperature, top_p=top_p, has_grammar=False
+                )
+                steps += 1
+                active_p1 = next_active_p1
+
+            ana_ids = p1_ids
+            extra_lists: list[list[int]] = []
+            for i in range(b_sz):
+                if already_stopped_p1[i]:
+                    extra_lists.append([self._dummy_pad_id])
+                    in_final_slots[i] = True
+                    continue
+                chunk_i = [pending_last_ana[i]] if pending_last_ana[i] is not None else []
+                if not already_in_final[i]:
+                    chunk_i.extend(self._trans_ids)
+                ff0 = ff0_per_doc[i]
                 if ff0:
-                    suf_lists[i] = suf_lists[i] + ff0
+                    chunk_i.extend(ff0)
                     out_ids[i].extend(ff0)
                     ff_skipped[i] += len(ff0)
+                if not chunk_i:
+                    chunk_i.append(self._dummy_pad_id)
+                extra_lists.append(chunk_i)
+                in_final_slots[i] = True
 
-        suf_max = max(len(s) for s in suf_lists)
-        bc = self.model.alloc_batch_cache(sp, B=b_sz, suf_max=suf_max, max_dec=max_tokens)
+            lg = self.model.append_batch_suffixes(
+                extra_lists,
+                bc,
+                p1_done_steps=p1_done_steps,
+                saved_swa=saved_swa,
+                chunk_docs=chunk_docs,
+            )
+            del saved_swa
+            eval_pack = self._eval_logits_for_sampling(
+                lg, temperature=temperature, top_p=top_p, has_grammar=any_wave_grammar
+            )
+        else:
+            for i in range(b_sz):
+                g_i = doc_grammars[i]
+                if g_i is not None:
+                    ff0 = self._doc_upfront_ff(g_i, i)
+                    if ff0:
+                        suf_lists[i] = suf_lists[i] + ff0
+                        out_ids[i].extend(ff0)
+                        ff_skipped[i] += len(ff0)
 
-        any_wave_grammar = any(g is not None for g in doc_grammars)
-        t_pp0 = time.perf_counter()
-        lg = self.model.prefill_batch_suffixes(suf_lists, bc, chunk_docs=chunk_docs)
-        eval_pack = self._eval_logits_for_sampling(
-            lg, temperature=temperature, top_p=top_p, has_grammar=any_wave_grammar
-        )
-        t_pp = time.perf_counter() - t_pp0
+            suf_max = max(len(s) for s in suf_lists)
+            bc = self.model.alloc_batch_cache(sp, B=b_sz, suf_max=suf_max, max_dec=max_tokens)
 
-        t_dec0 = time.perf_counter()
+            t_pp0 = time.perf_counter()
+            lg = self.model.prefill_batch_suffixes(suf_lists, bc, chunk_docs=chunk_docs)
+            eval_pack = self._eval_logits_for_sampling(
+                lg, temperature=temperature, top_p=top_p, has_grammar=any_wave_grammar
+            )
+            t_pp = time.perf_counter() - t_pp0
+            t_dec0 = time.perf_counter()
+
         active_orig = list(range(b_sz))
         b1_tail_mode = False
         b1_cache: list[dict[str, Any]] | None = None
         b1_orig_idx: int | None = None
-        steps = 0
         ff_lm_head_skipped_steps = 0
         compactions = 0
         stop_ids = self.tokenizer.final_stop_token_ids
@@ -1043,6 +1436,10 @@ class FastGptOssEngine:
             next_toks: list[int] = []
             samp_row = 0
             for loc_i, orig_i in zip(step_locals, step_origs):
+                if finished_flags[orig_i]:
+                    if cur_pack is not None:
+                        samp_row += 1
+                    continue
                 g_i = doc_grammars[orig_i]
                 if g_i is not None:
                     if ff_q[orig_i]:
@@ -1062,6 +1459,11 @@ class FastGptOssEngine:
                         keep_orig.append(orig_i)
                         next_toks.append(tok)
                         continue
+                    if matchers[orig_i].is_stopped():
+                        finished_flags[orig_i] = True
+                        if cur_pack is not None:
+                            samp_row += 1
+                        continue
 
                     assert cur_pack is not None
                     tok, was_masked = self._sample_row_from_eval(
@@ -1073,6 +1475,7 @@ class FastGptOssEngine:
                         top_p=top_p,
                         rng=rng,
                         stats_counters=samp_stats,
+                        recent_ids=out_ids[orig_i],
                     )
                     samp_row += 1
                     mask_hits[orig_i] += int(was_masked)
@@ -1104,10 +1507,15 @@ class FastGptOssEngine:
                         top_p=top_p,
                         rng=rng,
                         stats_counters=samp_stats,
+                        recent_ids=out_ids[orig_i],
                     )
                     samp_row += 1
                     out_ids[orig_i].append(tok)
-                    if self._is_unconstrained_stop(tok, out_ids[orig_i], started_in_final):
+                    in_fin, should_stop = self._advance_channel_and_check_stop(
+                        tok, out_ids[orig_i], in_final_slots[orig_i]
+                    )
+                    in_final_slots[orig_i] = in_fin
+                    if should_stop:
                         finished_flags[orig_i] = True
                         continue
                     if len(out_ids[orig_i]) >= max_tokens:
@@ -1179,6 +1587,7 @@ class FastGptOssEngine:
                         top_p=top_p,
                         rng=rng,
                         stats_counters=samp_stats,
+                        recent_ids=out_ids[orig_i],
                     )
                     mask_hits[orig_i] += int(was_masked)
                     if not matchers[orig_i].consume_token(tok):
@@ -1204,10 +1613,15 @@ class FastGptOssEngine:
                         top_p=top_p,
                         rng=rng,
                         stats_counters=samp_stats,
+                        recent_ids=out_ids[orig_i],
                     )
                     out_ids[orig_i].append(tok)
-                    if self._is_unconstrained_stop(tok, out_ids[orig_i], started_in_final) or len(out_ids[orig_i]) >= max_tokens:
-                        finished_flags[orig_i] = self._is_unconstrained_stop(tok, out_ids[orig_i], started_in_final)
+                    in_fin, should_stop = self._advance_channel_and_check_stop(
+                        tok, out_ids[orig_i], in_final_slots[orig_i]
+                    )
+                    in_final_slots[orig_i] = in_fin
+                    if should_stop or len(out_ids[orig_i]) >= max_tokens:
+                        finished_flags[orig_i] = should_stop
                         keep_orig = []
                         break
                 lg1_2d = None
@@ -1276,6 +1690,8 @@ class FastGptOssEngine:
         mx.clear_cache()
         return {
             "out_ids": out_ids,
+            "ana_ids": ana_ids,
+            "two_phase_final": two_phase_budgeted,
             "ff_skipped": ff_skipped,
             "mask_hits": mask_hits,
             "finished": finished_flags,
@@ -1305,11 +1721,13 @@ class FastGptOssEngine:
         mode: str | None = None,
         speculative: bool | None = None,
         use_chat_template: bool = True,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = None,
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
         compact: bool | None = None,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
     ) -> GenerationItem:
         res = self.generate_batch(
             [prompt],
@@ -1327,6 +1745,8 @@ class FastGptOssEngine:
             reasoning_effort=reasoning_effort,
             reasoning_budget=reasoning_budget,
             compact=compact,
+            collect_telemetry=collect_telemetry,
+            collect_valid_lse=collect_valid_lse,
         )
         return res.items[0]
 
@@ -1345,14 +1765,16 @@ class FastGptOssEngine:
         batch_size: int | None = None,
         speculative: bool | None = None,
         use_chat_template: bool = True,
-        whitespace_flexible: bool = True,
+        whitespace_flexible: bool | None = None,
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
         compact: bool | None = None,
         chunk_docs: int = 8,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
     ) -> GenerationBatchResult:
-        del speculative  # Unsupported on MoE (batching/Hydragen dominates); accepted cleanly for API parity.
+        del speculative, collect_telemetry, collect_valid_lse  # Accepted for cross-engine API parity.
         n_docs = len(prompts)
         if per_doc_grammars is not None and len(per_doc_grammars) != n_docs:
             raise ValueError(
@@ -1363,7 +1785,13 @@ class FastGptOssEngine:
 
         import mlx.core as mx
 
-        eff_ws = (not bool(compact)) if compact is not None else bool(whitespace_flexible)
+        if compact is not None:
+            eff_ws: bool | None = False if bool(compact) else (
+                None if whitespace_flexible is None else bool(whitespace_flexible)
+            )
+        else:
+            eff_ws = None if whitespace_flexible is None else bool(whitespace_flexible)
+
         has_any_schema = (json_schema is not None) or (
             per_doc_grammars is not None and any(g is not None for g in per_doc_grammars)
         )
@@ -1403,14 +1831,11 @@ class FastGptOssEngine:
                 batch_size=batch_size,
                 memory_bytes=host_mem,
             )
-            # Budgeted reasoning before strict JSON schema transitions cleanly via B=1 phase-1->2.
-            if has_any_schema and ana_budget > 0:
-                path_mode = "b1"
-                wave_bs = 1
 
             rng = np.random.default_rng(int(seed))
             all_out_ids: list[list[int]] = [[] for _ in range(n_docs)]
             all_ana_ids: list[list[int]] = [[] for _ in range(n_docs)]
+            all_out_in_final: list[bool] = [bool(started_in_final)] * n_docs
             all_finished: list[bool] = [False] * n_docs
             tot_ff = 0
             tot_mask_hits = 0
@@ -1461,6 +1886,8 @@ class FastGptOssEngine:
                     )
                     all_out_ids[idx] = res_1["out_ids"]
                     all_ana_ids[idx] = res_1["ana_ids"]
+                    if res_1.get("two_phase_final"):
+                        all_out_in_final[idx] = True
                     all_finished[idx] = bool(res_1["finished"])
                     tot_ff += int(res_1["ff_skipped"])
                     tot_mask_hits += int(res_1["mask_hits"])
@@ -1474,8 +1901,6 @@ class FastGptOssEngine:
                     if getattr(mx, "get_cache_memory", lambda: 0)() > (256 << 20):
                         mx.clear_cache()
             else:
-                # Sort docs by prompt length before wave slicing to minimize per-wave KV padding (`suf_max`),
-                # while restoring exact original input ordering in `all_out_ids` / `all_finished`.
                 order = sorted(range(n_docs), key=lambda idx: len(prompt_ids_list[idx]))
                 for start in range(0, n_docs, wave_bs):
                     end = min(n_docs, start + wave_bs)
@@ -1503,6 +1928,8 @@ class FastGptOssEngine:
                         )
                         all_out_ids[orig_0] = res_1["out_ids"]
                         all_ana_ids[orig_0] = res_1["ana_ids"]
+                        if res_1.get("two_phase_final"):
+                            all_out_in_final[orig_0] = True
                         all_finished[orig_0] = bool(res_1["finished"])
                         tot_ff += int(res_1["ff_skipped"])
                         tot_mask_hits += int(res_1["mask_hits"])
@@ -1524,10 +1951,17 @@ class FastGptOssEngine:
                             top_p=top_p,
                             rng=rng,
                             started_in_final=started_in_final,
+                            analysis_budget=ana_budget,
                             chunk_docs=chunk_docs,
                         )
+                        w_ana = w_res.get("ana_ids")
+                        w_tp_fin = bool(w_res.get("two_phase_final", False))
                         for loc_i, orig_i in enumerate(wave_orig):
                             all_out_ids[orig_i] = w_res["out_ids"][loc_i]
+                            if w_ana is not None and loc_i < len(w_ana):
+                                all_ana_ids[orig_i] = w_ana[loc_i]
+                            if w_tp_fin:
+                                all_out_in_final[orig_i] = True
                             all_finished[orig_i] = bool(w_res["finished"][loc_i])
                             tot_ff += int(w_res["ff_skipped"][loc_i])
                             tot_mask_hits += int(w_res["mask_hits"][loc_i])
@@ -1564,7 +1998,12 @@ class FastGptOssEngine:
                     )
                 else:
                     raw_full = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
-                    text, reasoning = parse_harmony_output(raw_full)
+                    text, reasoning = parse_harmony_output(
+                        raw_full,
+                        started_in_analysis=(use_chat_template and not all_out_in_final[idx]),
+                    )
+                    if reasoning is None and ana_ids:
+                        reasoning = self.tokenizer.decode(ana_ids, skip_special_tokens=True).strip() or None
 
                 parsed = None
                 is_json = False

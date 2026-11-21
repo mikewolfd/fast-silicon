@@ -36,6 +36,7 @@ from fast_shared.bench import (
     collect_env_telemetry,
     wired_limit,
 )
+from fast_shared.embeddings import accepts_kwarg
 from fast_shared.outcome_eval import (
     DEFAULT_LOSSLESS_TOLERANCE,
     CLINC150_DOMAINS,
@@ -124,6 +125,7 @@ PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("public-gemma4", 4, "FAST_GEMMA4_HOME", "Stock mlx-vlm Gemma-4 E2B 4-bit (Cat 3+4)"),
     OutcomePackageSpec("public-gpt-oss", 4, "FAST_GPT_OSS_HOME", "Stock mlx-lm GPT-OSS-20B MXFP4 (Cat 3+4)"),
     OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
+    OutcomePackageSpec("coreai-gemma4", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Gemma-4 E2B QAT (Cat 3+4)"),
 )
 COREML_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("coreml-bge-small", 1, "FAST_BGE_SMALL_HOME", "Open HF CoreML FP16 BGE-small ANE (sidekickd, Cat 1)"),
@@ -140,7 +142,7 @@ PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     ),
     "fast-pplx": ("public-pplx",),
     "fast-decision-models": ("public-laya", "coreai-laya", "public-kev-0.8b", "coreml-laya", "coreml-kev-0.8b"),
-    "fast-gemma4": ("public-gemma4",),
+    "fast-gemma4": ("public-gemma4", "coreai-gemma4"),
     "fast-gpt-oss": ("public-gpt-oss",),
 }
 _SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {
@@ -162,7 +164,12 @@ _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-gemma4": "fast-gemma4",
     "public-gpt-oss": "fast-gpt-oss",
     "coreai-qwen3.5-4b": "fast-gemma4",
+    "coreai-gemma4": "fast-gemma4",
 }
+
+
+def _coreai_cache_dir() -> Path:
+    return Path.home() / "Library" / "Caches" / "coreai-cache"
 
 
 def _has_staged_artifacts(home_dir: Path) -> bool:
@@ -343,6 +350,10 @@ def _merge_daemon_telemetry(
         diag["cold_warm_latency"] = dict(lat)
     if telemetry.get("compile_sec") is not None:
         diag["compile_sec"] = round(float(telemetry["compile_sec"]), 4)
+    if telemetry.get("external_peak_gb") is not None:
+        diag["external_peak_gb"] = round(float(telemetry["external_peak_gb"]), 4)
+    if telemetry.get("max_rss_gb") is not None:
+        diag["max_rss_gb"] = round(float(telemetry["max_rss_gb"]), 4)
     if isinstance(telemetry.get("coreml_info"), Mapping):
         diag["coreml_info"] = dict(telemetry["coreml_info"])
     if isinstance(telemetry.get("asset_summary"), Mapping):
@@ -416,16 +427,17 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--mode", default=None)
     p.add_argument("--ane-profile", default=None)
     p.add_argument("--ane-variant", default="fp16")
-    p.add_argument("--no-kv-i8", action="store_true")
+    p.add_argument("--kv-i8", dest="kv_i8", action="store_true", default=None)
+    p.add_argument("--no-kv-i8", action="store_true", default=False)
     p.add_argument("--model-dir", default=None)
     p.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
-    p.add_argument("--mlp-dtype", choices=("bfloat16", "quantized"), default="bfloat16")
+    p.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
     p.add_argument("--mtp-drafter", action="store_true")
     p.add_argument("--mtp-drafter-path", default=None)
     p.add_argument("--backend", choices=("all", "laya-ane", "kev-0.8b"), default="all")
     p.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="w8")
     p.add_argument("--batch-docs", type=int, default=8)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--categories", default="all")
     p.add_argument("--no-llguidance", action="store_true")
     p.add_argument("--mlx-cache-limit-mb", type=int, help="Cap the isolated MLX worker allocation cache, in MiB")
@@ -506,6 +518,8 @@ def _run_cat1_worker(
         from _outcome_public_backends import stock_hf_model_files
 
         model_dirs.extend(stock_hf_model_files(pkg_name))
+    elif pkg_name.startswith("coreai-"):
+        model_dirs.append(_coreai_cache_dir())
     probe = FourBucketMemoryProbe(model_directories=model_dirs)
     guard = DeviceMemoryGuard()
     guard_tripped = False
@@ -627,7 +641,7 @@ def _run_cat1_worker(
         def _enc_d(txts: list[str]) -> np.ndarray:
             return eng.encode_documents(txts, mode=eff_mode, output_dtype="float32", normalize=True)
 
-        ctx_max_len = 4096 if tier == "tier1" else 16384
+        ctx_max_len = 2048 if tier == "tier1" else 16384
 
         def _enc_ctx(doc_groups: list[list[str]]) -> list[np.ndarray]:
             from fast_shared.outcome_eval.retrieval import collect_pplx_window_vectors, plan_pplx_windows
@@ -883,6 +897,34 @@ def _run_cat1_worker(
 # ---------------------------------------------------------------------------
 
 
+def _group_shared_prefix_indices(
+    items: Sequence[Any],
+    key_fn: Callable[[Any], Any],
+    *,
+    max_group_size: int,
+    length_fn: Callable[[Any], int] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Group sibling items sharing a prompt/passage into contiguous <=max_group_size blocks and return inverse map."""
+    n = len(items)
+    if n == 0:
+        return [], []
+    cap = max(1, int(max_group_size))
+    buckets: dict[Any, list[int]] = {}
+    for idx, it in enumerate(items):
+        buckets.setdefault(key_fn(it), []).append(idx)
+    groups: list[list[int]] = []
+    for members in buckets.values():
+        for off in range(0, len(members), cap):
+            groups.append(members[off : off + cap])
+    if length_fn is not None:
+        groups.sort(key=lambda grp: int(length_fn(items[grp[0]])))
+    grouped_order = [idx for grp in groups for idx in grp]
+    inv = [0] * n
+    for pos, orig_idx in enumerate(grouped_order):
+        inv[orig_idx] = pos
+    return grouped_order, inv
+
+
 def _run_cat2_single_backend(
     backend_name: str,
     *,
@@ -905,7 +947,10 @@ def _run_cat2_single_backend(
     from _outcome_public_backends import stock_decision_model_files
 
     art_dir = home / "artifacts"
-    probe = FourBucketMemoryProbe(model_directories=[art_dir, *stock_decision_model_files(backend_name)])
+    cat2_model_dirs = [art_dir, *stock_decision_model_files(backend_name)]
+    if backend_name.startswith("coreai-") or pkg_name.startswith("coreai-"):
+        cat2_model_dirs.append(_coreai_cache_dir())
+    probe = FourBucketMemoryProbe(model_directories=cat2_model_dirs)
     guard = DeviceMemoryGuard()
     guard_tripped = False
 
@@ -998,17 +1043,27 @@ def _run_cat2_single_backend(
         all_scores: list[float] = []
         laya_opt_truncations = 0
 
-        # 2A: RAGTruth (`noul`)
+        # 2A: RAGTruth (`noul`) — group <=6 sibling candidates per passage while preserving deterministic item order
         rt_p_true: list[float] = []
         rt_tok_counts: list[int] = []
+        rt_order, rt_inv = _group_shared_prefix_indices(
+            rt_items,
+            key_fn=lambda it: (str(it.get("context") or it.get("source") or ""), str(it.get("query") or "")),
+            max_group_size=6,
+            length_fn=lambda it: len(str(it.get("context") or it.get("source") or "")) + len(str(it.get("query") or "")),
+        )
+        rt_pairs_grouped = [rt_pairs[idx] for idx in rt_order]
         if is_laya:
-            rt_encs = [eng.encode_item(st, rt_qdef, on_truncate="ignore") for st, _ in rt_pairs]
-            rt_tok_counts = [rt_header_toks + int(e.get("original_state_tokens", 0)) for e in rt_encs]
-            rt_p_true = [float(p) for p in eng.score_noul_batch(rt_encs)]
+            rt_encs_g = [eng.encode_item(st, rt_qdef, on_truncate="ignore") for st, _ in rt_pairs_grouped]
+            rt_tok_g = [rt_header_toks + int(e.get("original_state_tokens", 0)) for e in rt_encs_g]
+            rt_p_g = [float(p) for p in eng.score_noul_batch(rt_encs_g)]
+            rt_tok_counts = [rt_tok_g[rt_inv[i]] for i in range(len(rt_items))]
+            rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
         else:
             rt_tok_counts = kev_rt_tok_counts
-            out_rt = eng.score_multi_states_noul(rt_pairs, batch_docs=int(extra.batch_docs))
-            rt_p_true = [float(r[0][0]) for r in out_rt]
+            out_rt_g = eng.score_multi_states_noul(rt_pairs_grouped, batch_docs=int(extra.batch_docs))
+            rt_p_g = [float(r[0][0]) for r in out_rt_g]
+            rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
         _mx_sync()
         r_rt = evaluate_ragtruth_noul(rt_items, rt_p_true, token_counts=rt_tok_counts)
         sub_reports["ragtruth_noul"] = {k: v for k, v in r_rt.items() if not k.startswith("per_item_")}
@@ -1064,22 +1119,31 @@ def _run_cat2_single_backend(
         all_valid.extend(r_cl["per_item_valid"])
         all_scores.extend(r_cl["per_item_scores"])
 
-        # 2C: RewardBench-2 Best-of-4 (`score`)
+        # 2C: RewardBench-2 Best-of-4 (`score`) — group 4 candidates per prompt sorted by prompt length
         rb_cand_probs: list[list[list[float]]] = []
         rb_cand_logits: list[list[list[float]] | None] = []
-        flat_states = [
-            {"prompt": it["prompt"], "response": cand}
-            for it in rb_items
+        flat_rb_entries = [
+            (item_idx, {"prompt": it["prompt"], "response": cand})
+            for item_idx, it in enumerate(rb_items)
             for cand in it["candidates"]
         ]
+        rb_order, rb_inv = _group_shared_prefix_indices(
+            flat_rb_entries,
+            key_fn=lambda ent: (ent[0], str(ent[1]["prompt"])),
+            max_group_size=4,
+            length_fn=lambda ent: len(str(ent[1]["prompt"])),
+        )
+        grouped_rb_states = [flat_rb_entries[idx][1] for idx in rb_order]
         if is_laya:
-            rb_encs = [eng.encode_item(st, rb_qdef, on_truncate="ignore") for st in flat_states]
-            flat_p = eng.score_choice_batch(rb_encs)
+            rb_encs_g = [eng.encode_item(st, rb_qdef, on_truncate="ignore") for st in grouped_rb_states]
+            flat_p_g = eng.score_choice_batch(rb_encs_g)
+            flat_p = [flat_p_g[rb_inv[i]] for i in range(len(flat_rb_entries))]
             for idx in range(len(rb_items)):
                 rb_cand_probs.append(flat_p[4 * idx : 4 * idx + 4])
                 rb_cand_logits.append(None)
         else:
-            rb_raw = eng.score_multi_states([(st, [rb_qdef]) for st in flat_states], batch_docs=int(extra.batch_docs))
+            rb_raw_g = eng.score_multi_states([(st, [rb_qdef]) for st in grouped_rb_states], batch_docs=int(extra.batch_docs))
+            rb_raw = [rb_raw_g[rb_inv[i]] for i in range(len(flat_rb_entries))]
             for idx in range(len(rb_items)):
                 sl = rb_raw[4 * idx : 4 * idx + 4]
                 rb_cand_probs.append([x[0][0] for x in sl])
@@ -1293,6 +1357,8 @@ def _run_llm_worker(
         from _outcome_public_backends import stock_hf_model_files
 
         model_dirs.extend(stock_hf_model_files(pkg_name))
+    elif pkg_name.startswith("coreai-"):
+        model_dirs.append(_coreai_cache_dir())
     probe = FourBucketMemoryProbe(model_directories=model_dirs or None)
     guard = DeviceMemoryGuard()
     guard_tripped = False
@@ -1301,7 +1367,16 @@ def _run_llm_worker(
     pub_llm: Any = None
     ltok: Any = None
     eff_label = config_label
-    batch_sz = int(extra.batch_size)
+    if extra.batch_size is not None:
+        batch_sz = int(extra.batch_size)
+    elif pkg_name in ("fast-gemma4", "public-gemma4"):
+        batch_sz = 64 if host_mem_gb >= 36.0 else 32
+    elif pkg_name in ("fast-gpt-oss", "public-gpt-oss"):
+        batch_sz = 8 if 0 < host_mem_gb < 36.0 else 16
+    else:
+        batch_sz = 16
+    if pkg_name in ("fast-gpt-oss", "public-gpt-oss") and 0 < host_mem_gb < 36.0:
+        batch_sz = min(batch_sz, 8)
     use_mtp = bool(extra.mtp_drafter or extra.mtp_drafter_path)
 
     if pkg_name == "fast-gemma4":
@@ -1309,30 +1384,49 @@ def _run_llm_worker(
 
         eff_mode = extra.mode or "gpu"
         mtp_ref = extra.mtp_drafter_path or (True if extra.mtp_drafter else None)
-        eng = FastGemma4Engine(
-            home=home,
-            model_dir=extra.model_dir,
-            vocab_out=extra.gemma_vocab_out,
-            default_mode=eff_mode,
-            ane_variant=extra.ane_variant,
-            ane_ring_variant=extra.ane_variant,
-            lm_head_mode=extra.lm_head_mode,
-            mlp_dtype=extra.mlp_dtype,
-            kv_i8=not bool(extra.no_kv_i8),
-            mtp_drafter=mtp_ref,
-            local_files_only=True,
-            warmup=True,
-            warmup_ane=(eff_mode == "hetero"),
-        )
+        eff_kv_i8 = False if extra.no_kv_i8 else bool(extra.kv_i8)
+        req_mlp_dtype = extra.mlp_dtype or "auto"
+        g4_kw: dict[str, Any] = {
+            "home": home,
+            "model_dir": extra.model_dir,
+            "vocab_out": extra.gemma_vocab_out,
+            "default_mode": eff_mode,
+            "ane_variant": extra.ane_variant,
+            "ane_ring_variant": extra.ane_variant,
+            "lm_head_mode": extra.lm_head_mode,
+            "mlp_dtype": req_mlp_dtype,
+            "kv_i8": eff_kv_i8,
+            "mtp_drafter": mtp_ref,
+            "local_files_only": True,
+            "warmup": True,
+            "warmup_ane": (eff_mode == "hetero"),
+        }
+        try:
+            eng = FastGemma4Engine(**g4_kw)
+        except ValueError as exc:
+            if req_mlp_dtype == "auto" and "mlp_dtype" in str(exc):
+                g4_kw["mlp_dtype"] = "quantized" if (0 < host_mem_gb < 36.0 or batch_sz <= 32) else "bfloat16"
+                eng = FastGemma4Engine(**g4_kw)
+            else:
+                raise
         ltok = eng.tokenizer.llguidance_tokenizer()
         mtp_tag = "_mtp" if use_mtp else ""
-        eff_label = config_label or f"{eff_mode}_{extra.ane_variant}_{'kvi8' if not extra.no_kv_i8 else 'kvbf16'}{mtp_tag}"
+        eff_label = config_label or f"{eff_mode}_{extra.ane_variant}_{'kvi8' if eff_kv_i8 else 'kvbf16'}{mtp_tag}"
     elif pkg_name == "fast-gpt-oss":
         from fast_gpt_oss.engine import FastGptOssEngine
 
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from public_baselines import resolve_hf_snapshot
+
         eff_mode = extra.mode or "auto"
+        oss_model_dir: str | Path | None = extra.model_dir
+        if oss_model_dir is None and not (home / "artifacts" / "hf_model" / "config.json").is_file():
+            q8_snap = resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q8")
+            if q8_snap is not None:
+                oss_model_dir = q8_snap
         eng = FastGptOssEngine(
             home=home,
+            model_dir=oss_model_dir,
             default_mode=eff_mode,
             default_reasoning_effort=extra.reasoning_effort or "low",
             local_files_only=True,
@@ -1340,7 +1434,7 @@ def _run_llm_worker(
         )
         ltok = eng.tokenizer.llguidance_tokenizer()
         eff_label = config_label or f"gpt_oss_{eff_mode}"
-    elif pkg_name in ("public-gemma4", "public-gpt-oss", "coreai-qwen3.5-4b"):
+    elif pkg_name in ("public-gemma4", "public-gpt-oss", "coreai-qwen3.5-4b", "coreai-gemma4"):
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import build_public_llm_adapter
 
@@ -1376,17 +1470,20 @@ def _run_llm_worker(
         per_doc_schemas: list[dict[str, Any] | None] | None = None,
         max_tokens: int = 256,
         reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
     ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
         if not prompts:
             return [], [], [], {"completion_tokens": 0, "mask_fallbacks": 0}
         if pub_llm is not None:
-            return pub_llm.generate_fn(
-                prompts,
-                system_prompt=system_prompt,
-                per_doc_schemas=per_doc_schemas,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-            )
+            pub_kw: dict[str, Any] = {
+                "system_prompt": system_prompt,
+                "per_doc_schemas": per_doc_schemas,
+                "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
+            }
+            if reasoning_budget is not None and accepts_kwarg(pub_llm.generate_fn, "reasoning_budget"):
+                pub_kw["reasoning_budget"] = int(reasoning_budget)
+            return pub_llm.generate_fn(prompts, **pub_kw)
         if pkg_name == "openai-chat":
             texts: list[str] = []
             reasons: list[str] = []
@@ -1424,21 +1521,33 @@ def _run_llm_worker(
         safe_grammars = None
         if per_doc_schemas is not None:
             is_gemma = pkg_name == "fast-gemma4"
-            whitespace = {"fixed": None, "compact": False, "flexible": True}[extra.gemma_json_layout] if is_gemma else False
+            whitespace = {"fixed": None, "compact": False, "flexible": True}[extra.gemma_json_layout] if is_gemma else None
             safe_grammars = _compile_required_grammars(
                 pkg_name, per_doc_schemas, eng.get_grammar if is_gemma else eng._get_grammar,
                 whitespace_flexible=whitespace,
             )
 
+        eff_max_tokens = int(max_tokens)
+        if (
+            pkg_name == "fast-gpt-oss"
+            and per_doc_schemas is None
+            and reasoning_budget is not None
+            and int(reasoning_budget) > 0
+            and eff_max_tokens <= int(reasoning_budget)
+        ):
+            eff_max_tokens = int(reasoning_budget) + eff_max_tokens
         kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
             "per_doc_grammars": safe_grammars,
-            "max_tokens": int(max_tokens),
+            "max_tokens": eff_max_tokens,
             "temperature": 0.0,
             "batch_size": min(batch_sz, len(prompts)),
         }
-        if pkg_name == "fast-gpt-oss" and reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
+        if pkg_name == "fast-gpt-oss":
+            if reasoning_effort is not None:
+                kwargs["reasoning_effort"] = reasoning_effort
+            if reasoning_budget is not None:
+                kwargs["reasoning_budget"] = int(reasoning_budget)
         elif pkg_name == "fast-gemma4":
             kwargs["enable_thinking"] = False
             kwargs["speculative"] = True if use_mtp else False
@@ -1498,7 +1607,10 @@ def _run_llm_worker(
 
             # 3A: IFBench (+ IFEval in Tier-2)
             ifb_txt, ifb_fr, ifb_ids, ifb_st = _generate_batch(
-                [it["prompt"] for it in ifb_items], max_tokens=256 if smoke else 512, reasoning_effort="skip"
+                [it["prompt"] for it in ifb_items],
+                max_tokens=256 if smoke else 512,
+                reasoning_effort="low",
+                reasoning_budget=192,
             )
             r_ifb = evaluate_instruction_following(ifb_items, ifb_txt, finish_reasons=ifb_fr, token_ids_list=ifb_ids)
             sub3["ifbench_test"] = {k: v for k, v in r_ifb.items() if not k.startswith("per_item_")}
@@ -1511,7 +1623,10 @@ def _run_llm_worker(
             if_scores_for_comp = [float(r_ifb["prompt_loose_acc"])]
             if ife_items:
                 ife_txt, ife_fr, ife_ids, ife_st = _generate_batch(
-                    [it["prompt"] for it in ife_items], max_tokens=512, reasoning_effort="skip"
+                    [it["prompt"] for it in ife_items],
+                    max_tokens=512,
+                    reasoning_effort="low",
+                    reasoning_budget=192,
                 )
                 r_ife = evaluate_instruction_following(ife_items, ife_txt, finish_reasons=ife_fr, token_ids_list=ife_ids)
                 sub3["ifeval"] = {k: v for k, v in r_ife.items() if not k.startswith("per_item_")}
@@ -1522,9 +1637,12 @@ def _run_llm_worker(
                 tot_fin_len += sum(1 for fr in ife_fr if fr == "length")
                 if_scores_for_comp.append(float(r_ife["prompt_loose_acc"]))
 
-            # 3B: MMLU-Redux 2.0 (max_tokens=16)
+            # 3B: MMLU-Redux 2.0 (max_tokens=16, budgeted low reasoning for Harmony models)
             mm_txt, mm_fr, mm_ids, mm_st = _generate_batch(
-                [_format_mmlu_prompt(it) for it in mm_items], max_tokens=16, reasoning_effort="skip"
+                [_format_mmlu_prompt(it) for it in mm_items],
+                max_tokens=16,
+                reasoning_effort="low",
+                reasoning_budget=64,
             )
             r_mm = evaluate_mmlu_redux(mm_items, mm_txt, finish_reasons=mm_fr, token_ids_list=mm_ids)
             sub3["mmlu_redux_2"] = {k: v for k, v in r_mm.items() if not k.startswith("per_item_")}
@@ -1536,7 +1654,10 @@ def _run_llm_worker(
 
             # 3C: MATH-500 (+ LiveBench-Reasoning in Tier-2)
             math_txt, math_fr, math_ids, math_st = _generate_batch(
-                [_format_math_prompt(it) for it in math_items], max_tokens=512, reasoning_effort="low"
+                [_format_math_prompt(it) for it in math_items],
+                max_tokens=512 if smoke else 1536,
+                reasoning_effort="low",
+                reasoning_budget=384,
             )
             r_math = evaluate_math_500(math_items, math_txt, finish_reasons=math_fr, token_ids_list=math_ids)
             sub3["math_500"] = {k: v for k, v in r_math.items() if not k.startswith("per_item_")}
@@ -1549,7 +1670,10 @@ def _run_llm_worker(
             reason_scores = [float(r_math["verified_accuracy"])]
             if lb_items:
                 lb_txt, lb_fr, lb_ids, lb_st = _generate_batch(
-                    [it["prompt"] for it in lb_items], max_tokens=512, reasoning_effort="low"
+                    [it["prompt"] for it in lb_items],
+                    max_tokens=1536,
+                    reasoning_effort="low",
+                    reasoning_budget=384,
                 )
                 r_lb = evaluate_livebench_reasoning(lb_items, lb_txt, finish_reasons=lb_fr, token_ids_list=lb_ids)
                 sub3["livebench_reasoning"] = {k: v for k, v in r_lb.items() if not k.startswith("per_item_")}
@@ -1634,7 +1758,8 @@ def _run_llm_worker(
                     system_prompt="Extract fields strictly from the document as compact JSON matching the schema.",
                     per_doc_schemas=lq_schemas,
                     max_tokens=256 if smoke else 512,
-                    reasoning_effort="skip",
+                    reasoning_effort="low",
+                    reasoning_budget=64,
                 )
                 r_lq = evaluate_structured_extraction(lq_items, lq_txt, finish_reasons=lq_fr, token_ids_list=lq_ids)
                 sub4["liquidai_extraction"] = {k: v for k, v in r_lq.items() if not k.startswith("per_item_")}
@@ -1653,7 +1778,8 @@ def _run_llm_worker(
                     system_prompt="Select matching tool calls or return empty tool_calls if none apply. Output raw JSON only.",
                     per_doc_schemas=bf_schemas,
                     max_tokens=192 if smoke else 384,
-                    reasoning_effort="skip",
+                    reasoning_effort="low",
+                    reasoning_budget=96,
                 )
                 r_bf = evaluate_bfcl_v3(bfcl_items, bf_txt, finish_reasons=bf_fr, token_ids_list=bf_ids)
                 sub4["bfcl_v3"] = {k: v for k, v in r_bf.items() if not k.startswith("per_item_")}
@@ -2238,6 +2364,7 @@ def compute_public_comparisons(
         ("fast-decision-models", "kev-0.8b", "public-kev-0.8b"),
         ("fast-decision-models", "kev-0.8b", "coreml-kev-0.8b"),
         ("fast-gemma4", None, "public-gemma4"),
+        ("fast-gemma4", None, "coreai-gemma4"),
         ("fast-gpt-oss", None, "public-gpt-oss"),
     )
     for fast_pkg, backend_filter, pub_pkg in pair_map:
@@ -2337,7 +2464,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     expanded.append(pub_p)
         pkg_names = expanded
 
-    if args.skip_gpt_oss or (0 < host_mem <= 24.5 and saw_group_token):
+    if args.skip_gpt_oss or (0 < host_mem < 23.0 and saw_group_token):
         pkg_names = [p for p in pkg_names if p not in ("fast-gpt-oss", "public-gpt-oss")]
 
     abba_arms = [parse_abba_arm(x) for x in (args.abba_compare or [])]

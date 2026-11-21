@@ -7,9 +7,10 @@ Implements four composable training accelerations on Apple Silicon (M4 / M5+):
           reset, block-diagonal Full + sliding-window (SWA) additive masks,
           per-token PLE alignment, and exact token/example answer loss gathering.
   - P1.6: ``8-bit g64`` frozen base trunk quantization (QLoRA) with ``BF16`` LoRA
-          adapters, automatic ``--ckpt-tokens`` raising, plus a sorted
-          ``mx.gather_qmm(..., lhs_indices=..., sorted_indices=True)`` MoE QLoRA
-          projection helper.
+          adapters, RAM-aware ``--ckpt-tokens`` defaults (``512`` on ``<= 24 GB``,
+          ``1280`` on ``>= 36 GB``), pre-stripped/pre-quantized text-only checkpoint
+          loading, plus a sorted ``mx.gather_qmm(..., lhs_indices=..., sorted_indices=True)``
+          MoE QLoRA projection helper.
   - P1.7: Differentiable shared-prefix KV broadcast across ``grad_accum``
           micro-batches using exact two-stage VJP (``O(1)`` memory in ``K``) and
           automatic KV-shared upper-layer skipping on Gemma-4.
@@ -19,8 +20,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+import inspect
+import json
 import math
+import os
+from pathlib import Path
 import random
+import shutil
+import tempfile
 from typing import Any, Callable, Literal, Sequence
 
 import mlx.core as mx
@@ -878,17 +885,268 @@ def compute_packed_tail_ce_loss(
 # ---------------------------------------------------------------------------
 
 
+_MULTIMODAL_TENSOR_MARKERS: tuple[str, ...] = (
+    "vision_tower",
+    "audio_tower",
+    "embed_vision",
+    "embed_audio",
+    "multi_modal_projector",
+)
+
+
+def _detect_host_ram_gib() -> float:
+    try:
+        return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024.0**3)
+    except Exception:
+        return 0.0
+
+
+def _is_multimodal_tensor_key(key: str) -> bool:
+    return any(key.startswith(m) or f".{m}." in key or key.endswith(f".{m}") for m in _MULTIMODAL_TENSOR_MARKERS)
+
+
 def compute_effective_ckpt_tokens(
     requested_ckpt_tokens: int | None,
     *,
     qlora_8bit: bool,
+    host_ram_gib: float | None = None,
     default_bf16: int = 2200,
-    default_qlora: int = 4096,
+    default_qlora_low_ram: int = 512,
+    default_qlora_high_ram: int = 1280,
 ) -> int:
-    """Resolve ``--ckpt-tokens``: auto-raise to ``4096`` under ``--qlora-8bit`` unless user explicitly set it."""
+    """Resolve ``--ckpt-tokens``: ``512`` on ``<= 24 GB`` (``< 36 GB``) and ``1280`` on ``>= 36 GB`` for ``--qlora-8bit``."""
     if requested_ckpt_tokens is not None:
         return int(requested_ckpt_tokens)
-    return int(default_qlora if qlora_8bit else default_bf16)
+    if not qlora_8bit:
+        return int(default_bf16)
+    ram = float(_detect_host_ram_gib() if host_ram_gib is None else host_ram_gib)
+    if 0.0 < ram < 36.0:
+        return int(default_qlora_low_ram)
+    return int(default_qlora_high_ram)
+
+
+def inspect_lora_base_checkpoint(base_dir: Path | str) -> dict[str, Any]:
+    """Inspect a Gemma-4 base checkpoint via JSON + safetensors headers without allocating Metal tensors."""
+    from .packager import inspect_safetensors_headers
+
+    bdir = Path(base_dir)
+    cfg_path = bdir / "config.json"
+    cfg: dict[str, Any] = (
+        json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+    )
+    tcfg = cfg.get("text_config", cfg)
+    has_quant_cfg = bool(
+        cfg.get("quantization")
+        or cfg.get("quantization_config")
+        or tcfg.get("quantization")
+        or tcfg.get("quantization_config")
+    )
+    has_vision_cfg = bool(cfg.get("vision_config") or cfg.get("audio_config"))
+
+    headers = inspect_safetensors_headers(bdir) if any(bdir.glob("*.safetensors")) else {}
+    has_scales = False
+    has_mm_tensors = False
+    text_bytes = 0
+    mm_bytes = 0
+    for key, info in headers.items():
+        nbytes = int(info.get("nbytes", 0))
+        if _is_multimodal_tensor_key(key):
+            has_mm_tensors = True
+            mm_bytes += nbytes
+        else:
+            text_bytes += nbytes
+            if key.endswith(".scales"):
+                has_scales = True
+
+    return {
+        "is_prequantized": bool(has_quant_cfg or has_scales),
+        "has_multimodal_tensors": bool(has_mm_tensors),
+        "has_vision_config": bool(has_vision_cfg),
+        "text_only_bytes": int(text_bytes),
+        "multimodal_bytes": int(mm_bytes),
+    }
+
+
+def load_text_only_lora_base_model(
+    base_dir: Path | str,
+    *,
+    strict: bool = False,
+    load_model_fn: Callable[..., Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Load a pre-stripped/pre-quantized or multimodal Gemma-4 checkpoint without materializing 10.24 GB multimodal BF16."""
+    bdir = Path(base_dir)
+    info = inspect_lora_base_checkpoint(bdir)
+    if load_model_fn is None:
+        from mlx_lm.utils import load_model as _mlx_load_model
+
+        load_model_fn = _mlx_load_model
+
+    supports_lazy = False
+    try:
+        supports_lazy = "lazy" in inspect.signature(load_model_fn).parameters
+    except (TypeError, ValueError):
+        supports_lazy = False
+
+    # Fast path: already text-only (and optionally pre-quantized) on disk -> load directly!
+    if not info["has_multimodal_tensors"] and not info["has_vision_config"]:
+        call_kw: dict[str, Any] = {"strict": strict}
+        if supports_lazy:
+            call_kw["lazy"] = False
+        loaded = load_model_fn(bdir, **call_kw)
+        model = loaded[0] if isinstance(loaded, tuple) else loaded
+        return model, info
+
+    # Stage a lightweight header-only view with vision/audio stripped from config.json and shard index
+    # so `mlx_lm` never instantiates vision/audio towers or reads pure-multimodal shards into RAM!
+    with tempfile.TemporaryDirectory(prefix="fg4_text_base_") as tmp_s:
+        sdir = Path(tmp_s)
+        cfg_p = bdir / "config.json"
+        if cfg_p.is_file():
+            cfg_d = json.loads(cfg_p.read_text(encoding="utf-8"))
+            cfg_d.pop("vision_config", None)
+            cfg_d.pop("audio_config", None)
+            (sdir / "config.json").write_text(json.dumps(cfg_d, indent=2) + "\n", encoding="utf-8")
+
+        idx_p = bdir / "model.safetensors.index.json"
+        referenced_shards: set[str] | None = None
+        if idx_p.is_file():
+            idx_d = json.loads(idx_p.read_text(encoding="utf-8"))
+            wmap = idx_d.get("weight_map", {})
+            filtered_wmap = {
+                k: v for k, v in wmap.items() if not _is_multimodal_tensor_key(k)
+            }
+            idx_d["weight_map"] = filtered_wmap
+            referenced_shards = set(filtered_wmap.values())
+            (sdir / "model.safetensors.index.json").write_text(
+                json.dumps(idx_d, indent=2) + "\n", encoding="utf-8"
+            )
+
+        for sf in sorted(bdir.glob("*.safetensors")):
+            if referenced_shards is not None and sf.name not in referenced_shards:
+                continue
+            os.symlink(sf.resolve(), sdir / sf.name)
+
+        for tok_name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
+            tp = bdir / tok_name
+            if tp.is_file():
+                shutil.copy2(tp, sdir / tok_name)
+
+        call_kw = {"strict": False}
+        if supports_lazy:
+            call_kw["lazy"] = True
+        loaded = load_model_fn(sdir, **call_kw)
+        model = loaded[0] if isinstance(loaded, tuple) else loaded
+        for mm_attr in _MULTIMODAL_TENSOR_MARKERS:
+            if hasattr(model, mm_attr):
+                setattr(model, mm_attr, None)
+        if supports_lazy:
+            mx.eval(model.parameters())
+        mx.clear_cache()
+        return model, info
+
+
+def strip_quantization_from_config_dict(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of `config.json` with top-level and `text_config` quantization blocks removed."""
+    out = dict(cfg)
+    out.pop("quantization", None)
+    out.pop("quantization_config", None)
+    out.pop("ple_sidecar", None)
+    if isinstance(out.get("text_config"), dict):
+        tcfg = dict(out["text_config"])
+        tcfg.pop("quantization", None)
+        tcfg.pop("quantization_config", None)
+        out["text_config"] = tcfg
+    return out
+
+
+def dequantize_prequantized_shard_tensors(
+    shard_tensors: dict[str, mx.array],
+    base_cfg: dict[str, Any],
+    *,
+    lora_by_key: dict[str, Any] | None = None,
+    quant_mod_by_key: dict[str, Any] | None = None,
+) -> tuple[dict[str, mx.array], int]:
+    """Convert one safetensors shard (pre-quantized or BF16) + LoRA deltas into clean BF16 tensors."""
+    from .model import _resolve_quant_spec
+
+    tcfg = base_cfg.get("text_config", base_cfg)
+    qcfg: dict[str, Any] = dict(
+        base_cfg.get("quantization")
+        or base_cfg.get("quantization_config")
+        or tcfg.get("quantization")
+        or tcfg.get("quantization_config")
+        or {}
+    )
+    lora_map = lora_by_key or {}
+    qmod_map = quant_mod_by_key or {}
+    out_shard: dict[str, mx.array] = {}
+    fused_count = 0
+
+    for k, t_val in shard_tensors.items():
+        if _is_multimodal_tensor_key(k):
+            continue
+        if k.endswith(".scales") or k.endswith(".biases"):
+            continue
+        if k in lora_map:
+            mod = lora_map[k]
+            delta_f32 = float(mod.scale) * (
+                mod.lora_b.astype(mx.float32).T @ mod.lora_a.astype(mx.float32).T
+            )
+            qlin = getattr(mod, "linear", None)
+            if isinstance(qlin, nn.QuantizedLinear):
+                base_f32 = mx.dequantize(
+                    qlin.weight,
+                    qlin.scales,
+                    qlin.biases,
+                    group_size=qlin.group_size,
+                    bits=qlin.bits,
+                    mode=qlin.mode,
+                ).astype(mx.float32)
+            elif k.endswith(".weight") and f"{k[:-7]}.scales" in shard_tensors:
+                pref = k[:-7]
+                bits, gs, mode = _resolve_quant_spec(shard_tensors, pref, qcfg)
+                base_f32 = mx.dequantize(
+                    t_val,
+                    shard_tensors[f"{pref}.scales"],
+                    shard_tensors.get(f"{pref}.biases"),
+                    group_size=gs,
+                    bits=bits,
+                    mode=mode,
+                ).astype(mx.float32)
+            else:
+                base_f32 = t_val.astype(mx.float32)
+            merged_bf16 = (base_f32 + delta_f32).astype(mx.bfloat16)
+            mx.eval(merged_bf16)
+            out_shard[k] = merged_bf16
+            fused_count += 1
+        elif k in qmod_map and isinstance(qmod_map[k], (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            qm = qmod_map[k]
+            deq_bf16 = mx.dequantize(
+                qm.weight,
+                qm.scales,
+                qm.biases,
+                group_size=qm.group_size,
+                bits=qm.bits,
+                mode=qm.mode,
+            ).astype(mx.bfloat16)
+            mx.eval(deq_bf16)
+            out_shard[k] = deq_bf16
+        elif k.endswith(".weight") and f"{k[:-7]}.scales" in shard_tensors:
+            pref = k[:-7]
+            bits, gs, mode = _resolve_quant_spec(shard_tensors, pref, qcfg)
+            deq_bf16 = mx.dequantize(
+                t_val,
+                shard_tensors[f"{pref}.scales"],
+                shard_tensors.get(f"{pref}.biases"),
+                group_size=gs,
+                bits=bits,
+                mode=mode,
+            ).astype(mx.bfloat16)
+            mx.eval(deq_bf16)
+            out_shard[k] = deq_bf16
+        else:
+            out_shard[k] = t_val
+    return out_shard, fused_count
 
 
 def quantize_frozen_trunk_8bit(
@@ -897,19 +1155,28 @@ def quantize_frozen_trunk_8bit(
     group_size: int = 64,
     bits: int = 8,
     quantize_ple_embedding: bool = True,
-    quantize_embed_tokens: bool = False,
+    quantize_embed_tokens: bool = True,
 ) -> dict[str, int]:
-    """Quantize frozen trunk ``nn.Linear`` (and optional PLE / token embeddings) to ``8-bit g64``.
+    """Quantize frozen trunk ``nn.Linear`` (and PLE + token embeddings by default) to ``8-bit g64``.
 
-    Must be called BEFORE wrapping trainable layers with LoRA adapters so trainable
-    ``(lora_a, lora_b)`` tensors are never quantized.
+    Already-quantized ``QuantizedLinear`` / ``QuantizedEmbedding`` modules are skipped cleanly
+    without double-quantizing. Must be called BEFORE wrapping trainable layers with LoRA adapters.
     """
-    stats = {"linear_quantized": 0, "embedding_quantized": 0, "skipped_lora": 0, "skipped_shape": 0}
+    stats = {
+        "linear_quantized": 0,
+        "embedding_quantized": 0,
+        "skipped_quantized": 0,
+        "skipped_lora": 0,
+        "skipped_shape": 0,
+    }
     target = model.language_model if hasattr(model, "language_model") else model
 
     def _predicate(path: str, module: nn.Module) -> bool:
         if hasattr(module, "lora_a") or hasattr(module, "lora_b"):
             stats["skipped_lora"] += 1
+            return False
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            stats["skipped_quantized"] += 1
             return False
         if isinstance(module, nn.Linear):
             in_dim = int(module.weight.shape[-1])

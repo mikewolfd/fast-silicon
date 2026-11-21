@@ -160,3 +160,56 @@ def test_loaded_laya_matches_pytorch_option_order_and_probabilities():
         expected = case["reference_probabilities"]
         assert sorted(range(len(actual)), key=actual.__getitem__) == sorted(range(len(expected)), key=expected.__getitem__)
         assert actual == pytest.approx(expected, abs=fixture["max_abs_probability_error"])
+
+
+def test_public_laya_length_sort_restores_exact_order_and_256mb_cache_limit(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    import mlx.nn as nn
+
+    backend = object.__new__(public.PublicLayaMlxBackend)
+    backend._mx = mx
+    backend._nn = nn
+    backend.H = 8
+    backend.nh = 2
+    backend.hd = 4
+    backend.scale = 0.5
+    backend.type_emb_w = mx.zeros((3, 8), dtype=mx.bfloat16)
+    backend.head_layers = []
+    backend.sc_n_w = mx.ones((8,), dtype=mx.float32)
+    backend.sc_n_b = mx.zeros((8,), dtype=mx.float32)
+    backend.sc_1_w = mx.eye(8, dtype=mx.float32)
+    backend.sc_1_b = mx.zeros((8,), dtype=mx.float32)
+    backend.sc_3_w = mx.array([[0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=mx.float32)
+    backend.sc_3_b = mx.zeros((1,), dtype=mx.float32)
+    backend._qtype_map = {"choice": 0, "score": 1, "noul": 2}
+    backend._tok_helper = SimpleNamespace(pad_id=0, resolve_temperature=lambda _qt, _k: 1.0)
+
+    seen_batch_shapes: list[tuple[int, int]] = []
+
+    def _fake_enc(ids_mx, attention_mask=None):
+        del attention_mask
+        seen_batch_shapes.append(tuple(ids_mx.shape))
+        # Direction varies monotonically with token id so LayerNorm preserves strict per-item ordering
+        B, L = ids_mx.shape
+        x = ids_mx.astype(mx.float32)[:, :, None] * 0.05
+        vals = mx.concatenate([mx.ones((B, L, 1), dtype=mx.float32), x * x, mx.zeros((B, L, 6), dtype=mx.float32)], axis=-1)
+        return {"last_hidden_state": vals.astype(mx.bfloat16)}
+
+    backend.encoder = _fake_enc
+
+    # Alternating long and short items; bsz=2 after length-sort packs short(4,6) -> width 6 and long(30,32) -> width 32
+    encs = [
+        {"ids": [10] + [1] * 31, "markers": [0, 1], "qtype": 0},  # len 32
+        {"ids": [20] + [1] * 3, "markers": [0, 1], "qtype": 0},   # len 4
+        {"ids": [30] + [1] * 29, "markers": [0, 1], "qtype": 0},  # len 30
+        {"ids": [40] + [1] * 5, "markers": [0, 1], "qtype": 0},   # len 6
+    ]
+    with mx.stream(mx.cpu):
+        probs = backend._score_generic(encs, bsz=2)
+    assert seen_batch_shapes == [(2, 6), (2, 32)]
+    assert len(probs) == 4
+    # Exact original order restored ([10, 20, 30, 40], NOT length-sorted [20, 40, 30, 10])
+    assert probs[3][0] > probs[2][0] > probs[1][0] > probs[0][0] > 0.5
+    src = Path(public.__file__).read_text(encoding="utf-8")
+    assert "set_cache_limit(256 * 1024 * 1024)" in src
+

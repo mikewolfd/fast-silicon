@@ -15,8 +15,13 @@ from fast_shared.bench import clear_mlx_arena
 from fast_shared.embeddings import set_mlx_cache_limit
 
 from .gpu import FastBgeSmallGPU, pack_sequences
-from .paths import require_runtime_paths
+from .paths import load_or_mmap_host_tables, require_runtime_paths
 from .tokenizer import FastBgeTokenizer
+
+_MULTIFUNCTION_CANDIDATES: tuple[str, ...] = (
+    "bge_ane_w8a16.mlmodelc",
+    "bge_ane_multifunction.mlmodelc",
+)
 
 _ANE_BUCKETS: tuple[tuple[int, str, int, int], ...] = (
     (24, "bge_b1_s24_fp16.mlmodelc", 1, 1),
@@ -30,8 +35,7 @@ _ANE_BUCKETS: tuple[tuple[int, str, int, int], ...] = (
     (512, "bge_b1_s512_fp16.mlmodelc", 1, 4),
 )
 
-# Optional B=1 S=256 single-query bucket if generated via `scripts/build_ane_models.py --include-s256-query`.
-# When absent on disk, 193..256-token queries safely pad to S=320 without touching the B=8 corpus bucket.
+# Single-query B=1 S=256 bucket (included by default in W8A16 multifunction builds; optional on legacy FP16).
 _OPTIONAL_QUERY_BUCKETS: tuple[tuple[int, str, int, int], ...] = (
     (256, "bge_b1_s256_fp16.mlmodelc", 1, 1),
 )
@@ -81,8 +85,21 @@ def _load_ane_lib(dylib_path: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(dylib_path))
     lib.bge_ane_init_tables.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
     lib.bge_ane_init_tables.restype = ctypes.c_int
+    if hasattr(lib, "bge_ane_init_tables_borrowed"):
+        lib.bge_ane_init_tables_borrowed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        lib.bge_ane_init_tables_borrowed.restype = ctypes.c_int
     lib.bge_ane_load_bucket.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.bge_ane_load_bucket.restype = ctypes.c_int
+    if hasattr(lib, "bge_ane_load_bucket_fn"):
+        lib.bge_ane_load_bucket_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.bge_ane_load_bucket_fn.restype = ctypes.c_int
     lib.bge_ane_query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
     lib.bge_ane_query.restype = ctypes.c_double
     lib.bge_ane_encode_bucket.argtypes = [
@@ -97,6 +114,12 @@ def _load_ane_lib(dylib_path: Path) -> ctypes.CDLL:
     lib.bge_ane_encode_bucket.restype = ctypes.c_double
     lib.bge_ane_free_all.argtypes = []
     lib.bge_ane_free_all.restype = None
+    if hasattr(lib, "bge_ane_free_bucket"):
+        lib.bge_ane_free_bucket.argtypes = [ctypes.c_int]
+        lib.bge_ane_free_bucket.restype = None
+    if hasattr(lib, "bge_ane_clear_borrowed_tables"):
+        lib.bge_ane_clear_borrowed_tables.argtypes = [ctypes.c_void_p]
+        lib.bge_ane_clear_borrowed_tables.restype = None
     if hasattr(lib, "bge_ane_inspect_plan"):
         lib.bge_ane_inspect_plan.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.bge_ane_inspect_plan.restype = None
@@ -109,6 +132,16 @@ def _load_ane_lib(dylib_path: Path) -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.bge_ane_get_plan_counts.restype = ctypes.c_int
+    if hasattr(lib, "bge_ane_get_plan_counts_fn"):
+        lib.bge_ane_get_plan_counts_fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.bge_ane_get_plan_counts_fn.restype = ctypes.c_int
     if hasattr(lib, "bge_ane_last_error"):
         lib.bge_ane_last_error.argtypes = []
         lib.bge_ane_last_error.restype = ctypes.c_char_p
@@ -155,7 +188,9 @@ class FastBgeSmall:
         self.ane: ctypes.CDLL | None = None
         self.buckets: dict[int, int] = {}
         self.query_buckets: dict[int, int] = {}
+        self._owned_bucket_ids: set[int] = set()
         self._bucket_paths: dict[int, Path] = {}
+        self._bucket_fn_names: dict[int, str | None] = {}
         self.ane_plan_stats: dict[int, dict[str, int]] = {}
         self.ane_available = False
         self._wt0_f16: np.ndarray | None = None
@@ -164,6 +199,7 @@ class FastBgeSmall:
         self._query_lock = threading.Lock()
         self._corpus_lock = threading.Lock()
         self.last_stats: dict[str, int] | None = None
+        self.cpu_sme_available = self.paths.cpu_dylib.exists()
 
         norm_default = "hetero" if default_mode == "hetero2" else default_mode
 
@@ -203,7 +239,13 @@ class FastBgeSmall:
             with self._gpu_init_lock:
                 if self._gpu is None:
                     self._ensure_memory_hygiene()
-                    self._gpu = FastBgeSmallGPU(self.paths.weights_npz)
+                    if self._wt0_f16 is None or self._pos_f16 is None:
+                        self._wt0_f16, self._pos_f16 = load_or_mmap_host_tables(self.paths.weights_npz)
+                    self._gpu = FastBgeSmallGPU(
+                        self.paths.weights_npz,
+                        wt0_f16=self._wt0_f16,
+                        pos_f16=self._pos_f16,
+                    )
         return self._gpu
 
     @gpu.setter
@@ -211,6 +253,30 @@ class FastBgeSmall:
         self._gpu = value
 
     def close(self) -> None:
+        ane_lib = getattr(self, "ane", None)
+        if ane_lib is not None:
+            owned_ids = sorted(getattr(self, "_owned_bucket_ids", ()))
+            if hasattr(ane_lib, "bge_ane_free_bucket"):
+                for bid in owned_ids:
+                    ane_lib.bge_ane_free_bucket(bid)
+            if hasattr(ane_lib, "bge_ane_clear_borrowed_tables"):
+                wt0 = getattr(self, "_wt0_f16", None)
+                if wt0 is not None:
+                    ane_lib.bge_ane_clear_borrowed_tables(wt0.ctypes.data)
+            self._owned_bucket_ids.clear()
+            self.buckets.clear()
+            self.query_buckets.clear()
+            self.ane = None
+        self.ane_available = False
+
+        for attr in ("_wt0_f16", "_pos_f16"):
+            arr = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if isinstance(arr, np.memmap):
+                backing = getattr(arr, "_mmap", None)
+                if backing is not None and not getattr(backing, "closed", False):
+                    backing.close()
+
         prev = getattr(self, "_prev_wired_limit", None)
         self._prev_wired_limit = None
         _restore_mlx_wired_limit(prev)
@@ -223,16 +289,18 @@ class FastBgeSmall:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
 
-    def _init_ane(self, *, verify_plan: bool = True) -> None:
-        f16 = dict(np.load(self.paths.weights_npz))
-        self._wt0_f16 = np.ascontiguousarray(
-            f16["embeddings.word_embeddings.weight"].astype(np.float16)
-            + f16["embeddings.token_type_embeddings.weight"][0:1].astype(np.float16)
-        )
-        self._pos_f16 = np.ascontiguousarray(f16["embeddings.position_embeddings.weight"].astype(np.float16))
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
-        ane = _load_ane_lib(self.paths.ane_dylib)
-        rc = ane.bge_ane_init_tables(
+    def _bind_ane_tables(self, ane: Any | None = None) -> None:
+        lib = ane if ane is not None else self.ane
+        if lib is None or self._wt0_f16 is None or self._pos_f16 is None:
+            return
+        init_fn = getattr(lib, "bge_ane_init_tables_borrowed", lib.bge_ane_init_tables)
+        rc = init_fn(
             self._wt0_f16.ctypes.data,
             self._wt0_f16.shape[0],
             self._pos_f16.ctypes.data,
@@ -241,25 +309,57 @@ class FastBgeSmall:
         if rc != 0:
             raise RuntimeError(f"bge_ane_init_tables failed with code {rc}")
 
+    def _init_ane(self, *, verify_plan: bool = True) -> None:
+        self._wt0_f16, self._pos_f16 = load_or_mmap_host_tables(self.paths.weights_npz)
+
+        ane = _load_ane_lib(self.paths.ane_dylib)
+        self._bind_ane_tables(ane)
+
+        mf_path: Path | None = None
+        if hasattr(ane, "bge_ane_load_bucket_fn"):
+            for mf_name in _MULTIFUNCTION_CANDIDATES:
+                cand = self.paths.ane_models_dir / mf_name
+                if cand.exists():
+                    mf_path = cand
+                    break
+
+        def _try_load_bucket(batch_size: int, cap: int, legacy_filename: str, slots: int) -> tuple[int, Path | None, str | None]:
+            fn_name = f"bge_b{batch_size}_s{cap}"
+            if mf_path is not None:
+                bid_mf = ane.bge_ane_load_bucket_fn(
+                    str(mf_path).encode("utf-8"),
+                    fn_name.encode("utf-8"),
+                    batch_size,
+                    cap,
+                    slots,
+                    1,
+                )
+                if bid_mf >= 0:
+                    return bid_mf, mf_path, fn_name
+            w8_path = self.paths.ane_models_dir / f"bge_b{batch_size}_s{cap}_w8a16.mlmodelc"
+            for model_path in (w8_path, self.paths.ane_models_dir / legacy_filename):
+                if not model_path.exists():
+                    continue
+                bid_sep = ane.bge_ane_load_bucket(str(model_path).encode("utf-8"), batch_size, cap, slots, 1)
+                if bid_sep >= 0:
+                    return bid_sep, model_path, None
+            return -1, None, None
+
         loaded: dict[int, int] = {}
         query_loaded: dict[int, int] = {}
         bucket_paths: dict[int, Path] = {}
+        bucket_fns: dict[int, str | None] = {}
         for cap, filename, batch_size, slots in _ANE_BUCKETS:
-            model_path = self.paths.ane_models_dir / filename
-            if not model_path.exists():
-                continue
-            bid = ane.bge_ane_load_bucket(str(model_path).encode("utf-8"), batch_size, cap, slots, 1)
-            if bid >= 0:
+            bid, model_path, fn_name = _try_load_bucket(batch_size, cap, filename, slots)
+            if bid >= 0 and model_path is not None:
                 loaded[cap] = bid
                 bucket_paths[cap] = model_path
+                bucket_fns[cap] = fn_name
                 if batch_size == 1:
                     query_loaded[cap] = bid
 
         for cap, filename, batch_size, slots in _OPTIONAL_QUERY_BUCKETS:
-            model_path = self.paths.ane_models_dir / filename
-            if not model_path.exists():
-                continue
-            bid = ane.bge_ane_load_bucket(str(model_path).encode("utf-8"), batch_size, cap, slots, 1)
+            bid, _, _ = _try_load_bucket(batch_size, cap, filename, slots)
             if bid >= 0:
                 query_loaded[cap] = bid
 
@@ -267,28 +367,45 @@ class FastBgeSmall:
             self.ane = ane
             self.buckets = loaded
             self.query_buckets = query_loaded
+            self._owned_bucket_ids = set(loaded.values()) | set(query_loaded.values())
             self._bucket_paths = bucket_paths
+            self._bucket_fn_names = bucket_fns
             self.ane_available = True
             if verify_plan:
                 self.inspect_ane_plans(warn_on_cpu_fallback=True)
+        else:
+            if hasattr(ane, "bge_ane_clear_borrowed_tables") and self._wt0_f16 is not None:
+                ane.bge_ane_clear_borrowed_tables(self._wt0_f16.ctypes.data)
 
     def inspect_ane_plans(self, *, warn_on_cpu_fallback: bool = True) -> dict[int, dict[str, int]]:
         """Inspect MLComputePlan placement for loaded ANE buckets; warn if cpu_ops > 0 or ane_ops == 0."""
         plans: dict[int, dict[str, int]] = {}
         if not self.ane_available or self.ane is None or not hasattr(self.ane, "bge_ane_get_plan_counts"):
             return plans
+        has_fn_plan = hasattr(self.ane, "bge_ane_get_plan_counts_fn")
         for cap in sorted(self._bucket_paths):
             model_path = self._bucket_paths[cap]
+            fn_name = self._bucket_fn_names.get(cap)
             ane_c = ctypes.c_int(0)
             gpu_c = ctypes.c_int(0)
             cpu_c = ctypes.c_int(0)
-            rc = self.ane.bge_ane_get_plan_counts(
-                str(model_path).encode("utf-8"),
-                1,
-                ctypes.byref(ane_c),
-                ctypes.byref(gpu_c),
-                ctypes.byref(cpu_c),
-            )
+            if fn_name and has_fn_plan:
+                rc = self.ane.bge_ane_get_plan_counts_fn(
+                    str(model_path).encode("utf-8"),
+                    fn_name.encode("utf-8"),
+                    1,
+                    ctypes.byref(ane_c),
+                    ctypes.byref(gpu_c),
+                    ctypes.byref(cpu_c),
+                )
+            else:
+                rc = self.ane.bge_ane_get_plan_counts(
+                    str(model_path).encode("utf-8"),
+                    1,
+                    ctypes.byref(ane_c),
+                    ctypes.byref(gpu_c),
+                    ctypes.byref(cpu_c),
+                )
             if rc != 0:
                 if warn_on_cpu_fallback:
                     warnings.warn(
@@ -331,6 +448,7 @@ class FastBgeSmall:
         sl = int(arr.shape[0])
         with self._query_lock:
             if prefer_ane and self.ane_available and self.ane is not None:
+                self._bind_ane_tables()
                 q_map = getattr(self, "query_buckets", None) or self.buckets
                 for cap in _QUERY_CAPS:
                     if sl <= cap and cap in q_map:
@@ -375,6 +493,7 @@ class FastBgeSmall:
     def _run_ane_subdocs(self, doc_lists: Sequence[Sequence[int]], doc_indices: list[int], out_vecs: np.ndarray) -> None:
         if not self.ane_available or self.ane is None:
             raise RuntimeError("ANE runner not initialized")
+        self._bind_ane_tables()
         avail_caps = [c for c in _CORPUS_CAPS if c in self.buckets]
         if not avail_caps:
             raise RuntimeError("No ANE corpus buckets loaded")
@@ -516,16 +635,17 @@ class FastBgeSmall:
                         if batch_orig is None:
                             break
                         sub_toks = [norm_toks[i] for i in batch_orig]
-                        b = pack_sequences(sub_toks, max_tokens=gpu_max_tokens + 512)[0]
-                        vecs = self.gpu.forward_packed(
-                            b["tok_mx"], b["pos_mx"], b["tiles_mx"], b["bounds_mx"], b["cls_mx"], b["M_tok"], b["M_pad"]
-                        )
-                        mx.async_eval(vecs)
-                        if pending is not None:
-                            pv, p_orig = pending
-                            mx.eval(pv)  # guard: allow-eval (materialize previous async-dispatched batch)
-                            out[p_orig] = np.array(pv, dtype=np.float32)
-                        pending = (vecs, np.asarray(batch_orig, dtype=np.int32))
+                        batch_orig_arr = np.asarray(batch_orig, dtype=np.int32)
+                        for b in pack_sequences(sub_toks, max_tokens=gpu_max_tokens + 512):
+                            vecs = self.gpu.forward_packed(
+                                b["tok_mx"], b["pos_mx"], b["tiles_mx"], b["bounds_mx"], b["cls_mx"], b["M_tok"], b["M_pad"]
+                            )
+                            mx.async_eval(vecs)
+                            if pending is not None:
+                                pv, p_orig = pending
+                                mx.eval(pv)  # guard: allow-eval (materialize previous async-dispatched batch)
+                                out[p_orig] = np.array(pv, dtype=np.float32)
+                            pending = (vecs, batch_orig_arr[b["orig_idx"]])
                     if pending is not None:
                         pv, p_orig = pending
                         mx.eval(pv)

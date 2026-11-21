@@ -30,9 +30,8 @@ $(BUILD_DIR)/libbge_cpu_query.dylib: native/bge_cpu_query.mm native/bge_cpu_quer
 $(BUILD_DIR)/bge-ane-cli: native/bge_ane_cli.mm native/bge_ane_runner.mm native/bge_ane_runner.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -ObjC++ -fobjc-arc native/bge_ane_cli.mm native/bge_ane_runner.mm $(CLI_FW) -o $@
 
-# Default native build ships the active ANE runner + standalone CLI.
-# Optional vectorized CPU query dylib is built via `make cpu-query`.
-native: $(BUILD_DIR)/libbge_ane_runner.dylib $(BUILD_DIR)/bge-ane-cli
+# Default native build ships the active ANE runner, standalone CLI, and vectorized CPU query dylib.
+native: $(BUILD_DIR)/libbge_ane_runner.dylib $(BUILD_DIR)/bge-ane-cli $(BUILD_DIR)/libbge_cpu_query.dylib
 
 cpu-query: $(BUILD_DIR)/libbge_cpu_query.dylib
 

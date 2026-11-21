@@ -16,6 +16,14 @@ int emb2_get_plan_counts(
     int* out_gpu_ops,
     int* out_cpu_ops
 );
+int emb2_get_plan_counts_fn(
+    const char* mlmodelc_path,
+    const char* function_name,
+    int compute_mode,
+    int* out_ane_ops,
+    int* out_gpu_ops,
+    int* out_cpu_ops
+);
 
 // Retrieve last recorded CoreML error description (empty string if none).
 const char* emb2_last_error(void);
@@ -23,6 +31,18 @@ const char* emb2_last_error(void);
 // Load a packed CoreML bundle for sequence length S with pipe_depth async prediction slots.
 // compute_mode: 0 = CPUAndNeuralEngine (ANE), 1 = CPUOnly (AMX/SME), 2 = All.
 void* emb2_pk_load_units(const char* mlmodelc_path, int S, int pipe_depth, int compute_mode);
+void* emb2_pk_load_units_fn(
+    const char* mlmodelc_path,
+    const char* function_name,
+    int S,
+    int pipe_depth,
+    int compute_mode
+);
+
+// OpenInfinity / FluidInference multifunction loader (embed_32..512: inputs_embeds [1,S,512], attention_mask [1,S] -> embedding [1,768]).
+void* emb2_oi_load_embed(const char* mlmodelc_path, const char* function_name, int S, int pipe_depth, int compute_mode);
+double emb2_oi_exec_embed(void* handle, int N, const uint16_t* embeds_f16, const uint16_t* mask_f16, float* out_f32_768);
+void emb2_oi_free(void* handle);
 
 // Submit N packed sequences asynchronously and return an inflight handle (must be awaited by emb2_pk_wait_queue).
 void* emb2_pk_submit_queue(

@@ -193,10 +193,13 @@ def mlx_wired_scope(enabled=True):
         yield
         return
     prev = None
+    prev_cache = None
     mx_mod = None
     try:
         import mlx.core as mx
         mx_mod = mx
+        if hasattr(mx, "set_cache_limit"):
+            prev_cache = mx.set_cache_limit(256 * 1024 * 1024)
         if hasattr(mx, "set_wired_limit"):
             max_rec = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
             if max_rec > 0:
@@ -208,6 +211,8 @@ def mlx_wired_scope(enabled=True):
     finally:
         if mx_mod is not None:
             try:
+                if prev_cache is not None and hasattr(mx_mod, "set_cache_limit"):
+                    mx_mod.set_cache_limit(prev_cache)
                 if prev is not None and hasattr(mx_mod, "set_wired_limit"):
                     mx_mod.set_wired_limit(prev)
                 if hasattr(mx_mod, "clear_cache"):
@@ -717,9 +722,12 @@ elif pkg == "fast-gpt-oss":
         import mlx_lm
     except Exception as exc:
         skip(f"mlx_lm unavailable ({exc})")
-    snap = resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q4")
+    snap = (
+        resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q8")
+        or resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q4")
+    )
     if snap is None:
-        skip("no local HF snapshot for mlx-community/gpt-oss-20b-MXFP4-Q4")
+        skip("no local HF snapshot for mlx-community/gpt-oss-20b-MXFP4-Q8 (or MXFP4-Q4)")
 
     with mlx_wired_scope(use_wired):
         t0 = time.perf_counter()

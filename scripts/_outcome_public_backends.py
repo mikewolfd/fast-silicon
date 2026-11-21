@@ -43,6 +43,24 @@ def _ensure_fast_decision_models_on_path() -> None:
     if _FAST_DECISION_MODELS_SRC.is_dir() and src not in sys.path:
         sys.path.insert(0, src)
 
+
+def resolve_coreai_cache_dir() -> Path:
+    """Return Apple CoreAI `.aimodelx` specialization cache path without literal tilde-slash."""
+    return Path.home() / "Library" / "Caches" / "coreai-cache"
+
+
+def _parse_macos_tuple(raw: str | None = None) -> tuple[int, ...]:
+    import platform
+
+    ver = platform.mac_ver()[0] if raw is None else str(raw)
+    parts: list[int] = []
+    for tok in ver.split("."):
+        m = re.match(r"(\d+)", tok.strip())
+        if not m:
+            break
+        parts.append(int(m.group(1)))
+    return tuple(parts)
+
 _COREAI_DAEMON_PREAMBLE = r"""
 import ctypes, json, os, sys, time
 from pathlib import Path
@@ -83,14 +101,21 @@ def _inspect_aimodel_asset(aimodel_path):
 
 
 class _DaemonTelemetry:
-    def __init__(self, model_dirs=None):
-        self.model_dirs = [str(Path(d)) for d in (model_dirs or []) if d]
+    def __init__(self, model_dirs=None, *, include_coreai_cache=False):
+        dirs = [str(Path(d)) for d in (model_dirs or []) if d]
+        coreai_cache = Path.home() / "Library" / "Caches" / "coreai-cache"
+        if include_coreai_cache or coreai_cache.exists():
+            cache_str = str(coreai_cache)
+            if cache_str not in dirs:
+                dirs.append(cache_str)
+        self.model_dirs = dirs
         self.compile_sec = 0.0
         self.cold_load_ms = None
         self.cold_warmup_ms = None
         self.cold_first_infer_ms = None
         self.warm_latencies_ms = []
         self.external_peak_gb = 0.0
+        self.max_rss_gb = 0.0
         self.asset_summary = None
         self.coreml_info = None
         self.profiler_available = False
@@ -144,6 +169,12 @@ class _DaemonTelemetry:
         if pk is not None:
             self.external_peak_gb = max(self.external_peak_gb, float(pk))
 
+    def observe_max_rss_gb(self, rss_gb):
+        if rss_gb is not None:
+            self.max_rss_gb = max(self.max_rss_gb, float(rss_gb))
+            if isinstance(self.coreml_info, dict):
+                self.coreml_info["max_rss_gb"] = round(self.max_rss_gb, 4)
+
     def payload(self, *, final=False):
         if self._collect_4b is not None:
             four = self._collect_4b(self._probe, model_directories=self.model_dirs, evict_mapped=False)
@@ -183,6 +214,8 @@ class _DaemonTelemetry:
         }
         if self.external_peak_gb > 0.0:
             out["external_peak_gb"] = round(self.external_peak_gb, 4)
+        if self.max_rss_gb > 0.0:
+            out["max_rss_gb"] = round(self.max_rss_gb, 4)
         if self.compile_sec > 0.0 or self.coreml_info is not None:
             out["compile_sec"] = round(self.compile_sec, 4)
         if self.coreml_info is not None:
@@ -191,6 +224,51 @@ class _DaemonTelemetry:
             out["asset_summary"] = self.asset_summary
             self._sent_asset = True
         return out
+
+
+def _parse_coreai_llm_runner_result(stdout_s, stderr_s, returncode, wall_ms):
+    import re as _re
+
+    out_s = stdout_s or ""
+    err_s = stderr_s or ""
+    txt = out_s.split("Generating...\n", 1)[1] if "Generating...\n" in out_s else out_s
+    summary = ""
+    if "Performance Summary:" in txt:
+        txt, summary = txt.split("Performance Summary:", 1)
+        txt = _re.sub(r"\n+[^\n]*$", "", txt).rstrip("\n")
+    else:
+        summary = out_s
+    m_gen = _re.search(r"Generation:\s*([0-9.]+)ms,\s*(\d+)\s*tokens", summary)
+    gen_tokens = int(m_gen.group(2)) if m_gen else 0
+    m_ld = _re.search(r"Model Load:\s*([0-9.]+)ms", out_s)
+    load_ms = round(float(m_ld.group(1)), 3) if m_ld else None
+    infer_ms = round(max(0.0, float(wall_ms) - (load_ms if load_ms is not None else 0.0)), 3)
+    m_fp = _re.search(r"(\d+)\s+peak memory footprint", err_s)
+    peak_fp_gb = round(int(m_fp.group(1)) / 1e9, 4) if m_fp else None
+    m_rss = _re.search(r"(\d+)\s+maximum resident set size", err_s)
+    max_rss_gb = round(int(m_rss.group(1)) / 1e9, 4) if m_rss else None
+    ok = int(returncode) == 0
+    err_tail = "" if ok else ((err_s or out_s or f"llm-runner exited with code {returncode}")[-400:]).strip()
+    return {
+        "ok": ok,
+        "text": txt if ok else "",
+        "gen_tokens": gen_tokens if ok else 0,
+        "model_load_ms": load_ms,
+        "infer_ms": infer_ms,
+        "peak_footprint_gb": peak_fp_gb,
+        "max_rss_gb": max_rss_gb,
+        "error": err_tail,
+    }
+
+
+def _apply_runner_telemetry(telem, aim_path, parsed):
+    if parsed.get("model_load_ms") is not None:
+        telem.mark_loaded(aim_path, parsed["model_load_ms"])
+    telem.record_infer(parsed["infer_ms"])
+    if parsed.get("peak_footprint_gb") is not None:
+        telem.observe_external_peak_gb(parsed["peak_footprint_gb"])
+    if parsed.get("max_rss_gb") is not None:
+        telem.observe_max_rss_gb(parsed["max_rss_gb"])
 """.lstrip()
 
 
@@ -262,6 +340,10 @@ class _CoreAiSubprocessClient:
         if "external_peak_gb" in resp and resp["external_peak_gb"] is not None:
             self._telemetry["external_peak_gb"] = round(
                 max(float(self._telemetry.get("external_peak_gb", 0.0)), float(resp["external_peak_gb"])), 4
+            )
+        if "max_rss_gb" in resp and resp["max_rss_gb"] is not None:
+            self._telemetry["max_rss_gb"] = round(
+                max(float(self._telemetry.get("max_rss_gb", 0.0)), float(resp["max_rss_gb"])), 4
             )
         if "compile_sec" in resp and resp["compile_sec"] is not None:
             self._telemetry["compile_sec"] = round(float(resp["compile_sec"]), 4)
@@ -721,6 +803,43 @@ main()
     )
 
 
+class PublicBgeSmallBackend:
+    """Stock `mlx-embeddings` BGE-small backend with bounded 256 MiB Metal cache."""
+
+    def __init__(self) -> None:
+        import mlx.core as mx
+        import mlx_embeddings
+
+        snap8 = resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-8bit")
+        snap = snap8 or resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-bf16")
+        if snap is None:
+            raise FileNotFoundError("Missing cached HF snapshot for mlx-community/bge-small-en-v1.5-8bit")
+        self._mx = mx
+        self._mlx_embeddings = mlx_embeddings
+        self._previous_cache_limit = mx.set_cache_limit(256 * 1024 * 1024)
+        self.model, self.tokenizer = mlx_embeddings.utils.load(str(snap))
+        self.harness_label = "mlx-embeddings-8bit" if snap8 is not None else "mlx-embeddings-bf16"
+
+    def encode_texts(self, txts: list[str], *, prefix: str = "", bsz: int = 64) -> np.ndarray:
+        mx = self._mx
+        vecs: list[np.ndarray] = []
+        for i in range(0, len(txts), bsz):
+            sub = [prefix + t for t in txts[i : i + bsz]]
+            out = self._mlx_embeddings.utils.generate(self.model, self.tokenizer, sub, max_length=512)
+            te = out.text_embeds
+            mx.eval(te)
+            vecs.append(np.asarray(te.astype(mx.float32)))
+        if hasattr(mx, "synchronize"):
+            mx.synchronize()
+        return np.vstack(vecs) if vecs else np.zeros((0, 384), dtype=np.float32)
+
+    def close(self) -> float | None:
+        if self._previous_cache_limit is not None:
+            self._mx.set_cache_limit(self._previous_cache_limit)
+            self._previous_cache_limit = None
+        return None
+
+
 def build_public_cat1_adapter(
     pkg_name: str,
     *,
@@ -731,38 +850,18 @@ def build_public_cat1_adapter(
 ) -> Cat1Adapter:
     """Instantiate the fastest verified stock baseline encoder for Category 1."""
     if pkg_name == "public-bge-small":
-        import mlx.core as mx
-        import mlx_embeddings
-
-        snap8 = resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-8bit")
-        snap = snap8 or resolve_hf_snapshot("mlx-community/bge-small-en-v1.5-bf16")
-        if snap is None:
-            raise FileNotFoundError("Missing cached HF snapshot for mlx-community/bge-small-en-v1.5-8bit")
-        mdl, tok = mlx_embeddings.utils.load(str(snap))
+        bge_backend = PublicBgeSmallBackend()
         q_prefix = "Represent this sentence for searching relevant passages: "
-        lbl = "mlx-embeddings-8bit" if snap8 is not None else "mlx-embeddings-bf16"
-
-        def _enc_bge(txts: list[str], *, prefix: str = "", bsz: int = 64) -> np.ndarray:
-            vecs: list[np.ndarray] = []
-            for i in range(0, len(txts), bsz):
-                sub = [prefix + t for t in txts[i : i + bsz]]
-                out = mlx_embeddings.utils.generate(mdl, tok, sub, max_length=512)
-                te = out.text_embeds
-                mx.eval(te)
-                vecs.append(np.asarray(te.astype(mx.float32)))
-            if hasattr(mx, "synchronize"):
-                mx.synchronize()
-            return np.vstack(vecs) if vecs else np.zeros((0, 384), dtype=np.float32)
-
         return Cat1Adapter(
-            harness_label=lbl,
+            harness_label=bge_backend.harness_label,
             mrl_dims=(128, 256, "max"),
             int8_mode="sym_int8",
             nb_pre_normalized=True,
-            enc_q_nb=lambda txts: _enc_bge(txts, prefix=q_prefix),
-            enc_d_nb=lambda txts: _enc_bge(txts, prefix=""),
-            enc_q=lambda txts: _enc_bge(txts, prefix=q_prefix),
-            enc_d=lambda txts: _enc_bge(txts, prefix=""),
+            enc_q_nb=lambda txts: bge_backend.encode_texts(txts, prefix=q_prefix),
+            enc_d_nb=lambda txts: bge_backend.encode_texts(txts, prefix=""),
+            enc_q=lambda txts: bge_backend.encode_texts(txts, prefix=q_prefix),
+            enc_d=lambda txts: bge_backend.encode_texts(txts, prefix=""),
+            close_fn=bge_backend.close,
         )
 
     if pkg_name == "public-embeddinggemma-2":
@@ -778,6 +877,7 @@ def build_public_cat1_adapter(
         )
         if snap is None:
             raise FileNotFoundError("Missing cached HF snapshot for mlx-community/embeddinggemma-2-8bit")
+        prev_emb2_cache = mx.set_cache_limit(256 * 1024 * 1024)
         mdl = load_embedding_model(Path(snap))
         tok = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
         q_prefix = "task: search result | query: "
@@ -797,6 +897,11 @@ def build_public_cat1_adapter(
                 mx.synchronize()
             return np.vstack(out_vecs) if out_vecs else np.zeros((0, 768), dtype=np.float32)
 
+        def _close_emb2() -> float | None:
+            if prev_emb2_cache is not None:
+                mx.set_cache_limit(prev_emb2_cache)
+            return None
+
         coarse_cap = int(max_coarse_tokens) if max_coarse_tokens is not None else 2048
         return Cat1Adapter(
             harness_label=lbl,
@@ -808,6 +913,7 @@ def build_public_cat1_adapter(
             enc_q=lambda txts: _enc_emb2(txts, prefix=q_prefix, max_len=512, bsz=32),
             enc_d=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=512, bsz=32),
             enc_coarse_2k=lambda txts: _enc_emb2(txts, prefix=d_prefix, max_len=coarse_cap, bsz=8),
+            close_fn=_close_emb2,
             coarse_max_tokens=coarse_cap,
         )
 
@@ -838,7 +944,7 @@ import numpy as np
 async def main():
     bdir = Path(sys.argv[1])
     aim_path = bdir / "text_encoder.aimodel"
-    telem = _DaemonTelemetry([bdir])
+    telem = _DaemonTelemetry([bdir, Path.home() / "Library" / "Caches" / "coreai-cache"], include_coreai_cache=True)
     t_load = time.perf_counter()
     model = await AIModel.load(str(aim_path))
     telem.mark_loaded(aim_path, (time.perf_counter() - t_load) * 1000.0)
@@ -963,7 +1069,8 @@ asyncio.run(main())
                 mx.synchronize()
             return np.vstack(rows) if rows else np.zeros((0, 1024), dtype=np.float32)
 
-        ctx_max_len = 4096 if tier == "tier1" else 16384
+        del tier
+        ctx_max_len = 2048
 
         def _enc_ctx_pplx(doc_groups: list[list[str]]) -> list[np.ndarray]:
             from fast_shared.outcome_eval.retrieval import collect_pplx_window_vectors, plan_pplx_windows
@@ -1151,7 +1258,14 @@ _STOCK_HF_REPOS: dict[str, tuple[str, ...]] = {
     "public-laya": (_STOCK_DECISION_REPOS["public-laya"],),
     "public-kev-0.8b": (_STOCK_DECISION_REPOS["public-kev-0.8b"],),
     "public-gemma4": ("lmstudio-community/gemma-4-E2B-it-MLX-4bit",),
-    "public-gpt-oss": ("mlx-community/gpt-oss-20b-MXFP4-Q4",),
+    "coreai-gemma4": (
+        "mikedoise/gemma-4-E2B-it-coreai-4bit-128k-text",
+        "mlboydaisuke/gemma-4-E2B-CoreAI",
+    ),
+    "public-gpt-oss": (
+        "mlx-community/gpt-oss-20b-MXFP4-Q8",
+        "mlx-community/gpt-oss-20b-MXFP4-Q4",
+    ),
 }
 
 
@@ -1248,18 +1362,23 @@ class PublicLayaMlxBackend:
             max_len=512,
         )
         self._qtype_map = {"choice": 0, "score": 1, "noul": 2}
-        # The variable-length suite issues many allocation shapes on the 24 GB host.
-        self._previous_cache_limit = mx.set_cache_limit(512 << 20)
+        # Cap free-list cache at 256 MiB across variable-length batches.
+        self._previous_cache_limit = mx.set_cache_limit(256 * 1024 * 1024)
 
     def encode_item(self, state: Any, qdef: Mapping[str, Any], *, on_truncate: str = "ignore") -> dict[str, Any]:
         return self._tok_helper.encode_item(state, qdef, on_truncate=on_truncate)
 
     def _score_generic(self, encs: Sequence[Mapping[str, Any]], qtype_override: str | None = None, bsz: int = 16) -> list[list[float]]:
+        if not encs:
+            return []
         mx = self._mx
         nn = self._nn
-        out_probs: list[list[float]] = []
-        for i in range(0, len(encs), bsz):
-            batch = encs[i : i + bsz]
+        n_items = len(encs)
+        order = sorted(range(n_items), key=lambda idx: len(encs[idx]["ids"]))
+        out_probs: list[list[float]] = [[] for _ in range(n_items)]
+        for i in range(0, n_items, bsz):
+            batch_orig = order[i : i + bsz]
+            batch = [encs[idx] for idx in batch_orig]
             B = len(batch)
             qtypes = [self._qtype_map[qtype_override] if qtype_override else int(e["qtype"]) for e in batch]
             tv = self.type_emb_w[mx.array(qtypes)][:, None, :]
@@ -1295,13 +1414,14 @@ class PublicLayaMlxBackend:
             pos_l = (nn.gelu(sn @ self.sc_1_w.T + self.sc_1_b) @ self.sc_3_w.T + self.sc_3_b).squeeze(-1)
             mx.eval(pos_l)
             pos_np = np.asarray(pos_l)
-            for r_i, e in enumerate(batch):
+            for r_i, orig_idx in enumerate(batch_orig):
+                e = batch[r_i]
                 m_pos = e["markers"]
                 temp = self._tok_helper.resolve_temperature(qtypes[r_i], len(m_pos))
                 raw_l = np.array([pos_np[r_i, p] for p in m_pos], dtype=np.float64) / max(temp, 0.05)
                 raw_l -= np.max(raw_l)
                 ex = np.exp(raw_l)
-                out_probs.append((ex / np.sum(ex)).tolist())
+                out_probs[orig_idx] = (ex / np.sum(ex)).tolist()
         if hasattr(mx, "synchronize"):
             mx.synchronize()
         return out_probs
@@ -1356,7 +1476,7 @@ import numpy as np
 
 async def main():
     aim_path = Path({str(snap_ca)!r}) / "decision.aimodel"
-    telem = _DaemonTelemetry([aim_path.parent])
+    telem = _DaemonTelemetry([aim_path.parent, Path.home() / "Library" / "Caches" / "coreai-cache"], include_coreai_cache=True)
     t_load = time.perf_counter()
     m = await AIModel.load(str(aim_path))
     telem.mark_loaded(aim_path, (time.perf_counter() - t_load) * 1000.0)
@@ -2065,6 +2185,556 @@ main()
         return self.peak_gb
 
 
+def _extract_harmony_final_and_length(
+    raw_tx: str,
+    *,
+    encode_fn: Callable[[str], Sequence[int]],
+    eff_max: int,
+    raw_token_count: int | None = None,
+) -> tuple[str, bool, int]:
+    """Compute finish_length BEFORE stripping `<|channel|>analysis<|message|>`, then extract final channel text."""
+    raw_cnt = int(raw_token_count) if (raw_token_count is not None and int(raw_token_count) > 0) else len(encode_fn(raw_tx))
+    closed = raw_tx.rstrip().endswith(("<|return|>", "<|end|>"))
+    hit_length = (not closed) and (raw_cnt >= max(1, int(eff_max) - 1))
+
+    if "<|channel|>final<|message|>" in raw_tx:
+        clean_tx = raw_tx.split("<|channel|>final<|message|>", 1)[1]
+    elif "<|channel|>analysis<|message|>" in raw_tx:
+        # Truncated inside analysis channel before reaching final channel
+        clean_tx = ""
+    elif "<|message|>" in raw_tx:
+        clean_tx = raw_tx.split("<|message|>")[-1]
+    else:
+        clean_tx = raw_tx
+    clean_tx = clean_tx.replace("<|return|>", "").replace("<|end|>", "").strip()
+    return clean_tx, hit_length, raw_cnt
+
+
+class CoreAiQwen35Backend:
+    """Apple `CoreAI` Qwen3.5-4B `.aimodel` backend with `--warmup off`, `--repetition-penalty 1.05`, and `(1, cur_len)` `position_ids`."""
+
+    def __init__(self, *, coreai_python: str | None = None, coreai_variant: str = "4bit") -> None:
+        ca_py = resolve_coreai_python(coreai_python)
+        ca_bdir = resolve_coreai_bundle(f"qwen35/qwen35_4b_{coreai_variant}")
+        tok_snap = (
+            (ca_bdir / "tokenizer") if (ca_bdir is not None and (ca_bdir / "tokenizer").is_dir()) else None
+        ) or resolve_hf_snapshot("Qwen/Qwen3.5-4B") or ca_bdir
+        if ca_py is None or ca_bdir is None or tok_snap is None or not list(ca_bdir.glob("*.aimodel")):
+            raise FileNotFoundError(f"CoreAI Qwen3.5-4B ({coreai_variant}) bundle or coreai runtime not staged")
+
+        self.default_label = f"coreai_qwen35_4b_{coreai_variant}"
+        llm_run_cand = ca_py.parents[2] / ".build" / "out" / "Products" / "Release" / "llm-runner"
+        llm_run_str = str(llm_run_cand) if llm_run_cand.is_file() else ""
+
+        daemon_q = f"""
+import asyncio, re, subprocess
+import ml_dtypes, numpy as np
+from transformers import AutoTokenizer
+from coreai.runtime import AIModel, NDArray
+
+def make_state(fn, kv_len):
+    st = {{}}
+    for sn in fn.desc.state_names:
+        sd = fn.desc.state_descriptor(sn)
+        shape = tuple(kv_len if int(d) < 0 else int(d) for d in sd.shape)
+        ds = str(sd.dtype).lower()
+        dt = ml_dtypes.bfloat16 if "bfloat16" in ds else (ml_dtypes.float8_e4m3fn if ("float8" in ds or "e4m3" in ds) else (np.float16 if "float16" in ds else np.float32))
+        st[sn] = NDArray(np.zeros(shape, dtype=dt))
+    return st
+
+def parse_runner_out(stdout_s: str) -> tuple[str, int]:
+    txt = stdout_s.split("Generating...\\n", 1)[1] if "Generating...\\n" in stdout_s else stdout_s
+    summary = ""
+    if "Performance Summary:" in txt:
+        txt, summary = txt.split("Performance Summary:", 1)
+        txt = re.sub(r"\\n+[^\\n]*$", "", txt).rstrip("\\n")
+    m = re.search(r"Generation:\\s*[0-9.]+ms,\\s*(\\d+)\\s*tokens", summary)
+    return txt, (int(m.group(1)) if m else 0)
+
+def apply_rep_penalty(logits_1d, seen_ids, penalty=1.05):
+    if penalty <= 1.0 or not seen_ids:
+        return logits_1d
+    out = logits_1d.copy()
+    idx = np.array(sorted(seen_ids), dtype=np.int64)
+    idx = idx[(idx >= 0) & (idx < out.shape[0])]
+    if idx.size:
+        vals = out[idx]
+        out[idx] = np.where(vals > 0.0, vals / penalty, vals * penalty)
+    return out
+
+async def main():
+    bdir = Path({str(ca_bdir)!r})
+    llm_run = {llm_run_str!r}
+    tok = AutoTokenizer.from_pretrained({str(tok_snap)!r}, local_files_only=True)
+    raw_eos = tok.eos_token_id
+    eos_set = set([int(x) for x in ([raw_eos] if isinstance(raw_eos, int) else (raw_eos or []))])
+    eot_id = tok.convert_tokens_to_ids("<|endoftext|>") if hasattr(tok, "convert_tokens_to_ids") else None
+    if isinstance(eot_id, int) and eot_id >= 0:
+        eos_set.add(eot_id)
+    telem = _DaemonTelemetry([bdir, Path.home() / "Library" / "Caches" / "coreai-cache"], include_coreai_cache=True)
+    aim_path = next(bdir.glob("*.aimodel"), None)
+    fn = None
+    if not llm_run and aim_path is not None:
+        t_load = time.perf_counter()
+        model = await AIModel.load(str(aim_path))
+        telem.mark_loaded(aim_path, (time.perf_counter() - t_load) * 1000.0)
+        fn = model.load_function("main")
+    else:
+        telem.mark_loaded(aim_path, None)
+    tok_f = Path(__file__).resolve().parent / "in_toks.json"
+    sys.stdout.write("READY\\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        req = json.loads(line)
+        if req.get("cmd") == "quit":
+            sys.stdout.write(json.dumps(telem.payload(final=True)) + "\\n")
+            sys.stdout.flush()
+            break
+        msgs = req["messages"]
+        enable_think = bool(req.get("enable_thinking", False))
+        try:
+            raw = tok.apply_chat_template(
+                msgs, tokenize=True, add_generation_prompt=True, enable_thinking=enable_think
+            )
+        except TypeError:
+            raw = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+        p_ids = [int(x) for x in (raw if isinstance(raw, list) else getattr(raw, "input_ids", raw))]
+        max_new = int(req["max_tokens"])
+        t_req = time.perf_counter()
+        if llm_run:
+            tok_f.write_text(json.dumps({{"tokens": p_ids}}), encoding="utf-8")
+            cmd_full = [
+                "/usr/bin/time", "-l", llm_run,
+                "--model", str(bdir),
+                "--raw-tokens", str(tok_f),
+                "--temperature", "0.0",
+                "--max-tokens", str(max_new),
+                "--warmup", "off",
+                "--repetition-penalty", "1.05",
+                "--stop-tokens", "<|endoftext|>",
+            ]
+            proc_r = subprocess.run(cmd_full, capture_output=True, text=True, timeout=600)
+            if proc_r.returncode != 0 and any(w in (proc_r.stderr or "").lower() for w in ("unknown option", "unrecognized", "unexpected argument")):
+                proc_r = subprocess.run(cmd_full[:-4], capture_output=True, text=True, timeout=600)
+            parsed = _parse_coreai_llm_runner_result(
+                proc_r.stdout, proc_r.stderr, proc_r.returncode, (time.perf_counter() - t_req) * 1000.0
+            )
+            _apply_runner_telemetry(telem, aim_path, parsed)
+            if not parsed["ok"]:
+                sys.stdout.write(
+                    json.dumps({{"gen_ids": [], "text": "", "reason": "error", "error": parsed["error"], **telem.payload()}}) + "\\n"
+                )
+                sys.stdout.flush()
+                continue
+            txt, gtok = parsed["text"], int(parsed["gen_tokens"])
+            if "<|endoftext|>" in txt:
+                txt = txt.split("<|endoftext|>", 1)[0]
+            gen_ids = list(tok.encode(txt, add_special_tokens=False))
+            reason = "length" if (gtok or len(gen_ids)) >= max_new else "stop"
+            sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
+            sys.stdout.flush()
+            continue
+        kv_len = max(512, len(p_ids) + max_new + 32)
+        st = make_state(fn, kv_len)
+        pa = np.array([p_ids], dtype=np.int32)
+        pp = np.arange(len(p_ids), dtype=np.int32).reshape(1, len(p_ids))
+        out = await fn({{"input_ids": NDArray(pa), "position_ids": NDArray(pp)}}, state=st)
+        last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
+        gen_ids = []
+        seen_ids = set(p_ids)
+        cur_len = len(p_ids)
+        reason = "length"
+        for _ in range(max_new):
+            if not np.all(np.isfinite(last_l)):
+                reason = "nan"
+                break
+            penalized = apply_rep_penalty(last_l, seen_ids, 1.05)
+            nxt = int(np.argmax(penalized))
+            if nxt in eos_set:
+                reason = "stop"
+                break
+            gen_ids.append(nxt)
+            seen_ids.add(nxt)
+            cur_len += 1
+            ta = np.array([[nxt]], dtype=np.int32)
+            tp = np.arange(cur_len, dtype=np.int32).reshape(1, cur_len)
+            out = await fn({{"input_ids": NDArray(ta), "position_ids": NDArray(tp)}}, state=st)
+            last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
+        telem.record_infer((time.perf_counter() - t_req) * 1000.0)
+        txt = tok.decode(gen_ids, skip_special_tokens=True)
+        sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
+        sys.stdout.flush()
+
+asyncio.run(main())
+"""
+        self._client = _CoreAiSubprocessClient(
+            cmd=[ca_py],
+            daemon_script=daemon_q,
+            script_name="dq.py",
+            prefix="coreai_qwen35_",
+        )
+
+    def generate(
+        self,
+        prompts: list[str],
+        *,
+        system_prompt: str | None = None,
+        per_doc_schemas: list[dict[str, Any] | None] | None = None,
+        max_tokens: int = 256,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
+        enable_thinking: bool = False,
+    ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
+        del per_doc_schemas, reasoning_budget
+        # Qwen3.5-4B chat_template.jinja defaults thinking ON (unlike 0.8B/2B); force enable_thinking=False on non-thinking calls.
+        eff_think = bool(enable_thinking) and (reasoning_effort not in (None, "skip", "low"))
+        texts: list[str] = []
+        reasons: list[str] = []
+        ids_list: list[list[int]] = []
+        tot_comp = 0
+        for p in prompts:
+            msgs = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+                {"role": "user", "content": p}
+            ]
+            resp = self._client.request(
+                {"messages": msgs, "max_tokens": int(max_tokens), "enable_thinking": eff_think}
+            )
+            g_ids = list(resp["gen_ids"])
+            texts.append(str(resp["text"]))
+            reasons.append(str(resp["reason"]))
+            ids_list.append(g_ids)
+            tot_comp += len(g_ids)
+        return texts, reasons, ids_list, {"completion_tokens": tot_comp, "mask_fallbacks": 0}
+
+    def telemetry(self) -> dict[str, Any]:
+        return self._client.telemetry()
+
+    def close(self) -> float:
+        return float(self._client.close().get("peak_gb", 0.0))
+
+
+def _parse_coreai_llm_runner_result(
+    stdout_s: str, stderr_s: str, returncode: int, wall_ms: float
+) -> dict[str, Any]:
+    """Parse `coreai-models` `llm-runner` stdout/stderr (`/usr/bin/time -l`), load latency, RSS/footprint, and error tail."""
+    out_s = stdout_s or ""
+    err_s = stderr_s or ""
+    txt = out_s.split("Generating...\n", 1)[1] if "Generating...\n" in out_s else out_s
+    summary = ""
+    if "Performance Summary:" in txt:
+        txt, summary = txt.split("Performance Summary:", 1)
+        txt = re.sub(r"\n+[^\n]*$", "", txt).rstrip("\n")
+    else:
+        summary = out_s
+    m_gen = re.search(r"Generation:\s*([0-9.]+)ms,\s*(\d+)\s*tokens", summary)
+    gen_tokens = int(m_gen.group(2)) if m_gen else 0
+    m_ld = re.search(r"Model Load:\s*([0-9.]+)ms", out_s)
+    load_ms = round(float(m_ld.group(1)), 3) if m_ld else None
+    infer_ms = round(max(0.0, float(wall_ms) - (load_ms if load_ms is not None else 0.0)), 3)
+    m_fp = re.search(r"(\d+)\s+peak memory footprint", err_s)
+    peak_fp_gb = round(int(m_fp.group(1)) / 1e9, 4) if m_fp else None
+    m_rss = re.search(r"(\d+)\s+maximum resident set size", err_s)
+    max_rss_gb = round(int(m_rss.group(1)) / 1e9, 4) if m_rss else None
+    ok = int(returncode) == 0
+    err_tail = "" if ok else ((err_s or out_s or f"llm-runner exited with code {returncode}")[-400:]).strip()
+    return {
+        "ok": ok,
+        "text": txt if ok else "",
+        "gen_tokens": gen_tokens if ok else 0,
+        "model_load_ms": load_ms,
+        "infer_ms": infer_ms,
+        "peak_footprint_gb": peak_fp_gb,
+        "max_rss_gb": max_rss_gb,
+        "error": err_tail,
+    }
+
+
+def _bundle_has_llm_runner_layout(bdir: Path) -> bool:
+    """Return True if `bdir` carries `apple/coreai-models` 2-input `metadata.json` (`per_layer_embeddings` / `auxiliary_assets`)."""
+    if "mikedoise" in str(bdir).lower():
+        return True
+    meta_files = sorted(bdir.glob("metadata.json"), key=str) or sorted(bdir.rglob("metadata.json"), key=str)
+    for mf in meta_files:
+        try:
+            raw = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(raw, Mapping) and any(
+            k in raw for k in ("per_layer_embeddings", "auxiliary_assets", "ple_sidecar")
+        ):
+            return True
+    return False
+
+
+def _select_coreai_gemma4_bundle(
+    ca_py: Path | None,
+    *,
+    resolve_snap_fn: Callable[[str], Path | None] = resolve_hf_snapshot,
+    resolve_bundle_fn: Callable[[str], Path | None] = resolve_coreai_bundle,
+) -> tuple[Path, Path, str, str]:
+    """Select `(ca_bdir, aim_dir, llm_run_str, default_label)` preferring 2-input `llm-runner` bundles when `llm-runner` exists."""
+    llm_run_cand = (
+        (ca_py.parents[2] / ".build" / "out" / "Products" / "Release" / "llm-runner")
+        if (ca_py is not None and len(ca_py.parents) >= 3)
+        else None
+    )
+    llm_run_str = str(llm_run_cand) if (llm_run_cand is not None and llm_run_cand.is_file()) else ""
+
+    snap_mike = resolve_snap_fn("mikedoise/gemma-4-E2B-it-coreai-4bit-128k-text")
+    snap_mlboy = resolve_snap_fn("mlboydaisuke/gemma-4-E2B-CoreAI")
+    b_4bit = resolve_bundle_fn("gemma4/gemma4_e2b")
+    b_qat = resolve_bundle_fn("gemma4/gemma4_e2b_qat")
+
+    ordered: list[tuple[Path | None, str]] = []
+    if llm_run_str:
+        ordered.append((snap_mike, "coreai_gemma4_e2b_4bit"))
+        for loc_b, loc_lbl in ((b_4bit, "coreai_gemma4_e2b_4bit"), (b_qat, "coreai_gemma4_e2b_qat")):
+            if loc_b is not None and _bundle_has_llm_runner_layout(loc_b):
+                ordered.append((loc_b, loc_lbl))
+        ordered.extend(
+            [
+                (snap_mlboy, "coreai_gemma4_e2b_qat"),
+                (b_qat, "coreai_gemma4_e2b_qat"),
+                (b_4bit, "coreai_gemma4_e2b_4bit"),
+            ]
+        )
+    else:
+        ordered.extend(
+            [
+                (snap_mike, "coreai_gemma4_e2b_4bit"),
+                (snap_mlboy, "coreai_gemma4_e2b_qat"),
+                (b_qat, "coreai_gemma4_e2b_qat"),
+                (b_4bit, "coreai_gemma4_e2b_4bit"),
+            ]
+        )
+
+    for cand_dir, lbl in ordered:
+        if cand_dir is None or not cand_dir.is_dir():
+            continue
+        top_cands = sorted(cand_dir.glob("*.aimodel"), key=str) + sorted(cand_dir.glob("*.aimodelc"), key=str)
+        rec_cands = sorted(cand_dir.rglob("*.aimodel"), key=str) + sorted(cand_dir.rglob("*.aimodelc"), key=str)
+        aim_cands = top_cands or rec_cands
+        if aim_cands:
+            return cand_dir, aim_cands[0].parent, llm_run_str, lbl
+
+    raise FileNotFoundError(
+        "Missing CoreAI Gemma-4 E2B snapshot (mikedoise/gemma-4-E2B-it-coreai-4bit-128k-text or mlboydaisuke/gemma-4-E2B-CoreAI)"
+    )
+
+
+class CoreAiGemma4Backend:
+    """Apple `CoreAI` Gemma-4 E2B (`mikedoise/gemma-4-E2B-it-coreai-4bit-128k-text` / `mlboydaisuke/gemma-4-E2B-CoreAI`) runner gated to `macOS >= 27.2`."""
+
+    def __init__(
+        self,
+        *,
+        coreai_python: str | None = None,
+        macos_version: str | None = None,
+    ) -> None:
+        os_ver = _parse_macos_tuple(macos_version)
+        if os_ver and os_ver < (27, 2):
+            raise FileNotFoundError(
+                f"CoreAI Gemma-4 requires macOS >= 27.2 (current version={macos_version or '.'.join(map(str, os_ver))})"
+            )
+
+        ca_py = resolve_coreai_python(coreai_python)
+        if ca_py is None:
+            raise FileNotFoundError("Missing CoreAI Python runtime for CoreAiGemma4Backend")
+        ca_bdir, aim_dir, llm_run_str, self.default_label = _select_coreai_gemma4_bundle(ca_py)
+
+        tok_snap = (
+            (ca_bdir / "tokenizer")
+            if (ca_bdir / "tokenizer").is_dir()
+            else (
+                ca_bdir
+                if (ca_bdir / "tokenizer.json").is_file()
+                else (
+                    resolve_hf_snapshot("google/gemma-4-E2B-it-qat-q4_0-unquantized")
+                    or resolve_hf_snapshot("lmstudio-community/gemma-4-E2B-it-MLX-4bit")
+                )
+            )
+        )
+        if tok_snap is None:
+            raise FileNotFoundError("Missing Gemma-4 tokenizer snapshot for CoreAiGemma4Backend")
+
+        daemon_g4 = f"""
+import asyncio, re, subprocess
+import ml_dtypes, numpy as np
+from transformers import AutoTokenizer
+from coreai.runtime import AIModel, NDArray
+
+def make_state(fn, kv_len):
+    st = {{}}
+    for sn in fn.desc.state_names:
+        sd = fn.desc.state_descriptor(sn)
+        shape = tuple(kv_len if int(d) < 0 else int(d) for d in sd.shape)
+        ds = str(sd.dtype).lower()
+        dt = ml_dtypes.bfloat16 if "bfloat16" in ds else (ml_dtypes.float8_e4m3fn if ("float8" in ds or "e4m3" in ds) else (np.float16 if "float16" in ds else np.float32))
+        st[sn] = NDArray(np.zeros(shape, dtype=dt))
+    return st
+
+async def main():
+    bdir = Path({str(aim_dir)!r})
+    root_dir = Path({str(ca_bdir)!r})
+    llm_run = {llm_run_str!r}
+    tok = AutoTokenizer.from_pretrained({str(tok_snap)!r}, local_files_only=True)
+    eos_set = {{1, 106, 50}}
+    raw_eos = tok.eos_token_id
+    for x in ([raw_eos] if isinstance(raw_eos, int) else (raw_eos or [])):
+        if x is not None:
+            eos_set.add(int(x))
+    telem = _DaemonTelemetry([root_dir, bdir, Path.home() / "Library" / "Caches" / "coreai-cache"], include_coreai_cache=True)
+    aim_cands = sorted(bdir.glob("*.aimodel"), key=str) + sorted(bdir.glob("*.aimodelc"), key=str)
+    aim_path = aim_cands[0] if aim_cands else None
+    fn = None
+    if not llm_run and aim_path is not None:
+        t_load = time.perf_counter()
+        model = await AIModel.load(str(aim_path))
+        telem.mark_loaded(aim_path, (time.perf_counter() - t_load) * 1000.0)
+        fn = model.load_function("main")
+    else:
+        telem.mark_loaded(aim_path, None)
+    tok_f = Path(__file__).resolve().parent / "in_toks.json"
+    sys.stdout.write("READY\\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        req = json.loads(line)
+        if req.get("cmd") == "quit":
+            sys.stdout.write(json.dumps(telem.payload(final=True)) + "\\n")
+            sys.stdout.flush()
+            break
+        msgs = req["messages"]
+        enable_think = bool(req.get("enable_thinking", False))
+        try:
+            raw = tok.apply_chat_template(
+                msgs, tokenize=True, add_generation_prompt=True, enable_thinking=enable_think
+            )
+        except TypeError:
+            raw = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+        p_ids = [int(x) for x in (raw if isinstance(raw, list) else getattr(raw, "input_ids", raw))]
+        max_new = int(req["max_tokens"])
+        t_req = time.perf_counter()
+        if llm_run:
+            tok_f.write_text(json.dumps({{"tokens": p_ids}}), encoding="utf-8")
+            cmd_full = [
+                "/usr/bin/time", "-l", llm_run,
+                "--model", str(bdir),
+                "--raw-tokens", str(tok_f),
+                "--temperature", "0.0",
+                "--max-tokens", str(max_new),
+                "--warmup", "off",
+                "--repetition-penalty", "1.05",
+                "--stop-tokens", "<turn|>",
+            ]
+            proc_r = subprocess.run(cmd_full, capture_output=True, text=True, timeout=600)
+            if proc_r.returncode != 0 and any(w in (proc_r.stderr or "").lower() for w in ("unknown option", "unrecognized", "unexpected argument")):
+                proc_r = subprocess.run(cmd_full[:-4], capture_output=True, text=True, timeout=600)
+            parsed = _parse_coreai_llm_runner_result(
+                proc_r.stdout, proc_r.stderr, proc_r.returncode, (time.perf_counter() - t_req) * 1000.0
+            )
+            _apply_runner_telemetry(telem, aim_path, parsed)
+            if not parsed["ok"]:
+                sys.stdout.write(
+                    json.dumps({{"gen_ids": [], "text": "", "reason": "error", "error": parsed["error"], **telem.payload()}}) + "\\n"
+                )
+                sys.stdout.flush()
+                continue
+            txt, gtok = parsed["text"], int(parsed["gen_tokens"])
+            for stop_str in ("<turn|>", "<eos>", "<|tool_response>"):
+                if stop_str in txt:
+                    txt = txt.split(stop_str, 1)[0]
+            gen_ids = list(tok.encode(txt, add_special_tokens=False))
+            reason = "length" if (gtok or len(gen_ids)) >= max_new else "stop"
+            sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
+            sys.stdout.flush()
+            continue
+        kv_len = max(512, len(p_ids) + max_new + 32)
+        st = make_state(fn, kv_len)
+        pa = np.array([p_ids], dtype=np.int32)
+        pp = np.arange(len(p_ids), dtype=np.int32).reshape(1, len(p_ids))
+        out = await fn({{"input_ids": NDArray(pa), "position_ids": NDArray(pp)}}, state=st)
+        last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
+        gen_ids = []
+        cur_len = len(p_ids)
+        reason = "length"
+        for _ in range(max_new):
+            if not np.all(np.isfinite(last_l)):
+                reason = "nan"
+                break
+            nxt = int(np.argmax(last_l))
+            if nxt in eos_set:
+                reason = "stop"
+                break
+            gen_ids.append(nxt)
+            cur_len += 1
+            ta = np.array([[nxt]], dtype=np.int32)
+            tp = np.arange(cur_len, dtype=np.int32).reshape(1, cur_len)
+            out = await fn({{"input_ids": NDArray(ta), "position_ids": NDArray(tp)}}, state=st)
+            last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
+        telem.record_infer((time.perf_counter() - t_req) * 1000.0)
+        txt = tok.decode(gen_ids, skip_special_tokens=True)
+        sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
+        sys.stdout.flush()
+
+asyncio.run(main())
+"""
+        env_g4 = dict(os.environ)
+        env_g4.setdefault("COREAI_CHUNK_THRESHOLD", "1")
+        self._client = _CoreAiSubprocessClient(
+            cmd=[ca_py],
+            daemon_script=daemon_g4,
+            script_name="dg4.py",
+            prefix="coreai_gemma4_",
+            env=env_g4,
+        )
+
+    def generate(
+        self,
+        prompts: list[str],
+        *,
+        system_prompt: str | None = None,
+        per_doc_schemas: list[dict[str, Any] | None] | None = None,
+        max_tokens: int = 256,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
+        enable_thinking: bool = False,
+    ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
+        del per_doc_schemas, reasoning_budget
+        eff_think = bool(enable_thinking) and (reasoning_effort not in (None, "skip", "low"))
+        texts: list[str] = []
+        reasons: list[str] = []
+        ids_list: list[list[int]] = []
+        errors: list[str] = []
+        tot_comp = 0
+        for p in prompts:
+            msgs = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+                {"role": "user", "content": p}
+            ]
+            resp = self._client.request(
+                {"messages": msgs, "max_tokens": int(max_tokens), "enable_thinking": eff_think}
+            )
+            if resp.get("error"):
+                err_s = str(resp["error"])
+                if not errors:
+                    print(f"[coreai-gemma4] llm-runner error: {err_s}", file=sys.stderr)
+                errors.append(err_s)
+            g_ids = list(resp["gen_ids"])
+            texts.append(str(resp["text"]))
+            reasons.append(str(resp["reason"]))
+            ids_list.append(g_ids)
+            tot_comp += len(g_ids)
+        stats_out: dict[str, Any] = {"completion_tokens": tot_comp, "mask_fallbacks": 0}
+        if errors:
+            stats_out["runner_errors"] = errors[:5]
+        return texts, reasons, ids_list, stats_out
+
+    def telemetry(self) -> dict[str, Any]:
+        return self._client.telemetry()
+
+    def close(self) -> float:
+        return float(self._client.close().get("peak_gb", 0.0))
+
+
 @dataclass
 class PublicLlmAdapter:
     """Category 3 & 4 stock LLM generator adapter."""
@@ -2157,11 +2827,15 @@ def build_public_llm_adapter(
         import mlx.core as mx
         import mlx_lm
 
-        snap = resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q4")
+        snap_q8 = resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q8")
+        snap = snap_q8 or resolve_hf_snapshot("mlx-community/gpt-oss-20b-MXFP4-Q4")
         if snap is None:
-            raise FileNotFoundError("Missing cached HF snapshot for mlx-community/gpt-oss-20b-MXFP4-Q4")
+            raise FileNotFoundError(
+                "Missing cached HF snapshot for mlx-community/gpt-oss-20b-MXFP4-Q8 (or MXFP4-Q4)"
+            )
         model, tok = mlx_lm.load(str(snap))
-        eff_bsz = min(max(1, int(batch_size)), 16)
+        eff_bsz = min(max(1, int(batch_size)), 8 if 0 < host_mem_gb < 36.0 else 16)
+        lbl = "mlx_lm_mxfp4_q8" if snap_q8 is not None else "mlx_lm_mxfp4_q4"
 
         def _gen_oss(
             prompts: list[str],
@@ -2170,10 +2844,15 @@ def build_public_llm_adapter(
             per_doc_schemas: list[dict[str, Any] | None] | None = None,
             max_tokens: int = 256,
             reasoning_effort: str | None = None,
+            reasoning_budget: int | None = None,
         ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
             del per_doc_schemas
             eff_re = "low" if reasoning_effort in (None, "skip") else reasoning_effort
-            eff_max = max(64, int(max_tokens)) if int(max_tokens) <= 16 else int(max_tokens)
+            req_max = int(max_tokens)
+            if reasoning_budget is not None and int(reasoning_budget) > 0 and req_max <= int(reasoning_budget):
+                eff_max = max(64, int(reasoning_budget) + req_max)
+            else:
+                eff_max = max(64, req_max) if req_max <= 16 else req_max
             texts: list[str] = []
             reasons: list[str] = []
             ids_list: list[list[int]] = []
@@ -2195,178 +2874,44 @@ def build_public_llm_adapter(
                 rb = mlx_lm.batch_generate(model, tok, prompts=p_toks, max_tokens=eff_max, verbose=False)
                 if hasattr(mx, "synchronize"):
                     mx.synchronize()
-                for tx in rb.texts:
-                    clean_tx = (
-                        tx.split("<|message|>")[-1].replace("<|return|>", "").strip()
-                        if "<|message|>" in tx
-                        else tx
+                rb_gen_counts = getattr(rb, "generation_tokens", None)
+                for idx_tx, tx in enumerate(rb.texts):
+                    raw_cnt_opt = (
+                        int(rb_gen_counts[idx_tx])
+                        if isinstance(rb_gen_counts, (list, tuple)) and idx_tx < len(rb_gen_counts)
+                        else None
+                    )
+                    clean_tx, hit_len, raw_cnt = _extract_harmony_final_and_length(
+                        tx,
+                        encode_fn=lambda s: tok.encode(s, add_special_tokens=False),
+                        eff_max=eff_max,
+                        raw_token_count=raw_cnt_opt,
                     )
                     tids = list(tok.encode(clean_tx, add_special_tokens=False))
                     texts.append(clean_tx)
                     ids_list.append(tids)
-                    tot_comp += len(tids)
-                    reasons.append("length" if len(tids) >= eff_max - 1 else "stop")
+                    tot_comp += raw_cnt
+                    reasons.append("length" if hit_len else "stop")
             return texts, reasons, ids_list, {"completion_tokens": tot_comp, "mask_fallbacks": 0}
 
-        return PublicLlmAdapter(default_label="mlx_lm_mxfp4_q4", generate_fn=_gen_oss)
+        return PublicLlmAdapter(default_label=lbl, generate_fn=_gen_oss)
 
     if pkg_name == "coreai-qwen3.5-4b":
-        ca_py = resolve_coreai_python(coreai_python)
-        ca_bdir = resolve_coreai_bundle(f"qwen35/qwen35_4b_{coreai_variant}")
-        tok_snap = (
-            (ca_bdir / "tokenizer") if (ca_bdir is not None and (ca_bdir / "tokenizer").is_dir()) else None
-        ) or resolve_hf_snapshot("Qwen/Qwen3.5-4B") or ca_bdir
-        if ca_py is None or ca_bdir is None or tok_snap is None or not list(ca_bdir.glob("*.aimodel")):
-            raise FileNotFoundError(f"CoreAI Qwen3.5-4B ({coreai_variant}) bundle or coreai runtime not staged")
-
-        llm_run_cand = ca_py.parents[2] / ".build" / "out" / "Products" / "Release" / "llm-runner"
-        llm_run_str = str(llm_run_cand) if llm_run_cand.is_file() else ""
-
-        daemon_q = f"""
-import asyncio, re, subprocess
-import ml_dtypes, numpy as np
-from transformers import AutoTokenizer
-from coreai.runtime import AIModel, NDArray
-
-def make_state(fn, kv_len):
-    st = {{}}
-    for sn in fn.desc.state_names:
-        sd = fn.desc.state_descriptor(sn)
-        shape = tuple(kv_len if int(d) < 0 else int(d) for d in sd.shape)
-        ds = str(sd.dtype).lower()
-        dt = ml_dtypes.bfloat16 if "bfloat16" in ds else (ml_dtypes.float8_e4m3fn if ("float8" in ds or "e4m3" in ds) else (np.float16 if "float16" in ds else np.float32))
-        st[sn] = NDArray(np.zeros(shape, dtype=dt))
-    return st
-
-def parse_runner_out(stdout_s: str) -> tuple[str, int]:
-    txt = stdout_s.split("Generating...\\n", 1)[1] if "Generating...\\n" in stdout_s else stdout_s
-    summary = ""
-    if "Performance Summary:" in txt:
-        txt, summary = txt.split("Performance Summary:", 1)
-        txt = re.sub(r"\\n+[^\\n]*$", "", txt).rstrip("\\n")
-    m = re.search(r"Generation:\\s*[0-9.]+ms,\\s*(\\d+)\\s*tokens", summary)
-    return txt, (int(m.group(1)) if m else 0)
-
-async def main():
-    bdir = Path({str(ca_bdir)!r})
-    llm_run = {llm_run_str!r}
-    tok = AutoTokenizer.from_pretrained({str(tok_snap)!r}, local_files_only=True)
-    raw_eos = tok.eos_token_id
-    eos_set = set([int(x) for x in ([raw_eos] if isinstance(raw_eos, int) else (raw_eos or []))])
-    telem = _DaemonTelemetry([bdir])
-    aim_path = next(bdir.glob("*.aimodel"), None)
-    fn = None
-    if not llm_run and aim_path is not None:
-        t_load = time.perf_counter()
-        model = await AIModel.load(str(aim_path))
-        telem.mark_loaded(aim_path, (time.perf_counter() - t_load) * 1000.0)
-        fn = model.load_function("main")
-    else:
-        telem.mark_loaded(aim_path, None)
-    tok_f = Path(__file__).resolve().parent / "in_toks.json"
-    sys.stdout.write("READY\\n")
-    sys.stdout.flush()
-    for line in sys.stdin:
-        req = json.loads(line)
-        if req.get("cmd") == "quit":
-            sys.stdout.write(json.dumps(telem.payload(final=True)) + "\\n")
-            sys.stdout.flush()
-            break
-        msgs = req["messages"]
-        try:
-            raw = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, enable_thinking=False)
-        except TypeError:
-            raw = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
-        p_ids = [int(x) for x in (raw if isinstance(raw, list) else getattr(raw, "input_ids", raw))]
-        max_new = int(req["max_tokens"])
-        t_req = time.perf_counter()
-        if llm_run:
-            tok_f.write_text(json.dumps({{"tokens": p_ids}}), encoding="utf-8")
-            proc_r = subprocess.run(
-                ["/usr/bin/time", "-l", llm_run, "--model", str(bdir), "--raw-tokens", str(tok_f), "--temperature", "0.0", "--max-tokens", str(max_new), "--warmup", "off"],
-                capture_output=True, text=True, timeout=180,
-            )
-            telem.record_infer((time.perf_counter() - t_req) * 1000.0)
-            m_fp = re.search(r"(\\d+)\\s+peak memory footprint", proc_r.stderr)
-            if m_fp:
-                telem.observe_external_peak_gb(round(int(m_fp.group(1)) / 1e9, 4))
-            if proc_r.returncode != 0:
-                sys.stdout.write(json.dumps({{"gen_ids": [], "text": "", "reason": "error", **telem.payload()}}) + "\\n")
-                sys.stdout.flush()
-                continue
-            txt, gtok = parse_runner_out(proc_r.stdout)
-            gen_ids = list(tok.encode(txt, add_special_tokens=False))
-            reason = "length" if (gtok or len(gen_ids)) >= max_new else "stop"
-            sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
-            sys.stdout.flush()
-            continue
-        kv_len = max(512, len(p_ids) + max_new + 32)
-        st = make_state(fn, kv_len)
-        pa = np.array([p_ids], dtype=np.int32)
-        pp = np.arange(len(p_ids), dtype=np.int32).reshape(1, len(p_ids))
-        out = await fn({{"input_ids": NDArray(pa), "position_ids": NDArray(pp)}}, state=st)
-        last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
-        gen_ids = []
-        cur_len = len(p_ids)
-        reason = "length"
-        for _ in range(max_new):
-            if not np.all(np.isfinite(last_l)):
-                reason = "nan"
-                break
-            nxt = int(np.argmax(last_l))
-            if nxt in eos_set:
-                reason = "stop"
-                break
-            gen_ids.append(nxt)
-            cur_len += 1
-            ta = np.array([[nxt]], dtype=np.int32)
-            tp = np.array([[cur_len - 1]], dtype=np.int32)
-            out = await fn({{"input_ids": NDArray(ta), "position_ids": NDArray(tp)}}, state=st)
-            last_l = out["logits"].numpy()[0, -1, :].astype(np.float32)
-        telem.record_infer((time.perf_counter() - t_req) * 1000.0)
-        txt = tok.decode(gen_ids, skip_special_tokens=True)
-        sys.stdout.write(json.dumps({{"gen_ids": gen_ids, "text": txt, "reason": reason, **telem.payload()}}) + "\\n")
-        sys.stdout.flush()
-
-asyncio.run(main())
-"""
-        client_q = _CoreAiSubprocessClient(
-            cmd=[ca_py],
-            daemon_script=daemon_q,
-            script_name="dq.py",
-            prefix="coreai_qwen35_",
+        q_backend = CoreAiQwen35Backend(coreai_python=coreai_python, coreai_variant=coreai_variant)
+        return PublicLlmAdapter(
+            default_label=q_backend.default_label,
+            generate_fn=q_backend.generate,
+            close_fn=q_backend.close,
+            telemetry_fn=q_backend.telemetry,
         )
 
-        def _gen_qwen_ca(
-            prompts: list[str],
-            *,
-            system_prompt: str | None = None,
-            per_doc_schemas: list[dict[str, Any] | None] | None = None,
-            max_tokens: int = 256,
-            reasoning_effort: str | None = None,
-        ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
-            del per_doc_schemas, reasoning_effort
-            texts: list[str] = []
-            reasons: list[str] = []
-            ids_list: list[list[int]] = []
-            tot_comp = 0
-            for p in prompts:
-                msgs = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
-                    {"role": "user", "content": p}
-                ]
-                resp = client_q.request({"messages": msgs, "max_tokens": int(max_tokens)})
-                g_ids = list(resp["gen_ids"])
-                texts.append(str(resp["text"]))
-                reasons.append(str(resp["reason"]))
-                ids_list.append(g_ids)
-                tot_comp += len(g_ids)
-            return texts, reasons, ids_list, {"completion_tokens": tot_comp, "mask_fallbacks": 0}
-
+    if pkg_name == "coreai-gemma4":
+        g4_backend = CoreAiGemma4Backend(coreai_python=coreai_python)
         return PublicLlmAdapter(
-            default_label=f"coreai_qwen35_4b_{coreai_variant}",
-            generate_fn=_gen_qwen_ca,
-            close_fn=lambda: float(client_q.close().get("peak_gb", 0.0)),
-            telemetry_fn=client_q.telemetry,
+            default_label=g4_backend.default_label,
+            generate_fn=g4_backend.generate,
+            close_fn=g4_backend.close,
+            telemetry_fn=g4_backend.telemetry,
         )
 
     raise ValueError(f"Unsupported public LLM package: {pkg_name}")
