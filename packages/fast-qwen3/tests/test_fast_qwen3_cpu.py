@@ -659,3 +659,180 @@ def test_prefix_tree_chunk_reuse_kv_i8_and_a4_v2_loop_breaker(tmp_path: Path) ->
     assert het.items[0].parsed["tag"] in ("alpha", "beta")
     assert het.items[1].parsed["count"] in (1, 2)
     eng.close()
+
+
+def test_tied_vocab_remap_fallback_lora_r_ge_out_and_optiq_mtp(tmp_path: Path) -> None:
+    """Verify tied `vocab_remap` slicing, `R3` LoRA `r>=out` orientation, and `optiq/mtp.safetensors` load."""
+    from fast_qwen3 import QwenVocabRemapper
+    from fast_qwen3.mtp_drafter import should_use_speculative_qwen
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    w = _make_synthetic_qwen3_weights(cfg, include_mtp=True)
+
+    remap = QwenVocabRemapper(
+        np.arange(0, 260, dtype=np.int32), full_vocab_size=tok.vocab_size
+    )
+    model = FastQwen3Model(cfg, w, vocab_remap=remap, enable_fusion=False)
+    assert model.lm_head is not None and int(model.lm_head.weight.shape[0]) == remap.vocab_size
+    assert model.has_full_vocab_fallback is True
+    h = mx.random.normal((1, 2, cfg.hidden_size)).astype(mx.bfloat16)
+    pruned_l = model.project_logits(h, full_vocab=False)
+    full_l = model.project_logits(h, full_vocab=True)
+    mx.eval(pruned_l, full_l)
+    assert int(pruned_l.shape[-1]) == remap.vocab_size
+    assert int(full_l.shape[-1]) == cfg.vocab_size
+
+    # `R3` `in_proj_a`/`in_proj_b` where `r=8 >= out_features=4` in both PEFT and MLX conventions
+    peft_path = tmp_path / "peft_r8.safetensors"
+    mx.save_safetensors(
+        str(peft_path),
+        {
+            "base_model.model.layers.0.linear_attn.in_proj_a.lora_A.weight": mx.random.normal((8, cfg.hidden_size)).astype(mx.bfloat16),
+            "base_model.model.layers.0.linear_attn.in_proj_a.lora_B.weight": mx.random.normal((cfg.linear_num_value_heads, 8)).astype(mx.bfloat16),
+        },
+    )
+    assert model.load_lora_adapter(peft_path) == 1
+
+    mlx_path = tmp_path / "mlx_r8.safetensors"
+    mx.save_safetensors(
+        str(mlx_path),
+        {
+            "model.layers.0.linear_attn.in_proj_b.lora_a": mx.random.normal((cfg.hidden_size, 8)).astype(mx.bfloat16),
+            "model.layers.0.linear_attn.in_proj_b.lora_b": mx.random.normal((8, cfg.linear_num_value_heads)).astype(mx.bfloat16),
+        },
+    )
+    assert model.load_lora_adapter(mlx_path) == 1
+
+    # On-disk `optiq/mtp.safetensors` auto-discovery & `enable_fusion` propagation + `is_moe` auto-gate
+    mdir = tmp_path / "optiq_repo"
+    (mdir / "optiq").mkdir(parents=True)
+    tok.backend_tokenizer.save(str(mdir / "tokenizer.json"))
+    (mdir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_text",
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_hidden_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "tie_word_embeddings": True,
+                "linear_num_value_heads": cfg.linear_num_value_heads,
+                "linear_num_key_heads": cfg.linear_num_key_heads,
+                "linear_key_head_dim": cfg.linear_key_head_dim,
+                "linear_value_head_dim": cfg.linear_value_head_dim,
+                "linear_conv_kernel_dim": cfg.linear_conv_kernel_dim,
+                "mtp_num_hidden_layers": 1,
+                "mtp_file": "optiq/mtp.safetensors",
+            }
+        ),
+        encoding="utf-8",
+    )
+    base_only = {k: v for k, v in w.items() if not k.startswith("mtp.")}
+    mtp_only = {k[len("mtp."):]: v for k, v in w.items() if k.startswith("mtp.")}
+    mx.save_safetensors(str(mdir / "model.safetensors"), base_only)
+    mx.save_safetensors(str(mdir / "optiq" / "mtp.safetensors"), mtp_only)
+
+    loaded_m, loaded_mtp = FastQwen3Model.from_pretrained(mdir, enable_fusion=False)
+    drafter = Qwen3MtpDrafter.from_mtp_weights(loaded_m, loaded_mtp)
+    assert drafter is not None
+    assert loaded_m.enable_fusion is False
+    assert should_use_speculative_qwen(1, 0.0, speculative=None, has_native_mtp=True, hidden_size=4096, is_moe=True) is False
+    assert should_use_speculative_qwen(1, 0.0, speculative=None, has_native_mtp=True, hidden_size=4096, is_moe=False) is True
+
+
+def test_thinking_early_exit_mtp_long_parity_and_seed_determinism(tmp_path: Path) -> None:
+    """Verify `<think>` `upfront_ff` stop exit, `>10`-tok MTP parity vs non-spec, and `seed=` determinism."""
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=False)
+    w = _make_synthetic_qwen3_weights(cfg, seed=29, include_mtp=True)
+    model = FastQwen3Model(cfg, w)
+    mtp_w = {k: v for k, v in w.items() if k.startswith("mtp.")}
+    drafter = Qwen3MtpDrafter.from_mtp_weights(model, mtp_w)
+    assert drafter is not None
+
+    eng = FastQwen3Engine(model=model, tokenizer=tok, mtp_drafter=drafter, warmup=False)
+    # 1. Fixed constant schema where `upfront_ff` closes matcher immediately (`< max_tokens`) after thinking
+    const_schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean", "const": True}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    res_think = eng.generate(
+        "Emit fixed boolean.",
+        json_schema=const_schema,
+        max_tokens=64,
+        enable_thinking=True,
+        thinking_budget_tokens=4,
+        allow_short_thinking_budget=True,
+    )
+    assert res_think.valid_schema is True
+    assert res_think.parsed == {"ok": True}
+
+    # 2. >10-token MTP decode parity against `speculative=False` (syncs `mtp_cache` via exact `acc_h`)
+    r_nospec = eng.generate("Summarize technical notes.", max_tokens=20, speculative=False, temperature=0.0)
+    r_spec = eng.generate("Summarize technical notes.", max_tokens=20, speculative=True, temperature=0.0)
+    assert r_spec.token_ids == r_nospec.token_ids
+    assert len(r_spec.token_ids) >= 12
+
+    # 3. Deterministic `seed=` sampling parity (`generate` vs repeated `generate` / `generate_batch`)
+    s1 = eng.generate("Pick sample tokens.", max_tokens=12, temperature=0.8, seed=1234, speculative=False)
+    s2 = eng.generate("Pick sample tokens.", max_tokens=12, temperature=0.8, seed=1234, speculative=False)
+    assert s1.token_ids == s2.token_ids
+    b2 = eng.generate_batch(["Pick sample tokens.", "Other prompt."], max_tokens=12, temperature=0.8, seed=1234, batch_size=2)
+    assert len(b2.items) == 2
+    eng.close()
+
+
+def test_prefix_tree_multi_chunk_wave_reuse_and_chunked_ragged_parity(tmp_path: Path) -> None:
+    """Verify atomic multi-chunk `PrefixTree` (`kv_i8`, wave reuse) and `S > 256` chunked `B=1` vs `B=4` ragged parity."""
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    w = _make_synthetic_qwen3_weights(cfg, seed=37, include_mtp=False)
+    model = FastQwen3Model(cfg, w)
+
+    prev_lim = mx.set_cache_limit(128 << 20)
+    eng = FastQwen3Engine(
+        model=model,
+        tokenizer=tok,
+        warmup=False,
+        prefix_cache_mb=32,
+        max_prefix_cache_entries=0,
+        kv_i8=True,
+        mlx_cache_limit_mb=64,
+    )
+    try:
+        # 2+ full `256`-token chunks (`~600` byte tokens) so chunk 1 + chunk 2 publish atomically with `kv_i8`
+        p_long = ("Statutory record section header. " * 20)
+        b_ref = [eng.generate(p_long + sfx, max_tokens=10, temperature=0.0, speculative=False) for sfx in ("A", "Longer B suffix", "C!!", "Extra D words")]
+        assert eng.prefix_tree is not None and eng.prefix_tree.snapshot_count >= 2
+
+        # Force wave (`batch_size=4`) with `max_prefix_cache_entries=0` so `PrefixTree` feeds wave LCP directly!
+        b_wave = eng.generate_batch(
+            [p_long + sfx for sfx in ("A", "Longer B suffix", "C!!", "Extra D words")],
+            max_tokens=10,
+            temperature=0.0,
+            batch_size=4,
+            speculative=False,
+        )
+        assert [it.token_ids for it in b_wave.items] == [it.token_ids for it in b_ref]
+
+        # Test ragged `S > 256` chunked wave prefill without `PrefixTree` interference
+        eng2 = FastQwen3Engine(model=model, tokenizer=tok, warmup=False, prefix_cache_mb=0, max_prefix_cache_entries=0, kv_i8=False)
+        ragged_prompts = [
+            "Alpha " * 55,
+            "Beta words " * 40,
+            "Gamma record " * 45,
+            "Delta payload " * 60,
+        ]
+        r_single = [eng2.generate(p, max_tokens=8, temperature=0.0, speculative=False).token_ids for p in ragged_prompts]
+        r_batch = [it.token_ids for it in eng2.generate_batch(ragged_prompts, max_tokens=8, temperature=0.0, batch_size=4).items]
+        assert r_batch == r_single
+        eng2.close()
+    finally:
+        eng.close()
+        mx.set_cache_limit(prev_lim)

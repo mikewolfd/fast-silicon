@@ -23,6 +23,7 @@ from fast_qwen3 import (
     FastQwen3Model,
     FastQwen3Tokenizer,
     Qwen3MtpDrafter,
+    QwenVocabRemapper,
     resolve_paths,
 )
 
@@ -101,20 +102,30 @@ def run_model_suite(
     *,
     rounds: int = 2,
     max_tokens: int = 64,
+    vocab_out: int = 0,
+    no_mtp: bool = False,
 ) -> dict[str, Any]:
     paths = resolve_paths()
     snap = paths.resolve_model_dir(preset, local_files_only=True)
     tok = FastQwen3Tokenizer(snap)
+
+    remap: QwenVocabRemapper | None = None
+    if vocab_out and int(vocab_out) > 0 and int(vocab_out) < tok.vocab_size:
+        remap = QwenVocabRemapper.build_ascii_latin_subset(
+            tok.backend_tokenizer,
+            full_vocab_size=tok.vocab_size,
+            target_size=int(vocab_out),
+        )
 
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
 
     # 1. Measure 0-ULP fusion parity between SpecBucketedLinearGroup and unfused projections
     t_load0 = time.perf_counter()
-    m_fused, mtp_w = FastQwen3Model.from_pretrained(snap, enable_fusion=True)
+    m_fused, mtp_w = FastQwen3Model.from_pretrained(snap, vocab_remap=remap, enable_fusion=True)
     load_sec = time.perf_counter() - t_load0
 
-    m_unfused, _ = FastQwen3Model.from_pretrained(snap, enable_fusion=False)
+    m_unfused, _ = FastQwen3Model.from_pretrained(snap, vocab_remap=remap, enable_fusion=False)
     probe_ids = tok.encode_chat(BENCH_PROMPTS[0], system_prompt=BENCH_SYSTEM_PROMPT, enable_thinking=False)
     inp = mx.array([probe_ids], dtype=mx.int32)
     logits_f = m_fused(inp, m_fused.make_cache(kv_step=128))
@@ -124,7 +135,7 @@ def run_model_suite(
     top1_match = bool(int(mx.argmax(logits_f[0, -1]).item()) == int(mx.argmax(logits_u[0, -1]).item()))
 
     # 2. Build engines for interleaved ABBA (`unfused_no_lcp` vs `fast_qwen3`)
-    mtp_drafter = Qwen3MtpDrafter.from_mtp_weights(m_fused, mtp_w)
+    mtp_drafter = None if no_mtp else Qwen3MtpDrafter.from_mtp_weights(m_fused, mtp_w)
     eng_fast = FastQwen3Engine(
         model=m_fused,
         tokenizer=tok,
@@ -247,11 +258,12 @@ def run_model_suite(
     res_spec = eng_fast.generate(spec_prompt, max_tokens=64, speculative=True)
     spec_sec = time.perf_counter() - t_spec0
 
-    mem = _memory_snapshot()
+    mem_steady = _memory_snapshot()
     eng_fast.close()
     del eng_fast, m_fused
     gc.collect()
     mx.clear_cache()
+    mem_after_close = _memory_snapshot()
 
     med_b1_base = float(np.median(b1_base_sec))
     med_b1_fast = float(np.median(b1_fast_sec))
@@ -261,6 +273,8 @@ def run_model_suite(
     return {
         "preset": preset,
         "snapshot": snap.name,
+        "vocab_out": int(eng_vocab_n) if (eng_vocab_n := (remap.vocab_size if remap is not None else tok.vocab_size)) else tok.vocab_size,
+        "mtp_enabled": mtp_drafter is not None,
         "load_sec": round(load_sec, 3),
         "has_native_mtp_drafter": mtp_drafter is not None,
         "fusion_parity": {
@@ -293,8 +307,45 @@ def run_model_suite(
             "spec_tok_s": round(res_spec.completion_tokens / max(spec_sec, 1e-9), 2),
             "spec_speedup_x": round(nospec_sec / max(spec_sec, 1e-9), 3),
         },
-        "memory": mem,
+        "memory": {
+            **mem_steady,
+            "end_phys_footprint_gb": mem_after_close.get("phys_footprint_gb"),
+            "subprocess_peak_footprint_gb": mem_after_close.get("peak_footprint_gb"),
+        },
     }
+
+
+def _run_preset_subprocess(
+    preset: str,
+    *,
+    rounds: int,
+    max_tokens: int,
+    vocab_out: int,
+    no_mtp: bool,
+) -> dict[str, Any]:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker-preset",
+        preset,
+        "--rounds",
+        str(rounds),
+        "--max-tokens",
+        str(max_tokens),
+        "--vocab-out",
+        str(vocab_out),
+    ]
+    if no_mtp:
+        cmd.append("--no-mtp")
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return {
+            "preset": preset,
+            "status": "error",
+            "returncode": proc.returncode,
+            "stderr": proc.stderr[-1000:],
+        }
+    return json.loads(proc.stdout)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,25 +353,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--presets", default="4b,0.8b-bf16", help="Comma-separated presets to benchmark")
     parser.add_argument("--rounds", type=int, default=2, help="Interleaved ABBA rounds per preset")
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--vocab-out", type=int, default=0, help="Optional pruned output vocab size (e.g. 65536)")
+    parser.add_argument("--no-mtp", action="store_true", help="Disable native MTP drafter for ablation")
     parser.add_argument("--json-out", default=None, help="Optional JSON output path")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--worker-preset", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    mx.set_cache_limit(256 << 20)
+    if args.worker_preset is not None:
+        try:
+            res = run_model_suite(
+                args.worker_preset,
+                rounds=args.rounds,
+                max_tokens=args.max_tokens,
+                vocab_out=args.vocab_out,
+                no_mtp=bool(args.no_mtp),
+            )
+        except FileNotFoundError as exc:
+            res = {"preset": args.worker_preset, "status": "skipped", "reason": str(exc)}
+        print(json.dumps(res))
+        return 0
 
     presets = [p.strip() for p in args.presets.split(",") if p.strip()]
     if args.dry_run:
-        print(json.dumps({"dry_run": True, "presets": presets, "rounds": args.rounds}, indent=2))
+        print(json.dumps({"dry_run": True, "presets": presets, "rounds": args.rounds, "vocab_out": args.vocab_out, "no_mtp": bool(args.no_mtp)}, indent=2))
         return 0
 
-    mx.set_cache_limit(512 << 20)
     LOCK_PATH.touch(exist_ok=True)
     with open(LOCK_PATH, "r+", encoding="utf-8") as lock_fp:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-        results: list[dict[str, Any]] = []
-        for preset in presets:
-            try:
-                results.append(run_model_suite(preset, rounds=args.rounds, max_tokens=args.max_tokens))
-            except FileNotFoundError as exc:
-                results.append({"preset": preset, "status": "skipped", "reason": str(exc)})
+        results: list[dict[str, Any]] = [
+            _run_preset_subprocess(
+                preset,
+                rounds=args.rounds,
+                max_tokens=args.max_tokens,
+                vocab_out=args.vocab_out,
+                no_mtp=bool(args.no_mtp),
+            )
+            for preset in presets
+        ]
 
     payload = {
         "host": _host_summary(),

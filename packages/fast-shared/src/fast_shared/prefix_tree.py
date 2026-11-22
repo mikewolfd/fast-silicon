@@ -362,6 +362,21 @@ class PrefixTree:
                 self._nodes[parent].children += 1
             return key
 
+    def rollback_keys(self, keys: Sequence[str]) -> int:
+        """Remove newly inserted leaf keys in reverse order (aborting if a key gained children)."""
+        removed = 0
+        with self._lock:
+            for key in reversed(keys):
+                node = self._nodes.get(key)
+                if node is None or node.children > 0:
+                    continue
+                self._nodes.pop(key)
+                self._bytes_held = max(0, self._bytes_held - node.total_bytes)
+                if node.parent is not None and node.parent in self._nodes:
+                    self._nodes[node.parent].children = max(0, self._nodes[node.parent].children - 1)
+                removed += 1
+        return removed
+
     def attach_snapshot(
         self,
         key: str,
@@ -369,6 +384,7 @@ class PrefixTree:
         *,
         keeping_chain_to: str | None = None,
         byte_size: int | None = None,
+        rollback_keys_on_fail: Sequence[str] = (),
     ) -> bool:
         with self._lock:
             node = self._nodes.get(key)
@@ -383,6 +399,8 @@ class PrefixTree:
 
             protected = self._ancestors(key) | self._ancestors(keeping_chain_to)
             if not self._make_room(size, protected):
+                if rollback_keys_on_fail:
+                    self.rollback_keys(rollback_keys_on_fail)
                 return False
             self._clock += 1
             node.snapshot = snapshot

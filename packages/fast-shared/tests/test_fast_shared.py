@@ -2562,6 +2562,51 @@ def test_coreai_pipeline_coreml_w4_block_guard_and_fp16_cast_cpu(monkeypatch: An
     assert res_f32.cache_key_sha256 != res_f16.cache_key_sha256
 
 
+def test_safe_argmax_and_grammar_nan_guard_cpu() -> None:
+    llg = pytest.importorskip("llguidance")
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.grammar import (
+        GrammarHelper,
+        apply_loop_breaker_penalties_1d,
+        safe_argmax_1d,
+        sample_unconstrained,
+    )
+
+    assert llg is not None
+    assert safe_argmax_1d(np.array([1.0, float("nan"), 9.0], dtype=np.float32)) == -1
+    assert safe_argmax_1d(np.array([1.0, 5.0, 2.0], dtype=np.float32)) == 1
+    assert safe_argmax_1d(np.array([], dtype=np.float32)) == -1
+
+    vocab = {"<|endoftext|>": 0, "{": 1, '"': 2, "a": 3, ":": 4, "1": 5, "}": 6}
+    bt = Tokenizer(BPE(vocab=vocab, merges=[]))
+    bt.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bt.decoder = ByteLevelDecoder(add_prefix_space=False)
+    ltok = llg.LLTokenizer(bt.to_str(), eos_token=0)
+    gh = GrammarHelper(
+        ltok,
+        {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": False},
+        whitespace_flexible=False,
+        eos_token_id=0,
+    )
+    m = gh.new_matcher()
+
+    nan_logits = np.full(len(vocab), np.float32(np.nan), dtype=np.float32)
+    adj, am = apply_loop_breaker_penalties_1d(nan_logits, {5: 2.0}, None)
+    assert am == -1 and np.isnan(adj).all()
+    assert sample_unconstrained(nan_logits, gh.new_to_old, am) == -1
+    # Must fall back to grammar-valid integer token (5) rather than silently returning index 0 ('<|endoftext|>')!
+    tok_id, masked = gh.pick_valid_token(m, nan_logits, am)
+    assert masked is True and tok_id == 5
+
+    # Invalid-entry NaN with finite valid entry still selects the valid finite token (5)
+    partial_nan = np.array([float("nan"), -5.0, -5.0, -5.0, -5.0, 8.0, -5.0], dtype=np.float32)
+    tok_p, masked_p = gh.pick_valid_token(m, partial_nan, -1)
+    assert masked_p is True and tok_p == 5
+
+
 def test_grammar_helper_none_whitespace_and_explicit_separators_cpu() -> None:
     llg = pytest.importorskip("llguidance")
     from tokenizers import Tokenizer

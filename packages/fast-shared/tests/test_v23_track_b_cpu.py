@@ -677,6 +677,21 @@ def test_coreai_multibatch_diversity_gate_and_nonfinite_guard_cpu(
         def forward(self, x: Any) -> Any:
             return self.proj(x)
 
+    # Default strict_calibration_gate=True rejects single-batch / duplicate calibration even without passing the flag.
+    with pytest.raises(ValueError, match="Strict calibration gate requires >= 2 calibration batches"):
+        run_coreai_opt_calibration_and_export(
+            module_factory=lambda: _TinyMod().eval(),
+            sample_inputs_factory=lambda _i: (torch.ones(1, 32),),
+            model_name="tiny_single",
+            input_names=["x"],
+            output_names=["y"],
+            out_dir=tmp_path / "single_batch",
+            stem="tiny_single",
+            preset="w8",
+            export_backend="coreai",
+            calib_batches=1,
+        )
+
     monkeypatch.setattr(cp, "_score_teacher_vs_quant", lambda _r, _q: (0.0, float("inf"), False))
     with pytest.raises(ValueError, match="nonfinite quantized output"):
         run_coreai_opt_calibration_and_export(

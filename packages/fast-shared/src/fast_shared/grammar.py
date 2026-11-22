@@ -74,6 +74,14 @@ def validate_json_against_schema(
         raise ValueError(f"{path}: {val!r} not in enum {sch['enum']}")
 
 
+def safe_argmax_1d(logits_1d: Any) -> int:
+    """Return `int(np.argmax(logits_1d))`, or `-1` when empty or any `NaN` entry is present."""
+    arr = np.asarray(logits_1d)
+    if arr.size == 0 or bool(np.isnan(arr).any()):
+        return -1
+    return int(np.argmax(arr))
+
+
 def _sample_from_logits(
     logits_1d: np.ndarray,
     new_to_old: np.ndarray,
@@ -83,14 +91,16 @@ def _sample_from_logits(
     rng: np.random.Generator | None = None,
 ) -> int:
     if temperature <= 0.0:
-        return int(new_to_old[int(np.argmax(logits_1d))])
+        best = safe_argmax_1d(logits_1d)
+        return int(new_to_old[best]) if best >= 0 else -1
     gen = rng if rng is not None else np.random.default_rng()
     scaled = logits_1d.astype(np.float64) / float(temperature)
     scaled -= np.max(scaled)
     probs = np.exp(scaled)
     s = float(probs.sum())
     if not np.isfinite(s) or s <= 0.0:
-        return int(new_to_old[int(np.argmax(logits_1d))])
+        best = safe_argmax_1d(logits_1d)
+        return int(new_to_old[best]) if best >= 0 else -1
     probs /= s
     if top_p < 1.0:
         order = np.argsort(-probs)
@@ -118,7 +128,8 @@ def sample_unconstrained(
     if temperature <= 0.0:
         if 0 <= argmax_idx < len(new_to_old):
             return int(new_to_old[argmax_idx])
-        return int(new_to_old[int(np.argmax(logits_1d))])
+        best = safe_argmax_1d(logits_1d)
+        return int(new_to_old[best]) if best >= 0 else -1
     return _sample_from_logits(logits_1d, new_to_old, temperature=temperature, top_p=top_p, rng=rng)
 
 
@@ -242,18 +253,19 @@ class GrammarHelper:
                             full_arr = logits_arr
                     if full_arr is not None and len(full_arr) >= vocab_sz:
                         cand_logits = full_arr[valid_ids]
+                        eos_allowed = int(self.eos_token_id) in {int(v) for v in valid_ids}
+                        fallback_id = int(self.eos_token_id) if eos_allowed else int(valid_ids[0])
                         if temperature <= 0.0:
-                            return int(valid_ids[int(np.argmax(cand_logits))]), True
-                        return (
-                            _sample_from_logits(
-                                cand_logits,
-                                valid_ids,
-                                temperature=temperature,
-                                top_p=top_p,
-                                rng=rng,
-                            ),
-                            True,
+                            best_f = safe_argmax_1d(cand_logits)
+                            return (int(valid_ids[best_f]) if best_f >= 0 else fallback_id), True
+                        picked_f = _sample_from_logits(
+                            cand_logits,
+                            valid_ids,
+                            temperature=temperature,
+                            top_p=top_p,
+                            rng=rng,
                         )
+                        return (picked_f if picked_f >= 0 else fallback_id), True
                     if int(self.eos_token_id) in set(int(v) for v in valid_ids):
                         return self.eos_token_id, True
                     raise ValueError(
@@ -261,6 +273,18 @@ class GrammarHelper:
                         "requires `full_logits_1d` (or unpruned `logits_1d`) to score full-vocab candidates."
                     )
             return self.eos_token_id, True
+
+        def _nan_safe_valid_fallback(mask: np.ndarray) -> int:
+            eos_orig = int(self.eos_token_id)
+            eos_new_matches = np.flatnonzero(self.new_to_old == eos_orig)
+            if len(eos_new_matches) > 0:
+                eos_new = int(eos_new_matches[0])
+                if 0 <= eos_new < len(mask) and bool(mask[eos_new]):
+                    return eos_orig
+            valid_new = np.flatnonzero(mask)
+            if len(valid_new) > 0:
+                return int(self.new_to_old[int(valid_new[0])])
+            return eos_orig
 
         logits_arr = logits_1d() if callable(logits_1d) else logits_1d
         pruned_logits = (
@@ -273,15 +297,18 @@ class GrammarHelper:
         elif len(logits_arr) >= vocab_sz and argmax_full_allowed is not None:
             was_masked = not argmax_full_allowed
         else:
-            was_masked = not bool(allowed[int(np.argmax(pruned_logits))])
+            raw_best = safe_argmax_1d(pruned_logits)
+            was_masked = True if raw_best < 0 else (not bool(allowed[raw_best]))
         masked = np.where(allowed, pruned_logits, -1e9)
         if temperature <= 0.0:
-            best_j = int(np.argmax(masked))
+            best_j = safe_argmax_1d(masked)
+            if best_j < 0:
+                return _nan_safe_valid_fallback(allowed), True
             return int(self.new_to_old[best_j]), bool(was_masked)
-        return (
-            _sample_from_logits(masked, self.new_to_old, temperature=temperature, top_p=top_p, rng=rng),
-            bool(was_masked),
-        )
+        picked = _sample_from_logits(masked, self.new_to_old, temperature=temperature, top_p=top_p, rng=rng)
+        if picked < 0:
+            return _nan_safe_valid_fallback(allowed), True
+        return picked, bool(was_masked)
 
     def validate_token_sequence(self, full_ids: Sequence[int]) -> bool:
         """Verify that `full_ids` is strictly accepted from initial state and stops in an accepting state."""
@@ -367,7 +394,7 @@ def apply_loop_breaker_penalties_1d(
         idx = int(old_to_new[orig_id]) if (old_to_new is not None and 0 <= orig_id < n_o2n) else int(orig_id)
         if 0 <= idx < v_len:
             adj[idx] = np.float32(float(adj[idx]) - float(pen))
-    return adj, int(np.argmax(adj))
+    return adj, safe_argmax_1d(adj)
 
 
 __all__ = [
@@ -375,6 +402,7 @@ __all__ = [
     "apply_loop_breaker_penalties_1d",
     "compute_loop_breaker_penalties",
     "normalize_json_schema",
+    "safe_argmax_1d",
     "sample_unconstrained",
     "validate_json_against_schema",
 ]

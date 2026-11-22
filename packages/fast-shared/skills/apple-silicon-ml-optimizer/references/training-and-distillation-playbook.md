@@ -29,12 +29,14 @@ Hardware-grounded patterns for accelerating SFT, LoRA/QLoRA, teacher-student dis
 
 1. **Split Frozen Lower Prefix Outside `nn.value_and_grad`:**
    - When fine-tuning upper layers (`L_k..L_{N-1}`), execute `L_0..L_{k-1}` (and frozen per-layer auxiliary embeddings like `PLE`) in a plain helper *before* entering `nn.value_and_grad`, or apply `mx.stop_gradient` immediately at the boundary. Never build autograd tapes or retain forward activations across frozen bottom blocks.
-2. **Unwrap Dead KV-Shared LoRA Modules:**
-   - On KV-sharing models (`Gemma-4 E2B` layers `15..34`, `E4B` layers `24..41`), generic `linear_to_lora_layers` attaches `LoRALinear` wrappers to `k_proj`/`v_proj` even on layers that reuse earlier KV tensors. Unwrap dead `k_proj`/`v_proj` adapters before optimizer init (`40` modules saved on `E2B`) so `AdamW` does not allocate or step dead states.
-3. **Answer-Only `lm_head` Gathering + Sliced `FP32` Cross-Entropy:**
+2. **Align SFT JSON Formatting & Tokenizer Boundaries With Serving `llguidance` Grammar:**
+   - Format SFT ground-truth targets identically to the serving grammar (`separators` + `whitespace_flexible`) and validate `Qwen3.5` BPE / `Gemma-4` SentencePiece token alignment on held-out examples so fine-tuned checkpoints do not fight runtime constrained decoding.
+3. **Unwrap Dead KV-Shared LoRA Modules (and Guard Rectangular `GatedDeltaNet` LoRA Shapes):**
+   - On KV-sharing models (`Gemma-4 E2B` layers `15..34`, `E4B` layers `24..41`), generic `linear_to_lora_layers` attaches `LoRALinear` wrappers to `k_proj`/`v_proj` even on layers that reuse earlier KV tensors. Unwrap dead `k_proj`/`v_proj` adapters before optimizer init (`40` modules saved on `E2B`) so `AdamW` does not allocate or step dead states. On `Qwen3.5` `in_proj_a`/`in_proj_b` (`out < r` possible), match loaded adapter matrices against module `(in_features, out_features)` instead of heuristic shape inequalities.
+4. **Answer-Only `lm_head` Gathering + Sliced `FP32` Cross-Entropy:**
    - On prompt-heavy SFT (`1,000–2,000` prompt tokens, `150–300` answer tokens), gather hidden states `h_ans` strictly at supervised answer indices *before* multiplying by `[D, V]` (`V = 162K..262K`). This cuts `lm_head` forward+backward FLOPs `5×–8×`.
    - Slice `FP32` `tanh` logit softcapping + `logsumexp` + NLL into `256`-token chunks (`~2.0 GB` lower peak wired RAM than materializing `[S_full, V]` `FP32` logits).
-4. **Eliminate Per-Step Weight Casts & `FP32` SDPA Upcasts (`fast-ir-guard`):**
+5. **Eliminate Per-Step Weight Casts & `FP32` SDPA Upcasts (`fast-ir-guard`):**
    - Pre-cast frozen trunk weights to `mx.bfloat16` **once at load time**, never via `w.astype(mx.bfloat16)` inside `__call__` on every step.
    - Keep trainable transformer/head attention inputs and masks in `BF16`/`FP16` (`mx.where`/additive `BF16` bias); casting hidden states or masks to `mx.float32` inside self-attention triggers a **`-36%` register-spill slowdown** on both forward and backward passes.
 
@@ -70,7 +72,7 @@ LoRA weights stay fixed across the micro-batches in one optimizer step. Compute 
 - **Compiled Elementwise VJPs & Optimizer Step:** Apply `@mx.compile` to pure-elementwise `RMSNorm` / `GeGLU` / `SwiGLU` subgraphs and the `AdamW` parameter update (`150+` LoRA moment pairs), collapsing hundreds of tiny DRAM-bound Metal launches per step.
 
 ### 3.6 `PrefixTree` & Rolling Engines for Distillation, `GRPO` & Post-Training Builds (`3×–6×`)
-- **Multi-Candidate Teacher Distillation:** When a teacher (`Kev-0.8B`, `E4B`, `gpt-oss-20b`) scores `8–15` corruptions or candidate spans per document, snapshot the shared document state in a `PrefixTree` (`256`-token `GDN + KV` blocks) so the teacher prefills each document **once** instead of `10×`.
+- **Multi-Candidate Teacher Distillation & Conformal/Confidence Calibration:** When a teacher (`Kev-0.8B`, `E4B`, `gpt-oss-20b`, `Qwen3.5`) scores `8–15` corruptions or candidate spans per document, snapshot the shared document state in a `PrefixTree` (`256`-token `GDN` block-32 `INT8` + `KV` blocks, captured right after chunk insert) so the teacher prefills each document **once** instead of `10×`. Use held-out `OOF` telemetry to calibrate `CROQ` conformal routing sets (`alpha=0.05`, `aps_det`) and `ExtractConf` escalation thresholds (`strict_calibration_gate=True`).
 - **Online `GRPO` / Best-of-N Rollouts:** Drive rollout generation with `fast-silicon`'s persistent rolling slot engine (`B_slots=128`, `llguidance` + lazy `argmax`) while evaluating reward/schema critics concurrently on ANE (`0` GPU contention).
 - **Parallel Core ML compilation.** Four workers cut the build time for nine BGE shapes from 9.37 to 4.38 s on M4 Pro and 5.02 to 2.24 s on M5 (with identical output vectors across all nine shapes on 16 inputs). For two larger Gemma bundles, the second M4 Pro builds took 26.37 s serial and 25.97 s parallel. Compare actual output vectors from the compiled bundles as well as elapsed time.
 

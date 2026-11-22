@@ -565,7 +565,7 @@ def run_coreai_opt_calibration_and_export(
     eval_inputs: Sequence[tuple[Any, ...]] | Callable[[int], tuple[Any, ...]] | None = None,
     min_calib_batches: int = 1,
     require_calib_diversity: bool = False,
-    strict_calibration_gate: bool = False,
+    strict_calibration_gate: bool = True,
     min_calib_cosine: float | None = None,
     max_calib_cosine_std: float | None = None,
     max_calib_cosine_drop: float | None = None,
@@ -861,7 +861,7 @@ def run_coreai_opt_preset_sweep(
     eval_inputs: Sequence[tuple[Any, ...]] | Callable[[int], tuple[Any, ...]] | None = None,
     min_calib_batches: int = 1,
     require_calib_diversity: bool = False,
-    strict_calibration_gate: bool = False,
+    strict_calibration_gate: bool = True,
     min_calib_cosine: float | None = None,
     max_calib_cosine_std: float | None = None,
     max_calib_cosine_drop: float | None = None,
@@ -879,15 +879,15 @@ def run_coreai_opt_preset_sweep(
             if export_backend.strip().lower() == "coreml" and not allow_experimental_coreml_w4_block
             else ("fp16", "w8", "w4", "w4_per_block")
         )
-    gate_kw: dict[str, Any] = {}
+    gate_kw: dict[str, Any] = {
+        "strict_calibration_gate": bool(strict_calibration_gate),
+    }
     if eval_inputs is not None:
         gate_kw["eval_inputs"] = eval_inputs
     if int(min_calib_batches) != 1:
         gate_kw["min_calib_batches"] = min_calib_batches
     if require_calib_diversity:
         gate_kw["require_calib_diversity"] = True
-    if strict_calibration_gate:
-        gate_kw["strict_calibration_gate"] = True
     if min_calib_cosine is not None:
         gate_kw["min_calib_cosine"] = min_calib_cosine
     if max_calib_cosine_std is not None:

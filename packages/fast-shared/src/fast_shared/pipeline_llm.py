@@ -648,6 +648,8 @@ def _execute_rolling_batch(
             )
         except TypeError:
             gh_obj = engine.get_grammar(spec, whitespace_flexible=whitespace_flexible)
+        if len(grammar_cache) > 128:
+            grammar_cache.clear()
         grammar_cache[ck] = gh_obj
         return gh_obj
 
@@ -1204,6 +1206,26 @@ async def run_deferred_retries_async(
         if inspect.isawaitable(res):
             await res
     return results
+
+
+def _register_governor_shed_hooks(
+    stack: ExitStack,
+    governor: Any,
+    engine: Any,
+    grammar_cache: dict[tuple[Any, ...], Any] | None,
+) -> None:
+    if governor is None or not hasattr(governor, "register_shed_callback"):
+        return
+    if grammar_cache is not None:
+        governor.register_shed_callback(grammar_cache.clear)
+        stack.callback(governor.unregister_shed_callback, grammar_cache.clear)
+    for pt_attr in ("prefix_tree", "_prefix_tree"):
+        pt_obj = getattr(engine, pt_attr, None)
+        shed_fn = getattr(pt_obj, "shed", None) if pt_obj is not None else None
+        if callable(shed_fn):
+            governor.register_shed_callback(shed_fn)
+            stack.callback(governor.unregister_shed_callback, shed_fn)
+            break
 
 
 def _enter_mlx_limits(
@@ -1869,6 +1891,7 @@ def extract_parquet(
             mlx_cache_limit_mb=mlx_cache_limit_mb,
             use_wired_limit=use_wired_limit,
         )
+        _register_governor_shed_hooks(stack, governor, engine, grammar_cache)
         reader_thread.start()
         tok_thread.start()
         writer_thread.start()
@@ -2360,12 +2383,14 @@ def extract_jsonl(
                 and eff_mode != "hetero"
             )
 
+    grammar_cache: dict[tuple[Any, ...], Any] = {}
     with ExitStack() as stack:
         _enter_mlx_limits(
             stack,
             mlx_cache_limit_mb=mlx_cache_limit_mb,
             use_wired_limit=use_wired_limit,
         )
+        _register_governor_shed_hooks(stack, governor, engine, grammar_cache)
         eff_b_slots = eff_bs
         clear_thresh_mb = 256
         if governor is not None:
@@ -2378,7 +2403,6 @@ def extract_jsonl(
             clear_thresh_mb = max(0, adaptation.cache_limit_mb)
 
         if use_roll:
-            grammar_cache: dict[tuple[Any, ...], Any] = {}
             res_roll, order_roll = _execute_rolling_batch(
                 engine,
                 prompts,

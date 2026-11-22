@@ -747,3 +747,28 @@ def cfg():
     ml_odd.save(str(pkg))
     assert ir_dtype_guard.main(["--coreml", "--check-block-size", "32", "--block-axis", "0", str(pkg)]) == 1
     assert ir_dtype_guard.main(["--coreml", "--check-block-size", "25", "--block-axis", "0", str(pkg)]) == 0
+
+
+def test_sync_eval_in_decode_for_loop_flagged_and_exempt_cpu() -> None:
+    src = """
+import mlx.core as mx
+
+def _decode_wave(h, max_tokens: int):
+    for _step in range(max_tokens):
+        mx.eval(h)
+    return h
+
+def _decode_wave_annotated(h, max_tokens: int):
+    for _step in range(max_tokens):
+        mx.eval(h)  # guard: allow-eval
+    return h
+
+def train_step(x):
+    for _step in range(4):
+        mx.eval(x)
+    return x
+"""
+    rep = check_mlx_source(src)
+    for_warns = [f for f in rep.warnings if f.rule_id == "MLX_SYNC_EVAL_IN_FOR_LOOP"]
+    assert len(for_warns) == 1
+    assert for_warns[0].line == 6

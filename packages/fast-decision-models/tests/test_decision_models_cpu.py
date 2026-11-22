@@ -753,7 +753,7 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
         seq_len=seq_len,
         export_backend="coreai",
         preset="w4_per_block",
-        calib_batches=1,
+        calib_batches=2,
         stem="tiny_laya_ai",
     )
     assert res_ai.asset_path.exists()
@@ -773,7 +773,7 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
             seq_len=seq_len,
             export_backend="coreml",
             preset="w4_per_block",
-            calib_batches=1,
+            calib_batches=2,
             stem="tiny_laya_ml_bad",
         )
 
@@ -784,7 +784,7 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
         seq_len=seq_len,
         export_backend="coreml",
         preset="w8",
-        calib_batches=1,
+        calib_batches=2,
         stem="tiny_laya_ml",
     )
     assert res_ml.asset_path.exists()
@@ -797,7 +797,7 @@ def test_laya_coreai_opt_export_sensitivity_and_mil_guards_cpu(tmp_path: Path) -
         seq_len=seq_len,
         export_backend="coreai",
         presets=("fp16", "w8", "w4_per_block"),
-        calib_batches=1,
+        calib_batches=2,
         stem_prefix="tiny_laya_sweep",
     )
     assert [r["preset"] for r in sweep] == ["fp16", "w8", "w4_per_block"]

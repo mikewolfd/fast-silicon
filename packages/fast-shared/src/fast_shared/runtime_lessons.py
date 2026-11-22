@@ -2636,6 +2636,7 @@ class LiveMemoryGovernor:
         min_b_slots: int = 1,
         poll_interval_sec: float = 0.25,
         clean_polls_to_relax: int = 2,
+        shed_callbacks: Sequence[Any] = (),
     ) -> None:
         self.uma_ceiling_fraction = float(uma_ceiling_fraction)
         self.min_b_slots = max(1, int(min_b_slots))
@@ -2648,17 +2649,32 @@ class LiveMemoryGovernor:
         self._last_adaptation: MemoryAdaptation | None = None
         self._clean_streak: int = 0
         self._last_applied_cache_mb: int | None = None
+        self._shed_callbacks: list[Any] = [cb for cb in shed_callbacks if callable(cb)]
         self.polls: int = 0
         self.adaptations_triggered: int = 0
         self.cache_clears: int = 0
+        self.shed_callbacks_invoked: int = 0
         self.pressure_events: int = 0
         self.peak_phys_footprint_bytes: int = 0
         self.min_available_bytes: int | None = None
         self.min_b_slots_observed: int | None = None
 
+    def register_shed_callback(self, cb: Any) -> None:
+        """Register a memory-shed callback (e.g. `prefix_tree.shed`, `grammar_cache.clear`) on pressure."""
+        if not callable(cb):
+            return
+        with self._lock:
+            if cb not in self._shed_callbacks:
+                self._shed_callbacks.append(cb)
+
+    def unregister_shed_callback(self, cb: Any) -> None:
+        with self._lock:
+            self._shed_callbacks = [c for c in self._shed_callbacks if c is not cb]
+
     def _apply_mlx_limits(self, adaptation: MemoryAdaptation) -> None:
         changed_cache = self._last_applied_cache_mb != adaptation.cache_limit_mb
-        if not (changed_cache or adaptation.should_clear_cache):
+        should_shed = bool(adaptation.should_clear_cache or adaptation.throttle_tier in ("warn", "critical"))
+        if not (changed_cache or should_shed):
             return
         if changed_cache:
             try:
@@ -2668,6 +2684,15 @@ class LiveMemoryGovernor:
                 self._last_applied_cache_mb = adaptation.cache_limit_mb
             except Exception:
                 pass
+        if should_shed:
+            with self._lock:
+                callbacks = list(self._shed_callbacks)
+            for cb in callbacks:
+                try:
+                    cb()
+                    self.shed_callbacks_invoked += 1
+                except Exception:
+                    pass
         if adaptation.should_clear_cache:
             try:
                 from .bench import clear_mlx_arena
@@ -2779,6 +2804,7 @@ class LiveMemoryGovernor:
                 "polls": self.polls,
                 "adaptations_triggered": self.adaptations_triggered,
                 "cache_clears": self.cache_clears,
+                "shed_callbacks_invoked": self.shed_callbacks_invoked,
                 "pressure_events": self.pressure_events,
                 "active_tier": self._active_tier,
                 "min_b_slots_observed": self.min_b_slots_observed,

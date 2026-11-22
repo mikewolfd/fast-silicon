@@ -73,7 +73,7 @@ from .fault_injection import (
     FaultInjectionResult,
     run_fault_injection_suite,
 )
-from .grammar import normalize_json_schema, sample_unconstrained, validate_json_against_schema
+from .grammar import normalize_json_schema, safe_argmax_1d, sample_unconstrained, validate_json_against_schema
 from .hf import DEFAULT_TOKENIZER_FILES, copy_tokenizer_files, resolve_hf_model_dir
 from .hw_check import (
     SUPPORTED_APPLE_SILICON_PROFILES,
@@ -479,6 +479,7 @@ __all__ = [
     "run_deferred_retries_async",
     "run_embedding_request",
     "run_fault_injection_suite",
+    "safe_argmax_1d",
     "sample_host_memory",
     "sample_unconstrained",
     "schema_cache_key",

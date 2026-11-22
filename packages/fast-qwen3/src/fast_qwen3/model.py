@@ -236,27 +236,19 @@ class GrowingKVCache:
         self.v_scales: mx.array | None = None
         self.offset: int = 0
 
-    def update_and_fetch(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        b, h_kv, s, d = k.shape
+    def _ensure_capacity(self, b: int, h_kv: int, needed: int, d: int, dtype: mx.Dtype) -> int:
         prev = self.offset
-        needed = prev + s
         if not self.kv_i8:
             if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
                 alloc = ((needed + self.step - 1) // self.step) * self.step
-                new_k = mx.zeros((b, h_kv, alloc, d), dtype=k.dtype)
-                new_v = mx.zeros((b, h_kv, alloc, d), dtype=v.dtype)
+                new_k = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
+                new_v = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
                 if self.keys is not None and prev > 0 and int(self.keys.shape[0]) == b:
                     new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
                     new_v[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
                 self.keys = new_k
                 self.values = new_v
-            assert self.keys is not None and self.values is not None
-            self.keys[:, :, prev:needed, :] = k
-            self.values[:, :, prev:needed, :] = v
-            self.offset = needed
-            return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
-
-        # Symmetric per-(batch, head, pos) INT8 KV storage (halves KV bandwidth & RAM on large waves / long ctx)
+            return prev
         if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
             alloc = ((needed + self.step - 1) // self.step) * self.step
             new_kq = mx.zeros((b, h_kv, alloc, d), dtype=mx.int8)
@@ -270,17 +262,57 @@ class GrowingKVCache:
                 new_vs[:, :, :prev, :] = self.v_scales[:, :, :prev, :]  # type: ignore[index]
             self.keys, self.values = new_kq, new_vq
             self.k_scales, self.v_scales = new_ks, new_vs
-        assert self.keys is not None and self.values is not None and self.k_scales is not None and self.v_scales is not None
-        kf, vf = k.astype(mx.float32), v.astype(mx.float32)
-        ks_s = mx.maximum(mx.max(mx.abs(kf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
-        vs_s = mx.maximum(mx.max(mx.abs(vf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
-        self.keys[:, :, prev:needed, :] = mx.clip(mx.round(kf / ks_s), -127.0, 127.0).astype(mx.int8)
-        self.values[:, :, prev:needed, :] = mx.clip(mx.round(vf / vs_s), -127.0, 127.0).astype(mx.int8)
-        self.k_scales[:, :, prev:needed, :] = ks_s.astype(mx.bfloat16)
-        self.v_scales[:, :, prev:needed, :] = vs_s.astype(mx.bfloat16)
+        return prev
+
+    def _write_bf16(self, k: mx.array, v: mx.array) -> int:
+        b, h_kv, s, d = k.shape
+        needed = self.offset + s
+        prev = self._ensure_capacity(b, h_kv, needed, d, k.dtype)
+        assert self.keys is not None and self.values is not None
+        if not self.kv_i8:
+            self.keys[:, :, prev:needed, :] = k
+            self.values[:, :, prev:needed, :] = v
+        else:
+            assert self.k_scales is not None and self.v_scales is not None
+            kf, vf = k.astype(mx.float32), v.astype(mx.float32)
+            ks_s = mx.maximum(mx.max(mx.abs(kf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
+            vs_s = mx.maximum(mx.max(mx.abs(vf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
+            self.keys[:, :, prev:needed, :] = mx.clip(mx.round(kf / ks_s), -127.0, 127.0).astype(mx.int8)
+            self.values[:, :, prev:needed, :] = mx.clip(mx.round(vf / vs_s), -127.0, 127.0).astype(mx.int8)
+            self.k_scales[:, :, prev:needed, :] = ks_s.astype(mx.bfloat16)
+            self.v_scales[:, :, prev:needed, :] = vs_s.astype(mx.bfloat16)
         self.offset = needed
-        k_out = (self.keys[:, :, :needed, :].astype(k.dtype) * self.k_scales[:, :, :needed, :].astype(k.dtype))
-        v_out = (self.values[:, :, :needed, :].astype(v.dtype) * self.v_scales[:, :, :needed, :].astype(v.dtype))
+        return needed
+
+    def append_cached_bf16(self, k: mx.array, v: mx.array) -> None:
+        """Append prefilled `BF16` KV slices during prefix restore without materializing attention buffers."""
+        self._write_bf16(k, v)
+
+    def append_cached_i8(self, kq: mx.array, ks: mx.array, vq: mx.array, vs: mx.array) -> None:
+        """Append already-quantized `INT8` KV + `BF16` scales directly into `kv_i8` cache (0 double-quant)."""
+        if not self.kv_i8:
+            k_bf = kq.astype(mx.bfloat16) * ks.astype(mx.bfloat16)
+            v_bf = vq.astype(mx.bfloat16) * vs.astype(mx.bfloat16)
+            self._write_bf16(k_bf, v_bf)
+            return
+        b, h_kv, s, d = kq.shape
+        needed = self.offset + s
+        prev = self._ensure_capacity(b, h_kv, needed, d, mx.bfloat16)
+        assert self.keys is not None and self.values is not None and self.k_scales is not None and self.v_scales is not None
+        self.keys[:, :, prev:needed, :] = kq
+        self.values[:, :, prev:needed, :] = vq
+        self.k_scales[:, :, prev:needed, :] = ks
+        self.v_scales[:, :, prev:needed, :] = vs
+        self.offset = needed
+
+    def update_and_fetch(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        needed = self._write_bf16(k, v)
+        assert self.keys is not None and self.values is not None
+        if not self.kv_i8:
+            return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
+        assert self.k_scales is not None and self.v_scales is not None
+        k_out = self.keys[:, :, :needed, :].astype(k.dtype) * self.k_scales[:, :, :needed, :].astype(k.dtype)
+        v_out = self.values[:, :, :needed, :].astype(v.dtype) * self.v_scales[:, :, :needed, :].astype(v.dtype)
         return k_out, v_out
 
     def rewind_to(self, new_offset: int) -> None:
@@ -1107,6 +1139,7 @@ class FastQwen3Model(nn.Module):
         self.cfg = cfg
         self.model_dir = model_dir
         self.norm_add_one = bool(norm_add_one)
+        self.enable_fusion = bool(enable_fusion)
         self.vocab_remap = vocab_remap
         self.use_apple10_force_fused = detect_apple10_d256_force_fused()
 
@@ -1180,6 +1213,23 @@ class FastQwen3Model(nn.Module):
                     self.lm_head = sub_d
             else:
                 self.lm_head = full_head
+        elif vocab_remap is not None and vocab_remap.vocab_size < vocab_sz:
+            # Slice tied `embed_tokens` rows so `--vocab-out` accelerates tied 0.8B/2B/4B checkpoints too.
+            idx_arr = mx.array(vocab_remap.new_to_old, dtype=mx.int32)
+            if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
+                sub = nn.QuantizedLinear(
+                    hidden, vocab_remap.vocab_size, bias=False,
+                    group_size=self.embed_tokens.group_size, bits=self.embed_tokens.bits,
+                )
+                sub.weight = mx.take(self.embed_tokens.weight, idx_arr, axis=0)
+                sub.scales = mx.take(self.embed_tokens.scales, idx_arr, axis=0)
+                if getattr(self.embed_tokens, "biases", None) is not None:
+                    sub.biases = mx.take(self.embed_tokens.biases, idx_arr, axis=0)
+                self.lm_head = sub
+            else:
+                sub_d = nn.Linear(hidden, vocab_remap.vocab_size, bias=False)
+                sub_d.weight = mx.take(self.embed_tokens.weight, idx_arr, axis=0)
+                self.lm_head = sub_d
         else:
             self.lm_head = None
 
@@ -1238,9 +1288,18 @@ class FastQwen3Model(nn.Module):
                 )
         return self.norm(h)
 
+    @property
+    def has_full_vocab_fallback(self) -> bool:
+        return bool(self._cold_lm_head is not None or (self.vocab_remap is not None and self.cfg.tie_word_embeddings))
+
     def project_logits(self, h: mx.array, *, full_vocab: bool = False) -> mx.array:
-        if full_vocab and self._cold_lm_head is not None:
-            return self._cold_lm_head(h)
+        if full_vocab:
+            if self._cold_lm_head is not None:
+                return self._cold_lm_head(h)
+            if self.cfg.tie_word_embeddings:
+                if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
+                    return self.embed_tokens.as_linear(h)
+                return mx.matmul(h, self.embed_tokens.weight.T)
         if self.lm_head is not None:
             return self.lm_head(h)
         if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
@@ -1315,6 +1374,35 @@ class FastQwen3Model(nn.Module):
                     applied += sum(1 for x in (g, u, d) if x is not None)
         return applied
 
+    def _lora_stem_dims(self) -> dict[str, tuple[int, int]]:
+        """Expected `(in_features, out_features)` for every linear target that supports hot-swap LoRA."""
+        dims: dict[str, tuple[int, int]] = {}
+        hidden = int(self.cfg.hidden_size)
+        inter = int(self.cfg.intermediate_size)
+        for i, layer in enumerate(self.layers):
+            lpx = f"model.layers.{i}"
+            if layer.is_linear:
+                la = layer.linear_attn
+                gpx = f"{lpx}.linear_attn"
+                dims[f"{gpx}.in_proj_qkv"] = (hidden, int(la.conv_dim))
+                dims[f"{gpx}.in_proj_z"] = (hidden, int(la.value_dim))
+                dims[f"{gpx}.in_proj_b"] = (hidden, int(la.num_v_heads))
+                dims[f"{gpx}.in_proj_a"] = (hidden, int(la.num_v_heads))
+                dims[f"{gpx}.out_proj"] = (int(la.value_dim), hidden)
+            else:
+                sa = layer.self_attn
+                apx = f"{lpx}.self_attn"
+                dims[f"{apx}.q_proj"] = (hidden, 2 * int(sa.q_dim))
+                dims[f"{apx}.k_proj"] = (hidden, int(sa.kv_dim))
+                dims[f"{apx}.v_proj"] = (hidden, int(sa.kv_dim))
+                dims[f"{apx}.o_proj"] = (int(sa.q_dim), hidden)
+            if isinstance(layer.mlp, SwiGLUMLP):
+                mpx = f"{lpx}.mlp"
+                dims[f"{mpx}.gate_proj"] = (hidden, inter)
+                dims[f"{mpx}.up_proj"] = (hidden, inter)
+                dims[f"{mpx}.down_proj"] = (inter, hidden)
+        return dims
+
     def load_lora_adapter(self, adapter_dir_or_file: str | Path) -> int:
         """Load a PEFT or MLX LoRA `.safetensors` directory/file onto the frozen fused model."""
         p = Path(adapter_dir_or_file).expanduser()
@@ -1347,18 +1435,38 @@ class FastQwen3Model(nn.Module):
                 continue
             stem, tag = parsed
             # MLX LoRALinear stores lora_a as (in, r) and lora_b as (r, out); PEFT stores (r, in) and (out, r)
-            by_stem.setdefault(stem, {})[tag] = val
+            entry = by_stem.setdefault(stem, {})
+            entry[tag] = val
+            if ".lora_a" in rk or ".lora_b" in rk:
+                entry["is_mlx"] = True
 
+        expected_dims = self._lora_stem_dims()
         packed: dict[str, tuple[mx.array, mx.array, float]] = {}
         for stem, d in by_stem.items():
             if "lora_A" not in d or "lora_B" not in d:
                 continue
             la, lb = d["lora_A"], d["lora_B"]
-            # Normalize to PEFT convention: la=(r, in), lb=(out, r)
-            if int(la.shape[0]) > int(la.shape[1]):
-                la = mx.contiguous(la.T)
-            if int(lb.shape[0]) < int(lb.shape[1]):
-                lb = mx.contiguous(lb.T)
+            la_s = (int(la.shape[0]), int(la.shape[1]))
+            lb_s = (int(lb.shape[0]), int(lb.shape[1]))
+            exp = expected_dims.get(stem)
+            if exp is not None:
+                in_d, out_d = exp
+                peft_ok = la_s[1] == in_d and lb_s[0] == out_d and la_s[0] == lb_s[1]
+                mlx_ok = la_s[0] == in_d and lb_s[1] == out_d and la_s[1] == lb_s[0]
+                if mlx_ok and (not peft_ok or d.get("is_mlx")):
+                    la = mx.contiguous(la.T)
+                    lb = mx.contiguous(lb.T)
+                elif not peft_ok:
+                    if la_s[0] == in_d and la_s[1] != in_d:
+                        la = mx.contiguous(la.T)
+                    if lb_s[1] == out_d and lb_s[0] != out_d:
+                        lb = mx.contiguous(lb.T)
+            else:
+                # Normalize by heuristic only when target linear shape is unknown
+                if la_s[0] > la_s[1]:
+                    la = mx.contiguous(la.T)
+                if lb_s[0] < lb_s[1]:
+                    lb = mx.contiguous(lb.T)
             sc = float(d.get("scale", scale_default))
             packed[stem] = (la, lb, sc)
         return self.apply_lora_tensors(packed)
@@ -1397,6 +1505,12 @@ class FastQwen3Model(nn.Module):
 
         shards = sorted(glob.glob(str(mdir / "*.safetensors")))
         if not shards:
+            shards = [
+                sp
+                for sp in sorted(glob.glob(str(mdir / "optiq" / "*.safetensors")))
+                if Path(sp).name != "mtp.safetensors"
+            ]
+        if not shards:
             raise FileNotFoundError(f"No .safetensors shards found in {mdir}")
 
         norm_weights: dict[str, mx.array] = {}
@@ -1422,8 +1536,9 @@ class FastQwen3Model(nn.Module):
             del loaded
             mx.clear_cache()
 
-        if load_mtp_tensors and cfg.mtp_file:
-            mtp_p = mdir / cfg.mtp_file
+        eff_mtp_rel = cfg.mtp_file or ("optiq/mtp.safetensors" if (mdir / "optiq" / "mtp.safetensors").is_file() else None)
+        if load_mtp_tensors and eff_mtp_rel:
+            mtp_p = mdir / eff_mtp_rel
             if mtp_p.is_file():
                 extra_mtp: dict[str, mx.array] = mx.load(str(mtp_p))  # type: ignore[assignment]
                 for rk, tensor in extra_mtp.items():

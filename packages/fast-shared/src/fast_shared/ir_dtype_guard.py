@@ -1648,6 +1648,27 @@ class _MlxAstChecker(ast.NodeVisitor):
         iter_src = ast.get_source_segment(self.source, loop_node.iter) or ""
         return any(tok in iter_src for tok in ("layers", "NUM_LAYERS", "num_layers", "first_kv_shared"))
 
+    def _is_decode_or_chunk_loop(self, loop_node: ast.AST) -> bool:
+        if not isinstance(loop_node, ast.For):
+            return False
+        fn_name = self.scope_stack[-1].lower()
+        if any(tok in fn_name for tok in ("train", "qlora", "grpo", "loss", "grad", "export")):
+            return False
+        tgt_names: set[str] = set()
+        if isinstance(loop_node.target, ast.Name):
+            tgt_names.add(loop_node.target.id)
+        elif isinstance(loop_node.target, (ast.Tuple, ast.List)):
+            for elt in loop_node.target.elts:
+                if isinstance(elt, ast.Name):
+                    tgt_names.add(elt.id)
+        iter_src = ast.get_source_segment(self.source, loop_node.iter) or ""
+        has_decode_tgt = bool(tgt_names & {"_step", "step", "tok_idx", "draft_step", "chunk_idx"})
+        has_decode_iter = any(
+            tok in iter_src
+            for tok in ("max_tokens", "max_steps", "eff_max", "thinking_budget", "draft_steps", "chunk_tokens", "chunk_size")
+        )
+        return has_decode_tgt or has_decode_iter
+
     def _is_setup_or_bench_fn(self) -> bool:
         fn_name = self.scope_stack[-1]
         return fn_name.startswith(
@@ -1842,6 +1863,13 @@ class _MlxAstChecker(ast.NodeVisitor):
                         "warning",
                         node.lineno,
                         "Synchronous `mx.eval` inside `while` loop can stall device pipeline; consider `mx.async_eval` for pipelined decode steps.",
+                    )
+                elif not is_setup_or_bench and any(self._is_decode_or_chunk_loop(lp) for lp in self.loop_stack):
+                    self._emit(
+                        "MLX_SYNC_EVAL_IN_FOR_LOOP",
+                        "warning",
+                        node.lineno,
+                        "Synchronous `mx.eval` inside decode/chunk `for` loop can stall device pipeline; pipeline with `mx.async_eval` or annotate `# guard: allow-eval` if host grammar requires sync.",
                     )
             elif not is_setup_or_bench and not self._line_has_ignore(node.lineno, "sync"):
                 in_hot_loop = any(self._is_layer_loop(lp) or isinstance(lp, ast.While) for lp in self.loop_stack)

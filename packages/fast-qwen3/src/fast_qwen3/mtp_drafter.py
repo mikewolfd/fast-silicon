@@ -44,15 +44,16 @@ def should_use_speculative_qwen(
     has_drafter_or_lookup: bool = True,
     has_native_mtp: bool = False,
     hidden_size: int | None = None,
+    is_moe: bool = False,
     apple10_nax: bool | None = None,
 ) -> bool:
-    """Gate speculative drafting to `B == 1` on Apple10 NAX, `1 <= B <= 4` on Apple9 (`T == 0`), and `9B+` native MTP in `auto`."""
+    """Gate speculative drafting to `B == 1` on Apple10 NAX, `1 <= B <= 4` on Apple9 (`T == 0`), and `>=9B` dense native MTP in `auto`."""
     if not has_drafter_or_lookup or speculative is False or temperature > 0.0:
         return False
     if speculative is None:
-        # Empirical ABBA gate: on <=4B models (H <= 2560), 248,320-vocab lm_head + verify overhead exceeds single-step decode,
-        # and PromptLookup without native MTP regresses non-repetitive prompts on M4 Pro (0.863x). Auto-enable only on >=9B native MTP.
-        if not has_native_mtp or (hidden_size is not None and int(hidden_size) < 3584):
+        # Empirical ABBA gate: on <=4B models (H <= 2560) or sparse MoE, verify lm_head / expert overhead exceeds single-step decode,
+        # and PromptLookup without native MTP regresses non-repetitive prompts on M4 Pro (0.863x). Auto-enable only on >=9B dense native MTP.
+        if is_moe or not has_native_mtp or (hidden_size is not None and int(hidden_size) < 3584):
             return False
     is_nax = _host_supports_apple10_nax() if apple10_nax is None else bool(apple10_nax)
     max_b = 1 if is_nax else MAX_MTP_BATCH_APPLE9
@@ -142,6 +143,7 @@ class Qwen3MtpDrafter(nn.Module):
             mtp_weights,
             norm_add_one=target_model.norm_add_one,
             use_apple10_force_fused=target_model.use_apple10_force_fused,
+            enable_fusion=getattr(target_model, "enable_fusion", True),
         )
 
     def make_cache(self, *, kv_step: int = 256) -> GrowingKVCache:

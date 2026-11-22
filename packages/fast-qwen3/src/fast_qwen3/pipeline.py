@@ -43,7 +43,7 @@ def extract_parquet(
     ocr_pages_only: bool = False,
     skip_empty: bool = True,
     resume: bool = False,
-    mlx_cache_limit_mb: int | None = 512,
+    mlx_cache_limit_mb: int | None = 256,
     use_wired_limit: bool = False,
     **extra_gen_kwargs: Any,
 ) -> ParquetExtractSummary:
@@ -93,7 +93,7 @@ def extract_jsonl(
     whitespace_flexible: bool | None = None,
     response_text_key: str = "output_text",
     response_json_key: str = "parsed",
-    mlx_cache_limit_mb: int | None = 512,
+    mlx_cache_limit_mb: int | None = 256,
     use_wired_limit: bool = False,
     **extra_gen_kwargs: Any,
 ) -> dict[str, Any]:

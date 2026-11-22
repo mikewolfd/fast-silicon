@@ -918,11 +918,14 @@ def test_live_memory_governor_adaptation_hysteresis_and_mlx_hooks_cpu(
     monkeypatch.setattr("fast_shared.embeddings.set_mlx_cache_limit", lambda mb: cache_calls.append(int(mb)))
     monkeypatch.setattr("fast_shared.bench.clear_mlx_arena", lambda mb: clear_calls.append(int(mb)))
 
+    shed_count = [0]
     gov = LiveMemoryGovernor(poll_interval_sec=0.0, clean_polls_to_relax=2)
+    gov.register_shed_callback(lambda: shed_count.__setitem__(0, shed_count[0] + 1))
     ad_crit_snap = _fake_snap(phys_gb=19.5)
     step1 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=ad_crit_snap)
     assert step1.throttle_tier == "critical" and step1.b_slots == 32
     assert cache_calls[-1] == 64 and clear_calls == [0]
+    assert shed_count[0] == 1 and gov.stats()["shed_callbacks_invoked"] == 1
 
     healthy_snap = _fake_snap(host_mem_gb=24.0, available_gb=14.0, healthy_gb=12.0, phys_gb=4.0)
     step2 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=healthy_snap)

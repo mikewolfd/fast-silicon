@@ -1375,11 +1375,11 @@ def _run_llm_worker(
         batch_sz = int(extra.batch_size)
     elif pkg_name in ("fast-gemma4", "public-gemma4"):
         batch_sz = 64 if host_mem_gb >= 36.0 else 32
-    elif pkg_name in ("fast-gpt-oss", "public-gpt-oss"):
+    elif pkg_name in ("fast-gpt-oss", "public-gpt-oss", "fast-qwen3", "public-qwen3.5", "coreai-qwen3.5-4b"):
         batch_sz = 8 if 0 < host_mem_gb < 36.0 else 16
     else:
         batch_sz = 16
-    if pkg_name in ("fast-gpt-oss", "public-gpt-oss") and 0 < host_mem_gb < 36.0:
+    if pkg_name in ("fast-gpt-oss", "public-gpt-oss", "fast-qwen3", "public-qwen3.5", "coreai-qwen3.5-4b") and 0 < host_mem_gb < 36.0:
         batch_sz = min(batch_sz, 8)
     use_mtp = bool(extra.mtp_drafter or extra.mtp_drafter_path)
 
