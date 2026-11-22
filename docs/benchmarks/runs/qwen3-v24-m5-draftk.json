@@ -1,0 +1,53 @@
+{
+  "host": "Base M5 (24 GB)",
+  "mtp_draft_k_9b": {
+    "vocab_248320": {
+      "nospec_sec": 3.2934,
+      "nospec_tok_s": 19.43,
+      "ks": {
+        "2": {
+          "sec": 2.0472,
+          "tok_s": 31.26,
+          "speedup_x": 1.609,
+          "exact_match": false
+        },
+        "3": {
+          "sec": 1.8531,
+          "tok_s": 34.54,
+          "speedup_x": 1.777,
+          "exact_match": false
+        },
+        "4": {
+          "sec": 2.0969,
+          "tok_s": 30.52,
+          "speedup_x": 1.571,
+          "exact_match": false
+        }
+      }
+    },
+    "vocab_65536": {
+      "nospec_sec": 2.8947,
+      "nospec_tok_s": 22.11,
+      "ks": {
+        "2": {
+          "sec": 1.7306,
+          "tok_s": 36.98,
+          "speedup_x": 1.673,
+          "exact_match": true
+        },
+        "3": {
+          "sec": 1.4451,
+          "tok_s": 44.29,
+          "speedup_x": 2.003,
+          "exact_match": true
+        },
+        "4": {
+          "sec": 1.5916,
+          "tok_s": 40.21,
+          "speedup_x": 1.819,
+          "exact_match": true
+        }
+      }
+    }
+  }
+}

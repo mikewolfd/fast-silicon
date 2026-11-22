@@ -1,0 +1,96 @@
+{
+  "suite": "parity",
+  "telemetry": {
+    "mlx_version": "0.32.4",
+    "mlx_enable_tf32": "0",
+    "mlx_enable_tf32_source": "env",
+    "mlx_metal_no_nax": "0",
+    "device_name": "Apple M4 Pro",
+    "architecture": "applegpu_g16s",
+    "macos_version": "26.6",
+    "is_apple10": false,
+    "nax_sdpa_eligible": false,
+    "sdpa_slice_len": 512,
+    "sdpa_supports_force_fused": false
+  },
+  "reports": [
+    {
+      "mode": "gpu",
+      "dtype": "float16",
+      "parity_tier": "deterministic_gpu",
+      "status": "ok",
+      "cases_evaluated": 16,
+      "cases_skipped_ane_cap": 0,
+      "proj_max_abs_err": 0.00666,
+      "proj_min_cos": 0.999994,
+      "int8_max_abs_err": 1,
+      "int8_exact_fraction": 0.9573,
+      "int8_min_cos": 0.999851,
+      "within_strict_parity": true,
+      "ane_drift_warning": false,
+      "s4096_streamed_parity": {
+        "seq_len": 4096,
+        "proj_max_abs_err": 0.0,
+        "proj_min_cos": 1.0,
+        "int8_max_abs_err": 0,
+        "int8_exact_fraction": 1.0,
+        "int8_min_cos": 1.0,
+        "passed": true
+      }
+    },
+    {
+      "mode": "gpu-bf16",
+      "dtype": "bfloat16",
+      "parity_tier": "deterministic_gpu",
+      "status": "ok",
+      "cases_evaluated": 16,
+      "cases_skipped_ane_cap": 0,
+      "proj_max_abs_err": 0.047396,
+      "proj_min_cos": 0.999892,
+      "int8_max_abs_err": 4,
+      "int8_exact_fraction": 0.6967,
+      "int8_min_cos": 0.999196,
+      "within_strict_parity": true,
+      "ane_drift_warning": false,
+      "s4096_streamed_parity": {
+        "seq_len": 4096,
+        "proj_max_abs_err": 0.0,
+        "proj_min_cos": 1.0,
+        "int8_max_abs_err": 0,
+        "int8_exact_fraction": 1.0,
+        "int8_min_cos": 1.0,
+        "passed": true
+      }
+    },
+    {
+      "mode": "ane",
+      "dtype": "float16",
+      "parity_tier": "ane_drift_tolerant",
+      "status": "ok",
+      "cases_evaluated": 14,
+      "cases_skipped_ane_cap": 2,
+      "proj_max_abs_err": 0.250567,
+      "proj_min_cos": 0.982756,
+      "int8_max_abs_err": 21,
+      "int8_exact_fraction": 0.1836,
+      "int8_min_cos": 0.98261,
+      "within_strict_parity": false,
+      "ane_drift_warning": true
+    },
+    {
+      "mode": "hetero2",
+      "dtype": "float16",
+      "parity_tier": "ane_drift_tolerant",
+      "status": "ok",
+      "cases_evaluated": 16,
+      "cases_skipped_ane_cap": 0,
+      "proj_max_abs_err": 0.250567,
+      "proj_min_cos": 0.982756,
+      "int8_max_abs_err": 21,
+      "int8_exact_fraction": 0.2705,
+      "int8_min_cos": 0.98261,
+      "within_strict_parity": false,
+      "ane_drift_warning": true
+    }
+  ]
+}

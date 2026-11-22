@@ -1,0 +1,58 @@
+{
+  "host": {
+    "chip": "Apple M5",
+    "mem_gb": 24.0,
+    "macos": "27.2.1",
+    "mlx_version": "0.32.4",
+    "device_name": "Apple M5",
+    "architecture": "applegpu_g17g"
+  },
+  "results": [
+    {
+      "preset": "9b-optiq",
+      "snapshot": "10a7fc93870c02a14b6bd5ddef4a7f6ada5f111f",
+      "vocab_out": 248077,
+      "mtp_enabled": false,
+      "load_sec": 0.018,
+      "has_native_mtp_drafter": false,
+      "fusion_parity": {
+        "max_abs_logit_diff": 0.75,
+        "top1_match": true
+      },
+      "abba_b1_4docs": {
+        "unfused_unconstrained_median_sec": 13.8012,
+        "fast_qwen3_strict_lcp_median_sec": 4.836,
+        "wall_speedup_x": 2.854,
+        "fast_docs_per_sec": 0.827,
+        "fast_tok_s": 32.88
+      },
+      "abba_wave_8docs": {
+        "seq_unconstrained_median_sec": 26.3301,
+        "seq_valid_8": 0,
+        "seq_tok_s": 18.84,
+        "fast_b8_strict_lcp_median_sec": 3.4353,
+        "fast_valid_8": 8,
+        "fast_docs_per_sec": 2.329,
+        "fast_tok_s": 91.99,
+        "wall_speedup_x": 7.665
+      },
+      "speculative_b1_64tok": {
+        "drafter": "PromptLookupDrafter",
+        "exact_greedy_token_match": true,
+        "nospec_sec": 3.2983,
+        "nospec_tok_s": 19.4,
+        "spec_sec": 2.8912,
+        "spec_tok_s": 22.14,
+        "spec_speedup_x": 1.141
+      },
+      "memory": {
+        "mlx_active_gb": 8.2874,
+        "mlx_peak_gb": 8.9973,
+        "phys_footprint_gb": 9.0998,
+        "peak_footprint_gb": 17.7811,
+        "end_phys_footprint_gb": 8.4478,
+        "subprocess_peak_footprint_gb": 17.7811
+      }
+    }
+  ]
+}

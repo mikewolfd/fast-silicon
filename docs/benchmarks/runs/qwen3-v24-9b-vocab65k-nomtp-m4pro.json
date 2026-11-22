@@ -1,0 +1,58 @@
+{
+  "host": {
+    "chip": "Apple M4 Pro",
+    "mem_gb": 48.0,
+    "macos": "26.6",
+    "mlx_version": "0.32.4",
+    "device_name": "Apple M4 Pro",
+    "architecture": "applegpu_g16s"
+  },
+  "results": [
+    {
+      "preset": "9b-optiq",
+      "snapshot": "10a7fc93870c02a14b6bd5ddef4a7f6ada5f111f",
+      "vocab_out": 248077,
+      "mtp_enabled": false,
+      "load_sec": 0.022,
+      "has_native_mtp_drafter": false,
+      "fusion_parity": {
+        "max_abs_logit_diff": 0.8125,
+        "top1_match": true
+      },
+      "abba_b1_4docs": {
+        "unfused_unconstrained_median_sec": 9.1939,
+        "fast_qwen3_strict_lcp_median_sec": 3.3974,
+        "wall_speedup_x": 2.706,
+        "fast_docs_per_sec": 1.177,
+        "fast_tok_s": 46.8
+      },
+      "abba_wave_8docs": {
+        "seq_unconstrained_median_sec": 16.5707,
+        "seq_valid_8": 0,
+        "seq_tok_s": 29.99,
+        "fast_b8_strict_lcp_median_sec": 2.8891,
+        "fast_valid_8": 8,
+        "fast_docs_per_sec": 2.769,
+        "fast_tok_s": 109.38,
+        "wall_speedup_x": 5.736
+      },
+      "speculative_b1_64tok": {
+        "drafter": "PromptLookupDrafter",
+        "exact_greedy_token_match": true,
+        "nospec_sec": 2.0978,
+        "nospec_tok_s": 30.51,
+        "spec_sec": 2.1034,
+        "spec_tok_s": 30.43,
+        "spec_speedup_x": 0.997
+      },
+      "memory": {
+        "mlx_active_gb": 8.2875,
+        "mlx_peak_gb": 9.5744,
+        "phys_footprint_gb": 9.1556,
+        "peak_footprint_gb": 18.5459,
+        "end_phys_footprint_gb": 8.0716,
+        "subprocess_peak_footprint_gb": 18.5459
+      }
+    }
+  ]
+}

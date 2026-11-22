@@ -74,8 +74,47 @@ def recommended_draft_k(
     if not (1 <= b <= max_b):
         raise ValueError(f"Speculative drafting unsupported for batch_size={b} (max_b={max_b})")
     if b == 1:
-        return 3 if has_grammar else 4
+        # k=3 outperforms k=4 by +10-13% for 1-layer MTP on both M4 Pro and Base M5 (with or without grammar).
+        return 3
     return 2
+
+
+def detect_mtp_norm_add_one(
+    mtp_weights: Mapping[str, mx.array],
+    *,
+    fallback: bool = False,
+) -> bool:
+    """Detect zero-centered `(1 + w)` vs pre-shifted `w` independently on `mtp.*` tensors.
+
+    Quantized conversions (e.g., `OptiQ`) may fold `+1.0` into main-model RMSNorm weights
+    while shipping `optiq/mtp.safetensors` with raw zero-centered `(1 + w)` HF weights.
+    """
+    probe_keys = (
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+    )
+    means: list[float] = []
+    pre_fc_means: list[float] = []
+    min_val = float("inf")
+    for k in probe_keys:
+        w = mtp_weights.get(k)
+        if w is None:
+            continue
+        arr = np.asarray(w.astype(mx.float32))
+        m = float(np.mean(arr))
+        means.append(m)
+        min_val = min(min_val, float(np.min(arr)))
+        if k.startswith("mtp.pre_fc_norm_"):
+            pre_fc_means.append(m)
+    if not means:
+        return bool(fallback)
+    # Raw HF pre-FC norms sit negative (~ -0.5..-0.2); pre-shifted norms sit > +0.5 with min > 0.
+    if pre_fc_means and (min(pre_fc_means) < 0.15 or min_val < -0.15):
+        return True
+    overall_mean = sum(means) / len(means)
+    return abs(overall_mean - 1.0) > abs(overall_mean)
 
 
 class Qwen3MtpDrafter(nn.Module):
@@ -138,10 +177,11 @@ class Qwen3MtpDrafter(nn.Module):
         )
         if not all(k in mtp_weights for k in required):
             return None
+        mtp_norm_add_one = detect_mtp_norm_add_one(mtp_weights, fallback=target_model.norm_add_one)
         return cls(
             target_model.cfg,
             mtp_weights,
-            norm_add_one=target_model.norm_add_one,
+            norm_add_one=mtp_norm_add_one,
             use_apple10_force_fused=target_model.use_apple10_force_fused,
             enable_fusion=getattr(target_model, "enable_fusion", True),
         )

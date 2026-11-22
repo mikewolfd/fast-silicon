@@ -1,0 +1,32 @@
+{
+  "host": "Base M5 (24 GB)",
+  "parity": {
+    "4b-optiq": {
+      "ragged_b1_vs_b4_exact_match": false,
+      "prefix_tree_wave_vs_cold_bf16_match": false,
+      "kv_i8_vs_bf16_exact_match": false,
+      "s2048_prompt_tokens": 2213,
+      "s2048_chunked_vs_whole_first_tok_match": true
+    },
+    "9b-optiq": {
+      "ragged_b1_vs_b4_exact_match": true,
+      "prefix_tree_wave_vs_cold_bf16_match": true,
+      "kv_i8_vs_bf16_exact_match": true,
+      "s2048_prompt_tokens": 2213,
+      "s2048_chunked_vs_whole_first_tok_match": true
+    }
+  },
+  "concurrent_4b_gpu_plus_bge_ane": {
+    "wall_sec": 2.626,
+    "gpu_items": 8,
+    "ane_batches": 3,
+    "ane_shape": [
+      32,
+      384
+    ],
+    "phys_footprint_gb": 5.3207,
+    "peak_footprint_gb": 9.3902,
+    "mlx_peak_gb": 8.9176,
+    "under_19_2_gb_cap": true
+  }
+}

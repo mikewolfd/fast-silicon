@@ -736,12 +736,28 @@ def test_tied_vocab_remap_fallback_lora_r_ge_out_and_optiq_mtp(tmp_path: Path) -
     mx.save_safetensors(str(mdir / "model.safetensors"), base_only)
     mx.save_safetensors(str(mdir / "optiq" / "mtp.safetensors"), mtp_only)
 
+    from fast_qwen3.mtp_drafter import recommended_draft_k
+
     loaded_m, loaded_mtp = FastQwen3Model.from_pretrained(mdir, enable_fusion=False)
     drafter = Qwen3MtpDrafter.from_mtp_weights(loaded_m, loaded_mtp)
     assert drafter is not None
     assert loaded_m.enable_fusion is False
+    assert recommended_draft_k(1, has_grammar=False) == 3
+    assert recommended_draft_k(1, has_grammar=True) == 3
     assert should_use_speculative_qwen(1, 0.0, speculative=None, has_native_mtp=True, hidden_size=4096, is_moe=True) is False
     assert should_use_speculative_qwen(1, 0.0, speculative=None, has_native_mtp=True, hidden_size=4096, is_moe=False) is True
+
+    # Bool `mtp_drafter=True/False` on FastQwen3Engine works cleanly without AttributeError
+    (mdir / "tokenizer.json").write_text(
+        tok.backend_tokenizer.to_str() if hasattr(tok, "backend_tokenizer") else (tmp_path / "tokenizer.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    eng_mtp_true = FastQwen3Engine(model_dir=mdir, mtp_drafter=True, warmup=False, prefix_cache_mb=0)
+    assert eng_mtp_true.mtp_drafter is not None
+    eng_mtp_true.close()
+    eng_mtp_false = FastQwen3Engine(model_dir=mdir, mtp_drafter=False, warmup=False, prefix_cache_mb=0)
+    assert eng_mtp_false.mtp_drafter is None
+    eng_mtp_false.close()
 
 
 def test_thinking_early_exit_mtp_long_parity_and_seed_determinism(tmp_path: Path) -> None:
@@ -836,3 +852,68 @@ def test_prefix_tree_multi_chunk_wave_reuse_and_chunked_ragged_parity(tmp_path: 
     finally:
         eng.close()
         mx.set_cache_limit(prev_lim)
+
+
+def test_mtp_independent_norm_autodetect_and_bytelevel_vocab_remap(tmp_path: Path) -> None:
+    """Verify `detect_mtp_norm_add_one` handles raw MTP weights on folded OptiQ and `build_ascii_latin_subset` caps ByteLevel CJK."""
+    from tokenizers import Tokenizer as HfTokenizer
+    from fast_qwen3 import QwenVocabRemapper
+    from fast_qwen3.mtp_drafter import detect_mtp_norm_add_one
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    # Main model folded (+1), raw zero-centered MTP weights (as in `9B-OptiQ` `optiq/mtp.safetensors`)
+    main_w = _make_synthetic_qwen3_weights(cfg, seed=19, zero_centered_norms=False, include_mtp=False)
+    mtp_raw_w = {
+        k: v for k, v in _make_synthetic_qwen3_weights(cfg, seed=23, zero_centered_norms=True, include_mtp=True).items() if k.startswith("mtp.")
+    }
+    # Emulate negative raw pre_fc norms seen in HF Qwen3.5 MTP weights
+    mtp_raw_w["mtp.pre_fc_norm_embedding.weight"] = mx.full((cfg.hidden_size,), -0.45, dtype=mx.bfloat16)
+    mtp_raw_w["mtp.pre_fc_norm_hidden.weight"] = mx.full((cfg.hidden_size,), -0.25, dtype=mx.bfloat16)
+    mtp_raw_w["mtp.norm.weight"] = mx.full((cfg.hidden_size,), 1.4, dtype=mx.bfloat16)
+
+    folded_model = FastQwen3Model(cfg, main_w, norm_add_one=False, enable_fusion=False)
+    assert detect_mtp_norm_add_one(mtp_raw_w, fallback=folded_model.norm_add_one) is True
+    drafter_raw = Qwen3MtpDrafter.from_mtp_weights(folded_model, mtp_raw_w)
+    assert drafter_raw is not None
+    assert abs(float(mx.mean(drafter_raw.pre_fc_norm_embedding.weight.astype(mx.float32)).item()) - 0.55) < 0.05
+
+    mtp_folded_w = {
+        k: v for k, v in _make_synthetic_qwen3_weights(cfg, seed=29, zero_centered_norms=False, include_mtp=True).items() if k.startswith("mtp.")
+    }
+    assert detect_mtp_norm_add_one(mtp_folded_w, fallback=False) is False
+    drafter_folded = Qwen3MtpDrafter.from_mtp_weights(folded_model, mtp_folded_w)
+    assert drafter_folded is not None
+    assert abs(float(mx.mean(drafter_folded.pre_fc_norm_embedding.weight.astype(mx.float32)).item()) - 1.0) < 0.08
+
+    # ByteLevel tokenizer encodes CJK UTF-8 bytes as Latin-1 chars (< 0x0250); decoded check must filter CJK and honor target_size
+    vocab = dict(ByteLevel.alphabet()) if False else {}
+    for ch in ByteLevel.alphabet():
+        if ch not in vocab:
+            vocab[ch] = len(vocab)
+    tok_bl = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    tok_bl.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tok_bl.decoder = ByteLevelDecoder(add_prefix_space=False)
+    # Add >300 ASCII tokens after a small prefix so CJK (`tid >= 275`) is outside `must_prefix` (`<= 256` for target_size=600)
+    tok_bl.add_tokens(["hello", "world"])
+    tok_bl.add_tokens([f"padtok{i}" for i in range(40)])
+    tok_bl.add_tokens(["çļĦ", "ä¸Ń"])  # ByteLevel encodings of CJK '的' and '中'
+    tok_bl.add_tokens([f"posttok{i}" for i in range(1100)])
+    cjk_de = tok_bl.token_to_id("çļĦ")
+    cjk_zh = tok_bl.token_to_id("ä¸Ń")
+    ascii_hello = tok_bl.token_to_id("hello")
+    assert cjk_de > 290 and tok_bl.decode([cjk_de]) == "的"
+
+    remap_uncapped = QwenVocabRemapper.build_ascii_latin_subset(
+        tok_bl, full_vocab_size=tok_bl.get_vocab_size(), target_size=None
+    )
+    # Use target_size=500 so must_prefix = 256; cjk_de (~298 >= 256) is checked cleanly and excluded
+    remap_capped = QwenVocabRemapper.build_ascii_latin_subset(
+        tok_bl, full_vocab_size=tok_bl.get_vocab_size(), target_size=500
+    )
+    assert remap_capped.vocab_size == 500
+    assert ascii_hello in set(remap_capped.new_to_old.tolist())
+    assert cjk_de not in set(remap_capped.new_to_old.tolist())
+    assert cjk_zh not in set(remap_capped.new_to_old.tolist())
+    assert remap_uncapped.vocab_size > 500
+

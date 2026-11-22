@@ -115,22 +115,34 @@ class QwenVocabRemapper:
         """Keep all ASCII/Latin/JSON/punctuation/digit/special tokens plus lowest-ID BPE merges."""
         vocab = tokenizer.get_vocab(with_added_tokens=True)
         real_tok_limit = min(int(full_vocab_size), int(tokenizer.get_vocab_size(with_added_tokens=True)))
-        keep: set[int] = set()
-        for tok_str, tid in vocab.items():
-            if tid < 0 or tid >= real_tok_limit:
+        id_to_tok = {int(tid): tok_str for tok_str, tid in vocab.items() if 0 <= int(tid) < real_tok_limit}
+        must_prefix = min(1024, max(256, int(target_size) // 4)) if target_size is not None else 1024
+        allowed_ext = set("—–“”‘’•§¶°±×÷€£¥¢\r\n\t ")
+        must_keep: set[int] = set()
+        latin_candidates: list[int] = []
+        for tid in range(real_tok_limit):
+            tok_str = id_to_tok.get(tid, "")
+            if tid < must_prefix or tok_str.startswith("<|") or tok_str in (THINK_OPEN, THINK_CLOSE):
+                must_keep.add(tid)
                 continue
-            if tid < 1024 or tok_str.startswith("<|") or tok_str in (THINK_OPEN, THINK_CLOSE):
-                keep.add(int(tid))
-                continue
-            # Keep printable ASCII + Latin-1/Extended tokens used in Western structured text
-            if all(ord(ch) < 0x0250 or ch in "ĠĊĉ—–“”‘’•§¶°±×÷€£¥¢" for ch in tok_str):
-                keep.add(int(tid))
-        if target_size is not None and int(target_size) > len(keep):
-            cap = min(int(target_size), real_tok_limit)
-            for tid in range(real_tok_limit):
+            # Decode from ByteLevel encoding so non-Latin UTF-8 byte tokens (and U+FFFD fragments) are excluded
+            dec = tokenizer.decode([tid], skip_special_tokens=False)
+            if dec and all(ord(ch) < 0x0250 or ch in allowed_ext for ch in dec):
+                latin_candidates.append(tid)
+        if target_size is None:
+            keep = must_keep | set(latin_candidates)
+        else:
+            cap = max(len(must_keep), min(int(target_size), real_tok_limit))
+            keep = set(must_keep)
+            for tid in latin_candidates:
                 if len(keep) >= cap:
                     break
                 keep.add(tid)
+            if len(keep) < cap:
+                for tid in range(real_tok_limit):
+                    if len(keep) >= cap:
+                        break
+                    keep.add(tid)
         ordered = np.array(sorted(keep), dtype=np.int32)
         return cls(ordered, full_vocab_size=full_vocab_size)
 

@@ -129,7 +129,7 @@ class FastQwen3Engine:
         repo_id: str | None = None,
         model: FastQwen3Model | None = None,
         tokenizer: FastQwen3Tokenizer | None = None,
-        mtp_drafter: Qwen3MtpDrafter | None = None,
+        mtp_drafter: Qwen3MtpDrafter | bool | None = None,
         lora_adapter: str | Path | None = None,
         vocab_out: int | None = None,
         default_mode: str = "auto",
@@ -199,7 +199,7 @@ class FastQwen3Engine:
             self.model_dir: Path | None = model.model_dir
             self.model = model
             self.tokenizer = tokenizer
-            self.mtp_drafter = mtp_drafter
+            self.mtp_drafter = None if isinstance(mtp_drafter, bool) else mtp_drafter
             self.model_name = str(repo_id or (model.model_dir.name if model.model_dir else "fast-qwen3"))
         else:
             resolved_dir = self.paths.resolve_model_dir(
@@ -229,7 +229,12 @@ class FastQwen3Engine:
                 allow_oversubscribe=allow_oversubscribe,
             )
             self.model = loaded_model
-            self.mtp_drafter = mtp_drafter or Qwen3MtpDrafter.from_mtp_weights(loaded_model, mtp_w)
+            if mtp_drafter is False:
+                self.mtp_drafter = None
+            elif mtp_drafter is None or mtp_drafter is True:
+                self.mtp_drafter = Qwen3MtpDrafter.from_mtp_weights(loaded_model, mtp_w)
+            else:
+                self.mtp_drafter = mtp_drafter
 
         if lora_adapter is not None:
             self.model.load_lora_adapter(lora_adapter)

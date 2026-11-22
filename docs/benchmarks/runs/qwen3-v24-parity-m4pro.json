@@ -1,0 +1,95 @@
+{
+  "host": "M4 Pro",
+  "models": {
+    "4b-optiq": {
+      "ragged_s_gt_256_lens": [
+        290,
+        289,
+        288,
+        288
+      ],
+      "ragged_b1_vs_b4_matches": [
+        true,
+        true,
+        true,
+        false
+      ],
+      "prefix_tree_snapshots": 3,
+      "prefix_tree_wave_vs_same_kvi8_exact_match": true,
+      "prefix_tree_reused_tokens": 1536,
+      "kv_i8_vs_bf16_wave1_exact_match": true,
+      "s2048_prompt_tokens": 2213,
+      "s2048_chunked_vs_whole_first_tok_match": true
+    },
+    "9b-optiq": {
+      "ragged_s_gt_256_lens": [
+        290,
+        289,
+        288,
+        288
+      ],
+      "ragged_b1_vs_b4_matches": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "prefix_tree_snapshots": 3,
+      "prefix_tree_wave_vs_same_kvi8_exact_match": true,
+      "prefix_tree_reused_tokens": 1536,
+      "kv_i8_vs_bf16_wave1_exact_match": true,
+      "s2048_prompt_tokens": 2213,
+      "s2048_chunked_vs_whole_first_tok_match": true
+    }
+  },
+  "mtp_draft_k_9b": {
+    "vocab_248320": {
+      "nospec_sec": 1.9798,
+      "nospec_tok_s": 32.33,
+      "ks": {
+        "2": {
+          "sec": 1.4263,
+          "tok_s": 44.87,
+          "speedup_x": 1.388,
+          "exact_match": true
+        },
+        "3": {
+          "sec": 1.3719,
+          "tok_s": 46.65,
+          "speedup_x": 1.443,
+          "exact_match": true
+        },
+        "4": {
+          "sec": 1.5507,
+          "tok_s": 41.27,
+          "speedup_x": 1.277,
+          "exact_match": true
+        }
+      }
+    },
+    "vocab_65536": {
+      "nospec_sec": 1.7753,
+      "nospec_tok_s": 36.05,
+      "ks": {
+        "2": {
+          "sec": 1.2182,
+          "tok_s": 52.54,
+          "speedup_x": 1.457,
+          "exact_match": true
+        },
+        "3": {
+          "sec": 1.0958,
+          "tok_s": 58.4,
+          "speedup_x": 1.62,
+          "exact_match": true
+        },
+        "4": {
+          "sec": 1.2347,
+          "tok_s": 51.84,
+          "speedup_x": 1.438,
+          "exact_match": true
+        }
+      }
+    }
+  }
+}

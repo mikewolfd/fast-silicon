@@ -1,0 +1,150 @@
+{
+  "host": {
+    "chip": "Apple M4 Pro",
+    "mem_gb": 48.0,
+    "macos": "26.6",
+    "mlx_version": "0.32.4",
+    "device_name": "Apple M4 Pro",
+    "architecture": "applegpu_g16s"
+  },
+  "results": [
+    {
+      "preset": "0.8b-bf16",
+      "snapshot": "2fc06364715b967f1860aea9cf38778875588b17",
+      "vocab_out": 248070,
+      "mtp_enabled": true,
+      "load_sec": 0.024,
+      "has_native_mtp_drafter": true,
+      "fusion_parity": {
+        "max_abs_logit_diff": 0.640625,
+        "top1_match": true
+      },
+      "abba_b1_4docs": {
+        "unfused_unconstrained_median_sec": 2.4631,
+        "fast_qwen3_strict_lcp_median_sec": 0.8702,
+        "wall_speedup_x": 2.831,
+        "fast_docs_per_sec": 4.597,
+        "fast_tok_s": 187.32
+      },
+      "abba_wave_8docs": {
+        "seq_unconstrained_median_sec": 4.7607,
+        "seq_valid_8": 8,
+        "seq_tok_s": 99.57,
+        "fast_b8_strict_lcp_median_sec": 0.5097,
+        "fast_valid_8": 8,
+        "fast_docs_per_sec": 15.694,
+        "fast_tok_s": 635.61,
+        "wall_speedup_x": 9.339
+      },
+      "speculative_b1_64tok": {
+        "drafter": "Qwen3MtpDrafter",
+        "exact_greedy_token_match": true,
+        "nospec_sec": 0.6257,
+        "nospec_tok_s": 102.29,
+        "spec_sec": 0.8444,
+        "spec_tok_s": 75.8,
+        "spec_speedup_x": 0.741
+      },
+      "memory": {
+        "mlx_active_gb": 1.6671,
+        "mlx_peak_gb": 2.4624,
+        "phys_footprint_gb": 2.5126,
+        "peak_footprint_gb": 4.7697,
+        "end_phys_footprint_gb": 1.943,
+        "subprocess_peak_footprint_gb": 4.7697
+      }
+    },
+    {
+      "preset": "4b-optiq",
+      "snapshot": "4d4b423e71999777417dd587f429c9ad06e15dc0",
+      "vocab_out": 248077,
+      "mtp_enabled": false,
+      "load_sec": 0.022,
+      "has_native_mtp_drafter": false,
+      "fusion_parity": {
+        "max_abs_logit_diff": 1.0,
+        "top1_match": true
+      },
+      "abba_b1_4docs": {
+        "unfused_unconstrained_median_sec": 5.449,
+        "fast_qwen3_strict_lcp_median_sec": 2.0127,
+        "wall_speedup_x": 2.707,
+        "fast_docs_per_sec": 1.987,
+        "fast_tok_s": 79.0
+      },
+      "abba_wave_8docs": {
+        "seq_unconstrained_median_sec": 10.3288,
+        "seq_valid_8": 1,
+        "seq_tok_s": 48.02,
+        "fast_b8_strict_lcp_median_sec": 1.7258,
+        "fast_valid_8": 8,
+        "fast_docs_per_sec": 4.635,
+        "fast_tok_s": 183.1,
+        "wall_speedup_x": 5.985
+      },
+      "speculative_b1_64tok": {
+        "drafter": "PromptLookupDrafter",
+        "exact_greedy_token_match": true,
+        "nospec_sec": 1.2685,
+        "nospec_tok_s": 50.45,
+        "spec_sec": 1.4639,
+        "spec_tok_s": 43.72,
+        "spec_speedup_x": 0.867
+      },
+      "memory": {
+        "mlx_active_gb": 3.3761,
+        "mlx_peak_gb": 4.7645,
+        "phys_footprint_gb": 4.2194,
+        "peak_footprint_gb": 8.7631,
+        "end_phys_footprint_gb": 3.3258,
+        "subprocess_peak_footprint_gb": 8.7631
+      }
+    },
+    {
+      "preset": "9b-optiq",
+      "snapshot": "10a7fc93870c02a14b6bd5ddef4a7f6ada5f111f",
+      "vocab_out": 248077,
+      "mtp_enabled": true,
+      "load_sec": 0.023,
+      "has_native_mtp_drafter": true,
+      "fusion_parity": {
+        "max_abs_logit_diff": 0.8125,
+        "top1_match": true
+      },
+      "abba_b1_4docs": {
+        "unfused_unconstrained_median_sec": 9.2789,
+        "fast_qwen3_strict_lcp_median_sec": 3.426,
+        "wall_speedup_x": 2.708,
+        "fast_docs_per_sec": 1.168,
+        "fast_tok_s": 46.41
+      },
+      "abba_wave_8docs": {
+        "seq_unconstrained_median_sec": 17.3643,
+        "seq_valid_8": 0,
+        "seq_tok_s": 28.62,
+        "fast_b8_strict_lcp_median_sec": 3.0909,
+        "fast_valid_8": 8,
+        "fast_docs_per_sec": 2.588,
+        "fast_tok_s": 102.23,
+        "wall_speedup_x": 5.618
+      },
+      "speculative_b1_64tok": {
+        "drafter": "Qwen3MtpDrafter",
+        "exact_greedy_token_match": true,
+        "nospec_sec": 2.1299,
+        "nospec_tok_s": 30.05,
+        "spec_sec": 4.8305,
+        "spec_tok_s": 13.25,
+        "spec_speedup_x": 0.441
+      },
+      "memory": {
+        "mlx_active_gb": 7.4722,
+        "mlx_peak_gb": 8.4937,
+        "phys_footprint_gb": 8.3188,
+        "peak_footprint_gb": 16.3754,
+        "end_phys_footprint_gb": 7.1395,
+        "subprocess_peak_footprint_gb": 16.3754
+      }
+    }
+  ]
+}
