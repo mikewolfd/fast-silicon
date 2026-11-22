@@ -391,3 +391,50 @@ def test_monorepo_benchmark_dry_run_and_parsers(capsys: pytest.CaptureFixture[st
     mono_parsed = mod._try_parse_json_tail(noisy_stdout)
     assert mono_parsed is not None and mono_parsed["suite"] == "parity"
     assert "parity: gpu=ok(16)" == mod.summarize_throughput("fast-pplx", noisy_stdout)
+
+    rc_cw = pplx_bench.main(
+        [
+            "context-windows",
+            "--dry-run",
+            "--repeat-header-tokens",
+            "64",
+            "--window-overlap-chunks",
+            "1",
+        ]
+    )
+    assert rc_cw == 0
+    cw_payload = json.loads(capsys.readouterr().out)
+    assert cw_payload["repeat_header_tokens"] == 64
+    assert cw_payload["window_overlap_chunks"] == 1
+
+
+def test_build_ane_models_parallel_compile_passes_worker_fn_and_sys_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify _compile_mlpackages_parallel passes picklable worker_fn + extra_sys_paths."""
+    import pickle
+
+    build_mod = _load_module(
+        "test_build_ane_models_mod",
+        _REPO_ROOT / "packages" / "fast-pplx" / "scripts" / "build_ane_models.py",
+    )
+    # Smoke-check picklability under spawn multiprocessing
+    assert pickle.loads(pickle.dumps(build_mod._compile_mlpackage_task)) is build_mod._compile_mlpackage_task
+
+    recorded: dict[str, Any] = {}
+
+    def _spy_compile(tasks, worker_fn, *, max_workers=None, label_fn=None, extra_sys_paths=()):
+        recorded["tasks"] = list(tasks)
+        recorded["worker_fn"] = worker_fn
+        recorded["max_workers"] = max_workers
+        recorded["label_fn"] = label_fn
+        recorded["extra_sys_paths"] = tuple(extra_sys_paths)
+
+    monkeypatch.setattr(build_mod, "compile_buckets_parallel", _spy_compile)
+    pkgs = [tmp_path / "a.mlpackage", tmp_path / "b.mlpackage"]
+    build_mod._compile_mlpackages_parallel(pkgs, tmp_path / "compiled", max_workers=2)
+    assert recorded["worker_fn"] is build_mod._compile_mlpackage_task
+    assert recorded["tasks"] == [(str(pkgs[0]), str(tmp_path / "compiled")), (str(pkgs[1]), str(tmp_path / "compiled"))]
+    assert recorded["max_workers"] == 2
+    assert recorded["label_fn"](recorded["tasks"][0]) == "a"
+    assert str(build_mod.Path(build_mod.__file__).resolve().parent) in recorded["extra_sys_paths"]

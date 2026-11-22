@@ -77,7 +77,20 @@ Measured via `packages/fast-pplx/scripts/benchmark.py ane-profiles` in isolated 
 | **`parity`** | `12,679` | `12,496` | `9,519` | **`0.9989`** | **`0.72`** | `0.92–0.94×` |
 | Stock `pplx-context-mlx` (`fp16`) | `11,707` | `8,735` | `8,425` | `1.0000` (GPU) | — | — |
 
-These measurements establish vector agreement and processing speed. Choosing a precision profile for search quality still requires a comparison of the same labeled queries across all three profiles.
+**Paired Tier-1 Retrieval Outcomes (`N=325` queries, identical dataset lock & isolated profile homes):**
+
+| Host | Arm | `S_obj,e2e` | `EOT (u/s)` | Wall (`s`) | `NanoBEIR` / `LB-Ctx` (`lift`) | Paired vs. `gpu` (`Δ` / `95% CI` / `EOT×`) | Mem (`OS phys` / `comb` / `peak`) |
+| :--- | :--- | ---: | ---: | ---: | :---: | :--- | :---: |
+| **M4 Pro** (`48 GB`) | `gpu` | `0.7392` | `0.878` | `273.73s` | `0.7483` / `0.7314` (`+0.3786`) | baseline | `1.48` / `1.48` / `3.09 GB` |
+| **M4 Pro** (`48 GB`) | **`hetero2 fast`** | **`0.7394`** | `1.512` | `158.91s` | `0.7479` / `0.7320` (`+0.3737`) | `+0.0002` `[-0.0050, +0.0054]` (`1.72×`) | `1.13` / `1.36` / `3.24 GB` |
+| **M4 Pro** (`48 GB`) | **`hetero2 balanced`** | `0.7376` | **`1.538`** | **`155.83s`** | `0.7452` / `0.7311` (`+0.3803`) | `-0.0016` `[-0.0036, +0.0004]` (`1.75×`) | `1.48` / `1.82` / `3.59 GB` |
+| **M4 Pro** (`48 GB`) | `hetero2 parity` | `0.7369` | `1.497` | `160.02s` | `0.7426` / `0.7320` (`+0.3815`) | `-0.0023` `[-0.0052, +0.0005]` (`1.71×`) | `1.61` / `1.95` / `3.36 GB` |
+| **Base M5** (`24 GB`) | `gpu` | `0.7390` | `1.614` | `148.79s` | `0.7478` / `0.7314` (`+0.3787`) | baseline | `1.06` / `1.06` / `2.93 GB` |
+| **Base M5** (`24 GB`) | **`hetero2 fast`** | **`0.7381`** | **`2.163`** | **`110.93s`** | `0.7460` / `0.7313` (`+0.3734`) | `-0.0009` `[-0.0052, +0.0034]` (`1.34×`) | `1.54` / `1.88` / `3.05 GB` |
+| **Base M5** (`24 GB`) | **`hetero2 balanced`** | `0.7379` | `2.116` | `113.36s` | `0.7450` / `0.7318` (`+0.3811`) | `-0.0011` `[-0.0038, +0.0017]` (`1.31×`) | `1.58` / `1.93` / `3.09 GB` |
+| **Base M5** (`24 GB`) | `hetero2 parity` | `0.7373` | `2.064` | `116.07s` | `0.7434` / `0.7321` (`+0.3817`) | `-0.0017` `[-0.0039, +0.0006]` (`1.28×`) | `1.20` / `1.54` / `3.08 GB` |
+
+Across all three ANE profiles (`fast`, `balanced`, `parity`), `hetero2` cuts end-to-end Tier-1 wall time by **`1.71–1.75×`** on M4 Pro and **`1.28–1.34×`** on Base M5 while keeping `S_obj,e2e` within `0.0002–0.0023` of `gpu`. (`NanoBEIR` + `LegalBench` per-query variance spans the `-0.003` lossless lower bound on `N=325`, so formal equivalence under `lossless_tolerance=0.003` remains statistically unresolved even where point differences are `< 0.002`.)
 
 ### 4. Direct MIL (`100%` Pure-ANE `2.24 ms`) vs. `CoreAI-Opt` / `.aimodel` Findings
 
@@ -92,11 +105,39 @@ Audited across both **M4 Pro `macOS 26.6`** (`Track A`) and **Base M5 `macOS 27.
 
 > Direct hand-crafted 4D NCHW `conv1x1` MIL (`build_stage_mil_program`) remains the default ANE backend because `torch.export` lowering of chunked `GatedDeltaNet` block-inversion graphs fails ANE compilation on `macOS 26.6` and requires `FP16` compute + `F.softplus` replacement to avoid `MPSGraph` fallback on `27.2.1`.
 
-### 5. v2.2 `GdnDecodeShared`, `state_codec` & Tier-1 GPU Speedups
+### 5. `GdnDecodeShared`, Numerical Invariance & Paired `LongEmbed` `state_codec` (`4K–32K`)
 
 - **`GdnDecodeShared` carried/segmented decode:** Ragged NanoBEIR throughput jumps from `7,918` to **`9,211 tok/s`** (`~1.16×`) on M4 Pro and from `12,743` to **`17,412 tok/s`** (`~1.37×`) on Base M5.
-- **`state_codec` precision & memory:** Default `state_dtype="float32"` keeps `S=4096` stream-vs-whole `min_cos=1.0` on M4 Pro; opt-in `state_dtype="int8"` compresses carried state **`3.76×`** (`6,291,456 B -> 1,671,168 B`) with `S=4096 min_cos=0.9999918`.
+- **Precision & Apple10 (`Base M5`) streamed invariance:** Passing explicit zero `rec_state` into the first `S > 2048` streamed GatedDeltaNet slice guarantees identical `GdnDecodeShared` kernel routing on `slice-0`, eliminating the prior Base M5 `S=4096` stream-vs-whole divergence (`3.01e-03 -> 0.0` `max|stream - whole|` and `0.0` `slice-0` diff across all linear layers on both M4 Pro and Base M5). `PplxGatedDeltaNet` also evaluates `beta` `mx.sigmoid` in `float32` (`float16` path) and `MappedEmbedding.gather(..., out_dtype="float32")` preserves exact `F32`/`BF16` precision when loading into `bfloat16` activations.
 - **Tier-1 GPU (`N=325`) verified runs:** M4 Pro improved from `305.34s` (`0.739249` score, `0.7868 EOT`) to `268.36s` (`0.738421`, `0.8943 EOT`, **`1.137×`**) in `f32` and `264.47s` (`0.738421`, `0.9074 EOT`, **`1.153×`**, `1.278 GB`) in `i8`; Base M5 improved from `203.68s` (`0.739189`, `1.1795 EOT`) to `149.29s` (`0.739011`, `1.6089 EOT`, **`1.364×`**) in `f32` and `146.51s` (`0.739011`, `1.6394 EOT`, **`1.390×`**) in `i8`. [v2.2 validation JSON](../../docs/benchmarks/v22-validation-20261121.json)
+
+**Paired Tier-2 `LongEmbed 4K–32K` (`N=500`: `200` `passkey` `4K/8K/16K/32K` + `300` `2wikimqa`) — `float32` vs. opt-in `int8` `state_codec`:**
+
+| Host | `state_codec` | Mean `nDCG@10` (`N=500`) | `passkey 16K–32K` (`n=100`, `R@10`) | `passkey 4K / 8K / 16K / 32K` | `2wikimqa` (`n=300`) | Eval Wall (`s`) / `EOT` | Mem (`mlx_peak` / `OS phys` / `peak_fp`) |
+| :--- | :--- | ---: | ---: | :---: | ---: | :---: | :---: |
+| **M4 Pro** (`48 GB`) | `float32` (default) | `0.750958` | `0.2534` (`0.56`) | `1.000 / 0.636 / 0.460 / 0.047` | `0.894502` | `2205.5s` / `0.1702` | `4.27` / `1.69` / `5.60 GB` |
+| **M4 Pro** (`48 GB`) | `int8` (opt-in) | **`0.751856`** | **`0.2579`** (`0.57`) | `1.000 / 0.636 / 0.462 / 0.053` | `0.894502` | `2265.8s` / `0.1659` | `4.25` / **`1.63`** / `5.59 GB` |
+| **Base M5** (`24 GB`) | `float32` (default) | `0.751073` | `0.2541` (`0.56`) | `1.000 / 0.636 / 0.462 / 0.047` | `0.894462` | `1630.9s` / `0.2303` | `4.42` / `1.67` / `5.74 GB` |
+| **Base M5** (`24 GB`) | `int8` (opt-in) | **`0.751856`** | **`0.2579`** (`0.57`) | `1.000 / 0.636 / 0.462 / 0.053` | `0.894502` | **`1628.0s`** / **`0.2309`** | `4.44` / **`1.64`** / `5.72 GB` |
+
+- `int8` `state_codec` (`3.76×` smaller carried GDN recurrent state) passes paired equivalence cleanly against `float32` across `N=500` queries on both hosts (**M4 Pro** `Δ=+0.000898`, `95% CI = [-0.000310, +0.002105]`; **Base M5** `Δ=+0.000783`, `95% CI = [-0.000395, +0.001961]`) while holding `32K` retrieval inside `1.63–1.69 GB` live OS footprint. Base M5 (`NAX`) executes the full `4K–32K` sweep **`1.35×` faster** than M4 Pro (`1628s` vs `2205–2266s`).
+
+### 6. Contextual Window Header Anchoring (`embed_contextual_parquet`, M4 Pro)
+
+Validated on full-document `LegalBench-RAG` (`Tier-1`: `175` queries / `796` chunks; `Tier-2`: `568` queries / `2,700` chunks) and `LongEmbed 2wikimqa` (`300` queries):
+
+| Windowing Config (`chunk_tokens=256`) | `LegalBench Tier-1` (`span_nDCG@10` / `char_R@10`) | `LegalBench Tier-2` (`span_nDCG@10` / `char_R@10`) | `2wikimqa` (`nDCG@10`) | Tier-2 Wall (`s`) / GPU Peak | Verdict |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `isolated` (no surrounding context) | `0.3562` / `0.7225` | `0.3571` / `0.6248` | `1.0000` | `73.4s` / `1577.5 MB` | baseline |
+| `context_tokens=512` (`rep=0`) | `0.3513` / `0.7185` | `0.3563` / `0.6220` | — | `73.1s` / `1577.2 MB` | collapsed |
+| `context_tokens=2048` (`rep=0`) | `0.4528` / `0.6827` | `0.5145` / `0.7333` | `0.9923` | `76.6s` / `1650.1 MB` | prior default |
+| `context_tokens=4096` (`rep=0`) | `0.5343` / `0.6912` | `0.5802` / `0.7265` | `0.9811` | `89.0s` / `2367.4 MB` | `+43%` GPU peak, hurts `2wikimqa` |
+| `context_tokens=2048 + header_text` (`--header-col`) | `0.5446` / `0.7460` | `0.5952` / `0.7931` | — | `77.6s` / `1650.0 MB` | `+0.08–0.09` at `1%` cost |
+| **`context_tokens=2048 + repeat_header_tokens=128`** | **`0.7352`** / **`0.9154`** | **`0.6832`** / **`0.8448`** | **`0.9920`** | `82.7s` / `1650.4 MB` | **PROMOTED** (`+0.28` T1 / `+0.17` T2, `0 MB` extra) |
+| `context_tokens=2048 + overlap=1` (`rep=0`) | `0.4177` / `0.6634` | `0.5067` / `0.7131` | `0.9884` | `88.8s` / `1650.1 MB` | **REGRESSED** (`0` default) |
+| `context_tokens=2048 + rep=128 + overlap=1` | `0.7326` / `0.8976` | `0.6887` / `0.8550` | `0.9926` | `96.3s` / `1650.1 MB` | opt-in only (`+16.5%` wall) |
+
+`embed_contextual_parquet` and `fast-pplx parquet --context-tokens` default to `repeat_header_tokens=128` for `context_tokens >= 512` (disable via `--repeat-header-tokens 0`), support explicit `--header-text` / `--header-col` and opt-in `--window-overlap-chunks`, and slice off injected prefix/overlap rows before Parquet write so emitted rows stay strictly `1:1` with unique source chunks.
 
 ## What keeps it fast
 
@@ -113,8 +154,8 @@ Audited across both **M4 Pro `macOS 26.6`** (`Track A`) and **Base M5 `macOS 27.
 # Single/batch embeddings (--mode auto|gpu|ane|hetero|hetero2, --dimensions 128..1024, --dtype int8|float16|float32)
 fast-pplx embed "First passage" "Second passage" --dimensions 256 --dtype int8 --json
 
-# Standard or contextual Parquet ingestion (--context-tokens groups chunks under up to 32K context)
-fast-pplx parquet --input docs.parquet --output out_shards/ --text-col body \
+# Standard or contextual Parquet ingestion (--context-tokens defaults repeat_header_tokens=128 when >= 512)
+fast-pplx parquet --input docs.parquet --output out_shards/ --text-col body --header-col title \
   --mode hetero2 --chunk-tokens 256 --context-tokens 2048 --dimensions 512 --dtype int8 --resume
 
 # OpenAI-compatible HTTP server (/v1/embeddings with optional "dimensions")

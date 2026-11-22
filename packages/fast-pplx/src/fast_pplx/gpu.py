@@ -1214,7 +1214,8 @@ def gated_delta_update(
     tile_rows: int | None = None,
 ) -> tuple[mx.array, mx.array | tuple[mx.array, mx.array]]:
     """Run GatedDeltaNet recurrence keeping ``q, k, v`` in activation dtype and configurable ``state_dtype``."""
-    beta = mx.sigmoid(b)
+    # Promote FP16 sigmoid inputs to FP32 so GdnDecodeShared keeps high-precision beta without disturbing BF16 parity.
+    beta = mx.sigmoid(b.astype(mx.float32)) if b.dtype == mx.float16 else mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     has_carried_state = state is not None
 
@@ -1854,7 +1855,14 @@ class PplxGatedDeltaNet(nn.Module):
             )
             return out
 
-        rec_state: mx.array | tuple[mx.array, mx.array] | None = None
+        if self.state_dtype == "int8" and self.head_k_dim >= 32 and self.head_k_dim % 32 == 0:
+            rec_state: mx.array | tuple[mx.array, mx.array] | None = (
+                mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.int8),
+                mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim // 32), dtype=mx.bfloat16),
+            )
+        else:
+            init_state_dtype = mx.bfloat16 if self.state_dtype == "bfloat16" else mx.float32
+            rec_state = mx.zeros((B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=init_state_dtype)
         conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=mx.float32)
         outs: list[mx.array] = []
         for s0, s1 in tile_aligned_slices(S, slice_len=_GDN_SLICE_LEN, min_tail=_GDN_SLICE_LEN):
@@ -2351,10 +2359,13 @@ class FastPplxGPU:
 
     def _embed_inputs(self, input_ids: np.ndarray) -> mx.array:
         if self._mapped_embed is not None:
-            # Always gather as float16 (2 B/el) and cast FP16 -> BF16 on GPU in MLX when needed.
-            gathered = self._mapped_embed.gather(input_ids, out_dtype="float16")
-            arr = mx.array(gathered, dtype=mx.float16)
-            return arr if self.act_dtype == mx.float16 else arr.astype(self.act_dtype)
+            # Gather as float32 when F32/BF16 weights feed non-FP16 activations to avoid F16 truncation/subnormal loss.
+            src_dtype = str(getattr(self._mapped_embed, "dtype", "F16")).upper()
+            use_f32_gather = src_dtype not in ("F16", "FLOAT16") and self.act_dtype != mx.float16
+            out_dt = "float32" if use_f32_gather else "float16"
+            gathered = self._mapped_embed.gather(input_ids, out_dtype=out_dt)
+            arr = mx.array(gathered, dtype=mx.float32 if use_f32_gather else mx.float16)
+            return arr if arr.dtype == self.act_dtype else arr.astype(self.act_dtype)
         assert self.model.embed_tokens is not None
         return self.model.embed_tokens(mx.array(input_ids, dtype=mx.int32))
 

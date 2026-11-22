@@ -1739,12 +1739,17 @@ def build_synthetic_context_corpus(filler_repeats: int = 8) -> tuple[list[dict[s
 
 def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
     budgets = _parse_int_csv(args.context_budgets)
+    rep_tok_arg = getattr(args, "repeat_header_tokens", 128)
+    rep_tokens = 128 if rep_tok_arg is None else int(rep_tok_arg)
+    ov_chunks = int(getattr(args, "window_overlap_chunks", 0))
     plan = {
         "suite": "context-windows",
         "mode": args.mode,
         "dtype": args.dtype,
         "context_budgets": budgets,
         "filler_repeats": args.filler_repeats,
+        "repeat_header_tokens": rep_tokens,
+        "window_overlap_chunks": ov_chunks,
         "telemetry": _collect_telemetry(),
         "quiescence_warnings": _sys_quiescence(),
     }
@@ -1799,18 +1804,52 @@ def cmd_context_windows(args: argparse.Namespace) -> dict[str, Any]:
             for budget in budgets:
                 t1 = time.perf_counter()
                 windows_chunks: list[list[str]] = []
-                chunk_doc_ids: list[str] = []
+                win_emit_meta: list[tuple[str, int, int]] = []
                 total_toks = 0
                 for d in docs:
-                    packed = eng.tokenizer.group_chunks_by_context_windows(d["chunks"], context_tokens=budget)
-                    for win in packed:
+                    packed = eng.tokenizer.group_chunks_by_context_windows(
+                        d["chunks"],
+                        context_tokens=budget,
+                        repeat_header_tokens=rep_tokens if rep_tokens > 0 else None,
+                        window_overlap_chunks=ov_chunks,
+                    )
+                    body_cursor = 0
+                    for w_idx, win in enumerate(packed):
                         windows_chunks.append(win)
-                        chunk_doc_ids.extend([d["doc_id"]] * len(win))
+                        has_anchor = (
+                            rep_tokens > 0
+                            and w_idx > 0
+                            and body_cursor < len(d["chunks"])
+                            and len(win) >= 2
+                            and win[0] != d["chunks"][body_cursor]
+                        )
+                        min_prefix = 1 if has_anchor else 0
+                        n_rem = len(d["chunks"]) - body_cursor
+                        max_ov = min(ov_chunks, body_cursor) if w_idx > 0 else 0
+                        emit_st = min_prefix
+                        if max_ov > 0:
+                            for cand_ov in range(max_ov, -1, -1):
+                                st_k = min_prefix + cand_ov
+                                cand_n = len(win) - st_k
+                                if 1 <= cand_n <= n_rem and win[st_k:] == d["chunks"][body_cursor : body_cursor + cand_n]:
+                                    emit_st = st_k
+                                    break
+                        n_body = len(win) - emit_st
+                        win_emit_meta.append((d["doc_id"], emit_st, n_body))
+                        body_cursor += n_body
                         total_toks += len(eng.tokenizer.encode_contextual_document(win)[0])
                 vec_lists = eng.encode_contextual_chunks(
                     windows_chunks, batch_size=4, dimensions=args.dimensions, normalize=True, mode=args.mode
                 )
-                c_vecs = np.concatenate(vec_lists, axis=0)
+                emitted_vecs: list[np.ndarray] = []
+                chunk_doc_ids: list[str] = []
+                for vec_mat, (doc_id, emit_st, n_body) in zip(vec_lists, win_emit_meta, strict=True):
+                    arr = np.asarray(vec_mat)
+                    if arr.ndim == 1:
+                        arr = arr.reshape(1, -1)
+                    emitted_vecs.append(arr[emit_st : emit_st + n_body])
+                    chunk_doc_ids.extend([doc_id] * n_body)
+                c_vecs = np.concatenate(emitted_vecs, axis=0)
                 dt_w = time.perf_counter() - t1
                 rows.append(
                     {
@@ -2235,6 +2274,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cwin.add_argument("--mode", choices=("auto", "gpu", "hetero", "hetero2"), default="gpu")
     p_cwin.add_argument("--context-budgets", default="512,1024,2048,4096")
     p_cwin.add_argument("--filler-repeats", type=int, default=8)
+    p_cwin.add_argument("--repeat-header-tokens", type=int, default=128)
+    p_cwin.add_argument("--window-overlap-chunks", type=int, default=0)
 
     p_bit = sub.add_parser("bit-identity", help="Dump or compare exact float32 projected arrays across commits")
     _add_shared_flags(p_bit)
