@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from fast_shared.grammar import compute_loop_breaker_penalties
+from fast_shared.prefix_tree import (
+    dequantize_gdn_state_block32,
+    quantize_gdn_state_block32,
+)
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from functools import partial
@@ -398,19 +403,10 @@ def merge_lora_weights_safe(
 
 
 def quantize_gdn_state_int8(state: mx.array) -> tuple[mx.array, mx.array]:
-    """Block-32 symmetric `INT8` compression (`4x` memory reduction) for GDN recurrent `[B, Hv, Dv, Dk]` state."""
-    b, hv, dv, dk = state.shape
-    if dk % 32 != 0:
-        raise ValueError(f"GDN Dk must be divisible by 32 for block-32 INT8 codec, got {dk}")
-    n_blocks = dk // 32
-    blocks = state.astype(mx.float32).reshape(b, hv, dv, n_blocks, 32)
-    amax = mx.max(mx.abs(blocks), axis=-1)
-    scales_bf16 = (amax * (1.0 / 127.0)).astype(mx.bfloat16)
-    scales_f32 = scales_bf16.astype(mx.float32)[..., None]
-    safe_denom = mx.where(scales_f32 > 0.0, scales_f32, mx.array(1.0, dtype=mx.float32))
-    codes = mx.clip(mx.round(blocks / safe_denom), -127.0, 127.0).astype(mx.int8)
-    codes = mx.where(scales_f32 > 0.0, codes, mx.zeros_like(codes))
-    return codes.reshape(b, hv, dv, dk), scales_bf16
+    """Block-32 symmetric `INT8` compression (`3.76x` memory reduction) via `fast_shared.prefix_tree`."""
+    if int(state.shape[-1]) % 32 != 0:
+        raise ValueError(f"GDN Dk must be divisible by 32 for block-32 INT8 codec, got {state.shape[-1]}")
+    return quantize_gdn_state_block32(state)
 
 
 def dequantize_gdn_state_int8(
@@ -420,10 +416,7 @@ def dequantize_gdn_state_int8(
     dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
     """Restore `[B, Hv, Dv, Dk]` GDN recurrent state from block-32 `(int8 codes, bfloat16 scales)`."""
-    b, hv, dv, dk = codes.shape
-    n_blocks = dk // 32
-    rec = codes.astype(mx.float32).reshape(b, hv, dv, n_blocks, 32) * scales.astype(mx.float32)[..., None]
-    return rec.reshape(b, hv, dv, dk).astype(dtype)
+    return dequantize_gdn_state_block32(codes, scales, out_dtype=dtype)
 
 
 def build_additive_causal_mask(
@@ -481,19 +474,16 @@ def safe_training_sdpa(
 def find_repeated_4gram_penalties(
     token_history: Sequence[int],
     *,
-    window: int = 128,
-    min_repeats: int = 2,
-    penalty: float = 4.5,
+    window: int = 96,
+    min_repeats: int = 4,
+    penalty: float = 8.0,
+    stop_token_ids: frozenset[int] = frozenset(),
 ) -> dict[int, float]:
-    """Identify next-token candidates that would repeat an already-repeated 4-gram within `window` tokens."""
-    hist = token_history[-window:] if len(token_history) > window else token_history
-    n = len(hist)
-    if n < 6:
-        return {}
-    tail3 = (int(hist[-3]), int(hist[-2]), int(hist[-1]))
-    counts: dict[int, int] = {}
-    for i in range(n - 3):
-        if (int(hist[i]), int(hist[i + 1]), int(hist[i + 2])) == tail3:
-            nxt = int(hist[i + 3])
-            counts[nxt] = counts.get(nxt, 0) + 1
-    return {tok: float(penalty) * cnt for tok, cnt in counts.items() if cnt >= min_repeats}
+    """Delegate to `fast_shared.grammar.compute_loop_breaker_penalties` (`A4_v2` `p=1..8` cycle + 4-gram breaker)."""
+    return compute_loop_breaker_penalties(
+        token_history,
+        window=window,
+        min_prior_hits=min_repeats,
+        base_penalty=penalty,
+        stop_token_ids=stop_token_ids,
+    )

@@ -1,18 +1,50 @@
 {
-  "suite": "fast-qwen3-cross-silicon-abba",
-  "date": "2026-11-22",
-  "protocol": "Lock-serialized (/tmp/m4_gpu_validation.lock) 2-round interleaved ABBA timing after warmup, mx.set_cache_limit(512 MiB), single-engine steady-state 4-bucket footprint",
-  "hosts": {
-    "m4_pro": {
-      "chip": "Apple M4 Pro",
-      "mem_gb": 48.0,
-      "macos": "26.6",
-      "mlx_version": "0.32.4",
-      "architecture": "applegpu_g16s",
+  "benchmark_date": "2026-11-22",
+  "package": "fast-qwen3",
+  "version": "0.2.0",
+  "protocol": "Lock-serialized 2-round interleaved ABBA + 50-item Tier-1 Category-4 Objective Outcomes (LiquidAI 25 + BFCL v3 25 + JSONSchemaBench 40) vs stock mlx-lm 0.32.2 across M4 Pro (48 GB) & Base M5 (24 GB)",
+  "whitespace_layout_probe_m4_pro_16docs": {
+    "fixed_colon_space_default_None": {
+      "grounded_field_f1": 0.925215,
+      "valid": "16/16",
+      "wall_sec": 40.98,
+      "repeat_4gram_rate": 0.0,
+      "repeat_loop_count": 0
+    },
+    "flexible_True": {
+      "grounded_field_f1": 0.930676,
+      "valid": "16/16",
+      "wall_sec": 49.46,
+      "repeat_4gram_rate": 0.006389,
+      "repeat_loop_count": 0
+    },
+    "compact_False": {
+      "grounded_field_f1": 0.830851,
+      "valid": "16/16",
+      "wall_sec": 41.88,
+      "repeat_4gram_rate": 0.0,
+      "repeat_loop_count": 0
+    },
+    "ragged_post_lcp_b1_vs_b4_parity": {
+      "lcp_tokens": 59,
+      "parsed_exact_matches": "4/4",
+      "f1_b1": 0.8989,
+      "f1_b4": 0.8989
+    }
+  },
+  "abba_speed_and_memory": {
+    "m4_pro_48gb": {
+      "host": {
+        "chip": "Apple M4 Pro",
+        "mem_gb": 48.0,
+        "macos": "26.6",
+        "mlx_version": "0.32.4",
+        "device_name": "Apple M4 Pro",
+        "architecture": "applegpu_g16s"
+      },
       "results": [
         {
           "preset": "4b",
-          "repo_id": "mlx-community/Qwen3.5-4B-OptiQ-4bit",
           "snapshot": "4d4b423e71999777417dd587f429c9ad06e15dc0",
           "load_sec": 0.021,
           "has_native_mtp_drafter": false,
@@ -21,93 +53,94 @@
             "top1_match": true
           },
           "abba_b1_4docs": {
-            "unfused_unconstrained_median_sec": 5.4805,
-            "fast_qwen3_strict_lcp_median_sec": 2.3936,
-            "wall_speedup_x": 2.29,
-            "fast_docs_per_sec": 1.671,
-            "fast_tok_s": 66.43
+            "unfused_unconstrained_median_sec": 4.9717,
+            "fast_qwen3_strict_lcp_median_sec": 1.9233,
+            "wall_speedup_x": 2.585,
+            "fast_docs_per_sec": 2.08,
+            "fast_tok_s": 82.67
           },
           "abba_wave_8docs": {
-            "seq_unconstrained_median_sec": 11.0674,
-            "seq_valid_8": 0,
-            "seq_tok_s": 45.27,
-            "fast_b8_strict_lcp_median_sec": 2.1502,
+            "seq_unconstrained_median_sec": 10.0351,
+            "seq_valid_8": 1,
+            "seq_tok_s": 49.43,
+            "fast_b8_strict_lcp_median_sec": 1.6541,
             "fast_valid_8": 8,
-            "fast_docs_per_sec": 3.721,
-            "fast_tok_s": 146.96,
-            "wall_speedup_x": 5.147
+            "fast_docs_per_sec": 4.836,
+            "fast_tok_s": 191.04,
+            "wall_speedup_x": 6.067
           },
           "speculative_b1_64tok": {
             "drafter": "PromptLookupDrafter",
             "exact_greedy_token_match": true,
-            "nospec_sec": 1.3706,
-            "nospec_tok_s": 46.7,
-            "spec_sec": 1.5878,
-            "spec_tok_s": 40.31,
-            "spec_speedup_x": 0.863,
-            "auto_default": "OFF_BELOW_9B_NATIVE_MTP"
+            "nospec_sec": 1.2277,
+            "nospec_tok_s": 52.13,
+            "spec_sec": 1.4369,
+            "spec_tok_s": 44.54,
+            "spec_speedup_x": 0.854
           },
           "memory": {
-            "mlx_active_gb": 3.376,
-            "mlx_peak_gb": 4.7485,
-            "phys_footprint_gb": 4.491
+            "mlx_active_gb": 3.3761,
+            "mlx_peak_gb": 4.7645,
+            "phys_footprint_gb": 4.4859,
+            "peak_footprint_gb": 9.0467
           }
         },
         {
           "preset": "0.8b-bf16",
-          "repo_id": "Qwen/Qwen3.5-0.8B",
           "snapshot": "2fc06364715b967f1860aea9cf38778875588b17",
-          "load_sec": 0.013,
+          "load_sec": 0.011,
           "has_native_mtp_drafter": true,
           "fusion_parity": {
             "max_abs_logit_diff": 0.640625,
             "top1_match": true
           },
           "abba_b1_4docs": {
-            "unfused_unconstrained_median_sec": 2.659,
-            "fast_qwen3_strict_lcp_median_sec": 1.0497,
-            "wall_speedup_x": 2.533,
-            "fast_docs_per_sec": 3.811,
-            "fast_tok_s": 155.28
+            "unfused_unconstrained_median_sec": 2.2855,
+            "fast_qwen3_strict_lcp_median_sec": 0.8307,
+            "wall_speedup_x": 2.751,
+            "fast_docs_per_sec": 4.815,
+            "fast_tok_s": 196.21
           },
           "abba_wave_8docs": {
-            "seq_unconstrained_median_sec": 5.1777,
+            "seq_unconstrained_median_sec": 4.5598,
             "seq_valid_8": 8,
-            "seq_tok_s": 91.55,
-            "fast_b8_strict_lcp_median_sec": 0.6586,
+            "seq_tok_s": 103.95,
+            "fast_b8_strict_lcp_median_sec": 0.4929,
             "fast_valid_8": 8,
-            "fast_docs_per_sec": 12.146,
-            "fast_tok_s": 491.93,
-            "wall_speedup_x": 7.861
+            "fast_docs_per_sec": 16.229,
+            "fast_tok_s": 657.29,
+            "wall_speedup_x": 9.25
           },
           "speculative_b1_64tok": {
             "drafter": "Qwen3MtpDrafter",
             "exact_greedy_token_match": true,
-            "nospec_sec": 0.7176,
-            "nospec_tok_s": 89.18,
-            "spec_sec": 0.9223,
-            "spec_tok_s": 69.39,
-            "spec_speedup_x": 0.778,
-            "auto_default": "OFF_BELOW_9B_NATIVE_MTP"
+            "nospec_sec": 0.5645,
+            "nospec_tok_s": 113.37,
+            "spec_sec": 0.8677,
+            "spec_tok_s": 73.76,
+            "spec_speedup_x": 0.651
           },
           "memory": {
-            "mlx_active_gb": 1.6673,
-            "mlx_peak_gb": 2.393,
-            "phys_footprint_gb": 2.9151
+            "mlx_active_gb": 1.6671,
+            "mlx_peak_gb": 2.4624,
+            "phys_footprint_gb": 2.8605,
+            "peak_footprint_gb": 9.0467
           }
         }
       ]
     },
-    "base_m5": {
-      "chip": "Apple M5",
-      "mem_gb": 24.0,
-      "macos": "27.2.1",
-      "mlx_version": "0.32.4",
-      "architecture": "applegpu_g17g",
+    "base_m5_24gb": {
+      "host": {
+        "chip": "Apple M5",
+        "mem_gb": 24.0,
+        "macos": "27.2.1",
+        "mlx_version": "0.32.4",
+        "device_name": "Apple M5",
+        "architecture": "applegpu_g17g"
+      },
       "results": [
         {
           "preset": "4b",
-          "repo_id": "mlx-community/Qwen3.5-4B-OptiQ-4bit",
           "snapshot": "4d4b423e71999777417dd587f429c9ad06e15dc0",
           "load_sec": 0.014,
           "has_native_mtp_drafter": false,
@@ -116,82 +149,447 @@
             "top1_match": true
           },
           "abba_b1_4docs": {
-            "unfused_unconstrained_median_sec": 7.6964,
-            "fast_qwen3_strict_lcp_median_sec": 3.0821,
-            "wall_speedup_x": 2.497,
-            "fast_docs_per_sec": 1.298,
-            "fast_tok_s": 51.59
+            "unfused_unconstrained_median_sec": 7.6633,
+            "fast_qwen3_strict_lcp_median_sec": 2.7678,
+            "wall_speedup_x": 2.769,
+            "fast_docs_per_sec": 1.445,
+            "fast_tok_s": 57.45
           },
           "abba_wave_8docs": {
-            "seq_unconstrained_median_sec": 15.1604,
+            "seq_unconstrained_median_sec": 15.3523,
             "seq_valid_8": 0,
-            "seq_tok_s": 33.05,
-            "fast_b8_strict_lcp_median_sec": 2.257,
+            "seq_tok_s": 32.63,
+            "fast_b8_strict_lcp_median_sec": 1.843,
             "fast_valid_8": 8,
-            "fast_docs_per_sec": 3.544,
-            "fast_tok_s": 140.01,
-            "wall_speedup_x": 6.717
+            "fast_docs_per_sec": 4.341,
+            "fast_tok_s": 171.46,
+            "wall_speedup_x": 8.33
           },
           "speculative_b1_64tok": {
             "drafter": "PromptLookupDrafter",
             "exact_greedy_token_match": true,
-            "nospec_sec": 1.8877,
-            "nospec_tok_s": 33.9,
-            "spec_sec": 1.6891,
-            "spec_tok_s": 37.89,
-            "spec_speedup_x": 1.118,
-            "auto_default": "OFF_BELOW_9B_NATIVE_MTP"
+            "nospec_sec": 1.8906,
+            "nospec_tok_s": 33.85,
+            "spec_sec": 1.6927,
+            "spec_tok_s": 37.81,
+            "spec_speedup_x": 1.117
           },
           "memory": {
-            "mlx_active_gb": 3.3761,
-            "mlx_peak_gb": 4.524,
-            "phys_footprint_gb": 4.4445
+            "mlx_active_gb": 3.3762,
+            "mlx_peak_gb": 4.5609,
+            "phys_footprint_gb": 4.464,
+            "peak_footprint_gb": 8.8043
           }
         },
         {
           "preset": "0.8b-bf16",
-          "repo_id": "Qwen/Qwen3.5-0.8B",
           "snapshot": "2fc06364715b967f1860aea9cf38778875588b17",
-          "load_sec": 0.014,
+          "load_sec": 0.01,
           "has_native_mtp_drafter": true,
           "fusion_parity": {
             "max_abs_logit_diff": 0.796875,
             "top1_match": true
           },
           "abba_b1_4docs": {
-            "unfused_unconstrained_median_sec": 3.3058,
-            "fast_qwen3_strict_lcp_median_sec": 1.2517,
-            "wall_speedup_x": 2.641,
-            "fast_docs_per_sec": 3.196,
-            "fast_tok_s": 130.22
+            "unfused_unconstrained_median_sec": 3.3059,
+            "fast_qwen3_strict_lcp_median_sec": 1.1804,
+            "wall_speedup_x": 2.801,
+            "fast_docs_per_sec": 3.389,
+            "fast_tok_s": 138.09
           },
           "abba_wave_8docs": {
-            "seq_unconstrained_median_sec": 6.5611,
+            "seq_unconstrained_median_sec": 6.5893,
             "seq_valid_8": 8,
-            "seq_tok_s": 72.24,
-            "fast_b8_strict_lcp_median_sec": 0.7054,
+            "seq_tok_s": 71.94,
+            "fast_b8_strict_lcp_median_sec": 0.5651,
             "fast_valid_8": 8,
-            "fast_docs_per_sec": 11.341,
-            "fast_tok_s": 460.73,
-            "wall_speedup_x": 9.301
+            "fast_docs_per_sec": 14.157,
+            "fast_tok_s": 573.37,
+            "wall_speedup_x": 11.661
           },
           "speculative_b1_64tok": {
             "drafter": "Qwen3MtpDrafter",
             "exact_greedy_token_match": true,
-            "nospec_sec": 0.8679,
-            "nospec_tok_s": 73.74,
-            "spec_sec": 0.9805,
-            "spec_tok_s": 65.27,
-            "spec_speedup_x": 0.885,
-            "auto_default": "OFF_BELOW_9B_NATIVE_MTP"
+            "nospec_sec": 0.8675,
+            "nospec_tok_s": 73.78,
+            "spec_sec": 0.9802,
+            "spec_tok_s": 65.29,
+            "spec_speedup_x": 0.885
           },
           "memory": {
             "mlx_active_gb": 1.6671,
-            "mlx_peak_gb": 2.2351,
-            "phys_footprint_gb": 2.9784
+            "mlx_peak_gb": 2.3065,
+            "phys_footprint_gb": 2.9918,
+            "peak_footprint_gb": 8.8043
           }
         }
       ]
+    }
+  },
+  "cat4_outcomes_vs_stock_mlx_lm": {
+    "base_m5_24gb": {
+      "fast_qwen3": {
+        "package": "fast-qwen3",
+        "config_label": "qwen3_auto_llg_on",
+        "n_items": 50,
+        "n_valid": 50,
+        "objective_score_e2e": 0.90242,
+        "effective_outcome_per_sec": 0.5127,
+        "wall_sec": 88.0078,
+        "memory_4bucket_gb": {
+          "mlx_peak_gb": 18.084,
+          "phys_footprint_gb": 5.2555,
+          "peak_footprint_gb": 19.1953,
+          "model_mapped_gb": 0.0,
+          "neural_nofootprint_gb": 0.0,
+          "combined_with_model_mapped_gb": 5.2555
+        },
+        "sub_benchmarks": {
+          "jsonschemabench_compiler": {
+            "n_schemas": 40,
+            "compiled_ok": 38,
+            "compile_success_rate": 0.95,
+            "gct_p50_ms": 0.196,
+            "gct_p99_ms": 2.023,
+            "mean_upfront_ff_tokens": 1.474,
+            "keyword_coverage": {
+              "has_ref": {
+                "present": 16,
+                "compiled": 15,
+                "rate": 0.9375
+              },
+              "has_anyof": {
+                "present": 7,
+                "compiled": 5,
+                "rate": 0.7143
+              },
+              "has_allof": {
+                "present": 1,
+                "compiled": 0,
+                "rate": 0.0
+              },
+              "has_additional_false": {
+                "present": 13,
+                "compiled": 12,
+                "rate": 0.9231
+              },
+              "has_pattern": {
+                "present": 10,
+                "compiled": 9,
+                "rate": 0.9
+              }
+            },
+            "sample_errors": [
+              {
+                "id": "o38403",
+                "error": "ValueError: min/maxProperties only supported when all keys listed in \"properties\" are required"
+              },
+              {
+                "id": "o77304",
+                "error": "ValueError: Unimplemented keys: [\"not\"]"
+              }
+            ]
+          },
+          "liquidai_extraction": {
+            "n_items": 25,
+            "n_valid": 25,
+            "valid_json_rate": 1.0,
+            "valid_schema_rate": 1.0,
+            "grounded_field_f1": 0.924841,
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          },
+          "bfcl_v3": {
+            "n_items": 25,
+            "n_valid": 25,
+            "overall_ast_acc": 0.88,
+            "abstention_acc": 0.8,
+            "split_accuracy": {
+              "irrelevance": 0.8,
+              "live_multiple": 1.0,
+              "multiple": 0.8,
+              "parallel_multiple": 0.8,
+              "simple": 1.0
+            },
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          }
+        },
+        "gate_verdict": "PASS"
+      },
+      "public_qwen35_mlx_lm": {
+        "package": "public-qwen3.5",
+        "config_label": "mlx_lm_qwen35_optiq_llg_off",
+        "n_items": 50,
+        "n_valid": 37,
+        "objective_score_e2e": 0.661908,
+        "effective_outcome_per_sec": 0.3358,
+        "wall_sec": 98.5637,
+        "memory_4bucket_gb": {
+          "mlx_peak_gb": 10.6107,
+          "phys_footprint_gb": 3.7887,
+          "peak_footprint_gb": 15.6464,
+          "model_mapped_gb": 0.0,
+          "neural_nofootprint_gb": 0.0,
+          "combined_with_model_mapped_gb": 3.7887
+        },
+        "sub_benchmarks": {
+          "jsonschemabench_compiler": {
+            "n_schemas": 40,
+            "compiled_ok": 38,
+            "compile_success_rate": 0.95,
+            "gct_p50_ms": 0.373,
+            "gct_p99_ms": 3.486,
+            "mean_upfront_ff_tokens": null,
+            "keyword_coverage": {
+              "has_ref": {
+                "present": 16,
+                "compiled": 15,
+                "rate": 0.9375
+              },
+              "has_anyof": {
+                "present": 7,
+                "compiled": 5,
+                "rate": 0.7143
+              },
+              "has_allof": {
+                "present": 1,
+                "compiled": 0,
+                "rate": 0.0
+              },
+              "has_additional_false": {
+                "present": 13,
+                "compiled": 12,
+                "rate": 0.9231
+              },
+              "has_pattern": {
+                "present": 10,
+                "compiled": 9,
+                "rate": 0.9
+              }
+            },
+            "sample_errors": [
+              {
+                "id": "o38403",
+                "error": "ValueError: min/maxProperties only supported when all keys listed in \"properties\" are required"
+              },
+              {
+                "id": "o77304",
+                "error": "ValueError: Unimplemented keys: [\"not\"]"
+              }
+            ]
+          },
+          "liquidai_extraction": {
+            "n_items": 25,
+            "n_valid": 12,
+            "valid_json_rate": 1.0,
+            "valid_schema_rate": 0.48,
+            "grounded_field_f1": 0.443815,
+            "repeat_4gram_rate": 0.018638,
+            "repeat_loop_count": 0
+          },
+          "bfcl_v3": {
+            "n_items": 25,
+            "n_valid": 25,
+            "overall_ast_acc": 0.88,
+            "abstention_acc": 0.8,
+            "split_accuracy": {
+              "irrelevance": 0.8,
+              "live_multiple": 1.0,
+              "multiple": 0.8,
+              "parallel_multiple": 0.8,
+              "simple": 1.0
+            },
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          }
+        },
+        "gate_verdict": "PASS"
+      },
+      "eot_speedup_x": 1.527,
+      "score_delta_pp": 24.05
+    },
+    "m4_pro_48gb": {
+      "fast_qwen3": {
+        "package": "fast-qwen3",
+        "config_label": "qwen3_auto_llg_on",
+        "n_items": 50,
+        "n_valid": 50,
+        "objective_score_e2e": 0.90242,
+        "effective_outcome_per_sec": 0.3955,
+        "wall_sec": 114.0903,
+        "memory_4bucket_gb": {
+          "mlx_peak_gb": 18.7855,
+          "phys_footprint_gb": 5.1786,
+          "peak_footprint_gb": 20.0772,
+          "model_mapped_gb": 0.0,
+          "neural_nofootprint_gb": 0.0,
+          "combined_with_model_mapped_gb": 5.1786
+        },
+        "sub_benchmarks": {
+          "jsonschemabench_compiler": {
+            "n_schemas": 40,
+            "compiled_ok": 38,
+            "compile_success_rate": 0.95,
+            "gct_p50_ms": 0.262,
+            "gct_p99_ms": 2.688,
+            "mean_upfront_ff_tokens": 1.474,
+            "keyword_coverage": {
+              "has_ref": {
+                "present": 16,
+                "compiled": 15,
+                "rate": 0.9375
+              },
+              "has_anyof": {
+                "present": 7,
+                "compiled": 5,
+                "rate": 0.7143
+              },
+              "has_allof": {
+                "present": 1,
+                "compiled": 0,
+                "rate": 0.0
+              },
+              "has_additional_false": {
+                "present": 13,
+                "compiled": 12,
+                "rate": 0.9231
+              },
+              "has_pattern": {
+                "present": 10,
+                "compiled": 9,
+                "rate": 0.9
+              }
+            },
+            "sample_errors": [
+              {
+                "id": "o38403",
+                "error": "ValueError: min/maxProperties only supported when all keys listed in \"properties\" are required"
+              },
+              {
+                "id": "o77304",
+                "error": "ValueError: Unimplemented keys: [\"not\"]"
+              }
+            ]
+          },
+          "liquidai_extraction": {
+            "n_items": 25,
+            "n_valid": 25,
+            "valid_json_rate": 1.0,
+            "valid_schema_rate": 1.0,
+            "grounded_field_f1": 0.924841,
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          },
+          "bfcl_v3": {
+            "n_items": 25,
+            "n_valid": 25,
+            "overall_ast_acc": 0.88,
+            "abstention_acc": 0.8,
+            "split_accuracy": {
+              "irrelevance": 0.8,
+              "live_multiple": 1.0,
+              "multiple": 0.8,
+              "parallel_multiple": 0.8,
+              "simple": 1.0
+            },
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          }
+        },
+        "gate_verdict": "PASS"
+      },
+      "public_qwen35_mlx_lm": {
+        "package": "public-qwen3.5",
+        "config_label": "mlx_lm_qwen35_optiq_llg_off",
+        "n_items": 50,
+        "n_valid": 35,
+        "objective_score_e2e": 0.622514,
+        "effective_outcome_per_sec": 0.2865,
+        "wall_sec": 108.6565,
+        "memory_4bucket_gb": {
+          "mlx_peak_gb": 10.6124,
+          "phys_footprint_gb": 8.0217,
+          "peak_footprint_gb": 30.827,
+          "model_mapped_gb": 0.0,
+          "neural_nofootprint_gb": 0.0,
+          "combined_with_model_mapped_gb": 8.0217
+        },
+        "sub_benchmarks": {
+          "jsonschemabench_compiler": {
+            "n_schemas": 40,
+            "compiled_ok": 38,
+            "compile_success_rate": 0.95,
+            "gct_p50_ms": 0.362,
+            "gct_p99_ms": 3.972,
+            "mean_upfront_ff_tokens": null,
+            "keyword_coverage": {
+              "has_ref": {
+                "present": 16,
+                "compiled": 15,
+                "rate": 0.9375
+              },
+              "has_anyof": {
+                "present": 7,
+                "compiled": 5,
+                "rate": 0.7143
+              },
+              "has_allof": {
+                "present": 1,
+                "compiled": 0,
+                "rate": 0.0
+              },
+              "has_additional_false": {
+                "present": 13,
+                "compiled": 12,
+                "rate": 0.9231
+              },
+              "has_pattern": {
+                "present": 10,
+                "compiled": 9,
+                "rate": 0.9
+              }
+            },
+            "sample_errors": [
+              {
+                "id": "o38403",
+                "error": "ValueError: min/maxProperties only supported when all keys listed in \"properties\" are required"
+              },
+              {
+                "id": "o77304",
+                "error": "ValueError: Unimplemented keys: [\"not\"]"
+              }
+            ]
+          },
+          "liquidai_extraction": {
+            "n_items": 25,
+            "n_valid": 10,
+            "valid_json_rate": 1.0,
+            "valid_schema_rate": 0.4,
+            "grounded_field_f1": 0.365027,
+            "repeat_4gram_rate": 0.018783,
+            "repeat_loop_count": 0
+          },
+          "bfcl_v3": {
+            "n_items": 25,
+            "n_valid": 25,
+            "overall_ast_acc": 0.88,
+            "abstention_acc": 0.8,
+            "split_accuracy": {
+              "irrelevance": 0.8,
+              "live_multiple": 1.0,
+              "multiple": 0.8,
+              "parallel_multiple": 0.8,
+              "simple": 1.0
+            },
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0
+          }
+        },
+        "gate_verdict": "PASS"
+      },
+      "eot_speedup_x": 1.38,
+      "score_delta_pp": 27.99
     }
   }
 }

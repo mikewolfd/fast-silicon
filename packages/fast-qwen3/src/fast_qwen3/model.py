@@ -225,32 +225,63 @@ class DeltaSlotCache:
 
 
 class GrowingKVCache:
-    """Chunk-allocated `O(1)` decode KV cache with instant `rewind_to` for speculative verification."""
+    """Chunk-allocated `O(1)` decode KV cache with optional per-position `INT8` compression and `rewind_to`."""
 
-    def __init__(self, step: int = 256) -> None:
+    def __init__(self, step: int = 256, *, kv_i8: bool = False) -> None:
         self.step = int(step)
+        self.kv_i8 = bool(kv_i8)
         self.keys: mx.array | None = None
         self.values: mx.array | None = None
+        self.k_scales: mx.array | None = None
+        self.v_scales: mx.array | None = None
         self.offset: int = 0
 
     def update_and_fetch(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
         b, h_kv, s, d = k.shape
         prev = self.offset
         needed = prev + s
+        if not self.kv_i8:
+            if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
+                alloc = ((needed + self.step - 1) // self.step) * self.step
+                new_k = mx.zeros((b, h_kv, alloc, d), dtype=k.dtype)
+                new_v = mx.zeros((b, h_kv, alloc, d), dtype=v.dtype)
+                if self.keys is not None and prev > 0 and int(self.keys.shape[0]) == b:
+                    new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
+                    new_v[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
+                self.keys = new_k
+                self.values = new_v
+            assert self.keys is not None and self.values is not None
+            self.keys[:, :, prev:needed, :] = k
+            self.values[:, :, prev:needed, :] = v
+            self.offset = needed
+            return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
+
+        # Symmetric per-(batch, head, pos) INT8 KV storage (halves KV bandwidth & RAM on large waves / long ctx)
         if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
             alloc = ((needed + self.step - 1) // self.step) * self.step
-            new_k = mx.zeros((b, h_kv, alloc, d), dtype=k.dtype)
-            new_v = mx.zeros((b, h_kv, alloc, d), dtype=v.dtype)
+            new_kq = mx.zeros((b, h_kv, alloc, d), dtype=mx.int8)
+            new_vq = mx.zeros((b, h_kv, alloc, d), dtype=mx.int8)
+            new_ks = mx.zeros((b, h_kv, alloc, 1), dtype=mx.bfloat16)
+            new_vs = mx.zeros((b, h_kv, alloc, 1), dtype=mx.bfloat16)
             if self.keys is not None and prev > 0 and int(self.keys.shape[0]) == b:
-                new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
-                new_v[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
-            self.keys = new_k
-            self.values = new_v
-        assert self.keys is not None and self.values is not None
-        self.keys[:, :, prev:needed, :] = k
-        self.values[:, :, prev:needed, :] = v
+                new_kq[:, :, :prev, :] = self.keys[:, :, :prev, :]
+                new_vq[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
+                new_ks[:, :, :prev, :] = self.k_scales[:, :, :prev, :]  # type: ignore[index]
+                new_vs[:, :, :prev, :] = self.v_scales[:, :, :prev, :]  # type: ignore[index]
+            self.keys, self.values = new_kq, new_vq
+            self.k_scales, self.v_scales = new_ks, new_vs
+        assert self.keys is not None and self.values is not None and self.k_scales is not None and self.v_scales is not None
+        kf, vf = k.astype(mx.float32), v.astype(mx.float32)
+        ks_s = mx.maximum(mx.max(mx.abs(kf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
+        vs_s = mx.maximum(mx.max(mx.abs(vf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
+        self.keys[:, :, prev:needed, :] = mx.clip(mx.round(kf / ks_s), -127.0, 127.0).astype(mx.int8)
+        self.values[:, :, prev:needed, :] = mx.clip(mx.round(vf / vs_s), -127.0, 127.0).astype(mx.int8)
+        self.k_scales[:, :, prev:needed, :] = ks_s.astype(mx.bfloat16)
+        self.v_scales[:, :, prev:needed, :] = vs_s.astype(mx.bfloat16)
         self.offset = needed
-        return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
+        k_out = (self.keys[:, :, :needed, :].astype(k.dtype) * self.k_scales[:, :, :needed, :].astype(k.dtype))
+        v_out = (self.values[:, :, :needed, :].astype(v.dtype) * self.v_scales[:, :, :needed, :].astype(v.dtype))
+        return k_out, v_out
 
     def rewind_to(self, new_offset: int) -> None:
         if new_offset < 0 or new_offset > self.offset:
@@ -289,10 +320,16 @@ def snapshot_hybrid_cache(
                 saved.append(("gdn_raw", conv, rec))
         elif isinstance(entry, GrowingKVCache):
             off = entry.offset
-            ks = mx.contiguous(entry.keys[:, :, :off, :]) if (entry.keys is not None and off > 0) else None
-            vs = mx.contiguous(entry.values[:, :, :off, :]) if (entry.values is not None and off > 0) else None
-            if ks is not None and vs is not None:
+            if entry.keys is not None and off > 0:
+                if entry.kv_i8 and entry.k_scales is not None and entry.v_scales is not None:
+                    ks = mx.contiguous(entry.keys[:, :, :off, :].astype(mx.bfloat16) * entry.k_scales[:, :, :off, :])
+                    vs = mx.contiguous(entry.values[:, :, :off, :].astype(mx.bfloat16) * entry.v_scales[:, :, :off, :])
+                else:
+                    ks = mx.contiguous(entry.keys[:, :, :off, :])
+                    vs = mx.contiguous(entry.values[:, :, :off, :])  # type: ignore[index]
                 mx.eval(ks, vs)
+            else:
+                ks, vs = None, None
             saved.append(("kv", off, ks, vs))
         else:
             raise TypeError(f"Unexpected cache entry {type(entry)}")
@@ -304,6 +341,7 @@ def restore_hybrid_cache(
     *,
     batch_size: int = 1,
     kv_step: int = 256,
+    kv_i8: bool = False,
 ) -> list[DeltaSlotCache | GrowingKVCache]:
     """Materialize an isolated `B=batch_size` hybrid cache from a `HybridPrefixSnapshot`."""
     b = max(1, int(batch_size))
@@ -327,7 +365,7 @@ def restore_hybrid_cache(
             restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b))
         elif kind == "kv":
             _, off, ks, vs = item
-            kv = GrowingKVCache(step=kv_step)
+            kv = GrowingKVCache(step=kv_step, kv_i8=kv_i8)
             if ks is not None and vs is not None and off > 0:
                 kb = mx.repeat(ks, b, axis=0) if b > 1 else ks
                 vb = mx.repeat(vs, b, axis=0) if b > 1 else vs
@@ -735,6 +773,7 @@ class GatedDeltaLayer(nn.Module):
         cache: DeltaSlotCache | None = None,
         *,
         valid_token_scale: mx.array | None = None,
+        valid_lengths: mx.array | None = None,
     ) -> mx.array:
         b_sz, s_len, _ = x.shape
         ins = self.in_group(x)
@@ -753,7 +792,13 @@ class GatedDeltaLayer(nn.Module):
             conv_in = mx.concatenate([cache.conv_state, qkv], axis=1)
 
         if cache is not None:
-            cache.conv_state = mx.contiguous(conv_in[:, -(self.conv_k - 1) :, :])
+            if valid_lengths is not None:
+                # Gather exact last (conv_k - 1) valid tokens per slot (works for len=0, 1..s_len without branching!)
+                tap_offsets = mx.arange(self.conv_k - 1, dtype=mx.int32)[None, :, None]
+                gather_idx = valid_lengths.astype(mx.int32)[:, None, None] + tap_offsets
+                cache.conv_state = mx.contiguous(mx.take_along_axis(conv_in, gather_idx, axis=1))
+            else:
+                cache.conv_state = mx.contiguous(conv_in[:, -(self.conv_k - 1) :, :])
 
         conv_out = nn.silu(self.conv1d(conv_in))
         if valid_token_scale is not None:
@@ -1022,6 +1067,7 @@ class Qwen3DecoderBlock(nn.Module):
         cache: DeltaSlotCache | GrowingKVCache | None = None,
         *,
         valid_token_scale: mx.array | None = None,
+        valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
     ) -> mx.array:
@@ -1030,6 +1076,7 @@ class Qwen3DecoderBlock(nn.Module):
                 self.input_layernorm(x),
                 cache,  # type: ignore[arg-type]
                 valid_token_scale=valid_token_scale,
+                valid_lengths=valid_lengths,
             )
         else:
             h = x + self.self_attn(
@@ -1148,9 +1195,9 @@ class FastQwen3Model(nn.Module):
             return int(self.lm_head.weight.shape[0])
         return int(self.cfg.vocab_size)
 
-    def make_cache(self, *, kv_step: int = 256) -> list[DeltaSlotCache | GrowingKVCache]:
+    def make_cache(self, *, kv_step: int = 256, kv_i8: bool = False) -> list[DeltaSlotCache | GrowingKVCache]:
         return [
-            DeltaSlotCache() if layer.is_linear else GrowingKVCache(step=kv_step)
+            DeltaSlotCache() if layer.is_linear else GrowingKVCache(step=kv_step, kv_i8=kv_i8)
             for layer in self.layers
         ]
 
@@ -1164,6 +1211,7 @@ class FastQwen3Model(nn.Module):
         cache: Sequence[DeltaSlotCache | GrowingKVCache] | None = None,
         *,
         valid_token_scale: mx.array | None = None,
+        valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
     ) -> mx.array:
@@ -1174,6 +1222,7 @@ class FastQwen3Model(nn.Module):
                     h,
                     None,
                     valid_token_scale=valid_token_scale,
+                    valid_lengths=valid_lengths,
                     attn_mask=attn_mask,
                     rope_trig=rope_trig,
                 )
@@ -1183,6 +1232,7 @@ class FastQwen3Model(nn.Module):
                     h,
                     c,
                     valid_token_scale=valid_token_scale,
+                    valid_lengths=valid_lengths,
                     attn_mask=attn_mask,
                     rope_trig=rope_trig,
                 )
@@ -1203,6 +1253,7 @@ class FastQwen3Model(nn.Module):
         cache: Sequence[DeltaSlotCache | GrowingKVCache] | None = None,
         *,
         valid_token_scale: mx.array | None = None,
+        valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
     ) -> mx.array:
@@ -1210,6 +1261,7 @@ class FastQwen3Model(nn.Module):
             input_ids,
             cache,
             valid_token_scale=valid_token_scale,
+            valid_lengths=valid_lengths,
             attn_mask=attn_mask,
             rope_trig=rope_trig,
         )

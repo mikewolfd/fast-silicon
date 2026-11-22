@@ -540,3 +540,122 @@ def test_engine_strict_json_left_pad_batch_and_http_server(tmp_path: Path) -> No
         assert parsed["kind"] in ("bill", "notice")
 
     assert split_lcp_ids([[1, 2, 3], [1, 2, 4]], min_lcp=2) == ([1, 2], [[3], [4]])
+
+
+def test_post_lcp_ragged_right_pad_conv_and_gdn_state_invariance() -> None:
+    """Verify right-padded post-LCP suffixes (`len=1, 2, 24`) preserve exact `conv_state` + `rec_state` vs `B=1`."""
+    cfg = _small_dense_cfg()
+    w = _make_synthetic_qwen3_weights(cfg)
+    model = FastQwen3Model(cfg, w)
+
+    lcp = [10 + (i % 40) for i in range(36)]
+    suf_list = [
+        [77],  # len=1: conv_state must combine LCP[-2:] + suf[0]
+        [88, 99],  # len=2: conv_state must combine LCP[-1:] + suf[:2]
+        [20 + (i * 3) % 50 for i in range(24)],  # len=24: >= conv_k
+    ]
+
+    # Build LCP snapshot once (with raw GDN state to isolate padding math from INT8 snapshotting)
+    c_lcp = model.make_cache(kv_step=128)
+    _ = model.forward_hidden(mx.array([lcp], dtype=mx.int32), c_lcp)
+    snap = snapshot_hybrid_cache(lcp, c_lcp, compress_gdn_int8=False)
+
+    # Reference: 3 independent B=1 runs from restored LCP snapshot
+    ref_caches = []
+    ref_last_h = []
+    for suf in suf_list:
+        c1 = restore_hybrid_cache(snap, batch_size=1, kv_step=128)
+        h1 = model.forward_hidden(mx.array([suf], dtype=mx.int32), c1)
+        mx.eval(h1)
+        ref_caches.append(c1)
+        ref_last_h.append(np.asarray(h1[0, -1, :].astype(mx.float32)))
+
+    # Batched right-padded run (`B=3`) with `valid_token_scale` + `valid_lengths`
+    max_s = max(len(s) for s in suf_list)
+    padded = [s + [0] * (max_s - len(s)) for s in suf_list]
+    v2d = np.zeros((3, max_s, 1), dtype=np.float32)
+    for idx, s in enumerate(suf_list):
+        v2d[idx, : len(s), 0] = 1.0
+    cb = restore_hybrid_cache(snap, batch_size=3, kv_step=128)
+    hb = model.forward_hidden(
+        mx.array(padded, dtype=mx.int32),
+        cb,
+        valid_token_scale=mx.array(v2d, dtype=mx.bfloat16),
+        valid_lengths=mx.array([len(s) for s in suf_list], dtype=mx.int32),
+        attn_mask="causal",
+    )
+    mx.eval(hb)
+
+    for idx, s in enumerate(suf_list):
+        got_h = np.asarray(hb[idx, len(s) - 1, :].astype(mx.float32))
+        cos_h = float(np.dot(got_h, ref_last_h[idx]) / (np.linalg.norm(got_h) * np.linalg.norm(ref_last_h[idx]) + 1e-9))
+        assert cos_h > 0.9999 and np.max(np.abs(got_h - ref_last_h[idx])) < 3e-2
+        for l_i, (e_bat, e_ref) in enumerate(zip(cb, ref_caches[idx])):
+            if hasattr(e_bat, "conv_state"):
+                c_got = np.asarray(e_bat.conv_state[idx].astype(mx.float32))
+                c_exp = np.asarray(e_ref.conv_state[0].astype(mx.float32))
+                assert np.max(np.abs(c_got - c_exp)) < 2.5e-2, f"conv_state mismatch slot={idx} layer={l_i}"
+                r_got = np.asarray(e_bat.rec_state[idx].astype(mx.float32))
+                r_exp = np.asarray(e_ref.rec_state[0].astype(mx.float32))
+                assert np.max(np.abs(r_got - r_exp)) < 2.5e-2, f"rec_state mismatch slot={idx} layer={l_i}"
+
+
+def test_prefix_tree_chunk_reuse_kv_i8_and_a4_v2_loop_breaker(tmp_path: Path) -> None:
+    """Verify `256`-token `PrefixTree` reuse across distinct schemas, `kv_i8`, and `A4_v2` cycle breaker."""
+    from fast_shared.grammar import compute_loop_breaker_penalties
+
+    # 1. `A4_v2` consecutive p=1..8 cycle detector + 4-gram repeat detector
+    cyc = [42, 43] * 6  # p=2 cycle repeated 6x (>= min_prior_hits=5)
+    pens = compute_loop_breaker_penalties(cyc, window=96, min_prior_hits=5, base_penalty=8.0)
+    assert 42 in pens and pens[42] >= 8.0
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size)
+    w = _make_synthetic_qwen3_weights(cfg)
+    model = FastQwen3Model(cfg, w)
+    eng = FastQwen3Engine(
+        model=model,
+        tokenizer=tok,
+        warmup=False,
+        prefix_cache_mb=32,
+        kv_i8=True,
+    )
+    assert eng.prefix_tree is not None
+
+    schema_a = {
+        "type": "object",
+        "properties": {"tag": {"type": "string", "enum": ["alpha", "beta"]}},
+        "required": ["tag"],
+        "additionalProperties": False,
+    }
+    schema_b = {
+        "type": "object",
+        "properties": {"count": {"type": "integer", "enum": [1, 2]}},
+        "required": ["count"],
+        "additionalProperties": False,
+    }
+
+    # >300 byte tokens so `PrefixTree` (`chunk_tokens=256`) publishes 1 chunk on call 1 and reuses it on call 2!
+    shared_doc = "Section 101: Statutory Extraction Payload. " * 9
+    r1 = eng.generate(shared_doc + "Question A?", json_schema=schema_a, max_tokens=32)
+    assert r1.valid_schema is True
+    assert eng.prefix_tree.node_count >= 1
+    assert eng.prefix_tree.snapshot_count >= 1
+
+    r2 = eng.generate(shared_doc + "Question B?", json_schema=schema_b, max_tokens=32)
+    assert r2.valid_schema is True
+    assert eng.prefix_tree.hits >= 1
+    assert eng.prefix_tree.reused_tokens >= 256
+
+    # Heterogeneous per-doc schemas + multi-token FF resynchronization under `kv_i8=True`
+    het = eng.generate_batch(
+        [shared_doc + "Q1", shared_doc + "Longer Q2 suffix here", "Short Q3", "Another Q4 with extra words"],
+        json_schemas=[schema_a, schema_b, schema_a, schema_b],
+        max_tokens=32,
+        batch_size=4,
+    )
+    assert len(het.items) == 4
+    assert all(it.valid_schema for it in het.items)
+    assert het.items[0].parsed["tag"] in ("alpha", "beta")
+    assert het.items[1].parsed["count"] in (1, 2)
+    eng.close()

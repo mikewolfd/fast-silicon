@@ -2467,18 +2467,19 @@ def test_coreai_pipeline_coreml_w4_block_guard_and_fp16_cast_cpu(monkeypatch: An
     with pytest.raises(ValueError, match="allow_experimental_coreml_w4_block"):
         cap.build_coreai_opt_config(preset="w4_per_block", export_backend="coreml")
 
+    assert cap._resolve_coreai_compute_dtype("coreai", "w8") == "fp16"
+    assert cap._resolve_coreai_compute_dtype("coreai", "fp16") == "fp16"
+    assert cap._resolve_coreai_compute_dtype("coreai", "fp4_fp8") == "fp32"
+    assert cap._resolve_coreai_compute_dtype("coreml", "w8") == "fp32"
+    assert cap._resolve_coreai_compute_dtype("coreai", "w8", "fp32") == "fp32"
+
+    pytest.importorskip("coreai_opt")
     _, meta_opt = cap.build_coreai_opt_config(
         preset="w4_per_block",
         export_backend="coreml",
         allow_experimental_coreml_w4_block=True,
     )
     assert meta_opt["preset"] == "w4_per_block"
-
-    assert cap._resolve_coreai_compute_dtype("coreai", "w8") == "fp16"
-    assert cap._resolve_coreai_compute_dtype("coreai", "fp16") == "fp16"
-    assert cap._resolve_coreai_compute_dtype("coreai", "fp4_fp8") == "fp32"
-    assert cap._resolve_coreai_compute_dtype("coreml", "w8") == "fp32"
-    assert cap._resolve_coreai_compute_dtype("coreai", "w8", "fp32") == "fp32"
 
     # Default preset sweep on coreml excludes w4_per_block unless explicitly opted in.
     seen_presets: list[str] = []

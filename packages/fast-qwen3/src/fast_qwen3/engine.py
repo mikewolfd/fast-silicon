@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import gc
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -17,12 +18,21 @@ import numpy as np
 
 from fast_shared.grammar import (
     GrammarHelper,
+    apply_loop_breaker_penalties_1d,
+    compute_loop_breaker_penalties,
     normalize_json_schema,
     sample_unconstrained,
     validate_json_against_schema,
 )
+from fast_shared.prefix_tree import (
+    DEFAULT_CHUNK_TOKENS,
+    PrefixTree,
+    dequantize_gdn_state_block32,
+    quantize_gdn_state_block32,
+    recommended_prefix_budget_bytes,
+)
+from fast_shared.runtime_lessons import LiveMemoryGovernor
 
-from .kernels import build_additive_causal_mask, find_repeated_4gram_penalties
 from .model import (
     DeltaSlotCache,
     FastQwen3Model,
@@ -125,6 +135,8 @@ class FastQwen3Engine:
         default_enable_thinking: bool = False,
         default_thinking_budget: int = 0,
         max_prefix_cache_entries: int = 8,
+        prefix_cache_mb: int | str | None = "auto",
+        kv_i8: bool | str = "auto",
         mlx_cache_limit_mb: int = 512,
         local_files_only: bool = True,
         allow_oversubscribe: bool = False,
@@ -135,9 +147,28 @@ class FastQwen3Engine:
         self.default_enable_thinking = bool(default_enable_thinking)
         self.default_thinking_budget = int(default_thinking_budget)
         self.max_prefix_cache_entries = max(0, int(max_prefix_cache_entries))
+        self.kv_i8_mode = kv_i8
+        self._mlx_cache_limit_mb = int(mlx_cache_limit_mb)
         self._lock = threading.RLock()
         self._grammar_cache: OrderedDict[tuple[str, bool | None], GrammarHelper] = OrderedDict()
         self._prefix_cache: OrderedDict[tuple[int, ...], HybridPrefixSnapshot] = OrderedDict()
+        self._memory_governor = LiveMemoryGovernor(min_b_slots=1)
+
+        try:
+            host_ram_bytes = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            host_ram_bytes = 24 * (1 << 30)
+        if prefix_cache_mb is None or prefix_cache_mb == 0:
+            tree_budget = 0
+        elif str(prefix_cache_mb).strip().lower() == "auto":
+            tree_budget = recommended_prefix_budget_bytes(host_ram_bytes)
+        else:
+            tree_budget = max(0, int(prefix_cache_mb)) << 20
+        self.prefix_tree: PrefixTree | None = (
+            PrefixTree(chunk_tokens=DEFAULT_CHUNK_TOKENS, byte_budget=tree_budget)
+            if tree_budget > 0
+            else None
+        )
 
         if mlx_cache_limit_mb > 0 and hasattr(mx, "set_cache_limit"):
             try:
@@ -203,9 +234,16 @@ class FastQwen3Engine:
 
     def close(self) -> None:
         self._prefix_cache.clear()
+        if self.prefix_tree is not None:
+            self.prefix_tree.clear()
         self._grammar_cache.clear()
         gc.collect()
         mx.clear_cache()
+
+    def _resolve_kv_i8(self, batch_size: int, kv_alloc: int) -> bool:
+        if isinstance(self.kv_i8_mode, bool):
+            return self.kv_i8_mode
+        return int(batch_size) >= 16 or int(kv_alloc) >= 2048
 
     def get_grammar(
         self,
@@ -276,17 +314,20 @@ class FastQwen3Engine:
         collect_telemetry: bool,
     ) -> tuple[int, dict[str, float] | None]:
         work = logits_1d[: len(self._new_to_old)] if (self.model.vocab_remap is None and len(logits_1d) > len(self._new_to_old)) else logits_1d
-        if repeat_penalty and matcher is None:
-            pen = find_repeated_4gram_penalties(recent_tokens)
-            if pen:
-                work = work.copy()
-                old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
-                for tid, pval in pen.items():
-                    idx = int(old_to_new[tid]) if old_to_new is not None else int(tid)
-                    if 0 <= idx < len(work):
-                        work[idx] -= float(pval)
-
         argmax_idx = int(np.argmax(work))
+        if repeat_penalty:
+            min_hits = 5 if matcher is not None else 4
+            pen = compute_loop_breaker_penalties(
+                recent_tokens,
+                window=96,
+                min_prior_hits=min_hits,
+                base_penalty=8.0,
+                stop_token_ids=self.tokenizer.stop_token_ids,
+            )
+            if pen:
+                old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
+                work, argmax_idx = apply_loop_breaker_penalties_1d(work, pen, old_to_new)
+
         if matcher is not None and gram is not None:
             def _lazy_full() -> np.ndarray:
                 assert full_hidden_1d is not None
@@ -365,6 +406,108 @@ class FastQwen3Engine:
             telemetry=telemetry,
         )
 
+    def _prefill_single_with_caches(
+        self,
+        prompt_ids: list[int],
+        *,
+        prefix_snap: HybridPrefixSnapshot | None,
+        suffix_ids: list[int],
+        max_tokens: int,
+        extra_tail_ids: Sequence[int] = (),
+    ) -> tuple[list[DeltaSlotCache | GrowingKVCache], mx.array, list[int]]:
+        """Prefill `B=1` using `prefix_snap` (`>=32` LCP), `PrefixTree` (`256`-tok chunks), or cold chunked publish."""
+        ext = [int(t) for t in extra_tail_ids]
+        kv_alloc = max(256, len(prompt_ids) + len(ext) + max_tokens + 64)
+        use_kvi8 = self._resolve_kv_i8(1, kv_alloc)
+
+        if prefix_snap is not None:
+            cache = restore_hybrid_cache(prefix_snap, batch_size=1, kv_step=kv_alloc, kv_i8=use_kvi8)
+            run_ids = list(suffix_ids) + ext
+            inp = mx.array([run_ids], dtype=mx.int32)
+            hidden = self.model.forward_hidden(inp, cache)
+            return cache, hidden, run_ids
+
+        ptree = self.prefix_tree
+        ct = ptree.chunk_tokens if ptree is not None else 0
+        if ptree is not None and ct > 0 and len(prompt_ids) > ct:
+            match = ptree.match(prompt_ids, limit=len(prompt_ids) - 1, needs_snapshot=True)
+            if not match.is_empty and match.snapshot is not None:
+                ptree.record(match, restored=True)
+                cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+                gdn_idx = 0
+                kv_idx = 0
+                for entry in cache:
+                    if isinstance(entry, DeltaSlotCache):
+                        conv, codes, scales = match.snapshot[gdn_idx]
+                        entry.conv_state = conv
+                        entry.rec_state = dequantize_gdn_state_block32(codes, scales) if codes is not None else None
+                        gdn_idx += 1
+                    elif isinstance(entry, GrowingKVCache):
+                        k_cat = mx.concatenate([ch[kv_idx][0] for ch in match.chunks], axis=2)
+                        v_cat = mx.concatenate([ch[kv_idx][1] for ch in match.chunks], axis=2)
+                        entry.update_and_fetch(k_cat, v_cat)
+                        kv_idx += 1
+                start_pos = match.reused_tokens
+                parent_key: str | None = match.keys[-1]
+                depth = len(match.keys)
+            else:
+                ptree.record(match, restored=False)
+                cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+                start_pos = 0
+                parent_key = None
+                depth = 0
+
+            # Publish any newly crossed 256-token chunks of `prompt_ids` (schema-independent!) when circuit breaker allows
+            n_full_chunks = (len(prompt_ids) - 1) // ct
+            if ptree.should_write_snapshots() and n_full_chunks > depth:
+                last_inserted: str | None = None
+                for d in range(depth + 1, n_full_chunks + 1):
+                    c_start = (d - 1) * ct
+                    c_end = d * ct
+                    c_toks = prompt_ids[c_start:c_end]
+                    _ = self.model.forward_hidden(mx.array([c_toks], dtype=mx.int32), cache)
+                    kv_payload: list[tuple[mx.array, mx.array]] = []
+                    for entry in cache:
+                        if isinstance(entry, GrowingKVCache) and entry.keys is not None and entry.values is not None:
+                            if entry.kv_i8 and entry.k_scales is not None and entry.v_scales is not None:
+                                kc = mx.contiguous(entry.keys[:, :, c_start:c_end, :].astype(mx.bfloat16) * entry.k_scales[:, :, c_start:c_end, :])
+                                vc = mx.contiguous(entry.values[:, :, c_start:c_end, :].astype(mx.bfloat16) * entry.v_scales[:, :, c_start:c_end, :])
+                            else:
+                                kc = mx.contiguous(entry.keys[:, :, c_start:c_end, :])
+                                vc = mx.contiguous(entry.values[:, :, c_start:c_end, :])
+                            mx.eval(kc, vc)
+                            kv_payload.append((kc, vc))
+                    parent_key = ptree.insert(parent=parent_key, tokens=c_toks, depth=d, chunk=tuple(kv_payload))
+                    if parent_key is None:
+                        start_pos = c_end
+                        break
+                    last_inserted = parent_key
+                    start_pos = c_end
+
+                if last_inserted is not None:
+                    gdn_snap: list[tuple[Any, Any, Any]] = []
+                    for entry in cache:
+                        if isinstance(entry, DeltaSlotCache):
+                            cv = mx.contiguous(entry.conv_state) if entry.conv_state is not None else None
+                            if entry.rec_state is not None:
+                                q_c, s_c = quantize_gdn_state_block32(entry.rec_state)
+                                mx.eval(q_c, s_c)
+                                gdn_snap.append((cv, q_c, s_c))
+                            else:
+                                gdn_snap.append((cv, None, None))
+                    ptree.attach_snapshot(last_inserted, tuple(gdn_snap))
+
+            tail_ids = prompt_ids[start_pos:] + ext
+            inp = mx.array([tail_ids], dtype=mx.int32)
+            hidden = self.model.forward_hidden(inp, cache)
+            return cache, hidden, tail_ids
+
+        cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+        run_all = list(prompt_ids) + ext
+        inp = mx.array([run_all], dtype=mx.int32)
+        hidden = self.model.forward_hidden(inp, cache)
+        return cache, hidden, run_all
+
     def _decode_single(
         self,
         prompt_ids: list[int],
@@ -379,15 +522,47 @@ class FastQwen3Engine:
         speculative: bool | None,
         collect_telemetry: bool,
     ) -> GenerationItem:
-        if prefix_snap is not None:
-            cache = restore_hybrid_cache(prefix_snap, batch_size=1, kv_step=max(256, len(prompt_ids) + max_tokens + 64))
-            prefill_in = suffix_ids
-        else:
-            cache = self.model.make_cache(kv_step=max(256, len(prompt_ids) + max_tokens + 64))
-            prefill_in = prompt_ids
+        matcher = gram.new_matcher() if gram is not None else None
+        telemetry: list[dict[str, float]] | None = [] if collect_telemetry else None
+        folded_ff: list[int] = []
+        if thinking_budget <= 0 and matcher is not None and gram is not None and gram.upfront_ff:
+            hit_stop_up = False
+            for t in gram.upfront_ff:
+                ti = int(t)
+                if ti in self.tokenizer.stop_token_ids:
+                    hit_stop_up = True
+                    break
+                folded_ff.append(ti)
+            if len(folded_ff) >= max_tokens:
+                cap_ff = folded_ff[:max_tokens]
+                is_done_ok = len(folded_ff) == max_tokens and (
+                    hit_stop_up or (matcher.is_stopped() and matcher.is_accepting())
+                )
+                return self._finalize_item(
+                    prompt_tokens=len(prompt_ids),
+                    answer_ids=cap_ff,
+                    reasoning_text=None,
+                    hit_max_tokens=not is_done_ok,
+                    schema_obj=schema_obj,
+                    telemetry=telemetry,
+                )
+            if hit_stop_up or matcher.is_stopped():
+                return self._finalize_item(
+                    prompt_tokens=len(prompt_ids),
+                    answer_ids=folded_ff,
+                    reasoning_text=None,
+                    hit_max_tokens=False,
+                    schema_obj=schema_obj,
+                    telemetry=telemetry,
+                )
 
-        inp = mx.array([prefill_in], dtype=mx.int32)
-        hidden = self.model.forward_hidden(inp, cache)
+        cache, hidden, prefill_in = self._prefill_single_with_caches(
+            prompt_ids,
+            prefix_snap=prefix_snap,
+            suffix_ids=suffix_ids,
+            max_tokens=max_tokens,
+            extra_tail_ids=folded_ff,
+        )
         last_h = hidden[:, -1:, :]
         logits = self.model.project_logits(last_h)
         mx.eval(last_h, logits)
@@ -441,19 +616,27 @@ class FastQwen3Engine:
             logits = self.model.project_logits(last_h)
             mx.eval(last_h, logits)
 
-        matcher = gram.new_matcher() if gram is not None else None
-        answer_ids: list[int] = []
-        telemetry: list[dict[str, float]] | None = [] if collect_telemetry else None
+        answer_ids: list[int] = list(folded_ff)
         hit_max_tokens = False
 
-        # Advance model over upfront deterministic grammar prefix tokens (`{"`, etc.) in 1 step!
-        if matcher is not None and gram is not None and gram.upfront_ff:
-            ff0 = list(gram.upfront_ff)[:max_tokens]
-            answer_ids.extend(ff0)
+        # When two-phase thinking ran first, advance over upfront deterministic grammar prefix after `</think>\n\n`
+        if thinking_budget > 0 and matcher is not None and gram is not None and gram.upfront_ff:
+            ff0: list[int] = []
+            hit_stop_t = False
+            for t in gram.upfront_ff:
+                ti = int(t)
+                if ti in self.tokenizer.stop_token_ids:
+                    hit_stop_t = True
+                    break
+                ff0.append(ti)
+            ff0_cap = ff0[:max_tokens]
+            answer_ids.extend(ff0_cap)
             if len(answer_ids) >= max_tokens:
-                hit_max_tokens = True
-            elif not matcher.is_stopped():
-                ff_arr = mx.array([ff0], dtype=mx.int32)
+                hit_max_tokens = not (
+                    len(ff0) == max_tokens and (hit_stop_t or (matcher.is_stopped() and matcher.is_accepting()))
+                )
+            elif not hit_stop_t and not matcher.is_stopped() and ff0_cap:
+                ff_arr = mx.array([ff0_cap], dtype=mx.int32)
                 sh = self.model.forward_hidden(ff_arr, cache)
                 last_h = sh[:, -1:, :]
                 logits = self.model.project_logits(last_h)
@@ -675,58 +858,9 @@ class FastQwen3Engine:
         temperature: float,
         collect_telemetry: bool,
     ) -> list[GenerationItem]:
-        """Left-padded batched prefill + synchronous `B`-wide decode wave (`B >= 2`, zero pad leakage)."""
+        """Right-padded batched prefill + multi-token FF + active-row `lm_head` decode wave (`B >= 2`, zero pad leakage)."""
         b_sz = len(wave_prompt_ids)
-        max_suf = max(len(s) for s in wave_suffix_ids)
         pad_id = self.tokenizer.eos_token_id
-        pad_lens = [max_suf - len(s) for s in wave_suffix_ids]
-        padded_suf = [[pad_id] * pl + s for pl, s in zip(pad_lens, wave_suffix_ids)]
-
-        lcp_len = len(prefix_snap.prefix_tokens) if prefix_snap is not None else 0
-        kv_alloc = max(256, lcp_len + max_suf + max_tokens + 64)
-        if prefix_snap is not None:
-            cache = restore_hybrid_cache(prefix_snap, batch_size=b_sz, kv_step=kv_alloc)
-        else:
-            cache = self.model.make_cache(kv_step=kv_alloc)
-
-        # Build left-pad masks & RoPE positions so padded slots match B=1 bit-for-bit!
-        if any(pl > 0 for pl in pad_lens):
-            valid_2d = np.zeros((b_sz, max_suf, 1), dtype=np.float32)
-            pos_np = np.zeros((b_sz, max_suf), dtype=np.int32)
-            for i, pl in enumerate(pad_lens):
-                valid_2d[i, pl:, 0] = 1.0
-                pos_np[i, pl:] = np.arange(lcp_len, lcp_len + (max_suf - pl), dtype=np.int32)
-            valid_scale: mx.array | None = mx.array(valid_2d, dtype=mx.bfloat16)
-            rope_trig: tuple[mx.array, mx.array] | None = self.model.precompute_rope_trig(mx.array(pos_np, dtype=mx.int32))
-            # Offset full-attention mask by lcp_len when prefix cache is active
-            total_kv = lcp_len + max_suf
-            if lcp_len == 0:
-                attn_mask = build_additive_causal_mask(pad_lens, max_suf, total_kv)
-            else:
-                # Prefix [0..lcp_len-1] is valid for all B items; pad_lens live at [lcp_len .. lcp_len + pl - 1]
-                q_pos = mx.arange(max_suf, dtype=mx.int32)[None, None, :, None] + lcp_len
-                k_pos = mx.arange(total_kv, dtype=mx.int32)[None, None, None, :]
-                pl_arr = mx.array(pad_lens, dtype=mx.int32)[:, None, None, None]
-                in_pad = (k_pos >= lcp_len) & (k_pos < (lcp_len + pl_arr))
-                allow = ((~in_pad) & (k_pos <= q_pos) & (q_pos >= (lcp_len + pl_arr))) | (in_pad & (k_pos == q_pos))
-                attn_mask = mx.where(allow, mx.array(0.0, dtype=mx.bfloat16), mx.array(-1e9, dtype=mx.bfloat16))
-        else:
-            valid_scale = None
-            rope_trig = None
-            attn_mask = "causal"
-
-        inp = mx.array(padded_suf, dtype=mx.int32)
-        h = self.model.forward_hidden(
-            inp,
-            cache,
-            valid_token_scale=valid_scale,
-            attn_mask=attn_mask,
-            rope_trig=rope_trig,
-        )
-        last_h = h[:, -1:, :]
-        logits = self.model.project_logits(last_h)
-        mx.eval(last_h, logits)
-
         matchers = [g.new_matcher() if g is not None else None for g in grammars]
         ans_ids: list[list[int]] = [[] for _ in range(b_sz)]
         tels: list[list[dict[str, float]] | None] = [
@@ -734,90 +868,127 @@ class FastQwen3Engine:
         ]
         done = [False] * b_sz
         hit_max = [False] * b_sz
-        true_pos = np.array([len(p) for p in wave_prompt_ids], dtype=np.int32)
 
-        # Consume upfront_ff tokens per slot if present
-        cur_logits = np.asarray(logits[:, 0, :].astype(mx.float32))
-        cur_h = last_h[:, 0, :]
-
-        # If all active grammars share identical non-empty upfront_ff, advance them together
-        first_ffs = [list(g.upfront_ff) if g is not None else [] for g in grammars]
-        if first_ffs[0] and all(ff == first_ffs[0] for ff in first_ffs):
-            shared_ff = first_ffs[0][:max_tokens]
-            for i in range(b_sz):
-                ans_ids[i].extend(shared_ff)
-            if len(shared_ff) >= max_tokens:
-                for i in range(b_sz):
-                    done[i] = True
-                    hit_max[i] = True
+        # Fold each slot's deterministic `upfront_ff` directly into its prefill suffix (saves 1 forward + 1 lm_head!)
+        aug_sufs: list[list[int]] = []
+        for i in range(b_sz):
+            g = grammars[i]
+            m = matchers[i]
+            up_clean: list[int] = []
+            hit_stop_up = False
+            if g is not None and g.upfront_ff:
+                for t in g.upfront_ff:
+                    ti = int(t)
+                    if ti in self.tokenizer.stop_token_ids:
+                        hit_stop_up = True
+                        break
+                    up_clean.append(ti)
+            if len(up_clean) >= max_tokens:
+                ans_ids[i] = up_clean[:max_tokens]
+                done[i] = True
+                is_done_ok = len(up_clean) == max_tokens and (
+                    hit_stop_up or (m is not None and m.is_stopped() and m.is_accepting())
+                )
+                hit_max[i] = not is_done_ok
+                aug_sufs.append(list(wave_suffix_ids[i]))
+            elif hit_stop_up or (m is not None and m.is_stopped()):
+                ans_ids[i] = up_clean
+                done[i] = True
+                aug_sufs.append(list(wave_suffix_ids[i]))
             else:
-                ff_len = len(shared_ff)
-                ff_inp = mx.array([shared_ff] * b_sz, dtype=mx.int32)
-                if any(pl > 0 for pl in pad_lens):
-                    p_mat = true_pos[:, None] + np.arange(ff_len, dtype=np.int32)[None, :]
-                    r_trig = self.model.precompute_rope_trig(mx.array(p_mat, dtype=mx.int32))
-                    total_kv = lcp_len + max_suf + ff_len
-                    q_pos = mx.arange(ff_len, dtype=mx.int32)[None, None, :, None] + (lcp_len + max_suf)
-                    k_pos = mx.arange(total_kv, dtype=mx.int32)[None, None, None, :]
-                    pl_arr = mx.array(pad_lens, dtype=mx.int32)[:, None, None, None]
-                    in_pad = (k_pos >= lcp_len) & (k_pos < (lcp_len + pl_arr))
-                    allow = (~in_pad) & (k_pos <= q_pos)
-                    d_mask: str | mx.array = mx.where(
-                        allow, mx.array(0.0, dtype=mx.bfloat16), mx.array(-1e9, dtype=mx.bfloat16)
-                    )
-                else:
-                    r_trig = None
-                    d_mask = "causal"
-                sh = self.model.forward_hidden(ff_inp, cache, attn_mask=d_mask, rope_trig=r_trig)
-                last_h = sh[:, -1:, :]
-                sl = self.model.project_logits(last_h)
-                mx.eval(last_h, sl)
-                cur_h = last_h[:, 0, :]
-                cur_logits = np.asarray(sl[:, 0, :].astype(mx.float32))
-                true_pos += ff_len
-        else:
-            # Rewind per-item matchers to 0 so step-by-step consumes upfront_ff tokens cleanly when heterogeneous
-            for idx_m, g in enumerate(grammars):
-                if g is not None and g.upfront_ff:
-                    matchers[idx_m] = g._llguidance.LLMatcher(g.ltok, g.gram)
+                ans_ids[i] = list(up_clean)
+                aug_sufs.append(list(wave_suffix_ids[i]) + up_clean)
 
-        for _step in range(max_tokens):
-            next_toks = [pad_id] * b_sz
-            any_alive = False
+        if all(done):
+            return [
+                self._finalize_item(
+                    prompt_tokens=len(wave_prompt_ids[i]),
+                    answer_ids=ans_ids[i],
+                    reasoning_text=None,
+                    hit_max_tokens=hit_max[i],
+                    schema_obj=schema_objs[i],
+                    telemetry=tels[i],
+                )
+                for i in range(b_sz)
+            ]
+
+        suf_lens = [len(s) for s in aug_sufs]
+        max_suf = max(suf_lens)
+        any_ragged = any(sl < max_suf for sl in suf_lens)
+        padded_suf = [s + [pad_id] * (max_suf - len(s)) for s in aug_sufs]
+
+        lcp_len = len(prefix_snap.prefix_tokens) if prefix_snap is not None else 0
+        kv_alloc = max(256, lcp_len + max_suf + max_tokens + 64)
+        use_kvi8 = self._resolve_kv_i8(b_sz, kv_alloc)
+        if prefix_snap is not None:
+            cache = restore_hybrid_cache(prefix_snap, batch_size=b_sz, kv_step=kv_alloc, kv_i8=use_kvi8)
+        else:
+            cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+
+        # Right-padded suffixes stay contiguous with `LCP[-3:]` (`0` conv1d boundary corruption, `"causal"` SDPA!)
+        if any_ragged:
+            valid_2d = np.zeros((b_sz, max_suf, 1), dtype=np.float32)
+            for i, sl in enumerate(suf_lens):
+                valid_2d[i, :sl, 0] = 1.0
+            valid_scale: mx.array | None = mx.array(valid_2d, dtype=mx.bfloat16)
+            valid_lens_mx: mx.array | None = mx.array(suf_lens, dtype=mx.int32)
+        else:
+            valid_scale = None
+            valid_lens_mx = None
+
+        inp = mx.array(padded_suf, dtype=mx.int32)
+        h = self.model.forward_hidden(
+            inp,
+            cache,
+            valid_token_scale=valid_scale,
+            valid_lengths=valid_lens_mx,
+            attn_mask="causal",
+            rope_trig=None,
+        )
+        if any_ragged:
+            last_idx = mx.array([sl - 1 for sl in suf_lens], dtype=mx.int32)
+            cur_h = mx.take_along_axis(h, last_idx[:, None, None], axis=1)[:, 0, :]
+        else:
+            cur_h = h[:, -1, :]
+
+        def _project_needed_rows(h_2d: mx.array, need_rows: list[int]) -> dict[int, np.ndarray]:
+            if not need_rows:
+                mx.eval(h_2d)
+                return {}
+            if len(need_rows) == b_sz:
+                sl_all = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
+                mx.eval(h_2d, sl_all)
+                arr_all = np.asarray(sl_all.astype(mx.float32))
+                return {r: arr_all[r] for r in range(b_sz)}
+            idx_mx = mx.array(need_rows, dtype=mx.int32)
+            sub_h = mx.take(h_2d, idx_mx, axis=0)[:, None, :]
+            sl_sub = self.model.project_logits(sub_h)[:, 0, :]
+            mx.eval(h_2d, sl_sub)
+            arr_sub = np.asarray(sl_sub.astype(mx.float32))
+            return {r: arr_sub[pos] for pos, r in enumerate(need_rows)}
+
+        cur_logits_map = _project_needed_rows(cur_h, [i for i in range(b_sz) if not done[i]])
+        true_pos = np.array([lcp_len + sl for sl in suf_lens], dtype=np.int32)
+        kv_cursor = lcp_len + max_suf
+        suf_end_arr = mx.array([lcp_len + sl for sl in suf_lens], dtype=mx.int32)[:, None, None, None] if any_ragged else None
+        pending_q: list[list[int]] = [[] for _ in range(b_sz)]
+
+        for _step in range(max_tokens + 1):
             for i in range(b_sz):
-                if done[i]:
-                    continue
-                if len(ans_ids[i]) >= max_tokens:
-                    done[i] = True
-                    hit_max[i] = True
+                if done[i] or pending_q[i]:
                     continue
                 m = matchers[i]
                 g = grammars[i]
+                if len(ans_ids[i]) >= max_tokens:
+                    done[i] = True
+                    hit_max[i] = not (m is not None and m.is_stopped() and m.is_accepting())
+                    continue
                 if m is not None and m.is_stopped():
                     done[i] = True
                     continue
-                # Check forced FF token first
-                if m is not None:
-                    ff_i = list(m.compute_ff_tokens())
-                    if ff_i:
-                        forced = int(ff_i[0])
-                        if forced in self.tokenizer.stop_token_ids:
-                            done[i] = True
-                            continue
-                        m.consume_token(forced)
-                        ans_ids[i].append(forced)
-                        next_toks[i] = forced
-                        if m.is_stopped():
-                            done[i] = True
-                        elif len(ans_ids[i]) >= max_tokens:
-                            done[i] = True
-                            hit_max[i] = True
-                        else:
-                            any_alive = True
-                        continue
 
                 tid, tel = self._select_next_token(
-                    cur_logits[i],
+                    cur_logits_map[i],
                     full_hidden_1d=cur_h[i],
                     matcher=m,
                     gram=g,
@@ -832,50 +1003,97 @@ class FastQwen3Engine:
                     done[i] = True
                     continue
                 ans_ids[i].append(tid)
-                next_toks[i] = tid
+
                 if m is not None:
                     m.consume_token(tid)
                     if m.is_stopped():
                         done[i] = True
                         continue
-                if len(ans_ids[i]) >= max_tokens:
-                    done[i] = True
-                    hit_max[i] = True
+                    if len(ans_ids[i]) >= max_tokens:
+                        done[i] = True
+                        hit_max[i] = True
+                        continue
+                    ff_clean: list[int] = []
+                    stopped_by_ff = False
+                    for ft in m.compute_ff_tokens():
+                        fti = int(ft)
+                        if fti in self.tokenizer.stop_token_ids:
+                            stopped_by_ff = True
+                            break
+                        if len(ans_ids[i]) + len(ff_clean) >= max_tokens:
+                            break
+                        ff_clean.append(fti)
+                    if ff_clean:
+                        m.consume_tokens(ff_clean)
+                        ans_ids[i].extend(ff_clean)
+                    if stopped_by_ff or m.is_stopped():
+                        done[i] = True
+                        continue
+                    if len(ans_ids[i]) >= max_tokens:
+                        done[i] = True
+                        hit_max[i] = True
+                        continue
+                    pending_q[i] = [tid] + ff_clean
                 else:
-                    any_alive = True
+                    if len(ans_ids[i]) >= max_tokens:
+                        done[i] = True
+                        hit_max[i] = True
+                        continue
+                    pending_q[i] = [tid]
 
-            if not any_alive:
+            alive = [i for i in range(b_sz) if not done[i]]
+            if not alive:
                 break
 
-            step_inp = mx.array([[t] for t in next_toks], dtype=mx.int32)
-            if any(pl > 0 for pl in pad_lens):
-                r_trig_1 = self.model.precompute_rope_trig(mx.array(true_pos[:, None], dtype=mx.int32))
-                cur_kv_len = (cache[self.model.cfg.full_attention_interval - 1].offset  # type: ignore[union-attr]
-                              if self.model.cfg.full_attention_interval <= len(cache)
-                              else int(true_pos[0])) + 1
-                k_pos = mx.arange(cur_kv_len, dtype=mx.int32)[None, None, None, :]
-                pl_arr = mx.array(pad_lens, dtype=mx.int32)[:, None, None, None]
-                in_pad = (k_pos >= lcp_len) & (k_pos < (lcp_len + pl_arr))
-                d_mask_1: str | mx.array = mx.where(
-                    ~in_pad, mx.array(0.0, dtype=mx.bfloat16), mx.array(-1e9, dtype=mx.bfloat16)
+            # Advance `step_w >= 1` common queued tokens across all alive slots in a single forward pass!
+            step_w = min(len(pending_q[i]) for i in alive)
+            step_rows: list[list[int]] = []
+            for i in range(b_sz):
+                if done[i]:
+                    step_rows.append([pad_id] * step_w)
+                else:
+                    step_rows.append(pending_q[i][:step_w])
+                    del pending_q[i][:step_w]
+
+            step_inp = mx.array(step_rows, dtype=mx.int32)
+            kv_prev = kv_cursor
+            kv_now = kv_prev + step_w
+            kv_cursor = kv_now
+
+            if any_ragged:
+                assert suf_end_arr is not None
+                p_mat = true_pos[:, None] + np.arange(step_w, dtype=np.int32)[None, :]
+                r_trig_s: tuple[mx.array, mx.array] | None = self.model.precompute_rope_trig(mx.array(p_mat, dtype=mx.int32))
+                k_pos = mx.arange(kv_now, dtype=mx.int32)[None, None, None, :]
+                in_pad = (k_pos >= suf_end_arr) & (k_pos < (lcp_len + max_suf))
+                if step_w == 1:
+                    allow = ~in_pad
+                else:
+                    q_kv = mx.arange(step_w, dtype=mx.int32)[None, None, :, None] + kv_prev
+                    allow = (~in_pad) & (k_pos <= q_kv)
+                d_mask_s: str | mx.array = mx.where(
+                    allow, mx.array(0.0, dtype=mx.bfloat16), mx.array(-1e9, dtype=mx.bfloat16)
                 )
             else:
-                r_trig_1 = None
-                d_mask_1 = "causal"
+                r_trig_s = None
+                d_mask_s = "causal"
 
-            v_scale_1 = mx.array([[[0.0 if done[i] else 1.0]] for i in range(b_sz)], dtype=mx.bfloat16)
+            v_scale_s = (
+                mx.array([[[0.0] if done[i] else [1.0]] * step_w for i in range(b_sz)], dtype=mx.bfloat16)
+                if len(alive) < b_sz
+                else None
+            )
             sh = self.model.forward_hidden(
                 step_inp,
                 cache,
-                valid_token_scale=v_scale_1,
-                attn_mask=d_mask_1,
-                rope_trig=r_trig_1,
+                valid_token_scale=v_scale_s,
+                attn_mask=d_mask_s,
+                rope_trig=r_trig_s,
             )
-            sl = self.model.project_logits(sh)
-            mx.eval(sh, sl)
-            cur_h = sh[:, 0, :]
-            cur_logits = np.asarray(sl[:, 0, :].astype(mx.float32))
-            true_pos += 1
+            cur_h = sh[:, -1, :]
+            need_rows = [i for i in alive if not pending_q[i]]
+            cur_logits_map = _project_needed_rows(cur_h, need_rows)
+            true_pos += step_w
 
         return [
             self._finalize_item(
@@ -973,19 +1191,37 @@ class FastQwen3Engine:
             for p in prompts
         ]
 
-        with self._lock:
-            lcp_ids, suffixes = split_lcp_ids(encoded, min_lcp=32)
-            prefix_snap = self._lookup_or_build_prefix(lcp_ids) if lcp_ids else None
+        sys_prefix_ids: list[int] = (
+            self.tokenizer.encode(f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n", add_special_tokens=False)
+            if system_prompt and all(isinstance(p, str) for p in prompts)
+            else []
+        )
 
-            eff_wave_bs = int(batch_size) if batch_size is not None else min(n_docs, 64)
+        with self._lock:
+            base_wave_bs = int(batch_size) if batch_size is not None else min(n_docs, 64)
+            eff_wave_bs = self._memory_governor.adapt(
+                max(1, base_wave_bs),
+                base_cache_limit_mb=self._mlx_cache_limit_mb,
+                apply_mlx=True,
+            ).b_slots
             results: list[GenerationItem | None] = [None] * n_docs
+            max_lcp_seen = 0
 
             if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
+                b1_snap: HybridPrefixSnapshot | None = None
+                if (
+                    self.max_prefix_cache_entries > 0
+                    and len(sys_prefix_ids) >= 32
+                    and all(len(enc) > len(sys_prefix_ids) and enc[: len(sys_prefix_ids)] == sys_prefix_ids for enc in encoded)
+                ):
+                    b1_snap = self._lookup_or_build_prefix(sys_prefix_ids)
+                    max_lcp_seen = len(sys_prefix_ids)
                 for idx in range(n_docs):
+                    suf_i = encoded[idx][len(sys_prefix_ids) :] if b1_snap is not None else encoded[idx]
                     results[idx] = self._decode_single(
                         encoded[idx],
-                        prefix_snap=prefix_snap,
-                        suffix_ids=suffixes[idx],
+                        prefix_snap=b1_snap,
+                        suffix_ids=suf_i,
                         gram=grammars[idx],
                         schema_obj=schema_objs[idx],
                         max_tokens=int(max_tokens),
@@ -995,16 +1231,35 @@ class FastQwen3Engine:
                         collect_telemetry=collect_telemetry,
                     )
             else:
-                # Sort by suffix length to minimize left-padding waste across waves
-                order = sorted(range(n_docs), key=lambda i: len(suffixes[i]))
-                for start in range(0, n_docs, eff_wave_bs):
-                    chunk_idx = order[start : start + eff_wave_bs]
+                # Group identical GrammarHelper instances first so batched upfront_ff & multi-token FF jumps align!
+                order = sorted(
+                    range(n_docs),
+                    key=lambda i: (0 if grammars[i] is None else id(grammars[i]), len(encoded[i])),
+                )
+                cursor = 0
+                for _wave in range(n_docs):
+                    if cursor >= n_docs:
+                        break
+                    cur_bs = self._memory_governor.adapt(
+                        eff_wave_bs,
+                        base_cache_limit_mb=self._mlx_cache_limit_mb,
+                        apply_mlx=True,
+                    ).b_slots
+                    chunk_idx = order[cursor : cursor + max(1, cur_bs)]
+                    cursor += len(chunk_idx)
                     if len(chunk_idx) == 1:
                         i0 = chunk_idx[0]
+                        b1_s = (
+                            self._lookup_or_build_prefix(sys_prefix_ids)
+                            if (self.max_prefix_cache_entries > 0 and len(sys_prefix_ids) >= 32 and len(encoded[i0]) > len(sys_prefix_ids) and encoded[i0][: len(sys_prefix_ids)] == sys_prefix_ids)
+                            else None
+                        )
+                        if b1_s is not None:
+                            max_lcp_seen = max(max_lcp_seen, len(sys_prefix_ids))
                         results[i0] = self._decode_single(
                             encoded[i0],
-                            prefix_snap=prefix_snap,
-                            suffix_ids=suffixes[i0],
+                            prefix_snap=b1_s,
+                            suffix_ids=encoded[i0][len(sys_prefix_ids) :] if b1_s is not None else encoded[i0],
                             gram=grammars[i0],
                             schema_obj=schema_objs[i0],
                             max_tokens=int(max_tokens),
@@ -1014,10 +1269,17 @@ class FastQwen3Engine:
                             collect_telemetry=collect_telemetry,
                         )
                     else:
+                        wave_encs = [encoded[i] for i in chunk_idx]
+                        w_lcp, w_sufs = split_lcp_ids(wave_encs, min_lcp=32)
+                        w_snap = self._lookup_or_build_prefix(w_lcp) if (w_lcp and self.max_prefix_cache_entries > 0) else None
+                        if w_snap is None and w_lcp:
+                            w_sufs = wave_encs
+                        elif w_snap is not None:
+                            max_lcp_seen = max(max_lcp_seen, len(w_lcp))
                         wave_items = self._decode_wave_batched(
-                            [encoded[i] for i in chunk_idx],
-                            prefix_snap=prefix_snap,
-                            wave_suffix_ids=[suffixes[i] for i in chunk_idx],
+                            wave_encs,
+                            prefix_snap=w_snap,
+                            wave_suffix_ids=w_sufs,
                             grammars=[grammars[i] for i in chunk_idx],
                             schema_objs=[schema_objs[i] for i in chunk_idx],
                             max_tokens=int(max_tokens),
@@ -1034,7 +1296,8 @@ class FastQwen3Engine:
             items=final_items,
             stats={
                 "docs": n_docs,
-                "lcp_tokens": len(lcp_ids),
+                "lcp_tokens": max_lcp_seen,
+                "prefix_tree_reused_tokens": int(self.prefix_tree.reused_tokens) if self.prefix_tree is not None else 0,
                 "elapsed_sec": round(elapsed, 4),
                 "docs_per_sec": round(n_docs / max(elapsed, 1e-9), 3),
                 "decode_tok_s": round(total_comp / max(elapsed, 1e-9), 2),

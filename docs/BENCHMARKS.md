@@ -680,18 +680,30 @@ Machine-readable validation receipt: [`benchmarks/v23-validation-20261121.json`]
 
 ## 11. `fast-qwen3` Hybrid GatedDeltaNet + OptiQ + LoRA Validation (2026-11-22)
 
-Machine-readable `ABBA` receipt: [`benchmarks/fast-qwen3-20261122.json`](benchmarks/fast-qwen3-20261122.json).
+Machine-readable `ABBA` & Category-4 outcome receipt: [`benchmarks/fast-qwen3-20261122.json`](benchmarks/fast-qwen3-20261122.json).
+
+### Category-4 Public Outcomes vs Stock `mlx-lm 0.32.2` (`LiquidAI 25 + BFCL v3 25 + JSONSchemaBench 40`)
+
+| Host | Engine (`Qwen3.5-4B-OptiQ-4bit`) | Valid / 50 | `LiquidAI` Valid / Field F1 | `BFCL v3` AST | Combined `S_obj,e2e` | Wall (`s`) | **`EOT` (`u/s`)** | 4-Bucket Mem (`GB`) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Base M5 (`24 GB`, `Apple10 NAX`)** | **`fast-qwen3` `v0.2`** (`qwen3_auto_llg_on`) | **`50/50`** (`100%`) | **`25/25` · `0.9248`** | **`25/25` · `0.8800`** | **`0.9024`** (**`+24.05 pp`**) | **`88.01`** | **`0.513`** (**`1.53×`**) | `5.255` |
+| **Base M5 (`24 GB`, `Apple10 NAX`)** | Stock `mlx-lm 0.32.2` (`public-qwen3.5`) | `37/50` (`74%`) | `12/25` · `0.4438` | `25/25` · `0.8800` | `0.6619` | `98.56` | `0.336` (`1.00×`) | `3.789` |
+| **M4 Pro (`48 GB`, `Apple9`)** | **`fast-qwen3` `v0.2`** (`qwen3_auto_llg_on`) | **`50/50`** (`100%`) | **`25/25` · `0.9248`** | **`25/25` · `0.8800`** | **`0.9024`** (**`+27.99 pp`**) | `114.09` | **`0.396`** (**`1.38×`**) | **`5.179`** (**`-35.4%`**) |
+| **M4 Pro (`48 GB`, `Apple9`)** | Stock `mlx-lm 0.32.2` (`public-qwen3.5`) | `35/50` (`70%`) | `10/25` · `0.3650` | `25/25` · `0.8800` | `0.6225` | `108.66` | `0.286` (`1.00×`) | `8.022` |
 
 ### Cross-Silicon Interleaved `ABBA` Throughput & Footprint (`M4 Pro 48 GB` vs `Base M5 24 GB`)
 
 | Model Preset | Workload (`max_tokens=64`) | Base M5 (`24 GB`, `10c Apple10 NAX`) | M4 Pro (`48 GB`, `20c Apple9`) | Steady-State Memory (`MLX Active / MLX Peak / OS Phys`) |
 | :--- | :--- | :---: | :---: | :---: |
-| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=1` strict JSON + LCP (`4` docs) | **`51.59 tok/s`** (`1.298 docs/s`, **`2.50×`** vs `7.70s` unfused) | **`66.43 tok/s`** (`1.671 docs/s`, **`2.29×`** vs `5.48s` unfused) | M5: `3.38 / 4.52 / 4.44 GB` · M4: `3.38 / 4.75 / 4.49 GB` |
-| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=8` strict JSON wave (`8` docs) | **`140.01 tok/s`** (`3.544 docs/s`, `8/8` valid vs `0/8` raw, **`6.72×`**) | **`146.96 tok/s`** (`3.721 docs/s`, `8/8` valid vs `0/8` raw, **`5.15×`**) | M5: `3.38 / 4.52 / 4.44 GB` · M4: `3.38 / 4.75 / 4.49 GB` |
-| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=1` strict JSON + LCP (`4` docs) | **`130.22 tok/s`** (`3.196 docs/s`, **`2.64×`** vs `3.31s` unfused) | **`155.28 tok/s`** (`3.811 docs/s`, **`2.53×`** vs `2.66s` unfused) | M5: `1.67 / 2.24 / 2.98 GB` · M4: `1.67 / 2.39 / 2.92 GB` |
-| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=8` strict JSON wave (`8` docs) | **`460.73 tok/s`** (`11.341 docs/s`, `8/8` valid, **`9.30×`**) | **`491.93 tok/s`** (`12.146 docs/s`, `8/8` valid, **`7.86×`**) | M5: `1.67 / 2.24 / 2.98 GB` · M4: `1.67 / 2.39 / 2.92 GB` |
+| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=1` strict JSON + LCP (`4` docs) | **`57.45 tok/s`** (`1.445 docs/s`, **`2.77×`** vs `7.66s` unfused) | **`82.67 tok/s`** (`2.080 docs/s`, **`2.59×`** vs `4.97s` unfused) | M5: `3.38 / 4.56 / 4.46 GB` · M4: `3.38 / 4.76 / 4.49 GB` |
+| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=8` strict JSON wave (`8` docs) | **`171.46 tok/s`** (`4.341 docs/s`, `8/8` valid vs `0/8` raw, **`8.33×`**) | **`191.04 tok/s`** (`4.836 docs/s`, `8/8` valid vs `1/8` raw, **`6.07×`**) | M5: `3.38 / 4.56 / 4.46 GB` · M4: `3.38 / 4.76 / 4.49 GB` |
+| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=1` strict JSON + LCP (`4` docs) | **`138.09 tok/s`** (`3.389 docs/s`, **`2.80×`** vs `3.31s` unfused) | **`196.21 tok/s`** (`4.815 docs/s`, **`2.75×`** vs `2.29s` unfused) | M5: `1.67 / 2.31 / 2.99 GB` · M4: `1.67 / 2.46 / 2.86 GB` |
+| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=8` strict JSON wave (`8` docs) | **`573.37 tok/s`** (`14.157 docs/s`, `8/8` valid, **`11.66×`**) | **`657.29 tok/s`** (`16.229 docs/s`, `8/8` valid, **`9.25×`**) | M5: `1.67 / 2.31 / 2.99 GB` · M4: `1.67 / 2.46 / 2.86 GB` |
 
-### Validated Architectural & Post-Training Gates
+### Validated Architectural, Outcome-Quality & Post-Training Gates
+
+- **DRY `PrefixTree`, Right-Padded Post-LCP Invariance, Multi-Token FF & Active-Row `lm_head` (`v0.2`):** Hoisting `PrefixTree` (`256`-token chunks + block-32 `INT8` `3.76×` GDN state codec) and `compute_loop_breaker_penalties` (`A4_v2`) into `fast-shared`, replacing post-LCP left-padding with right-padded `valid_lengths` `conv1d` gathers (`4/4` parsed matches on ragged `LiquidAI` prompts), folding `upfront_ff` into prefill, coalescing `step_w >= 2` forced transitions, and slicing `lm_head` to active `M_samp` rows lifted `B=8` wave throughput `+22.5%..+33.6%` over `v0.1` (`4B-OptiQ`: `140.0 -> 171.5 tok/s` M5, `147.0 -> 191.0 tok/s` M4 Pro; `0.8B`: `460.7 -> 573.4 tok/s` M5, `491.9 -> 657.3 tok/s` M4 Pro).
+- **JSON Whitespace BPE Separator Guard (`whitespace_flexible=None` Default):** Paired 16-item `LiquidAI` probe on `Qwen3.5-4B-OptiQ-4bit` confirmed `whitespace_flexible=None` (`separators=(",", ": ")`) achieves `0.9252` field F1 (`16/16` valid, `0.0` repeat 4-gram rate, `40.98 s`, `+21%` higher EOT than `flexible=True` `49.46 s`), whereas minified `whitespace_flexible=False` (`":"`) drops field F1 by **`-9.43 pts` (`0.8309`)** despite `16/16` schema validity.
 
 - **General `OptiQ` Spec-Bucketing (`SpecBucketedLinearGroup`):** Handles non-contiguous `(4, 8, 4, 4)` GatedDeltaNet bit layouts (`9/24` GDN layers in `Qwen3.5-4B-OptiQ-4bit`) and heterogeneous `(4, 4, 8)` / `(8, 4, 4)` / `(8, 4, 8)` Self-Attention layers (`8/8` layers) with `0.0` ULP weight drift and `100%` top-1 agreement (`max_abs_logit_diff <= 1.0` across 32 `BF16` layers).
 - **No-Think Default & `>= 384`-Token Thinking-Budget Floor:** On `Qwen3.5-4B-OptiQ-4bit`, `enable_thinking=False` (`no-think`) matches or beats `<think>` on structured JSON and tool AST (`BFCL-hard` `87.5%` vs `83.3%` at `3.2×` lower latency; `LiquidAI` `0.933` F1), whereas truncating `<think>` at `128` tokens on multi-step math triggers a `-12.5 pp` valley (`28.1% -> 15.6%` vs `78.1%` at `1024` tokens). `validate_thinking_budget` enforces `>= 384` tokens whenever `enable_thinking=True`.

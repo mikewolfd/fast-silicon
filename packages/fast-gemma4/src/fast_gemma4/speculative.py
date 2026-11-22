@@ -53,83 +53,16 @@ def build_ngram_table(
     return t3, t2
 
 
+from fast_shared.grammar import (
+    apply_loop_breaker_penalties_1d as _apply_repeat_penalties_row,
+    compute_loop_breaker_penalties as _repeated_4gram_penalties,
+)
+
 _REPEAT_4GRAM_BREAKER_DEFAULT: bool = True
 _REPEAT_4GRAM_WINDOW: int = 96
 _REPEAT_4GRAM_MIN_HITS: int = 4
 _REPEAT_4GRAM_MIN_HITS_CONSTRAINED: int = 5
 _REPEAT_4GRAM_PENALTY: float = 8.0
-
-
-def _repeated_4gram_penalties(
-    token_ids: Sequence[int] | None,
-    *,
-    window: int = _REPEAT_4GRAM_WINDOW,
-    min_prior_hits: int = _REPEAT_4GRAM_MIN_HITS,
-    base_penalty: float = _REPEAT_4GRAM_PENALTY,
-    stop_token_ids: frozenset[int] = frozenset(),
-) -> dict[int, float]:
-    """Return `{next_token_id: penalty}` only on true cyclic/dense degenerate repeat loops."""
-    if not token_ids:
-        return {}
-    n = len(token_ids)
-    out: dict[int, float] = {}
-
-    # 1. Exact consecutive periodic suffix detector: suppresses stuck `p=1..8` token cycles
-    # without touching legitimate prose, lists, CSV rows, or 2-hit math derivations.
-    if n >= 6:
-        tail = [int(t) for t in token_ids[-min(n, 32) :]]
-        nt = len(tail)
-        # p = 1: >= 6 consecutive identical tokens (avoids false hits on markdown/ellipsis)
-        if nt >= 6 and all(t == tail[-1] for t in tail[-6:-1]):
-            d = tail[-1]
-            if d not in stop_token_ids:
-                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
-        # p = 2: >= 4 consecutive 2-token copies
-        if nt >= 8 and tail[-2:] == tail[-4:-2] == tail[-6:-4] == tail[-8:-6]:
-            d = tail[-2]
-            if d not in stop_token_ids:
-                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
-        # p = 3..8: >= 3 consecutive p-token copies
-        for p in range(3, 9):
-            if nt >= 3 * p:
-                pat = tail[-p:]
-                if tail[-2 * p : -p] == pat and tail[-3 * p : -2 * p] == pat:
-                    d = pat[0]
-                    if d not in stop_token_ids:
-                        out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
-
-    # 2. High-threshold 4-gram frequency check inside trailing window (5th+ occurrence).
-    if n >= (3 + min_prior_hits):
-        start = max(0, n - int(window))
-        a, b, c = int(token_ids[-3]), int(token_ids[-2]), int(token_ids[-1])
-        if c in token_ids[start : n - 1]:
-            hits: dict[int, int] = {}
-            for i in range(start, n - 3):
-                if int(token_ids[i]) == a and int(token_ids[i + 1]) == b and int(token_ids[i + 2]) == c:
-                    d = int(token_ids[i + 3])
-                    if d not in stop_token_ids:
-                        hits[d] = hits.get(d, 0) + 1
-            for d, cnt in hits.items():
-                if cnt >= min_prior_hits:
-                    pen = float(base_penalty) * float(min(cnt - min_prior_hits + 1, 3))
-                    out[d] = max(out.get(d, 0.0), pen)
-    return out
-
-
-def _apply_repeat_penalties_row(
-    row_lg: np.ndarray,
-    penalties: dict[int, float],
-    old_to_new: np.ndarray | None,
-) -> tuple[np.ndarray, int]:
-    """Copy a 1D logit row, apply repeat penalties in vocab space, and return `(adj_lg, argmax_j)`."""
-    adj = np.array(row_lg, copy=True)
-    n_o2n = int(len(old_to_new)) if old_to_new is not None else -1
-    v_len = int(adj.shape[0])
-    for orig_id, pen in penalties.items():
-        idx = int(old_to_new[orig_id]) if (old_to_new is not None and 0 <= orig_id < n_o2n) else orig_id
-        if 0 <= idx < v_len:
-            adj[idx] -= float(pen)
-    return adj, int(np.argmax(adj))
 
 
 def _host_ram_gib() -> float:

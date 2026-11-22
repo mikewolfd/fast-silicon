@@ -302,8 +302,78 @@ class GrammarHelper:
         return bool(m.is_stopped() and m.is_accepting())
 
 
+def compute_loop_breaker_penalties(
+    token_ids: Sequence[int] | None,
+    *,
+    window: int = 96,
+    min_prior_hits: int = 4,
+    base_penalty: float = 8.0,
+    stop_token_ids: frozenset[int] = frozenset(),
+) -> dict[int, float]:
+    """Return `{next_token_id: penalty}` on cyclic (`p=1..8`) or dense 4-gram degenerate repeat loops (`A4_v2`)."""
+    if not token_ids:
+        return {}
+    n = len(token_ids)
+    out: dict[int, float] = {}
+
+    # 1. Exact consecutive periodic suffix detector (`p=1..8`)
+    if n >= 6:
+        tail = [int(t) for t in token_ids[-min(n, 32) :]]
+        nt = len(tail)
+        if nt >= 6 and all(t == tail[-1] for t in tail[-6:-1]):
+            d = tail[-1]
+            if d not in stop_token_ids:
+                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+        if nt >= 8 and tail[-2:] == tail[-4:-2] == tail[-6:-4] == tail[-8:-6]:
+            d = tail[-2]
+            if d not in stop_token_ids:
+                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+        for p in range(3, 9):
+            if nt >= 3 * p:
+                pat = tail[-p:]
+                if tail[-2 * p : -p] == pat and tail[-3 * p : -2 * p] == pat:
+                    d = pat[0]
+                    if d not in stop_token_ids:
+                        out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+
+    # 2. Trailing-window 4-gram frequency check (fires on `(min_prior_hits + 1)`-th occurrence)
+    if n >= (3 + min_prior_hits):
+        start = max(0, n - int(window))
+        a, b, c = int(token_ids[-3]), int(token_ids[-2]), int(token_ids[-1])
+        if c in token_ids[start : n - 1]:
+            hits: dict[int, int] = {}
+            for i in range(start, n - 3):
+                if int(token_ids[i]) == a and int(token_ids[i + 1]) == b and int(token_ids[i + 2]) == c:
+                    d = int(token_ids[i + 3])
+                    if d not in stop_token_ids:
+                        hits[d] = hits.get(d, 0) + 1
+            for d, cnt in hits.items():
+                if cnt >= min_prior_hits:
+                    pen = float(base_penalty) * float(min(cnt - min_prior_hits + 1, 3))
+                    out[d] = max(out.get(d, 0.0), pen)
+    return out
+
+
+def apply_loop_breaker_penalties_1d(
+    row_logits: np.ndarray,
+    penalties: dict[int, float],
+    old_to_new: np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    """Copy a 1D logit vector, subtract `penalties` in active-vocab space, and return `(adjusted, argmax_idx)`."""
+    adj = np.array(row_logits, copy=True)
+    n_o2n = int(len(old_to_new)) if old_to_new is not None else -1
+    v_len = int(adj.shape[0])
+    for orig_id, pen in penalties.items():
+        idx = int(old_to_new[orig_id]) if (old_to_new is not None and 0 <= orig_id < n_o2n) else int(orig_id)
+        if 0 <= idx < v_len:
+            adj[idx] = np.float32(float(adj[idx]) - float(pen))
+    return adj, int(np.argmax(adj))
+
+
 __all__ = [
     "GrammarHelper",
+    "apply_loop_breaker_penalties_1d",
+    "compute_loop_breaker_penalties",
     "normalize_json_schema",
     "sample_unconstrained",
     "validate_json_against_schema",
