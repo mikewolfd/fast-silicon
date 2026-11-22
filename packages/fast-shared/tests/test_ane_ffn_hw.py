@@ -39,12 +39,29 @@ pytestmark = pytest.mark.gpu_ane
 
 @contextmanager
 def _hw_lock():
+    if os.environ.get("M4_GPU_LOCK_HELD") == "1" or os.environ.get("FAST_SILICON_GPU_LOCK_HELD") == "1":
+        yield
+        return
     lock_path = Path(os.environ.get("FAST_ANE_LOCK_PATH", "/tmp/m4_gpu_validation.lock"))
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        prev_m4 = os.environ.get("M4_GPU_LOCK_HELD")
+        prev_fs = os.environ.get("FAST_SILICON_GPU_LOCK_HELD")
+        os.environ["M4_GPU_LOCK_HELD"] = "1"
+        os.environ["FAST_SILICON_GPU_LOCK_HELD"] = "1"
+        try:
+            yield
+        finally:
+            if prev_m4 is None:
+                os.environ.pop("M4_GPU_LOCK_HELD", None)
+            else:
+                os.environ["M4_GPU_LOCK_HELD"] = prev_m4
+            if prev_fs is None:
+                os.environ.pop("FAST_SILICON_GPU_LOCK_HELD", None)
+            else:
+                os.environ["FAST_SILICON_GPU_LOCK_HELD"] = prev_fs
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)

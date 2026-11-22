@@ -49,16 +49,30 @@ def test_mpp_int8_apple10_regimes_cpu() -> None:
     assert not should_use_mpp_w8a8(1024, 1536, 12288, mode="mxfp4", apple10_nax=True)
     assert not should_use_mpp_int8_linear(1024, 1536, 12288, bits=6, apple10_nax=True)
 
-    # W8A8 winning regimes on Apple10 (large matrices >= 8M elems; medium < 8M stay OFF)
-    assert should_use_mpp_w8a8(32, 1536, 12288, apple10_nax=True)
-    assert should_use_mpp_w8a8(32, 6144, 1536, apple10_nax=True)
-    assert should_use_mpp_w8a8(32, 2880, 5120, apple10_nax=True)
-    assert should_use_mpp_w8a8(32, 4096, 2880, apple10_nax=True)
-    assert should_use_mpp_w8a8(32, 2880, 2880, apple10_nax=True)
-    assert not should_use_mpp_w8a8(256, 2048, 1536, apple10_nax=True)
-    assert not should_use_mpp_w8a8(2048, 1536, 2560, apple10_nax=True)
-    assert not should_use_mpp_w8a8(2048, 1536, 5120, apple10_nax=True)
-    assert not should_use_mpp_w8a8(2048, 4096, 1536, apple10_nax=True)
+    # W8A8 stays off by default (un-rotated Gemma-4 GeGLU outliers) until explicit opt-in
+    assert not should_use_mpp_w8a8(32, 1536, 12288, apple10_nax=True)
+    assert not should_use_mpp_int8_linear(1024, 1536, 12288, bits=8, apple10_nax=True)
+    assert should_use_mpp_w8a8(32, 1536, 12288, apple10_nax=True, allow_w8a8=True)
+    assert should_use_mpp_w8a8(32, 6144, 1536, apple10_nax=True, allow_w8a8=True)
+    assert should_use_mpp_w8a8(32, 2880, 5120, apple10_nax=True, allow_w8a8=True)
+    assert should_use_mpp_w8a8(32, 4096, 2880, apple10_nax=True, allow_w8a8=True)
+    assert should_use_mpp_w8a8(32, 2880, 2880, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_mpp_w8a8(256, 2048, 1536, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_mpp_w8a8(2048, 1536, 2560, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_mpp_w8a8(2048, 1536, 5120, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_mpp_w8a8(2048, 4096, 1536, apple10_nax=True, allow_w8a8=True)
+
+    # Verify env opt-in works and cleans up
+    prev_env = os.environ.get("FAST_SILICON_MPP_W8A8")
+    try:
+        os.environ["FAST_SILICON_MPP_W8A8"] = "1"
+        assert should_use_mpp_w8a8(1024, 1536, 12288, apple10_nax=True)
+        assert not should_use_mpp_w8a8(1024, 1536, 2560, apple10_nax=True)
+    finally:
+        if prev_env is None:
+            os.environ.pop("FAST_SILICON_MPP_W8A8", None)
+        else:
+            os.environ["FAST_SILICON_MPP_W8A8"] = prev_env
 
     # W4A8 winning regimes on Apple10 (never medium shapes < 8M)
     assert not should_use_mpp_w4a8(2048, 1536, 2560, apple10_nax=True)
@@ -90,14 +104,31 @@ def test_mpp_int8_kernel_parity_and_nan_isolation_gpu() -> None:
     )
 
     is_m5 = bool(supports_apple10_nax())
-    lock_p = "/tmp/m5_gpu_validation.lock" if is_m5 else "/tmp/m4_gpu_validation.lock"
+    lock_p = os.environ.get("FAST_SILICON_HW_LOCK", "/tmp/m4_gpu_validation.lock")
 
     @contextlib.contextmanager
     def _locked():
+        if os.environ.get("M4_GPU_LOCK_HELD") == "1" or os.environ.get("FAST_SILICON_GPU_LOCK_HELD") == "1":
+            yield
+            return
         fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o666)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            prev_m4 = os.environ.get("M4_GPU_LOCK_HELD")
+            prev_fs = os.environ.get("FAST_SILICON_GPU_LOCK_HELD")
+            os.environ["M4_GPU_LOCK_HELD"] = "1"
+            os.environ["FAST_SILICON_GPU_LOCK_HELD"] = "1"
+            try:
+                yield
+            finally:
+                if prev_m4 is None:
+                    os.environ.pop("M4_GPU_LOCK_HELD", None)
+                else:
+                    os.environ["M4_GPU_LOCK_HELD"] = prev_m4
+                if prev_fs is None:
+                    os.environ.pop("FAST_SILICON_GPU_LOCK_HELD", None)
+                else:
+                    os.environ["FAST_SILICON_GPU_LOCK_HELD"] = prev_fs
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -141,6 +172,19 @@ def test_mpp_int8_kernel_parity_and_nan_isolation_gpu() -> None:
                     / (np.linalg.norm(r_np[ok_rows]) * np.linalg.norm(o_np[ok_rows]) + 1e-12)
                 )
                 assert cos > 0.9997, f"bits={bits} m={m} dt={dt} cos={cos}"
+
+        # Verify FP32 metadata fma(offset, ws, bq) avoids BF16 b_eff cancellation on mixed-magnitude (sq, bq)
+        wq_c = mx.full((n, k // 4), 0x80808080, dtype=mx.uint32)
+        sq_c = mx.full((n, k // 64), 0.0078125, dtype=mx.bfloat16)  # 128 * sq = 1.0
+        bq_c = mx.full((n, k // 64), -0.001953125, dtype=mx.bfloat16)  # 1.0 - 2^-9 lost if b_eff rounded to bf16
+        pw_c = pack_affine_weights_for_mpp_i8(wq_c, sq_c, bq_c, bits=8)
+        x_c = mx.full((64, k), 1.0 / 64.0, dtype=mx.bfloat16)
+        mx.eval(wq_c, sq_c, bq_c, pw_c[0], pw_c[1], x_c)
+        out_c = mpp_quantized_linear(x_c, wq_c, sq_c, bq_c, bits=8, out_dtype=mx.bfloat16, packed_weights=pw_c)
+        ref_c = mx.quantized_matmul(x_c, wq_c, scales=sq_c, biases=bq_c, transpose=True, group_size=64, bits=8, mode="affine")
+        mx.eval(out_c, ref_c)
+        max_c_err = float(mx.max(mx.abs(out_c.astype(mx.float32) - ref_c.astype(mx.float32))))
+        assert max_c_err < 0.15, f"max_c_err={max_c_err}"
 
         # Verify `x_meta` uses `mx.uint32` (compliant with strict IR dtype guard)
         x_q_u, x_m_u = quantize_activations_i8_k64(mx.ones((32, 128), dtype=mx.bfloat16))

@@ -15,9 +15,11 @@ TARGET := $(BUILD_DIR)/libfast_ane_handoff.dylib
 SRCS := fast_ane_handoff.mm
 HDRS := fast_ane_handoff.h
 
-.PHONY: all clean
+.PHONY: all native clean
 
 all: $(TARGET)
+
+native: all
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

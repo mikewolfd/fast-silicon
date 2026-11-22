@@ -66,7 +66,16 @@ mem = read_process_rusage_v6(os.getpid())  # RUSAGE_INFO_V6 physical + neural fo
 | `fast_shared.tokenizer` | Rust `tokenizers` base + sliding character-offset chunking | `BaseFastTokenizer` |
 | `fast_shared.parquet_pipeline` | Multi-file streaming/sharded/resumable Parquet + UTF-8 `page_offsets` | `embed_parquet` |
 | `fast_shared.server` | Managed HTTP/SSE server + OpenAI router + coalescing micro-batcher | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
-| `fast_shared.grammar` / `pipeline_llm` | Optional `[llm]` `llguidance` lazy GPU argmax masking + shard resume | `GrammarHelper`, `extract_parquet` |
+| `fast_shared.grammar` / `pipeline_llm` | Optional `[llm]` `llguidance` lazy GPU argmax masking + shard resume + rolling per-doc schemas | `GrammarHelper`, `extract_parquet` |
+
+### v2.2 Cross-Silicon Runtime & Kernel Highlights
+
+Structured numbers live in [`../fast-silicon/docs/benchmarks/v22-validation-20261121.json`](../../docs/benchmarks/v22-validation-20261121.json):
+
+- **`LiveMemoryGovernor` & 24 GB QLoRA `pack=1024`:** Wave memory admission check runs in `1.924 us`/wave (`12.26 us` raw) on M4 Pro and `1.458 us`/wave (`9.15 us` raw) on Base M5. On 24 GB Base M5 (`19.2 GB` cap, `1.5 GB` cache), `qlora-packing` (`pack_tokens=1024, grad_accum=2, ckpt_tokens=512`) completes with zero OOMs (`4.848 GiB` unpacked at `87.67` sup tok/s, `4.849 GiB` packed at `80.52` sup tok/s, `6.759 GiB` shared-KV at `81.63` sup tok/s; `loss_diff=0.0, grad_cos=1.0`).
+- **Rolling Per-Doc Grammar & Whitespace Guard:** Across `96` multi-schema LiquidAI tasks (`38` schemas), per-document grammar compilation speeds up M4 Pro **`1.925x`** (`90.026s -> 46.953s`, `2.04 docs/s`, `0.9271 -> 0.9248` F1) and Base M5 **`2.486x`** (`86.584s -> 34.790s`, `2.76 docs/s`, `0.9289 -> 0.9263` F1). Preserving `whitespace_flexible=None` by default avoids the `-0.164` F1 regression (`0.7647` M4 / `0.7646` M5) observed when forcing `whitespace_flexible=False`.
+- **Embedding Prefetch & No-Cache Guard:** `lookahead_batches=4` (`N=1024`) accelerates `fast-bge-small` **`1.331x`** on M4 Pro (`280.4 -> 373.2 docs/s`, `min_cos=0.9999754`) and **`1.178x`** on Base M5 (`359.1 -> 423.0 docs/s`, `min_cos=0.9999746`), and speeds `fast-pplx` GPU **`1.022x`** on both hosts (`min_cos >= 0.9999965`). `use_nocache=False` remains the default after `use_nocache=True` regressed M4 Pro `embeddinggemma` runtime (`23.793s -> 27.122s`).
+- **Metal 4 `MPP::matmul2d` Quantized Gating & ANE FFN:** `metal_mpp_int8` keeps `W4A8` active on `bits=4` Apple10 prefill shapes (`>=8M`), while `W8A8` defaults OFF (`FAST_SILICON_MPP_W8A8=1` / `allow_w8a8=True` opt-in) with FP32 `fma(128.0|8.0, ws, bq)` weight metadata packing. Post-norm Hadamard `W8A8` ANE FFN raises worst 35-layer FFN cosine from `0.996032` to `0.999740`, `AneWave` wins **`1.66x–2.40x`** over GPU on M4 Pro, and `p28` `MTLSharedEvent` saves `7.84 ms` (M4 Pro) / `8.64 ms` (Base M5) CPU sync overhead at `M=1024`.
 
 ## Shared Parquet Controls
 

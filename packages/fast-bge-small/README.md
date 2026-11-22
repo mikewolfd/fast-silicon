@@ -96,7 +96,7 @@ The run records include the model revisions, individual timings and per-bucket c
 |---|---|---|
 | **16-core ANE Runner** | `MLComputeUnitsCPUAndNeuralEngine`, NEON FP16 add, `8x8` register transpose, Layer-11 `[CLS]` slice, 4-slot async ring | [`native/bge_ane_runner.mm`](native/bge_ane_runner.mm) |
 | **Metal 4 GPU (`Apple9` / `Apple10 NAX`)** | Packed varlen batching (0 attn pad), custom `D=32` bidirectional FlashAttention, 128-wide `MPP::matmul2d` fused GELU/residual, single-pass LN+L2 | [`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py) |
-| **Work-Stealing Scheduler & Parallel Build** | GPU consumes longest sequences forward while ANE pulls shortest sequences backward with zero contention; `spawn`-parallel 9-bucket CoreML build (`--jobs 4`) | [`src/fast_bge_small/`](src/fast_bge_small/), [`scripts/build_ane_models.py`](scripts/build_ane_models.py) |
+| **Work-Stealing Scheduler & Parallel Build** | GPU consumes longest sequences forward while ANE pulls shortest sequences backward with zero contention; `spawn`-parallel 9-bucket CoreML build (`--jobs 4`); `lookahead_batches=4` Parquet prefetch delivers **`1.331x`** M4 Pro (`373.2 docs/s`, `min_cos=0.9999754`) and **`1.178x`** Base M5 (`423.0 docs/s`, `min_cos=0.9999746`) speedup (`N=1024`) | [`src/fast_bge_small/`](src/fast_bge_small/), [`scripts/build_ane_models.py`](scripts/build_ane_models.py) |
 
 ## CLI, Parquet & Reproduce
 

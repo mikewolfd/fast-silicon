@@ -92,6 +92,12 @@ Audited across both **M4 Pro `macOS 26.6`** (`Track A`) and **Base M5 `macOS 27.
 
 > Direct hand-crafted 4D NCHW `conv1x1` MIL (`build_stage_mil_program`) remains the default ANE backend because `torch.export` lowering of chunked `GatedDeltaNet` block-inversion graphs fails ANE compilation on `macOS 26.6` and requires `FP16` compute + `F.softplus` replacement to avoid `MPSGraph` fallback on `27.2.1`.
 
+### 5. v2.2 `GdnDecodeShared`, `state_codec` & Tier-1 GPU Speedups
+
+- **`GdnDecodeShared` carried/segmented decode:** Ragged NanoBEIR throughput jumps from `7,918` to **`9,211 tok/s`** (`~1.16×`) on M4 Pro and from `12,743` to **`17,412 tok/s`** (`~1.37×`) on Base M5.
+- **`state_codec` precision & memory:** Default `state_dtype="float32"` keeps `S=4096` stream-vs-whole `min_cos=1.0` on M4 Pro; opt-in `state_dtype="int8"` compresses carried state **`3.76×`** (`6,291,456 B -> 1,671,168 B`) with `S=4096 min_cos=0.9999918`.
+- **Tier-1 GPU (`N=325`) verified runs:** M4 Pro improved from `305.34s` (`0.739249` score, `0.7868 EOT`) to `268.36s` (`0.738421`, `0.8943 EOT`, **`1.137×`**) in `f32` and `264.47s` (`0.738421`, `0.9074 EOT`, **`1.153×`**, `1.278 GB`) in `i8`; Base M5 improved from `203.68s` (`0.739189`, `1.1795 EOT`) to `149.29s` (`0.739011`, `1.6089 EOT`, **`1.364×`**) in `f32` and `146.51s` (`0.739011`, `1.6394 EOT`, **`1.390×`**) in `i8`. [v2.2 validation JSON](../../docs/benchmarks/v22-validation-20261121.json)
+
 ## What keeps it fast
 
 | Component | Optimization | Source |

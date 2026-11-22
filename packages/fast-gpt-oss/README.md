@@ -45,6 +45,7 @@ The project rows use eight extraction fixtures, a JSON schema and up to 512 outp
 
 - **Standalone long-prefix suite (`gpt-oss bench --batches 8,64,128`, `L_sys=1,275`, `max_tokens=512`, `vocab_out=131,072`):** reaches **`462.8 dec tok/s`** (`0.710 docs/s`, `128/128` valid, `16.56 GB` peak MLX) at `B=128` vs `71.4 tok/s` (`0.200 docs/s`, `11.46 GB`) sustained `B=1` (**`6.5x`** decode scaling).
 - **Parity (`gpt-oss verify`):** passes `b1_valid=4/4` (`89.0 dec tok/s`), `b8_valid=8/8` (`185.0 dec tok/s`), `prefix16_token_matches=4`, and `key_field_matches=4`.
+- **v2.2 `MoE FP32` router/combine & kernel gates:** Keeping MoE routing & weighted combine in `float32` on `gpt-oss-20b-MXFP4-Q8` (`3072` rows) cuts router set/order mismatch from `0.130%/0.488%` to `0.0%/0.0%` on M4 Pro (`bf16_round_diff 22.66% -> 0.003%`) and `0.065%/0.358%` to `0.0%/0.065%` on Base M5. `MPP` `4-bit` (`0.69x..0.76x` on `gpt-oss-20b`) and `col_gemv` (`0.781x..0.961x` M5) stay gated OFF. [v2.2 validation](../../docs/benchmarks/v22-validation-20261121.json)
 
 ## Hardware Sizing Guidance
 

@@ -378,7 +378,7 @@ On generated inputs with random labels, packing reached 42.26 items/s on M5 vers
 
 The first two runs used 11,146 input tokens with 1,683 supervised answer tokens. The shared-prefix run counted 15,003 logical input tokens with 1,120 answer tokens, crediting each example with the 1,288-token prefix that the model reused. Replaying the M4 Pro 2,048-token batch preparation scheduled three optimizer updates for unpacked training, two for packed training and one for the shared-prefix arm. At 1,280 tokens the two matched arms scheduled three each. These counts come from the actual batch planner. The 2.39× ratio compares different workloads. Measuring the gain from prefix reuse requires timing the same examples and optimizer updates with reuse on and off. The initial gradient cosines were 0.999673 for packed versus unpacked BF16 and 0.994881 for packed 8-bit versus packed BF16. [Training results and fixture counts](benchmarks/capability-corrections-20261121.json)
 
-- On the 24 GB M5, two QLoRA attempts exhausted Metal memory. The benchmark targeted 2,048 tokens and then 1,280. The reports leave the failed step unspecified. The sizing policy recommends `pack_len=1024, grad_accum=2, ckpt_tokens=512` with a 19.2 GB ceiling. A completed 24 GB run at those settings would establish throughput. [Sizing policy](../packages/fast-shared/src/fast_shared/runtime_lessons.py)
+- On the 24 GB M5, earlier 2,048- and 1,280-token QLoRA attempts exhausted Metal memory. Validating the sizing policy (`pack_tokens=1024, grad_accum=2, ckpt_tokens=512`, `19.2 GB` memory ceiling, `1.5 GB` cache limit) completed with zero OOMs (`pressure=['normal']`): unpacked `5.205 GB` (`4.848 GiB`) peak at `87.67` sup tok/s, packed `5.207 GB` (`4.849 GiB`) peak at `80.52` sup tok/s (`loss_diff=0.0, grad_cos=1.0, min_tensor_cos=1.0`), and shared-KV `7.257 GB` (`6.759 GiB`) peak at `81.63` sup tok/s. [Sizing policy](../packages/fast-shared/src/fast_shared/runtime_lessons.py) · [v2.2 validation JSON](benchmarks/v22-validation-20261121.json)
 - **P2.8 ANE Frozen-Prefix Prefetch (`Gemma-4 E2B` `L0..11` ANE `[1650,0,0]` + `L12..34` GPU LoRA on M4 Pro):** Hides **`99.3%–99.8%`** of frozen prefix time (`84.9–374.0 ms -> 0.56–0.83 ms` exposed), yielding **`1.086×` (`B=1`) / `1.088×` (`B=2`)** end-to-end LoRA step speedup with `h_12` cosine `0.999124` and adapter gradient cosine `0.996968`.
 
 ### 5.3 Disaggregated `GPU Actor + ANE Critic` `GRPO` & Best-of-N (`G=4`, `grpo-ane-critic`)
@@ -602,3 +602,46 @@ All commands run from the `fast-silicon` repository root using `.venv/bin/python
 .venv/bin/python packages/fast-pplx/scripts/benchmark.py context-windows --context-budgets 512,1024,2048,4096
 .venv/bin/python packages/fast-pplx/scripts/benchmark.py bit-identity dump --out-dir artifacts/bit_base
 ```
+
+---
+
+## 9. v2.2 Cross-Silicon Validation & Regression Gates (2026-11-21)
+
+Machine-readable record: [`docs/benchmarks/v22-validation-20261121.json`](benchmarks/v22-validation-20261121.json).
+
+### Track 1: `fast-shared` (`LiveMemoryGovernor`, `24 GB` QLoRA, Rolling Per-Doc Grammar, Lookahead)
+
+- **`LiveMemoryGovernor` admission overhead:** `1.924 us`/wave (`12.26 us` raw) on M4 Pro; `1.458 us`/wave (`9.15 us` raw) on Base M5.
+- **`24 GB` Base M5 QLoRA packing (`pack_tokens=1024, grad_accum=2, ckpt_tokens=512`, `19.2 GB` cap):** Unpacked peaked at `5.205 GB` (`4.848 GiB`) @ `87.67` sup tok/s; packed peaked at `5.207 GB` (`4.849 GiB`) @ `80.52` sup tok/s (`loss_diff=0.0, grad_cos=1.0, min_tensor_cos=1.0`); shared-KV peaked at `7.257 GB` (`6.759 GiB`) @ `81.63` sup tok/s (`pressure=['normal']`).
+- **Rolling per-doc grammar compilation & `whitespace_flexible` guard:** `Suite 2A` (`96` docs) sped up `50.468s -> 47.787s` (`1.058x`, `98.96% -> 100.0%` valid) on M4 Pro and `42.761s -> 40.200s` (`1.062x`, `100.0%` valid) on Base M5. `Suite 2B` (`96` LiquidAI docs, `38` schemas) sped up **`1.925x`** on M4 Pro (`90.026s -> 46.953s`, `1.06 -> 2.04 docs/s`, `0.9271 -> 0.9248` F1) and **`2.486x`** on Base M5 (`86.584s -> 34.790s`, `1.11 -> 2.76 docs/s`, `0.9289 -> 0.9263` F1). Forcing `whitespace_flexible=False` crashed F1 to `0.7647` (M4 Pro) and `0.7646` (Base M5), confirming the `whitespace_flexible=None` default guard.
+- **Embedding prefetch (`lookahead_batches=4`, `N=1024`) & no-cache guard:** `fast-bge-small` sped up **`1.331x`** on M4 Pro (`280.4 -> 373.2 docs/s`, `min_cos=0.9999754`) and **`1.178x`** on Base M5 (`359.1 -> 423.0 docs/s`, `min_cos=0.9999746`); `fast-pplx` GPU sped up `1.022x` on both hosts (`24.306s -> 23.793s` M4, `min_cos >= 0.9999965`). `use_nocache=True` regressed M4 Pro `embeddinggemma` (`23.793s -> 27.122s`), so `use_nocache=False` remains default.
+
+### Track 2: `fast-gemma4` & `fast-gpt-oss` (`MoE FP32`, `MPP`, Constrained `MTP`, Rejections)
+
+| Gate / Mechanism | M4 Pro (`48 GB`) | Base M5 (`24 GB`, `Apple10 NAX`) | Promotion Verdict |
+|---|---|---|---|
+| **MoE FP32 router + combine (`gpt-oss-20b-MXFP4-Q8`, `3072` rows)** | Router set/ord mismatch `0.130%/0.488% -> 0.0%/0.0%`; `bf16_round_diff 22.66% -> 0.003%` | Router set/ord mismatch `0.065%/0.358% -> 0.0%/0.065%` | **PROMOTED** (default) |
+| **`MPP::matmul2d` `W4A8` prefill (`>=8M`)** | Fallback (`Apple9`) | Active for `bits=4 >=8M`; `gpt-oss-20b` (`0.69x..0.76x`) & `<8M` excluded | **PROMOTED** (`bits=4` gated) |
+| **`MPP::matmul2d` `W8A8` (`metal_mpp_int8`)** | Fallback (`Apple9`) | Synthetic normal microbench `1.16x..2.62x`, `e2b_qat4` TTFT `1.16x..1.56x`, but un-rotated `L13 down_proj` `662.2x` outliers drop L14 ANE cos to `0.997748 < 0.9983` (`3/8` greedy `sample_docs_8`, `5.066s -> 5.239s` `B=8` E2E) | **OPT-IN ONLY** (`FAST_SILICON_MPP_W8A8=1` / `allow_w8a8=True`; FP32 `fma` weight metadata packing active) |
+| **Constrained `MTP`** | `1<=B<=2` (`B=1` `1.48x`, `B=2` `1.16x`; dense wins `B>=3`) | `B==1` only (`LiquidAI` **`2.026x`** wall / **`2.152x`** dec `39.06 -> 84.05 tok/s`, `8/8` T=0 match; `JSB` `1.138x` wall / `1.740x` dec `36.91 -> 64.23`) | **PROMOTED** (gated by host + `B`) |
+| **`Q8Q` & `col_gemv` kernels** | `col_gemv` `M=1` `0.911x..1.009x` | `Q8Q` `0.408x..0.958x` (`cos=0.754..0.943`); `col_gemv` `0.781x..0.961x` | **REJECTED** (`NEGATIVE_NOT_PROMOTED`) |
+
+### Track 3: `fast-pplx` (`GdnDecodeShared`, `state_codec`, `Tier-1` GPU)
+
+- **`GdnDecodeShared` ragged throughput:** M4 Pro `7,918 -> 9,211 tok/s` (`~1.16x`); Base M5 `12,743 -> 17,412 tok/s` (`~1.37x`).
+- **`state_codec`:** `state_dtype="float32"` default (`S=4096` stream vs whole `min_cos=1.0` on M4 Pro); opt-in `state_dtype="int8"` reduces carried state `3.76x` (`6,291,456 B -> 1,671,168 B`, `S=4096 min_cos=0.9999918`).
+- **`Tier-1` GPU (`N=325`):** M4 Pro `0.739249` (`305.34s`, `0.7868 EOT`) -> `cand_f32` `0.738421` (`268.36s`, `0.8943 EOT`, `1.137x`) / `cand_i8` `0.738421` (`264.47s`, `0.9074 EOT`, `1.153x`, `1.278 GB`); Base M5 `0.739189` (`203.68s`, `1.1795 EOT`) -> `cand_f32` `0.739011` (`149.29s`, `1.6089 EOT`, `1.364x`) / `cand_i8` `0.739011` (`146.51s`, `1.6394 EOT`, `1.390x`).
+
+### Track 4: Hybrid ANE FFN (`Hadamard W8A8`, `AneWave`, `MTLSharedEvent`)
+
+- **Post-norm Hadamard `W8A8` FFN parity:** Raises 35-layer `v64a35` worst FFN cosine from `0.996032` to **`0.999740`** (vs FP16 unnormalized L11 `cos=0.743022`), with live ANE wave parity `0.999812..0.999924` on M4 Pro and Base M5.
+- **`AneWave` dispatch gating:** M4 Pro `d_ff=6144` wins **`1.81x–2.40x`** vs GPU (`M=128..256`) and `d_ff=12288` wins **`1.66x–2.13x`** (`M=128..2048`), while Base M5 breaker cleanly skips negative GPU-faster regimes.
+- **`p28` `MTLSharedEvent`:** At `M=1024`, M4 Pro drops `cpu_sync` (`~8.29 ms`) to `cpu_begin_return=0.45 ms` (saving `7.84 ms`), and Base M5 drops `8.75 ms` to `0.27 ms` (saving `8.64 ms`).
+
+### v2.3 Accuracy & Outcome Roadmap (Parallel Validation Queue)
+
+Pending parallel validation targets on real backfill/outcome benchmarks:
+- `fast-shared`: `finish_reason="length"` detection under constrained decoding, single-model async retry hooks (`roll_swa=1024`), header-anchored + sentence-snapped `parquet_pipeline` chunking, and multi-batch CoreAI calibration gates.
+- `fast-gemma4` & `fast-gpt-oss`: 4-gram repeat-loop breaker, `kv_i8='auto'` BF16 KV A/B on long contexts, FP32 `fused_softcap_argmax_bf16` + `precise::exp` parity, `WhitespaceGuard(32)` + `whitespace_flexible=True`, Hadamard-smoothed `W8A8`, and FP32 `MidOut`/RMSNorm/RoPE/SWA in `fast-gpt-oss`.
+- `fast-pplx`: `header_text` / `repeat_header_tokens` contextual window overlap tuning, Base M5 `slice-0` `GdnDecodeShared` invariance + FP32 `beta` sigmoid + `F32` `MappedEmbedding.gather`, and paired `Tier-1` `hetero2` + `Tier-2 LongEmbed 16K–32K` runs.
+- `ane_ffn` & `Early14`: `quantize_a8=False` (`W8A16`) default, `H > 2048` scale bypass fix, wired Hadamard + `normalize_mid` + `gelu` clamp in `build_ane_models.py`, and Hadamard-smoothed `kv_i8` long-context evaluation.

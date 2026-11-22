@@ -1,6 +1,6 @@
 UV ?= uv
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
-NATIVE_PACKAGES := packages/fast-bge-small packages/fast-embeddinggemma-2 packages/fast-gemma4 packages/fast-decision-models packages/fast-pplx
+NATIVE_PACKAGES := packages/fast-shared packages/fast-bge-small packages/fast-embeddinggemma-2 packages/fast-gemma4 packages/fast-decision-models packages/fast-pplx
 
 .PHONY: uv-sync hw-check native clean setup guard test-cpu test-hw sync sync-check sync-clean-check leak-check
 
@@ -45,12 +45,21 @@ test-cpu: hw-check
 	$(PYTHON) -m pytest -v \
 		packages/fast-shared/tests/test_ir_dtype_guard_cpu.py \
 		packages/fast-shared/tests/test_fast_shared.py \
+		packages/fast-shared/tests/test_runtime_lessons_cpu.py \
+		packages/fast-shared/tests/test_parquet_pipeline_v2_cpu.py \
+		packages/fast-shared/tests/test_croq_extractconf_cpu.py \
+		packages/fast-shared/tests/test_ane_ffn_cpu.py \
+		packages/fast-shared/tests/test_bench_memory.py \
 		packages/fast-decision-models/tests/test_decision_models_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \
 		packages/fast-gpt-oss/tests/test_fast_gpt_oss.py \
 		packages/fast-gemma4/tests/test_per_doc_grammar.py \
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \
+		packages/fast-gemma4/tests/test_mpp_int8_cpu.py \
+		packages/fast-gemma4/tests/test_mtp_drafter_cpu.py \
+		packages/fast-gemma4/tests/test_whitespace_guard_cpu.py \
+		packages/fast-gemma4/tests/test_remediation_regressions.py \
 		tests/test_setup_all_cpu.py \
 		tests/test_benchmark_suites_cpu.py \
 		-k "not mpp_matmul and not _gpu"

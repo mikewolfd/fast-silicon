@@ -9,9 +9,10 @@ for Apple10+ GPUs with Metal 4 Hardware TensorOps (`MPP::matmul2d` `16x32x16`/`T
     bits (`0x7fc00000u`) into `x_meta` even when Metal fast-math is active.
   - Outputs `[M, K] int8` codes and `[K//64, M, 2] float32` metadata (`sc`, `sc * sum(q)`).
 - Offline/lazy weight repacking (`pack_affine_weights_for_mpp_i8`):
-  - `bits == 8` (`W8A8`): `w_i8 = (wq ^ 0x80808080).view(int8)` + `b_eff = bq + 128 * sq`.
-  - `bits == 4` (`W4A8`): `w_i4 = (wq ^ 0x88888888)` (consumed as `metal::int4b_format`) + `b_eff = bq + 8 * sq`.
-  - Compact `uint32` metadata `[K//64, N]` packing `(bfloat(sq), bfloat(b_eff))` per `(group, col)`.
+  - `bits == 8` (`W8A8`): `w_i8 = (wq ^ 0x80808080).view(int8)`.
+  - `bits == 4` (`W4A8`): `w_i4 = (wq ^ 0x88888888)` (consumed as `metal::int4b_format`).
+  - Compact `uint32` metadata `[K//64, N]` packing `(bfloat(sq), bfloat(bq))` per `(group, col)`,
+    reconstructing exact `FP32` `wb = fma(128|8, ws, bq)` inside the kernel without BF16 re-rounding.
 - Single-barrier double-buffered 64-tile (`TM=32` for `M < 64`, `TM=64` for `M >= 64`, `TN=64`) kernels
   with 16-column-band tile walk (`prefill_int8_walk`) and optional fused epilogue vector bias.
 
@@ -21,6 +22,7 @@ Strictly gated OFF on Apple9 (`supports_apple10_nax() == False`) and gated on Ap
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import mlx.core as mx
@@ -56,6 +58,13 @@ def _apple10_nax_supported(apple10_nax: bool | None = None) -> bool:
     return detected
 
 
+def _w8a8_opt_in_enabled(allow_w8a8: bool | None) -> bool:
+    if allow_w8a8 is not None:
+        return bool(allow_w8a8)
+    raw = os.environ.get("FAST_SILICON_MPP_W8A8", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def should_use_mpp_w8a8(
     m: int,
     k: int,
@@ -64,15 +73,20 @@ def should_use_mpp_w8a8(
     group_size: int = 64,
     mode: str = "affine",
     apple10_nax: bool | None = None,
+    allow_w8a8: bool | None = None,
 ) -> bool:
-    """Gate ``W8A8`` (`int8 * int8`) strictly to Apple10+ and winning `>= 8M`-element prefill shapes.
+    """Gate ``W8A8`` (`int8 * int8`) strictly to Apple10+, `>= 8M`-element prefill shapes, and explicit opt-in.
 
-    Empirical Base M5 E2E + microbenchmarks vs both `mx.quantized_matmul(bits=8)` and `BF16 MPP`:
-    - Wide `>= 8M` element matrices (`1536x12288`, `6144x1536` in E2B QAT-4bit): win `1.16x..1.57x` TTFT
-      with `cos=0.999993`, `KL=0.0`, and zero downstream F1/schema regression.
-    - Medium attention/narrow matrices (`< 8M`, e.g. `1536x2560`, `2048x1536`, `256`-wide PLE) score `< 1.03x`
-      E2E/micro and fail Two-Gate (`valid_schema` drop `0.875 -> 0.75` on `e2b_w8`), so stay on `MLX qmm`.
+    Empirical Base M5 findings (`b_eff` FP32 fix still isolates dynamic `A8` noise on un-rotated activations):
+    - Wide `>= 8M` matrices (`1536x12288`, `6144x1536`) win `1.16x..2.62x` micro/TTFT when opted in via
+      `FAST_SILICON_MPP_W8A8=1` or `allow_w8a8=True`.
+    - However, un-rotated Gemma-4 GeGLU activations exhibit `125x..662x` outlier spikes (`down_proj`), causing
+      per-group `A8` activation quantization on 8-bit MLPs to drift Layer-14 KV cosine below `0.9983` against
+      Linear-W8 ANE (`0.997748`) and change `5/8` structured greedy outputs (`B=8` E2E `5.066s -> 5.239s`).
+      Keep `W8A8` opt-in by default until Hadamard-smoothed `W8A8` is promoted; keep `W4A8` active on `bits=4`.
     """
+    if not _w8a8_opt_in_enabled(allow_w8a8):
+        return False
     if not _apple10_nax_supported(apple10_nax):
         return False
     m_i, k_i, n_i = int(m), int(k), int(n)
@@ -238,18 +252,15 @@ def pack_affine_weights_for_mpp_i8(
     b_i = int(bits)
     if int(group_size) != 64 or b_i not in (4, 8):
         raise ValueError(f"Expected group_size=64 and bits in (4, 8), got group_size={group_size}, bits={bits}")
-    sq_f = sq.astype(mx.float32)
-    bq_f = bq.astype(mx.float32)
     if b_i == 8:
         w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x80808080, dtype=mx.uint32)).view(mx.int8))
-        b_eff = (bq_f + 128.0 * sq_f).astype(mx.bfloat16)
     else:
         w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x88888888, dtype=mx.uint32)))
-        b_eff = (bq_f + 8.0 * sq_f).astype(mx.bfloat16)
     sq_bf = sq.astype(mx.bfloat16)
+    bq_bf = bq.astype(mx.bfloat16)
     sq_u32 = sq_bf.view(mx.uint16).astype(mx.uint32)
-    be_u32 = b_eff.view(mx.uint16).astype(mx.uint32)
-    w_meta = mx.contiguous((sq_u32 | (be_u32 << mx.array(16, dtype=mx.uint32))).T)
+    bq_u32 = bq_bf.view(mx.uint16).astype(mx.uint32)
+    w_meta = mx.contiguous((sq_u32 | (bq_u32 << mx.array(16, dtype=mx.uint32))).T)
     return w_packed, w_meta
 
 
@@ -269,6 +280,7 @@ def _get_gemm_kernel(
     if cached is not None:
         return cached
     ng = k // 64
+    w_offset_f = "128.0f" if bits == 8 else "8.0f"
     if bits == 8:
         w_arg = "w_i8"
         right_decl = "device int8_t* wp = const_cast<device int8_t*>(w_i8);"
@@ -366,7 +378,8 @@ def _get_gemm_kernel(
                 float2 xm = tg_xm[rm];
                 uint wu = tg_wm[nl[i]];
                 float ws_v = float(as_type<bfloat>(ushort(wu & 0xFFFFu)));
-                float wb_v = float(as_type<bfloat>(ushort(wu >> 16)));
+                float bq_v = float(as_type<bfloat>(ushort(wu >> 16)));
+                float wb_v = fma({w_offset_f}, ws_v, bq_v);
                 acc[i] = fma(float(c[i]), xm.x * ws_v, fma(xm.y, wb_v, acc[i]));
             }}
         }}
