@@ -298,3 +298,106 @@ def test_ane_ffn_startup_and_breaker_live_hw_gpu(ane_lib: AneHandoffLibrary):
     for w_ms in measured_walls:
         breaker_trip.observe(gpu_full_ms=med_ms * 0.25, split_ms=w_ms)
     assert breaker_trip.tripped
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size", "outlier_idx"),
+    [
+        (2560, 10240, 2200),  # E4B 4-segment FFN with outlier above 2048
+        (4096, 2560, 3500),   # Larger H>2048 1-segment FFN with outlier near tail
+    ],
+)
+def test_ane_ffn_wave_h_gt_2048_unit_scale_and_w8a16_default_gpu(
+    ane_lib: AneHandoffLibrary,
+    hidden_size: int,
+    intermediate_size: int,
+    outlier_idx: int,
+):
+    rng = np.random.default_rng(1000 + hidden_size)
+    M = 128
+    w_norm = rng.uniform(0.5, 3.0, size=(hidden_size,)).astype(np.float32)
+    w_norm[12] = 90.0
+    w_norm[outlier_idx] = 135.0
+    h = rng.normal(0.0, 1.0, size=(M, hidden_size)).astype(np.float32)
+    x_real = (h / np.sqrt(np.mean(h * h, axis=-1, keepdims=True) + 1e-6)) * w_norm[None, :]
+    x_fp16 = x_real.astype(np.float16)
+
+    wg = rng.normal(0.0, 0.02, size=(intermediate_size, hidden_size)).astype(np.float32)
+    wu = rng.normal(0.0, 0.02, size=(intermediate_size, hidden_size)).astype(np.float32)
+    wd = rng.normal(0.0, 0.02, size=(hidden_size, intermediate_size)).astype(np.float32)
+    ref_fp32 = eval_ffn_fp32_ref(x_fp16.astype(np.float32), wg, wu, wd, activation="gelu_tanh")
+
+    signs_in = make_hadamard_signs(hidden_size, seed=77)
+    signs_fp16 = signs_in.astype(np.float16)
+    x_rot_expected = hadamard_rotate_blocks(x_fp16.astype(np.float32), ANE_FFN_INPUT_BLOCK, signs_in)
+    expected_row_max = np.maximum(np.max(np.abs(x_rot_expected), axis=1), 1e-3)
+
+    seg_sizes = segment_intermediate_sizes(intermediate_size, ANE_FFN_DEFAULT_SEGMENT)
+    seg_mils: list[str] = []
+    seg_blobs: list[bytes] = []
+    offset = 0
+    for seg_d in seg_sizes:
+        qg, sg = quantize_symmetric_int8(
+            hadamard_rotate_blocks(wg[offset : offset + seg_d], ANE_FFN_INPUT_BLOCK, signs_in)
+        )
+        qu, su = quantize_symmetric_int8(
+            hadamard_rotate_blocks(wu[offset : offset + seg_d], ANE_FFN_INPUT_BLOCK, signs_in)
+        )
+        qd, sd = quantize_symmetric_int8(wd[:, offset : offset + seg_d])
+        offset += seg_d
+        blob, offs = pack_weight_blobs(
+            [
+                ("wg_q", qg.reshape(seg_d, hidden_size, 1, 1), BLOB_DTYPE_INT8),
+                ("wg_s", sg.astype(np.float16), BLOB_DTYPE_FP16),
+                ("wu_q", qu.reshape(seg_d, hidden_size, 1, 1), BLOB_DTYPE_INT8),
+                ("wu_s", su.astype(np.float16), BLOB_DTYPE_FP16),
+                ("wd_q", qd.reshape(hidden_size, seg_d, 1, 1), BLOB_DTYPE_INT8),
+                ("wd_s", sd.astype(np.float16), BLOB_DTYPE_FP16),
+            ]
+        )
+        mil = build_ffn_geglu_segment_mil(
+            hidden_size,
+            seg_d,
+            M,
+            w_gate_off=offs["wg_q"],
+            w_up_off=offs["wu_q"],
+            w_down_off=offs["wd_q"],
+            w_gate_scale_off=offs["wg_s"],
+            w_up_scale_off=offs["wu_s"],
+            w_down_scale_off=offs["wd_s"],
+            weight_dtype="int8_dequant",
+            input_dtype="fp16",
+            activation="gelu_tanh",
+            packed_token_scale=True,
+            fp16_safe_clamp=True,
+            normalize_mid=True,
+        )
+        seg_mils.append(mil)
+        seg_blobs.append(blob)
+
+    with _hw_lock(), ane_lib.create_context(allow_unavailable=True) as ctx, ExitStack() as stack:
+        assert ctx.ane_available and ctx.shared_event_available
+        progs = [
+            stack.enter_context(ctx.compile_program(m, weight_blob=b, preformatted_blob=True))
+            for m, b in zip(seg_mils, seg_blobs)
+        ]
+        surf_in = stack.enter_context(ctx.surface(M, hidden_size + 1))
+        surf_outs = [stack.enter_context(ctx.surface(M, hidden_size)) for _ in seg_sizes]
+
+        # Default quantize_a8=False (W8A16) vs explicit quantize_a8=True (W8A8)
+        with ctx.begin_ffn_wave(progs, surf_outs, surf_in, x_fp16, signs_fp16) as wave_default:
+            y_w8a16, _ = wave_default.finish(None)
+        surf_arr = surf_in.read()
+        hw_row_max = surf_arr[hidden_size, :M].astype(np.float32)
+        np.testing.assert_allclose(hw_row_max, expected_row_max, rtol=5e-3, atol=5e-3)
+
+        with ctx.begin_ffn_wave(progs, surf_outs, surf_in, x_fp16, signs_fp16, quantize_a8=True) as wave_a8:
+            y_w8a8, _ = wave_a8.finish(None)
+
+    assert np.all(np.isfinite(y_w8a16)) and np.all(np.isfinite(y_w8a8))
+    m_w8a16 = compute_error_metrics(ref_fp32, y_w8a16.astype(np.float32))
+    m_w8a8 = compute_error_metrics(ref_fp32, y_w8a8.astype(np.float32))
+    assert m_w8a16["cosine"] >= 0.9998
+    assert m_w8a8["cosine"] >= 0.999
+    assert m_w8a16["cosine"] > m_w8a8["cosine"]
+    assert m_w8a16["rel_rms_err"] < m_w8a8["rel_rms_err"]

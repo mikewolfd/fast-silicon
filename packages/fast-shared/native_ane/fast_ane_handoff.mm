@@ -176,8 +176,56 @@ kernel void ane_smoke_post(device const half* src_surface [[buffer(0)]],
     dst[dst_idx] = half(v + 5.0f);
 }
 
+inline float4 wht128_block(device const half* x_in,
+                           device const half* signs,
+                           uint row_off,
+                           uint base,
+                           uint simd_lane) {
+    float v0 = float(x_in[row_off + base + 0u]) * float(signs[base + 0u]);
+    float v1 = float(x_in[row_off + base + 1u]) * float(signs[base + 1u]);
+    float v2 = float(x_in[row_off + base + 2u]) * float(signs[base + 2u]);
+    float v3 = float(x_in[row_off + base + 3u]) * float(signs[base + 3u]);
+
+    // Stride 1 & 2 in registers
+    float a0 = v0 + v1;
+    float a1 = v0 - v1;
+    float a2 = v2 + v3;
+    float a3 = v2 - v3;
+    float b0 = a0 + a2;
+    float b1 = a1 + a3;
+    float b2 = a0 - a2;
+    float b3 = a1 - a3;
+
+    // Strides 4, 8, 16, 32, 64 across 32 lanes via simd_shuffle_xor
+    for (uint mask = 1u; mask <= 16u; mask <<= 1u) {
+        float p0 = simd_shuffle_xor(b0, mask);
+        float p1 = simd_shuffle_xor(b1, mask);
+        float p2 = simd_shuffle_xor(b2, mask);
+        float p3 = simd_shuffle_xor(b3, mask);
+        const bool odd = ((simd_lane & mask) != 0u);
+        b0 = odd ? (p0 - b0) : (b0 + p0);
+        b1 = odd ? (p1 - b1) : (b1 + p1);
+        b2 = odd ? (p2 - b2) : (b2 + p2);
+        b3 = odd ? (p3 - b3) : (b3 + p3);
+    }
+
+    return float4(b0, b1, b2, b3) * kInvSqrt128;
+}
+
+inline half pack_scaled_elem(float v,
+                            float row_max,
+                            float inv_scale,
+                            float out_scale,
+                            uint quantize_a8,
+                            uint write_unit_scale_row) {
+    float val = (quantize_a8 != 0u)
+                    ? clamp(rint(v * inv_scale), -127.0f, 127.0f) * out_scale
+                    : ((write_unit_scale_row != 0u) ? (v / row_max) : v);
+    return half(val);
+}
+
 // One threadgroup (e.g. 192 threads = 6 simdgroups) per token row m.
-// Supports arbitrary hidden_size % 128 == 0 (including H=1536 = 12*128).
+// Supports arbitrary hidden_size % 128 == 0 (including H=1536, E4B H=2560, H=4096).
 kernel void ane_ffn_rotate_pack_fp16(device const half* x_in [[buffer(0)]],
                                      device const half* signs [[buffer(1)]],
                                      device half* dst_surface [[buffer(2)]],
@@ -198,54 +246,26 @@ kernel void ane_ffn_rotate_pack_fp16(device const half* x_in [[buffer(0)]],
     threadgroup float tg_sg_max[16];
 
     float local_max = 0.0f;
-    const bool need_scale = (p.hidden_size <= 2048u) && (p.quantize_a8 != 0u || p.write_unit_scale_row != 0u);
+    const bool need_scale = (p.quantize_a8 != 0u || p.write_unit_scale_row != 0u);
+    const bool cache_rot = need_scale && (p.hidden_size <= 2048u);
 
     for (uint blk = simd_id; blk < num_blocks; blk += num_sgs) {
         const uint base = blk * 128u + simd_lane * 4u;
-        float v0 = float(x_in[row_off + base + 0u]) * float(signs[base + 0u]);
-        float v1 = float(x_in[row_off + base + 1u]) * float(signs[base + 1u]);
-        float v2 = float(x_in[row_off + base + 2u]) * float(signs[base + 2u]);
-        float v3 = float(x_in[row_off + base + 3u]) * float(signs[base + 3u]);
-
-        // Stride 1 & 2 in registers
-        float a0 = v0 + v1;
-        float a1 = v0 - v1;
-        float a2 = v2 + v3;
-        float a3 = v2 - v3;
-        float b0 = a0 + a2;
-        float b1 = a1 + a3;
-        float b2 = a0 - a2;
-        float b3 = a1 - a3;
-
-        // Strides 4, 8, 16, 32, 64 across 32 lanes via simd_shuffle_xor
-        for (uint mask = 1u; mask <= 16u; mask <<= 1u) {
-            float p0 = simd_shuffle_xor(b0, mask);
-            float p1 = simd_shuffle_xor(b1, mask);
-            float p2 = simd_shuffle_xor(b2, mask);
-            float p3 = simd_shuffle_xor(b3, mask);
-            const bool odd = ((simd_lane & mask) != 0u);
-            b0 = odd ? (p0 - b0) : (b0 + p0);
-            b1 = odd ? (p1 - b1) : (b1 + p1);
-            b2 = odd ? (p2 - b2) : (b2 + p2);
-            b3 = odd ? (p3 - b3) : (b3 + p3);
-        }
-
-        b0 *= kInvSqrt128;
-        b1 *= kInvSqrt128;
-        b2 *= kInvSqrt128;
-        b3 *= kInvSqrt128;
+        const float4 b = wht128_block(x_in, signs, row_off, base, simd_lane);
 
         if (need_scale) {
-            tg_rot[base + 0u] = b0;
-            tg_rot[base + 1u] = b1;
-            tg_rot[base + 2u] = b2;
-            tg_rot[base + 3u] = b3;
-            local_max = max(local_max, max(max(fabs(b0), fabs(b1)), max(fabs(b2), fabs(b3))));
+            if (cache_rot) {
+                tg_rot[base + 0u] = b.x;
+                tg_rot[base + 1u] = b.y;
+                tg_rot[base + 2u] = b.z;
+                tg_rot[base + 3u] = b.w;
+            }
+            local_max = max(local_max, max(max(fabs(b.x), fabs(b.y)), max(fabs(b.z), fabs(b.w))));
         } else {
-            dst_surface[(base + 0u) * p.surf_stride_elems + m] = half(b0);
-            dst_surface[(base + 1u) * p.surf_stride_elems + m] = half(b1);
-            dst_surface[(base + 2u) * p.surf_stride_elems + m] = half(b2);
-            dst_surface[(base + 3u) * p.surf_stride_elems + m] = half(b3);
+            dst_surface[(base + 0u) * p.surf_stride_elems + m] = half(b.x);
+            dst_surface[(base + 1u) * p.surf_stride_elems + m] = half(b.y);
+            dst_surface[(base + 2u) * p.surf_stride_elems + m] = half(b.z);
+            dst_surface[(base + 3u) * p.surf_stride_elems + m] = half(b.w);
         }
     }
 
@@ -264,11 +284,26 @@ kernel void ane_ffn_rotate_pack_fp16(device const half* x_in [[buffer(0)]],
         const float inv_scale = 127.0f / row_max;
         const float out_scale = (p.write_unit_scale_row != 0u) ? (1.0f / 127.0f) : scale;
 
-        for (uint c = lid; c < p.hidden_size; c += tg_threads) {
-            float val = (p.quantize_a8 != 0u)
-                            ? clamp(rint(tg_rot[c] * inv_scale), -127.0f, 127.0f) * out_scale
-                            : ((p.write_unit_scale_row != 0u) ? (tg_rot[c] / row_max) : tg_rot[c]);
-            dst_surface[c * p.surf_stride_elems + m] = half(val);
+        if (cache_rot) {
+            for (uint c = lid; c < p.hidden_size; c += tg_threads) {
+                dst_surface[c * p.surf_stride_elems + m] = pack_scaled_elem(
+                    tg_rot[c], row_max, inv_scale, out_scale, p.quantize_a8, p.write_unit_scale_row);
+            }
+        } else {
+            // For H > 2048 (e.g. E4B H=2560, H=4096), recompute WHT-128 in pass 2 instead
+            // of skipping row-max scaling, keeping threadgroup memory bounded.
+            for (uint blk = simd_id; blk < num_blocks; blk += num_sgs) {
+                const uint base = blk * 128u + simd_lane * 4u;
+                const float4 b = wht128_block(x_in, signs, row_off, base, simd_lane);
+                dst_surface[(base + 0u) * p.surf_stride_elems + m] = pack_scaled_elem(
+                    b.x, row_max, inv_scale, out_scale, p.quantize_a8, p.write_unit_scale_row);
+                dst_surface[(base + 1u) * p.surf_stride_elems + m] = pack_scaled_elem(
+                    b.y, row_max, inv_scale, out_scale, p.quantize_a8, p.write_unit_scale_row);
+                dst_surface[(base + 2u) * p.surf_stride_elems + m] = pack_scaled_elem(
+                    b.z, row_max, inv_scale, out_scale, p.quantize_a8, p.write_unit_scale_row);
+                dst_surface[(base + 3u) * p.surf_stride_elems + m] = pack_scaled_elem(
+                    b.w, row_max, inv_scale, out_scale, p.quantize_a8, p.write_unit_scale_row);
+            }
         }
         if (p.write_unit_scale_row != 0u && lid == 0u) {
             dst_surface[p.hidden_size * p.surf_stride_elems + m] = half(row_max);

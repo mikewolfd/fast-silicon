@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import inspect
 import struct
 
 import numpy as np
 import pytest
 
 from fast_shared.ane_ffn import (
+    ANE_FFN_DEFAULT_SEGMENT,
     ANE_FFN_INPUT_BLOCK,
     ANE_FFN_INTERMEDIATE_BLOCK,
     ANE_FFN_PEAK_FLOOR,
     BLOB_DTYPE_FP16,
     BLOB_DTYPE_INT8,
     BLOB_MAGIC,
+    AneContext,
     AneFfnBreaker,
     AneFfnCalibration,
     AneFfnStartup,
@@ -299,3 +302,213 @@ def test_ane_wave_input_validation_without_hardware():
             host_in_fp16=np.zeros((4, 128), dtype=np.float16),
             signs_fp16=np.ones((64,), dtype=np.float16),
         )
+
+
+def test_ane_wave_default_quantize_a8_is_false_w8a16():
+    assert inspect.signature(AneContext.begin_ffn_wave).parameters["quantize_a8"].default is False
+    assert inspect.signature(AneWave.__init__).parameters["quantize_a8"].default is False
+
+    seen: dict[str, int] = {}
+
+    class _FakeCLib:
+        def fast_ane_ffn_wave_begin(
+            self,
+            _ctx,
+            _progs,
+            _outs,
+            n_segs,
+            _surf_in,
+            _host_in,
+            _signs,
+            tokens,
+            hidden,
+            quantize_a8,
+            use_shared_event,
+            timeout_ms,
+            out_ptr,
+            _err,
+            _err_len,
+        ):
+            seen["n_segs"] = int(n_segs)
+            seen["tokens"] = int(tokens)
+            seen["hidden"] = int(hidden)
+            seen["quantize_a8"] = int(quantize_a8)
+            seen["use_shared_event"] = int(use_shared_event)
+            seen["timeout_ms"] = int(timeout_ms)
+            out_ptr._obj.value = 0
+            return 0
+
+        def fast_ane_ffn_wave_destroy(self, _ptr):
+            return None
+
+    class _FakeLib:
+        _lib = _FakeCLib()
+
+    class _FakeCtx:
+        _lib = _FakeLib()
+        _ptr = 1
+
+    class _FakeHandle:
+        _ptr = 1
+
+    wave = AneWave(
+        _FakeCtx(),  # type: ignore[arg-type]
+        seg_progs=[_FakeHandle()],  # type: ignore[list-item]
+        seg_out_surfs=[_FakeHandle()],  # type: ignore[list-item]
+        surf_in=_FakeHandle(),  # type: ignore[arg-type]
+        host_in_fp16=np.zeros((8, 2560), dtype=np.float16),
+        signs_fp16=np.ones((2560,), dtype=np.float16),
+    )
+    wave.close()
+    assert seen == {
+        "n_segs": 1,
+        "tokens": 8,
+        "hidden": 2560,
+        "quantize_a8": 0,
+        "use_shared_event": 1,
+        "timeout_ms": 5000,
+    }
+
+
+def test_e4b_h_gt_2048_segmentation_and_mil_generation():
+    H, d_ff, M = 2560, 10240, 128
+    segs = segment_intermediate_sizes(d_ff, ANE_FFN_DEFAULT_SEGMENT)
+    assert segs == [2560, 2560, 2560, 2560]
+
+    rng = np.random.default_rng(2026)
+    w_norm = rng.uniform(0.5, 3.0, size=(H,)).astype(np.float32)
+    w_norm[2150] = 110.0  # Outlier past 2048 channel threshold
+    x_raw = rng.normal(0.0, 1.0, size=(M, H)).astype(np.float32)
+    x = (x_raw / np.sqrt(np.mean(x_raw**2, axis=-1, keepdims=True) + 1e-6)) * w_norm[None, :]
+    wg = rng.normal(0.0, 0.02, size=(d_ff, H)).astype(np.float32)
+    wu = rng.normal(0.0, 0.02, size=(d_ff, H)).astype(np.float32)
+    wd = rng.normal(0.0, 0.02, size=(H, d_ff)).astype(np.float32)
+
+    ref = eval_ffn_fp32_ref(x, wg, wu, wd, activation="gelu_tanh")
+    w8 = prepare_ffn_w8a8_weights(wg, wu, wd, hadamard_mode="full")
+    y = eval_ffn_w8a8(x, w8, activation="gelu_tanh")
+    m = compute_error_metrics(ref, y)
+    assert m["cosine"] > 0.999
+
+    mil = build_ffn_geglu_segment_mil(
+        H,
+        segs[0],
+        M,
+        w_gate_off=64,
+        w_up_off=128,
+        w_down_off=192,
+        w_gate_scale_off=256,
+        w_up_scale_off=320,
+        w_down_scale_off=384,
+        weight_dtype="int8_dequant",
+        input_dtype="fp16",
+        activation="gelu_tanh",
+        packed_token_scale=True,
+        fp16_safe_clamp=True,
+        normalize_mid=True,
+    )
+    assert f"tensor<fp16, [1, {H + 1}, 1, {M}]> x_cat" in mil
+    assert f"val = tensor<int32, [4]>([1, {H}, 1, {M}])" in mil
+    assert "constexpr_blockwise_shift_scale(" in mil
+
+
+def test_build_ane_models_post_norm_hadamard_mil_and_options():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    pytest.importorskip("coremltools")
+    build_script = Path(__file__).resolve().parents[2] / "fast-gemma4" / "scripts" / "build_ane_models.py"
+    if not build_script.is_file():
+        pytest.skip(f"build_ane_models.py not present at {build_script}")
+
+    spec = importlib.util.spec_from_file_location("build_ane_models_track_e_test", build_script)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["build_ane_models_track_e_test"] = mod
+    spec.loader.exec_module(mod)
+
+    # 1. Option resolution and validation
+    with pytest.raises(ValueError, match="hadamard_mode"):
+        mod.resolve_variant_mil_options("w8", hadamard_mode="bad")
+    with pytest.raises(ValueError, match="hadamard_op"):
+        mod.resolve_variant_mil_options("w8", hadamard_op="matmul")
+    auto_w8 = mod.resolve_variant_mil_options("w8")
+    assert auto_w8["hadamard_mode"] == "post_norm"
+    assert auto_w8["hadamard_op"] == "grouped_conv"
+    assert auto_w8["safe_gelu_clamp"] is False
+    assert auto_w8["normalize_mid"] is False
+    auto_fp16 = mod.resolve_variant_mil_options("fp16")
+    assert auto_fp16["hadamard_mode"] == "none"
+    assert auto_fp16["safe_gelu_clamp"] is False
+    assert auto_fp16["normalize_mid"] is False
+    opts = mod.resolve_variant_mil_options(
+        "w8", hadamard_mode="post_norm", hadamard_op="grouped_conv", safe_gelu_clamp="true", normalize_mid="true"
+    )
+    assert opts["hadamard_mode"] == "post_norm"
+    assert opts["hadamard_op"] == "grouped_conv"
+    assert opts["safe_gelu_clamp"] is True
+    assert opts["normalize_mid"] is True
+
+    # 2. Synthetic EarlyExit NPZ with E4B-width H=2560 (n_kv=2, k=4: 2 SWA + 2 Full)
+    rng = np.random.default_rng(314)
+    k, H, d_ff, ple_dim, n_q, n_kv = 4, 2560, 512, 64, 8, 2
+    npz: dict[str, np.ndarray] = {
+        "per_layer_model_proj_w": (rng.normal(0.0, 0.02, size=((k - 1) * ple_dim, H, 1, 1))).astype(np.float16),
+        "per_layer_proj_scale": np.array([1.0], dtype=np.float16),
+        "per_layer_proj_norm_w": np.ones((ple_dim,), dtype=np.float16),
+        "per_layer_input_scale": np.array([1.0], dtype=np.float16),
+        "n_q_heads": np.array(n_q, dtype=np.int32),
+    }
+    for i in range(k):
+        hd = 512 if i in (1, k - 1) else 256
+        qdim = n_q * hd
+        kv_dim = n_kv * hd
+        p = f"l{i}_"
+        npz[p + "w_in"] = rng.uniform(0.5, 2.0, size=(1, H, 1, 1)).astype(np.float16)
+        npz[p + "w_kn"] = np.ones((1, 1, 1, hd), dtype=np.float16)
+        if i == k - 1:
+            npz[p + "kv"] = rng.normal(0.0, 0.02, size=(2 * kv_dim, H, 1, 1)).astype(np.float16)
+        else:
+            npz[p + "qkv"] = rng.normal(0.0, 0.02, size=(qdim + 2 * kv_dim, H, 1, 1)).astype(np.float16)
+            npz[p + "w_qn"] = np.ones((1, 1, 1, hd), dtype=np.float16)
+            npz[p + "wo"] = rng.normal(0.0, 0.02, size=(H, qdim, 1, 1)).astype(np.float16)
+            npz[p + "w_pa"] = np.ones((1, H, 1, 1), dtype=np.float16)
+            npz[p + "w_pff"] = rng.uniform(0.5, 2.0, size=(1, H, 1, 1)).astype(np.float16)
+            npz[p + "gu"] = rng.normal(0.0, 0.02, size=(2 * d_ff, H, 1, 1)).astype(np.float16)
+            npz[p + "dn"] = rng.normal(0.0, 0.02, size=(H, d_ff, 1, 1)).astype(np.float16)
+            npz[p + "w_poff"] = np.ones((1, H, 1, 1), dtype=np.float16)
+            npz[p + "w_pg"] = rng.normal(0.0, 0.02, size=(ple_dim, H, 1, 1)).astype(np.float16)
+            npz[p + "w_pp"] = rng.normal(0.0, 0.02, size=(H, ple_dim, 1, 1)).astype(np.float16)
+            npz[p + "w_pple"] = np.ones((1, H, 1, 1), dtype=np.float16)
+            npz[p + "scalar"] = np.array([1.0], dtype=np.float16)
+
+    # Check exact WHT inner-product preservation on transformed weights
+    arch = mod.infer_ane_arch_from_npz(npz)
+    npz_rot, signs_map = mod.apply_post_norm_hadamard_transforms(npz, arch, hadamard_mode="post_norm")
+    assert set(signs_map) >= {"l0_in", "l0_pff", "l0_mid", "l3_in"}
+    x_norm = rng.normal(0.0, 1.0, size=(4, H)).astype(np.float32)
+    y_orig = x_norm @ npz["l0_qkv"].astype(np.float32)[:, :, 0, 0].T
+    x_had = hadamard_rotate_blocks(x_norm * signs_map["l0_in"][None, :], ANE_FFN_INPUT_BLOCK)
+    y_rot = x_had @ npz_rot["l0_qkv"].astype(np.float32)[:, :, 0, 0].T
+    np.testing.assert_allclose(y_rot, y_orig, atol=2e-2, rtol=2e-2)
+
+    # Build both grouped_conv and shared_conv MIL programs cleanly
+    for op_mode in ("grouped_conv", "shared_conv"):
+        prog, got_arch = mod.build_early_prefix_mil_program(
+            npz,
+            S=32,
+            P_SWA=64,
+            P_FULL=64,
+            hadamard_mode="post_norm",
+            hadamard_op=op_mode,
+            safe_gelu_clamp=True,
+            normalize_mid=True,
+        )
+        assert got_arch["hidden_size"] == H
+        mil_txt = str(prog)
+        assert "had_in" in mil_txt
+        assert "had_pff" in mil_txt
+        assert "had_mid" in mil_txt
+        assert "gclip" in mil_txt
+        assert "mscale" in mil_txt
