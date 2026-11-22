@@ -27,6 +27,8 @@ Model format and input limits can differ within a model family. For example, Flu
 6. [Speculative Decoding, `PrefixTree`, ANE Profiles & Parallel CoreML](#6-speculative-decoding-prefixtree-ane-profiles--parallel-coreml)
 7. [CoreAI audit of 22 decisions](#7-coreai-audit-of-22-decisions)
 8. [Reproducible CLI Invocations](#8-reproducible-cli-invocations)
+9. [v2.2 Cross-Silicon Validation & Regression Gates (2026-11-21)](#9-v22-cross-silicon-validation--regression-gates-2026-11-21)
+10. [v2.3 Cross-Silicon Accuracy, Precision & Contextual Validation (2026-11-22)](#10-v23-cross-silicon-accuracy-precision--contextual-validation-2026-11-22)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -638,10 +640,37 @@ Machine-readable record: [`docs/benchmarks/v22-validation-20261121.json`](benchm
 - **`AneWave` dispatch gating:** M4 Pro `d_ff=6144` wins **`1.81x–2.40x`** vs GPU (`M=128..256`) and `d_ff=12288` wins **`1.66x–2.13x`** (`M=128..2048`), while Base M5 breaker cleanly skips negative GPU-faster regimes.
 - **`p28` `MTLSharedEvent`:** At `M=1024`, M4 Pro drops `cpu_sync` (`~8.29 ms`) to `cpu_begin_return=0.45 ms` (saving `7.84 ms`), and Base M5 drops `8.75 ms` to `0.27 ms` (saving `8.64 ms`).
 
-### v2.3 Accuracy & Outcome Roadmap (Parallel Validation Queue)
+## 10. v2.3 Cross-Silicon Accuracy, Precision & Contextual Validation (2026-11-22)
 
-Pending parallel validation targets on real backfill/outcome benchmarks:
-- `fast-shared`: `finish_reason="length"` detection under constrained decoding, single-model async retry hooks (`roll_swa=1024`), header-anchored + sentence-snapped `parquet_pipeline` chunking, and multi-batch CoreAI calibration gates.
-- `fast-gemma4` & `fast-gpt-oss`: 4-gram repeat-loop breaker, `kv_i8='auto'` BF16 KV A/B on long contexts, FP32 `fused_softcap_argmax_bf16` + `precise::exp` parity, `WhitespaceGuard(32)` + `whitespace_flexible=True`, Hadamard-smoothed `W8A8`, and FP32 `MidOut`/RMSNorm/RoPE/SWA in `fast-gpt-oss`.
-- `fast-pplx`: `header_text` / `repeat_header_tokens` contextual window overlap tuning, Base M5 `slice-0` `GdnDecodeShared` invariance + FP32 `beta` sigmoid + `F32` `MappedEmbedding.gather`, and paired `Tier-1` `hetero2` + `Tier-2 LongEmbed 16K–32K` runs.
-- `ane_ffn` & `Early14`: `quantize_a8=False` (`W8A16`) default, `H > 2048` scale bypass fix, wired Hadamard + `normalize_mid` + `gelu` clamp in `build_ane_models.py`, and Hadamard-smoothed `kv_i8` long-context evaluation.
+Machine-readable validation receipt: [`benchmarks/v23-validation-20261121.json`](benchmarks/v23-validation-20261121.json). Only paired outcome/accuracy wins pass into defaults; negative experiments stay behind explicit opt-in flags or out of default code paths.
+
+### Track B — `fast-shared` Finish-Reason, Deferred Retries, Chunking & Calibration Gates
+
+| Fix / Gate | Baseline -> Promoted Outcome | Notes & Source |
+|---|---|---|
+| **Grammar `finish_reason="length"` + Async Retry** | `liquidai_112`: `5/16` valid (`0.3125`, F1 `0.2977`, `item 6` `ctok=117` mislabeled `stop`) -> **`16/16` (`1.000`, F1 `0.9114` / `0.9000`, `12/12` improved)**; `tight48`: `0/16` (`0.000` F1) -> **`16/16` (`0.9000` F1)**; `number_max8`: `4/4` emit `"length"` across `generate_batch` / `extract_rolling` / `extract_batch` | [`pipeline_llm.py`](../packages/fast-shared/src/fast_shared/pipeline_llm.py) |
+| **Conditional `SWA=1024` Gating** | Unconditional `swa=1024` regressed `norm256_roll_n16` (`230.8 -> 199.9 tok/s`, `3` `ff_jump` steps); gated `roll_swa` keeps `swa=512` (`B8` `305.9–314.0`, `B16` `459.9–463.5 tok/s`) | [`pipeline_llm.py`](../packages/fast-shared/src/fast_shared/pipeline_llm.py) |
+| **Header-Anchored & Sentence-Snapped Chunking** (`LegalBench-RAG`, `175` queries) | `fast-bge-small`: `0.3046 -> 0.4439` `span_ndcg@10` (`+0.1392`), `0.6314 -> 0.7099` `char_recall@10` (`auto_snap_header`, `136.6k tok/s`); `fast-embeddinggemma-2`: `0.3803 -> 0.5054` (`header_anchored`, `+0.1251`) / `0.4958` (`auto_snap_header`); cutoff `min_cos = 1.0` | [`parquet_pipeline.py`](../packages/fast-shared/src/fast_shared/parquet_pipeline.py) |
+| **Multi-Batch CoreAI Calibration & Diversity Gate** | Passes diverse 4-batch (`rms_scale_ratio=709.37`, `min_cos=0.999953`); rejects `calib_batches < 2`, duplicates (`unique=1`), and batch-1 outlier collapse (`per_batch_cosine=[1.0, -0.0519]`) | [`coreai_pipeline.py`](../packages/fast-shared/src/fast_shared/coreai_pipeline.py) |
+
+### Track C — `fast-gemma4` & `fast-gpt-oss` Precision, Loop Breakers & CoT Budgets
+
+| Package & Experiment | Promoted Default / Verdict | Paired Evidence (M4 Pro & Base M5) |
+|---|---|---|
+| **`fast-gemma4` FP32 `fused_softcap_argmax_bf16` & `logit_softcap`** | **PROMOTED** | Eliminates `1/1024` BF16 greedy mismatches vs FP32 (`0/1024` mismatches). `precise::exp` SDPA (`0.8232` vs `0.8232` F1, `52.7s` vs `51.7s`): **`NEGATIVE_NOT_PROMOTED`**. |
+| **`fast-gemma4` `A4_v2` 4-gram / Cycle Breaker + Lazy MTP Fallback** | **PROMOTED** (`window=96, min_prior_hits=4/5, penalty=8.0, p=1..8`) | Preserves `IFBench` `0.14` / `0.1607` (fixing `A4` v1 `0.12` regression; `rep_4gram 0.0221 -> 0.0142`), `MMLU` `0.4737`, `LiquidAI` `0.9444`, `BFCL` `0.8133`, lifting `MATH-500` `0.18 -> 0.20`. |
+| **`fast-gemma4` Negative / Unchanged Defaults** | `whitespace_flexible=None`, `kv_i8=True`, `MPP W8A8=OFF` | `ws_true`: BFCL `-24%..-35%` tok/s (`mask_fb` `34->49` / `32->180`); `kv_bf16` on `>6k` (`32` docs): identical `0.7720` F1 / `1.0` valid at `6.31 GB` vs `5.06 GB`; Base M5 `FWHT-64 MPP W8A8`: `EM=5/8`, `LQ48 0.9359–0.9373` vs `nompp` `8/8`, `0.9411` (`FAST_SILICON_MPP_W8A8` opt-in). |
+| **`fast-gpt-oss` Hybrid `f16` + `f32` Accumulators** | **VALIDATED OPTIMAL** (`bf16`/`fp32` **`NEGATIVE_NOT_PROMOTED`**) | Step-0 (`12` prompts) `min_cos=0.9963, max_diff=1.8109, 12/12 top1` vs `bf16_mlx` (`min_cos=0.9929, max_diff=3.5235`, `MidOut bf16` `7.5x` worse). Outcomes: `canon_low` MMLU `0.7263` (`137.2s`) beats `true_fp32` (`0.7228`, `458.9s`) and `bf16_inter` (`0.7018`, `421.9s`). |
+| **`fast-gpt-oss` `canon_low` CoT Budgets** | **VALIDATED OPTIMAL** (`_EFFORT_DEFAULT_BUDGET["low"]=48`, 4-gram `window=64`) | **`IFBench 0.19` (`inst 0.2321`), `MMLU 0.7263` (`207/285`), `MATH-500 0.54`, `LiquidAI 0.8128`, `BFCL 0.8467`** vs `skip` (`MATH 0.06`, `BFCL 0.52`), `natural_low` (`MMLU 0.4421`), `tight_48` (`IF 0.16, MMLU 0.7018`), `med` (`IF 0.13, MMLU 0.6702, MATH 0.48, BFCL 0.8133, LQ 0.8307`), and `low_loop_v2` (`IF 0.15`). |
+
+### Track D — `fast-pplx` Contextual Windows, `M5` Invariance & `LongEmbed 4K–32K`
+
+- **Contextual header repeat (`repeat_header_tokens=128` default for `context_tokens >= 512`, `overlap=0` default):** Lifts `LegalBench-RAG` `span_ndcg@10` / `char_recall@10` from `0.4528 / 0.6827` -> **`0.7352 / 0.9154`** (Tier-1, `+0.2825`) and `0.5145 / 0.7333` -> **`0.6832 / 0.8448`** (Tier-2, `+0.1687`, `1650.4 MB` peak), plus `0.9920` on `LongEmbed 2wikimqa`; `overlap=1` alone regressed (`0.4177` Tier-1, `0.5067` Tier-2) so remains opt-in.
+- **Base M5 `slice-0` `GdnDecodeShared` invariance & FP32 precision:** Passing explicit zero `rec_state` into the first streamed chunk plus FP32 `beta` `sigmoid` and `MappedEmbedding.gather(..., out_dtype="float32")` eliminated Base M5 `S=4096` stream-vs-whole drift (`3.01e-03 -> 0.0`).
+- **Paired `Tier-1` (`N=325`) `GPU` vs `hetero2` (`balanced`/`fast`/`parity`) & `Tier-2 LongEmbed 4K–32K` (`N=500`):** M4 Pro `hetero2_balanced` hits `155.8s` (`1.538 EOT`, `0.7376` E2E) vs `gpu` `273.7s` (`0.878 EOT`, `0.7392`); Base M5 `hetero2_fast` hits `110.9s` (`2.163 EOT`, `0.7381`) vs `gpu` `148.8s` (`1.614 EOT`, `0.7390`). On `LongEmbed 4K–32K` (`N=500`), `float32` scores `0.7510` (M4 `2205.5s`, `1.693 GB` `phys_footprint`) / `0.7511` (M5 `1630.9s`, `1.665 GB`) vs opt-in `int8` `state_codec` `0.7519` (`1.634–1.638 GB`).
+
+### Track E — ANE `W8A16`, `H>2048` Packing, `Early14` Hadamard & `6K` `kv_i8`
+
+- **`ane_ffn` `W8A16` default (`quantize_a8=False`) & `H > 2048` WHT fix:** Fixes row-scale packing (`row_max_rel_err <= 0.00044`, `H=2560`/`4096` `cos=0.99989`) and protects outlier layers (`E4B_M128_outlier`: `W8A8_NoHad` `0.993737` -> `W8A8_Had` `0.999788` -> **`W8A16_Had` `0.999893`** at `2.126 ms` M4 / `2.347 ms` M5).
+- **`build_ane_models.py --hadamard-mode auto`:** Applies `post_norm + grouped_conv` to `w8` (M4 Pro `cos_l14k 0.999031 -> 0.999363`, `rel_l14k 0.04298 -> 0.03552`, `40.41 -> 41.91 ms`; M5 `0.998742 -> 0.999076`, `rel_l14k 0.04783 -> 0.04104`, `37.94 -> 40.05 ms`, `2065` ANE / `0` CPU / `0` GPU ops) and `none` to `fp16` (`safe_gelu_clamp=False`, `normalize_mid=False`).
+- **`6K` Hadamard `kv_i8` (opt-in):** Improves `full_D512` `V cos 0.999798 -> 0.999961`, teacher-forced `KL 0.000877 -> 0.000498` (M4) / `0.000799 -> 0.000344` (M5), and M5 `6K` `bf16` agreement `0.6667 -> 0.8333` (`46.36 -> 32.69 tok/s` M4, `66.90 -> 43.17 tok/s` M5), so standard `kv_i8` remains default (`0.558` F1 on both).

@@ -77,6 +77,16 @@ Structured numbers live in [`../fast-silicon/docs/benchmarks/v22-validation-2026
 - **Embedding Prefetch & No-Cache Guard:** `lookahead_batches=4` (`N=1024`) accelerates `fast-bge-small` **`1.331x`** on M4 Pro (`280.4 -> 373.2 docs/s`, `min_cos=0.9999754`) and **`1.178x`** on Base M5 (`359.1 -> 423.0 docs/s`, `min_cos=0.9999746`), and speeds `fast-pplx` GPU **`1.022x`** on both hosts (`min_cos >= 0.9999965`). `use_nocache=False` remains the default after `use_nocache=True` regressed M4 Pro `embeddinggemma` runtime (`23.793s -> 27.122s`).
 - **Metal 4 `MPP::matmul2d` Quantized Gating & ANE FFN:** `metal_mpp_int8` keeps `W4A8` active on `bits=4` Apple10 prefill shapes (`>=8M`), while `W8A8` defaults OFF (`FAST_SILICON_MPP_W8A8=1` / `allow_w8a8=True` opt-in) with FP32 `fma(128.0|8.0, ws, bq)` weight metadata packing. Post-norm Hadamard `W8A8` ANE FFN raises worst 35-layer FFN cosine from `0.996032` to `0.999740`, `AneWave` wins **`1.66x–2.40x`** over GPU on M4 Pro, and `p28` `MTLSharedEvent` saves `7.84 ms` (M4 Pro) / `8.64 ms` (Base M5) CPU sync overhead at `M=1024`.
 
+### v2.3 Accuracy, Retry, Chunking & ANE FFN Highlights
+
+Structured numbers live in [`../fast-silicon/docs/benchmarks/v23-validation-20261121.json`](../../docs/benchmarks/v23-validation-20261121.json):
+
+- **Constrained Grammar `finish_reason` Fix & Single-Model Retry (`pipeline_llm.py`):** Fixed constrained rolling decode reporting `"stop"` instead of `"length"` when hitting `max_tokens` (`ctok=117` @ `max_tokens=112`), and added `ExtractRetryRequest`, `run_deferred_retries`, and `run_deferred_retries_async` for inline or post-sweep retry (`tight48`: `0/16 -> 16/16` valid, `F1 0.0 -> 0.900034`, `+4.1 MB` RSS; `async_deferred_112`: `12/12` improved `F1 0.235243 -> 0.900034`).
+- **Gated Rolling SWA (`pipeline_llm.py`):** Unlocked `roll_swa=1024` for `n_docs > 4` when `eff_roll_slots <= 8`, delivering **`+2.68%`** faster throughput (`197.25 -> 202.55 tok/s`) without the `-9.4%` regression observed at `B_slots=16`.
+- **Header-Anchored Embedding Windows (`parquet_pipeline.py`):** `plan_header_anchored_windows` + `has_header_anchor` lifts `LegalBench-RAG` (`n=175`) `span_nDCG@10` on **`fast-bge-small`** **`0.304649 -> 0.443886` (`+45.7%`, `char_R@10 0.631442 -> 0.709903`)** and **`fast-embeddinggemma-2`** **`0.38028 -> 0.505361` (`+32.9%`, `char_R@10 0.720889 -> 0.811396`)**; `snap_sentences` stays opt-in after scoring `0.280048` alone.
+- **CoreAI Calibration Diversity Gate (`coreai_pipeline.py`):** Added `assess_calibration_batch_diversity`, `evaluate_multi_batch_calibration_gate`, and `fail_on_nonfinite=True` (rejects single-batch, duplicate-batch, and synthetic collapse while diverse 4-batch passes at `min_cos=0.999953`).
+- **`ANE FFN` `W8A16` Default & `H > 2048` WHT Fix (`ane_ffn.py`, `fast_ane_handoff.mm`):** `AneWave` defaults to `quantize_a8=False` (`W8A16`, `cos=0.999868..0.999901` on E2B vs `0.999794..0.999832` `W8A8_Had` and `0.9937..0.9951` `W8A8_NoHad`), and `H > 2048` WHT-128 scale bypass fix achieves `cos=0.999890..0.999892` (`row_max_rel_err <= 0.00044`) on `H=2560` / `4096`.
+
 ## Shared Parquet Controls
 
 The shared CLI and `embed_parquet` separate source reading (`--batch-rows`), encoder calls (`--encode-batch-rows`), and shard writes (`--shard-rows`):
