@@ -54,6 +54,7 @@ The public short and long probes used 47 and 512 tokens including the question. 
 - **Opt-in `CoreAI-Opt` & `macOS 27.2.1` `.aimodel` options** ([`coreai_export.py`](src/fast_decision_models/coreai_export.py)):
   - **`CoreAI-Opt` calibrated `w8` (`ExportBackend.CoreML`, M4 Pro `26.6`):** cuts `RAGTruth` `ECE-15` by **`-14.3%`** (`0.0970` vs. `0.1131`), improves Brier (`0.2174` vs. `0.2214`) and NLL (`0.6245` vs. `0.6341`), at `5.756` vs. `5.826 EOT` (`0.988x`). (`w4_per_block` on `ExportBackend.CoreML` is blocked by default due to macOS `26.6` CoreML logit inversion.)
   - **`macOS 27.2.1` `FP16` `.aimodel` ANE (`w8_f16` + `prefer_neural_engine`, Base M5):** casting weights/inputs to `FP16` unlocks **`1,652` ANE ops** (`logit_cos = 0.999831`), cutting isolated `S=256` warm latency **`4.09x`** from `94.18 ms` (FP32 `MPSGraph`) to **`23.00 ms`** (`15.4x` faster than stock `CoreAI`'s `354.1 ms`) in **`0.44 GB`** combined (`62.3 MB` `phys_footprint`).
+  - **v2.3 Multi-Batch `CoreAI-Opt` Calibration & Diversity Gate (`coreai_pipeline.py`):** Enforces `calib_batches >= 2`, duplicate-batch detection, `fail_on_nonfinite=True`, and per-batch cosine stability (`evaluate_multi_batch_calibration_gate`, passing diverse 4-batch calibration at `min_cos = 0.999953` while rejecting single-batch outlier collapse). [v2.3 validation](../../docs/benchmarks/v23-validation-20261121.json)
 
 ### 2. `Kev-0.8B` (`W8 g64`) Batched `B=8` & `256`-Token `GDN+KV` `PrefixTree` (`Cat 2`, `N=1,400`)
 

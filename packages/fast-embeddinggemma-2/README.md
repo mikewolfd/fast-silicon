@@ -62,6 +62,8 @@ At 512 tokens, 81 questions had no annotated answer text in any visible passage.
 
 Warm encoding covers all queries and passages from prepared token IDs. The 2,048-token row reuses the same queries and includes their encoding time. Loading and warmup took 112.8 s for the project, 94.7 s for FP16 and 95.3 s for INT8 in this run. [Matched scores, timing and source spans](../../docs/benchmarks/embeddinggemma-legal-512-20261121.json)
 
+- **v2.3 Header-Anchored Chunking & Cutoff Parity (`parquet_pipeline.py`):** On 175-query `LegalBench-RAG` chunked windows, `header_anchored` chunking lifted `span_ndcg@10` from **`0.3803 -> 0.5054` (`+32.9%`)** (`char_recall@10` `0.7209 -> 0.8114`; `auto_snap_header` reached `0.4958`), with boundary cutoff `min_cos = 1.0`. Under v2.2 `use_nocache=False` stays default after `use_nocache=True` regressed M4 Pro runtime (`23.79 s -> 27.12 s`). [v2.3 validation](../../docs/benchmarks/v23-validation-20261121.json)
+
 ### 2. Corpus Speed, `B=1` Latency & Silicon Wins
 
 | Benchmark (`benchmark_monorepo.py` / ABBA OCR) | Base M5 (`24 GB`, `macOS 27.2.1`) | M4 Pro (`48 GB`, `macOS 26.6`) | Key Architectural Takeaway |

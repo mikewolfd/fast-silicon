@@ -47,6 +47,8 @@ The retrieval score averages the ranking scores for 150 NanoBEIR queries and 175
 
 The public Core ML comparison uses `sidekickd/bge-small-en-v1.5-coreml`. On M4 Pro its embeddings had at least 0.99996 cosine similarity to `fast-bge-small` across two queries and three documents. The alternative `michaeljelly/bge-small-en-coreml-v1.5` export returned non-finite first-token embeddings with `CPU_ONLY` and `CPU_AND_GPU`. With `CPU_AND_NE` it reached 0.518 cosine similarity on the test query and 0.619 on the test document.
 
+- **v2.3 Header-Anchored & Sentence-Snapped Chunking (`parquet_pipeline.py`):** Prepending document headers (`plan_header_anchored_windows` + `auto_snap_header`) lifted 175-query `LegalBench-RAG` `span_ndcg@10` from **`0.3046 -> 0.4439` (`+45.7%`)** and `char_recall@10` from **`0.6314 -> 0.7099`** at `136,600 tok/s` (`sentence_snap` alone without header anchoring scored `0.2800` and remains opt-in). [v2.3 validation](../../docs/benchmarks/v23-validation-20261121.json)
+
 ### 2. Throughput, Latency & Parallel Multi-Bucket CoreML Build
 
 | Benchmark (`benchmark_monorepo.py` / `benchmark_capabilities.py`) | Base M5 (`24 GB`, `macOS 27.2.1`) | M4 Pro (`48 GB`, `macOS 26.6`) | Takeaway |
