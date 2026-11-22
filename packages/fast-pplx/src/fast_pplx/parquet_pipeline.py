@@ -23,6 +23,7 @@ from fast_shared.parquet_pipeline import (
 )
 
 from .config import PplxConfig
+from .tokenizer import ContextualWindow
 
 _SUPPORTED_VECTOR_DTYPES = ("float32", "float16", "int8")
 
@@ -318,6 +319,10 @@ def embed_contextual_parquet(
     chunk_tokens: int = 256,
     context_tokens: int = 2048,
     overlap: int = 32,
+    header_text: str | None = None,
+    header_col: str | None = None,
+    repeat_header_tokens: int | None = None,
+    window_overlap_chunks: int = 0,
     mode: str | None = None,
     dtype: str = "float32",
     batch_rows: int = 256,
@@ -348,6 +353,10 @@ def embed_contextual_parquet(
         raise ValueError(f"context_tokens must be positive, got {context_tokens}")
     if int(shard_rows) <= 0:
         raise ValueError(f"shard_rows must be positive, got {shard_rows}")
+    if int(window_overlap_chunks) < 0:
+        raise ValueError(f"window_overlap_chunks must be non-negative, got {window_overlap_chunks}")
+    if repeat_header_tokens is not None and int(repeat_header_tokens) < 0:
+        raise ValueError(f"repeat_header_tokens must be non-negative, got {repeat_header_tokens}")
     if dtype not in _SUPPORTED_VECTOR_DTYPES:
         raise ValueError(f"Unsupported vector dtype {dtype!r}; expected one of {_SUPPORTED_VECTOR_DTYPES}")
 
@@ -360,6 +369,12 @@ def embed_contextual_parquet(
     cols_to_read = list(first_schema.names if keep_cols is None else keep_cols)
     if eff_text_col not in cols_to_read:
         cols_to_read.append(eff_text_col)
+    eff_header_col = str(header_col) if header_col is not None else None
+    if eff_header_col is not None:
+        if eff_header_col not in first_schema.names:
+            raise KeyError(f"Header column {eff_header_col!r} not found in schema {first_schema.names}")
+        if eff_header_col not in cols_to_read:
+            cols_to_read.append(eff_header_col)
     if ocr_pages_only or filter_ocr:
         for req_col in ("is_ocr", "page_offsets", "ocr_pages"):
             if req_col in first_schema.names and req_col not in cols_to_read:
@@ -422,12 +437,24 @@ def embed_contextual_parquet(
     wave_num = 0
 
     # Pending prepared windows (bounded to <= shard_rows in sharded mode or flushed per batch in single-file mode).
-    # Each entry: (meta_row_dict, w_idx, chunks_w, spans_w)
-    pending_windows: list[tuple[dict[str, Any], int, list[str], list[tuple[int, int]]]] = []
+    eff_header_text = header_text.strip() if (header_text is not None and header_text.strip()) else None
+    default_repeat_tokens: int | None
+    if repeat_header_tokens is not None:
+        default_repeat_tokens = int(repeat_header_tokens)
+    elif eff_header_text is not None:
+        default_repeat_tokens = None
+    elif int(context_tokens) >= 512:
+        # Validated LegalBench-RAG default: anchor lead tokens on long continuation windows unless disabled (0).
+        default_repeat_tokens = 128
+    else:
+        default_repeat_tokens = None
+
+    # Each entry: (meta_row_dict, w_idx, ContextualWindow)
+    pending_windows: list[tuple[dict[str, Any], int, ContextualWindow]] = []
     pending_chunk_count = 0
 
     def _build_wave_table(
-        entries: Sequence[tuple[dict[str, Any], int, list[str], list[tuple[int, int]]]],
+        entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
         vec_mats: Sequence[np.ndarray],
     ) -> pa.Table:
         col_data: dict[str, list[Any]] = {k: [] for k in keep_names}
@@ -439,12 +466,19 @@ def embed_contextual_parquet(
         vec_blocks: list[np.ndarray] = []
 
         _, _, np_dt = _arrow_vector_types(dtype, target_dim)
-        for (meta_row, w_idx, chunks_w, spans_w), vec_mat in zip(entries, vec_mats, strict=True):
+        for (meta_row, w_idx, win), vec_mat in zip(entries, vec_mats, strict=True):
             vec_np = np.asarray(vec_mat, dtype=np_dt)
             if vec_np.ndim == 1:
                 vec_np = vec_np.reshape(1, target_dim)
-            vec_blocks.append(vec_np[: len(chunks_w)])
-            for c_idx, (c_text, (c0, c1)) in enumerate(zip(chunks_w, spans_w, strict=True)):
+            st = int(win.emit_start)
+            n_emit = len(win.spans)
+            if len(vec_np) < st + n_emit:
+                raise RuntimeError(
+                    f"Expected at least {st + n_emit} vectors for window {w_idx}, got {len(vec_np)}"
+                )
+            vec_blocks.append(vec_np[st : st + n_emit])
+            emitted_chunks = win.chunks[st : st + n_emit]
+            for c_idx, (c_text, (c0, c1)) in enumerate(zip(emitted_chunks, win.spans, strict=True)):
                 for k in keep_names:
                     col_data[k].append(meta_row.get(k))
                 win_indices.append(int(w_idx))
@@ -468,9 +502,9 @@ def embed_contextual_parquet(
         return pa.Table.from_arrays(arrays, schema=out_schema)
 
     def _encode_entries(
-        entries: Sequence[tuple[dict[str, Any], int, list[str], list[tuple[int, int]]]],
+        entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
     ) -> tuple[list[np.ndarray], int]:
-        win_chunks = [e[2] for e in entries]
+        win_chunks = [e[2].chunks for e in entries]
         win_vecs: list[np.ndarray] = []
         tok_count = 0
         encode_ctx_toks_fn = getattr(engine, "encode_contextual_tokens", None)
@@ -497,11 +531,11 @@ def embed_contextual_parquet(
         clear_mlx_arena(256)
         return win_vecs, tok_count
 
-    def _flush_wave(entries: list[tuple[dict[str, Any], int, list[str], list[tuple[int, int]]]]) -> None:
+    def _flush_wave(entries: list[tuple[dict[str, Any], int, ContextualWindow]]) -> None:
         nonlocal single_writer, shard_idx, rows_emitted, total_tokens, wave_num
         if not entries:
             return
-        n_chunks_wave = sum(len(e[2]) for e in entries)
+        n_chunks_wave = sum(len(e[2].spans) for e in entries)
         wave_num += 1
 
         if single_file_mode:
@@ -528,7 +562,7 @@ def embed_contextual_parquet(
                         sub_entries = entries[st : st + eff_window_batch]
                         win_vecs, tok_cnt = _encode_entries(sub_entries)
                         writer.write_table(_build_wave_table(sub_entries, win_vecs))
-                        rows_emitted += sum(len(e[2]) for e in sub_entries)
+                        rows_emitted += sum(len(e[2].spans) for e in sub_entries)
                         total_tokens += tok_cnt
                 os.replace(tmp_shard, shard_path)
             except BaseException:
@@ -568,22 +602,49 @@ def embed_contextual_parquet(
                     if not raw_text.strip():
                         if skip_empty:
                             continue
-                        grouped = [([""], [(0, 0)])]
+                        grouped = [ContextualWindow(chunks=[""], spans=[(0, 0)], emit_start=0)]
                     else:
                         doc_input = (eff_prefix + raw_text) if eff_prefix else raw_text
-                        grouped = tokenizer.chunk_and_group_document(
-                            doc_input,
-                            chunk_tokens=int(chunk_tokens),
-                            context_tokens=int(context_tokens),
-                            overlap=int(overlap),
+                        raw_hdr = r.get(eff_header_col) if eff_header_col is not None else eff_header_text
+                        row_hdr = str(raw_hdr).strip() if raw_hdr is not None else ""
+                        if not row_hdr:
+                            row_hdr = eff_header_text or ""
+                        row_hdr_opt = row_hdr or None
+                        row_rep = (
+                            int(repeat_header_tokens)
+                            if repeat_header_tokens is not None
+                            else (None if row_hdr_opt is not None else default_repeat_tokens)
                         )
+                        plan_fn = getattr(tokenizer, "plan_contextual_windows", None)
+                        if callable(plan_fn):
+                            grouped = plan_fn(
+                                doc_input,
+                                chunk_tokens=int(chunk_tokens),
+                                context_tokens=int(context_tokens),
+                                overlap=int(overlap),
+                                header_text=row_hdr_opt,
+                                repeat_header_tokens=row_rep,
+                                window_overlap_chunks=int(window_overlap_chunks),
+                            )
+                        else:
+                            grouped = [
+                                ContextualWindow(chunks=c_w, spans=s_w, emit_start=0)
+                                for c_w, s_w in tokenizer.chunk_and_group_document(
+                                    doc_input,
+                                    chunk_tokens=int(chunk_tokens),
+                                    context_tokens=int(context_tokens),
+                                    overlap=int(overlap),
+                                    header_text=row_hdr_opt,
+                                    repeat_header_tokens=row_rep,
+                                )
+                            ]
                         if not grouped:
                             continue
 
                     meta_row = {k: r.get(k) for k in keep_names}
-                    for w_idx, (chunks_w, spans_w) in enumerate(grouped):
-                        pending_windows.append((meta_row, w_idx, chunks_w, spans_w))
-                        pending_chunk_count += len(chunks_w)
+                    for w_idx, win in enumerate(grouped):
+                        pending_windows.append((meta_row, w_idx, win))
+                        pending_chunk_count += len(win.spans)
                         if single_file_mode and len(pending_windows) >= eff_window_batch:
                             _flush_wave(pending_windows)
                             pending_windows = []

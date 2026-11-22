@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field, is_dataclass, replace
 import inspect
 import json
 import os
@@ -15,6 +16,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -49,6 +51,27 @@ class ParquetExtractSummary:
     elapsed_sec: float
     docs_per_sec: float
     decode_tok_s: float
+    retries_attempted: int = 0
+    retries_succeeded: int = 0
+
+
+@dataclass(frozen=True)
+class ExtractRetryRequest:
+    """Deferred single-model extraction retry payload."""
+
+    row_index: int
+    prompt: str
+    system_prompt: str
+    json_schema: str | dict[str, Any] | None
+    json_schema_dict: Mapping[str, Any] | None
+    attempt: int
+    max_tokens: int
+    finish_reason: str
+    valid_json: bool
+    valid_schema: bool
+    extractconf_risk: float
+    response_text: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 def slice_first_pages_utf8(text: str, page_offsets: list[int] | None, max_pages: int) -> str:
@@ -354,6 +377,240 @@ def _resolve_effective_thinking(
     return eff_thinking
 
 
+_ENGINE_LOCKS_GUARD = threading.Lock()
+_ENGINE_LOCKS: WeakKeyDictionary[Any, threading.RLock] = WeakKeyDictionary()
+DEFAULT_RETRY_REASONS: tuple[str, ...] = ("length", "invalid_schema", "invalid_json")
+
+
+def _get_engine_lock(engine: Any) -> threading.RLock:
+    with _ENGINE_LOCKS_GUARD:
+        lock = _ENGINE_LOCKS.get(engine)
+        if lock is None:
+            lock = threading.RLock()
+            try:
+                _ENGINE_LOCKS[engine] = lock
+            except TypeError:
+                pass
+        return lock
+
+
+def _resolve_stop_token_ids(tokenizer: Any) -> frozenset[int]:
+    if tokenizer is None:
+        return frozenset()
+    out: set[int] = set()
+    raw_stops = getattr(tokenizer, "stop_token_ids", None)
+    if raw_stops is not None and not isinstance(raw_stops, (str, bytes)):
+        try:
+            for tid in raw_stops:
+                if isinstance(tid, int) and not isinstance(tid, bool):
+                    out.add(int(tid))
+        except TypeError:
+            pass
+    for attr in ("eos_token_id", "eot_id", "eot_token_id"):
+        val = getattr(tokenizer, attr, None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            out.add(int(val))
+    return frozenset(out)
+
+
+def _resolve_rolling_finish_reason(
+    gen_tokens: Sequence[int],
+    *,
+    max_tokens: int,
+    stop_ids: frozenset[int],
+    explicit_finish_reason: str | None = None,
+    valid_json: bool = True,
+    valid_schema: bool = True,
+) -> str:
+    if explicit_finish_reason == "length":
+        return "length"
+    ended_with_stop = bool(gen_tokens and stop_ids and int(gen_tokens[-1]) in stop_ids)
+    if max_tokens > 0 and len(gen_tokens) >= max_tokens and not ended_with_stop:
+        return "length"
+    if max_tokens > 0 and len(gen_tokens) >= max_tokens and not (valid_json and valid_schema):
+        return "length"
+    return explicit_finish_reason or "stop"
+
+
+def _update_item_finish_reason(item: Any, finish_reason: str) -> Any:
+    if str(getattr(item, "finish_reason", "stop")) == finish_reason:
+        return item
+    try:
+        item.finish_reason = finish_reason
+        return item
+    except Exception:
+        if is_dataclass(item):
+            try:
+                return replace(item, finish_reason=finish_reason)
+            except Exception:
+                pass
+        return SimpleNamespace(
+            text=getattr(item, "text", ""),
+            parsed=getattr(item, "parsed", None),
+            token_ids=getattr(item, "token_ids", None),
+            prompt_tokens=int(getattr(item, "prompt_tokens", 0) or 0),
+            completion_tokens=int(getattr(item, "completion_tokens", 0) or 0),
+            valid_json=bool(getattr(item, "valid_json", True)),
+            valid_schema=bool(getattr(item, "valid_schema", True)),
+            finish_reason=finish_reason,
+            telemetry=getattr(item, "telemetry", None),
+            repaired=bool(getattr(item, "repaired", False)),
+            fallback_used=bool(getattr(item, "fallback_used", False)),
+        )
+
+
+def _normalize_batch_finish_reasons(
+    engine: Any,
+    items: Sequence[Any],
+    *,
+    max_tokens: int,
+    entry_schemas: Sequence[str | dict[str, Any] | None],
+) -> list[Any]:
+    if max_tokens <= 0 or not items:
+        return list(items)
+    stop_ids = _resolve_stop_token_ids(getattr(engine, "tokenizer", None))
+    upfront_cache: dict[str | None, tuple[int, ...]] = {}
+    has_get_grammar = callable(getattr(engine, "get_grammar", None))
+
+    def _upfront_for(spec: str | dict[str, Any] | None) -> tuple[int, ...]:
+        if spec is None or not has_get_grammar:
+            return ()
+        sk = spec if isinstance(spec, str) else json.dumps(spec, sort_keys=True, ensure_ascii=False)
+        cached = upfront_cache.get(sk)
+        if cached is not None:
+            return cached
+        up: tuple[int, ...] = ()
+        try:
+            gh = engine.get_grammar(spec)
+            raw_up = getattr(gh, "upfront_ff", ())
+            if raw_up:
+                up = tuple(int(t) for t in raw_up)
+        except Exception:
+            up = ()
+        upfront_cache[sk] = up
+        return up
+
+    out: list[Any] = []
+    for idx, it in enumerate(items):
+        raw_fr = str(getattr(it, "finish_reason", "stop"))
+        if raw_fr == "length":
+            out.append(it)
+            continue
+        spec = entry_schemas[idx] if idx < len(entry_schemas) else None
+        tok_ids = getattr(it, "token_ids", None)
+        c_toks = int(getattr(it, "completion_tokens", 0) or 0)
+        v_json = bool(getattr(it, "valid_json", True))
+        v_schema = bool(getattr(it, "valid_schema", True))
+        repaired = bool(getattr(it, "repaired", False))
+
+        hit_len = False
+        if isinstance(tok_ids, Sequence) and not isinstance(tok_ids, (str, bytes)):
+            ended_with_stop = bool(tok_ids and stop_ids and int(tok_ids[-1]) in stop_ids)
+            upfront_ff = _upfront_for(spec)
+            matched_up = (
+                len(upfront_ff)
+                if (
+                    upfront_ff
+                    and len(tok_ids) >= len(upfront_ff)
+                    and tuple(int(t) for t in tok_ids[: len(upfront_ff)]) == upfront_ff
+                )
+                else 0
+            )
+            eff_gen_len = len(tok_ids) - matched_up
+            if (eff_gen_len >= max_tokens and not ended_with_stop) or (
+                c_toks >= max_tokens and spec is not None and (not v_json or not v_schema)
+            ):
+                hit_len = True
+        elif c_toks >= max_tokens and spec is not None and (not v_json or not v_schema or repaired):
+            hit_len = True
+
+        out.append(_update_item_finish_reason(it, "length") if hit_len else it)
+    return out
+
+
+def _resolve_retry_reasons(retry_on: Sequence[str] | str | None) -> tuple[str, ...]:
+    if retry_on is None:
+        return DEFAULT_RETRY_REASONS
+    if isinstance(retry_on, str):
+        parts = [p.strip().lower() for p in retry_on.split(",") if p.strip()]
+        return tuple(parts) if parts else DEFAULT_RETRY_REASONS
+    return tuple(str(x).strip().lower() for x in retry_on if str(x).strip())
+
+
+def _should_retry_row(
+    *,
+    finish_reason: str,
+    valid_json: bool,
+    valid_schema: bool,
+    extractconf_risk: float,
+    retry_reasons: tuple[str, ...],
+    retry_risk_threshold: float | None,
+) -> bool:
+    if finish_reason in ("skipped_empty", "empty"):
+        return False
+    if "always" in retry_reasons:
+        return True
+    if "length" in retry_reasons and finish_reason == "length":
+        return True
+    if "invalid_json" in retry_reasons and not valid_json:
+        return True
+    if "invalid_schema" in retry_reasons and not valid_schema:
+        return True
+    if retry_risk_threshold is not None and float(extractconf_risk) >= float(retry_risk_threshold):
+        return True
+    return False
+
+
+def _run_awaitables_sync(coros: Sequence[Any]) -> None:
+    if not coros:
+        return
+
+    async def _gather_all() -> None:
+        for c in coros:
+            await c
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(_gather_all())
+        return
+    for c in coros:
+        loop.create_task(c)
+
+
+def _dispatch_retry_hooks(
+    requests: Sequence[ExtractRetryRequest],
+    *,
+    deferred_retries: list[ExtractRetryRequest] | None = None,
+    retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
+    async_retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
+) -> None:
+    if not requests:
+        return
+    if deferred_retries is not None:
+        deferred_retries.extend(requests)
+    pending_coros: list[Any] = []
+    if retry_hook is not None:
+        for req in requests:
+            res = retry_hook(req)
+            if inspect.isawaitable(res):
+                pending_coros.append(res)
+    if async_retry_hook is not None:
+        for req in requests:
+            res = async_retry_hook(req)
+            if inspect.isawaitable(res):
+                pending_coros.append(res)
+    _run_awaitables_sync(pending_coros)
+
+
+def _schema_key(spec: str | dict[str, Any] | None) -> str | None:
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        return spec
+    return json.dumps(spec, sort_keys=True, ensure_ascii=False)
+
+
 def _execute_rolling_batch(
     engine: Any,
     prompts: Sequence[str],
@@ -459,8 +716,19 @@ def _execute_rolling_batch(
     sys_ids = prompt_ids_ord[0][:lcp]
     suf_all = [x[lcp:] + upfront_ord[i] for i, x in enumerate(prompt_ids_ord)]
     max_suf = max(len(s) for s in suf_all)
+    eff_roll_slots = max(1, min(int(b_slots), len(suf_all)))
     win_sz = int(getattr(getattr(engine, "model", None), "window_size", 512))
-    roll_swa = 1024 if (clean_extra.get("enable_ff_jump", True) and n_docs <= 4 and (max_suf + max_tokens + 64) > win_sz) else 512
+    explicit_swa_cap = clean_extra.get("swa_ring_cap")
+    if explicit_swa_cap is not None:
+        roll_swa = int(explicit_swa_cap)
+    elif (
+        clean_extra.get("enable_ff_jump", True)
+        and eff_roll_slots <= 8
+        and (max_suf + max_tokens + 64) > win_sz
+    ):
+        roll_swa = max(1024, win_sz)
+    else:
+        roll_swa = max(512, win_sz)
 
     roll_kw: dict[str, Any] = {
         "sys_ids": sys_ids,
@@ -491,6 +759,8 @@ def _execute_rolling_batch(
     gen_toks_all = roll_res["gen_toks"]
     roll_telem = roll_res.get("telemetry")
     roll_valid_schemas = roll_res.get("valid_schemas")
+    roll_finish_reasons = roll_res.get("finish_reasons")
+    stop_ids = _resolve_stop_token_ids(getattr(engine, "tokenizer", None))
 
     items: list[Any] = []
     valid_json_cnt = 0
@@ -516,10 +786,22 @@ def _execute_rolling_batch(
                 is_schema = bool(doc_g.validate_token_sequence(full_out_ids))
         if is_schema:
             valid_schema_cnt += 1
-        finish_reason = (
-            "length"
-            if len(g_toks) >= max_tokens and not (doc_g is not None and is_schema)
-            else "stop"
+        explicit_fr = (
+            str(roll_finish_reasons[idx])
+            if (
+                roll_finish_reasons is not None
+                and idx < len(roll_finish_reasons)
+                and roll_finish_reasons[idx] is not None
+            )
+            else None
+        )
+        finish_reason = _resolve_rolling_finish_reason(
+            g_toks,
+            max_tokens=max_tokens,
+            stop_ids=stop_ids,
+            explicit_finish_reason=explicit_fr,
+            valid_json=is_json,
+            valid_schema=is_schema,
         )
         telem_i = roll_telem[idx] if (roll_telem is not None and idx < len(roll_telem)) else None
         items.append(
@@ -543,6 +825,7 @@ def _execute_rolling_batch(
         "prompt_tokens": sum(len(x) for x in prompt_ids_ord),
         "completion_tokens": int(roll_res.get("tot_out_tok", sum(len(it.token_ids) for it in items))),
         "decode_sec": float(roll_res.get("decode_sec", 0.0)),
+        "swa_ring_cap": roll_swa,
     }
     return SimpleNamespace(items=items, stats=stats), order
 
@@ -558,28 +841,29 @@ def _generate_batch_with_schema_fallback(
     eff_b_slots: int,
 ) -> Any:
     """Route multi-schema batches natively via `per_doc_grammars` or group cleanly by schema."""
-    distinct_specs = {
-        (
-            s
-            if isinstance(s, str)
-            else (json.dumps(s, sort_keys=True, ensure_ascii=False) if s is not None else None)
-        ): s
-        for s in entry_schemas
-    }
+    distinct_specs = {_schema_key(s): s for s in entry_schemas}
     single_schema = next(iter(distinct_specs.values())) if len(distinct_specs) == 1 else fallback_schema
     kw = dict(base_gen_kw)
+    eff_max_tokens = int(kw.get("max_tokens", 0) or 0)
     if len(distinct_specs) <= 1:
         kw["json_schema"] = single_schema
-        return engine.generate_batch(prompts, **kw)
+        raw_res = engine.generate_batch(prompts, **kw)
+        norm_items = _normalize_batch_finish_reasons(
+            engine, raw_res.items, max_tokens=eff_max_tokens, entry_schemas=entry_schemas
+        )
+        return SimpleNamespace(items=norm_items, stats=getattr(raw_res, "stats", {}) or {})
     if accepts_per_doc:
         kw["json_schema"] = single_schema
         kw["per_doc_grammars"] = list(entry_schemas)
-        return engine.generate_batch(prompts, **kw)
+        raw_res = engine.generate_batch(prompts, **kw)
+        norm_items = _normalize_batch_finish_reasons(
+            engine, raw_res.items, max_tokens=eff_max_tokens, entry_schemas=entry_schemas
+        )
+        return SimpleNamespace(items=norm_items, stats=getattr(raw_res, "stats", {}) or {})
 
     grouped: dict[str | None, list[int]] = {}
     for idx_e, sc in enumerate(entry_schemas):
-        sk = sc if isinstance(sc, str) else (json.dumps(sc, sort_keys=True, ensure_ascii=False) if sc is not None else None)
-        grouped.setdefault(sk, []).append(idx_e)
+        grouped.setdefault(_schema_key(sc), []).append(idx_e)
 
     combined_items: list[Any] = [None] * len(prompts)
     combined_stats: dict[str, float] = {
@@ -594,22 +878,26 @@ def _generate_batch_with_schema_fallback(
         g_kw = dict(kw)
         g_kw["json_schema"] = entry_schemas[idx_list[0]]
         g_kw["batch_size"] = min(len(idx_list), eff_b_slots)
+        sub_schemas = [entry_schemas[k] for k in idx_list]
         sub_res = engine.generate_batch([prompts[k] for k in idx_list], **g_kw)
+        norm_sub_items = _normalize_batch_finish_reasons(
+            engine, sub_res.items, max_tokens=eff_max_tokens, entry_schemas=sub_schemas
+        )
         for pos_sub, orig_e in enumerate(idx_list):
-            combined_items[orig_e] = sub_res.items[pos_sub]
+            combined_items[orig_e] = norm_sub_items[pos_sub]
         sub_stats = getattr(sub_res, "stats", {}) or {}
-        combined_stats["docs"] += int(sub_stats.get("docs", len(sub_res.items)))
+        combined_stats["docs"] += int(sub_stats.get("docs", len(norm_sub_items)))
         combined_stats["valid_json_count"] += int(
-            sub_stats.get("valid_json_count", sum(1 for it in sub_res.items if it.valid_json))
+            sub_stats.get("valid_json_count", sum(1 for it in norm_sub_items if it.valid_json))
         )
         combined_stats["valid_schema_count"] += int(
-            sub_stats.get("valid_schema_count", sum(1 for it in sub_res.items if it.valid_schema))
+            sub_stats.get("valid_schema_count", sum(1 for it in norm_sub_items if it.valid_schema))
         )
         combined_stats["prompt_tokens"] += int(
-            sub_stats.get("prompt_tokens", sum(it.prompt_tokens for it in sub_res.items))
+            sub_stats.get("prompt_tokens", sum(it.prompt_tokens for it in norm_sub_items))
         )
         combined_stats["completion_tokens"] += int(
-            sub_stats.get("completion_tokens", sum(it.completion_tokens for it in sub_res.items))
+            sub_stats.get("completion_tokens", sum(it.completion_tokens for it in norm_sub_items))
         )
         combined_stats["decode_sec"] += float(sub_stats.get("decode_sec", 0.0))
     return SimpleNamespace(items=combined_items, stats=combined_stats)
@@ -679,6 +967,243 @@ def _score_item_extractconf(
         calibrator=calibrator,
         _already_parsed=True,
     )
+
+
+def _is_retry_better(
+    *,
+    cur_valid_schema: bool,
+    cur_valid_json: bool,
+    cur_finish_reason: str,
+    cur_risk: float,
+    cand_valid_schema: bool,
+    cand_valid_json: bool,
+    cand_finish_reason: str,
+    cand_risk: float,
+) -> bool:
+    cur_rank = (
+        1 if cur_valid_schema else 0,
+        1 if cur_valid_json else 0,
+        1 if cur_finish_reason != "length" else 0,
+        -float(cur_risk),
+    )
+    cand_rank = (
+        1 if cand_valid_schema else 0,
+        1 if cand_valid_json else 0,
+        1 if cand_finish_reason != "length" else 0,
+        -float(cand_risk),
+    )
+    return cand_rank > cur_rank
+
+
+def run_deferred_retries(
+    engine: Any,
+    requests: Sequence[ExtractRetryRequest],
+    *,
+    system_prompt: str | None = None,
+    retry_max_tokens: int | None = None,
+    temperature: float | None = None,
+    whitespace_flexible: bool | None = None,
+    max_whitespace_run: int | None = None,
+    mode: str | None = None,
+    speculative: bool | None = None,
+    b_slots: int | None = None,
+    use_rolling: bool | str = "auto",
+    emit_extractconf: bool = True,
+    extractconf_calibrator: ExtractConfCalibrator | None = None,
+    retry_prompt_builder: Callable[[ExtractRetryRequest], str] | None = None,
+    on_retry_complete: Callable[[list[dict[str, Any]]], Any] | None = None,
+    clear_cache_mb: int = 256,
+    grammar_cache: dict[tuple[Any, ...], Any] | None = None,
+    **extra_gen_kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Execute deferred extraction retries sequentially/batched on the single already-loaded `engine`."""
+    if not requests:
+        return []
+
+    req_list = list(requests)
+    eff_ws = resolve_engine_whitespace_flexible(engine, whitespace_flexible)
+    clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
+    if max_whitespace_run is not None and _engine_accepts_explicit_kwarg(engine, "max_whitespace_run"):
+        clean_extra.setdefault("max_whitespace_run", int(max_whitespace_run))
+    if emit_extractconf and "collect_telemetry" not in clean_extra and _engine_accepts_explicit_kwarg(engine, "collect_telemetry"):
+        clean_extra["collect_telemetry"] = True
+
+    eff_slots = int(b_slots) if (b_slots is not None and int(b_slots) > 0) else _resolve_default_b_slots(engine)
+    eff_mode = str(mode or getattr(engine, "default_mode", "auto") or "auto").lower()
+    accepts_per_doc = _engine_accepts_explicit_kwarg(engine, "per_doc_grammars")
+    can_roll = _engine_supports_rolling(engine)
+    eff_use_chat = bool(clean_extra.get("use_chat_template", True))
+    g_cache = grammar_cache if grammar_cache is not None else {}
+
+    # Deduplicate identical retry `(system_prompt, prompt, schema_key, budget)` pairs cleanly.
+    groups: dict[tuple[str, int], list[int]] = {}
+    for idx_r, req in enumerate(req_list):
+        sys_p = req.system_prompt if system_prompt is None else system_prompt
+        budget = (
+            int(retry_max_tokens)
+            if retry_max_tokens is not None
+            else max(int(req.max_tokens) * 2, 256)
+        )
+        groups.setdefault((sys_p, budget), []).append(idx_r)
+
+    results: list[dict[str, Any]] = [{} for _ in req_list]
+    eff_temp = 0.0 if temperature is None else float(temperature)
+    lock = _get_engine_lock(engine)
+    with lock:
+        for (sys_p, budget), group_indices in groups.items():
+            clear_mlx_arena(clear_cache_mb)
+            prompts = [
+                retry_prompt_builder(req_list[i]) if retry_prompt_builder is not None else req_list[i].prompt
+                for i in group_indices
+            ]
+            entry_schemas = [req_list[i].json_schema for i in group_indices]
+            schema_dicts = [req_list[i].json_schema_dict for i in group_indices]
+            has_any_schema = any(s is not None for s in entry_schemas)
+            eff_thinking = _resolve_effective_thinking(
+                enable_thinking=bool(clean_extra.get("enable_thinking", False)),
+                has_schema=has_any_schema,
+                clean_extra=clean_extra,
+            )
+
+            use_roll = False
+            if can_roll:
+                if use_rolling is True:
+                    use_roll = True
+                elif str(use_rolling).strip().lower() == "auto":
+                    use_roll = (
+                        not eff_thinking
+                        and (has_any_schema or len(prompts) > 4 or speculative is False)
+                        and eff_mode != "hetero"
+                    )
+
+            if use_roll:
+                res_roll, order = _execute_rolling_batch(
+                    engine,
+                    prompts,
+                    pre_encoded_ids=None,
+                    system_prompt=sys_p,
+                    entry_schemas=entry_schemas,
+                    grammar_cache=g_cache,
+                    max_tokens=budget,
+                    temperature=eff_temp,
+                    whitespace_flexible=eff_ws,
+                    max_whitespace_run=max_whitespace_run,
+                    b_slots=eff_slots,
+                    sort_by_length=True,
+                    clean_extra=clean_extra,
+                    use_chat_template=eff_use_chat,
+                    enable_thinking=eff_thinking,
+                )
+                ordered_items: list[Any] = [None] * len(prompts)
+                for pos_r, orig_r in enumerate(order):
+                    ordered_items[orig_r] = res_roll.items[pos_r]
+                out_items = ordered_items
+                dec_sec = float(res_roll.stats.get("decode_sec", 0.0))
+            else:
+                gen_kw: dict[str, Any] = {
+                    "system_prompt": sys_p,
+                    "max_tokens": budget,
+                    "temperature": eff_temp,
+                    "whitespace_flexible": eff_ws,
+                    "batch_size": min(len(prompts), eff_slots),
+                    **clean_extra,
+                }
+                if max_whitespace_run is not None and not _engine_accepts_explicit_kwarg(engine, "max_whitespace_run"):
+                    gen_kw.pop("max_whitespace_run", None)
+                if mode is not None:
+                    gen_kw["mode"] = mode
+                if speculative is not None:
+                    gen_kw["speculative"] = speculative
+                res_b = _generate_batch_with_schema_fallback(
+                    engine,
+                    prompts,
+                    entry_schemas=entry_schemas,
+                    fallback_schema=entry_schemas[0] if len(entry_schemas) == 1 else None,
+                    base_gen_kw=gen_kw,
+                    accepts_per_doc=accepts_per_doc,
+                    eff_b_slots=eff_slots,
+                )
+                out_items = list(res_b.items)
+                dec_sec = float((getattr(res_b, "stats", {}) or {}).get("decode_sec", 0.0))
+
+            clear_mlx_arena(clear_cache_mb)
+            per_item_dec = dec_sec / max(1, len(group_indices))
+            for g_pos, orig_r in enumerate(group_indices):
+                req = req_list[orig_r]
+                item = out_items[g_pos]
+                r_text = str(getattr(item, "text", ""))
+                v_json = bool(getattr(item, "valid_json", False))
+                v_schema = bool(getattr(item, "valid_schema", True))
+                f_reason = str(getattr(item, "finish_reason", "stop"))
+                p_toks = int(getattr(item, "prompt_tokens", 0) or 0)
+                c_toks = int(getattr(item, "completion_tokens", 0) or 0)
+                it_parsed = getattr(item, "parsed", None)
+                if it_parsed is None and v_json and r_text.strip():
+                    try:
+                        it_parsed = json.loads(r_text)
+                    except Exception:
+                        v_json = False
+                it_risk = (
+                    _score_item_extractconf(
+                        item,
+                        parsed=it_parsed,
+                        valid_json=v_json,
+                        json_schema=schema_dicts[g_pos],
+                        max_tokens=budget,
+                        calibrator=extractconf_calibrator,
+                    )
+                    if emit_extractconf
+                    else 0.0
+                )
+                improved = _is_retry_better(
+                    cur_valid_schema=req.valid_schema,
+                    cur_valid_json=req.valid_json,
+                    cur_finish_reason=req.finish_reason,
+                    cur_risk=req.extractconf_risk,
+                    cand_valid_schema=v_schema,
+                    cand_valid_json=v_json,
+                    cand_finish_reason=f_reason,
+                    cand_risk=it_risk,
+                )
+                results[orig_r] = {
+                    "row_index": req.row_index,
+                    "attempt": req.attempt,
+                    "max_tokens": budget,
+                    "prompt": prompts[g_pos],
+                    "text": r_text,
+                    "parsed": it_parsed,
+                    "valid_json": v_json,
+                    "valid_schema": v_schema,
+                    "finish_reason": f_reason,
+                    "prompt_tokens": p_toks,
+                    "completion_tokens": c_toks,
+                    "extractconf_risk": float(it_risk),
+                    "decode_sec": per_item_dec,
+                    "improved": improved,
+                    "metadata": dict(req.metadata),
+                }
+
+    if on_retry_complete is not None:
+        hook_res = on_retry_complete(results)
+        if inspect.isawaitable(hook_res):
+            _run_awaitables_sync([hook_res])
+    return results
+
+
+async def run_deferred_retries_async(
+    engine: Any,
+    requests: Sequence[ExtractRetryRequest],
+    *,
+    async_complete_hook: Callable[[list[dict[str, Any]]], Any] | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Run deferred single-model retries off the asyncio loop via `asyncio.to_thread` without co-loading models."""
+    results = await asyncio.to_thread(run_deferred_retries, engine, requests, **kwargs)
+    if async_complete_hook is not None:
+        res = async_complete_hook(results)
+        if inspect.isawaitable(res):
+            await res
+    return results
 
 
 def _enter_mlx_limits(
@@ -833,6 +1358,16 @@ def extract_parquet(
     memory_governor: LiveMemoryGovernor | bool | None = True,
     uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
     use_nocache: bool = False,
+    max_retries: int = 0,
+    retry_max_tokens: int | None = None,
+    retry_on: Sequence[str] | str = DEFAULT_RETRY_REASONS,
+    retry_risk_threshold: float | None = None,
+    retry_temperature: float | None = None,
+    retry_prompt_builder: Callable[[ExtractRetryRequest], str] | None = None,
+    defer_retries: bool = False,
+    deferred_retries: list[ExtractRetryRequest] | None = None,
+    retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
+    async_retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
     **extra_gen_kwargs: Any,
 ) -> ParquetExtractSummary:
     """Stream-extract structured JSON from Parquet input(s) with overlapped reader/GPU/writer threads."""
@@ -1313,6 +1848,14 @@ def extract_parquet(
     prompt_toks_tot = 0
     comp_toks_tot = 0
     tot_dec_sec = 0.0
+    retries_attempted_tot = 0
+    retries_succeeded_tot = 0
+    retry_reasons = _resolve_retry_reasons(retry_on)
+    has_retry_hooks = (
+        deferred_retries is not None
+        or retry_hook is not None
+        or async_retry_hook is not None
+    )
     grammar_cache: dict[tuple[Any, ...], Any] = {}
     t0 = time.perf_counter()
 
@@ -1391,9 +1934,11 @@ def extract_parquet(
                         )
                         sorted_entries = [unique_entries[i] for i in order]
                         sorted_schema_dicts = [entry_schema_dicts[i] for i in order]
+                        sorted_schema_specs = [entry_schemas[i] for i in order]
                     else:
                         sorted_entries = unique_entries
                         sorted_schema_dicts = entry_schema_dicts
+                        sorted_schema_specs = entry_schemas
                         sorted_prompts = [entry[1] for entry in sorted_entries]
                         base_gen_kw: dict[str, Any] = {
                             "system_prompt": system_prompt,
@@ -1422,8 +1967,9 @@ def extract_parquet(
                     clear_mlx_arena(clear_thresh_mb)
 
                     dedup_had_repeats = len(sorted_entries) < len(active_indices)
-                    for out_it, (_first_idx, _p_str, orig_positions), item_schema_dict in zip(
-                        res.items, sorted_entries, sorted_schema_dicts
+                    entry_states: list[dict[str, Any]] = []
+                    for out_it, (_first_idx, p_str, orig_positions), item_schema_dict, item_schema_spec in zip(
+                        res.items, sorted_entries, sorted_schema_dicts, sorted_schema_specs
                     ):
                         r_text = str(out_it.text)
                         v_json = bool(out_it.valid_json)
@@ -1451,26 +1997,31 @@ def extract_parquet(
 
                         for orig_idx in orig_positions:
                             resp_texts[orig_idx] = r_text
-                            valid_jsons[orig_idx] = bool(out_it.valid_json)
+                            valid_jsons[orig_idx] = v_json
                             valid_schemas[orig_idx] = v_schema
                             finish_reasons[orig_idx] = f_reason
                             prompt_toks_col[orig_idx] = p_toks
                             comp_toks_col[orig_idx] = c_toks
                             if emit_extractconf:
                                 risk_col[orig_idx] = it_risk
+                        entry_states.append(
+                            {
+                                "prompt": p_str,
+                                "orig_positions": orig_positions,
+                                "schema_spec": item_schema_spec,
+                                "schema_dict": item_schema_dict,
+                                "text": r_text,
+                                "valid_json": v_json,
+                                "valid_schema": v_schema,
+                                "finish_reason": f_reason,
+                                "risk": float(it_risk),
+                            }
+                        )
 
                     if dedup_had_repeats:
-                        valid_json_tot += sum(1 for idx in active_indices if valid_jsons[idx])
-                        valid_schema_tot += sum(1 for idx in active_indices if valid_schemas[idx])
                         prompt_toks_tot += sum(prompt_toks_col[idx] for idx in active_indices)
                         comp_toks_tot += sum(comp_toks_col[idx] for idx in active_indices)
                     else:
-                        valid_json_tot += int(
-                            res.stats.get("valid_json_count", sum(1 for it in res.items if it.valid_json))
-                        )
-                        valid_schema_tot += int(
-                            res.stats.get("valid_schema_count", sum(1 for it in res.items if it.valid_schema))
-                        )
                         prompt_toks_tot += int(
                             res.stats.get("prompt_tokens", sum(it.prompt_tokens for it in res.items))
                         )
@@ -1478,6 +2029,138 @@ def extract_parquet(
                             res.stats.get("completion_tokens", sum(it.completion_tokens for it in res.items))
                         )
                     tot_dec_sec += float(res.stats.get("decode_sec", 0.0))
+
+                    ran_inline_retry = False
+                    if (defer_retries or (int(max_retries) <= 0 and has_retry_hooks)) and (
+                        has_retry_hooks or int(max_retries) > 0
+                    ):
+                        deferred_reqs: list[ExtractRetryRequest] = []
+                        for st in entry_states:
+                            if _should_retry_row(
+                                finish_reason=st["finish_reason"],
+                                valid_json=st["valid_json"],
+                                valid_schema=st["valid_schema"],
+                                extractconf_risk=st["risk"],
+                                retry_reasons=retry_reasons,
+                                retry_risk_threshold=retry_risk_threshold,
+                            ):
+                                for orig_idx in st["orig_positions"]:
+                                    deferred_reqs.append(
+                                        ExtractRetryRequest(
+                                            row_index=docs_processed + orig_idx,
+                                            prompt=st["prompt"],
+                                            system_prompt=system_prompt,
+                                            json_schema=st["schema_spec"],
+                                            json_schema_dict=st["schema_dict"],
+                                            attempt=1,
+                                            max_tokens=max_tokens,
+                                            finish_reason=st["finish_reason"],
+                                            valid_json=st["valid_json"],
+                                            valid_schema=st["valid_schema"],
+                                            extractconf_risk=st["risk"],
+                                            response_text=st["text"],
+                                        )
+                                    )
+                        if deferred_reqs:
+                            _dispatch_retry_hooks(
+                                deferred_reqs,
+                                deferred_retries=deferred_retries,
+                                retry_hook=retry_hook,
+                                async_retry_hook=async_retry_hook,
+                            )
+                    elif int(max_retries) > 0:
+                        ran_inline_retry = True
+                        prev_budget = int(max_tokens)
+                        for attempt in range(1, int(max_retries) + 1):
+                            retry_state_indices: list[int] = []
+                            round_reqs: list[ExtractRetryRequest] = []
+                            attempt_budget = (
+                                int(retry_max_tokens)
+                                if retry_max_tokens is not None
+                                else max(prev_budget * 2, 256)
+                            )
+                            prev_budget = attempt_budget
+                            for s_idx, st in enumerate(entry_states):
+                                if _should_retry_row(
+                                    finish_reason=st["finish_reason"],
+                                    valid_json=st["valid_json"],
+                                    valid_schema=st["valid_schema"],
+                                    extractconf_risk=st["risk"],
+                                    retry_reasons=retry_reasons,
+                                    retry_risk_threshold=retry_risk_threshold,
+                                ):
+                                    retry_state_indices.append(s_idx)
+                                    round_reqs.append(
+                                        ExtractRetryRequest(
+                                            row_index=docs_processed + st["orig_positions"][0],
+                                            prompt=st["prompt"],
+                                            system_prompt=system_prompt,
+                                            json_schema=st["schema_spec"],
+                                            json_schema_dict=st["schema_dict"],
+                                            attempt=attempt,
+                                            max_tokens=attempt_budget,
+                                            finish_reason=st["finish_reason"],
+                                            valid_json=st["valid_json"],
+                                            valid_schema=st["valid_schema"],
+                                            extractconf_risk=st["risk"],
+                                            response_text=st["text"],
+                                        )
+                                    )
+                            if not round_reqs:
+                                break
+                            retry_results = run_deferred_retries(
+                                engine,
+                                round_reqs,
+                                system_prompt=system_prompt,
+                                retry_max_tokens=attempt_budget,
+                                temperature=temperature if retry_temperature is None else retry_temperature,
+                                whitespace_flexible=eff_ws,
+                                max_whitespace_run=max_whitespace_run,
+                                mode=mode,
+                                speculative=speculative,
+                                b_slots=eff_b_slots,
+                                use_rolling=use_rolling,
+                                emit_extractconf=emit_extractconf,
+                                extractconf_calibrator=extractconf_calibrator,
+                                retry_prompt_builder=retry_prompt_builder,
+                                clear_cache_mb=clear_thresh_mb,
+                                grammar_cache=grammar_cache,
+                                **clean_extra,
+                            )
+                            for s_idx, cand in zip(retry_state_indices, retry_results):
+                                st = entry_states[s_idx]
+                                n_pos = len(st["orig_positions"])
+                                retries_attempted_tot += n_pos
+                                prompt_toks_tot += int(cand["prompt_tokens"]) * n_pos
+                                comp_toks_tot += int(cand["completion_tokens"]) * n_pos
+                                tot_dec_sec += float(cand["decode_sec"])
+                                if cand["improved"]:
+                                    retries_succeeded_tot += n_pos
+                                    st["text"] = cand["text"]
+                                    st["valid_json"] = bool(cand["valid_json"])
+                                    st["valid_schema"] = bool(cand["valid_schema"])
+                                    st["finish_reason"] = str(cand["finish_reason"])
+                                    st["risk"] = float(cand["extractconf_risk"])
+                                    for orig_idx in st["orig_positions"]:
+                                        resp_texts[orig_idx] = st["text"]
+                                        valid_jsons[orig_idx] = st["valid_json"]
+                                        valid_schemas[orig_idx] = st["valid_schema"]
+                                        finish_reasons[orig_idx] = st["finish_reason"]
+                                        prompt_toks_col[orig_idx] = int(cand["prompt_tokens"])
+                                        comp_toks_col[orig_idx] = int(cand["completion_tokens"])
+                                        if emit_extractconf:
+                                            risk_col[orig_idx] = st["risk"]
+
+                    if dedup_had_repeats or ran_inline_retry:
+                        valid_json_tot += sum(1 for idx in active_indices if valid_jsons[idx])
+                        valid_schema_tot += sum(1 for idx in active_indices if valid_schemas[idx])
+                    else:
+                        valid_json_tot += int(
+                            res.stats.get("valid_json_count", sum(1 for it in res.items if it.valid_json))
+                        )
+                        valid_schema_tot += int(
+                            res.stats.get("valid_schema_count", sum(1 for it in res.items if it.valid_schema))
+                        )
 
                 out_table = (
                     meta_tbl.append_column("response_text", pa.array(resp_texts, type=pa.string()))
@@ -1541,6 +2224,8 @@ def extract_parquet(
         elapsed_sec=elapsed,
         docs_per_sec=docs_processed / elapsed,
         decode_tok_s=comp_toks_tot / max(tot_dec_sec, 1e-9),
+        retries_attempted=retries_attempted_tot,
+        retries_succeeded=retries_succeeded_tot,
     )
 
 
@@ -1576,6 +2261,16 @@ def extract_jsonl(
     use_rolling: bool | str = "auto",
     memory_governor: LiveMemoryGovernor | bool | None = True,
     uma_ceiling_fraction: float = WIRED_MEMORY_CEILING_FRACTION,
+    max_retries: int = 0,
+    retry_max_tokens: int | None = None,
+    retry_on: Sequence[str] | str = DEFAULT_RETRY_REASONS,
+    retry_risk_threshold: float | None = None,
+    retry_temperature: float | None = None,
+    retry_prompt_builder: Callable[[ExtractRetryRequest], str] | None = None,
+    defer_retries: bool = False,
+    deferred_retries: list[ExtractRetryRequest] | None = None,
+    retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
+    async_retry_hook: Callable[[ExtractRetryRequest], Any] | None = None,
     **extra_gen_kwargs: Any,
 ) -> dict[str, Any]:
     """Batch-extract structured JSON from a JSON or JSONL file into JSONL."""
@@ -1729,40 +2424,194 @@ def extract_jsonl(
             )
         clear_mlx_arena(clear_thresh_mb)
 
+    out_stats = dict(getattr(res, "stats", {}) or {})
+    retry_reasons = _resolve_retry_reasons(retry_on)
+    has_retry_hooks = (
+        deferred_retries is not None
+        or retry_hook is not None
+        or async_retry_hook is not None
+    )
+    row_states: list[dict[str, Any]] = []
+    for item, item_schema_dict in zip(res.items, entry_schema_dicts):
+        r_text = str(item.text)
+        v_json = bool(item.valid_json)
+        v_schema = bool(item.valid_schema)
+        f_reason = str(getattr(item, "finish_reason", "stop"))
+        p_toks = int(item.prompt_tokens)
+        c_toks = int(item.completion_tokens)
+        it_parsed = getattr(item, "parsed", None)
+        if it_parsed is None and v_json and r_text.strip():
+            try:
+                it_parsed = json.loads(r_text)
+            except Exception:
+                v_json = False
+        it_risk = (
+            _score_item_extractconf(
+                item,
+                parsed=it_parsed,
+                valid_json=v_json,
+                json_schema=item_schema_dict,
+                max_tokens=max_tokens,
+                calibrator=extractconf_calibrator,
+            )
+            if emit_extractconf
+            else 0.0
+        )
+        row_states.append(
+            {
+                "text": r_text,
+                "parsed": it_parsed,
+                "valid_json": v_json,
+                "valid_schema": v_schema,
+                "finish_reason": f_reason,
+                "prompt_tokens": p_toks,
+                "completion_tokens": c_toks,
+                "risk": float(it_risk),
+            }
+        )
+
+    retries_attempted = 0
+    retries_succeeded = 0
+    if (defer_retries and has_retry_hooks) or (int(max_retries) <= 0 and has_retry_hooks):
+        deferred_reqs = [
+            ExtractRetryRequest(
+                row_index=idx_r,
+                prompt=prompts[idx_r],
+                system_prompt=system_prompt,
+                json_schema=entry_schemas[idx_r],
+                json_schema_dict=entry_schema_dicts[idx_r],
+                attempt=1,
+                max_tokens=max_tokens,
+                finish_reason=st["finish_reason"],
+                valid_json=st["valid_json"],
+                valid_schema=st["valid_schema"],
+                extractconf_risk=st["risk"],
+                response_text=st["text"],
+            )
+            for idx_r, st in enumerate(row_states)
+            if _should_retry_row(
+                finish_reason=st["finish_reason"],
+                valid_json=st["valid_json"],
+                valid_schema=st["valid_schema"],
+                extractconf_risk=st["risk"],
+                retry_reasons=retry_reasons,
+                retry_risk_threshold=retry_risk_threshold,
+            )
+        ]
+        if deferred_reqs:
+            _dispatch_retry_hooks(
+                deferred_reqs,
+                deferred_retries=deferred_retries,
+                retry_hook=retry_hook,
+                async_retry_hook=async_retry_hook,
+            )
+    elif int(max_retries) > 0:
+        prev_budget = int(max_tokens)
+        g_cache_retry: dict[tuple[Any, ...], Any] = {}
+        for attempt in range(1, int(max_retries) + 1):
+            attempt_budget = (
+                int(retry_max_tokens)
+                if retry_max_tokens is not None
+                else max(prev_budget * 2, 256)
+            )
+            prev_budget = attempt_budget
+            round_reqs = [
+                ExtractRetryRequest(
+                    row_index=idx_r,
+                    prompt=prompts[idx_r],
+                    system_prompt=system_prompt,
+                    json_schema=entry_schemas[idx_r],
+                    json_schema_dict=entry_schema_dicts[idx_r],
+                    attempt=attempt,
+                    max_tokens=attempt_budget,
+                    finish_reason=st["finish_reason"],
+                    valid_json=st["valid_json"],
+                    valid_schema=st["valid_schema"],
+                    extractconf_risk=st["risk"],
+                    response_text=st["text"],
+                )
+                for idx_r, st in enumerate(row_states)
+                if _should_retry_row(
+                    finish_reason=st["finish_reason"],
+                    valid_json=st["valid_json"],
+                    valid_schema=st["valid_schema"],
+                    extractconf_risk=st["risk"],
+                    retry_reasons=retry_reasons,
+                    retry_risk_threshold=retry_risk_threshold,
+                )
+            ]
+            if not round_reqs:
+                break
+            retry_results = run_deferred_retries(
+                engine,
+                round_reqs,
+                system_prompt=system_prompt,
+                retry_max_tokens=attempt_budget,
+                temperature=temperature if retry_temperature is None else retry_temperature,
+                whitespace_flexible=eff_ws,
+                max_whitespace_run=max_whitespace_run,
+                mode=mode,
+                speculative=speculative,
+                b_slots=eff_b_slots,
+                use_rolling=use_rolling,
+                emit_extractconf=emit_extractconf,
+                extractconf_calibrator=extractconf_calibrator,
+                retry_prompt_builder=retry_prompt_builder,
+                clear_cache_mb=clear_thresh_mb,
+                grammar_cache=g_cache_retry,
+                **clean_extra,
+            )
+            for cand in retry_results:
+                idx_r = int(cand["row_index"])
+                retries_attempted += 1
+                out_stats["prompt_tokens"] = int(out_stats.get("prompt_tokens", 0)) + int(cand["prompt_tokens"])
+                out_stats["completion_tokens"] = int(out_stats.get("completion_tokens", 0)) + int(cand["completion_tokens"])
+                out_stats["decode_sec"] = float(out_stats.get("decode_sec", 0.0)) + float(cand["decode_sec"])
+                if cand["improved"]:
+                    retries_succeeded += 1
+                    row_states[idx_r] = {
+                        "text": cand["text"],
+                        "parsed": cand["parsed"],
+                        "valid_json": bool(cand["valid_json"]),
+                        "valid_schema": bool(cand["valid_schema"]),
+                        "finish_reason": str(cand["finish_reason"]),
+                        "prompt_tokens": int(cand["prompt_tokens"]),
+                        "completion_tokens": int(cand["completion_tokens"]),
+                        "risk": float(cand["extractconf_risk"]),
+                    }
+        out_stats["valid_json_count"] = sum(1 for st in row_states if st["valid_json"])
+        out_stats["valid_schema_count"] = sum(1 for st in row_states if st["valid_schema"])
+        out_stats["retries_attempted"] = retries_attempted
+        out_stats["retries_succeeded"] = retries_succeeded
+
     tmp_out = out_p.with_name(f".{out_p.name}.tmp.{os.getpid()}")
     try:
         with tmp_out.open("w", encoding="utf-8") as fp:
-            for rec, item, item_schema_dict in zip(records, res.items, entry_schema_dicts):
+            for rec, st in zip(records, row_states):
                 out_row: dict[str, Any] = {
                     **rec,
-                    response_text_key: item.text,
-                    response_json_key: getattr(item, "parsed", None),
-                    "valid_json": item.valid_json,
-                    "valid_schema": item.valid_schema,
-                    "finish_reason": str(getattr(item, "finish_reason", "stop")),
-                    "prompt_tokens": item.prompt_tokens,
-                    "completion_tokens": item.completion_tokens,
+                    response_text_key: st["text"],
+                    response_json_key: st["parsed"],
+                    "valid_json": st["valid_json"],
+                    "valid_schema": st["valid_schema"],
+                    "finish_reason": st["finish_reason"],
+                    "prompt_tokens": st["prompt_tokens"],
+                    "completion_tokens": st["completion_tokens"],
                 }
                 if emit_extractconf:
-                    out_row["extractconf_risk"] = round(
-                        _score_item_extractconf(
-                            item,
-                            json_schema=item_schema_dict,
-                            max_tokens=max_tokens,
-                            calibrator=extractconf_calibrator,
-                        ),
-                        6,
-                    )
+                    out_row["extractconf_risk"] = round(float(st["risk"]), 6)
                 fp.write(json.dumps(out_row, ensure_ascii=False) + "\n")
         os.replace(tmp_out, out_p)
     except BaseException:
         tmp_out.unlink(missing_ok=True)
         raise
-    return res.stats
+    return out_stats
 
 
 __all__ = [
+    "DEFAULT_RETRY_REASONS",
     "DEFAULT_TEXT_COLUMNS",
+    "ExtractRetryRequest",
     "ParquetExtractSummary",
     "extract_jsonl",
     "extract_parquet",
@@ -1772,6 +2621,8 @@ __all__ = [
     "resolve_input_files",
     "resolve_llm_text_column",
     "resolve_text_column",
+    "run_deferred_retries",
+    "run_deferred_retries_async",
     "slice_first_pages_utf8",
     "slice_ocr_pages_utf8",
 ]

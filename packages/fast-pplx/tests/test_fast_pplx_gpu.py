@@ -542,3 +542,78 @@ def test_gpu_block32_int8_state_codec_and_end_to_end_parity() -> None:
             v_i8 = g_i8.encode_documents(docs, batch_size=2, max_length=4096, output_dtype="float32", normalize=True)
         cos_e2e = np.sum(v_f32 * v_i8, axis=-1)
         assert float(np.min(cos_e2e)) >= 0.9999, f"End-to-end int8 vs float32 state drift: {cos_e2e}"
+
+
+@pytest.mark.gpu_ane
+def test_gpu_gdn_streamed_slice0_invariance_and_fp32_beta_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mlx.utils import tree_map
+    import fast_pplx.gpu as gpu_mod
+    from fast_pplx.gpu import PplxConfig, PplxGatedDeltaNet, gated_delta_update, normalize_qk
+
+    with _gpu_validation_lock():
+        # Force Apple10 mx.fast GDN path so even M4 Pro exercises Base M5's slice-0 dispatch.
+        monkeypatch.setattr(gpu_mod, "_CACHED_IS_APPLE10_HOST", True)
+        cfg = PplxConfig(
+            vocab_size=64,
+            hidden_size=128,
+            num_hidden_layers=1,
+            layer_types=("linear_attention",),
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            rope_dim=16,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        mx.random.seed(123)
+        gdn = PplxGatedDeltaNet(cfg, state_dtype="float32")
+        gdn.update(tree_map(lambda arr: arr.astype(mx.float16) if isinstance(arr, mx.array) else arr, gdn.parameters()))
+        gdn.A_log = gdn.A_log.astype(mx.float32)
+        gdn.dt_bias = gdn.dt_bias.astype(mx.float32)
+        gdn.norm.weight = gdn.norm.weight.astype(mx.float32)
+
+        x = mx.random.normal((1, 2560, 128)).astype(mx.float16) * 0.25
+        y_stream = gdn(x)
+        conv0 = mx.zeros((1, gdn.conv_kernel_size - 1, gdn.conv_dim), dtype=mx.float32)
+        rec0 = mx.zeros((1, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim), dtype=mx.float32)
+        y_whole, _, _ = gdn._run_step(x, conv0, rec0, None, keep_conv_state_fp32=True)
+        y_slice0, _, _ = gdn._run_step(x[:, :1024, :], conv0, rec0, None, keep_conv_state_fp32=True)
+        mx.eval(y_stream, y_whole, y_slice0)
+        assert float(mx.max(mx.abs(y_stream[:, :1024, :] - y_slice0)).item()) <= 1e-6
+        assert float(mx.max(mx.abs(y_stream - y_whole)).item()) <= 1e-6
+
+        q, k = normalize_qk(
+            mx.random.normal((1, 256, 4, 128)),
+            mx.random.normal((1, 256, 4, 128)),
+            inv_scale=128**-0.5,
+        )
+        q = q.astype(mx.float16)
+        k = k.astype(mx.float16)
+        v = mx.random.normal((1, 256, 4, 128)).astype(mx.float16) * 0.2
+        a = mx.random.normal((1, 256, 4)).astype(mx.float16) * 0.2
+        b = mx.random.normal((1, 256, 4)).astype(mx.float16) * 0.2
+        A_log = mx.full((4,), -2.0, dtype=mx.float32)
+        dt_bias = mx.full((4,), -1.0, dtype=mx.float32)
+        init_st = mx.zeros((1, 4, 128, 128), dtype=mx.float32)
+        y_kern, st_kern = gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, state=init_st, use_kernel=True, state_dtype="float32"
+        )
+        y_ref, st_ref = gated_delta_update(
+            q.astype(mx.float32),
+            k.astype(mx.float32),
+            v.astype(mx.float32),
+            a.astype(mx.float32),
+            b.astype(mx.float32),
+            A_log,
+            dt_bias,
+            state=init_st,
+            use_kernel=False,
+            state_dtype="float32",
+        )
+        mx.eval(y_kern, st_kern, y_ref, st_ref)
+        assert float(mx.max(mx.abs(st_kern - st_ref)).item()) < 5e-6
+        assert float(mx.max(mx.abs(y_kern.astype(mx.float32) - y_ref)).item()) < 3e-5

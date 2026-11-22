@@ -31,6 +31,13 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 
 try:
+    from fast_shared.ane_ffn import (
+        ANE_FFN_INPUT_BLOCK,
+        DEFAULT_HADAMARD_SEED,
+        hadamard_matrix,
+        hadamard_rotate_blocks,
+        make_hadamard_signs,
+    )
     from fast_shared.parallel_coreml import (
         atomic_publish_dir,
         compile_buckets_parallel,
@@ -40,6 +47,13 @@ except ModuleNotFoundError:  # pragma: no cover - standalone / ephemeral uv invo
     _shared_src = Path(__file__).resolve().parents[2] / "fast-shared" / "src"
     if _shared_src.is_dir() and str(_shared_src) not in sys.path:
         sys.path.insert(0, str(_shared_src))
+    from fast_shared.ane_ffn import (
+        ANE_FFN_INPUT_BLOCK,
+        DEFAULT_HADAMARD_SEED,
+        hadamard_matrix,
+        hadamard_rotate_blocks,
+        make_hadamard_signs,
+    )
     from fast_shared.parallel_coreml import (
         atomic_publish_dir,
         compile_buckets_parallel,
@@ -50,6 +64,8 @@ DEFAULT_ANE_CHUNK_S = 256
 DEFAULT_ANE_P_SWA = 512
 DEFAULT_ANE_P_FULL = 1920
 AWQ_ALPHA_GRID: tuple[float, ...] = (0.86, 0.89, 0.92, 0.94, 0.96, 0.975, 0.99, 1.00)
+HADAMARD_MODES: tuple[str, ...] = ("none", "ffn", "post_norm")
+HADAMARD_OPS: tuple[str, ...] = ("grouped_conv", "shared_conv")
 GPU_LOCK_PATH = "/tmp/m4_gpu_validation.lock"
 
 
@@ -299,6 +315,10 @@ def write_ane_calibration_manifest(
     calibration_docs: int = 0,
     qat_validated: bool = False,
     checkpoint_key: str | None = None,
+    hadamard_mode: str = "none",
+    hadamard_op: str = "grouped_conv",
+    safe_gelu_clamp: bool = False,
+    normalize_mid: bool = False,
 ) -> Path:
     """Write/update `ane_calibration_manifest.json` alongside compiled `.mlmodelc` bundles."""
     manifest_p = out_ane_dir / "ane_calibration_manifest.json"
@@ -324,6 +344,10 @@ def write_ane_calibration_manifest(
         "calibration_docs": int(calibration_docs),
         "qat_validated": bool(qat_validated),
         "checkpoint_ane_key": checkpoint_key,
+        "hadamard_mode": str(hadamard_mode),
+        "hadamard_op": str(hadamard_op),
+        "safe_gelu_clamp": bool(safe_gelu_clamp),
+        "normalize_mid": bool(normalize_mid),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     manifest_p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -501,6 +525,69 @@ def apply_awq_mse_clipping(
     return clipped, mean_alpha
 
 
+def _rotate_conv1x1_input_channels(
+    w_4d: np.ndarray,
+    signs: np.ndarray,
+    block: int = ANE_FFN_INPUT_BLOCK,
+) -> np.ndarray:
+    """Right-multiply a `[out_c, in_c, 1, 1]` conv1x1 weight matrix by `diag(signs) @ H_block`."""
+    oc, ic = int(w_4d.shape[0]), int(w_4d.shape[1])
+    w_rot = hadamard_rotate_blocks(w_4d.astype(np.float32).reshape(oc, ic), block, signs)
+    return np.ascontiguousarray(w_rot.reshape(oc, ic, 1, 1).astype(np.float16))
+
+
+def apply_post_norm_hadamard_transforms(
+    npz: dict[str, np.ndarray],
+    arch: dict[str, Any],
+    *,
+    hadamard_mode: str = "none",
+    hadamard_seed: int = DEFAULT_HADAMARD_SEED,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Fold random signs + WHT-128 orthogonally into weights so MIL only applies fast online H_128 convs."""
+    if hadamard_mode not in HADAMARD_MODES:
+        raise ValueError(f"Unsupported hadamard_mode={hadamard_mode!r}; expected one of {HADAMARD_MODES}")
+    out = dict(npz)
+    signs_map: dict[str, np.ndarray] = {}
+    if hadamard_mode == "none":
+        return out, signs_map
+
+    block = ANE_FFN_INPUT_BLOCK
+    k = int(arch["first_kv_shared"])
+    H = int(arch["hidden_size"])
+    if H % block != 0:
+        raise ValueError(f"Post-norm Hadamard requires hidden_size % {block} == 0 (got H={H})")
+
+    for i in range(k):
+        p = f"l{i}_"
+        if hadamard_mode == "post_norm":
+            s_in = make_hadamard_signs(H, seed=hadamard_seed + i * 16 + 1)
+            signs_map[p + "in"] = s_in
+            out[p + "w_in"] = np.ascontiguousarray(
+                (out[p + "w_in"].astype(np.float32) * s_in.reshape(1, H, 1, 1)).astype(np.float16)
+            )
+            w_key = (p + "kv") if (i == k - 1 and (p + "kv") in out) else (p + "qkv")
+            out[w_key] = _rotate_conv1x1_input_channels(out[w_key], s_in, block)
+
+        if i == k - 1:
+            continue
+
+        s_pff = make_hadamard_signs(H, seed=hadamard_seed + i * 16 + 2)
+        signs_map[p + "pff"] = s_pff
+        out[p + "w_pff"] = np.ascontiguousarray(
+            (out[p + "w_pff"].astype(np.float32) * s_pff.reshape(1, H, 1, 1)).astype(np.float16)
+        )
+        out[p + "gu"] = _rotate_conv1x1_input_channels(out[p + "gu"], s_pff, block)
+
+        d_ff = int(out[p + "dn"].shape[1])
+        if d_ff % block != 0:
+            raise ValueError(f"Post-norm Hadamard requires d_ff % {block} == 0 at layer {i} (got d_ff={d_ff})")
+        s_mid = make_hadamard_signs(d_ff, seed=hadamard_seed + i * 16 + 3)
+        signs_map[p + "mid"] = s_mid
+        out[p + "dn"] = _rotate_conv1x1_input_channels(out[p + "dn"], s_mid, block)
+
+    return out, signs_map
+
+
 def build_early_prefix_mil_program(
     npz: dict[str, np.ndarray],
     *,
@@ -508,12 +595,19 @@ def build_early_prefix_mil_program(
     P_SWA: int = DEFAULT_ANE_P_SWA,
     P_FULL: int = DEFAULT_ANE_P_FULL,
     protect_fp16_residuals: bool = True,
+    hadamard_mode: str = "none",
+    hadamard_op: str = "grouped_conv",
+    safe_gelu_clamp: bool = False,
+    normalize_mid: bool = False,
+    hadamard_seed: int = DEFAULT_HADAMARD_SEED,
 ) -> tuple[Any, dict[str, Any]]:
     """Build CoreML MIL `EarlyExit{k-1}` program (`k = first_kv_shared`: `15` on E2B, `24` on E4B).
 
     Protects FP16 execution around Gemma-4's L10..L14+ residual peaks (~215K > FP16 max 65,504) via:
       1. Exact power-of-2 residual-scale folding (`fold_fp16_residual_scales`) keeping residual magnitudes < 16K.
       2. Scale-normalized RMSNorm (`x / max(|x|, 1e-4)` before squaring) eliminating `x^2` FP16 overflow for |x|>256.
+      3. Optional Post-Norm Hadamard rotation (`hadamard_mode`), GeLU `[-10, 10]` clamp (`safe_gelu_clamp`),
+         and per-token GeGLU down-projection `normalize_mid` scaling.
     """
     import coremltools as ct
     from coremltools.converters.mil import Builder as mb
@@ -521,6 +615,10 @@ def build_early_prefix_mil_program(
 
     if S <= 1:
         raise ValueError(f"H16ANE requires static chunk S >= 16 (got S={S}); S=1 slices fail ANECCompile().")
+    if hadamard_mode not in HADAMARD_MODES:
+        raise ValueError(f"Unsupported hadamard_mode={hadamard_mode!r}; expected one of {HADAMARD_MODES}")
+    if hadamard_op not in HADAMARD_OPS:
+        raise ValueError(f"Unsupported hadamard_op={hadamard_op!r}; expected one of {HADAMARD_OPS}")
 
     if protect_fp16_residuals:
         npz, res_scales = fold_fp16_residual_scales(npz)
@@ -532,6 +630,9 @@ def build_early_prefix_mil_program(
         )
 
     arch = infer_ane_arch_from_npz(npz)
+    npz, signs_map = apply_post_norm_hadamard_transforms(
+        npz, arch, hadamard_mode=hadamard_mode, hadamard_seed=hadamard_seed
+    )
     k = arch["first_kv_shared"]
     H = arch["hidden_size"]
     ple_dim = arch["ple_dim"]
@@ -541,6 +642,23 @@ def build_early_prefix_mil_program(
     n_q = arch["n_q_heads"]
     n_kv = arch["n_kv"]
     layers = arch["layers"]
+
+    blk = ANE_FFN_INPUT_BLOCK
+    h_mat_norm = hadamard_matrix(blk).astype(np.float32) / np.sqrt(float(blk))
+    h_1x1_fp16 = np.ascontiguousarray(h_mat_norm.reshape(blk, blk, 1, 1).astype(np.float16))
+    grouped_no_sign_cache: dict[int, np.ndarray] = {}
+
+    def _grouped_had_weight(dim: int, signs: np.ndarray | None) -> np.ndarray:
+        if signs is None:
+            cached = grouped_no_sign_cache.get(dim)
+            if cached is None:
+                w = np.broadcast_to(h_mat_norm[None, :, :], (dim // blk, blk, blk)).copy()
+                cached = np.ascontiguousarray(w.reshape(dim, blk, 1, 1).astype(np.float16))
+                grouped_no_sign_cache[dim] = cached
+            return cached
+        s_blk = signs.astype(np.float32).reshape(dim // blk, 1, blk)
+        w = h_mat_norm[None, :, :] * s_blk
+        return np.ascontiguousarray(w.reshape(dim, blk, 1, 1).astype(np.float16))
 
     @mb.program(
         input_specs=[
@@ -606,6 +724,28 @@ def build_early_prefix_mil_program(
                 name=prefix + "_out",
             )
 
+        def _safe_gelu_tanh(x, prefix: str):
+            if not safe_gelu_clamp:
+                return mb.gelu(x=x, mode="TANH_APPROXIMATION", name=prefix + "gelu")
+            xc = mb.clip(x=x, alpha=np.float16(-10.0), beta=np.float16(10.0), name=prefix + "gclip")
+            xt = mb.relu(x=mb.sub(x=x, y=xc, name=prefix + "gdiff"), name=prefix + "gtail")
+            return mb.add(x=mb.gelu(x=xc, mode="TANH_APPROXIMATION", name=prefix + "gelu"), y=xt, name=prefix + "gsafe")
+
+        def _hadamard_128(x, dim: int, signs: np.ndarray | None, prefix: str):
+            groups = dim // blk
+            if hadamard_op == "grouped_conv":
+                return mb.conv(x=x, weight=_grouped_had_weight(dim, signs), groups=np.int32(groups), name=prefix)
+            xs = (
+                mb.mul(x=x, y=np.ascontiguousarray(signs.reshape(1, dim, 1, 1).astype(np.float16)), name=prefix + "_sg")
+                if signs is not None
+                else x
+            )
+            xr0 = mb.reshape(x=xs, shape=[1, groups, blk, S], name=prefix + "_r0")
+            xt0 = mb.transpose(x=xr0, perm=[0, 2, 1, 3], name=prefix + "_t0")
+            xc = mb.conv(x=xt0, weight=h_1x1_fp16, name=prefix)
+            xt1 = mb.transpose(x=xc, perm=[0, 2, 1, 3], name=prefix + "_t1")
+            return mb.reshape(x=xt1, shape=[1, dim, 1, S], name=prefix + "_r1")
+
         plm = mb.mul(
             x=mb.conv(x=h_in, weight=npz["per_layer_model_proj_w"], name="plm"),
             y=npz["per_layer_proj_scale"][0],
@@ -652,13 +792,14 @@ def build_early_prefix_mil_program(
             kv_dim = n_kv * hd
             res_sqrt_eps = max(1e-4, 1e-3 * float(res_scales[i]))
             in_n = _rmsnorm_ch(cur, npz[p + "w_in"], p + "in", sqrt_eps=res_sqrt_eps)
+            in_proj = _hadamard_128(in_n, H, None, p + "had_in") if hadamard_mode == "post_norm" else in_n
 
             if i == k - 1:
                 kv_w = npz[p + "kv"] if (p + "kv") in npz else npz[p + "qkv"][qdim:]
-                kv = mb.conv(x=in_n, weight=kv_w, name=p + "kv")
+                kv = mb.conv(x=in_proj, weight=kv_w, name=p + "kv")
                 k_t, v_t = mb.split(x=kv, split_sizes=[kv_dim, kv_dim], axis=1, name=p + "sp")
             else:
-                qkv = mb.conv(x=in_n, weight=npz[p + "qkv"], name=p + "qkv")
+                qkv = mb.conv(x=in_proj, weight=npz[p + "qkv"], name=p + "qkv")
                 q, k_t, v_t = mb.split(x=qkv, split_sizes=[qdim, kv_dim, kv_dim], axis=1, name=p + "sp")
 
             kr = mb.transpose(
@@ -752,17 +893,29 @@ def build_early_prefix_mil_program(
             ao_n = _rmsnorm_ch(mb.conv(x=att_ch, weight=npz[p + "wo"], name=p + "wo"), npz[p + "w_pa"], p + "pa")
             c1 = mb.add(x=cur, y=ao_n, name=p + "res1")
             pff = _rmsnorm_ch(c1, npz[p + "w_pff"], p + "pff", sqrt_eps=res_sqrt_eps)
-            g, u = mb.split(x=mb.conv(x=pff, weight=npz[p + "gu"], name=p + "gu"), num_splits=2, axis=1, name=p + "spgu")
-            md = mb.conv(
-                x=mb.mul(x=mb.gelu(x=g, mode="TANH_APPROXIMATION", name=p + "gelu"), y=u, name=p + "geglu"),
-                weight=npz[p + "dn"],
-                name=p + "dn",
-            )
+            pff_in = _hadamard_128(pff, H, None, p + "had_pff") if hadamard_mode in ("ffn", "post_norm") else pff
+            g, u = mb.split(x=mb.conv(x=pff_in, weight=npz[p + "gu"], name=p + "gu"), num_splits=2, axis=1, name=p + "spgu")
+            mid = mb.mul(x=_safe_gelu_tanh(g, p), y=u, name=p + "geglu")
+            if normalize_mid:
+                mscale = mb.maximum(
+                    x=mb.reduce_max(x=mb.abs(x=mid, name=p + "mabs"), axes=[1], keep_dims=True, name=p + "mpeak"),
+                    y=np.float16(1.0),
+                    name=p + "mscale",
+                )
+                mid_in = mb.real_div(x=mid, y=mscale, name=p + "mid_u")
+            else:
+                mscale = None
+                mid_in = mid
+            if hadamard_mode in ("ffn", "post_norm"):
+                d_ff = int(npz[p + "dn"].shape[1])
+                mid_in = _hadamard_128(mid_in, d_ff, signs_map[p + "mid"], p + "had_mid")
+            md_raw = mb.conv(x=mid_in, weight=npz[p + "dn"], name=p + "dn")
+            md = mb.mul(x=md_raw, y=mscale, name=p + "dnm") if mscale is not None else md_raw
             c2 = mb.add(x=c1, y=_rmsnorm_ch(md, npz[p + "w_poff"], p + "poff"), name=p + "res2")
             w_pg = npz[p + "w_pg"] if (p + "w_pg") in npz else npz[p + "pg"]
             w_pp = npz[p + "w_pp"] if (p + "w_pp") in npz else npz[p + "pp"]
             pg = mb.conv(x=c2, weight=w_pg, name=p + "pg")
-            pge = mb.mul(x=mb.gelu(x=pg, mode="TANH_APPROXIMATION", name=p + "pgelu"), y=plis[i], name=p + "pmul")
+            pge = mb.mul(x=_safe_gelu_tanh(pg, p + "p"), y=plis[i], name=p + "pmul")
             cur = mb.mul(
                 x=mb.add(
                     x=c2,
@@ -884,6 +1037,53 @@ def _resolve_ct_precision(ct: Any, compute_precision_mode: str) -> Any:
     return ct.precision.FLOAT16
 
 
+def _parse_tri_bool(value: bool | str, *, auto_default: bool, flag_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    norm = str(value).strip().lower()
+    if norm == "auto":
+        return bool(auto_default)
+    if norm in ("true", "1", "yes", "on"):
+        return True
+    if norm in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"Unsupported {flag_name}={value!r}; expected 'auto', 'true', or 'false'")
+
+
+def resolve_variant_mil_options(
+    variant: str,
+    *,
+    hadamard_mode: str = "auto",
+    hadamard_op: str = "grouped_conv",
+    safe_gelu_clamp: bool | str = "auto",
+    normalize_mid: bool | str = "auto",
+    hadamard_seed: int = DEFAULT_HADAMARD_SEED,
+) -> dict[str, Any]:
+    """Resolve explicit or `auto` Hadamard / GeLU clamp / `normalize_mid` options for `(fp16, w8)`."""
+    if hadamard_op not in HADAMARD_OPS:
+        raise ValueError(f"Unsupported hadamard_op={hadamard_op!r}; expected one of {HADAMARD_OPS}")
+    mode_norm = str(hadamard_mode).strip().lower()
+    if mode_norm == "auto":
+        # Cross-Mac M4 Pro + Base M5 validation: post_norm + grouped_conv cuts w8 rel error
+        # 26-39% with CPU=0/GPU=0/ANE=all and ~1.5-2.1 ms/chunk overhead, whereas clamp/normalize_mid
+        # add +5.3-7.6 ms/chunk and hurt fp16 accuracy; fp16 keeps raw norm parity.
+        eff_mode = "post_norm" if variant == "w8" else "none"
+    elif mode_norm in HADAMARD_MODES:
+        eff_mode = mode_norm
+    else:
+        raise ValueError(f"Unsupported hadamard_mode={hadamard_mode!r}; expected 'auto' or one of {HADAMARD_MODES}")
+
+    eff_clamp = _parse_tri_bool(safe_gelu_clamp, auto_default=False, flag_name="safe_gelu_clamp")
+    eff_norm_mid = _parse_tri_bool(normalize_mid, auto_default=False, flag_name="normalize_mid")
+    return {
+        "hadamard_mode": eff_mode,
+        "hadamard_op": hadamard_op,
+        "safe_gelu_clamp": eff_clamp,
+        "normalize_mid": eff_norm_mid,
+        "hadamard_seed": int(hadamard_seed),
+    }
+
+
 def _compile_gemma4_ane_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
     """Top-level `spawn`-safe worker compiling one `(variant, S)` Gemma-4 EarlyExit `.mlmodelc`."""
     import coremltools as ct
@@ -896,11 +1096,26 @@ def _compile_gemma4_ane_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
     P_FULL = int(task["P_FULL"])
     compute_precision_mode = str(task["compute_precision_mode"])
     keep_mlpackage = bool(task["keep_mlpackage"])
+    hadamard_mode = str(task.get("hadamard_mode", "none"))
+    hadamard_op = str(task.get("hadamard_op", "grouped_conv"))
+    safe_gelu_clamp = bool(task.get("safe_gelu_clamp", False))
+    normalize_mid = bool(task.get("normalize_mid", False))
+    hadamard_seed = int(task.get("hadamard_seed", DEFAULT_HADAMARD_SEED))
 
     t0 = time.perf_counter()
     with np.load(npz_path) as npz_obj:
         npz_dict = {k: npz_obj[k] for k in npz_obj.files}
-    prog, arch = build_early_prefix_mil_program(npz_dict, S=S, P_SWA=P_SWA, P_FULL=P_FULL)
+    prog, arch = build_early_prefix_mil_program(
+        npz_dict,
+        S=S,
+        P_SWA=P_SWA,
+        P_FULL=P_FULL,
+        hadamard_mode=hadamard_mode,
+        hadamard_op=hadamard_op,
+        safe_gelu_clamp=safe_gelu_clamp,
+        normalize_mid=normalize_mid,
+        hadamard_seed=hadamard_seed,
+    )
     del npz_dict
 
     ct_precision = _resolve_ct_precision(ct, compute_precision_mode)
@@ -937,6 +1152,10 @@ def _compile_gemma4_ane_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         "variant": variant,
         "arch": arch,
         "S": S,
+        "hadamard_mode": hadamard_mode,
+        "hadamard_op": hadamard_op,
+        "safe_gelu_clamp": safe_gelu_clamp,
+        "normalize_mid": normalize_mid,
         "elapsed_sec": round(time.perf_counter() - t0, 3),
     }
 
@@ -968,6 +1187,11 @@ def compile_ane_bundles_from_npz(
     manifest_meta: dict[str, Any] | None = None,
     jobs: int | None = None,
     chunk_sizes: Sequence[int] | None = None,
+    hadamard_mode: str = "auto",
+    hadamard_op: str = "grouped_conv",
+    safe_gelu_clamp: bool | str = "auto",
+    normalize_mid: bool | str = "auto",
+    hadamard_seed: int = DEFAULT_HADAMARD_SEED,
 ) -> list[Path]:
     if compute_precision_mode not in ("fp16_safe", "fp32_norms", "fp32"):
         raise ValueError(f"Unsupported compute_precision_mode={compute_precision_mode!r}")
@@ -986,6 +1210,14 @@ def compile_ane_bundles_from_npz(
     tasks: list[dict[str, Any]] = []
     for chunk_s in eff_chunks:
         for var in variants:
+            mil_opts = resolve_variant_mil_options(
+                var,
+                hadamard_mode=hadamard_mode,
+                hadamard_op=hadamard_op,
+                safe_gelu_clamp=safe_gelu_clamp,
+                normalize_mid=normalize_mid,
+                hadamard_seed=hadamard_seed,
+            )
             tasks.append(
                 {
                     "variant": var,
@@ -996,6 +1228,7 @@ def compile_ane_bundles_from_npz(
                     "P_FULL": int(P_FULL),
                     "compute_precision_mode": compute_precision_mode,
                     "keep_mlpackage": bool(keep_mlpackage),
+                    **mil_opts,
                 }
             )
 
@@ -1031,6 +1264,10 @@ def compile_ane_bundles_from_npz(
                 arch=arch,
                 compute_precision_mode=compute_precision_mode,
                 checkpoint_key=meta.get("checkpoint_ane_key"),
+                hadamard_mode=str(info.get("hadamard_mode", "none")),
+                hadamard_op=str(info.get("hadamard_op", "grouped_conv")),
+                safe_gelu_clamp=bool(info.get("safe_gelu_clamp", False)),
+                normalize_mid=bool(info.get("normalize_mid", False)),
             )
         else:
             write_ane_calibration_manifest(
@@ -1045,6 +1282,10 @@ def compile_ane_bundles_from_npz(
                 calibration_docs=int(meta.get("calibration_docs", 0)),
                 qat_validated=bool(meta.get("qat_validated", False)),
                 checkpoint_key=meta.get("checkpoint_ane_key"),
+                hadamard_mode=str(info.get("hadamard_mode", "none")),
+                hadamard_op=str(info.get("hadamard_op", "grouped_conv")),
+                safe_gelu_clamp=bool(info.get("safe_gelu_clamp", False)),
+                normalize_mid=bool(info.get("normalize_mid", False)),
             )
         print(f"Compiled {mc} ({info['elapsed_sec']:.2f}s)", flush=True)
         built.append(mc)
@@ -1095,6 +1336,31 @@ def main() -> int:
         default=None,
         help=f"Optional comma-separated static ANE chunk sizes S (default: {DEFAULT_ANE_CHUNK_S})",
     )
+    parser.add_argument(
+        "--hadamard-mode",
+        choices=("auto", "none", "ffn", "post_norm"),
+        default="auto",
+        help="Online WHT-128 post-norm rotation policy before ANE convs (default: auto)",
+    )
+    parser.add_argument(
+        "--hadamard-op",
+        choices=HADAMARD_OPS,
+        default="grouped_conv",
+        help="CoreML MIL op lowering for WHT-128 (`grouped_conv` uses single grouped 1x1 conv)",
+    )
+    parser.add_argument(
+        "--safe-gelu-clamp",
+        choices=("auto", "true", "false"),
+        default="auto",
+        help="Clamp GeLU cubic input to [-10, 10] + ReLU linear tail for FP16 safety",
+    )
+    parser.add_argument(
+        "--normalize-mid",
+        choices=("auto", "true", "false"),
+        default="auto",
+        help="Scale per-token GeGLU mid vector by max(|mid|) before down projection",
+    )
+    parser.add_argument("--hadamard-seed", type=int, default=DEFAULT_HADAMARD_SEED)
     parser.add_argument("--compile-only-fp16-npz", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-w8-npz", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--compile-only-out-dir", default=None, help=argparse.SUPPRESS)
@@ -1120,6 +1386,11 @@ def main() -> int:
             manifest_meta=meta_obj,
             jobs=eff_jobs,
             chunk_sizes=_parse_chunk_sizes(args.chunk_sizes, DEFAULT_ANE_CHUNK_S),
+            hadamard_mode=args.hadamard_mode,
+            hadamard_op=args.hadamard_op,
+            safe_gelu_clamp=args.safe_gelu_clamp,
+            normalize_mid=args.normalize_mid,
+            hadamard_seed=args.hadamard_seed,
         )
         return 0
 
@@ -1225,6 +1496,11 @@ def main() -> int:
                 manifest_meta=calib_meta,
                 jobs=eff_jobs,
                 chunk_sizes=_parse_chunk_sizes(args.chunk_sizes, ANE_CHUNK_S),
+                hadamard_mode=args.hadamard_mode,
+                hadamard_op=args.hadamard_op,
+                safe_gelu_clamp=args.safe_gelu_clamp,
+                normalize_mid=args.normalize_mid,
+                hadamard_seed=args.hadamard_seed,
             )
         else:
             uv_bin = shutil.which("uv")
@@ -1244,6 +1520,16 @@ def main() -> int:
                 args.variant,
                 "--compute-precision",
                 args.compute_precision,
+                "--hadamard-mode",
+                args.hadamard_mode,
+                "--hadamard-op",
+                args.hadamard_op,
+                "--safe-gelu-clamp",
+                args.safe_gelu_clamp,
+                "--normalize-mid",
+                args.normalize_mid,
+                "--hadamard-seed",
+                str(args.hadamard_seed),
                 "--jobs",
                 str(eff_jobs),
                 "--compile-only-fp16-npz",

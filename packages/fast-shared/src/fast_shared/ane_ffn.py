@@ -1368,7 +1368,7 @@ class AneContext:
         host_in_fp16: np.ndarray,
         signs_fp16: np.ndarray,
         *,
-        quantize_a8: bool = True,
+        quantize_a8: bool = False,
         use_shared_event: bool = True,
         timeout_ms: int = 5000,
     ) -> "AneWave":
@@ -1451,7 +1451,7 @@ class AneWave:
         surf_in: AneSurface,
         host_in_fp16: np.ndarray,
         signs_fp16: np.ndarray,
-        quantize_a8: bool = True,
+        quantize_a8: bool = False,
         use_shared_event: bool = True,
         timeout_ms: int = 5000,
     ) -> None:

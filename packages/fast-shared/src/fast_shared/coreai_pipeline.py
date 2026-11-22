@@ -54,8 +54,10 @@ _PRESET_NOMINAL_BITS: dict[str, float] = {
 
 
 def _sanitize_custom_metadata(value: Any) -> Any:
-    """Strip None values recursively because AIModelAssetMetadata.set_custom rejects NoneType."""
+    """Strip None values and normalize non-finite floats for AIModelAssetMetadata."""
     if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float) and not np.isfinite(value):
         return str(value)
     if isinstance(value, dict):
         return {str(k): _sanitize_custom_metadata(v) for k, v in value.items() if v is not None}
@@ -90,6 +92,189 @@ def _flat_outputs(out: Any) -> np.ndarray:
         parts = [np.asarray(t.detach().cpu().numpy(), dtype=np.float64).reshape(-1) for t in out]
         return np.concatenate(parts) if parts else np.zeros((0,), dtype=np.float64)
     return np.asarray(out.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+
+
+def _extract_batch_feature_vector(batch_inputs: Any) -> np.ndarray:
+    """Flatten nested batch inputs (tensors/arrays/sequences/mappings) into one 1-D float64 vector."""
+    parts: list[np.ndarray] = []
+
+    def _visit(obj: Any) -> None:
+        if obj is None:
+            return
+        if hasattr(obj, "detach") and hasattr(obj, "cpu"):
+            parts.append(np.asarray(obj.detach().cpu().numpy(), dtype=np.float64).reshape(-1))
+        elif isinstance(obj, np.ndarray):
+            parts.append(np.asarray(obj, dtype=np.float64).reshape(-1))
+        elif isinstance(obj, Mapping):
+            for k in sorted(obj.keys(), key=str):
+                _visit(obj[k])
+        elif isinstance(obj, (tuple, list)):
+            for item in obj:
+                _visit(item)
+
+    _visit(batch_inputs)
+    if not parts:
+        return np.zeros((0,), dtype=np.float64)
+    return np.concatenate(parts)
+
+
+def assess_calibration_batch_diversity(
+    batches: Sequence[Any],
+    *,
+    min_l2_diff: float = 1e-6,
+) -> dict[str, Any]:
+    """Measure sample diversity and dynamic-range spread across calibration input batches."""
+    n_batches = len(batches)
+    vecs = [_extract_batch_feature_vector(b) for b in batches]
+    rms_vals = [float(np.sqrt(np.mean(v * v))) if v.size else 0.0 for v in vecs]
+    max_rms = max(rms_vals) if rms_vals else 0.0
+    min_rms = min(rms_vals) if rms_vals else 0.0
+    rms_scale_ratio = float(max_rms / max(min_rms, 1e-12)) if n_batches >= 2 and max_rms > 0.0 else 1.0
+
+    if n_batches <= 1:
+        return {
+            "n_batches": n_batches,
+            "unique_batches": n_batches,
+            "all_batches_identical": False,
+            "diverse": bool(n_batches == 1 and max_rms > 0.0),
+            "mean_pairwise_l2_diff": 0.0,
+            "min_pairwise_l2_diff": 0.0,
+            "min_pairwise_cosine": 1.0,
+            "max_rms": round(max_rms, 6),
+            "min_rms": round(min_rms, 6),
+            "rms_scale_ratio": round(rms_scale_ratio, 6),
+        }
+
+    pair_l2: list[float] = []
+    pair_cos: list[float] = []
+    reps: list[np.ndarray] = []
+    for i, vi in enumerate(vecs):
+        if not any(
+            vi.shape == r.shape and float(np.linalg.norm(vi - r)) <= min_l2_diff
+            for r in reps
+        ):
+            reps.append(vi)
+        ni = float(np.linalg.norm(vi))
+        for j in range(i + 1, n_batches):
+            vj = vecs[j]
+            if vi.shape != vj.shape:
+                pair_l2.append(float("inf"))
+                pair_cos.append(0.0)
+                continue
+            l2 = float(np.linalg.norm(vi - vj))
+            pair_l2.append(l2)
+            nj = float(np.linalg.norm(vj))
+            denom = ni * nj
+            pair_cos.append(float(np.dot(vi, vj) / denom) if denom > 0.0 else 0.0)
+
+    finite_l2 = [x for x in pair_l2 if np.isfinite(x)]
+    mean_l2 = float(np.mean(finite_l2)) if finite_l2 else (float(min_l2_diff) + 1.0 if pair_l2 else 0.0)
+    min_l2 = min(pair_l2) if pair_l2 else 0.0
+    min_cos = min(pair_cos) if pair_cos else 1.0
+    unique_cnt = len(reps)
+    all_identical = unique_cnt <= 1
+    diverse = bool(unique_cnt >= 2 and max_rms > 1e-12 and (mean_l2 > min_l2_diff or rms_scale_ratio > 1.01))
+    return {
+        "n_batches": n_batches,
+        "unique_batches": unique_cnt,
+        "all_batches_identical": all_identical,
+        "diverse": diverse,
+        "mean_pairwise_l2_diff": round(mean_l2, 6),
+        "min_pairwise_l2_diff": round(min_l2 if np.isfinite(min_l2) else mean_l2, 6),
+        "min_pairwise_cosine": round(min_cos, 6),
+        "max_rms": round(max_rms, 6),
+        "min_rms": round(min_rms, 6),
+        "rms_scale_ratio": round(rms_scale_ratio, 6),
+    }
+
+
+def _score_teacher_vs_quant(ref_vec: np.ndarray, q_vec: np.ndarray) -> tuple[float, float, bool]:
+    """Return `(cosine, mse, all_finite)` comparing flattened teacher vs quantized tensors."""
+    finite_ok = bool(np.all(np.isfinite(ref_vec)) and np.all(np.isfinite(q_vec)))
+    if not finite_ok or ref_vec.size == 0 or q_vec.size == 0:
+        return 0.0, float("inf") if not finite_ok else 0.0, finite_ok
+    denom = float(np.linalg.norm(ref_vec) * np.linalg.norm(q_vec))
+    cos = float(np.dot(ref_vec, q_vec) / denom) if denom > 0.0 else 0.0
+    mse = float(np.mean((ref_vec - q_vec) ** 2))
+    return cos, mse, True
+
+
+def evaluate_multi_batch_calibration_gate(
+    ref_outputs: Sequence[np.ndarray],
+    quant_outputs: Sequence[np.ndarray],
+    *,
+    batch_diversity: Mapping[str, Any] | None = None,
+    calib_batches: int = 1,
+    min_calib_batches: int = 1,
+    require_calib_diversity: bool = False,
+    min_cosine: float | None = None,
+    max_cosine_std: float | None = None,
+    max_cosine_drop: float | None = None,
+    max_mse: float | None = None,
+    check_finite: bool = True,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Score per-batch teacher-vs-quantized fidelity and enforce multi-batch calibration gates."""
+    if len(ref_outputs) != len(quant_outputs) or not ref_outputs:
+        raise ValueError("ref_outputs and quant_outputs must be non-empty sequences of matching length")
+
+    cos_list: list[float] = []
+    mse_list: list[float] = []
+    all_finite = True
+    for ref_v, q_v in zip(ref_outputs, quant_outputs):
+        c, m, fin = _score_teacher_vs_quant(np.asarray(ref_v, dtype=np.float64), np.asarray(q_v, dtype=np.float64))
+        cos_list.append(c)
+        mse_list.append(m)
+        all_finite = all_finite and fin
+
+    mean_cos = float(np.mean(cos_list))
+    min_cos = float(np.min(cos_list))
+    max_cos = float(np.max(cos_list))
+    cos_std = float(np.std(cos_list))
+    max_drop = float(max_cos - min_cos)
+    finite_mses = [x for x in mse_list if np.isfinite(x)]
+    mean_mse = float(np.mean(finite_mses)) if finite_mses else float("inf")
+    max_mse_val = float(np.max(mse_list))
+
+    eff_min_batches = max(2, int(min_calib_batches)) if strict else max(1, int(min_calib_batches))
+    eff_req_div = True if strict else bool(require_calib_diversity)
+    eff_min_cos = 0.90 if (strict and min_cosine is None) else min_cosine
+    eff_max_std = 0.05 if (strict and max_cosine_std is None) else max_cosine_std
+    eff_max_drop = 0.08 if (strict and max_cosine_drop is None) else max_cosine_drop
+
+    failures: list[str] = []
+    if check_finite and not all_finite:
+        failures.append("nonfinite_output")
+    if int(calib_batches) < eff_min_batches:
+        failures.append(f"calib_batches={int(calib_batches)} < min_calib_batches={eff_min_batches}")
+    if eff_req_div and int(calib_batches) >= 2:
+        if batch_diversity is None or not bool(batch_diversity.get("diverse", False)):
+            failures.append("calib_batches_not_diverse")
+    if eff_min_cos is not None and min_cos < float(eff_min_cos):
+        failures.append(f"min_cosine={min_cos:.6f} < min_cosine={float(eff_min_cos):.6f}")
+    if eff_max_std is not None and cos_std > float(eff_max_std):
+        failures.append(f"cosine_std={cos_std:.6f} > max_cosine_std={float(eff_max_std):.6f}")
+    if eff_max_drop is not None and max_drop > float(eff_max_drop):
+        failures.append(f"max_cosine_drop={max_drop:.6f} > max_cosine_drop={float(eff_max_drop):.6f}")
+    if max_mse is not None and (not np.isfinite(max_mse_val) or max_mse_val > float(max_mse)):
+        failures.append(f"max_mse={max_mse_val:.8g} > max_mse={float(max_mse):.8g}")
+
+    return {
+        "passed": len(failures) == 0,
+        "failures": failures,
+        "n_calib_batches": int(calib_batches),
+        "n_eval_batches": len(ref_outputs),
+        "all_finite": all_finite,
+        "per_batch_cosine": [round(c, 6) for c in cos_list],
+        "per_batch_mse": [round(m, 8) if np.isfinite(m) else float("inf") for m in mse_list],
+        "mean_cosine_vs_teacher": round(mean_cos, 6),
+        "min_cosine_vs_teacher": round(min_cos, 6),
+        "max_cosine_vs_teacher": round(max_cos, 6),
+        "cosine_std": round(cos_std, 6),
+        "max_cosine_drop": round(max_drop, 6),
+        "mean_mse_vs_teacher": round(mean_mse, 8) if np.isfinite(mean_mse) else float("inf"),
+        "max_mse_vs_teacher": round(max_mse_val, 8) if np.isfinite(max_mse_val) else float("inf"),
+    }
 
 
 def compute_analytical_bpw(module: Any, excluded_modules: set[str], bits_quant: float) -> float:
@@ -346,6 +531,19 @@ def build_coreai_opt_config(
     return cfg, meta
 
 
+def _materialize_eval_batches(
+    eval_inputs: Sequence[tuple[Any, ...]] | Callable[[int], tuple[Any, ...]] | None,
+    raw_calib_batches: Sequence[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
+    """Resolve evaluation batches from explicit sequence/callable or cached calibration batches."""
+    if eval_inputs is None:
+        return list(raw_calib_batches)
+    if callable(eval_inputs):
+        return [eval_inputs(bi) for bi in range(len(raw_calib_batches))]
+    batches = [tuple(b) for b in eval_inputs]
+    return batches if batches else list(raw_calib_batches)
+
+
 def run_coreai_opt_calibration_and_export(
     *,
     module_factory: Callable[[], Any],
@@ -364,6 +562,15 @@ def run_coreai_opt_calibration_and_export(
     excluded_modules: Sequence[str] = (),
     requested_dtypes: Sequence[Any] = (),
     calib_batches: int = 2,
+    eval_inputs: Sequence[tuple[Any, ...]] | Callable[[int], tuple[Any, ...]] | None = None,
+    min_calib_batches: int = 1,
+    require_calib_diversity: bool = False,
+    strict_calibration_gate: bool = False,
+    min_calib_cosine: float | None = None,
+    max_calib_cosine_std: float | None = None,
+    max_calib_cosine_drop: float | None = None,
+    max_calib_mse: float | None = None,
+    fail_on_nonfinite: bool = True,
     spec_metadata: Mapping[str, Any] | None = None,
     flag_add_fp16_cast: bool = False,
     inspect_placement: bool = False,
@@ -371,14 +578,40 @@ def run_coreai_opt_calibration_and_export(
     allow_experimental_coreml_w4_block: bool = False,
     compute_dtype: str = "auto",
 ) -> CoreAiExportResult:
-    """Calibrate, quantize (CoreAI-Opt), export (`.aimodel` / `.mlpackage`), and guard any `nn.Module`."""
+    """Calibrate, quantize (CoreAI-Opt), gate across batches, export, and guard any `nn.Module`."""
     import torch
+
+    eff_calib_batches = max(1, int(calib_batches))
+    eff_min_calib = max(2, int(min_calib_batches)) if strict_calibration_gate else max(1, int(min_calib_batches))
+    eff_req_div = bool(require_calib_diversity or strict_calibration_gate)
+    gate_enforced = bool(
+        strict_calibration_gate
+        or require_calib_diversity
+        or int(min_calib_batches) > 1
+        or min_calib_cosine is not None
+        or max_calib_cosine_std is not None
+        or max_calib_cosine_drop is not None
+        or max_calib_mse is not None
+    )
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     eff_compute_dtype = _resolve_coreai_compute_dtype(export_backend, preset, compute_dtype)
     module = module_factory().eval()
-    raw_sample = sample_inputs_factory(0)
+    raw_calib_batches = [sample_inputs_factory(bi) for bi in range(eff_calib_batches)]
+    raw_eval_batches = _materialize_eval_batches(eval_inputs, raw_calib_batches)
+    batch_diversity = assess_calibration_batch_diversity(raw_calib_batches)
+    if gate_enforced:
+        if eff_calib_batches < eff_min_calib:
+            raise ValueError(
+                f"Multi-batch calibration gate failed: calib_batches={eff_calib_batches} < min_calib_batches={eff_min_calib}"
+            )
+        if eff_req_div and eff_calib_batches >= 2 and not batch_diversity["diverse"]:
+            raise ValueError(
+                f"Multi-batch calibration gate failed: duplicate/non-diverse calibration batches ({batch_diversity})"
+            )
+
+    raw_sample = raw_calib_batches[0]
 
     weight_shapes = {
         name: tuple(int(d) for d in sub.weight.shape)
@@ -398,26 +631,25 @@ def run_coreai_opt_calibration_and_export(
     )
 
     with torch.no_grad():
-        ref_vec = _flat_outputs(module(*raw_sample))
+        ref_vecs = [_flat_outputs(module(*b)) for b in raw_eval_batches]
 
     if eff_compute_dtype == "fp16":
         # Cast floating weights/buffers + sample inputs to FP16 so Core AI exports stay ANE/FP16-eligible.
         module = module.to(dtype=torch.float16)
-        sample = _cast_floating_tensors(raw_sample, torch.float16)
-
-        def _calib_inputs(bi: int) -> tuple[Any, ...]:
-            return _cast_floating_tensors(sample_inputs_factory(bi), torch.float16)
+        calib_batches_cast = [_cast_floating_tensors(b, torch.float16) for b in raw_calib_batches]
+        eval_batches_cast = [_cast_floating_tensors(b, torch.float16) for b in raw_eval_batches]
     else:
-        sample = raw_sample
-        _calib_inputs = sample_inputs_factory
+        calib_batches_cast = list(raw_calib_batches)
+        eval_batches_cast = list(raw_eval_batches)
+    sample = calib_batches_cast[0]
 
     if preset == "fp16":
         finalized = module
         if eff_compute_dtype == "fp16":
             with torch.no_grad():
-                q_vec = _flat_outputs(finalized(*sample))
+                q_vecs = [_flat_outputs(finalized(*b)) for b in eval_batches_cast]
         else:
-            q_vec = ref_vec
+            q_vecs = list(ref_vecs)
     else:
         from coreai_opt import ExportBackend
         from coreai_opt.quantization import Quantizer
@@ -427,19 +659,55 @@ def run_coreai_opt_calibration_and_export(
         prepared = quantizer.prepare(sample)
         with quantizer.calibration_mode():
             with torch.no_grad():
-                for bi in range(max(1, int(calib_batches))):
-                    prepared(*_calib_inputs(bi))
+                for cb in calib_batches_cast:
+                    prepared(*cb)
         with torch.no_grad():
-            q_vec = _flat_outputs(prepared(*sample))
+            q_vecs = [_flat_outputs(prepared(*eb_in)) for eb_in in eval_batches_cast]
         finalized = quantizer.finalize(backend=eb)
 
-    denom = float(np.linalg.norm(ref_vec) * np.linalg.norm(q_vec))
-    cos = float(np.dot(ref_vec, q_vec) / denom) if denom > 0.0 else 0.0
-    mse = float(np.mean((ref_vec - q_vec) ** 2)) if ref_vec.size else 0.0
+    gate_res = evaluate_multi_batch_calibration_gate(
+        ref_vecs,
+        q_vecs,
+        batch_diversity=batch_diversity,
+        calib_batches=eff_calib_batches,
+        min_calib_batches=eff_min_calib,
+        require_calib_diversity=eff_req_div,
+        min_cosine=min_calib_cosine,
+        max_cosine_std=max_calib_cosine_std,
+        max_cosine_drop=max_calib_cosine_drop,
+        max_mse=max_calib_mse,
+        check_finite=bool(fail_on_nonfinite),
+        strict=strict_calibration_gate,
+    )
+    if fail_on_nonfinite and not gate_res["all_finite"]:
+        raise ValueError("Multi-batch calibration gate failed: nonfinite quantized output")
+    if gate_enforced and not gate_res["passed"]:
+        raise ValueError(f"Multi-batch calibration gate failed: {'; '.join(gate_res['failures'])}")
+
+    cos_b0 = float(gate_res["per_batch_cosine"][0])
+    mse_b0 = gate_res["per_batch_mse"][0]
     bits_q = _PRESET_NOMINAL_BITS[preset.strip().lower()]
     sensitivity = {
-        "cosine_vs_teacher": round(cos, 6),
-        "mse_vs_teacher": round(mse, 8),
+        "cosine_vs_teacher": cos_b0,
+        "mse_vs_teacher": mse_b0,
+        "mean_cosine_vs_teacher": gate_res["mean_cosine_vs_teacher"],
+        "min_cosine_vs_teacher": gate_res["min_cosine_vs_teacher"],
+        "max_cosine_vs_teacher": gate_res["max_cosine_vs_teacher"],
+        "cosine_std": gate_res["cosine_std"],
+        "max_cosine_drop": gate_res["max_cosine_drop"],
+        "mean_mse_vs_teacher": gate_res["mean_mse_vs_teacher"],
+        "max_mse_vs_teacher": gate_res["max_mse_vs_teacher"],
+        "per_batch_cosine": gate_res["per_batch_cosine"],
+        "per_batch_mse": gate_res["per_batch_mse"],
+        "all_finite": gate_res["all_finite"],
+        "n_calib_batches": eff_calib_batches,
+        "n_eval_batches": gate_res["n_eval_batches"],
+        "batch_diversity": batch_diversity,
+        "calibration_gate": {
+            "passed": gate_res["passed"],
+            "enforced": gate_enforced,
+            "failures": gate_res["failures"],
+        },
         "analytical_bpw": compute_analytical_bpw(module, set(qmeta["excluded_modules"]), bits_q),
         "compute_dtype": eff_compute_dtype,
         "excluded_modules": qmeta["excluded_modules"],
@@ -590,6 +858,15 @@ def run_coreai_opt_preset_sweep(
     block_axis: int = 1,
     excluded_modules: Sequence[str] = (),
     calib_batches: int = 2,
+    eval_inputs: Sequence[tuple[Any, ...]] | Callable[[int], tuple[Any, ...]] | None = None,
+    min_calib_batches: int = 1,
+    require_calib_diversity: bool = False,
+    strict_calibration_gate: bool = False,
+    min_calib_cosine: float | None = None,
+    max_calib_cosine_std: float | None = None,
+    max_calib_cosine_drop: float | None = None,
+    max_calib_mse: float | None = None,
+    fail_on_nonfinite: bool = True,
     spec_metadata: Mapping[str, Any] | None = None,
     allow_experimental_coreml_w4_block: bool = False,
     compute_dtype: str = "auto",
@@ -602,6 +879,25 @@ def run_coreai_opt_preset_sweep(
             if export_backend.strip().lower() == "coreml" and not allow_experimental_coreml_w4_block
             else ("fp16", "w8", "w4", "w4_per_block")
         )
+    gate_kw: dict[str, Any] = {}
+    if eval_inputs is not None:
+        gate_kw["eval_inputs"] = eval_inputs
+    if int(min_calib_batches) != 1:
+        gate_kw["min_calib_batches"] = min_calib_batches
+    if require_calib_diversity:
+        gate_kw["require_calib_diversity"] = True
+    if strict_calibration_gate:
+        gate_kw["strict_calibration_gate"] = True
+    if min_calib_cosine is not None:
+        gate_kw["min_calib_cosine"] = min_calib_cosine
+    if max_calib_cosine_std is not None:
+        gate_kw["max_calib_cosine_std"] = max_calib_cosine_std
+    if max_calib_cosine_drop is not None:
+        gate_kw["max_calib_cosine_drop"] = max_calib_cosine_drop
+    if max_calib_mse is not None:
+        gate_kw["max_calib_mse"] = max_calib_mse
+    if not fail_on_nonfinite:
+        gate_kw["fail_on_nonfinite"] = False
     rows: list[dict[str, Any]] = []
     for preset in presets:
         res = run_coreai_opt_calibration_and_export(
@@ -623,6 +919,7 @@ def run_coreai_opt_preset_sweep(
             spec_metadata=spec_metadata,
             allow_experimental_coreml_w4_block=allow_experimental_coreml_w4_block,
             compute_dtype=compute_dtype,
+            **gate_kw,
         )
         rows.append(
             {

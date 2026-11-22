@@ -658,6 +658,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="Target chunk size in tokens when --context-tokens is active (default: 256)",
     )
+    p_parquet.add_argument(
+        "--header-text",
+        default=None,
+        help="Optional document header/title anchored across contextual windows (--context-tokens)",
+    )
+    p_parquet.add_argument(
+        "--header-col",
+        default=None,
+        help="Optional input Parquet column containing per-document header/title text",
+    )
+    p_parquet.add_argument(
+        "--repeat-header-tokens",
+        type=int,
+        default=None,
+        help="Lead tokens from chunk 0 anchored on continuation windows (default: auto 128 when --context-tokens >= 512 and no header is supplied; 0 disables)",
+    )
+    p_parquet.add_argument(
+        "--window-overlap-chunks",
+        type=int,
+        default=0,
+        help="Opt-in leading chunk overlap for cross-window context without duplicating emitted rows (default: 0)",
+    )
 
     p_serve = sub.add_parser("serve", help="Start OpenAI-compatible HTTP embedding server")
     _add_common_engine_args(p_serve)
@@ -700,6 +722,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     chunk_tokens=args.chunk_tokens,
                     context_tokens=args.context_tokens,
                     overlap=args.overlap,
+                    header_text=getattr(args, "header_text", None),
+                    header_col=getattr(args, "header_col", None),
+                    repeat_header_tokens=getattr(args, "repeat_header_tokens", None),
+                    window_overlap_chunks=int(getattr(args, "window_overlap_chunks", 0)),
                     mode=args.mode,
                     dtype=args.dtype,
                     batch_rows=args.batch_rows,

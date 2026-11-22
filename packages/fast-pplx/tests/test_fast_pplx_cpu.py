@@ -1374,3 +1374,250 @@ def test_engine_forwards_state_dtype_and_benchmark_parser_accepts_flag(
     spec.loader.exec_module(bench_mod)
     args = bench_mod.build_parser().parse_args(["speed", "--state-dtype", "int8"])
     assert args.state_dtype == "int8"
+
+
+def test_embed_inputs_uses_float32_gather_for_non_f16_mapped_embedding(tmp_path: Path) -> None:
+    from fast_pplx.gpu import FastPplxGPU
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        values = np.array(
+            [[65536.0, 1e-6, 1.25, -0.5], [100000.0, -3e-6, -2.5, 0.75]],
+            dtype=np.float32,
+        )
+        f32_path = _write_synthetic_safetensors(
+            tmp_path / "embed_f32.safetensors",
+            {"weight": (values, "F32")},
+        )
+        bf16_u16 = (values.view(np.uint32) >> 16).astype(np.uint16)
+        bf16_path = _write_synthetic_safetensors(
+            tmp_path / "embed_bf16.safetensors",
+            {"weight": (bf16_u16, "BF16")},
+        )
+
+        class _Stub:
+            def __init__(self, mapped: MappedEmbedding, act_dtype: mx.Dtype) -> None:
+                self._mapped_embed = mapped
+                self.act_dtype = act_dtype
+                self.model = None
+
+        ids = np.array([[0, 1]], dtype=np.int32)
+        with MappedEmbedding(f32_path, tensor_name="weight") as mm_f32:
+            out_f32 = FastPplxGPU._embed_inputs(_Stub(mm_f32, mx.bfloat16), ids)
+            mx.eval(out_f32)
+            assert out_f32.dtype == mx.bfloat16
+            ref_f32 = mx.array(values[None, ...], dtype=mx.bfloat16)
+            mx.eval(ref_f32)
+            np.testing.assert_allclose(
+                np.asarray(out_f32.astype(mx.float32)),
+                np.asarray(ref_f32.astype(mx.float32)),
+                atol=0.0,
+                rtol=0.0,
+            )
+
+        with MappedEmbedding(bf16_path, tensor_name="weight") as mm_bf16:
+            out_bf16 = FastPplxGPU._embed_inputs(_Stub(mm_bf16, mx.bfloat16), ids)
+            mx.eval(out_bf16)
+            assert out_bf16.dtype == mx.bfloat16
+            expected_bf16 = ((bf16_u16.astype(np.uint32) << 16).view(np.float32))[None, ...]
+            np.testing.assert_allclose(
+                np.asarray(out_bf16.astype(mx.float32)),
+                expected_bf16,
+                atol=0.0,
+                rtol=0.0,
+            )
+
+        seen_dtypes: list[str] = []
+
+        class _Spy:
+            def __init__(self, dtype_tag: str) -> None:
+                self.dtype = dtype_tag
+
+            def gather(self, token_ids: np.ndarray, *, out_dtype: str = "float16") -> np.ndarray:
+                seen_dtypes.append(str(out_dtype))
+                return np.ones((*token_ids.shape, 4), dtype=np.dtype(out_dtype))
+
+        FastPplxGPU._embed_inputs(_Stub(_Spy("F32"), mx.bfloat16), ids)  # type: ignore[arg-type]
+        FastPplxGPU._embed_inputs(_Stub(_Spy("F32"), mx.float16), ids)  # type: ignore[arg-type]
+        FastPplxGPU._embed_inputs(_Stub(_Spy("F16"), mx.bfloat16), ids)  # type: ignore[arg-type]
+        assert seen_dtypes == ["float32", "float16", "float16"]
+    finally:
+        mx.set_default_device(prev_dev)
+
+
+def test_contextual_window_anchoring_overlap_and_parquet_1to1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify plan_contextual_windows + embed_contextual_parquet anchor/overlap emission without duplicating rows."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from fast_pplx.cli import main as cli_main
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.parquet_pipeline import embed_contextual_parquet
+
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+
+    doc_text = " ".join(["hello world chunk one two"] * 6)
+    base_plans = tok.plan_contextual_windows(doc_text, chunk_tokens=8, context_tokens=18, overlap=0)
+    assert len(base_plans) >= 2
+    base_spans = [sp for w in base_plans for sp in w.spans]
+
+    # 1. Explicit header_text + window_overlap_chunks=1: context carries prefix, emitted spans stay strictly 1:1
+    ov_plans = tok.plan_contextual_windows(
+        doc_text, chunk_tokens=8, context_tokens=22, overlap=0, header_text="hello", window_overlap_chunks=1
+    )
+    assert len(ov_plans) >= 2
+    assert ov_plans[0].has_header_anchor and ov_plans[0].emit_start == 1
+    assert ov_plans[1].has_header_anchor and ov_plans[1].overlap_chunks == 1 and ov_plans[1].emit_start == 2
+    for w in ov_plans:
+        assert len(tok.encode_contextual_document(w.chunks, return_spans=False)) <= 22
+    assert [sp for w in ov_plans for sp in w.spans] == base_spans
+
+    # 2. Positional vector test proves embed_contextual_parquet slices vec[emit_start : emit_start + n_emit]
+    seen_windows: list[list[str]] = []
+
+    class _PositionalGPU:
+        max_seq_len = 32768
+
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
+            d = dimensions or 8
+            out = []
+            for win_idx, (_, spans) in enumerate(docs):
+                # Store [win_pos_in_doc, pos_within_window, ...] so slicing out prefixes is directly observable.
+                mat = np.zeros((len(spans), d), dtype=np.float32)
+                for j in range(len(spans)):
+                    mat[j, 0] = float(j)
+                out.append(mat)
+            return out
+
+        def close(self):
+            pass
+
+    orig_enc = tok.encode_contextual_document
+
+    def _spy_enc(chunks_w, *args, **kwargs):
+        seen_windows.append(list(chunks_w))
+        return orig_enc(chunks_w, *args, **kwargs)
+
+    monkeypatch.setattr(tok, "encode_contextual_document", _spy_enc)
+
+    in_pq = tmp_path / "hdr_in.parquet"
+    pq.write_table(
+        pa.table({"doc_id": ["d0", "d1"], "title": ["hello", ""], "text": [doc_text, doc_text]}),
+        in_pq,
+    )
+    out_hdr_pq = tmp_path / "hdr_out.parquet"
+    out_shard_dir = tmp_path / "hdr_shards"
+
+    with FastPplx(home=tmp_path, mode="gpu", _gpu_backend=_PositionalGPU(), _tokenizer=tok) as eng:
+        with pytest.raises(KeyError, match="missing_col"):
+            embed_contextual_parquet(
+                eng, in_pq, out_hdr_pq, header_col="missing_col", chunk_tokens=8, context_tokens=22, overlap=0
+            )
+
+        summary = embed_contextual_parquet(
+            eng,
+            in_pq,
+            out_hdr_pq,
+            header_col="title",
+            chunk_tokens=8,
+            context_tokens=22,
+            overlap=0,
+            repeat_header_tokens=2,
+            window_overlap_chunks=1,
+            dimensions=8,
+        )
+        assert summary.rows_emitted == 2 * len(base_spans)
+        out_tbl = pq.read_table(out_hdr_pq)
+        assert out_tbl.num_rows == 2 * len(base_spans)
+        d0_vecs = [v for did, v in zip(out_tbl["doc_id"].to_pylist(), out_tbl["vector"].to_pylist(), strict=True) if did == "d0"]
+        d1_vecs = [v for did, v in zip(out_tbl["doc_id"].to_pylist(), out_tbl["vector"].to_pylist(), strict=True) if did == "d1"]
+        # d0 window 0 has header anchor ("hello") -> emit_start=1, window 1 has anchor+overlap -> emit_start=2
+        assert d0_vecs[0][0] == 1.0
+        assert any(v[0] == 2.0 for v in d0_vecs)
+        # d1 had blank title -> falls back to repeat_header_tokens=2: window 0 starts at 0.0, window 1 at 2.0
+        assert d1_vecs[0][0] == 0.0
+        assert any(v[0] == 2.0 for v in d1_vecs)
+
+        # Shard-dir mode matches exact non-duplicated emitted rows too
+        shard_sum = embed_contextual_parquet(
+            eng,
+            in_pq,
+            out_shard_dir,
+            header_col="title",
+            chunk_tokens=8,
+            context_tokens=22,
+            overlap=0,
+            repeat_header_tokens=2,
+            window_overlap_chunks=1,
+            shard_rows=4,
+            dimensions=8,
+        )
+        assert shard_sum.rows_emitted == 2 * len(base_spans)
+
+        # 3. Auto repeat_header_tokens=128 activates for context_tokens >= 512, and repeat_header_tokens=0 disables
+        long_doc = "hello world " + " ".join(["chunk one two"] * 200)
+        big_in = tmp_path / "big_in.parquet"
+        pq.write_table(pa.table({"doc_id": ["big"], "text": [long_doc]}), big_in)
+
+        seen_windows.clear()
+        s_auto = embed_contextual_parquet(
+            eng, big_in, tmp_path / "big_auto.parquet", chunk_tokens=160, context_tokens=512, overlap=0, dimensions=8
+        )
+        assert len(seen_windows) >= 2
+        assert seen_windows[1][0].startswith("hello world")
+        assert sum(len(w) for w in seen_windows) == s_auto.rows_emitted + (len(seen_windows) - 1)
+
+        seen_windows.clear()
+        s_off = embed_contextual_parquet(
+            eng,
+            big_in,
+            tmp_path / "big_off.parquet",
+            chunk_tokens=160,
+            context_tokens=512,
+            overlap=0,
+            repeat_header_tokens=0,
+            dimensions=8,
+        )
+        assert s_auto.rows_emitted == s_off.rows_emitted
+        assert sum(len(w) for w in seen_windows) == s_off.rows_emitted  # zero anchors when disabled
+
+    # 4. CLI forwards all 4 contextual window options
+    captured: dict[str, object] = {}
+
+    def _spy_ctx(*args, **kwargs):
+        captured.update(kwargs)
+        from fast_shared.parquet_pipeline import ParquetEmbedSummary
+
+        return ParquetEmbedSummary(1, 1, 1, 10, 0.01, tmp_path / "cli_out.parquet")
+
+    monkeypatch.setattr("fast_pplx.cli.warn_if_untested_hardware", lambda *a, **k: False)
+    monkeypatch.setattr("fast_pplx.cli._make_engine", lambda a, **kw: eng)
+    monkeypatch.setattr("fast_pplx.cli.embed_contextual_parquet", _spy_ctx)
+
+    rc = cli_main(
+        [
+            "parquet",
+            "--input",
+            str(in_pq),
+            "--output",
+            str(tmp_path / "cli_out.parquet"),
+            "--context-tokens",
+            "2048",
+            "--header-text",
+            "Contract Title",
+            "--header-col",
+            "title",
+            "--repeat-header-tokens",
+            "96",
+            "--window-overlap-chunks",
+            "1",
+        ]
+    )
+    assert rc == 0
+    assert captured["header_text"] == "Contract Title"
+    assert captured["header_col"] == "title"
+    assert captured["repeat_header_tokens"] == 96
+    assert captured["window_overlap_chunks"] == 1

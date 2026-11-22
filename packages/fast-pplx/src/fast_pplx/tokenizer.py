@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 from tokenizers import Tokenizer
@@ -16,6 +17,17 @@ def _resolve_tokenizer_json(path_or_file: str | Path) -> Path:
     if p.is_dir():
         return p / "tokenizer.json"
     return p
+
+
+@dataclass(frozen=True, slots=True)
+class ContextualWindow:
+    """Packed contextual window pairing encoded chunks with non-duplicated emitted spans."""
+
+    chunks: list[str]
+    spans: list[tuple[int, int]]
+    emit_start: int = 0
+    has_header_anchor: bool = False
+    overlap_chunks: int = 0
 
 
 class ContextualTokenizer:
@@ -386,34 +398,15 @@ class ContextualTokenizer:
             pos = next_pos
         return chunks
 
-    def group_chunks_by_context_windows(
+    def _resolve_header_anchors(
         self,
         chunks: Sequence[str],
+        encs: Sequence[Any],
         *,
-        max_context_tokens: int = 2048,
-        context_tokens: int | None = None,
         header_text: str | None = None,
         repeat_header_tokens: int | Sequence[int] | None = None,
-    ) -> list[list[str]]:
-        """Greedily pack ordered document chunks into contextual windows <= `max_context_tokens`.
-
-        Mirrors ``evals/vidore.py`` / ``evals/conteb.py`` two-knob contextual packing:
-        accounts for ``[D] `` prefix tokens once per window plus one ``<|chunk_sep|>``
-        token between adjacent chunks, without ever splitting an individual chunk.
-        Supports optional header-anchoring via ``header_text`` (prepended to every window)
-        or ``repeat_header_tokens`` (repeats the leading header tokens of ``chunks[0]`` or
-        an explicit token sequence at the start of subsequent windows ``w >= 1``).
-        """
-        if not chunks:
-            return []
-        raw_limit = max_context_tokens if context_tokens is None else context_tokens
-        limit = int(raw_limit)
-        if limit <= 0:
-            raise ValueError(f"max_context_tokens must be positive, got {raw_limit}")
-
-        prefix_len = max(1, len(self._tokenizer.encode(self.config.document_prefix, add_special_tokens=False).ids))
-        encs = self._tokenizer.encode_batch(list(chunks), add_special_tokens=False)
-
+    ) -> tuple[str | None, int, str | None, int]:
+        """Resolve optional window-0 and continuation-window header anchors."""
         anchor_w0: str | None = None
         anchor_w0_cost = 0
         anchor_subseq: str | None = None
@@ -447,32 +440,170 @@ class ContextualTokenizer:
                         rep_len = len(self._tokenizer.encode(rep_str, add_special_tokens=False).ids)
                         anchor_subseq = rep_str
                         anchor_subseq_cost = rep_len + 1
+        return anchor_w0, anchor_w0_cost, anchor_subseq, anchor_subseq_cost
 
-        windows: list[list[str]] = [[]]
+    def _pack_context_windows(
+        self,
+        chunks: Sequence[str],
+        *,
+        spans: Sequence[tuple[int, int]] | None = None,
+        max_context_tokens: int = 2048,
+        context_tokens: int | None = None,
+        header_text: str | None = None,
+        repeat_header_tokens: int | Sequence[int] | None = None,
+        window_overlap_chunks: int = 0,
+    ) -> list[ContextualWindow]:
+        """Pack ordered document chunks into `<= limit` token windows with optional anchor and overlap."""
+        if not chunks:
+            return []
+        raw_limit = max_context_tokens if context_tokens is None else context_tokens
+        limit = int(raw_limit)
+        if limit <= 0:
+            raise ValueError(f"max_context_tokens must be positive, got {raw_limit}")
+        ov_chunks = int(window_overlap_chunks)
+        if ov_chunks < 0:
+            raise ValueError(f"window_overlap_chunks must be non-negative, got {window_overlap_chunks}")
+        if spans is not None and len(spans) != len(chunks):
+            raise ValueError(f"spans length ({len(spans)}) != chunks length ({len(chunks)})")
+
+        prefix_len = max(1, len(self._tokenizer.encode(self.config.document_prefix, add_special_tokens=False).ids))
+        encs = self._tokenizer.encode_batch(list(chunks), add_special_tokens=False)
+        chunk_lens = [len(enc.ids) for enc in encs]
+
+        anchor_w0, anchor_w0_cost, anchor_subseq, anchor_subseq_cost = self._resolve_header_anchors(
+            chunks,
+            encs,
+            header_text=header_text,
+            repeat_header_tokens=repeat_header_tokens,
+        )
+
+        windows: list[ContextualWindow] = []
+        win_chunks: list[str] = []
         used = prefix_len
-        if anchor_w0 is not None and prefix_len + anchor_w0_cost + len(encs[0].ids) <= limit:
-            windows[0].append(anchor_w0)
+        cur_has_anchor = False
+        cur_ov = 0
+        if anchor_w0 is not None and prefix_len + anchor_w0_cost + chunk_lens[0] <= limit:
+            win_chunks.append(anchor_w0)
             used += anchor_w0_cost - 1
+            cur_has_anchor = True
+        cur_emit_start = len(win_chunks)
+        new_start_idx = 0
 
-        for chunk, enc in zip(chunks, encs, strict=True):
-            c_len = len(enc.ids)
-            sep_cost = 1 if windows[-1] else 0
+        def _flush(end_idx: int) -> None:
+            w_spans = (
+                list(spans[new_start_idx:end_idx]) if spans is not None else [(0, 0)] * (end_idx - new_start_idx)
+            )
+            windows.append(
+                ContextualWindow(
+                    chunks=win_chunks,
+                    spans=w_spans,
+                    emit_start=cur_emit_start,
+                    has_header_anchor=cur_has_anchor,
+                    overlap_chunks=cur_ov,
+                )
+            )
+
+        for idx, (chunk, c_len) in enumerate(zip(chunks, chunk_lens, strict=True)):
+            sep_cost = 1 if win_chunks else 0
             cost = c_len + sep_cost
-            if windows[-1] and used + cost > limit:
-                # Only split when current window already has at least one body chunk (not just anchor_w0).
-                has_body = len(windows[-1]) > (1 if (len(windows) == 1 and anchor_w0 is not None and windows[0][:1] == [anchor_w0]) else 0)
-                if has_body:
-                    windows.append([])
-                    used = prefix_len
-                    if anchor_subseq is not None and prefix_len + anchor_subseq_cost + c_len <= limit:
-                        windows[-1].append(anchor_subseq)
-                        used += anchor_subseq_cost - 1
-                        cost = c_len + 1
-                    else:
-                        cost = c_len
-            windows[-1].append(chunk)
+            body_count = idx - new_start_idx
+            # Only split when current window already has at least one new body chunk (not just anchor/overlap).
+            if win_chunks and used + cost > limit and body_count > 0:
+                _flush(idx)
+                win_chunks = []
+                used = prefix_len
+                cur_has_anchor = False
+                cur_ov = 0
+                new_start_idx = idx
+                if anchor_subseq is not None and prefix_len + anchor_subseq_cost + c_len <= limit:
+                    win_chunks.append(anchor_subseq)
+                    used += anchor_subseq_cost - 1
+                    cur_has_anchor = True
+                if ov_chunks > 0:
+                    cand_indices = list(range(max(0, idx - ov_chunks), idx))
+                    for st_k in range(len(cand_indices)):
+                        sub = cand_indices[st_k:]
+                        added = 0
+                        has_existing = bool(win_chunks)
+                        for j in sub:
+                            added += chunk_lens[j] + (1 if has_existing else 0)
+                            has_existing = True
+                        if used + added + (1 if has_existing else 0) + c_len <= limit:
+                            win_chunks.extend(chunks[j] for j in sub)
+                            used += added
+                            cur_ov = len(sub)
+                            break
+                cur_emit_start = len(win_chunks)
+                cost = c_len + (1 if win_chunks else 0)
+            win_chunks.append(chunk)
             used += cost
+
+        if win_chunks and len(chunks) > new_start_idx:
+            _flush(len(chunks))
         return windows
+
+    def group_chunks_by_context_windows(
+        self,
+        chunks: Sequence[str],
+        *,
+        max_context_tokens: int = 2048,
+        context_tokens: int | None = None,
+        header_text: str | None = None,
+        repeat_header_tokens: int | Sequence[int] | None = None,
+        window_overlap_chunks: int = 0,
+    ) -> list[list[str]]:
+        """Greedily pack ordered document chunks into contextual windows <= `max_context_tokens`.
+
+        Mirrors ``evals/vidore.py`` / ``evals/conteb.py`` two-knob contextual packing:
+        accounts for ``[D] `` prefix tokens once per window plus one ``<|chunk_sep|>``
+        token between adjacent chunks, without ever splitting an individual chunk.
+        Supports optional header-anchoring via ``header_text`` (prepended to every window),
+        ``repeat_header_tokens`` (repeats the leading header tokens of ``chunks[0]`` or
+        an explicit token sequence at the start of subsequent windows ``w >= 1``), and
+        optional inter-window overlap chunks via ``window_overlap_chunks``.
+        """
+        return [
+            w.chunks
+            for w in self._pack_context_windows(
+                chunks,
+                max_context_tokens=max_context_tokens,
+                context_tokens=context_tokens,
+                header_text=header_text,
+                repeat_header_tokens=repeat_header_tokens,
+                window_overlap_chunks=window_overlap_chunks,
+            )
+        ]
+
+    def plan_contextual_windows(
+        self,
+        text: str,
+        *,
+        chunk_tokens: int = 256,
+        max_context_tokens: int = 2048,
+        context_tokens: int | None = None,
+        overlap: int = 32,
+        header_text: str | None = None,
+        repeat_header_tokens: int | Sequence[int] | None = None,
+        window_overlap_chunks: int = 0,
+    ) -> list[ContextualWindow]:
+        """Split `text` into chunks and return structured windows isolating emitted spans from context prefixes."""
+        eff_ctx = max_context_tokens if context_tokens is None else int(context_tokens)
+        raw_pieces = self.chunk_text(
+            text,
+            max_chunk_tokens=int(chunk_tokens),
+            overlap=int(overlap),
+            add_document_prefix=False,
+        )
+        texts = [text[c0:c1] for _, c0, c1 in raw_pieces]
+        offsets = [(c0, c1) for _, c0, c1 in raw_pieces]
+        return self._pack_context_windows(
+            texts,
+            spans=offsets,
+            max_context_tokens=eff_ctx,
+            header_text=header_text,
+            repeat_header_tokens=repeat_header_tokens,
+            window_overlap_chunks=window_overlap_chunks,
+        )
 
     def chunk_and_group_document(
         self,
@@ -484,6 +615,7 @@ class ContextualTokenizer:
         overlap: int = 32,
         header_text: str | None = None,
         repeat_header_tokens: int | Sequence[int] | None = None,
+        window_overlap_chunks: int = 0,
     ) -> list[tuple[list[str], list[tuple[int, int]]]]:
         """Split `text` into <= `chunk_tokens` pieces and pack them into <= `max_context_tokens` windows.
 
@@ -498,35 +630,30 @@ class ContextualTokenizer:
         )
         texts = [text[c0:c1] for _, c0, c1 in raw_pieces]
         offsets = [(c0, c1) for _, c0, c1 in raw_pieces]
-        windows = self.group_chunks_by_context_windows(
+        planned = self._pack_context_windows(
             texts,
+            spans=offsets,
             max_context_tokens=eff_ctx,
             header_text=header_text,
             repeat_header_tokens=repeat_header_tokens,
+            window_overlap_chunks=window_overlap_chunks,
         )
         grouped: list[tuple[list[str], list[tuple[int, int]]]] = []
         cursor = 0
-        for win in windows:
-            # Check whether window starts with an injected header anchor before texts[cursor]
-            if (
-                (header_text is not None or repeat_header_tokens is not None)
-                and cursor < len(texts)
-                and len(win) >= 2
-                and win[0] != texts[cursor]
-                and win[1] == texts[cursor]
-            ):
-                n_body = len(win) - 1
-                hdr_end = min(len(text), offsets[0][0] + len(win[0])) if offsets else 0
-                span_slice = [(offsets[0][0] if offsets else 0, hdr_end), *offsets[cursor : cursor + n_body]]
-                grouped.append((win, span_slice))
-                cursor += n_body
-            else:
-                span_slice = offsets[cursor : cursor + len(win)]
-                grouped.append((win, span_slice))
-                cursor += len(win)
+        for win in planned:
+            n_emit = len(win.spans)
+            prefix_spans: list[tuple[int, int]] = []
+            if win.has_header_anchor and win.chunks:
+                hdr_end = min(len(text), offsets[0][0] + len(win.chunks[0])) if offsets else 0
+                prefix_spans.append((offsets[0][0] if offsets else 0, hdr_end))
+            if win.overlap_chunks > 0:
+                ov_start = max(0, cursor - win.overlap_chunks)
+                prefix_spans.extend(offsets[ov_start:cursor])
+            grouped.append((win.chunks, [*prefix_spans, *win.spans]))
+            cursor += n_emit
         return grouped
 
 
 FastPplxTokenizer = ContextualTokenizer
 
-__all__ = ["ContextualTokenizer", "FastPplxTokenizer"]
+__all__ = ["ContextualTokenizer", "ContextualWindow", "FastPplxTokenizer"]

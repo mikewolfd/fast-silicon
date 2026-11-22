@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import sys
 import time
 from typing import Any, Sequence
 
@@ -1155,6 +1156,26 @@ def _compile_mlpackage(pkg_path: Path, out_dir: Path) -> Path:
     return dst
 
 
+def _compile_mlpackage_task(task: tuple[str, str]) -> str:
+    """Top-level spawn worker compiling a single `(pkg_path, out_dir)` pair."""
+    pkg_s, out_s = task
+    return str(_compile_mlpackage(Path(pkg_s), Path(out_s)))
+
+
+def _compile_mlpackages_parallel(pkg_paths: Sequence[Path], out_dir: Path, max_workers: int | None) -> None:
+    """Compile saved `.mlpackage` bundles concurrently with worktree sys.path preserved."""
+    if not pkg_paths:
+        return
+    extra_paths = tuple(dict.fromkeys([str(Path(__file__).resolve().parent), *[p for p in sys.path if p]]))
+    compile_buckets_parallel(
+        [(str(pkg_p), str(out_dir)) for pkg_p in pkg_paths],
+        _compile_mlpackage_task,
+        max_workers=max_workers,
+        label_fn=lambda task: Path(task[0]).stem,
+        extra_sys_paths=extra_paths,
+    )
+
+
 def _parse_seq_lens(raw: Sequence[str | int]) -> tuple[int, ...]:
     out: list[int] = []
     for item in raw:
@@ -1435,11 +1456,7 @@ def build_ane_bundle_suite(
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
-        compile_jobs = [
-            (pkg_p.stem, lambda p=pkg_p: _compile_mlpackage(p, out_dir))
-            for pkg_p in mf_pkg_paths
-        ]
-        compile_buckets_parallel(compile_jobs, max_workers=max_compile_workers)
+        _compile_mlpackages_parallel(mf_pkg_paths, out_dir, max_compile_workers)
         if not keep_mlpackage:
             for pkg_p in mf_pkg_paths:
                 shutil.rmtree(pkg_p, ignore_errors=True)
@@ -1585,11 +1602,7 @@ def build_ane_bundle_suite(
             stage_entries.append(f"{stem}.mlmodelc")
 
         if stage_pkg_paths:
-            compile_jobs = [
-                (pkg_p.stem, lambda p=pkg_p: _compile_mlpackage(p, out_dir))
-                for pkg_p in stage_pkg_paths
-            ]
-            compile_buckets_parallel(compile_jobs, max_workers=max_compile_workers)
+            _compile_mlpackages_parallel(stage_pkg_paths, out_dir, max_compile_workers)
             for pkg_p in stage_pkg_paths:
                 compiled_path = out_dir / f"{pkg_p.stem}.mlmodelc"
                 if inspect_placement:
