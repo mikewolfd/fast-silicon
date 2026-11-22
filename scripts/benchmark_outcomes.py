@@ -112,6 +112,7 @@ PACKAGE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("fast-pplx", 1, "FAST_PPLX_HOME", "0.6B 32K contextual encoder (Cat 1)"),
     OutcomePackageSpec("fast-decision-models", 2, "FAST_DECISION_MODELS_HOME", "Laya-ANE & Kev-0.8B decisions (Cat 2)"),
     OutcomePackageSpec("fast-gemma4", 4, "FAST_GEMMA4_HOME", "Gemma-4 chat/IF/reasoning & structured JSON (Cat 3+4)"),
+    OutcomePackageSpec("fast-qwen3", 4, "FAST_QWEN3_HOME", "Qwen3.5/3.6 hybrid GDN+GQA chat & structured JSON (Cat 3+4)"),
     OutcomePackageSpec("fast-gpt-oss", 4, "FAST_GPT_OSS_HOME", "GPT-OSS-20B chat/reasoning & structured JSON (Cat 3+4)"),
 )
 PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
@@ -123,8 +124,9 @@ PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("coreai-laya", 2, "FAST_DECISION_MODELS_HOME", "Apple CoreAI Laya Typed Decisions (Cat 2)"),
     OutcomePackageSpec("public-kev-0.8b", 2, "FAST_DECISION_MODELS_HOME", "Stock mlx-lm Kev-0.8B 8-bit (Cat 2)"),
     OutcomePackageSpec("public-gemma4", 4, "FAST_GEMMA4_HOME", "Stock mlx-vlm Gemma-4 E2B 4-bit (Cat 3+4)"),
+    OutcomePackageSpec("public-qwen3.5", 4, "FAST_QWEN3_HOME", "Stock mlx-lm Qwen3.5-4B OptiQ 4-bit (Cat 3+4)"),
     OutcomePackageSpec("public-gpt-oss", 4, "FAST_GPT_OSS_HOME", "Stock mlx-lm GPT-OSS-20B MXFP4 (Cat 3+4)"),
-    OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
+    OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_QWEN3_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
     OutcomePackageSpec("coreai-gemma4", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Gemma-4 E2B QAT (Cat 3+4)"),
 )
 COREML_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
@@ -143,6 +145,7 @@ PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     "fast-pplx": ("public-pplx",),
     "fast-decision-models": ("public-laya", "coreai-laya", "public-kev-0.8b", "coreml-laya", "coreml-kev-0.8b"),
     "fast-gemma4": ("public-gemma4", "coreai-gemma4"),
+    "fast-qwen3": ("public-qwen3.5", "coreai-qwen3.5-4b"),
     "fast-gpt-oss": ("public-gpt-oss",),
 }
 _SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {
@@ -162,8 +165,9 @@ _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-kev-0.8b": "fast-decision-models",
     "coreml-kev-0.8b": "fast-decision-models",
     "public-gemma4": "fast-gemma4",
+    "public-qwen3.5": "fast-qwen3",
     "public-gpt-oss": "fast-gpt-oss",
-    "coreai-qwen3.5-4b": "fast-gemma4",
+    "coreai-qwen3.5-4b": "fast-qwen3",
     "coreai-gemma4": "fast-gemma4",
 }
 
@@ -1412,6 +1416,21 @@ def _run_llm_worker(
         ltok = eng.tokenizer.llguidance_tokenizer()
         mtp_tag = "_mtp" if use_mtp else ""
         eff_label = config_label or f"{eff_mode}_{extra.ane_variant}_{'kvi8' if eff_kv_i8 else 'kvbf16'}{mtp_tag}"
+    elif pkg_name == "fast-qwen3":
+        from fast_qwen3.engine import FastQwen3Engine
+
+        eff_mode = extra.mode or "auto"
+        eng = FastQwen3Engine(
+            home=home,
+            model_dir=extra.model_dir,
+            default_mode=eff_mode,
+            default_enable_thinking=False,
+            local_files_only=True,
+            warmup=True,
+        )
+        ltok = eng.tokenizer.llguidance_tokenizer()
+        mtp_tag = "_mtp" if use_mtp else ""
+        eff_label = config_label or f"qwen3_{eff_mode}{mtp_tag}"
     elif pkg_name == "fast-gpt-oss":
         from fast_gpt_oss.engine import FastGptOssEngine
 
@@ -1434,7 +1453,7 @@ def _run_llm_worker(
         )
         ltok = eng.tokenizer.llguidance_tokenizer()
         eff_label = config_label or f"gpt_oss_{eff_mode}"
-    elif pkg_name in ("public-gemma4", "public-gpt-oss", "coreai-qwen3.5-4b", "coreai-gemma4"):
+    elif pkg_name in ("public-gemma4", "public-qwen3.5", "public-gpt-oss", "coreai-qwen3.5-4b", "coreai-gemma4"):
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import build_public_llm_adapter
 
@@ -1548,7 +1567,7 @@ def _run_llm_worker(
                 kwargs["reasoning_effort"] = reasoning_effort
             if reasoning_budget is not None:
                 kwargs["reasoning_budget"] = int(reasoning_budget)
-        elif pkg_name == "fast-gemma4":
+        elif pkg_name in ("fast-gemma4", "fast-qwen3"):
             kwargs["enable_thinking"] = False
             kwargs["speculative"] = True if use_mtp else False
 
@@ -2106,6 +2125,7 @@ def _spawn_isolated_worker(
         str(_REPO_ROOT / "packages" / "fast-shared" / "src"),
         str(_REPO_ROOT / "packages" / "fast-decision-models" / "src"),
         str(_REPO_ROOT / "packages" / "fast-gemma4" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-qwen3" / "src"),
         str(_REPO_ROOT / "packages" / "fast-bge-small" / "src"),
         str(_REPO_ROOT / "packages" / "fast-embeddinggemma-2" / "src"),
         str(_REPO_ROOT / "packages" / "fast-pplx" / "src"),
@@ -2365,6 +2385,8 @@ def compute_public_comparisons(
         ("fast-decision-models", "kev-0.8b", "coreml-kev-0.8b"),
         ("fast-gemma4", None, "public-gemma4"),
         ("fast-gemma4", None, "coreai-gemma4"),
+        ("fast-qwen3", None, "public-qwen3.5"),
+        ("fast-qwen3", None, "coreai-qwen3.5-4b"),
         ("fast-gpt-oss", None, "public-gpt-oss"),
     )
     for fast_pkg, backend_filter, pub_pkg in pair_map:

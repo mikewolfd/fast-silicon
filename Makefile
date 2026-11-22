@@ -37,6 +37,7 @@ guard:
 		packages/fast-gemma4/src packages/fast-gemma4/tests packages/fast-gemma4/scripts \
 		packages/fast-gpt-oss/src packages/fast-gpt-oss/tests \
 		packages/fast-pplx/src packages/fast-pplx/tests packages/fast-pplx/scripts \
+		packages/fast-qwen3/src packages/fast-qwen3/tests packages/fast-qwen3/scripts \
 		packages/fast-decision-models/src packages/fast-decision-models/tests packages/fast-decision-models/scripts \
 		scripts tests
 	$(PYTHON) -m pytest -q packages/fast-shared/tests/test_ir_dtype_guard_cpu.py -k test_clean_pass_on_fast_repos
@@ -55,6 +56,7 @@ test-cpu: hw-check
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \
 		packages/fast-gpt-oss/tests/test_fast_gpt_oss.py \
 		packages/fast-gpt-oss/tests/test_v23_track_c_gpt_oss_regressions.py \
+		packages/fast-qwen3/tests/test_fast_qwen3_cpu.py \
 		packages/fast-gemma4/tests/test_per_doc_grammar.py \
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \
@@ -75,7 +77,7 @@ test-cpu: hw-check
 	$(PYTHON) -m pytest -v packages/fast-pplx/tests -m "not gpu_ane"
 
 test-hw: hw-check
-	@for pkg in fast-shared fast-bge-small fast-embeddinggemma-2 fast-gpt-oss fast-gemma4 fast-decision-models fast-pplx; do \
+	@for pkg in fast-shared fast-bge-small fast-embeddinggemma-2 fast-gpt-oss fast-gemma4 fast-decision-models fast-pplx fast-qwen3; do \
 		echo "==> Running full pytest suite for packages/$$pkg"; \
 		$(PYTHON) -m pytest -v packages/$$pkg/tests || exit 1; \
 	done

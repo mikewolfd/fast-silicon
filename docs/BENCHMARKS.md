@@ -29,6 +29,7 @@ Model format and input limits can differ within a model family. For example, Flu
 8. [Reproducible CLI Invocations](#8-reproducible-cli-invocations)
 9. [v2.2 Cross-Silicon Validation & Regression Gates (2026-11-21)](#9-v22-cross-silicon-validation--regression-gates-2026-11-21)
 10. [v2.3 Cross-Silicon Accuracy, Precision & Contextual Validation (2026-11-22)](#10-v23-cross-silicon-accuracy-precision--contextual-validation-2026-11-22)
+11. [`fast-qwen3` Hybrid GatedDeltaNet + OptiQ + LoRA Validation (2026-11-22)](#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -674,3 +675,25 @@ Machine-readable validation receipt: [`benchmarks/v23-validation-20261121.json`]
 - **`ane_ffn` `W8A16` default (`quantize_a8=False`) & `H > 2048` WHT fix:** Fixes row-scale packing (`row_max_rel_err <= 0.00044`, `H=2560`/`4096` `cos=0.99989`) and protects outlier layers (`E4B_M128_outlier`: `W8A8_NoHad` `0.993737` -> `W8A8_Had` `0.999788` -> **`W8A16_Had` `0.999893`** at `2.126 ms` M4 / `2.347 ms` M5).
 - **`build_ane_models.py --hadamard-mode auto`:** Applies `post_norm + grouped_conv` to `w8` (M4 Pro `cos_l14k 0.999031 -> 0.999363`, `rel_l14k 0.04298 -> 0.03552`, `40.41 -> 41.91 ms`; M5 `0.998742 -> 0.999076`, `rel_l14k 0.04783 -> 0.04104`, `37.94 -> 40.05 ms`, `2065` ANE / `0` CPU / `0` GPU ops) and `none` to `fp16` (`safe_gelu_clamp=False`, `normalize_mid=False`).
 - **`6K` Hadamard `kv_i8` (opt-in):** Improves `full_D512` `V cos 0.999798 -> 0.999961`, teacher-forced `KL 0.000877 -> 0.000498` (M4) / `0.000799 -> 0.000344` (M5), and M5 `6K` `bf16` agreement `0.6667 -> 0.8333` (`46.36 -> 32.69 tok/s` M4, `66.90 -> 43.17 tok/s` M5), so standard `kv_i8` remains default (`0.558` F1 on both).
+
+---
+
+## 11. `fast-qwen3` Hybrid GatedDeltaNet + OptiQ + LoRA Validation (2026-11-22)
+
+Machine-readable `ABBA` receipt: [`benchmarks/fast-qwen3-20261122.json`](benchmarks/fast-qwen3-20261122.json).
+
+### Cross-Silicon Interleaved `ABBA` Throughput & Footprint (`M4 Pro 48 GB` vs `Base M5 24 GB`)
+
+| Model Preset | Workload (`max_tokens=64`) | Base M5 (`24 GB`, `10c Apple10 NAX`) | M4 Pro (`48 GB`, `20c Apple9`) | Steady-State Memory (`MLX Active / MLX Peak / OS Phys`) |
+| :--- | :--- | :---: | :---: | :---: |
+| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=1` strict JSON + LCP (`4` docs) | **`51.59 tok/s`** (`1.298 docs/s`, **`2.50×`** vs `7.70s` unfused) | **`66.43 tok/s`** (`1.671 docs/s`, **`2.29×`** vs `5.48s` unfused) | M5: `3.38 / 4.52 / 4.44 GB` · M4: `3.38 / 4.75 / 4.49 GB` |
+| **`Qwen3.5-4B-OptiQ-4bit`** (`4b`) | `B=8` strict JSON wave (`8` docs) | **`140.01 tok/s`** (`3.544 docs/s`, `8/8` valid vs `0/8` raw, **`6.72×`**) | **`146.96 tok/s`** (`3.721 docs/s`, `8/8` valid vs `0/8` raw, **`5.15×`**) | M5: `3.38 / 4.52 / 4.44 GB` · M4: `3.38 / 4.75 / 4.49 GB` |
+| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=1` strict JSON + LCP (`4` docs) | **`130.22 tok/s`** (`3.196 docs/s`, **`2.64×`** vs `3.31s` unfused) | **`155.28 tok/s`** (`3.811 docs/s`, **`2.53×`** vs `2.66s` unfused) | M5: `1.67 / 2.24 / 2.98 GB` · M4: `1.67 / 2.39 / 2.92 GB` |
+| **`Qwen3.5-0.8B`** (`0.8b-bf16`) | `B=8` strict JSON wave (`8` docs) | **`460.73 tok/s`** (`11.341 docs/s`, `8/8` valid, **`9.30×`**) | **`491.93 tok/s`** (`12.146 docs/s`, `8/8` valid, **`7.86×`**) | M5: `1.67 / 2.24 / 2.98 GB` · M4: `1.67 / 2.39 / 2.92 GB` |
+
+### Validated Architectural & Post-Training Gates
+
+- **General `OptiQ` Spec-Bucketing (`SpecBucketedLinearGroup`):** Handles non-contiguous `(4, 8, 4, 4)` GatedDeltaNet bit layouts (`9/24` GDN layers in `Qwen3.5-4B-OptiQ-4bit`) and heterogeneous `(4, 4, 8)` / `(8, 4, 4)` / `(8, 4, 8)` Self-Attention layers (`8/8` layers) with `0.0` ULP weight drift and `100%` top-1 agreement (`max_abs_logit_diff <= 1.0` across 32 `BF16` layers).
+- **No-Think Default & `>= 384`-Token Thinking-Budget Floor:** On `Qwen3.5-4B-OptiQ-4bit`, `enable_thinking=False` (`no-think`) matches or beats `<think>` on structured JSON and tool AST (`BFCL-hard` `87.5%` vs `83.3%` at `3.2×` lower latency; `LiquidAI` `0.933` F1), whereas truncating `<think>` at `128` tokens on multi-step math triggers a `-12.5 pp` valley (`28.1% -> 15.6%` vs `78.1%` at `1024` tokens). `validate_thinking_budget` enforces `>= 384` tokens whenever `enable_thinking=True`.
+- **Hybrid `GatedDeltaNet` LoRA Regime (`R2`) & Double-Quantization Guard:** Including `linear_attn.{in_proj_qkv, in_proj_z, out_proj}` alongside `self_attn + mlp` in `BF16` (`R2`, keeping `conv1d/A_log/dt_bias` frozen) beats `self_attn + mlp` alone (`R1`) by **`+17.5 pp`** (`66.7%` vs `49.2%`, `p=0.00051`) and parameter-matched `R1` (`r=16`) by **`+21.7 pp`**, whereas unfreezing `conv1d/A_log/dt_bias` (`R4`) collapses `-18.3 pp` to `-30.8 pp` and 2-pass `4-bit -> LoRA -> 4-bit` requantization collapses exact match `64.2% -> 10.0%` (`blocked` by `QwenDoubleQuantError`).
+- **Empirical Speculative `MTP` Auto-Gating (`>= 9B` Native MTP):** On `0.8B` (`H=1024`), the `248,320`-row `lm_head` (`508 MB`, `33%` of model bytes) makes `K=4` `Qwen3MtpDrafter` projections `0.78×–0.89×` slower than `B=1` single-step decode (`89.2 -> 69.4 tok/s` M4 Pro; `73.7 -> 65.3 tok/s` Base M5, `100%` greedy token match), and `PromptLookupDrafter` on `4B-OptiQ` wins `1.12×` on Base M5 (`33.9 -> 37.9 tok/s`) but `0.86×` on M4 Pro (`46.7 -> 40.3 tok/s`). `speculative=None` (`"auto"`) therefore stays **`OFF` below `9B` native-MTP models**, with explicit `speculative=True` opt-in.

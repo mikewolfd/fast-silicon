@@ -29,6 +29,7 @@ PACKAGE_ORDER: tuple[str, ...] = (
     "decision-models",
     "gemma4",
     "gpt-oss",
+    "qwen3",
 )
 
 _PACKAGE_ALIASES: dict[str, str] = {
@@ -45,6 +46,8 @@ _PACKAGE_ALIASES: dict[str, str] = {
     "gemma4": "gemma4",
     "fast-gpt-oss": "gpt-oss",
     "gpt-oss": "gpt-oss",
+    "fast-qwen3": "qwen3",
+    "qwen3": "qwen3",
 }
 
 _BGE_REQUIRED_BUCKETS: tuple[tuple[int, int], ...] = (
@@ -72,6 +75,7 @@ _GEMMA4_TEST_HF_REPOS: tuple[str, ...] = (
 )
 _GPT_OSS_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
 _GPT_OSS_PREBUILT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+_QWEN3_HF_REPO = "mlx-community/Qwen3.5-4B-OptiQ-4bit"
 _LAYA_HF_REPO = "convaiinnovations/laya-typed-decisions"
 _KEV_ADAPTER_HF_REPO = "jaredpalmer/kev-0.8b"
 _KEV_BASE_HF_REPO = "Qwen/Qwen3.5-0.8B-Base"
@@ -99,6 +103,10 @@ VETTED_PREBUILT_HF_REPOS: dict[str, tuple[str, ...]] = {
     "gpt-oss": (
         _GPT_OSS_PREBUILT_HF_REPO,
     ),
+    "qwen3": (
+        "mlx-community/Qwen3.5-4B-OptiQ-4bit",
+        "mlx-community/Qwen3.5-0.8B-4bit",
+    ),
 }
 
 _PREBUILT_APPROX_GB: dict[str, float] = {
@@ -108,6 +116,7 @@ _PREBUILT_APPROX_GB: dict[str, float] = {
     "decision-models": 4.90,
     "gemma4": 10.40,
     "gpt-oss": 12.10,
+    "qwen3": 3.10,
 }
 
 
@@ -600,6 +609,43 @@ def _plan_gpt_oss(
     )
 
 
+def _plan_qwen3(
+    home: Path,
+    *,
+    force: bool,
+    hf_checker: Callable[[str], bool],
+    python_exe: str,
+) -> PackagePlan:
+    art = home / "artifacts"
+    hf_cached = hf_checker(_QWEN3_HF_REPO)
+    tok_ok = (art / "tokenizer" / "tokenizer.json").is_file()
+    actions = [
+        StepAction(
+            kind="subprocess",
+            label="qwen3: download Qwen3.5-4B-OptiQ-4bit + stage tokenizer",
+            needed=force or not (tok_ok and hf_cached),
+            reason="forced" if force else ("present" if (tok_ok and hf_cached) else "missing Qwen3.5-4B-OptiQ-4bit snapshot"),
+            repo_id=_QWEN3_HF_REPO,
+            command=(
+                python_exe,
+                "-m",
+                "fast_qwen3.cli",
+                "setup-weights",
+                "--home",
+                str(home),
+                "--allow-download",
+            ),
+        )
+    ]
+    return PackagePlan(
+        package="qwen3",
+        target_home=home,
+        approx_size_gb=2.6,
+        hf_repos=(_QWEN3_HF_REPO,),
+        actions=tuple(actions),
+    )
+
+
 def _plan_prebuilt_package(
     pkg: str,
     home: Path,
@@ -677,6 +723,7 @@ def build_setup_plan(
         "decision-models": ("fast-decision-models", "fast_decision_models.paths"),
         "gemma4": ("fast-gemma4", "fast_gemma4.paths"),
         "gpt-oss": ("fast-gpt-oss", "fast_gpt_oss.paths"),
+        "qwen3": ("fast-qwen3", "fast_qwen3.paths"),
     }
 
     plans: list[PackagePlan] = []
@@ -716,6 +763,8 @@ def build_setup_plan(
             )
         elif pkg == "gpt-oss":
             plans.append(_plan_gpt_oss(home, force=force, hf_checker=hf_checker, python_exe=python_exe))
+        elif pkg == "qwen3":
+            plans.append(_plan_qwen3(home, force=force, hf_checker=hf_checker, python_exe=python_exe))
 
     return native_actions, plans
 

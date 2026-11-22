@@ -114,6 +114,7 @@ def test_setup_all_marks_staged_artifacts_ready_and_validates_flags_cpu(tmp_path
         "pplx",
         "decision-models",
         "gemma4",
+        "qwen3",
     )
     with pytest.raises(ValueError, match="Unknown package"):
         mod.parse_packages_arg("bge-small,nonexistent")

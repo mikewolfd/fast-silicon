@@ -1266,6 +1266,10 @@ _STOCK_HF_REPOS: dict[str, tuple[str, ...]] = {
         "mlx-community/gpt-oss-20b-MXFP4-Q8",
         "mlx-community/gpt-oss-20b-MXFP4-Q4",
     ),
+    "public-qwen3.5": (
+        "mlx-community/Qwen3.5-4B-OptiQ-4bit",
+        "Qwen/Qwen3.5-0.8B",
+    ),
 }
 
 
@@ -2895,6 +2899,66 @@ def build_public_llm_adapter(
             return texts, reasons, ids_list, {"completion_tokens": tot_comp, "mask_fallbacks": 0}
 
         return PublicLlmAdapter(default_label=lbl, generate_fn=_gen_oss)
+
+    if pkg_name == "public-qwen3.5":
+        import mlx.core as mx
+        import mlx_lm
+
+        snap = resolve_hf_snapshot("mlx-community/Qwen3.5-4B-OptiQ-4bit") or resolve_hf_snapshot("Qwen/Qwen3.5-0.8B")
+        if snap is None:
+            raise FileNotFoundError("Missing cached HF snapshot for mlx-community/Qwen3.5-4B-OptiQ-4bit")
+        model, tok = mlx_lm.load(str(snap))
+        eff_bsz = min(max(1, int(batch_size)), 8 if 0 < host_mem_gb < 36.0 else 16)
+
+        def _gen_qwen35(
+            prompts: list[str],
+            *,
+            system_prompt: str | None = None,
+            per_doc_schemas: list[dict[str, Any] | None] | None = None,
+            max_tokens: int = 256,
+            reasoning_effort: str | None = None,
+            reasoning_budget: int | None = None,
+        ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
+            del per_doc_schemas, reasoning_effort, reasoning_budget
+            texts: list[str] = []
+            reasons: list[str] = []
+            ids_list: list[list[int]] = []
+            tot_comp = 0
+            for i in range(0, len(prompts), eff_bsz):
+                sub_p = prompts[i : i + eff_bsz]
+                p_toks = []
+                for p in sub_p:
+                    msgs = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+                        {"role": "user", "content": p}
+                    ]
+                    try:
+                        raw = tok.apply_chat_template(
+                            msgs, tokenize=True, add_generation_prompt=True, enable_thinking=False
+                        )
+                    except TypeError:
+                        raw = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+                    p_toks.append(list(raw if isinstance(raw, list) else getattr(raw, "input_ids", raw)))
+                if len(p_toks) > 1 and hasattr(mlx_lm, "batch_generate"):
+                    rb = mlx_lm.batch_generate(model, tok, prompts=p_toks, max_tokens=int(max_tokens), verbose=False)
+                    if hasattr(mx, "synchronize"):
+                        mx.synchronize()
+                    sub_txts = list(getattr(rb, "texts", []) or [])
+                else:
+                    sub_txts = [
+                        mlx_lm.generate(model, tok, prompt=pt, max_tokens=int(max_tokens), verbose=False)
+                        for pt in p_toks
+                    ]
+                    if hasattr(mx, "synchronize"):
+                        mx.synchronize()
+                for tx in sub_txts:
+                    tids = list(tok.encode(tx, add_special_tokens=False))
+                    texts.append(tx)
+                    ids_list.append(tids)
+                    tot_comp += len(tids)
+                    reasons.append("length" if len(tids) >= int(max_tokens) - 1 else "stop")
+            return texts, reasons, ids_list, {"completion_tokens": tot_comp, "mask_fallbacks": 0}
+
+        return PublicLlmAdapter(default_label="mlx_lm_qwen35_optiq", generate_fn=_gen_qwen35)
 
     if pkg_name == "coreai-qwen3.5-4b":
         q_backend = CoreAiQwen35Backend(coreai_python=coreai_python, coreai_variant=coreai_variant)
