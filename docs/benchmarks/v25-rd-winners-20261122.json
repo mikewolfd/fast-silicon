@@ -10416,5 +10416,70 @@
       "q4_quarot": 16908360
     },
     "exact_schema_match_across_modes": true
+  },
+  "compact_retrieval_index_100k_q1_latencies_m4_pro": {
+    "n_docs": 100000,
+    "n_queries_median": 64,
+    "top_k": 10,
+    "rerank_top_m": 64,
+    "bge_small_384d": {
+      "fp32_blas_1536b_ms": 1.4583,
+      "sym_int8_386b_ms": 1.1577,
+      "sym_int8_speedup": 1.26,
+      "binary_int8_434b_ms": 0.4952,
+      "binary_int8_speedup": 2.945
+    },
+    "embeddinggemma2_768d_to_512d_mrl": {
+      "fp32_blas_3072b_ms": 2.2269,
+      "mrl_int8_514b_ms": 1.4166,
+      "mrl_int8_speedup": 1.572,
+      "binary_int8_578b_ms": 0.5023,
+      "binary_int8_speedup": 4.433
+    },
+    "fast_pplx_1024d": {
+      "fp32_blas_4096b_ms": 2.8229,
+      "sym_int8_1026b_ms": 2.1057,
+      "sym_int8_speedup": 1.341,
+      "binary_int8_1154b_ms": 0.6591,
+      "binary_int8_speedup": 4.283
+    }
+  },
+  "bge_small_384d_h2_parity": {
+    "nanobeir_n150": {
+      "fp32_ndcg10": 0.742715,
+      "sym_int8_384d": {
+        "bytes_per_vec": 386,
+        "compression_vs_fp32": 3.979,
+        "ndcg10": 0.741402,
+        "delta": -0.001313,
+        "ci95": [-0.0044, 0.0018],
+        "verdict": "PASS"
+      },
+      "binary_int8_384d_top64": {
+        "bytes_per_vec": 434,
+        "compression_vs_fp32": 3.539,
+        "ndcg10": 0.742462,
+        "delta": -0.000253,
+        "ci95": [-0.0065, 0.006],
+        "verdict": "PASS"
+      },
+      "mrl_256d_int8": {
+        "bytes_per_vec": 258,
+        "compression_vs_fp32": 5.953,
+        "ndcg10": 0.724343,
+        "delta": -0.018372,
+        "ci95": [-0.0351, -0.0016],
+        "verdict": "REJECT_NON_MRL"
+      }
+    },
+    "legalbench_rag_header_anchored_n175": {
+      "fp32_span_ndcg10": 0.329357,
+      "sym_int8_384d": {
+        "span_ndcg10": 0.331986,
+        "delta": 0.002629,
+        "ci95": [-0.0017, 0.007],
+        "verdict": "PASS"
+      }
+    }
   }
 }

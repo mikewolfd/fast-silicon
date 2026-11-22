@@ -24,6 +24,13 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
     docs = model.encode_contextual_chunks([
         ["Chunk A discussing heat transport.", "Chunk B expanding on polar gyres."],
     ], max_length=512)
+
+    # For long 4K-32K documents, build a contextual multi-vector MaxSim index (1024d INT8):
+    long_index = model.build_index(
+        ["Long 32K document text...", "Second long document..."],
+        multivector=True,
+    )
+    top_doc_ids, top_scores = long_index.search(model.encode_queries(["ocean currents"])[0], top_k=5)
 ```
 
 `max_length` caps the whole document, including its prefix and chunk separators. The result contains one matrix per input document and one row per original chunk, in input order. A chunk crossing the cap uses the tokens that fit. A chunk wholly beyond it gets a zero vector. To index every passage in a longer document, split it into context windows before encoding.
@@ -146,10 +153,12 @@ Validated on full-document `LegalBench-RAG` (`Tier-1`: `175` queries / `796` chu
 | Retrieval / Storage Mode (`M4 Pro`, `N=500` `LongEmbed` / `N=325` `Tier-1`) | Quality vs `FP32` Single-Vec | Storage / Footprint | Speedup & Notes |
 | :--- | :---: | :---: | :--- |
 | **`encode_documents_multivector` (`window_tokens=1024, context_tokens=2048, rep=128`, `MaxSim`)** | **`32K passkey`: `0.0470 -> 1.0000` split (`0.6743` pooled, `R@10=1.000`)** · **`2wikimqa`: `0.8945 -> 0.9851`** (`N=500`: `0.7510 -> 0.8452` pooled / `0.9911` split) | `15.97 KiB/doc` (`1024d INT8`, `0.0000` loss vs `FP32`); `1.72 GB` Metal peak (**`2.48×` lower** than `4.27 GB` `32K`) | **`2.31×` faster GPU encode** (`955.4s` vs `2205.5s`) by replacing `O(32768^2)` full attention with `2K` contextual windows |
-| **Symmetric `1024d INT8` (`mode="auto"` / `"int8"`)** | **`+0.0000` `NanoBEIR`** `[-0.0020, +0.0007]`, **`-0.0012` `LB-Ctx`** `[-0.0029, +0.0005]` (**PASS** `<= 0.003`, `2.6–6.8×` lower error than `native_tanh_int8`) | `1,026 B/vec` (**`4.0×` smaller**) | NEON `vdotq_s32` dot scoring; enforced automatically by `CorpusBackfillConfig.for_engine(engine)` (`mrl_dim=None`) |
-| **NEON `bin1024 -> Top-64 -> 1024d INT8` (`mode="binary_int8"`)** | **`+0.0006` `NanoBEIR`**, **`-0.0012` `LB-Ctx`** (**PASS** `<= 0.003` lossless gate) | `128 B` hot binary scan (`32×` smaller) + `1,026 B` `INT8` (`3.55×` total) | **`0.027 ms/q`** (`7.6×` faster) · **`0.606 ms/q` single-thread @ `100K` docs** (`1.70 ms` M5 / `6.43 ms` M4 on `72`-window `multivector=True` `MaxSim`) |
+| **Symmetric `1024d INT8` (`mode="auto"` `< 16K` / `"int8"`)** | **`-0.0007` `NanoBEIR`** `[-0.0020, +0.0007]`, **`-0.0012` `LB-Ctx`** `[-0.0029, +0.0005]` (**PASS** `<= 0.003`, `2.6–6.8×` lower error than `native_tanh_int8`) | `1,026 B/vec` (**`3.99×` smaller**) | **`2.11 ms/q`** `Q=1` @ `100K` docs (`1.34×` vs `2.82 ms/q` `FP32` BLAS); enforced automatically by `CorpusBackfillConfig.for_engine(engine)` (`mrl_dim=None`) |
+| **NEON `bin1024 -> Top-64 -> 1024d INT8` (`mode="auto"` `>= 16K` / `"binary_int8"`)** | **`+0.0006` `NanoBEIR`** `[-0.0016, +0.0036]`, **`-0.0012` `LB-Ctx`** `[-0.0029, +0.0005]` (**PASS** `<= 0.003` lossless gate) | `128 B` hot binary scan (`32×` smaller) + `1,026 B` `INT8` (`3.55×` total) | **`0.66 ms/q` interactive `Q=1` @ `100K` docs** (**`4.28×` faster** than `2.82 ms/q` `FP32` BLAS; `0.61 ms/q` batched; `1.70 ms` M5 / `6.43 ms` M4 on `72`-window `multivector=True` `MaxSim`) |
 | **FFD `pack_ane_buckets` + Host-Aware `hetero2` + Async Parquet (`T4.1–T4.3`)** | Exact deterministic row/vector parity (`resume=True` + `.tmp` cleanup) | **`26` vs `32` ANE bins (`-18.8%`)**, **`648` vs `1,638` pad toks (`-60.4%`)** | Mixed-64 **`19,443 tok/s`** M5 (`1.17×` vs GPU) / **`17,793 tok/s`** M4 (**`1.84×`** vs GPU); `S>512` (`768`/`1024`) ANE gated out (M4 GPU fallback, M5 GPU `1.40×` faster) |
 | **Opt-In `quantize_weights="w8"` (`T4.4`, `--quantize-weights w8`)** | `16`-case `min_f32_cos = 0.99883` (`mean = 0.99970`) | **`460.8 -> 247.0 MB` (`-46.4%` active linear weights)** | `0.94–0.95×` FP16 speed on M5 (`15,628` vs `16,419 tok/s` @ `16×2048`), saving `~214 MB` for `24 GB` multi-model co-residency (`default="none"`) |
+
+*(Apples-to-apples note on `LongEmbed` `passkey`: official per-length splits evaluate 50 queries against 100 docs at a single length and reach **`1.0000` `nDCG@10`** across all `4K–32K` splits; `benchmark_outcomes.py` also reports the pooled `400`-doc corpus across `[4K, 8K, 16K, 32K]`, where identical target entities appear in all 4 splits and cap any length-invariant oracle near `0.640–0.680` at `Recall@10 = 1.000`.)*
 
 ## What keeps it fast
 
@@ -170,8 +179,8 @@ fast-pplx embed "First passage" "Second passage" --dimensions 256 --dtype int8 -
 fast-pplx parquet --input docs.parquet --output out_shards/ --text-col body --header-col title \
   --mode hetero2 --chunk-tokens 256 --context-tokens 2048 --dimensions 512 --dtype int8 --resume
 
-# OpenAI-compatible HTTP server (/v1/embeddings with optional "dimensions")
-fast-pplx serve --host 127.0.0.1 --port 8080 --mode hetero2 --dimensions 512
+# OpenAI-compatible HTTP server (/v1/embeddings with optional "dimensions" and opt-in 8-bit Metal weights)
+fast-pplx serve --host 127.0.0.1 --port 8080 --mode hetero2 --dimensions 512 --quantize-weights w8
 ```
 
 ## Reproducible Benchmark Harness
