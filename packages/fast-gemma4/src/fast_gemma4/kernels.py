@@ -893,7 +893,8 @@ def _get_softcap_argmax_telem_kernel(stride: int, v_lim: int, softcap: float, ha
     constexpr int STRIDE = {stride};
     constexpr int V = {v_lim};
     constexpr int OUT_COLS = {out_cols};
-    constexpr bfloat SC_BF = (bfloat){softcap:.8e}f;
+    constexpr float SC_F = {softcap:.8e}f;
+    constexpr float INV_SC_F = 1.0f / SC_F;
 
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
@@ -918,9 +919,7 @@ def _get_softcap_argmax_telem_kernel(stride: int, v_lim: int, softcap: float, ha
             continue;
         }}
         float raw_f = (float)rp[j];
-        bfloat x_div = rp[j] / SC_BF;
-        bfloat y_bf = (bfloat)(metal::precise::tanh((float)x_div)) * SC_BF;
-        float v = (float)y_bf;
+        float v = metal::precise::tanh(raw_f * INV_SC_F) * SC_F;
 
         if (best_i < 0 || v > best_v) {{
             second_v = best_v;
@@ -1144,7 +1143,8 @@ def fused_softcap_argmax_bf16(
         src = f"""
     constexpr int STRIDE = {stride};
     constexpr int V = {v_lim};
-    constexpr bfloat SC_BF = (bfloat){softcap:.8e}f;
+    constexpr float SC_F = {softcap:.8e}f;
+    constexpr float INV_SC_F = 1.0f / SC_F;
 
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
@@ -1162,9 +1162,7 @@ def fused_softcap_argmax_bf16(
             continue;
         }}
         float raw_f = (float)rp[j];
-        bfloat x_div = rp[j] / SC_BF;
-        bfloat y_bf = (bfloat)(metal::precise::tanh((float)x_div)) * SC_BF;
-        float v = (float)y_bf;
+        float v = metal::precise::tanh(raw_f * INV_SC_F) * SC_F;
         if (v > best_v) {{
             best_v = v;
             best_i = j;

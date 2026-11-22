@@ -587,10 +587,10 @@ def test_fused_softcap_argmax_telemetry_and_valid_mask_gpu() -> None:
         am_masked, telem_4 = fused_softcap_argmax_bf16(
             raw_mx, softcap, vocab_limit=V, collect_telemetry=True, valid_mask_u32=mask_mx
         )
-        # Compute exact softcapped BF16 values matching the kernel's precision for FP64 ground truth
-        sc_bf = mx.array(softcap, dtype=mx.bfloat16)
-        z_bf = (mx.tanh((raw_mx[:, 0, :V] / sc_bf).astype(mx.float32)).astype(mx.bfloat16) * sc_bf).astype(mx.float32)
-        mx.eval(am_plain, am_telem, telem_3, am_masked, telem_4, z_bf)
+        # Compute exact softcapped FP32 values matching the kernel's precision for FP64 ground truth
+        inv_sc = 1.0 / float(softcap)
+        z_fp32 = mx.tanh(raw_mx[:, 0, :V].astype(mx.float32) * inv_sc) * float(softcap)
+        mx.eval(am_plain, am_telem, telem_3, am_masked, telem_4, z_fp32)
 
         am_p_list = am_plain.tolist()
         assert am_telem.tolist() == am_p_list
@@ -600,7 +600,7 @@ def test_fused_softcap_argmax_telemetry_and_valid_mask_gpu() -> None:
 
         t3_np = np.asarray(telem_3)
         t4_np = np.asarray(telem_4)
-        z_np = np.asarray(z_bf).astype(np.float64)
+        z_np = np.asarray(z_fp32).astype(np.float64)
         assert t3_np.shape == (B, 3)
         assert t4_np.shape == (B, 4)
         assert np.all(np.isnan(t3_np[5])) and np.all(np.isnan(t4_np[5]))
