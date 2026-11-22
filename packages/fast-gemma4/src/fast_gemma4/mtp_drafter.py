@@ -28,7 +28,18 @@ from .model import (
     _singleton_verify_linear,
     safe_argmax_with_nan_guard,
 )
-from .speculative import _pick_valid_token_safe, _seed_tables, _update_ngrams_from_tail
+from .speculative import (
+    _REPEAT_4GRAM_BREAKER_DEFAULT,
+    _REPEAT_4GRAM_MIN_HITS,
+    _REPEAT_4GRAM_MIN_HITS_CONSTRAINED,
+    _REPEAT_4GRAM_PENALTY,
+    _REPEAT_4GRAM_WINDOW,
+    _apply_repeat_penalties_row,
+    _pick_valid_token_safe,
+    _repeated_4gram_penalties,
+    _seed_tables,
+    _update_ngrams_from_tail,
+)
 
 DEFAULT_MTP_DRAFTER_REPO: str = "google/gemma-4-E2B-it-assistant"
 DEFAULT_QAT_MTP_DRAFTER_REPO: str = "google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant"
@@ -852,6 +863,7 @@ def run_decode_mtp(
     doc_indices: Sequence[int] | None = None,
     constrained_top_m: int = 16,
     apple10_nax: bool | None = None,
+    repeat_4gram_breaker: bool | None = None,
 ) -> dict[str, Any]:
     """Speculative MTP decode (`B=1..4` Apple9 / `B=1` Apple10, `T=0`) supporting constrained JSON + DFS."""
     if not (1 <= int(B) <= MAX_MTP_BATCH_SIZE):
@@ -871,6 +883,7 @@ def run_decode_mtp(
 
     t_dec0 = time.perf_counter()
     new_to_old = model.new_to_old
+    eff_repeat_breaker = _REPEAT_4GRAM_BREAKER_DEFAULT if repeat_4gram_breaker is None else bool(repeat_4gram_breaker)
     doc_helpers = [per_doc_grammars[b] if per_doc_grammars is not None else grammar for b in range(B)]
     if all(h is None for h in doc_helpers):
         return _run_decode_mtp_unconstrained(
@@ -886,6 +899,7 @@ def run_decode_mtp(
             draft_k=draft_k,
             t_dec0=t_dec0,
             init_am=init_am,
+            repeat_4gram_breaker=eff_repeat_breaker,
         )
 
     orig_doc_ids = [int(doc_indices[b]) if doc_indices is not None else b for b in range(B)]
@@ -949,17 +963,37 @@ def run_decode_mtp(
         t3, t2 = prompt_tables[orig_b]
         n_indexed[orig_b] = _update_ngrams_from_tail(t3, t2, doc_ctx[orig_b], n_indexed[orig_b])
 
+    def _row_repeat_penalties(orig_b: int, *, constrained: bool) -> dict[int, float]:
+        if not eff_repeat_breaker:
+            return {}
+        return _repeated_4gram_penalties(
+            gen_toks[orig_b],
+            window=_REPEAT_4GRAM_WINDOW,
+            min_prior_hits=_REPEAT_4GRAM_MIN_HITS_CONSTRAINED if constrained else _REPEAT_4GRAM_MIN_HITS,
+            base_penalty=_REPEAT_4GRAM_PENALTY,
+            stop_token_ids=stop_token_ids,
+        )
+
     def sample_and_queue(
         orig_b: int,
         row_logits: np.ndarray | None,
         argmax_j: int,
         x_row_mx: mx.array | None = None,
+        *,
+        penalized: bool = False,
     ) -> bool:
         nonlocal ff_skipped, mask_fallbacks
         m = matchers[orig_b]
         h = doc_helpers[orig_b]
         if m is None or h is None:
             t_orig = int(new_to_old[argmax_j])
+            if not penalized:
+                pen = _row_repeat_penalties(orig_b, constrained=False)
+                if pen and t_orig in pen:
+                    if row_logits is None:
+                        return False
+                    _, adj_am = _apply_repeat_penalties_row(row_logits, pen, model.old_to_new)
+                    t_orig = int(new_to_old[adj_am])
             _append_tok(orig_b, t_orig)
             if t_orig in stop_token_ids or len(gen_toks[orig_b]) >= max_tokens:
                 done[orig_b] = True
@@ -968,11 +1002,14 @@ def run_decode_mtp(
             queues[orig_b].append(t_orig)
             return True
 
+        pen = {} if penalized else _row_repeat_penalties(orig_b, constrained=True)
         if row_logits is None:
             t_orig = int(new_to_old[argmax_j])
-            if not m.validate_tokens([t_orig]):
+            if (pen and t_orig in pen) or not m.validate_tokens([t_orig]):
                 return False
         else:
+            if pen:
+                row_logits, argmax_j = _apply_repeat_penalties_row(row_logits, pen, model.old_to_new)
             t_orig, fell = _pick_valid_token_safe(h, model, m, row_logits, argmax_j, x_row_mx=x_row_mx)
             if fell:
                 mask_fallbacks += 1
@@ -1222,7 +1259,15 @@ def run_decode_mtp(
             while j < len(dr):
                 d_tok = dr[j]
                 pos = (nf - 1 - keep_from_col) + j
-                pred_orig = int(new_to_old[am_list[r][pos]])
+                eff_am = am_list[r][pos]
+                pred_orig = int(new_to_old[eff_am])
+                adj_lg: np.ndarray | None = None
+                pen = _row_repeat_penalties(b, constrained=(m_b is not None))
+                if pen and pred_orig in pen:
+                    if lg_full_np is None:
+                        lg_full_np = np.array(lg_step.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
+                    adj_lg, eff_am = _apply_repeat_penalties_row(lg_full_np[r, pos], pen, model.old_to_new)
+                    pred_orig = int(new_to_old[eff_am])
                 if m_b is None:
                     if pred_orig == d_tok:
                         _append_tok(b, pred_orig)
@@ -1237,7 +1282,7 @@ def run_decode_mtp(
                             break
                         j += 1
                         continue
-                    sample_and_queue(b, None, am_list[r][pos])
+                    sample_and_queue(b, adj_lg, eff_am, penalized=(adj_lg is not None))
                     acc_lens[r] = nf + matched
                     seed_col_idx[r] = pos
                     next_seed_valid[r] = len(queues[b]) == 1 and not done[b]
@@ -1245,9 +1290,12 @@ def run_decode_mtp(
                     break
 
                 if not m_b.validate_tokens([pred_orig]):
-                    if lg_full_np is None:
-                        lg_full_np = np.array(lg_step.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
-                    sample_and_queue(b, lg_full_np[r, pos], am_list[r][pos], x_row_mx=x_step[r, pos])
+                    if adj_lg is None:
+                        if lg_full_np is None:
+                            lg_full_np = np.array(lg_step.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
+                        sample_and_queue(b, lg_full_np[r, pos], eff_am, x_row_mx=x_step[r, pos], penalized=False)
+                    else:
+                        sample_and_queue(b, adj_lg, eff_am, x_row_mx=x_step[r, pos], penalized=True)
                     acc_lens[r] = nf + matched
                     seed_col_idx[r] = pos
                     next_seed_valid[r] = len(queues[b]) == 1 and not done[b]
@@ -1306,7 +1354,7 @@ def run_decode_mtp(
                         continue
                     j += 1
                 else:
-                    sample_and_queue(b, None, am_list[r][pos])
+                    sample_and_queue(b, adj_lg, eff_am, penalized=(adj_lg is not None))
                     acc_lens[r] = nf + matched
                     seed_col_idx[r] = pos
                     next_seed_valid[r] = len(queues[b]) == 1 and not done[b]
@@ -1374,11 +1422,13 @@ def _run_decode_mtp_unconstrained(
     draft_k: int | None,
     t_dec0: float,
     init_am: mx.array | None = None,
+    repeat_4gram_breaker: bool | None = None,
 ) -> dict[str, Any]:
     """Zero-sync-between-draft-and-verify unconstrained greedy MTP loop (`0.0` ULP exact to `L_q=1`)."""
     is_slot_cache = "swa_cap" in cache
     slot_mx = mx.arange(B, dtype=mx.int32)
     new_to_old = model.new_to_old
+    eff_repeat_breaker = _REPEAT_4GRAM_BREAKER_DEFAULT if repeat_4gram_breaker is None else bool(repeat_4gram_breaker)
     gen_toks: list[list[int]] = [[] for _ in range(B)]
     done = [False] * B
     active = list(range(B))
@@ -1461,6 +1511,24 @@ def _run_decode_mtp_unconstrained(
         acc_lens = [0] * B_cur
         seed_col_idx = [0] * B_cur
         new_anchors = [fallback_tok] * B_cur
+        def _pick_unconstrained(orig_b: int, raw_am: int, r: int, pos: int) -> int:
+            pred = int(new_to_old[raw_am])
+            if eff_repeat_breaker:
+                pen = _repeated_4gram_penalties(
+                    gen_toks[orig_b],
+                    window=_REPEAT_4GRAM_WINDOW,
+                    min_prior_hits=_REPEAT_4GRAM_MIN_HITS,
+                    base_penalty=_REPEAT_4GRAM_PENALTY,
+                    stop_token_ids=stop_token_ids,
+                )
+                if pen and pred in pen:
+                    x_cell = x_step[r : r + 1, pos : pos + 1, :]
+                    lg_cell = model._apply_lm_head(x_cell, apply_softcap=True)[0, 0]
+                    row_lg = np.array(lg_cell.astype(mx.float32))  # guard: allow-sync (rare loop-breaker fallback)
+                    _, adj_am = _apply_repeat_penalties_row(row_lg, pen, model.old_to_new)
+                    return int(new_to_old[adj_am])
+            return pred
+
         for r, b in enumerate(active):
             dr = drafts_list[r]
             am_r = am_list[r]
@@ -1468,7 +1536,7 @@ def _run_decode_mtp_unconstrained(
             matched = 0
             stopped = False
             for j, d_tok in enumerate(dr):
-                pred = int(new_to_old[am_r[j]])
+                pred = _pick_unconstrained(b, am_r[j], r, j)
                 if pred == d_tok:
                     if pred in stop_token_ids:
                         done[b] = True
@@ -1498,7 +1566,7 @@ def _run_decode_mtp_unconstrained(
                     stopped = True
                     break
             if not stopped:
-                bonus = int(new_to_old[am_r[len(dr)]])
+                bonus = _pick_unconstrained(b, am_r[len(dr)], r, len(dr))
                 if bonus in stop_token_ids:
                     done[b] = True
                 else:

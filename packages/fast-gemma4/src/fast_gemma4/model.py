@@ -314,7 +314,8 @@ def compute_safe_fp16_residual_scales(
 
 @mx.compile
 def logit_softcap(softcap: float, x: mx.array) -> mx.array:
-    return mx.tanh(x / softcap) * softcap
+    inv_sc = 1.0 / float(softcap)
+    return mx.tanh(x.astype(mx.float32) * inv_sc) * float(softcap)
 
 
 def _candidate_quant_names(prefix: str) -> tuple[str, ...]:

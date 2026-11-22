@@ -53,6 +53,85 @@ def build_ngram_table(
     return t3, t2
 
 
+_REPEAT_4GRAM_BREAKER_DEFAULT: bool = True
+_REPEAT_4GRAM_WINDOW: int = 96
+_REPEAT_4GRAM_MIN_HITS: int = 4
+_REPEAT_4GRAM_MIN_HITS_CONSTRAINED: int = 5
+_REPEAT_4GRAM_PENALTY: float = 8.0
+
+
+def _repeated_4gram_penalties(
+    token_ids: Sequence[int] | None,
+    *,
+    window: int = _REPEAT_4GRAM_WINDOW,
+    min_prior_hits: int = _REPEAT_4GRAM_MIN_HITS,
+    base_penalty: float = _REPEAT_4GRAM_PENALTY,
+    stop_token_ids: frozenset[int] = frozenset(),
+) -> dict[int, float]:
+    """Return `{next_token_id: penalty}` only on true cyclic/dense degenerate repeat loops."""
+    if not token_ids:
+        return {}
+    n = len(token_ids)
+    out: dict[int, float] = {}
+
+    # 1. Exact consecutive periodic suffix detector: suppresses stuck `p=1..8` token cycles
+    # without touching legitimate prose, lists, CSV rows, or 2-hit math derivations.
+    if n >= 6:
+        tail = [int(t) for t in token_ids[-min(n, 32) :]]
+        nt = len(tail)
+        # p = 1: >= 6 consecutive identical tokens (avoids false hits on markdown/ellipsis)
+        if nt >= 6 and all(t == tail[-1] for t in tail[-6:-1]):
+            d = tail[-1]
+            if d not in stop_token_ids:
+                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+        # p = 2: >= 4 consecutive 2-token copies
+        if nt >= 8 and tail[-2:] == tail[-4:-2] == tail[-6:-4] == tail[-8:-6]:
+            d = tail[-2]
+            if d not in stop_token_ids:
+                out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+        # p = 3..8: >= 3 consecutive p-token copies
+        for p in range(3, 9):
+            if nt >= 3 * p:
+                pat = tail[-p:]
+                if tail[-2 * p : -p] == pat and tail[-3 * p : -2 * p] == pat:
+                    d = pat[0]
+                    if d not in stop_token_ids:
+                        out[d] = max(out.get(d, 0.0), float(base_penalty) * 2.0)
+
+    # 2. High-threshold 4-gram frequency check inside trailing window (5th+ occurrence).
+    if n >= (3 + min_prior_hits):
+        start = max(0, n - int(window))
+        a, b, c = int(token_ids[-3]), int(token_ids[-2]), int(token_ids[-1])
+        if c in token_ids[start : n - 1]:
+            hits: dict[int, int] = {}
+            for i in range(start, n - 3):
+                if int(token_ids[i]) == a and int(token_ids[i + 1]) == b and int(token_ids[i + 2]) == c:
+                    d = int(token_ids[i + 3])
+                    if d not in stop_token_ids:
+                        hits[d] = hits.get(d, 0) + 1
+            for d, cnt in hits.items():
+                if cnt >= min_prior_hits:
+                    pen = float(base_penalty) * float(min(cnt - min_prior_hits + 1, 3))
+                    out[d] = max(out.get(d, 0.0), pen)
+    return out
+
+
+def _apply_repeat_penalties_row(
+    row_lg: np.ndarray,
+    penalties: dict[int, float],
+    old_to_new: np.ndarray | None,
+) -> tuple[np.ndarray, int]:
+    """Copy a 1D logit row, apply repeat penalties in vocab space, and return `(adj_lg, argmax_j)`."""
+    adj = np.array(row_lg, copy=True)
+    n_o2n = int(len(old_to_new)) if old_to_new is not None else -1
+    v_len = int(adj.shape[0])
+    for orig_id, pen in penalties.items():
+        idx = int(old_to_new[orig_id]) if (old_to_new is not None and 0 <= orig_id < n_o2n) else orig_id
+        if 0 <= idx < v_len:
+            adj[idx] -= float(pen)
+    return adj, int(np.argmax(adj))
+
+
 def _host_ram_gib() -> float:
     try:
         return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024.0**3)
@@ -268,8 +347,10 @@ def run_decode_batch(
     auto_dual_mlp_q4: bool = False,
     dual_min_batch: int = 48,
     enable_ff_jump: bool = True,
+    repeat_4gram_breaker: bool | None = None,
 ) -> dict[str, Any]:
     """Optimized batched decode: lazy init_lg argmax, eager compaction down to B=1, optional PromptLookup tail handoff."""
+    eff_repeat_breaker = _REPEAT_4GRAM_BREAKER_DEFAULT if repeat_4gram_breaker is None else bool(repeat_4gram_breaker)
     use_q4 = auto_dual_mlp_q4 and should_auto_dual_mlp_q4(model, B, temperature=temperature, min_batch=dual_min_batch)
     prev_q4 = bool(getattr(model, "_dual_q4_active", False))
     if use_q4:
@@ -278,6 +359,7 @@ def run_decode_batch(
     try:
         t_dec0 = time.perf_counter()
         new_to_old = model.new_to_old
+        old_to_new = getattr(model, "old_to_new", None)
         fallback_pad = grammar.upfront_ff[0] if (grammar is not None and grammar.upfront_ff) else int(new_to_old[0])
 
         matchers = [grammar.new_matcher() for _ in range(B)] if grammar is not None else None
@@ -370,6 +452,14 @@ def run_decode_batch(
                 done[orig_b] = True
                 queues[orig_b].clear()
 
+        def _row_repeat_penalties(orig_b: int, *, constrained: bool) -> dict[int, float]:
+            if not eff_repeat_breaker:
+                return {}
+            min_hits = _REPEAT_4GRAM_MIN_HITS_CONSTRAINED if constrained else _REPEAT_4GRAM_MIN_HITS
+            return _repeated_4gram_penalties(
+                gen_toks[orig_b], min_prior_hits=min_hits, stop_token_ids=stop_token_ids
+            )
+
         def _sample_rows(logits_2d: mx.array, row_indices: Sequence[int]) -> None:
             """Sample `row_indices` from `[len(active), V_eff]` logits, copying float32 rows only when needed."""
             last_x = cache.get("_last_x_in")
@@ -378,10 +468,16 @@ def run_decode_batch(
                 nan_rows = [active[r] for r in row_indices if bool(np.isnan(lg_np[r]).any())]
                 if nan_rows:
                     raise FloatingPointError(f"NaN logits detected in run_decode_batch for rows {nan_rows}")
-                am_np = np.argmax(lg_np, axis=-1).tolist()
                 for r in row_indices:
+                    b = active[r]
+                    row_lg = lg_np[r]
+                    pen = _row_repeat_penalties(b, constrained=grammar is not None)
+                    if pen:
+                        row_lg, am_r = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
+                    else:
+                        am_r = int(np.argmax(row_lg))
                     xr = last_x[r, -1] if last_x is not None else None
-                    consume_sampled(active[r], lg_np[r], am_np[r], x_row_mx=xr)
+                    consume_sampled(b, row_lg, am_r, x_row_mx=xr)
                 return
 
             am_mx = safe_argmax_with_nan_guard(logits_2d, axis=-1)
@@ -392,24 +488,41 @@ def run_decode_batch(
             if bad_rows:
                 raise FloatingPointError(f"NaN logits detected in run_decode_batch for rows {bad_rows}")
             if grammar is None:
+                need_rep_rows: list[tuple[int, dict[int, float]]] = []
                 for r in row_indices:
-                    consume_sampled(active[r], None, am_list[r])
+                    b = active[r]
+                    t_orig = int(new_to_old[am_list[r]])
+                    pen = _row_repeat_penalties(b, constrained=False) if t_orig not in stop_token_ids else {}
+                    if pen and t_orig in pen:
+                        need_rep_rows.append((r, pen))
+                    else:
+                        consume_sampled(b, None, am_list[r])
+                if need_rep_rows:
+                    lg_sub = np.array(logits_2d[mx.array([x[0] for x in need_rep_rows], dtype=mx.int32), :].astype(mx.float32))
+                    for k_idx, (r, pen) in enumerate(need_rep_rows):
+                        _, am_adj = _apply_repeat_penalties_row(lg_sub[k_idx], pen, old_to_new)
+                        consume_sampled(active[r], None, am_adj)
                 return
 
             assert matchers is not None
-            need_mask_rows: list[int] = []
+            need_mask_rows: list[tuple[int, dict[int, float]]] = []
             for r in row_indices:
                 b = active[r]
                 t_orig = int(new_to_old[am_list[r]])
-                if matchers[b].validate_tokens([t_orig]):
+                pen = _row_repeat_penalties(b, constrained=True) if t_orig not in stop_token_ids else {}
+                if (not pen or t_orig not in pen) and matchers[b].validate_tokens([t_orig]):
                     consume_sampled(b, None, am_list[r])
                 else:
-                    need_mask_rows.append(r)
+                    need_mask_rows.append((r, pen))
             if need_mask_rows:
-                lg_sub = np.array(logits_2d[mx.array(need_mask_rows, dtype=mx.int32), :].astype(mx.float32))
-                for k_idx, r in enumerate(need_mask_rows):
+                lg_sub = np.array(logits_2d[mx.array([x[0] for x in need_mask_rows], dtype=mx.int32), :].astype(mx.float32))
+                for k_idx, (r, pen) in enumerate(need_mask_rows):
+                    row_lg = lg_sub[k_idx]
+                    am_j = am_list[r]
+                    if pen:
+                        row_lg, am_j = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
                     xr = last_x[r, -1] if last_x is not None else None
-                    consume_sampled(active[r], lg_sub[k_idx], am_list[r], x_row_mx=xr)
+                    consume_sampled(active[r], row_lg, am_j, x_row_mx=xr)
 
         # Step-0 lazy argmax (skips full [B, V_eff] float32 copy on Temp=0 unless fallback row hits!)
         _sample_rows(init_lg[:, 0, :], range(len(active)))
@@ -449,6 +562,7 @@ def run_decode_batch(
                     max_tokens=max_tokens,
                     draft_k=draft_k,
                     enable_ff_jump=enable_ff_jump,
+                    repeat_4gram_breaker=eff_repeat_breaker,
                     state={
                         "matchers": matchers,
                         "queues": queues,
@@ -557,12 +671,15 @@ def run_decode_prompt_lookup(
     max_tokens: int = 512,
     draft_k: int = 4,
     enable_ff_jump: bool = True,
+    repeat_4gram_breaker: bool | None = None,
     # Optional continuation state when handed off from run_decode_batch:
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Optimized PromptLookup L_q<=draft_k+1 verifier + causal slice jumping (`keep_from_col`) on forced spans."""
+    eff_repeat_breaker = _REPEAT_4GRAM_BREAKER_DEFAULT if repeat_4gram_breaker is None else bool(repeat_4gram_breaker)
     t_dec0 = time.perf_counter()
     new_to_old = model.new_to_old
+    old_to_new = getattr(model, "old_to_new", None)
     fallback_pad = grammar.upfront_ff[0] if (grammar is not None and grammar.upfront_ff) else int(new_to_old[0])
     L_step = int(draft_k)
 
@@ -601,6 +718,14 @@ def run_decode_prompt_lookup(
         ff_jump_steps = int(state.get("ff_jump_steps", 0))
         ff_jump_tokens = int(state.get("ff_jump_tokens", 0))
 
+    def _pl_repeat_penalties(orig_b: int) -> dict[int, float]:
+        if not eff_repeat_breaker:
+            return {}
+        min_hits = _REPEAT_4GRAM_MIN_HITS_CONSTRAINED if grammar is not None else _REPEAT_4GRAM_MIN_HITS
+        return _repeated_4gram_penalties(
+            gen_toks[orig_b], min_prior_hits=min_hits, stop_token_ids=stop_token_ids
+        )
+
     def sample_and_queue(
         orig_b: int,
         row_logits: np.ndarray | None,
@@ -610,6 +735,10 @@ def run_decode_prompt_lookup(
         nonlocal ff_skipped, mask_fallbacks
         if grammar is None:
             t_orig = int(new_to_old[argmax_j])
+            if row_logits is None and t_orig not in stop_token_ids:
+                pen = _pl_repeat_penalties(orig_b)
+                if pen and t_orig in pen:
+                    return False
             if t_orig in stop_token_ids:
                 done[orig_b] = True
                 queues[orig_b].clear()
@@ -627,7 +756,8 @@ def run_decode_prompt_lookup(
         m = matchers[orig_b]
         if row_logits is None:
             t_orig = int(new_to_old[argmax_j])
-            if not m.validate_tokens([t_orig]):
+            pen = _pl_repeat_penalties(orig_b) if t_orig not in stop_token_ids else {}
+            if (pen and t_orig in pen) or not m.validate_tokens([t_orig]):
                 return False  # Signal caller to fetch lazy row_logits!
         else:
             t_orig, fell_back = _pick_valid_token_safe(
@@ -670,8 +800,13 @@ def run_decode_prompt_lookup(
     ) -> np.ndarray:
         if lg_full_np is None:
             lg_full_np = np.array(lg_step_mx.astype(mx.float32))  # guard: allow-sync (lazy D2H on evaluated logits)
+        row_lg = lg_full_np[r_idx, pos_idx]
+        am_j = am_rows[r_idx][pos_idx]
+        pen = _pl_repeat_penalties(orig_b)
+        if pen:
+            row_lg, am_j = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
         xr = last_x[r_idx, pos_idx] if last_x is not None else None
-        sample_and_queue(orig_b, lg_full_np[r_idx, pos_idx], am_rows[r_idx][pos_idx], x_row_mx=xr)
+        sample_and_queue(orig_b, row_lg, am_j, x_row_mx=xr)
         return lg_full_np
 
     if init_lg is not None:
@@ -790,6 +925,13 @@ def run_decode_prompt_lookup(
             for j, d_tok in enumerate(dr):
                 pos = (nf - 1 - keep_from_col) + j
                 pred_orig = int(new_to_old[am_list[r][pos]])
+                pen = _pl_repeat_penalties(b) if pred_orig not in stop_token_ids else {}
+                if pen and pred_orig in pen:
+                    lg_full_np = _fallback_sample_step_row(b, r, pos, lg_full_np, lg_step, last_x_step, am_list)
+                    acc_lens[r] = nf + matched
+                    total_acc += nf + matched
+                    stopped = True
+                    break
                 if grammar is not None:
                     assert matchers is not None
                     if not matchers[b].validate_tokens([pred_orig]):
@@ -846,7 +988,8 @@ def run_decode_prompt_lookup(
                             stopped = True
                             break
                 else:
-                    sample_and_queue(b, None, am_list[r][pos])
+                    if not sample_and_queue(b, None, am_list[r][pos]):
+                        lg_full_np = _fallback_sample_step_row(b, r, pos, lg_full_np, lg_step, last_x_step, am_list)
                     acc_lens[r] = nf + matched
                     total_acc += nf + matched
                     stopped = True
@@ -915,6 +1058,7 @@ def run_decode_rolling(
     ane_ring_variant: str = "fp16",
     collect_telemetry: bool = False,
     collect_valid_lse: bool = False,
+    repeat_4gram_breaker: bool | None = None,
 ) -> dict[str, Any]:
     """
     Continuous length-sorted slot-refill rolling GPU (+ optional Async Hybrid ANE+GPU) scheduler:
@@ -927,6 +1071,7 @@ def run_decode_rolling(
       - optional zero-copy GPU pre-mask telemetry (`lse_all`, `H_pre`, `top2_margin`, + `lse_valid` via `uint32` bitmask)
       - propagates `valid_schemas` directly from live matchers without re-parsing from token 0
     """
+    eff_repeat_breaker = _REPEAT_4GRAM_BREAKER_DEFAULT if repeat_4gram_breaker is None else bool(repeat_4gram_breaker)
     N = len(suf_ids_list)
     want_telem = bool(collect_telemetry or collect_valid_lse)
     if per_doc_grammars is not None and len(per_doc_grammars) != N:
@@ -1134,6 +1279,7 @@ def run_decode_rolling(
 
     doc_telemetry: list[list[dict[str, float]]] = [[] for _ in range(N)] if want_telem else []
     model_vocab_size = int(getattr(model, "vocab_size", len(new_to_old)))
+    old_to_new = getattr(model, "old_to_new", None)
     head_mask_words = (model_vocab_size + 31) // 32
     new_to_old_u32 = np.asarray(new_to_old, dtype=np.uint32) if want_telem else None
 
@@ -1194,14 +1340,29 @@ def run_decode_rolling(
             bad_slots = [int(target_slots[i]) for i in range(len(target_slots)) if int(am_np[i]) < 0]
             raise FloatingPointError(f"NaN logits detected in fused_softcap_argmax_bf16 for slots {bad_slots}")
 
+        def _slot_repeat_penalties(slot_s: int, *, constrained: bool) -> dict[int, float]:
+            if not eff_repeat_breaker:
+                return {}
+            min_hits = _REPEAT_4GRAM_MIN_HITS_CONSTRAINED if constrained else _REPEAT_4GRAM_MIN_HITS
+            return _repeated_4gram_penalties(
+                gen_toks[slot_doc[slot_s]],
+                min_prior_hits=min_hits,
+                stop_token_ids=stop_token_ids,
+            )
+
         if return_logits:
             lg_np = np.asarray(x_or_lg[:, 0, :].astype(mx.float32))
             last_x = cache.get("_last_x_in")
             for r, s in enumerate(target_slots):
                 g_slot = slot_grammar[s]
+                row_lg = lg_np[r]
+                am_j = int(am_np[r])
+                pen = _slot_repeat_penalties(s, constrained=g_slot is not None)
+                if pen:
+                    row_lg, am_j = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
                 if g_slot is None:
                     oid = sample_unconstrained(
-                        lg_np[r], new_to_old, int(am_np[r]), temperature=temperature, top_p=top_p, rng=rng
+                        row_lg, new_to_old, am_j, temperature=temperature, top_p=top_p, rng=rng
                     )
                 else:
                     m = slot_matcher[s]
@@ -1210,8 +1371,8 @@ def run_decode_rolling(
                         g_slot,
                         model,
                         m,
-                        lg_np[r],
-                        int(am_np[r]),
+                        row_lg,
+                        am_j,
                         x_row_mx=xr,
                         temperature=temperature,
                         top_p=top_p,
@@ -1224,32 +1385,47 @@ def run_decode_rolling(
             return
 
         orig_ids = new_to_old[am_np]
-        need_fb: list[tuple[int, int, Any, int]] = []
+        need_fb: list[tuple[int, int, Any, int, dict[int, float]]] = []
         for r, s in enumerate(target_slots):
             oid = int(orig_ids[r])
             g_slot = slot_grammar[s]
+            pen = (
+                _slot_repeat_penalties(s, constrained=g_slot is not None)
+                if oid not in stop_token_ids
+                else {}
+            )
             if g_slot is None:
-                _process_sampled_token(s, oid)
+                if pen and oid in pen:
+                    need_fb.append((r, s, None, int(am_np[r]), pen))
+                else:
+                    _process_sampled_token(s, oid)
                 continue
             m = slot_matcher[s]
-            if m.try_consume_tokens([oid]) == 1:
+            if (not pen or oid not in pen) and m.try_consume_tokens([oid]) == 1:
                 _process_sampled_token(s, oid)
             else:
-                need_fb.append((r, s, g_slot, int(am_np[r])))
+                need_fb.append((r, s, g_slot, int(am_np[r]), pen))
         if need_fb:
             fb_rows = mx.array([x[0] for x in need_fb], dtype=mx.int32)
             x_fb = x_or_lg[fb_rows]
             lg_fb = model._apply_lm_head(x_fb, apply_softcap=True)
             mx.eval(lg_fb)
             lg_sub = np.asarray(lg_fb[:, 0, :].astype(mx.float32))
-            for k_i, (_, s, g_slot, am_j) in enumerate(need_fb):
-                m = slot_matcher[s]
-                oid, _ = _pick_valid_token_safe(
-                    g_slot, model, m, lg_sub[k_i], am_j, x_row_mx=x_fb[k_i, 0]
-                )
-                mask_fallbacks += 1
-                m.consume_token(oid)
-                _process_sampled_token(s, oid)
+            for k_i, (_, s, g_slot, am_j, pen) in enumerate(need_fb):
+                row_lg = lg_sub[k_i]
+                if pen:
+                    row_lg, am_j = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
+                if g_slot is None:
+                    _process_sampled_token(s, int(new_to_old[am_j]))
+                else:
+                    m = slot_matcher[s]
+                    oid, fell = _pick_valid_token_safe(
+                        g_slot, model, m, row_lg, am_j, x_row_mx=x_fb[k_i, 0]
+                    )
+                    if fell:
+                        mask_fallbacks += 1
+                    m.consume_token(oid)
+                    _process_sampled_token(s, oid)
 
     def _admit_batch(doc_indices: list[int], target_slots: list[int]) -> None:
         nonlocal prefill_sec, decode_sec, llm_steps
