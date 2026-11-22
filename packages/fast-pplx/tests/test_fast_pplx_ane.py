@@ -151,7 +151,13 @@ def test_multi_doc_bucket_packing_c32_gap3_isolation() -> None:
         (1, list(range(100, 130)), [(2, 28)]),     # len=30
         (2, list(range(200, 232)), [(0, 0)]),      # len=32 empty chunk span
     ]
-    bkts = pack_ane_buckets(items, supported_caps=(64, 128, 256, 512), chunk_size=32, conv_gap=3)
+    bkts = pack_ane_buckets(
+        items,
+        supported_caps=(64, 128, 256, 512),
+        chunk_size=32,
+        conv_gap=3,
+        strategy="sequential",
+    )
     assert len(bkts) == 1
     bkt = bkts[0]
     assert bkt.seq_len == 128
@@ -171,6 +177,48 @@ def test_multi_doc_bucket_packing_c32_gap3_isolation() -> None:
     assert bkt.pos_ids[0:29].tolist() == list(range(29))
     assert bkt.pos_ids[32:62].tolist() == list(range(30))
     assert bkt.pos_ids[96:128].tolist() == list(range(32))
+
+
+def test_pack_ane_buckets_ffd_density_and_isolation() -> None:
+    # Adversarial input order [32, 90, 32, 90] under cap=128:
+    # - Sequential uses 3 bins: [32], [90, 32], [90] (since 64 + 90 = 154 > 128).
+    # - Default FFD sorts [90, 90, 32, 32] and packs into 2 tight bins: [90, 32] + [90, 32].
+    items = [
+        (0, list(range(10, 42)), [(1, 16), (16, 31)]),        # len=32 (item_index=0)
+        (1, list(range(100, 190)), [(2, 45), (45, 89)]),      # len=90 (item_index=1)
+        (2, list(range(200, 232)), [(0, 32)]),                # len=32 (item_index=2)
+        (3, list(range(300, 390)), [(3, 90)]),                # len=90 (item_index=3)
+    ]
+    seq_bkts = pack_ane_buckets(items, supported_caps=(64, 128), chunk_size=32, conv_gap=3, strategy="sequential")
+    ffd_bkts = pack_ane_buckets(items, supported_caps=(64, 128), chunk_size=32, conv_gap=3)
+    assert len(seq_bkts) == 3
+    assert len(ffd_bkts) == 2
+
+    seen_items: set[int] = set()
+    for bkt in ffd_bkts:
+        assert bkt.seq_len == 128
+        assert bkt.n_docs == 2
+        assert np.all(bkt.doc_ids[0:90] == 0)
+        assert np.all(bkt.doc_ids[90:96] == -1)
+        assert np.all(bkt.doc_ids[96:128] == 1)
+        assert bkt.pos_ids[0:90].tolist() == list(range(90))
+        assert bkt.pos_ids[96:128].tolist() == list(range(32))
+        by_item: dict[int, list[PackedSpanTarget]] = {}
+        for t in bkt.targets:
+            by_item.setdefault(t.item_index, []).append(t)
+        assert len(by_item) == 2
+        seen_items.update(by_item.keys())
+        for idx, ts in by_item.items():
+            spans = [(t.start, t.end) for t in sorted(ts, key=lambda x: x.chunk_index)]
+            if idx == 0:
+                assert spans == [(97, 112), (112, 127)]
+            elif idx == 1:
+                assert spans == [(2, 45), (45, 89)]
+            elif idx == 2:
+                assert spans == [(96, 128)]
+            elif idx == 3:
+                assert spans == [(3, 90)]
+    assert seen_items == {0, 1, 2, 3}
 
 
 def test_native_fast_io_pack_rope_and_project_parity() -> None:

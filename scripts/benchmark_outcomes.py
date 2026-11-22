@@ -433,6 +433,12 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--ane-variant", default="fp16")
     p.add_argument("--kv-i8", dest="kv_i8", action="store_true", default=None)
     p.add_argument("--no-kv-i8", action="store_true", default=False)
+    p.add_argument("--kv-mode", choices=("auto", "bf16", "q8", "q4_quarot"), default=None)
+    p.add_argument(
+        "--pplx-doc-pooling",
+        choices=("single", "maxsim_1024", "maxsim_512", "top2_512"),
+        default="single",
+    )
     p.add_argument("--model-dir", default=None)
     p.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
     p.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
@@ -819,6 +825,7 @@ def _run_cat1_worker(
         # 1C: Tier-2 LongEmbed (fast-pplx / public-pplx 4K-32K)
         if tier == "tier2" and pkg_name in ("fast-pplx", "public-pplx") and not smoke:
             le_cfg = lock["datasets"]["longembed"]["tier2"]
+            doc_pooling = str(getattr(extra, "pplx_doc_pooling", "single") or "single")
             for le_sub in le_cfg["subsets"]:
                 ctx_lens = le_cfg.get("passkey_context_lengths") if le_sub == "passkey" else None
                 le_max_q = int(le_cfg.get(f"max_queries_{le_sub}", 200))
@@ -837,15 +844,68 @@ def _run_cat1_worker(
                     skipped_unjudged_by_sub[f"longembed_{le_sub}"] = unjudged_le
                 d_ids = sorted(le_pack["corpus"].keys())
                 q_vecs = _enc_q([le_pack["queries"][qid] for qid in q_ids])
-                d_vecs = _enc_d([le_pack["corpus"][did] for did in d_ids])
-                _mx_sync()
-                r_le = evaluate_retrieval_rankings(q_ids, q_vecs, d_ids, d_vecs, le_pack["qrels"], k=10)
+                if pkg_name == "fast-pplx" and doc_pooling != "single":
+                    from fast_shared.outcome_eval.retrieval import check_embedding_validity, dcg_at_k
+                    from fast_shared.retrieval_index import score_document_windows
+
+                    win_toks = 1024 if doc_pooling == "maxsim_1024" else 512
+                    agg_mode = "top2_mean" if doc_pooling == "top2_512" else "maxsim"
+                    flat_wins, doc_offsets = eng.encode_documents_multivector(
+                        [le_pack["corpus"][did] for did in d_ids],
+                        window_tokens=win_toks,
+                        context_tokens=2048,
+                        repeat_header_tokens=128,
+                        mode=eff_mode,
+                        output_dtype="float32",
+                        normalize=True,
+                    )
+                    _mx_sync()
+                    win_sims = np.asarray(q_vecs, dtype=np.float64) @ np.asarray(flat_wins, dtype=np.float64).T
+                    doc_sims = score_document_windows(win_sims, doc_offsets, agg=agg_mode)
+                    q_ok = check_embedding_validity(q_vecs, expect_unit_norm=True)
+                    d_ok = bool(np.all(check_embedding_validity(flat_wins, expect_unit_norm=True)))
+                    avail_dids = set(d_ids)
+                    eff_k = min(10, len(d_ids))
+                    per_v, per_ndcg, per_mrr, per_rec, eval_qids = [], [], [], [], []
+                    for qi, qid in enumerate(q_ids):
+                        pos = {did: float(sc) for did, sc in (le_pack["qrels"].get(qid) or {}).items() if float(sc) > 0.0}
+                        if not pos:
+                            continue
+                        eval_qids.append(qid)
+                        row_sim = doc_sims[qi]
+                        if not (bool(q_ok[qi]) and d_ok and pos.keys() <= avail_dids and bool(np.all(np.isfinite(row_sim)))):
+                            per_v.append(False)
+                            per_ndcg.append(0.0)
+                            per_mrr.append(0.0)
+                            per_rec.append(0.0)
+                            continue
+                        order = np.argsort(-row_sim, kind="mergesort")[:eff_k]
+                        rels = [pos.get(d_ids[int(di)], 0.0) for di in order]
+                        idcg = dcg_at_k(sorted(pos.values(), reverse=True), 10)
+                        per_v.append(True)
+                        per_ndcg.append((dcg_at_k(rels, 10) / idcg) if idcg > 0.0 else 0.0)
+                        per_mrr.append(next((1.0 / float(ri + 1) for ri, rv in enumerate(rels) if rv > 0.0), 0.0))
+                        per_rec.append(float(sum(1 for rv in rels if rv > 0.0)) / float(len(pos)))
+                    r_le = {
+                        "n_docs": len(d_ids),
+                        "ndcg@10": float(np.mean(per_ndcg)) if per_ndcg else 0.0,
+                        "mrr@10": float(np.mean(per_mrr)) if per_mrr else 0.0,
+                        "recall@10": float(np.mean(per_rec)) if per_rec else 0.0,
+                        "per_query_ids": eval_qids,
+                        "per_query_valid": per_v,
+                        "per_query_ndcg": per_ndcg,
+                    }
+                else:
+                    d_vecs = _enc_d([le_pack["corpus"][did] for did in d_ids])
+                    _mx_sync()
+                    r_le = evaluate_retrieval_rankings(q_ids, q_vecs, d_ids, d_vecs, le_pack["qrels"], k=10)
                 valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_le, "per_query_ndcg")
                 all_valid.extend(valid)
                 all_scores.extend(scores)
                 le_entry: dict[str, Any] = {
                     **coverage,
                     "n_docs": r_le["n_docs"],
+                    "doc_pooling": doc_pooling if pkg_name == "fast-pplx" else "single",
                     "ndcg@10": round(float(r_le["ndcg@10"]), 6),
                     "mrr@10": round(float(r_le["mrr@10"]), 6),
                     "recall@10": round(float(r_le["recall@10"]), 6),
@@ -1420,17 +1480,24 @@ def _run_llm_worker(
         from fast_qwen3.engine import FastQwen3Engine
 
         eff_mode = extra.mode or "auto"
+        qwen_kv: bool | str = (
+            extra.kv_mode
+            if extra.kv_mode is not None
+            else (False if extra.no_kv_i8 else (True if extra.kv_i8 else "auto"))
+        )
         eng = FastQwen3Engine(
             home=home,
             model_dir=extra.model_dir,
             default_mode=eff_mode,
             default_enable_thinking=False,
+            kv_i8=qwen_kv,
             local_files_only=True,
             warmup=True,
         )
         ltok = eng.tokenizer.llguidance_tokenizer()
         mtp_tag = "_mtp" if use_mtp else ""
-        eff_label = config_label or f"qwen3_{eff_mode}{mtp_tag}"
+        kv_tag = f"_{qwen_kv}" if isinstance(qwen_kv, str) and qwen_kv != "auto" else ("_kvi8" if qwen_kv is True else "")
+        eff_label = config_label or f"qwen3_{eff_mode}{kv_tag}{mtp_tag}"
     elif pkg_name == "fast-gpt-oss":
         from fast_gpt_oss.engine import FastGptOssEngine
 

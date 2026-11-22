@@ -50,9 +50,25 @@ def _import_lance() -> Any | None:
 LANCE_AVAILABLE: bool = importlib.util.find_spec("lance") is not None
 
 
+def recommended_backfill_mrl_dim(engine: Any | None, *, default_mrl_dim: int = 512) -> int | None:
+    """Return `512` only when `engine.is_mrl_trained` is True; `None` (full native dim) otherwise.
+
+    Non-MRL encoders (`FastPplx` `1024d`, `FastBgeSmall` `384d`) lose `-1.10 pp` to `-3.77 pp`
+    when truncated to `512d`, whereas full-dim symmetric `int8` is CI95-lossless (`4.0x` smaller).
+    """
+    if engine is None:
+        return int(default_mrl_dim)
+    if not bool(getattr(engine, "is_mrl_trained", False)):
+        return None
+    raw_dim = getattr(engine, "max_dim", None) or getattr(engine, "dim", None)
+    if raw_dim is not None and int(raw_dim) <= int(default_mrl_dim):
+        return None
+    return int(default_mrl_dim)
+
+
 @dataclass(frozen=True)
 class CorpusBackfillConfig:
-    """10M-document scale defaults (`d512 int8`, uncompressed vector columns, macro-window length sort)."""
+    """10M-document scale defaults (`int8` + `fp16` scale, model-aware MRL via `.for_engine()`, macro-window sort)."""
 
     dtype: str = "int8"
     mrl_dim: int | None = 512
@@ -70,6 +86,13 @@ class CorpusBackfillConfig:
     pin_non_hetero_cutoffs: bool | None = None
     non_hetero_min_batch: int = 12
     non_hetero_min_tokens: int = 1024
+
+    @classmethod
+    def for_engine(cls, engine: Any, **overrides: Any) -> CorpusBackfillConfig:
+        """Build a model-aware `CorpusBackfillConfig` (`512d int8` if MRL-trained else full-dim `int8`)."""
+        kw: dict[str, Any] = {"mrl_dim": recommended_backfill_mrl_dim(engine)}
+        kw.update(overrides)
+        return cls(**kw)
 
 
 @dataclass

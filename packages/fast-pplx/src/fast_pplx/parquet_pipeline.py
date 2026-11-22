@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import os
 from pathlib import Path
+import queue
+import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Iterator, Sequence, TypeVar
 
 import numpy as np
 import pyarrow as pa
@@ -23,9 +27,90 @@ from fast_shared.parquet_pipeline import (
 )
 
 from .config import PplxConfig
-from .tokenizer import ContextualWindow
+from .tokenizer import ContextualTokenizer, ContextualWindow
 
 _SUPPORTED_VECTOR_DTYPES = ("float32", "float16", "int8")
+_T = TypeVar("_T")
+
+
+def _prefetch_iter(it: Iterator[_T], *, max_prefetch: int = 2) -> Iterator[_T]:
+    """Yield items from a synchronous producer iterator with bounded lookahead."""
+    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=max(1, int(max_prefetch)))
+    stop_event = threading.Event()
+
+    def _producer() -> None:
+        try:
+            for item in it:
+                while not stop_event.is_set():
+                    try:
+                        q.put((True, item), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+                if stop_event.is_set():
+                    return
+            while not stop_event.is_set():
+                try:
+                    q.put((False, None), timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+        except BaseException as exc:
+            while not stop_event.is_set():
+                try:
+                    q.put((False, exc), timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+
+    worker = threading.Thread(target=_producer, daemon=True)
+    worker.start()
+    try:
+        while True:
+            ok, payload = q.get()
+            if ok:
+                yield payload
+                continue
+            if payload is not None:
+                raise payload
+            return
+    finally:
+        stop_event.set()
+        worker.join()
+
+
+class _AsyncOrderedWriter:
+    """Single-worker ordered background Parquet writer with bounded backpressure."""
+
+    def __init__(self, *, max_in_flight: int = 2) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pplx-pq-write")
+        self._pending: deque[Future[tuple[int, int]]] = deque()
+        self._max_in_flight = max(1, int(max_in_flight))
+        self.rows_written = 0
+        self.tokens_written = 0
+
+    def submit(self, fn: Callable[..., tuple[int, int]], *args: Any) -> None:
+        while self._pending and (self._pending[0].done() or len(self._pending) >= self._max_in_flight):
+            r, t = self._pending.popleft().result()
+            self.rows_written += int(r)
+            self.tokens_written += int(t)
+        self._pending.append(self._pool.submit(fn, *args))
+
+    def drain(self) -> tuple[int, int]:
+        while self._pending:
+            r, t = self._pending.popleft().result()
+            self.rows_written += int(r)
+            self.tokens_written += int(t)
+        return self.rows_written, self.tokens_written
+
+    def abort_and_close(self) -> None:
+        for fut in self._pending:
+            fut.cancel()
+        self._pool.shutdown(wait=True)
+        self._pending.clear()
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True)
 
 
 def _arrow_vector_types(dtype: str, dim: int) -> tuple[pa.DataType, pa.DataType, np.dtype[Any]]:
@@ -164,12 +249,13 @@ def embed_parquet(
 
     tmp_single = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
     single_writer: pq.ParquetWriter | None = None
-    rows_read = 0
+    rows_read_box = [0]
     rows_emitted = 0
     total_tokens = 0
     shard_idx = 0
     pending_meta: list[pa.Table] = []
     pending_toks: list[list[int]] = []
+    async_writer = _AsyncOrderedWriter(max_in_flight=2)
 
     def _encode_int8_toks(tok_lists: list[list[int]]) -> np.ndarray:
         out_mat = np.empty((len(tok_lists), target_dim), dtype=np.int8)
@@ -186,8 +272,40 @@ def embed_parquet(
         clear_mlx_arena(256)
         return out_mat
 
+    def _write_shard_sync(
+        meta_tbl: pa.Table,
+        vecs: np.ndarray,
+        tok_count: int,
+        shard_path: Path,
+        tmp_shard: Path,
+    ) -> tuple[int, int]:
+        out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
+        try:
+            with pq.ParquetWriter(tmp_shard, out_tbl.schema, compression=compression) as writer:
+                writer.write_table(out_tbl)
+            os.replace(tmp_shard, shard_path)
+        except BaseException:
+            tmp_shard.unlink(missing_ok=True)
+            raise
+        return out_tbl.num_rows, tok_count
+
+    def _write_single_sync(meta_tbl: pa.Table, vecs: np.ndarray, tok_count: int) -> tuple[int, int]:
+        nonlocal single_writer
+        out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
+        if single_writer is None:
+            single_writer = pq.ParquetWriter(tmp_single, out_tbl.schema, compression=compression)
+        single_writer.write_table(out_tbl)
+        return out_tbl.num_rows, tok_count
+
+    def _close_single_sync() -> tuple[int, int]:
+        nonlocal single_writer
+        if single_writer is not None:
+            single_writer.close()
+            single_writer = None
+        return 0, 0
+
     def _flush_shard(meta_tbl: pa.Table, tok_slice: list[list[int]]) -> None:
-        nonlocal shard_idx, rows_emitted, total_tokens
+        nonlocal shard_idx
         shard_path = out_p / f"part-{shard_idx:05d}.parquet"
         tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
         shard_idx += 1
@@ -198,16 +316,8 @@ def embed_parquet(
             except Exception:
                 pass
         vecs = _encode_int8_toks(tok_slice)
-        out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
-        try:
-            with pq.ParquetWriter(tmp_shard, out_tbl.schema, compression=compression) as writer:
-                writer.write_table(out_tbl)
-            os.replace(tmp_shard, shard_path)
-        except BaseException:
-            tmp_shard.unlink(missing_ok=True)
-            raise
-        rows_emitted += len(tok_slice)
-        total_tokens += sum(len(t) for t in tok_slice)
+        tok_cnt = sum(len(t) for t in tok_slice)
+        async_writer.submit(_write_shard_sync, meta_tbl, vecs, tok_cnt, shard_path, tmp_shard)
 
     def _drain_pending(final: bool = False) -> None:
         nonlocal pending_meta, pending_toks
@@ -232,16 +342,16 @@ def embed_parquet(
                 pending_meta = [cur_meta]
                 pending_toks = cur_toks
 
-    try:
+    def _iter_prepared_batches() -> Iterator[tuple[pa.Table, list[list[int]]]]:
         for fpath in files:
             pf = pq.ParquetFile(fpath)
             avail = [c for c in read_cols if c in pf.schema_arrow.names]
             for rb in pf.iter_batches(batch_size=max(1, int(batch_rows)), columns=avail):
-                if limit is not None and rows_read >= int(limit):
-                    break
-                if limit is not None and rows_read + rb.num_rows > int(limit):
-                    rb = rb.slice(0, max(0, int(limit) - rows_read))
-                rows_read += rb.num_rows
+                if limit is not None and rows_read_box[0] >= int(limit):
+                    return
+                if limit is not None and rows_read_box[0] + rb.num_rows > int(limit):
+                    rb = rb.slice(0, max(0, int(limit) - rows_read_box[0]))
+                rows_read_box[0] += rb.num_rows
                 py_rows = rb.to_pylist()
                 keep_idx: list[int] = []
                 texts: list[str] = []
@@ -264,27 +374,25 @@ def embed_parquet(
                 sub_rb = rb.take(keep_idx)
                 meta_tbl = pa.Table.from_batches([sub_rb]).select([c for c in keep_names if c in sub_rb.schema.names])
                 tok_lists = tokenizer.encode_batch(texts, prefix=eff_prefix, max_length=eff_max_len)
-                if single_file_mode:
-                    vecs = _encode_int8_toks(tok_lists)
-                    out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
-                    if single_writer is None:
-                        single_writer = pq.ParquetWriter(tmp_single, out_tbl.schema, compression=compression)
-                    single_writer.write_table(out_tbl)
-                    rows_emitted += len(tok_lists)
-                    total_tokens += sum(len(t) for t in tok_lists)
-                else:
-                    pending_meta.append(meta_tbl)
-                    pending_toks.extend(tok_lists)
-                    _drain_pending(final=False)
-            if limit is not None and rows_read >= int(limit):
-                break
+                yield meta_tbl, tok_lists
+
+    try:
+        for meta_tbl, tok_lists in _prefetch_iter(_iter_prepared_batches(), max_prefetch=2):
+            if single_file_mode:
+                vecs = _encode_int8_toks(tok_lists)
+                tok_cnt = sum(len(t) for t in tok_lists)
+                async_writer.submit(_write_single_sync, meta_tbl, vecs, tok_cnt)
+            else:
+                pending_meta.append(meta_tbl)
+                pending_toks.extend(tok_lists)
+                _drain_pending(final=False)
 
         if not single_file_mode:
             _drain_pending(final=True)
+            rows_emitted, total_tokens = async_writer.drain()
         else:
-            if single_writer is not None:
-                single_writer.close()
-                single_writer = None
+            async_writer.submit(_close_single_sync)
+            rows_emitted, total_tokens = async_writer.drain()
             if tmp_single is not None and tmp_single.exists():
                 os.replace(tmp_single, out_p)
             else:
@@ -292,7 +400,11 @@ def embed_parquet(
                     [f for f in first_schema if f.name in keep_names] + [pa.field("vector", pa_vec_type)]
                 )
                 pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_p, compression=compression)
+    except BaseException:
+        async_writer.abort_and_close()
+        raise
     finally:
+        async_writer.close()
         if single_writer is not None:
             single_writer.close()
         if tmp_single is not None and tmp_single.exists():
@@ -300,7 +412,7 @@ def embed_parquet(
 
     return ParquetEmbedSummary(
         input_files=len(files),
-        rows_read=rows_read,
+        rows_read=rows_read_box[0],
         rows_emitted=rows_emitted,
         total_tokens=total_tokens,
         elapsed_seconds=time.perf_counter() - t0,
@@ -326,7 +438,7 @@ def embed_contextual_parquet(
     mode: str | None = None,
     dtype: str = "float32",
     batch_rows: int = 256,
-    encode_batch_windows: int = 16,
+    encode_batch_windows: int = 64,
     encode_batch_rows: int | None = None,
     shard_rows: int = 65536,
     filter_ocr: bool = False,
@@ -429,12 +541,28 @@ def embed_contextual_parquet(
     eff_normalize = False if dtype == "int8" else bool(normalize)
 
     tmp_single = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
-    single_writer: pq.ParquetWriter | None = None
+    single_writer_box: list[pq.ParquetWriter | None] = [None]
+    shard_writer_box: list[pq.ParquetWriter | None] = [None]
+    shard_tmp_box: list[Path | None] = [None]
     shard_idx = 0
-    rows_read = 0
+    rows_read_box = [0]
     rows_emitted = 0
     total_tokens = 0
     wave_num = 0
+    async_writer = _AsyncOrderedWriter(max_in_flight=2)
+    encode_ctx_toks_fn = getattr(engine, "encode_contextual_tokens", None)
+    eff_max_len = getattr(engine, "max_seq_len", None)
+    plan_max_workers = min(4, max(1, os.cpu_count() or 1)) if isinstance(tokenizer, ContextualTokenizer) else 1
+    plan_pool = (
+        ThreadPoolExecutor(max_workers=plan_max_workers, thread_name_prefix="pplx-pq-plan")
+        if plan_max_workers > 1
+        else None
+    )
+    tok_pool = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="pplx-pq-tok")
+        if callable(encode_ctx_toks_fn)
+        else None
+    )
 
     # Pending prepared windows (bounded to <= shard_rows in sharded mode or flushed per batch in single-file mode).
     eff_header_text = header_text.strip() if (header_text is not None and header_text.strip()) else None
@@ -501,92 +629,171 @@ def embed_contextual_parquet(
         arrays.append(_make_vector_column(stacked, dim=target_dim, dtype=dtype))
         return pa.Table.from_arrays(arrays, schema=out_schema)
 
-    def _encode_entries(
-        entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
-    ) -> tuple[list[np.ndarray], int]:
-        win_chunks = [e[2].chunks for e in entries]
-        win_vecs: list[np.ndarray] = []
-        tok_count = 0
-        encode_ctx_toks_fn = getattr(engine, "encode_contextual_tokens", None)
-        eff_max_len = getattr(engine, "max_seq_len", None)
-        for st in range(0, len(win_chunks), eff_window_batch):
-            sub = win_chunks[st : st + eff_window_batch]
-            enc_kw: dict[str, Any] = {
-                "dimensions": target_dim,
-                "output_dtype": dtype,
-                "normalize": eff_normalize,
-            }
-            if mode is not None:
-                enc_kw["mode"] = mode
-            if callable(encode_ctx_toks_fn):
-                encoded_sub = [
-                    tokenizer.encode_contextual_document(chunks_w, return_spans=True, max_length=eff_max_len)
-                    for chunks_w in sub
-                ]
-                tok_count += sum(len(ids) for ids, _ in encoded_sub)
-                win_vecs.extend(encode_ctx_toks_fn(encoded_sub, **enc_kw))
-            else:
-                win_vecs.extend(engine.encode_contextual_chunks(sub, **enc_kw))
-                tok_count += sum(len(chunks_w) for chunks_w in sub)
-        clear_mlx_arena(256)
-        return win_vecs, tok_count
+    def _encode_ctx_window(chunks_w: Sequence[str]) -> tuple[list[int], list[tuple[int, int]]]:
+        return tokenizer.encode_contextual_document(
+            chunks_w,
+            return_spans=True,
+            max_length=eff_max_len,
+        )
 
-    def _flush_wave(entries: list[tuple[dict[str, Any], int, ContextualWindow]]) -> None:
-        nonlocal single_writer, shard_idx, rows_emitted, total_tokens, wave_num
+    def _prepare_sub(
+        entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
+    ) -> tuple[bool, Any, int]:
+        win_chunks = [e[2].chunks for e in entries]
+        if callable(encode_ctx_toks_fn):
+            if plan_pool is not None and len(win_chunks) >= 8:
+                encoded_sub = list(plan_pool.map(_encode_ctx_window, win_chunks))
+            else:
+                encoded_sub = [_encode_ctx_window(chunks_w) for chunks_w in win_chunks]
+            tok_cnt = sum(len(ids) for ids, _ in encoded_sub)
+            return True, encoded_sub, tok_cnt
+        tok_cnt = sum(len(chunks_w) for chunks_w in win_chunks)
+        return False, win_chunks, tok_cnt
+
+    def _encode_prepared_sub(prepared: tuple[bool, Any, int]) -> tuple[list[np.ndarray], int]:
+        is_toks, payload, tok_cnt = prepared
+        enc_kw: dict[str, Any] = {
+            "dimensions": target_dim,
+            "output_dtype": dtype,
+            "normalize": eff_normalize,
+        }
+        if mode is not None:
+            enc_kw["mode"] = mode
+        if is_toks:
+            win_vecs = list(encode_ctx_toks_fn(payload, **enc_kw))
+        else:
+            win_vecs = list(engine.encode_contextual_chunks(payload, **enc_kw))
+        clear_mlx_arena(256)
+        return win_vecs, tok_cnt
+
+    def _write_single_wave_sync(
+        entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
+        win_vecs: Sequence[np.ndarray],
+        tok_cnt: int,
+    ) -> tuple[int, int]:
+        tbl = _build_wave_table(entries, win_vecs)
+        if single_writer_box[0] is None:
+            single_writer_box[0] = pq.ParquetWriter(tmp_single, out_schema, compression=compression)
+        single_writer_box[0].write_table(tbl)
+        return tbl.num_rows, tok_cnt
+
+    def _close_single_sync() -> tuple[int, int]:
+        if single_writer_box[0] is not None:
+            single_writer_box[0].close()
+            single_writer_box[0] = None
+        return 0, 0
+
+    def _write_shard_sub_sync(
+        sub_entries: Sequence[tuple[dict[str, Any], int, ContextualWindow]],
+        win_vecs: Sequence[np.ndarray],
+        tok_cnt: int,
+        tmp_shard: Path,
+        finalize_shard_path: Path | None,
+    ) -> tuple[int, int]:
+        tbl = _build_wave_table(sub_entries, win_vecs)
+        try:
+            if shard_writer_box[0] is None:
+                shard_tmp_box[0] = tmp_shard
+                shard_writer_box[0] = pq.ParquetWriter(tmp_shard, out_schema, compression=compression)
+            shard_writer_box[0].write_table(tbl)
+            if finalize_shard_path is not None:
+                shard_writer_box[0].close()
+                shard_writer_box[0] = None
+                os.replace(tmp_shard, finalize_shard_path)
+                shard_tmp_box[0] = None
+        except BaseException:
+            if shard_writer_box[0] is not None:
+                shard_writer_box[0].close()
+                shard_writer_box[0] = None
+            tmp_shard.unlink(missing_ok=True)
+            shard_tmp_box[0] = None
+            raise
+        return tbl.num_rows, tok_cnt
+
+    def _log_progress(progress_chunks: int, progress_tokens: int) -> None:
+        if progress_every > 0 and (wave_num % progress_every == 0):
+            dt = time.perf_counter() - t0
+            print(
+                f"[contextual parquet wave {wave_num}] chunks={progress_chunks:,} toks={progress_tokens:,} "
+                f"elapsed={dt:.2f}s ({progress_tokens / max(dt, 1e-9):,.0f} tok/s)",
+                flush=True,
+            )
+
+    progress_chunks = 0
+    progress_tokens = 0
+
+    def _flush_shard_wave(entries: list[tuple[dict[str, Any], int, ContextualWindow]]) -> None:
+        nonlocal shard_idx, wave_num, progress_chunks, progress_tokens
         if not entries:
             return
         n_chunks_wave = sum(len(e[2].spans) for e in entries)
         wave_num += 1
-
-        if single_file_mode:
-            win_vecs, tok_cnt = _encode_entries(entries)
-            tbl = _build_wave_table(entries, win_vecs)
-            if single_writer is None:
-                single_writer = pq.ParquetWriter(tmp_single, out_schema, compression=compression)
-            single_writer.write_table(tbl)
-            rows_emitted += n_chunks_wave
-            total_tokens += tok_cnt
-        else:
-            shard_path = out_p / f"part-{shard_idx:05d}.parquet"
-            tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
-            shard_idx += 1
-            if resume and shard_path.exists():
-                try:
-                    if pq.ParquetFile(shard_path).metadata.num_rows == n_chunks_wave:
-                        return
-                except Exception:
-                    pass
+        shard_path = out_p / f"part-{shard_idx:05d}.parquet"
+        tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
+        shard_idx += 1
+        if resume and shard_path.exists():
             try:
-                with pq.ParquetWriter(tmp_shard, out_schema, compression=compression) as writer:
-                    for st in range(0, len(entries), eff_window_batch):
-                        sub_entries = entries[st : st + eff_window_batch]
-                        win_vecs, tok_cnt = _encode_entries(sub_entries)
-                        writer.write_table(_build_wave_table(sub_entries, win_vecs))
-                        rows_emitted += sum(len(e[2].spans) for e in sub_entries)
-                        total_tokens += tok_cnt
-                os.replace(tmp_shard, shard_path)
-            except BaseException:
-                tmp_shard.unlink(missing_ok=True)
-                raise
-
-        if progress_every > 0 and (wave_num % progress_every == 0):
-            dt = time.perf_counter() - t0
-            print(
-                f"[contextual parquet wave {wave_num}] chunks={rows_emitted:,} toks={total_tokens:,} "
-                f"elapsed={dt:.2f}s ({total_tokens / max(dt, 1e-9):,.0f} tok/s)",
-                flush=True,
+                if pq.ParquetFile(shard_path).metadata.num_rows == n_chunks_wave:
+                    return
+            except Exception:
+                pass
+        subs = [entries[st : st + eff_window_batch] for st in range(0, len(entries), eff_window_batch)]
+        cur_fut: Future[tuple[bool, Any, int]] | None = (
+            tok_pool.submit(_prepare_sub, subs[0]) if tok_pool is not None else None
+        )
+        for i, sub in enumerate(subs):
+            prepared = cur_fut.result() if cur_fut is not None else _prepare_sub(sub)
+            cur_fut = (
+                tok_pool.submit(_prepare_sub, subs[i + 1])
+                if (tok_pool is not None and i + 1 < len(subs))
+                else None
             )
+            win_vecs, tok_cnt = _encode_prepared_sub(prepared)
+            finalize_path = shard_path if i + 1 == len(subs) else None
+            async_writer.submit(_write_shard_sub_sync, sub, win_vecs, tok_cnt, tmp_shard, finalize_path)
+            progress_chunks += sum(len(e[2].spans) for e in sub)
+            progress_tokens += tok_cnt
+        _log_progress(progress_chunks, progress_tokens)
 
-    try:
+    plan_fn = getattr(tokenizer, "plan_contextual_windows", None)
+
+    def _plan_one_doc(args: tuple[str, str | None, int | None]) -> list[ContextualWindow]:
+        doc_input, row_hdr_opt, row_rep = args
+        if callable(plan_fn):
+            return plan_fn(
+                doc_input,
+                chunk_tokens=int(chunk_tokens),
+                context_tokens=int(context_tokens),
+                overlap=int(overlap),
+                header_text=row_hdr_opt,
+                repeat_header_tokens=row_rep,
+                window_overlap_chunks=int(window_overlap_chunks),
+            )
+        return [
+            ContextualWindow(chunks=c_w, spans=s_w, emit_start=0)
+            for c_w, s_w in tokenizer.chunk_and_group_document(
+                doc_input,
+                chunk_tokens=int(chunk_tokens),
+                context_tokens=int(context_tokens),
+                overlap=int(overlap),
+                header_text=row_hdr_opt,
+                repeat_header_tokens=row_rep,
+            )
+        ]
+
+    def _iter_planned_docs() -> Iterator[tuple[dict[str, Any], list[ContextualWindow]]]:
         for fpath in files:
             pf = pq.ParquetFile(fpath)
             avail_cols = [c for c in cols_to_read if c in pf.schema_arrow.names]
             for rb in pf.iter_batches(batch_size=max(1, int(batch_rows)), columns=avail_cols):
                 py_rows = rb.to_pylist()
+                staged: list[tuple[dict[str, Any], tuple[str, str | None, int | None] | None]] = []
+                plan_indices: list[int] = []
+                plan_args: list[tuple[str, str | None, int | None]] = []
                 for r in py_rows:
-                    if limit is not None and rows_read >= int(limit):
+                    if limit is not None and rows_read_box[0] >= int(limit):
                         break
-                    rows_read += 1
+                    rows_read_box[0] += 1
                     if filter_ocr:
                         is_ocr = bool(r.get("is_ocr"))
                         ocr_p = r.get("ocr_pages")
@@ -599,10 +806,11 @@ def embed_contextual_parquet(
                         if skip_empty:
                             continue
                         raw_text = ""
+                    meta_row = {k: r.get(k) for k in keep_names}
                     if not raw_text.strip():
                         if skip_empty:
                             continue
-                        grouped = [ContextualWindow(chunks=[""], spans=[(0, 0)], emit_start=0)]
+                        staged.append((meta_row, None))
                     else:
                         doc_input = (eff_prefix + raw_text) if eff_prefix else raw_text
                         raw_hdr = r.get(eff_header_col) if eff_header_col is not None else eff_header_text
@@ -615,71 +823,113 @@ def embed_contextual_parquet(
                             if repeat_header_tokens is not None
                             else (None if row_hdr_opt is not None else default_repeat_tokens)
                         )
-                        plan_fn = getattr(tokenizer, "plan_contextual_windows", None)
-                        if callable(plan_fn):
-                            grouped = plan_fn(
-                                doc_input,
-                                chunk_tokens=int(chunk_tokens),
-                                context_tokens=int(context_tokens),
-                                overlap=int(overlap),
-                                header_text=row_hdr_opt,
-                                repeat_header_tokens=row_rep,
-                                window_overlap_chunks=int(window_overlap_chunks),
-                            )
+                        plan_indices.append(len(staged))
+                        args = (doc_input, row_hdr_opt, row_rep)
+                        plan_args.append(args)
+                        staged.append((meta_row, args))
+
+                if staged:
+                    if plan_pool is not None and len(plan_args) >= 4:
+                        planned_list = list(plan_pool.map(_plan_one_doc, plan_args))
+                    else:
+                        planned_list = [_plan_one_doc(a) for a in plan_args]
+                    planned_by_pos = dict(zip(plan_indices, planned_list, strict=True))
+                    for pos, (meta_row, maybe_args) in enumerate(staged):
+                        if maybe_args is None:
+                            grouped = [ContextualWindow(chunks=[""], spans=[(0, 0)], emit_start=0)]
                         else:
-                            grouped = [
-                                ContextualWindow(chunks=c_w, spans=s_w, emit_start=0)
-                                for c_w, s_w in tokenizer.chunk_and_group_document(
-                                    doc_input,
-                                    chunk_tokens=int(chunk_tokens),
-                                    context_tokens=int(context_tokens),
-                                    overlap=int(overlap),
-                                    header_text=row_hdr_opt,
-                                    repeat_header_tokens=row_rep,
-                                )
-                            ]
-                        if not grouped:
-                            continue
+                            grouped = planned_by_pos[pos]
+                        if grouped:
+                            yield meta_row, grouped
 
-                    meta_row = {k: r.get(k) for k in keep_names}
-                    for w_idx, win in enumerate(grouped):
-                        pending_windows.append((meta_row, w_idx, win))
-                        pending_chunk_count += len(win.spans)
-                        if single_file_mode and len(pending_windows) >= eff_window_batch:
-                            _flush_wave(pending_windows)
-                            pending_windows = []
-                            pending_chunk_count = 0
-                        elif not single_file_mode and pending_chunk_count >= int(shard_rows):
-                            _flush_wave(pending_windows)
-                            pending_windows = []
-                            pending_chunk_count = 0
-                if limit is not None and rows_read >= int(limit):
-                    break
-            if limit is not None and rows_read >= int(limit):
-                break
+                if limit is not None and rows_read_box[0] >= int(limit):
+                    return
 
+    def _iter_single_waves() -> Iterator[list[tuple[dict[str, Any], int, ContextualWindow]]]:
+        nonlocal pending_windows, pending_chunk_count
+        for meta_row, grouped in _prefetch_iter(_iter_planned_docs(), max_prefetch=2):
+            for w_idx, win in enumerate(grouped):
+                pending_windows.append((meta_row, w_idx, win))
+                pending_chunk_count += len(win.spans)
+                if len(pending_windows) >= eff_window_batch:
+                    wave = pending_windows
+                    pending_windows = []
+                    pending_chunk_count = 0
+                    yield wave
         if pending_windows:
-            _flush_wave(pending_windows)
+            wave = pending_windows
             pending_windows = []
             pending_chunk_count = 0
+            yield wave
 
-        if single_file_mode:
-            if single_writer is not None:
-                single_writer.close()
-                single_writer = None
+    try:
+        if not single_file_mode:
+            for meta_row, grouped in _prefetch_iter(_iter_planned_docs(), max_prefetch=2):
+                for w_idx, win in enumerate(grouped):
+                    pending_windows.append((meta_row, w_idx, win))
+                    pending_chunk_count += len(win.spans)
+                    if pending_chunk_count >= int(shard_rows):
+                        _flush_shard_wave(pending_windows)
+                        pending_windows = []
+                        pending_chunk_count = 0
+            if pending_windows:
+                _flush_shard_wave(pending_windows)
+                pending_windows = []
+                pending_chunk_count = 0
+            rows_emitted, total_tokens = async_writer.drain()
+        else:
+            wave_iter = _iter_single_waves()
+            cur_wave = next(wave_iter, None)
+            cur_fut: Future[tuple[bool, Any, int]] | None = (
+                tok_pool.submit(_prepare_sub, cur_wave)
+                if (cur_wave is not None and tok_pool is not None)
+                else None
+            )
+            while cur_wave is not None:
+                wave_num += 1
+                next_wave = next(wave_iter, None)
+                prepared = cur_fut.result() if cur_fut is not None else _prepare_sub(cur_wave)
+                next_fut = (
+                    tok_pool.submit(_prepare_sub, next_wave)
+                    if (next_wave is not None and tok_pool is not None)
+                    else None
+                )
+                win_vecs, tok_cnt = _encode_prepared_sub(prepared)
+                async_writer.submit(_write_single_wave_sync, cur_wave, win_vecs, tok_cnt)
+                progress_chunks += sum(len(e[2].spans) for e in cur_wave)
+                progress_tokens += tok_cnt
+                _log_progress(progress_chunks, progress_tokens)
+                cur_wave = next_wave
+                cur_fut = next_fut
+            async_writer.submit(_close_single_sync)
+            rows_emitted, total_tokens = async_writer.drain()
             if tmp_single is not None and tmp_single.exists():
                 os.replace(tmp_single, out_p)
             else:
                 pq.write_table(pa.Table.from_pylist([], schema=out_schema), out_p, compression=compression)
+    except BaseException:
+        async_writer.abort_and_close()
+        raise
     finally:
-        if single_writer is not None:
-            single_writer.close()
+        if plan_pool is not None:
+            plan_pool.shutdown(wait=True)
+        if tok_pool is not None:
+            tok_pool.shutdown(wait=True)
+        async_writer.close()
+        if single_writer_box[0] is not None:
+            single_writer_box[0].close()
+            single_writer_box[0] = None
+        if shard_writer_box[0] is not None:
+            shard_writer_box[0].close()
+            shard_writer_box[0] = None
+        if shard_tmp_box[0] is not None and shard_tmp_box[0].exists():
+            shard_tmp_box[0].unlink(missing_ok=True)
         if tmp_single is not None and tmp_single.exists():
             tmp_single.unlink(missing_ok=True)
 
     return ParquetEmbedSummary(
         input_files=len(files),
-        rows_read=rows_read,
+        rows_read=rows_read_box[0],
         rows_emitted=rows_emitted,
         total_tokens=total_tokens,
         elapsed_seconds=time.perf_counter() - t0,

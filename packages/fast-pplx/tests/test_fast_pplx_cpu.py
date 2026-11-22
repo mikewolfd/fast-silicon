@@ -1621,3 +1621,388 @@ def test_contextual_window_anchoring_overlap_and_parquet_1to1(
     assert captured["header_col"] == "title"
     assert captured["repeat_header_tokens"] == 96
     assert captured["window_overlap_chunks"] == 1
+
+
+def test_multivector_maxsim_and_build_index_cpu(tmp_path: Path) -> None:
+    """Verify `FastPplx.is_mrl_trained=False`, `encode_documents_multivector`, and `build_index` (`int8` & `binary_int8`)."""
+    from fast_pplx import FastPplx
+    from fast_shared.parquet_pipeline import CorpusBackfillConfig
+
+    tok_json = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_json, DEFAULT_PPLX_CONFIG)
+
+    class _MockNeedleGPU:
+        max_seq_len = 32768
+
+        def encode_tokens(self, token_lists, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
+            d = dimensions or 1024
+            out = np.zeros((len(token_lists), d), dtype=np.float32)
+            for i, ids in enumerate(token_lists):
+                # Needle token 8 ("two") aligns along dim 1; filler aligns along dim 0
+                out[i, 1 if 8 in ids else 0] = 1.0
+                out[i, 2] = 0.05 * float((i % 7) + 1)
+            if normalize:
+                out /= np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+            return out
+
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
+            d = dimensions or 1024
+            out = []
+            for ids, spans in docs:
+                mat = np.zeros((len(spans), d), dtype=np.float32)
+                for j, (s, e) in enumerate(spans):
+                    seg = ids[s:e]
+                    mat[j, 1 if 8 in seg else 0] = 1.0
+                    mat[j, 3] = 0.02 * float(j + 1)
+                if normalize and len(spans) > 0:
+                    mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
+                out.append(mat)
+            return out
+
+        def close(self):
+            pass
+
+    docs = [
+        " ".join(["hello world chunk one"] * 8),
+        " ".join(["hello world chunk one"] * 6) + " chunk two hello world",  # needle buried at tail!
+        " ".join(["chunk one hello world"] * 7),
+    ]
+    with FastPplx(home=tmp_path, mode="gpu", _gpu_backend=_MockNeedleGPU(), _tokenizer=tok) as eng:
+        assert eng.is_mrl_trained is False
+        assert eng.max_dim == 1024
+        cfg_bf = CorpusBackfillConfig.for_engine(eng)
+        assert cfg_bf.mrl_dim is None and cfg_bf.dtype == "int8"
+
+        flat_16, offsets_16 = eng.encode_documents_multivector(
+            docs, window_tokens=16, context_tokens=256, repeat_header_tokens=4
+        )
+        assert flat_16.ndim == 2 and flat_16.shape[1] == 1024
+        assert offsets_16[0] == 0 and offsets_16[-1] == flat_16.shape[0]
+        assert int(offsets_16[2] - offsets_16[1]) >= 2  # multi-window long doc
+
+        idx_mv = eng.build_index(
+            docs,
+            multivector=True,
+            window_tokens=16,
+            context_tokens=256,
+            repeat_header_tokens=4,
+            mode="auto",
+        )
+        assert idx_mv.mode == "int8" and idx_mv.dim == 1024 and idx_mv.doc_offsets is not None
+        q_vec = eng.encode_queries(["chunk two"], mode="gpu")
+        top_idx, top_sc = idx_mv.search(q_vec, k=2, agg="maxsim")
+        assert top_idx.shape == (1, 2) and top_sc.shape == (1, 2)
+        assert int(top_idx[0, 0]) == 1
+
+        idx_bin = eng.build_index(docs, mode="binary_int8")
+        assert idx_bin.mode == "binary_int8" and idx_bin.binary_u8 is not None
+        top_idx_bin, _ = idx_bin.search(q_vec, k=2, rerank_top_r=3)
+        assert int(top_idx_bin[0, 0]) == 1
+
+        idx_bin_mv = eng.build_index(
+            docs,
+            multivector=True,
+            window_tokens=16,
+            context_tokens=256,
+            repeat_header_tokens=4,
+            mode="binary_int8",
+        )
+        assert idx_bin_mv.mode == "binary_int8"
+        assert idx_bin_mv.binary_u8 is not None and idx_bin_mv.doc_offsets is not None
+        top_idx_bmv, top_sc_bmv = idx_bin_mv.search(q_vec, k=2, agg="maxsim", rerank_top_r=3)
+        assert top_idx_bmv.shape == (1, 2) and top_sc_bmv.shape == (1, 2)
+        assert int(top_idx_bmv[0, 0]) == 1
+
+
+def test_resolve_hetero_schedule_m4_vs_m5_apple10() -> None:
+    from fast_pplx.engine import resolve_hetero_schedule
+
+    m4 = resolve_hetero_schedule(is_apple10=False, batch_size=4, pipe_depth=4)
+    m5 = resolve_hetero_schedule(is_apple10=True, batch_size=4, pipe_depth=4)
+    assert m4 == (8, 4, 4, 1, 2)
+    assert m5 == (6, 4, 16, 2, 3)
+
+    m5_small = resolve_hetero_schedule(is_apple10=True, batch_size=1, pipe_depth=2)
+    assert m5_small[0] >= 4 and m5_small[1] == 2 and m5_small[2] >= 16
+
+
+def test_prepare_batch_inputs_and_mask_uniform_and_wave_cap() -> None:
+    from fast_pplx.gpu import FastPplxGPU
+
+    class _DummyTokenizer:
+        def pad(self, rows):
+            mx_len = max((len(r) for r in rows), default=0)
+            arr = np.zeros((len(rows), mx_len), dtype=np.int32)
+            mask = np.zeros((len(rows), mx_len), dtype=np.uint8)
+            for i, r in enumerate(rows):
+                if r:
+                    arr[i, : len(r)] = r
+                    mask[i, : len(r)] = 1
+            return arr, mask
+
+    class _PrepSpy(FastPplxGPU):
+        def __init__(self) -> None:
+            self.tokenizer = _DummyTokenizer()
+            self.embed_weight = None
+            self.layer_head_dims = (64, 64)
+            self.quantize_weights = "none"
+            self.dim = 8
+            self.max_batch_size = 64
+            self.max_seq_len = 32768
+            self.model = SimpleNamespace(contextual_projection=lambda x: x)
+
+        def _forward_contextual_embeddings(self, hidden: mx.array, attention_mask: mx.array | None):
+            return hidden
+
+    spy = _PrepSpy()
+    arr_u, mask_u = spy._prepare_batch_inputs_and_mask([[1, 2, 3], [4, 5, 6]])
+    assert mask_u is None
+    assert arr_u.dtype == np.int32 and arr_u.shape == (2, 3)
+
+    arr_r, mask_r = spy._prepare_batch_inputs_and_mask([[1, 2], [3, 4, 5]])
+    assert mask_r is not None
+    assert arr_r.shape == (2, 3) and mask_r.tolist() == [[1, 1, 0], [1, 1, 1]]
+
+    # Empty uniform rows must still take the masked path cleanly.
+    arr_e, mask_e = spy._prepare_batch_inputs_and_mask([[], []])
+    assert arr_e.shape == (2, 0) and mask_e is not None
+
+    hidden = mx.array(np.arange(2 * 4 * 8, dtype=np.float32).reshape(2, 4, 8))
+    pooled_none = np.asarray(FastPplxGPU._project_mean_pool(spy, hidden, None))
+    pooled_ones = np.asarray(
+        FastPplxGPU._project_mean_pool(spy, hidden, np.ones((2, 4), dtype=np.uint8))
+    )
+    assert np.max(np.abs(pooled_none - pooled_ones)) < 1e-6
+
+    # Verify uniform 2048-token batch caps effective GPU sub-batch to 8192 // 2048 == 4.
+    seen_wave_sizes: list[int] = []
+
+    class _WaveCapGPU(_PrepSpy):
+        def forward_hidden(self, input_ids: np.ndarray, attention_mask: np.ndarray | None = None, **kwargs):
+            seen_wave_sizes.append(int(input_ids.shape[0]))
+            assert attention_mask is None
+            return mx.ones((input_ids.shape[0], input_ids.shape[1], 8), dtype=mx.float16)
+
+        def _project_mean_pool(self, hidden: mx.array, attention_mask: np.ndarray | None = None) -> np.ndarray:
+            return np.asarray(mx.mean(hidden, axis=1), dtype=np.float32)
+
+    wave_spy = _WaveCapGPU()
+    uniform_rows = [[5] * 2048 for _ in range(9)]
+    out = wave_spy.encode_tokens(uniform_rows, batch_size=16, output_dtype="float32", normalize=False)
+    assert out.shape == (9, 8)
+    assert seen_wave_sizes == [4, 4, 1]
+
+
+def test_pplx_attention_qk_norm_rope_and_w8_quantization_parity() -> None:
+    import mlx.nn as nn
+    from fast_pplx.gpu import PplxModel, _quantize_pplx_linear_weights
+
+    args = build_parser().parse_args(["verify", "--quantize-weights", "w8"])
+    assert args.quantize_weights == "w8"
+
+    cfg = PplxConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        partial_rotary_factor=0.25,
+        rope_dim=16,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        vocab_size=64,
+        embedding_dim=128,
+        layer_types=("linear_attention", "full_attention"),
+    )
+    mx.random.seed(7)
+    model_fp16 = PplxModel(cfg, has_embed_module=False)
+    model_fp16.set_dtype(mx.float16)
+    model_w8 = PplxModel(cfg, has_embed_module=False)
+    model_w8.set_dtype(mx.float16)
+    model_w8.update(model_fp16.parameters())
+    mx.eval(model_fp16.parameters(), model_w8.parameters())
+
+    _quantize_pplx_linear_weights(model_w8)
+    assert isinstance(model_w8.layers[1].self_attn.qkv_proj, nn.QuantizedLinear)
+    assert isinstance(model_w8.contextual_projection, nn.Linear)
+    assert not isinstance(model_w8.contextual_projection, nn.QuantizedLinear)
+
+    x_h = mx.array(np.random.default_rng(11).normal(size=(2, 16, 128)).astype(np.float16))
+    y_fp16 = model_fp16.contextual_projection(mx.mean(model_fp16.forward_hidden(x_h).astype(mx.float32), axis=1))
+    y_w8 = model_w8.contextual_projection(mx.mean(model_w8.forward_hidden(x_h).astype(mx.float32), axis=1))
+    mx.eval(y_fp16, y_w8)
+    a = np.asarray(y_fp16, dtype=np.float32).reshape(-1)
+    b = np.asarray(y_w8, dtype=np.float32).reshape(-1)
+    cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert cos >= 0.999
+
+
+def test_parquet_async_pipeline_multivector_and_tmp_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.parquet_pipeline import embed_contextual_parquet
+
+    sig = inspect.signature(embed_contextual_parquet)
+    assert sig.parameters["encode_batch_windows"].default == 64
+
+    tok_path = _write_synthetic_tokenizer(tmp_path)
+    tok = ContextualTokenizer(tok_path)
+
+    class _DetEngine:
+        max_dim = 8
+        dim = 8
+        max_seq_len = 64
+
+        def __init__(self) -> None:
+            self.tokenizer = tok
+
+        def encode_corpus(self, tok_lists, *, dimensions=None, output_dtype="int8", normalize=False, mode=None):
+            d = dimensions or 8
+            out = np.zeros((len(tok_lists), d), dtype=np.int8)
+            for i, ids in enumerate(tok_lists):
+                out[i, 0] = np.int8(min(120, len(ids)))
+                out[i, 1] = np.int8(sum(ids) % 97)
+            return out
+
+        def encode_contextual_tokens(self, docs, *, dimensions=None, output_dtype="float32", normalize=True, mode=None):
+            d = dimensions or 8
+            out = []
+            for ids, spans in docs:
+                mat = np.zeros((len(spans), d), dtype=np.float32)
+                for j, (s, e) in enumerate(spans):
+                    mat[j, 0] = float(len(ids[s:e]))
+                    mat[j, 1] = float(ids[s] if s < len(ids) else 0)
+                out.append(mat)
+            return out
+
+    in_pq = tmp_path / "in.parquet"
+    rows = [{"doc_id": i, "text": f"hello world chunk {'one ' * ((i % 4) + 1)}two"} for i in range(10)]
+    pq.write_table(pa.Table.from_pylist(rows), in_pq)
+
+    eng = _DetEngine()
+    ctx_single = tmp_path / "ctx_single.parquet"
+    s1 = embed_contextual_parquet(
+        eng,
+        in_pq,
+        ctx_single,
+        chunk_tokens=4,
+        context_tokens=32,
+        overlap=1,
+        repeat_header_tokens=0,
+        encode_batch_windows=3,
+        batch_rows=4,
+        dtype="float32",
+        normalize=False,
+    )
+    assert s1.rows_read == 10 and s1.rows_emitted > 0
+    tbl_s = pq.read_table(ctx_single)
+    assert tbl_s["doc_id"].to_pylist() == sorted(tbl_s["doc_id"].to_pylist())
+
+    ctx_dir = tmp_path / "ctx_shards"
+    s2 = embed_contextual_parquet(
+        eng,
+        in_pq,
+        ctx_dir,
+        chunk_tokens=4,
+        context_tokens=32,
+        overlap=1,
+        repeat_header_tokens=0,
+        shard_rows=4,
+        encode_batch_windows=2,
+        batch_rows=3,
+        dtype="float32",
+        normalize=False,
+    )
+    assert s2.rows_emitted == s1.rows_emitted
+    shard_files = sorted(ctx_dir.glob("part-*.parquet"))
+    assert len(shard_files) >= 2
+    assert list(ctx_dir.glob("*.tmp")) == []
+    assert pq.read_table(shard_files[0]).schema == tbl_s.schema
+
+    # Verify embed_parquet int8 async single + sharded equivalence & zero leftover tmp files.
+    i8_single = tmp_path / "int8_single.parquet"
+    r_i8 = embed_parquet(eng, in_pq, i8_single, batch_rows=3, encode_batch_rows=2, dtype="int8")
+    assert r_i8.rows_emitted == 10
+    assert pq.read_table(i8_single)["doc_id"].to_pylist() == list(range(10))
+
+    i8_dir = tmp_path / "int8_shards"
+    r_i8d = embed_parquet(eng, in_pq, i8_dir, batch_rows=3, shard_rows=4, encode_batch_rows=2, dtype="int8")
+    assert r_i8d.rows_emitted == 10
+    assert list(i8_dir.glob("*.tmp")) == []
+
+    # Verify .tmp cleanup if ParquetWriter fails mid-write on int8 shard & contextual shard.
+    class _FailingWriter:
+        def __init__(self, path, *args, **kwargs) -> None:
+            Path(path).touch()
+
+        def write_table(self, tbl) -> None:
+            raise RuntimeError("simulated disk error")
+
+        def close(self) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(pq, "ParquetWriter", _FailingWriter)
+    fail_ctx_dir = tmp_path / "fail_ctx"
+    with pytest.raises(RuntimeError, match="simulated disk error"):
+        embed_contextual_parquet(
+            eng, in_pq, fail_ctx_dir, chunk_tokens=4, context_tokens=32, overlap=1, shard_rows=4
+        )
+    assert list(fail_ctx_dir.glob("*.tmp")) == []
+    fail_i8_dir = tmp_path / "fail_i8"
+    with pytest.raises(RuntimeError, match="simulated disk error"):
+        embed_parquet(eng, in_pq, fail_i8_dir, shard_rows=4, dtype="int8")
+    assert list(fail_i8_dir.glob("*.tmp")) == []
+    monkeypatch.undo()
+
+    # Verify encode_documents_multivector >= 8 docs parallel path matches doc order identically.
+    class _SpyMVGPU:
+        dtype = "float32"
+
+        def encode_tokens(self, token_lists, *, batch_size=16, dimensions=None, output_dtype="float32", normalize=True):
+            return eng.encode_corpus(token_lists, dimensions=dimensions, output_dtype=output_dtype)
+
+        def encode_contextual_tokens(self, docs, *, batch_size=8, dimensions=None, output_dtype="float32", normalize=True):
+            return eng.encode_contextual_tokens(
+                docs, dimensions=dimensions or 8, output_dtype=output_dtype, normalize=normalize
+            )
+
+        def close(self) -> None:
+            pass
+
+    docs_10 = [f"hello world chunk {'one ' * ((i % 3) + 2)}two" for i in range(10)]
+    with FastPplx(home=tmp_path, mode="gpu", _gpu_backend=_SpyMVGPU(), _tokenizer=tok) as pplx_eng:
+        flat_10, off_10 = pplx_eng.encode_documents_multivector(
+            docs_10,
+            window_tokens=4,
+            context_tokens=256,
+            overlap=1,
+            repeat_header_tokens=0,
+            dimensions=8,
+            output_dtype="float32",
+        )
+        ref_parts = [
+            pplx_eng.encode_documents_multivector(
+                [d],
+                window_tokens=4,
+                context_tokens=256,
+                overlap=1,
+                repeat_header_tokens=0,
+                dimensions=8,
+                output_dtype="float32",
+            )[0]
+            for d in docs_10
+        ]
+        ref_flat = np.concatenate(ref_parts, axis=0)
+        assert off_10.tolist() == [0] + list(np.cumsum([p.shape[0] for p in ref_parts]))
+        assert np.max(np.abs(flat_10 - ref_flat)) == 0.0
+

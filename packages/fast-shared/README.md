@@ -63,8 +63,10 @@ mem = read_process_rusage_v6(os.getpid())  # RUSAGE_INFO_V6 physical + neural fo
 | `fast_shared.metal_mpp` / `_bf16` | Metal 4 `MPP::matmul2d` builders (`FP16`/`BF16`, GeGLU, bias epilogues) | `HEADER_MPP`, `mpp_linear_bf16`, `mpp_fused_geglu_bf16` |
 | `fast_shared.include/*` | Header-only C++/ObjC++ CoreML & Accelerate helpers | `fast_shared_apple.hpp`, `fast_shared_coreml.hpp` |
 | `fast_shared.embeddings` | Safetensors memmap gather, Matryoshka slice+norm, tile slices, cache limits | `MappedEmbedding`, `truncate_and_normalize`, `tile_aligned_slices`, `set_mlx_cache_limit` |
+| `fast_shared.retrieval_index` | Universal `INT8` (`4x` lossless), model-aware `MRL+INT8`, `Binary+INT8` NEON rerank (`9x` faster), & `MaxSim` windows | `CompactRetrievalIndex`, `quantize_int8_symmetric`, `pack_binary_bits`, `score_document_windows` |
+| `fast_shared.kv_quant` | Fused-`qmm` `QuantizedKVCache` (`q8` `4.72x` faster than Python-dequant `i8`) & online `(Q,K,V)` `FWHT-64` `QuaRot` (`q4_quarot`) | `QuantizedKVCache`, `HadamardTransformBank`, `fused_quantized_sdpa`, `normalize_kv_mode` |
 | `fast_shared.tokenizer` | Rust `tokenizers` base + sliding character-offset chunking | `BaseFastTokenizer` |
-| `fast_shared.parquet_pipeline` | Multi-file streaming/sharded/resumable Parquet + UTF-8 `page_offsets` | `embed_parquet` |
+| `fast_shared.parquet_pipeline` | Multi-file streaming/sharded/resumable Parquet + model-aware `CorpusBackfillConfig.for_engine` | `embed_parquet`, `CorpusBackfillConfig`, `recommended_backfill_mrl_dim` |
 | `fast_shared.server` | Managed HTTP/SSE server + OpenAI router + coalescing micro-batcher | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
 | `fast_shared.prefix_tree` | Chained SHA-256 `256`-token hybrid KV + block-32 `INT8` GDN prefix tree w/ rolling hit-rate circuit breaker | `PrefixTree`, `PrefixMatch`, `quantize_gdn_state_block32`, `dequantize_gdn_state_block32` |
 | `fast_shared.grammar` / `pipeline_llm` | Optional `[llm]` `llguidance` lazy GPU argmax masking + `A4_v2` `p=1..8` cycle/4-gram loop breaker + rolling per-doc schemas | `GrammarHelper`, `compute_loop_breaker_penalties`, `extract_parquet` |
@@ -87,6 +89,13 @@ Structured numbers live in [`../fast-silicon/docs/benchmarks/v23-validation-2026
 - **Header-Anchored Embedding Windows (`parquet_pipeline.py`):** `plan_header_anchored_windows` + `has_header_anchor` lifts `LegalBench-RAG` (`n=175`) `span_nDCG@10` on **`fast-bge-small`** **`0.304649 -> 0.443886` (`+45.7%`, `char_R@10 0.631442 -> 0.709903`)** and **`fast-embeddinggemma-2`** **`0.38028 -> 0.505361` (`+32.9%`, `char_R@10 0.720889 -> 0.811396`)**; `snap_sentences` stays opt-in after scoring `0.280048` alone.
 - **CoreAI Calibration Diversity Gate (`coreai_pipeline.py`):** Added `assess_calibration_batch_diversity`, `evaluate_multi_batch_calibration_gate`, and `fail_on_nonfinite=True` (rejects single-batch, duplicate-batch, and synthetic collapse while diverse 4-batch passes at `min_cos=0.999953`).
 - **`ANE FFN` `W8A16` Default & `H > 2048` WHT Fix (`ane_ffn.py`, `fast_ane_handoff.mm`):** `AneWave` defaults to `quantize_a8=False` (`W8A16`, `cos=0.999868..0.999901` on E2B vs `0.999794..0.999832` `W8A8_Had` and `0.9937..0.9951` `W8A8_NoHad`), and `H > 2048` WHT-128 scale bypass fix achieves `cos=0.999890..0.999892` (`row_max_rel_err <= 0.00044`) on `H=2560` / `4096`.
+
+### v2.5 Cross-Model R&D Winners (`retrieval_index.py`, `kv_quant.py`, `parquet_pipeline.py`)
+
+Structured numbers live in [`../fast-silicon/docs/benchmarks/v25-rd-winners-20261122.json`](../../docs/benchmarks/v25-rd-winners-20261122.json):
+
+- **Shared `CompactRetrievalIndex` & Model-Aware `CorpusBackfillConfig.for_engine`:** Full-dim symmetric `INT8 + FP16 scale` (`4.0x` smaller) is CI95-lossless across all encoders (`|ΔnDCG@10| <= 0.0012`), `512d MRL+INT8` (`6.0x` smaller) lifts `FastEmbeddingGemma2` `LegalBench-RAG` `+0.38 pp` while `CorpusBackfillConfig.for_engine` protects non-MRL `FastPplx` (`1024d`) and `FastBgeSmall` (`384d`) from premature `512d` truncation (`-1.10..-3.73 pp`), `1-bit` packed binary Hamming `Top-64 -> INT8` rerank (`vcntq_u8` + `vdotq_s32`) runs in `0.53–0.61 ms/q` at `100K` docs (`7.6x–9.4x` faster on `NanoBEIR`, CI95-lossless `+0.06 pp` on `FastPplx`), and multi-window `MaxSim` lifts `32K` `LongEmbed` passkey `nDCG@10` from `0.047 -> 1.000` per-split (`0.674` pooled) and `2wikimqa` from `0.8945 -> 0.9871` while cutting GPU encode time `2.31x`.
+- **Fused-`qmm` `QuantizedKVCache` & Online `(Q, K, V)` `FWHT-64` `QuaRot` (`kv_quant.py`):** Executing `mx.quantized_matmul` directly on packed `(k_w, k_s, k_b)` and `(v_w, v_s, v_b)` speeds `B=4, T=16,384` `q8` decode SDPA **`4.72x`** over Python-dequant `INT8` (`2.53 ms` vs `11.94 ms`, `0.0001` KL, `100%` greedy sequence match), while online `(Q, K, V)` block-64 `simd_shuffle_xor` `FWHT-64` (`kv_q4_quarot`, `2.70 ms`, `3.6x–3.8x` KV compression) inverted *before* `fused_sigmoid_attn_gate` recovers **`100%` (`27/27`) multi-depth passkeys** (`88.9%` raw `q4`, `55.6%` K-only `QuaRot`).
 
 ## Shared Parquet Controls
 

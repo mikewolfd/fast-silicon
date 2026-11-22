@@ -25,7 +25,7 @@ import os
 from pathlib import Path
 import platform
 import re
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -86,6 +86,7 @@ def _is_apple10_gdn_host() -> bool:
     return _CACHED_IS_APPLE10_HOST
 _ENABLE_VARLEN_PACK = os.environ.get("FAST_PPLX_VARLEN_PACK", "1") != "0"
 _ARCH_GEN_RE = re.compile(r"g(\d+)", re.IGNORECASE)
+_VALID_QUANTIZE_WEIGHTS: tuple[str, ...] = ("none", "w8")
 
 _VALID_STATE_DTYPES = ("float32", "bfloat16", "int8")
 _STATE_DTYPE_ALIASES = {
@@ -1508,9 +1509,10 @@ class PplxGatedRMSNorm(nn.Module):
 
 
 @partial(mx.compile, shapeless=True)
-def _fused_qk_rms_norm(qk: mx.array, qk_weight: mx.array, eps: float) -> mx.array:
-    normed_f32 = mx.fast.rms_norm(qk.astype(mx.float32), None, eps) * qk_weight
-    return normed_f32.astype(qk.dtype)
+def _norm_qk_head_hsd(x: mx.array, weight_f32: mx.array, eps: float) -> mx.array:
+    """Evaluate per-head Q/K RMSNorm in float32 and transpose `[B, S, H, D] -> [B, H, S, D]` without Q/K concat."""
+    normed_f32 = mx.fast.rms_norm(x.astype(mx.float32), weight_f32, eps)
+    return normed_f32.astype(x.dtype).swapaxes(1, 2)
 
 
 @mx.compile
@@ -1582,21 +1584,6 @@ class PplxAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self._qk_src_ids: tuple[int, int] | None = None
-        self._qk_norm_weight_cache: mx.array | None = None
-
-    def _get_qk_norm_weight(self) -> mx.array:
-        qw = self.q_norm.weight
-        kw = self.k_norm.weight
-        cur_ids = (id(qw), id(kw))
-        if self._qk_norm_weight_cache is None or self._qk_src_ids != cur_ids:
-            qw_f32 = qw if qw.dtype == mx.float32 else qw.astype(mx.float32)
-            kw_f32 = kw if kw.dtype == mx.float32 else kw.astype(mx.float32)
-            q_rep = mx.broadcast_to(qw_f32[None, :], (self.num_heads, self.head_dim))
-            k_rep = mx.broadcast_to(kw_f32[None, :], (self.num_kv_heads, self.head_dim))
-            self._qk_norm_weight_cache = mx.concatenate([q_rep, k_rep], axis=0)[None, None, :, :]
-            self._qk_src_ids = cur_ids
-        return self._qk_norm_weight_cache
 
     def _run_sdpa(
         self,
@@ -1657,14 +1644,19 @@ class PplxAttention(nn.Module):
         gate = gate.reshape(B, S, self.num_heads * self.head_dim)
 
         keys_4d = keys.reshape(B, S, self.num_kv_heads, self.head_dim)
-        qk = mx.concatenate([queries, keys_4d], axis=2)
-        qk_hsd = _fused_qk_rms_norm(qk, self._get_qk_norm_weight(), self.rms_norm_eps).swapaxes(1, 2)
+        qw = self.q_norm.weight
+        kw = self.k_norm.weight
+        qw_f32 = qw if qw.dtype == mx.float32 else qw.astype(mx.float32)
+        kw_f32 = kw if kw.dtype == mx.float32 else kw.astype(mx.float32)
+        queries_hsd = _norm_qk_head_hsd(queries, qw_f32, self.rms_norm_eps)
+        keys_hsd = _norm_qk_head_hsd(keys_4d, kw_f32, self.rms_norm_eps)
         values = values.reshape(B, S, self.num_kv_heads, self.head_dim).swapaxes(1, 2)
 
+        qk_hsd = mx.concatenate([queries_hsd, keys_hsd], axis=1)
         if rope_cos is not None and rope_sin is not None:
-            qk_rope = _apply_custom_partial_rope(qk_hsd, rope_cos, rope_sin, self.rope_dim)
+            qk_hsd = _apply_custom_partial_rope(qk_hsd, rope_cos, rope_sin, self.rope_dim)
         else:
-            qk_rope = mx.fast.rope(
+            qk_hsd = mx.fast.rope(
                 qk_hsd,
                 self.rope_dim,
                 traditional=False,
@@ -1672,7 +1664,7 @@ class PplxAttention(nn.Module):
                 scale=1.0,
                 offset=0,
             )
-        queries, keys = mx.split(qk_rope, [self.num_heads], axis=1)
+        queries, keys = mx.split(qk_hsd, [self.num_heads], axis=1)
 
         if S <= _STREAMED_SEQ_THRESHOLD or sdpa_mask == "causal":
             attn_out = self._run_sdpa(queries, keys, values, sdpa_mask)
@@ -2220,6 +2212,20 @@ def _resolve_max_length(max_length: int | None, max_seq_len: int) -> int:
     return min(ml, max_seq_len)
 
 
+def _quantize_pplx_linear_weights(model: PplxModel, *, bits: int = 8, group_size: int = 64) -> None:
+    """Quantize backbone linear projections while keeping embeddings, RMSNorms, conv1d, and contextual head native."""
+    nn.quantize(
+        model,
+        group_size=group_size,
+        bits=bits,
+        class_predicate=lambda path, mod: (
+            isinstance(mod, nn.Linear)
+            and "contextual_projection" not in path
+            and int(mod.weight.shape[-1]) % group_size == 0
+        ),
+    )
+
+
 class FastPplxGPU:
     """High-throughput MLX Metal GPU backend for `pplx-embed-v2-context-0.6b`."""
 
@@ -2230,6 +2236,7 @@ class FastPplxGPU:
         model_dir: str | Path | None = None,
         dtype: str = "float16",
         state_dtype: str | None = None,
+        quantize_weights: Literal["none", "w8"] = "none",
         use_mapped_embedding: bool = True,
         cache_limit_mb: int = 512,
         local_files_only: bool = True,
@@ -2238,16 +2245,26 @@ class FastPplxGPU:
     ) -> None:
         if dtype not in ("float16", "bfloat16"):
             raise ValueError(f"Unsupported dtype {dtype!r}; expected 'float16' or 'bfloat16'")
+        eff_quant_weights = str(quantize_weights).strip().lower()
+        if eff_quant_weights not in _VALID_QUANTIZE_WEIGHTS:
+            raise ValueError(
+                f"Unsupported quantize_weights {quantize_weights!r}; expected one of {_VALID_QUANTIZE_WEIGHTS}"
+            )
 
         self.paths = resolve_paths(home)
         self.dtype_name = dtype
         self.state_dtype_name = normalize_state_dtype(state_dtype)
+        self.quantize_weights: Literal["none", "w8"] = "w8" if eff_quant_weights == "w8" else "none"
         self.act_dtype = mx.float16 if dtype == "float16" else mx.bfloat16
         self.use_mapped_embedding = bool(use_mapped_embedding)
         self.cache_limit_mb = int(cache_limit_mb)
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
-        self.runtime_telemetry = {**get_mlx_runtime_telemetry(), "state_dtype": self.state_dtype_name}
+        self.runtime_telemetry = {
+            **get_mlx_runtime_telemetry(),
+            "state_dtype": self.state_dtype_name,
+            "quantize_weights": self.quantize_weights,
+        }
 
         set_mlx_cache_limit(self.cache_limit_mb)
         self._prev_wired_limit: int | None = _apply_recommended_wired_limit()
@@ -2353,6 +2370,9 @@ class FastPplxGPU:
             all_items = [*backbone_items, ("contextual_projection.weight", head_w)]
             self.model.load_weights(all_items, strict=True)
             mx.eval(self.model.parameters())
+            if self.quantize_weights == "w8":
+                _quantize_pplx_linear_weights(self.model, bits=8, group_size=64)
+                mx.eval(self.model.parameters())
         except Exception:
             self.close()
             raise
@@ -2397,11 +2417,24 @@ class FastPplxGPU:
             return_trace=return_trace,
         )
 
-    def _project_mean_pool(self, hidden: mx.array, attention_mask: np.ndarray) -> np.ndarray:
+    def _prepare_batch_inputs_and_mask(
+        self, rows: Sequence[Sequence[int]]
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Avoid pad buffer and all-True mask allocation when every sequence in the wave has equal positive length."""
+        if rows:
+            first_len = len(rows[0])
+            if first_len > 0 and all(len(r) == first_len for r in rows):
+                return np.asarray(rows, dtype=np.int32), None
+        return self.tokenizer.pad(rows)
+
+    def _project_mean_pool(self, hidden: mx.array, attention_mask: np.ndarray | None = None) -> np.ndarray:
         hidden_f32 = hidden.astype(mx.float32)
-        mask_f32 = mx.array(attention_mask.astype(np.float32))[..., None]
-        denom = mx.maximum(mx.sum(mask_f32, axis=1), mx.array(1.0, dtype=mx.float32))
-        pooled = mx.sum(hidden_f32 * mask_f32, axis=1) / denom
+        if attention_mask is None:
+            pooled = mx.mean(hidden_f32, axis=1)
+        else:
+            mask_f32 = mx.array(attention_mask.astype(np.float32))[..., None]
+            denom = mx.maximum(mx.sum(mask_f32, axis=1), mx.array(1.0, dtype=mx.float32))
+            pooled = mx.sum(hidden_f32 * mask_f32, axis=1) / denom
         projected = self.model.contextual_projection(pooled)
         mx.eval(projected)
         out = np.array(projected, dtype=np.float32, copy=False)
@@ -2730,11 +2763,13 @@ class FastPplxGPU:
                 for pos_i, orig_idx in enumerate(bin_spec["orig_indices"]):
                     proj_all[int(orig_idx)] = proj_bin[pos_i]
         else:
+            uniform_pos_len = int(lengths[0]) if int(lengths.min()) == int(lengths.max()) > 0 else 0
+            eff_bs = min(bs, max(1, 8192 // uniform_pos_len)) if uniform_pos_len > 512 else bs
             order = np.argsort(lengths, kind="stable")
-            for start in range(0, n, bs):
-                idxs = order[start : start + bs]
+            for start in range(0, n, eff_bs):
+                idxs = order[start : start + eff_bs]
                 rows = [token_lists[int(i)] for i in idxs]
-                input_ids, attention_mask = self.tokenizer.pad(rows)
+                input_ids, attention_mask = self._prepare_batch_inputs_and_mask(rows)
                 hidden = self.forward_hidden(input_ids, attention_mask)
                 proj_batch = self._project_mean_pool(hidden, attention_mask)
                 proj_all[idxs] = proj_batch
@@ -2874,12 +2909,14 @@ class FastPplxGPU:
                         normalize=normalize,
                     )
         else:
+            uniform_pos_len = int(lengths[0]) if int(lengths.min()) == int(lengths.max()) > 0 else 0
+            eff_bs = min(bs, max(1, 8192 // uniform_pos_len)) if uniform_pos_len > 512 else bs
             order = np.argsort(lengths, kind="stable")
-            for start in range(0, len(encoded_docs), bs):
-                idxs = order[start : start + bs]
+            for start in range(0, len(encoded_docs), eff_bs):
+                idxs = order[start : start + eff_bs]
                 rows = [encoded_docs[int(i)][0] for i in idxs]
                 spans_list = [encoded_docs[int(i)][1] for i in idxs]
-                input_ids, attention_mask = self.tokenizer.pad(rows)
+                input_ids, attention_mask = self._prepare_batch_inputs_and_mask(rows)
                 max_c = max(1, *(len(s) for s in spans_list))
                 span_arr = np.zeros((len(idxs), max_c, 2), dtype=np.int32)
                 for row_i, sp in enumerate(spans_list):

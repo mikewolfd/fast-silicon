@@ -16,6 +16,7 @@ import mlx.core as mx
 import numpy as np
 from fast_shared.bench import clear_mlx_arena
 from fast_shared.embeddings import resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
+from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
 from .gpu import (
     ANE_MS_COST,
@@ -393,6 +394,7 @@ class FastEmbeddingGemma2:
     dim: int = EMBED_DIM
     max_dim: int = EMBED_DIM
     supports_dimensions: bool = True
+    is_mrl_trained: bool = True
     mrl_dimensions: tuple[int, ...] = MRL_DIMENSIONS
     model_name: str = "google/embeddinggemma-2"
     max_seq_len: int = MAX_SEQ_LEN
@@ -1463,3 +1465,64 @@ class FastEmbeddingGemma2:
                 "cpu_docs": stats["cpu_docs"],
             }
         return outs
+
+    def encode_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        mode: str | None = None,
+        dimensions: int | None = None,
+        max_length: int | None = None,
+        add_document_prefix: bool = False,
+    ) -> np.ndarray:
+        """Encode document strings `[N]` into `[N, dim]` L2-normalized float32 embeddings."""
+        items = list(texts)
+        eff_dim = self._resolve_dim(dimensions)
+        if not items:
+            return np.empty((0, eff_dim), dtype=np.float32)
+        return self.encode_texts(
+            items,
+            is_query=False,
+            add_document_prefix=add_document_prefix,
+            max_length=max_length,
+            mode=mode,
+            dimensions=eff_dim,
+        )
+
+    def build_index(
+        self,
+        corpus: Sequence[str] | Sequence[Sequence[int]] | np.ndarray,
+        *,
+        doc_offsets: np.ndarray | Sequence[int] | None = None,
+        mode: IndexMode = "auto",
+        mrl_dim: int | None = None,
+        binary_bits: int | None = None,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+        encode_mode: str | None = None,
+        add_document_prefix: bool = False,
+    ) -> CompactRetrievalIndex:
+        """Build a `CompactRetrievalIndex` (`512d mrl_int8` `6.0x` default, or `int8` / `binary_int8` / `MaxSim`)."""
+        if isinstance(corpus, np.ndarray):
+            vecs = corpus
+        elif not corpus:
+            vecs = np.empty((0, EMBED_DIM), dtype=np.float32)
+        elif isinstance(corpus[0], str):
+            vecs = self.encode_documents(
+                corpus,  # type: ignore[arg-type]
+                mode=encode_mode,
+                dimensions=EMBED_DIM,
+                add_document_prefix=add_document_prefix,
+            )
+        else:
+            vecs = self.encode_corpus(corpus, mode=encode_mode, dimensions=EMBED_DIM)  # type: ignore[arg-type]
+        return CompactRetrievalIndex(
+            vecs,
+            doc_offsets=list(doc_offsets) if doc_offsets is not None and not isinstance(doc_offsets, np.ndarray) else doc_offsets,
+            mode=mode,
+            is_mrl_trained=self.is_mrl_trained,
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
+        )

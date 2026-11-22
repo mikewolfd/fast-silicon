@@ -30,6 +30,7 @@ Model format and input limits can differ within a model family. For example, Flu
 9. [v2.2 Cross-Silicon Validation & Regression Gates (2026-11-21)](#9-v22-cross-silicon-validation--regression-gates-2026-11-21)
 10. [v2.3 Cross-Silicon Accuracy, Precision & Contextual Validation (2026-11-22)](#10-v23-cross-silicon-accuracy-precision--contextual-validation-2026-11-22)
 11. [`fast-qwen3` Hybrid GatedDeltaNet + OptiQ + LoRA Validation (2026-11-22)](#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
+12. [v2.5 Cross-Model R&D Winners & Negative Gates (2026-11-22)](#12-v25-cross-model-rd-winners--negative-gates-2026-11-22)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -721,3 +722,43 @@ Machine-readable `ABBA` & Category-4 outcome receipt: [`benchmarks/fast-qwen3-20
   - `9B-OptiQ` (M4 Pro & Base M5): `S>256` (`288..290`) ragged `B=1` vs `B=4` exact (`4/4` on both Macs), `PrefixTree` wave vs uncached `kv_i8`/`bf16` (`True` both; `1536` reused tokens across `3` snapshots on M4 Pro), `kv_i8` vs `bf16` (`True` both), `S=2213` chunked vs whole first-token (`True` both). `4B-OptiQ`: `S>256` ragged `4/4` Base M5 (`3/4` M4 Pro on `bf16` tie `" extraction"` vs `" extracted"`), `PrefixTree` wave vs `kv_i8` (`4/4` M4 Pro, `3/4` Base M5 deterministic tie `" list"` vs `" repetitive list"`), `S=2213` chunked vs whole (`True` both).
   - Base M5 concurrent `4B-OptiQ GPU` (`8x48` tokens) + `FastBgeSmall pure-ANE` (`3x32x384` `[32, 384]`): `2.626 s` wall, `OS phys 5.32 GB`, peak **`9.39 GB`** (`MLX peak 8.92 GB`, well under the `19.2 GB` `24 GB`-class ceiling).
   - `fast-pplx` M4 Pro real-checkpoint parity (`--allow-contended`): `gpu fp16` `min_cos=0.999994` (`s4096 cos=1.0`), `gpu-bf16` `min_cos=0.999892` (`s4096 cos=1.0`), `ane`/`hetero2` `min_cos=0.982756` (`int8_min_cos=0.98261`).
+
+---
+
+## 12. v2.5 Cross-Model R&D Winners & Negative Gates (2026-11-22)
+
+Machine-readable validation receipt: [`benchmarks/v25-rd-winners-20261122.json`](benchmarks/v25-rd-winners-20261122.json). All cross-model mechanisms live once in `packages/fast-shared` (`retrieval_index.py`, `kv_quant.py`, `parquet_pipeline.py`) with thin adapters across model packages; negative candidates remain out of defaults.
+
+### 12.1 Multi-Vector Contextual `MaxSim` Retrieval (`fast-pplx` + `fast_shared.retrieval_index`)
+
+Evaluated on `LongEmbed` (`N=500`: `200` `passkey` across `4K/8K/16K/32K` + `300` `2wikimqa`):
+
+| Pooling / Window Strategy | Pooled `N=500` `nDCG@10` | Per-Split `N=500` `nDCG@10` | `32K passkey` (`split` / `pooled`, `R@10`) | `2wikimqa` (`N=300`) | M4 Pro GPU Encode Wall / Metal Peak | Storage / Doc | Verdict |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Single-vector whole-doc (`FP32` `1024d`) | `0.7510` | `0.7532` | `0.0470` / `0.0470` (`0.14`) | `0.8945` | `2205.5 s` / `4.27 GB` | `4.00 KiB` | baseline |
+| **`encode_documents_multivector` (`win=1024, ctx=2048, rep=128`, `MaxSim`, `1024d INT8`)** | **`0.8452`** | **`0.9911`** | **`1.0000` / `0.6743` (`1.00`)** | **`0.9851`** | **`955.4 s` (`2.31×`)** / **`1.72 GB` (`2.48×` lower)** | `15.97 KiB` (`0.0000` loss vs `FP32`) | **PROMOTED** (`multivector=True`) |
+| `encode_documents_multivector` (`win=512, ctx=2048, rep=128`, `MaxSim`, `1024d INT8`) | `0.8449` | `0.9923` | `1.0000` / `0.6695` (`1.00`) | `0.9871` (`0.9884` `top2_mean`) | `955.4 s` / `1.72 GB` | `31.11 KiB` | opt-in (`window_tokens=512`) |
+| Hybrid `0.7*max + 0.3*mean` (`win=512`) | `0.7689` | `0.9901` | `0.9926` / `0.4710` (`0.82`) | `0.9838` | `955.4 s` / `1.72 GB` | `31.11 KiB` | **`NEGATIVE_DEFAULT`** (`1/L` dilution) |
+
+### 12.2 Model-Aware `MRL + INT8` & ARM64 NEON Binary Rerank (`fast-bge-small`, `fast-embeddinggemma-2`, `fast-pplx`)
+
+Evaluated across `NanoBEIR-en` (`150` queries) and `LegalBench-RAG` (`175` queries / `796` chunks):
+
+| Engine (`is_mrl_trained`) | Storage / Search Mode | Bytes / Vec (Compression) | `NanoBEIR` `ΔnDCG@10` (`95% CI`) | `LegalBench-RAG` `Δspan_nDCG@10` (`95% CI`) | Query Scan Latency (`100K` Docs, `1` Thread) | Verdict |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`FastEmbeddingGemma2`** (`True`, `768d`) | **`512d MRL + sym_int8`** (`mode="auto"`) | **`514 B` (`6.0×`)** | `-0.0038` `[-0.0110, +0.0030]` | **`+0.0038`** `[-0.0079, +0.0159]` *(pooled `+0.0003`)* | **`0.22 ms/q`** (`vdotq_s32`) | **PROMOTED** (`CorpusBackfillConfig.for_engine`) |
+| **`FastEmbeddingGemma2`** (`True`, `768d`) | **`bin512 -> Top-64 -> 512d INT8`** (`binary_int8`) | `64 B` hot (`48×`) / `578 B` (`5.3×`) | `-0.0089` | **`+0.0039`** | **`0.531 ms/q`** (`9.4×` faster) | **PROMOTED** (`>= 16K` docs / opt-in) |
+| **`FastPplx`** (`False`, `1024d`) | **`1024d sym_int8`** (`mode="auto"`) | **`1,026 B` (`4.0×`)** | **`+0.0000`** `[-0.0020, +0.0007]` | **`-0.0012`** `[-0.0029, +0.0005]` | **`0.31 ms/q`** (`2.6–6.8×` lower err vs `tanh_int8`) | **PROMOTED** (`mrl_dim=None` enforced) |
+| **`FastPplx`** (`False`, `1024d`) | **`bin1024 -> Top-64 -> 1024d INT8`** (`binary_int8`) | `128 B` hot (`32×`) / `1,154 B` (`3.55×`) | **`+0.0006`** `[-0.0016, +0.0036]` | **`-0.0012`** `[-0.0029, +0.0005]` | **`0.606 ms/q`** (beats multi-thread `FP32` BLAS `0.718 ms/q`) | **PROMOTED** (CI95-lossless) |
+| `FastPplx` (`False`, `1024d`) | `512d MRL + sym_int8` | `514 B` (`8.0×`) | `-0.0110` (`-3.10 pp` `NanoSciFact`) | **`-0.0373`** (`-0.0377` `FP32`) | — | **`NEGATIVE_NOT_PROMOTED`** (non-MRL) |
+| **`FastBgeSmall`** (`False`, `384d`) | **`384d sym_int8`** / `binary_int8` | **`386 B` (`4.0×`)** / `434 B` (`3.54×`) | lossless (`<= 0.001`) | lossless (`<= 0.001`) | **`0.18 ms/q`** / `0.48 ms/q` | **PROMOTED** (`mrl_dim=None` enforced) |
+
+### 12.3 Fused Quantized `KV` SDPA, `QuaRot` `4-Bit KV`, `fast-pplx` `FFD`/`hetero2` & `Kev-4B` `SpecBucket`
+
+| Mechanism / Target | Compression / Speedup | Quality & Parity Evidence (`M4 Pro 48 GB` & `Base M5 24 GB`) | Promotion Status |
+| :--- | :---: | :--- | :---: |
+| **Online `(Q, K, V)` `FWHT-64` `QuaRot` (`kv_i8="q4_quarot"`, post-RoPE + pre-gate inverse)** | **`3.56×` KV compression** (`576 MB` vs `2,048 MB` `BF16` @ `16K B=4`) · **`91.71 tok/s` (`2.13×` faster than `kv_i8` `43.05 tok/s`)** @ `16K B=4` (`156.94` vs `112.46 tok/s` @ `4K B=8`) | **`4K` (`N=9`):** `0.9602 == BF16` `LiquidAI` F1, **`27/27` (`100%`) PK**, `100%` exact greedy seq; **`8K` (`N=6`):** **`0.8667` vs `0.8644` `BF16` F1, `18/18` (`100%`) PK**; **`16K` (`N=6`):** **`0.9464 == BF16` F1** (vs **`0.8631` raw `q4_g64` = `-8.33 pp`**), **`18/18` (`100%`) PK**, `100%` top-1 agree, `83.3%` vs `33.3%` exact seq (`KL 0.0016` vs `0.0034`) | **PROMOTED** (`kv_i8="auto"` @ `>=8K` / `>=4K` `<=24GB` / `B>=16`) |
+| **`fused_quantized_sdpa` (`kv_i8="q8"`, `mx.quantized_matmul` on packed KV)** | **`1.98×` KV compression** (`1,032 MB`) · **`4.72×` faster** single-layer `B=4, T=16K` KV attention (`2.53 ms` vs `11.94 ms` Python-dequant `kv_i8`); `43.05 tok/s` E2E `16K B=4` | Strided non-compact `qvm_split_k` parity `max_diff = 0.000732` (`T=4261, alloc=4864`); `4K` / `8K` / `16K`: `0.9602 / 0.8644 / 0.9464 == BF16` F1, **`100%` passkeys (`63/63`)**, `KL = 0.00012–0.00025`, `100%` exact greedy seq @ `16K` | **SUPPORTED** (`kv_i8=True` / `"q8"`) |
+| **`fast-pplx` `FFD` `pack_ane_buckets` + Host-Aware `hetero2` + Async Parquet + Opt-In `W8` (`T4.1–T4.5`)** | **`26` vs `32` ANE bins (`-18.8%`)**, **`648` vs `1,638` pad toks (`-60.4%`)**; Mixed-64 **`19,443 tok/s`** M5 (`1.17×`) / **`17,793 tok/s`** M4 (**`1.84×`** vs GPU); `w8` **`-46.4%` weights** (`460.8 -> 247.0 MB`) | `binary_int8` `multivector=True` (`72` wins): **`1.70 ms` M5 / `6.43 ms` M4**; `w8` 16-case `min_f32_cos = 0.99883` (`0.95×` FP16 M5 speed, opt-in `default="none"`). `S=768/1024` ANE MIL: M4 GPU fallback (`all_on_target=False`) & M5 GPU `1.40×` faster (`0.69–0.72×`) | **PROMOTED** (`FFD` / `hetero2` / async; `w8` opt-in; `S<=512` kept) |
+| **`SpecBucketedLinearGroup` + `compress_gdn_prefix_int8="auto"` in `fast-decision-models` (`Kev-0.8B` / `Kev-4B`)** | **`3.76×` smaller GDN `PrefixTree` (`1.57 MB -> 0.42 MB`/node on `Kev-4B`)** + `2` GEMMs vs `4` on mixed `4b`/`8b` layers | `0.0`-ULP mixed-bit `(4, 8, 4, 4)` projection parity and `0.0`-logit-delta cold-vs-warm `PrefixTree` round-trip (`9/9` CPU + `stdlib_isolated_ok`) | **PROMOTED** (`kev_mlx.py`) |
+| **Base M5 `macOS 27.2.1` `CoreAI Qwen3.5-4B` (`.aimodel` `w4` / `fp4_fp8`)** | **`0` ANE ops** (`64/64` GPU ops, `0.21×` EOT, `1.5×` RAM) | `6.92–9.04 tok/s` (`0.12×–0.16×` `fast-qwen3` `57.45 tok/s`), `Cat-4` `0.838` (`258.5s`, `0.162 EOT`, `7.94 GB` peak) vs `fast-qwen3` **`0.9024` (`58.3s`, `0.774 EOT`, `5.26 GB`)**; Python `CoreAI` API lacks `GatedDeltaNet` recurrent state carry | **`NEGATIVE_NOT_PROMOTED`** (harness baseline only) |

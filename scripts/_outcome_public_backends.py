@@ -2318,7 +2318,10 @@ async def main():
                 "--stop-tokens", "<|endoftext|>",
             ]
             proc_r = subprocess.run(cmd_full, capture_output=True, text=True, timeout=600)
-            if proc_r.returncode != 0 and any(w in (proc_r.stderr or "").lower() for w in ("unknown option", "unrecognized", "unexpected argument")):
+            if proc_r.returncode != 0 and any(
+                w in (proc_r.stderr or "").lower()
+                for w in ("unknown option", "unrecognized", "unexpected argument", "invalid argument")
+            ):
                 proc_r = subprocess.run(cmd_full[:-4], capture_output=True, text=True, timeout=600)
             parsed = _parse_coreai_llm_runner_result(
                 proc_r.stdout, proc_r.stderr, proc_r.returncode, (time.perf_counter() - t_req) * 1000.0
@@ -2631,7 +2634,10 @@ async def main():
                 "--stop-tokens", "<turn|>",
             ]
             proc_r = subprocess.run(cmd_full, capture_output=True, text=True, timeout=600)
-            if proc_r.returncode != 0 and any(w in (proc_r.stderr or "").lower() for w in ("unknown option", "unrecognized", "unexpected argument")):
+            if proc_r.returncode != 0 and any(
+                w in (proc_r.stderr or "").lower()
+                for w in ("unknown option", "unrecognized", "unexpected argument", "invalid argument")
+            ):
                 proc_r = subprocess.run(cmd_full[:-4], capture_output=True, text=True, timeout=600)
             parsed = _parse_coreai_llm_runner_result(
                 proc_r.stdout, proc_r.stderr, proc_r.returncode, (time.perf_counter() - t_req) * 1000.0

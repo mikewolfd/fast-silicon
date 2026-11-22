@@ -42,7 +42,7 @@ from fast_qwen3.model import inspect_safetensor_header_keys, normalize_qwen3_wei
 def _make_tiny_byte_tokenizer(tmp_path: Path) -> FastQwen3Tokenizer:
     """Create a deterministic self-contained ByteLevel `BPE` `Tokenizer` (`0` network/cache deps)."""
     vocab: dict[str, int] = {}
-    for ch in ByteLevel.alphabet():
+    for ch in sorted(ByteLevel.alphabet()):
         if ch not in vocab:
             vocab[ch] = len(vocab)
 
@@ -887,8 +887,8 @@ def test_mtp_independent_norm_autodetect_and_bytelevel_vocab_remap(tmp_path: Pat
     assert abs(float(mx.mean(drafter_folded.pre_fc_norm_embedding.weight.astype(mx.float32)).item()) - 1.0) < 0.08
 
     # ByteLevel tokenizer encodes CJK UTF-8 bytes as Latin-1 chars (< 0x0250); decoded check must filter CJK and honor target_size
-    vocab = dict(ByteLevel.alphabet()) if False else {}
-    for ch in ByteLevel.alphabet():
+    vocab = {}
+    for ch in sorted(ByteLevel.alphabet()):
         if ch not in vocab:
             vocab[ch] = len(vocab)
     tok_bl = HfTokenizer(BPE(vocab=vocab, merges=[]))
@@ -916,4 +916,83 @@ def test_mtp_independent_norm_autodetect_and_bytelevel_vocab_remap(tmp_path: Pat
     assert cjk_de not in set(remap_capped.new_to_old.tolist())
     assert cjk_zh not in set(remap_capped.new_to_old.tolist())
     assert remap_uncapped.vocab_size > 500
+
+
+def test_fused_kv_q8_and_quarot_q4_with_prefix_tree_cpu(tmp_path: Path) -> None:
+    """Verify `kv_i8='q8'` (`fused_quantized_sdpa`), `kv_i8='q4_quarot'` (`FWHT-64`), cross-mode snapshots, and `PrefixTree`."""
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    weights = _make_synthetic_qwen3_weights(cfg, seed=37, include_mtp=False)
+    model = FastQwen3Model(cfg, weights, enable_fusion=True)
+
+    ids = mx.array([[12, 19, 23, 31, 41, 47, 53, 59, 61, 67]], dtype=mx.int32)
+    c_bf16 = model.make_cache(kv_i8="bf16")
+    c_q8 = model.make_cache(kv_i8="q8")
+    c_q4 = model.make_cache(kv_i8="q4_quarot")
+
+    y_bf16 = model(ids[:, :8], cache=c_bf16)[:, -1, :].astype(mx.float32)
+    y_q8 = model(ids[:, :8], cache=c_q8)[:, -1, :].astype(mx.float32)
+    y_q4 = model(ids[:, :8], cache=c_q4)[:, -1, :].astype(mx.float32)
+    mx.eval(y_bf16, y_q8, y_q4)
+
+    def _cos(a: mx.array, b: mx.array) -> float:
+        an = a / mx.maximum(mx.linalg.norm(a), 1e-8)
+        bn = b / mx.maximum(mx.linalg.norm(b), 1e-8)
+        return float(mx.sum(an * bn).item())
+
+    assert _cos(y_bf16, y_q8) > 0.999
+    assert _cos(y_bf16, y_q4) > 0.990
+
+    snap_q8_8 = snapshot_hybrid_cache(ids[0, :8].tolist(), c_q8, compress_gdn_int8=False)
+    snap_q4_8 = snapshot_hybrid_cache(ids[0, :8].tolist(), c_q4, compress_gdn_int8=False)
+
+    # Decode step (`L=1`) exercises `qvm_split_k` / `qmv` strided slice path on non-compact grown cache!
+    d_bf16 = model(ids[:, 8:9], cache=c_bf16)[:, -1, :].astype(mx.float32)
+    d_q8 = model(ids[:, 8:9], cache=c_q8)[:, -1, :].astype(mx.float32)
+    d_q4 = model(ids[:, 8:9], cache=c_q4)[:, -1, :].astype(mx.float32)
+    mx.eval(d_bf16, d_q8, d_q4)
+    assert _cos(d_bf16, d_q8) > 0.999
+    assert _cos(d_bf16, d_q4) > 0.990
+
+    # Rewind `GrowingKVCache` (`rewind_to(8)`) + restore GDN state matches exact pre-rewind decode logits (`0.0` ULP)!
+    for cache_i, snap_8, ref_d, mode_k in ((c_q8, snap_q8_8, d_q8, "q8"), (c_q4, snap_q4_8, d_q4, "q4_quarot")):
+        restored_8 = restore_hybrid_cache(snap_8, kv_i8=mode_k)
+        for idx_l, lc in enumerate(cache_i):
+            if hasattr(lc, "rewind_to"):
+                lc.rewind_to(8)
+            else:
+                cache_i[idx_l] = restored_8[idx_l]
+        d_replay = model(ids[:, 8:9], cache=cache_i)[:, -1, :].astype(mx.float32)
+        mx.eval(d_replay)
+        assert float(mx.max(mx.abs(d_replay - ref_d)).item()) == 0.0
+
+    # Cross-mode snapshot (`bf16 -> q4_quarot` and `q4_quarot -> q8`) preserves coherent forward step
+    snap_bf16 = snapshot_hybrid_cache(ids[0, :9].tolist(), c_bf16)
+    c_restored_q4 = restore_hybrid_cache(snap_bf16, kv_i8="q4_quarot")
+    step_from_snap = model(ids[:, 9:10], cache=c_restored_q4)[:, -1, :].astype(mx.float32)
+    step_bf16_ref = model(ids[:, 9:10], cache=c_bf16)[:, -1, :].astype(mx.float32)
+    mx.eval(step_from_snap, step_bf16_ref)
+    assert _cos(step_bf16_ref, step_from_snap) > 0.990
+
+    # Full `FastQwen3Engine` + `PrefixTree` chunked storage under `kv_i8="q8"` and `kv_i8="q4_quarot"`
+    shared_prefix = "Shared extraction context block " * 10  # 320 byte-level tokens -> >= 1 256-token PrefixTree chunk!
+    tree_bytes: dict[str, int] = {}
+    for kv_mode in ("q8", "q4_quarot"):
+        eng = FastQwen3Engine(
+            model=model,
+            tokenizer=tok,
+            warmup=False,
+            prefix_cache_mb=64,
+            kv_i8=kv_mode,
+        )
+        try:
+            r1 = eng.generate(shared_prefix + "Question Alpha?", max_tokens=6, temperature=0.0, speculative=False)
+            r2 = eng.generate(shared_prefix + "Question Alpha?", max_tokens=6, temperature=0.0, speculative=False)
+            assert r1.token_ids == r2.token_ids
+            assert eng.prefix_tree is not None and eng.prefix_tree.node_count >= 1 and eng.prefix_tree.bytes_held > 0
+            tree_bytes[kv_mode] = eng.prefix_tree.bytes_held
+        finally:
+            eng.close()
+    assert tree_bytes["q4_quarot"] < tree_bytes["q8"]
+
 

@@ -646,10 +646,16 @@ def _build_qwen35_backbone(
             if fused_in is not None:
                 self.in_proj_all = fused_in
             else:
-                self.in_proj_qkv = _make_single_linear(px + ".in_proj_qkv", hidden_size, self.conv_dim)
-                self.in_proj_z = _make_single_linear(px + ".in_proj_z", hidden_size, self.value_dim)
-                self.in_proj_b = _make_single_linear(px + ".in_proj_b", hidden_size, num_v_heads)
-                self.in_proj_a = _make_single_linear(px + ".in_proj_a", hidden_size, num_v_heads)
+                from fast_shared.kv_quant import SpecBucketedLinearGroup
+
+                self.in_proj_group = SpecBucketedLinearGroup(
+                    [
+                        ("qkv", _make_single_linear(px + ".in_proj_qkv", hidden_size, self.conv_dim)),
+                        ("z", _make_single_linear(px + ".in_proj_z", hidden_size, self.value_dim)),
+                        ("b", _make_single_linear(px + ".in_proj_b", hidden_size, num_v_heads)),
+                        ("a", _make_single_linear(px + ".in_proj_a", hidden_size, num_v_heads)),
+                    ]
+                )
 
             self.dt_bias = norm_weights[px + ".dt_bias"].astype(mx.bfloat16)
             self.A_log = norm_weights[px + ".A_log"].astype(mx.bfloat16)
@@ -674,10 +680,11 @@ def _build_qwen35_backbone(
                 qkv, z_flat, b, a = mx.split(proj, self._split_stops, axis=-1)
                 z = z_flat.reshape(B, S, num_v_heads, head_v_dim)
             else:
-                qkv = self.in_proj_qkv(x)
-                z = self.in_proj_z(x).reshape(B, S, num_v_heads, head_v_dim)
-                b = self.in_proj_b(x)
-                a = self.in_proj_a(x)
+                parts = self.in_proj_group(x)
+                qkv = parts["qkv"]
+                z = parts["z"].reshape(B, S, num_v_heads, head_v_dim)
+                b = parts["b"]
+                a = parts["a"]
 
             if valid_token_scale is not None:
                 qkv = qkv * valid_token_scale
@@ -778,9 +785,15 @@ def _build_qwen35_backbone(
             if fused_qkv is not None:
                 self.qkv_proj = fused_qkv
             else:
-                self.q_proj = _make_single_linear(px + ".q_proj", hidden_size, q_out)
-                self.k_proj = _make_single_linear(px + ".k_proj", hidden_size, kv_out)
-                self.v_proj = _make_single_linear(px + ".v_proj", hidden_size, kv_out)
+                from fast_shared.kv_quant import SpecBucketedLinearGroup
+
+                self.qkv_group = SpecBucketedLinearGroup(
+                    [
+                        ("q", _make_single_linear(px + ".q_proj", hidden_size, q_out)),
+                        ("k", _make_single_linear(px + ".k_proj", hidden_size, kv_out)),
+                        ("v", _make_single_linear(px + ".v_proj", hidden_size, kv_out)),
+                    ]
+                )
 
             self.o_proj = _make_single_linear(px + ".o_proj", num_q_heads * head_dim, hidden_size)
             self.q_norm = nn.RMSNorm(head_dim, eps=rms_eps)
@@ -805,9 +818,10 @@ def _build_qwen35_backbone(
                 qkv_out = self.qkv_proj(x)
                 qp, kp, vp = mx.split(qkv_out, self._qkv_stops, axis=-1)
             else:
-                qp = self.q_proj(x)
-                kp = self.k_proj(x)
-                vp = self.v_proj(x)
+                parts_qkv = self.qkv_group(x)
+                qp = parts_qkv["q"]
+                kp = parts_qkv["k"]
+                vp = parts_qkv["v"]
 
             queries, gate = mx.split(qp.reshape(B, L, num_q_heads, -1), 2, axis=-1)
             gate = gate.reshape(B, L, -1)
@@ -1126,6 +1140,7 @@ class KevMlxBackend:
         prefix_cache_mb: int | Literal["auto"] | None = "auto",
         prefix_chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         prefix_snapshot_stride: int = 1,
+        compress_gdn_prefix_int8: bool | Literal["auto"] = "auto",
         profile: Literal["auto", "backfill", "interactive"] = "auto",
         tokenizer_path: Path | str | None = None,
         auto_prebuilt: bool = True,
@@ -1352,6 +1367,10 @@ class KevMlxBackend:
             self.backbone = _build_qwen35_backbone(text_cfg, weights, quant_cfg=self.quantization)
             self._full_layer_indices = [i for i, blk in enumerate(self.backbone.layers) if not blk.is_linear]
             self._linear_layer_indices = [i for i, blk in enumerate(self.backbone.layers) if blk.is_linear]
+            if compress_gdn_prefix_int8 == "auto":
+                self.compress_gdn_prefix_int8 = self.model_variant == "4b"
+            else:
+                self.compress_gdn_prefix_int8 = bool(compress_gdn_prefix_int8)
             del weights
             mx.clear_cache()
         except Exception:
@@ -1511,7 +1530,14 @@ class KevMlxBackend:
         conv_snaps, rec_snaps = match.snapshot
         for gdn_i, l_idx in enumerate(self._linear_layer_indices):
             cache[l_idx].conv_state = conv_snaps[gdn_i]
-            cache[l_idx].rec_state = rec_snaps[gdn_i]
+            rs_entry = rec_snaps[gdn_i]
+            if isinstance(rs_entry, tuple) and len(rs_entry) == 3:
+                from fast_shared.prefix_tree import dequantize_gdn_state_block32
+
+                codes, scales, orig_dt = rs_entry
+                cache[l_idx].rec_state = dequantize_gdn_state_block32(codes, scales, out_dtype=orig_dt)
+            else:
+                cache[l_idx].rec_state = rs_entry
         return cache
 
     def _prefill_state_with_prefix_tree(
@@ -1574,8 +1600,35 @@ class KevMlxBackend:
                 want_snap = c_end in snap_positions
                 if want_snap:
                     conv_snap = tuple(mx.contiguous(cache[l_idx].conv_state) for l_idx in self._linear_layer_indices)
-                    rec_snap = tuple(mx.contiguous(cache[l_idx].rec_state) for l_idx in self._linear_layer_indices)
-                    mx.eval(h_c, *k_chunk, *v_chunk, *conv_snap, *rec_snap)
+                    use_i8_gdn = bool(getattr(self, "compress_gdn_prefix_int8", False))
+                    rec_list: list[Any] = []
+                    eval_tensors: list[Any] = [h_c, *k_chunk, *v_chunk, *conv_snap]
+                    for l_idx in self._linear_layer_indices:
+                        rs = cache[l_idx].rec_state
+                        if (
+                            use_i8_gdn
+                            and isinstance(getattr(mx, "array", None), type)
+                            and isinstance(rs, mx.array)
+                            and rs.ndim >= 1
+                            and int(rs.shape[-1]) >= 32
+                            and int(rs.shape[-1]) % 32 == 0
+                        ):
+                            from fast_shared.prefix_tree import (
+                                dequantize_gdn_state_block32,
+                                quantize_gdn_state_block32,
+                            )
+
+                            q_c, s_c = quantize_gdn_state_block32(rs)
+                            dq_rs = dequantize_gdn_state_block32(q_c, s_c, out_dtype=rs.dtype)
+                            cache[l_idx].rec_state = dq_rs
+                            rec_list.append((q_c, s_c, rs.dtype))
+                            eval_tensors.extend((q_c, s_c, dq_rs))
+                        else:
+                            rc = mx.contiguous(rs)
+                            rec_list.append(rc)
+                            eval_tensors.append(rc)
+                    rec_snap = tuple(rec_list)
+                    mx.eval(*eval_tensors)
                 else:
                     conv_snap = ()
                     rec_snap = ()

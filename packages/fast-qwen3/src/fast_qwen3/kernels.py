@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from fast_shared.grammar import compute_loop_breaker_penalties
+from fast_shared.kv_quant import (
+    SpecBucketedLinearGroup,
+    concat_compatible_linears,
+    linear_quant_spec_key,
+)
 from fast_shared.prefix_tree import (
     dequantize_gdn_state_block32,
     quantize_gdn_state_block32,
@@ -204,147 +209,6 @@ def split_linear_q_proj_to_q_gate(
         return lq, lg
 
     raise TypeError(f"Unsupported q_proj module type: {type(lin)}")
-
-
-def linear_quant_spec_key(lin: nn.Module) -> tuple[bool, int, int, bool, bool]:
-    """Return `(is_quant, bits, group_size, has_qbiases, has_linear_bias)` spec key for safe axis-0 fusion."""
-    has_lin_bias = getattr(lin, "bias", None) is not None
-    if isinstance(lin, nn.QuantizedLinear):
-        has_qb = getattr(lin, "biases", None) is not None
-        return (True, int(lin.bits), int(lin.group_size), has_qb, has_lin_bias)
-    if isinstance(lin, nn.Linear):
-        return (False, 16, 0, False, has_lin_bias)
-    raise TypeError(f"Unsupported linear module for spec-bucketing: {type(lin)}")
-
-
-def concat_compatible_linears(mods: Sequence[nn.Module]) -> nn.Module:
-    """Horizontally concatenate axis-0 rows of compatible `Linear` or `QuantizedLinear` modules (`0.0` ULP)."""
-    if len(mods) == 1:
-        return mods[0]
-    first = mods[0]
-    spec0 = linear_quant_spec_key(first)
-    for m in mods[1:]:
-        if linear_quant_spec_key(m) != spec0:
-            raise ValueError("Cannot concatenate linears with mismatched quantization specs")
-
-    is_quant, bits, group_size, has_qb, has_lin_bias = spec0
-    if is_quant:
-        in_dims = (int(first.weight.shape[1]) * 32) // bits
-        total_out = sum(int(m.weight.shape[0]) for m in mods)
-        fused = nn.QuantizedLinear(in_dims, total_out, bias=has_lin_bias, group_size=group_size, bits=bits)
-        fused.weight = mx.contiguous(mx.concatenate([m.weight for m in mods], axis=0))
-        fused.scales = mx.contiguous(mx.concatenate([m.scales for m in mods], axis=0))
-        if has_qb:
-            fused.biases = mx.contiguous(mx.concatenate([m.biases for m in mods], axis=0))
-        if has_lin_bias:
-            fused.bias = mx.contiguous(mx.concatenate([m.bias for m in mods], axis=0))
-        return fused
-
-    in_dims = int(first.weight.shape[1])
-    total_out = sum(int(m.weight.shape[0]) for m in mods)
-    fused_d = nn.Linear(in_dims, total_out, bias=has_lin_bias)
-    fused_d.weight = mx.contiguous(mx.concatenate([m.weight for m in mods], axis=0))
-    if has_lin_bias:
-        fused_d.bias = mx.contiguous(mx.concatenate([m.bias for m in mods], axis=0))
-    return fused_d
-
-
-class SpecBucketedLinearGroup(nn.Module):
-    """General arbitrary-order per-layer spec-bucketing over named projections sharing input `x`.
-
-    Handles uniform checkpoints (`1` GEMM) as well as real `OptiQ` non-contiguous mixed-bit
-    patterns such as `(4, 8, 4, 4)` in `GatedDeltaNet`, `(4, 4, 8)` / `(8, 4, 8)` in `SelfAttention`,
-    and mixed `(gate_proj, up_proj)` MLPs with `0.0` ULP quantization drift.
-    """
-
-    def __init__(
-        self,
-        named_linears: Sequence[tuple[str, nn.Module]],
-        *,
-        enable_fusion: bool = True,
-    ) -> None:
-        super().__init__()
-        if not named_linears:
-            raise ValueError("named_linears must be non-empty")
-
-        self.names: tuple[str, ...] = tuple(nm for nm, _ in named_linears)
-        if not enable_fusion:
-            self.buckets = [lin for _, lin in named_linears]
-            self._bucket_meta: list[tuple[list[str], list[int]]] = [
-                ([nm], []) for nm, _ in named_linears
-            ]
-        else:
-            grouped: OrderedDict[tuple[bool, int, int, bool, bool], list[tuple[str, nn.Module]]] = OrderedDict()
-            for nm, lin in named_linears:
-                key = linear_quant_spec_key(lin)
-                grouped.setdefault(key, []).append((nm, lin))
-
-            self.buckets = []
-            self._bucket_meta = []
-            for entries in grouped.values():
-                sub_names = [nm for nm, _ in entries]
-                sub_mods = [lin for _, lin in entries]
-                fused_mod = concat_compatible_linears(sub_mods)
-                stops: list[int] = []
-                acc = 0
-                for m in sub_mods[:-1]:
-                    acc += int(m.weight.shape[0])
-                    stops.append(acc)
-                self.buckets.append(fused_mod)
-                self._bucket_meta.append((sub_names, stops))
-
-        self._lora_stacked_A: mx.array | None = None
-        self._lora_meta: list[tuple[str, int, int, mx.array, float]] = []
-
-    @property
-    def num_gemms(self) -> int:
-        return len(self.buckets)
-
-    def clear_lora(self) -> None:
-        self._lora_stacked_A = None
-        self._lora_meta = []
-
-    def set_lora_slices(
-        self,
-        entries: Sequence[tuple[str, mx.array, mx.array, float]],
-    ) -> None:
-        """Attach hot-swappable `lora_accel` adapters (`(target_name, lora_A[r, in], lora_B[out, r], scale)`)."""
-        self.clear_lora()
-        if not entries:
-            return
-        valid_names = set(self.names)
-        a_list: list[mx.array] = []
-        meta: list[tuple[str, int, int, mx.array, float]] = []
-        offset = 0
-        for nm, la, lb, scale in entries:
-            if nm not in valid_names:
-                raise KeyError(f"Unknown target {nm!r} for SpecBucketedLinearGroup({self.names})")
-            la_bf = la.astype(mx.bfloat16)
-            lb_t = mx.contiguous(lb.astype(mx.bfloat16).T)
-            r = int(la_bf.shape[0])
-            a_list.append(la_bf)
-            meta.append((nm, offset, offset + r, lb_t, float(scale)))
-            offset += r
-        self._lora_stacked_A = mx.contiguous(mx.concatenate(a_list, axis=0).T)
-        self._lora_meta = meta
-
-    def __call__(self, x: mx.array) -> dict[str, mx.array]:
-        outputs: dict[str, mx.array] = {}
-        for bucket_mod, (sub_names, stops) in zip(self.buckets, self._bucket_meta):
-            y = bucket_mod(x)
-            if not stops:
-                outputs[sub_names[0]] = y
-            else:
-                parts = mx.split(y, stops, axis=-1)
-                for nm, part in zip(sub_names, parts):
-                    outputs[nm] = part
-
-        if self._lora_stacked_A is not None:
-            low = mx.matmul(x.astype(mx.bfloat16), self._lora_stacked_A)
-            for nm, s0, s1, lb_t, sc in self._lora_meta:
-                delta = (mx.matmul(low[..., s0:s1], lb_t) * sc).astype(outputs[nm].dtype)
-                outputs[nm] = outputs[nm] + delta
-        return outputs
 
 
 def merge_lora_weights_safe(

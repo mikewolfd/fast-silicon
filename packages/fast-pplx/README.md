@@ -39,7 +39,7 @@ with FastPplx(mode="auto", dimensions=512) as model:  # auto picks hetero2 if AN
 | What model & tokenizer behavior does it preserve? | `pplx-embed-v2-context-0.6b` (`12` layers, `full_attention_interval=2`, `+1.0` zero-centered RMSNorm shifts), matching upstream `split_special_tokens=True` (`[Q] ` = `248077`, `[D] ` = literal ordinary tokens, `<\|chunk_sep\|>` = `248079`). |
 | Why does `S > 2048` stay flat in memory? | `MappedEmbedding` keeps `embed_tokens` (~`1.02 GB`) out of Metal RAM; `S > 2048` automatically switches to streamed state-carried `GatedDeltaNet` (`1024`-tok slices) + tile-aligned `SDPA` (`512`-tok slices) — holding `32,768` tokens in **`2.690 GB`** OS footprint. |
 | How does `hetero2` combine ANE & GPU? | Short items (`<= 512` toks) pack chunk-aligned into `S{64,128,256,384,512}` Pure-ANE CoreML rings (`pipe_depth=4`, `0` CPU/GPU ops), while Metal processes `> 512` sequences concurrently and steals from tail on idle. |
-| Which ANE profile should I choose? | Default **`fast`** for peak throughput (`13.5K tok/s` at `S=128`); **`balanced`** (`MaxAbsRMSNorm` + `TanhSiLU`) closes **`73%`** of the ANE-vs-GPU cosine gap (`0.9866 -> 0.9964` corpus; `0.9909 -> 0.9988` `S=256`, `int8 MAE` `2.02 -> 0.79`) for only `4.5%–5.8%` latency cost. |
+| Which ANE profile should I choose? | Default **`balanced`** (`MaxAbsRMSNorm` + `TanhSiLU`) closes **`73%`** of the ANE-vs-GPU cosine gap (`0.9866 -> 0.9964` corpus; `0.9909 -> 0.9988` `S=256`, `int8 MAE` `2.02 -> 0.79`) for only `4.5%–5.8%` latency cost; use **`fast`** (`--ane-profile fast`) for peak throughput (`13.5K tok/s` at `S=128`). |
 
 ## Benchmark Highlights (Base M5 `24 GB` vs. M4 Pro `48 GB`)
 
@@ -72,8 +72,8 @@ Measured via `packages/fast-pplx/scripts/benchmark.py ane-profiles` in isolated 
 
 | Profile | `S=128` Base M5 (`tok/s`) | `S=128` M4 Pro (`tok/s`) | `S=256` M4 Pro (`tok/s`) | `S=256` `f32 min_cos` vs. GPU | `S=256` `int8 MAE` vs. GPU | Speed vs. `fast` |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
-| **`fast`** (default) | **`13,542`** (`1.16×` stock) | **`13,464`** (`1.54×` stock) | **`10,311`** (`1.22×` stock) | `0.9909` *(corpus `0.9866`)* | `2.02` | `1.00×` |
-| **`balanced`** (`MaxAbsRMSNorm` + `TanhSiLU`) | `12,754` | `12,856` | `9,762` | **`0.9988`** *(corpus **`0.9964`**)* | **`0.79`** | `0.94–0.95×` |
+| **`fast`** | **`13,542`** (`1.16×` stock) | **`13,464`** (`1.54×` stock) | **`10,311`** (`1.22×` stock) | `0.9909` *(corpus `0.9866`)* | `2.02` | `1.00×` |
+| **`balanced`** (`MaxAbsRMSNorm` + `TanhSiLU`, default) | `12,754` | `12,856` | `9,762` | **`0.9988`** *(corpus **`0.9964`**)* | **`0.79`** | `0.94–0.95×` |
 | **`parity`** | `12,679` | `12,496` | `9,519` | **`0.9989`** | **`0.72`** | `0.92–0.94×` |
 | Stock `pplx-context-mlx` (`fp16`) | `11,707` | `8,735` | `8,425` | `1.0000` (GPU) | — | — |
 
@@ -138,6 +138,18 @@ Validated on full-document `LegalBench-RAG` (`Tier-1`: `175` queries / `796` chu
 | `context_tokens=2048 + rep=128 + overlap=1` | `0.7326` / `0.8976` | `0.6887` / `0.8550` | `0.9926` | `96.3s` / `1650.1 MB` | opt-in only (`+16.5%` wall) |
 
 `embed_contextual_parquet` and `fast-pplx parquet --context-tokens` default to `repeat_header_tokens=128` for `context_tokens >= 512` (disable via `--repeat-header-tokens 0`), support explicit `--header-text` / `--header-col` and opt-in `--window-overlap-chunks`, and slice off injected prefix/overlap rows before Parquet write so emitted rows stay strictly `1:1` with unique source chunks.
+
+### 7. `v2.5` Multi-Vector `MaxSim`, `CompactRetrievalIndex` & `bin1024 -> 1024d INT8` Rerank
+
+`FastPplx` sets `is_mrl_trained = False` (because `512d` truncation drops `-3.73 pp` on `LegalBench-Ctx` and `-3.10 pp` on `NanoSciFact` vs `+0.38 pp` on MRL-trained `FastEmbeddingGemma2`) and shares `fast_shared.retrieval_index.CompactRetrievalIndex` across `encode_documents_multivector(...)` and `build_index(...)`:
+
+| Retrieval / Storage Mode (`M4 Pro`, `N=500` `LongEmbed` / `N=325` `Tier-1`) | Quality vs `FP32` Single-Vec | Storage / Footprint | Speedup & Notes |
+| :--- | :---: | :---: | :--- |
+| **`encode_documents_multivector` (`window_tokens=1024, context_tokens=2048, rep=128`, `MaxSim`)** | **`32K passkey`: `0.0470 -> 1.0000` split (`0.6743` pooled, `R@10=1.000`)** · **`2wikimqa`: `0.8945 -> 0.9851`** (`N=500`: `0.7510 -> 0.8452` pooled / `0.9911` split) | `15.97 KiB/doc` (`1024d INT8`, `0.0000` loss vs `FP32`); `1.72 GB` Metal peak (**`2.48×` lower** than `4.27 GB` `32K`) | **`2.31×` faster GPU encode** (`955.4s` vs `2205.5s`) by replacing `O(32768^2)` full attention with `2K` contextual windows |
+| **Symmetric `1024d INT8` (`mode="auto"` / `"int8"`)** | **`+0.0000` `NanoBEIR`** `[-0.0020, +0.0007]`, **`-0.0012` `LB-Ctx`** `[-0.0029, +0.0005]` (**PASS** `<= 0.003`, `2.6–6.8×` lower error than `native_tanh_int8`) | `1,026 B/vec` (**`4.0×` smaller**) | NEON `vdotq_s32` dot scoring; enforced automatically by `CorpusBackfillConfig.for_engine(engine)` (`mrl_dim=None`) |
+| **NEON `bin1024 -> Top-64 -> 1024d INT8` (`mode="binary_int8"`)** | **`+0.0006` `NanoBEIR`**, **`-0.0012` `LB-Ctx`** (**PASS** `<= 0.003` lossless gate) | `128 B` hot binary scan (`32×` smaller) + `1,026 B` `INT8` (`3.55×` total) | **`0.027 ms/q`** (`7.6×` faster) · **`0.606 ms/q` single-thread @ `100K` docs** (`1.70 ms` M5 / `6.43 ms` M4 on `72`-window `multivector=True` `MaxSim`) |
+| **FFD `pack_ane_buckets` + Host-Aware `hetero2` + Async Parquet (`T4.1–T4.3`)** | Exact deterministic row/vector parity (`resume=True` + `.tmp` cleanup) | **`26` vs `32` ANE bins (`-18.8%`)**, **`648` vs `1,638` pad toks (`-60.4%`)** | Mixed-64 **`19,443 tok/s`** M5 (`1.17×` vs GPU) / **`17,793 tok/s`** M4 (**`1.84×`** vs GPU); `S>512` (`768`/`1024`) ANE gated out (M4 GPU fallback, M5 GPU `1.40×` faster) |
+| **Opt-In `quantize_weights="w8"` (`T4.4`, `--quantize-weights w8`)** | `16`-case `min_f32_cos = 0.99883` (`mean = 0.99970`) | **`460.8 -> 247.0 MB` (`-46.4%` active linear weights)** | `0.94–0.95×` FP16 speed on M5 (`15,628` vs `16,419 tok/s` @ `16×2048`), saving `~214 MB` for `24 GB` multi-model co-residency (`default="none"`) |
 
 ## What keeps it fast
 

@@ -51,8 +51,10 @@ test-cpu: hw-check
 		packages/fast-shared/tests/test_croq_extractconf_cpu.py \
 		packages/fast-shared/tests/test_ane_ffn_cpu.py \
 		packages/fast-shared/tests/test_v23_track_b_cpu.py \
+		packages/fast-shared/tests/test_rd_winners_cpu.py \
 		packages/fast-shared/tests/test_bench_memory.py \
 		packages/fast-decision-models/tests/test_decision_models_cpu.py \
+		packages/fast-decision-models/tests/test_prefix_tree_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \
 		packages/fast-gpt-oss/tests/test_fast_gpt_oss.py \
 		packages/fast-gpt-oss/tests/test_v23_track_c_gpt_oss_regressions.py \

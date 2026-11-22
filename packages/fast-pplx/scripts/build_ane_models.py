@@ -1654,7 +1654,7 @@ def main() -> None:
         "--ane-profile",
         default=None,
         choices=list(VALID_ANE_PROFILES),
-        help="Preset ANE speed/parity profile: 'fast' (silu+prescale, default), 'balanced' (tanh_gdn+max_abs), "
+        help="Preset ANE speed/parity profile: 'balanced' (tanh_gdn+max_abs, default), 'fast' (silu+prescale), "
         "or 'parity' (tanh_all+max_abs). 'parity'/'balanced' is recommended for --dtype int8 or --dimensions 128 "
         "(prescale 1/64 inflates 2^-14 to 0.25 unscaled eps). Explicit --silu-mode/--rmsnorm-mode override the preset.",
     )
@@ -1662,13 +1662,13 @@ def main() -> None:
         "--silu-mode",
         default=None,
         choices=list(VALID_SILU_MODES),
-        help="ANE SiLU op variant: 'silu' (default speed), 'tanh_gdn', or 'tanh_all' (max parity).",
+        help="ANE SiLU op variant: 'silu', 'tanh_gdn' (default via balanced profile), or 'tanh_all' (max parity).",
     )
     parser.add_argument(
         "--rmsnorm-mode",
         default=None,
         choices=list(VALID_RMSNORM_MODES),
-        help="Channel RMSNorm scaling: 'prescale' (default) or 'max_abs' (overflow-safe dynamic scaling).",
+        help="Channel RMSNorm scaling: 'prescale' or 'max_abs' (default via balanced profile; overflow-safe).",
     )
     parser.add_argument("--ftz-alpha", type=float, default=DEFAULT_FTZ_ALPHA)
     parser.add_argument("--calib-stats", type=Path, default=None)

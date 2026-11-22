@@ -13,6 +13,7 @@ import numpy as np
 
 from fast_shared.bench import clear_mlx_arena
 from fast_shared.embeddings import set_mlx_cache_limit
+from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
 from .gpu import FastBgeSmallGPU, pack_sequences
 from .paths import load_or_mmap_host_tables, require_runtime_paths
@@ -160,6 +161,8 @@ class FastBgeSmall:
     """Heterogeneous Apple Silicon BGE-small-en-v1.5 engine (Metal GPU + 16-core ANE)."""
 
     dim: int = 384
+    max_dim: int = 384
+    is_mrl_trained: bool = False
     model_name: str = "BAAI/bge-small-en-v1.5"
     max_seq_len: int = 512
     ane_query_max_len: int = 512
@@ -678,3 +681,47 @@ class FastBgeSmall:
                 "ane_toks": state["ane_toks"],
             }
             return out
+
+    def encode_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        mode: str | None = None,
+    ) -> np.ndarray:
+        """Encode document strings `[N]` into `[N, 384]` L2-normalized float32 embeddings."""
+        items = list(texts)
+        if not items:
+            return np.empty((0, 384), dtype=np.float32)
+        return self.encode_texts(items, is_query=False, add_query_prefix=False, mode=mode)
+
+    def build_index(
+        self,
+        corpus: Sequence[str] | Sequence[Sequence[int]] | np.ndarray,
+        *,
+        doc_offsets: np.ndarray | Sequence[int] | None = None,
+        mode: IndexMode = "auto",
+        mrl_dim: int | None = None,
+        binary_bits: int | None = None,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+        encode_mode: str | None = None,
+    ) -> CompactRetrievalIndex:
+        """Build a `CompactRetrievalIndex` (`384d int8` `4.0x` lossless default, or `binary_int8` / `MaxSim`)."""
+        if isinstance(corpus, np.ndarray):
+            vecs = corpus
+        elif not corpus:
+            vecs = np.empty((0, 384), dtype=np.float32)
+        elif isinstance(corpus[0], str):
+            vecs = self.encode_documents(corpus, mode=encode_mode)  # type: ignore[arg-type]
+        else:
+            vecs = self.encode_corpus(corpus, mode=encode_mode)  # type: ignore[arg-type]
+        return CompactRetrievalIndex(
+            vecs,
+            doc_offsets=list(doc_offsets) if doc_offsets is not None and not isinstance(doc_offsets, np.ndarray) else doc_offsets,
+            mode=mode,
+            is_mrl_trained=self.is_mrl_trained,
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
+        )

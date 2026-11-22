@@ -16,6 +16,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from fast_shared.kv_quant import (
+    KVMode,
+    QuantizedKVCache,
+    get_hadamard_bank,
+    normalize_kv_mode,
+)
+
 from .kernels import (
     RMSNormGated,
     SpecBucketedLinearGroup,
@@ -225,100 +232,175 @@ class DeltaSlotCache:
 
 
 class GrowingKVCache:
-    """Chunk-allocated `O(1)` decode KV cache with optional per-position `INT8` compression and `rewind_to`."""
+    """Chunk-allocated `O(1)` decode KV cache supporting `bf16`, fused-`qmm` `q8`, and `q4_quarot`."""
 
-    def __init__(self, step: int = 256, *, kv_i8: bool = False) -> None:
-        self.step = int(step)
-        self.kv_i8 = bool(kv_i8)
+    def __init__(self, step: int = 256, *, kv_i8: bool | str = False) -> None:
+        self.step: int = int(step)
+        self.kv_mode: KVMode = normalize_kv_mode(kv_i8)
+        self.kv_i8: bool = self.kv_mode != "bf16"
+        self.use_quarot: bool = self.kv_mode == "q4_quarot"
         self.keys: mx.array | None = None
         self.values: mx.array | None = None
         self.k_scales: mx.array | None = None
         self.v_scales: mx.array | None = None
-        self.offset: int = 0
+        self._offset: int = 0
+        self._qcache: QuantizedKVCache | None = (
+            QuantizedKVCache(
+                step=self.step,
+                bits=4 if self.use_quarot else 8,
+                group_size=64,
+                use_quarot=self.use_quarot,
+            )
+            if self.kv_mode != "bf16"
+            else None
+        )
+
+    @property
+    def offset(self) -> int:
+        return self._qcache.offset if self._qcache is not None else self._offset
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        val = int(value)
+        if self._qcache is not None:
+            self._qcache.offset = val
+        else:
+            self._offset = val
 
     def _ensure_capacity(self, b: int, h_kv: int, needed: int, d: int, dtype: mx.Dtype) -> int:
-        prev = self.offset
-        if not self.kv_i8:
-            if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
-                alloc = ((needed + self.step - 1) // self.step) * self.step
-                new_k = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
-                new_v = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
-                if self.keys is not None and prev > 0 and int(self.keys.shape[0]) == b:
-                    new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
-                    new_v[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
-                self.keys = new_k
-                self.values = new_v
-            return prev
+        prev = self._offset
         if self.keys is None or needed > int(self.keys.shape[2]) or int(self.keys.shape[0]) != b:
             alloc = ((needed + self.step - 1) // self.step) * self.step
-            new_kq = mx.zeros((b, h_kv, alloc, d), dtype=mx.int8)
-            new_vq = mx.zeros((b, h_kv, alloc, d), dtype=mx.int8)
-            new_ks = mx.zeros((b, h_kv, alloc, 1), dtype=mx.bfloat16)
-            new_vs = mx.zeros((b, h_kv, alloc, 1), dtype=mx.bfloat16)
+            new_k = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
+            new_v = mx.zeros((b, h_kv, alloc, d), dtype=dtype)
             if self.keys is not None and prev > 0 and int(self.keys.shape[0]) == b:
-                new_kq[:, :, :prev, :] = self.keys[:, :, :prev, :]
-                new_vq[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
-                new_ks[:, :, :prev, :] = self.k_scales[:, :, :prev, :]  # type: ignore[index]
-                new_vs[:, :, :prev, :] = self.v_scales[:, :, :prev, :]  # type: ignore[index]
-            self.keys, self.values = new_kq, new_vq
-            self.k_scales, self.v_scales = new_ks, new_vs
+                new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
+                new_v[:, :, :prev, :] = self.values[:, :, :prev, :]  # type: ignore[index]
+            self.keys = new_k
+            self.values = new_v
         return prev
 
     def _write_bf16(self, k: mx.array, v: mx.array) -> int:
+        if self._qcache is not None:
+            return self._qcache.write(k, v)
         b, h_kv, s, d = k.shape
-        needed = self.offset + s
+        needed = self._offset + s
         prev = self._ensure_capacity(b, h_kv, needed, d, k.dtype)
         assert self.keys is not None and self.values is not None
-        if not self.kv_i8:
-            self.keys[:, :, prev:needed, :] = k
-            self.values[:, :, prev:needed, :] = v
-        else:
-            assert self.k_scales is not None and self.v_scales is not None
-            kf, vf = k.astype(mx.float32), v.astype(mx.float32)
-            ks_s = mx.maximum(mx.max(mx.abs(kf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
-            vs_s = mx.maximum(mx.max(mx.abs(vf), axis=-1, keepdims=True) * (1.0 / 127.0), 1e-8)
-            self.keys[:, :, prev:needed, :] = mx.clip(mx.round(kf / ks_s), -127.0, 127.0).astype(mx.int8)
-            self.values[:, :, prev:needed, :] = mx.clip(mx.round(vf / vs_s), -127.0, 127.0).astype(mx.int8)
-            self.k_scales[:, :, prev:needed, :] = ks_s.astype(mx.bfloat16)
-            self.v_scales[:, :, prev:needed, :] = vs_s.astype(mx.bfloat16)
-        self.offset = needed
+        self.keys[:, :, prev:needed, :] = k
+        self.values[:, :, prev:needed, :] = v
+        self._offset = needed
         return needed
 
-    def append_cached_bf16(self, k: mx.array, v: mx.array) -> None:
-        """Append prefilled `BF16` KV slices during prefix restore without materializing attention buffers."""
+    def append_cached_bf16(self, k: mx.array, v: mx.array, *, src_quarot: bool = False) -> None:
+        """Append prefilled `BF16` KV slices during prefix restore, adjusting `QuaRot` basis if needed."""
+        if src_quarot != self.use_quarot:
+            bank = get_hadamard_bank(int(k.shape[-1]))
+            k = bank.transform(k, inverse=src_quarot)
+            v = bank.transform(v, inverse=src_quarot)
         self._write_bf16(k, v)
 
     def append_cached_i8(self, kq: mx.array, ks: mx.array, vq: mx.array, vs: mx.array) -> None:
-        """Append already-quantized `INT8` KV + `BF16` scales directly into `kv_i8` cache (0 double-quant)."""
-        if not self.kv_i8:
-            k_bf = kq.astype(mx.bfloat16) * ks.astype(mx.bfloat16)
-            v_bf = vq.astype(mx.bfloat16) * vs.astype(mx.bfloat16)
-            self._write_bf16(k_bf, v_bf)
+        """Legacy helper converting symmetric `INT8` + `BF16` scale slices into the active cache."""
+        k_bf = kq.astype(mx.bfloat16) * ks.astype(mx.bfloat16)
+        v_bf = vq.astype(mx.bfloat16) * vs.astype(mx.bfloat16)
+        self.append_cached_bf16(k_bf, v_bf, src_quarot=False)
+
+    def extract_chunk_payload(self, start: int, end: int) -> tuple[Any, ...]:
+        """Extract `[start:end]` KV chunk payload for `PrefixTree` (`0` dequantization)."""
+        if self._qcache is not None:
+            kw, ks, kb, vw, vs, vb = self._qcache.slice_quantized(start, end)
+            mx.eval(kw, ks, kb, vw, vs, vb)  # guard: allow-eval
+            return (self.kv_mode.encode("ascii"), kw, ks, kb, vw, vs, vb)
+        assert self.keys is not None and self.values is not None
+        kc = mx.contiguous(self.keys[:, :, start:end, :])
+        vc = mx.contiguous(self.values[:, :, start:end, :])
+        mx.eval(kc, vc)  # guard: allow-eval
+        return (kc, vc)
+
+    def append_chunk_payloads(self, chunks: Sequence[tuple[Any, ...]]) -> None:
+        """Restore concatenated `PrefixTree` KV chunks (`0` double-quantization when modes match)."""
+        if not chunks:
             return
-        b, h_kv, s, d = kq.shape
-        needed = self.offset + s
-        prev = self._ensure_capacity(b, h_kv, needed, d, mx.bfloat16)
-        assert self.keys is not None and self.values is not None and self.k_scales is not None and self.v_scales is not None
-        self.keys[:, :, prev:needed, :] = kq
-        self.values[:, :, prev:needed, :] = vq
-        self.k_scales[:, :, prev:needed, :] = ks
-        self.v_scales[:, :, prev:needed, :] = vs
-        self.offset = needed
+        sample = chunks[0]
+        if len(sample) == 7 and isinstance(sample[0], (bytes, str)):
+            src_mode = sample[0].decode("ascii") if isinstance(sample[0], bytes) else str(sample[0])
+            kw_cat = mx.concatenate([ch[1] for ch in chunks], axis=2)
+            ks_cat = mx.concatenate([ch[2] for ch in chunks], axis=2)
+            kb_cat = mx.concatenate([ch[3] for ch in chunks], axis=2)
+            vw_cat = mx.concatenate([ch[4] for ch in chunks], axis=2)
+            vs_cat = mx.concatenate([ch[5] for ch in chunks], axis=2)
+            vb_cat = mx.concatenate([ch[6] for ch in chunks], axis=2)
+            if self._qcache is not None and src_mode == self.kv_mode:
+                self._qcache.append_cached_quantized(kw_cat, ks_cat, kb_cat, vw_cat, vs_cat, vb_cat)
+                return
+            src_bits = 4 if src_mode == "q4_quarot" else 8
+            k_dq = mx.dequantize(kw_cat, ks_cat, kb_cat, group_size=64, bits=src_bits, dtype=mx.bfloat16)
+            v_dq = mx.dequantize(vw_cat, vs_cat, vb_cat, group_size=64, bits=src_bits, dtype=mx.bfloat16)
+            self.append_cached_bf16(k_dq, v_dq, src_quarot=(src_mode == "q4_quarot"))
+            return
+        if len(sample) == 4:
+            kq_cat = mx.concatenate([ch[0] for ch in chunks], axis=2)
+            ks_cat = mx.concatenate([ch[1] for ch in chunks], axis=2)
+            vq_cat = mx.concatenate([ch[2] for ch in chunks], axis=2)
+            vs_cat = mx.concatenate([ch[3] for ch in chunks], axis=2)
+            self.append_cached_i8(kq_cat, ks_cat, vq_cat, vs_cat)
+            return
+        k_cat = mx.concatenate([ch[0] for ch in chunks], axis=2)
+        v_cat = mx.concatenate([ch[1] for ch in chunks], axis=2)
+        self.append_cached_bf16(k_cat, v_cat, src_quarot=False)
 
     def update_and_fetch(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
         needed = self._write_bf16(k, v)
+        if self._qcache is not None:
+            return self._qcache.fetch_dequantized(out_dtype=k.dtype)
         assert self.keys is not None and self.values is not None
-        if not self.kv_i8:
-            return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
-        assert self.k_scales is not None and self.v_scales is not None
-        k_out = self.keys[:, :, :needed, :].astype(k.dtype) * self.k_scales[:, :, :needed, :].astype(k.dtype)
-        v_out = self.values[:, :, :needed, :].astype(v.dtype) * self.v_scales[:, :, :needed, :].astype(v.dtype)
-        return k_out, v_out
+        return self.keys[:, :, :needed, :], self.values[:, :, :needed, :]
+
+    def attend(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        *,
+        scale: float,
+        mask: str | mx.array | None = "causal",
+        use_apple10_force_fused: bool = False,
+    ) -> mx.array:
+        """Write `(k, v)` and execute `fused_quantized_sdpa` (`q8`/`q4_quarot`) or `BF16` Flash SDPA."""
+        if self._qcache is not None:
+            return self._qcache.attend(
+                q,
+                k,
+                v,
+                scale=scale,
+                mask=mask,
+                use_apple10_force_fused=use_apple10_force_fused,
+            )
+        k_all, v_all = self.update_and_fetch(k, v)
+        s_len = int(q.shape[2])
+        eff_mask: str | mx.array | None = None if (s_len == 1 and mask == "causal") else mask
+        if use_apple10_force_fused and int(q.shape[-1]) == 256:
+            return mx.fast.scaled_dot_product_attention(
+                q, k_all, v_all, scale=scale, mask=eff_mask, force_fused=True
+            )
+        return mx.fast.scaled_dot_product_attention(q, k_all, v_all, scale=scale, mask=eff_mask)
+
+    def active_nbytes(self) -> int:
+        if self._qcache is not None:
+            return self._qcache.active_nbytes()
+        if self.keys is None or self._offset <= 0:
+            return 0
+        off = self._offset
+        return int(self.keys[:, :, :off, :].nbytes + self.values[:, :, :off, :].nbytes)  # type: ignore[index]
 
     def rewind_to(self, new_offset: int) -> None:
-        if new_offset < 0 or new_offset > self.offset:
-            raise ValueError(f"Invalid rewind offset {new_offset} for current offset {self.offset}")
-        self.offset = int(new_offset)
+        if self._qcache is not None:
+            self._qcache.rewind_to(new_offset)
+            return
+        if new_offset < 0 or new_offset > self._offset:
+            raise ValueError(f"Invalid rewind offset {new_offset} for current offset {self._offset}")
+        self._offset = int(new_offset)
 
 
 @dataclass(frozen=True)
@@ -352,17 +434,17 @@ def snapshot_hybrid_cache(
                 saved.append(("gdn_raw", conv, rec))
         elif isinstance(entry, GrowingKVCache):
             off = entry.offset
-            if entry.keys is not None and off > 0:
-                if entry.kv_i8 and entry.k_scales is not None and entry.v_scales is not None:
-                    ks = mx.contiguous(entry.keys[:, :, :off, :].astype(mx.bfloat16) * entry.k_scales[:, :, :off, :])
-                    vs = mx.contiguous(entry.values[:, :, :off, :].astype(mx.bfloat16) * entry.v_scales[:, :, :off, :])
-                else:
-                    ks = mx.contiguous(entry.keys[:, :, :off, :])
-                    vs = mx.contiguous(entry.values[:, :, :off, :])  # type: ignore[index]
+            if off > 0 and entry._qcache is not None and entry._qcache.k_w is not None:
+                kw, ks, kb, vw, vs, vb = entry._qcache.slice_quantized(0, off)
+                mx.eval(kw, ks, kb, vw, vs, vb)
+                saved.append(("kv_q", entry.kv_mode, off, kw, ks, kb, vw, vs, vb))
+            elif off > 0 and entry.keys is not None:
+                ks = mx.contiguous(entry.keys[:, :, :off, :])
+                vs = mx.contiguous(entry.values[:, :, :off, :])  # type: ignore[index]
                 mx.eval(ks, vs)
+                saved.append(("kv", off, ks, vs))
             else:
-                ks, vs = None, None
-            saved.append(("kv", off, ks, vs))
+                saved.append(("kv", 0, None, None))
         else:
             raise TypeError(f"Unexpected cache entry {type(entry)}")
     return HybridPrefixSnapshot(prefix_tokens=tuple(int(t) for t in prefix_tokens), layer_states=tuple(saved))
@@ -373,7 +455,7 @@ def restore_hybrid_cache(
     *,
     batch_size: int = 1,
     kv_step: int = 256,
-    kv_i8: bool = False,
+    kv_i8: bool | str = False,
 ) -> list[DeltaSlotCache | GrowingKVCache]:
     """Materialize an isolated `B=batch_size` hybrid cache from a `HybridPrefixSnapshot`."""
     b = max(1, int(batch_size))
@@ -395,13 +477,33 @@ def restore_hybrid_cache(
             c_b = mx.repeat(conv, b, axis=0) if (conv is not None and b > 1) else conv
             r_b = mx.repeat(rec1, b, axis=0) if b > 1 else rec1
             restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b))
+        elif kind == "kv_q":
+            _, src_mode, off, kw, ks, kb, vw, vs, vb = item
+            kv = GrowingKVCache(step=kv_step, kv_i8=kv_i8)
+            if off > 0:
+                if kv._qcache is not None and kv.kv_mode == src_mode:
+                    kw_b = mx.repeat(kw, b, axis=0) if b > 1 else kw
+                    ks_b = mx.repeat(ks, b, axis=0) if b > 1 else ks
+                    kb_b = mx.repeat(kb, b, axis=0) if b > 1 else kb
+                    vw_b = mx.repeat(vw, b, axis=0) if b > 1 else vw
+                    vs_b = mx.repeat(vs, b, axis=0) if b > 1 else vs
+                    vb_b = mx.repeat(vb, b, axis=0) if b > 1 else vb
+                    kv._qcache.append_cached_quantized(kw_b, ks_b, kb_b, vw_b, vs_b, vb_b)
+                else:
+                    src_bits = 4 if src_mode == "q4_quarot" else 8
+                    k_dq = mx.dequantize(kw, ks, kb, group_size=64, bits=src_bits, dtype=mx.bfloat16)
+                    v_dq = mx.dequantize(vw, vs, vb, group_size=64, bits=src_bits, dtype=mx.bfloat16)
+                    kb_bf = mx.repeat(k_dq, b, axis=0) if b > 1 else k_dq
+                    vb_bf = mx.repeat(v_dq, b, axis=0) if b > 1 else v_dq
+                    kv.append_cached_bf16(kb_bf, vb_bf, src_quarot=(src_mode == "q4_quarot"))
+            restored.append(kv)
         elif kind == "kv":
             _, off, ks, vs = item
             kv = GrowingKVCache(step=kv_step, kv_i8=kv_i8)
             if ks is not None and vs is not None and off > 0:
                 kb = mx.repeat(ks, b, axis=0) if b > 1 else ks
                 vb = mx.repeat(vs, b, axis=0) if b > 1 else vs
-                kv.update_and_fetch(kb, vb)
+                kv.append_cached_bf16(kb, vb, src_quarot=False)
             restored.append(kv)
         else:
             raise ValueError(f"Unknown snapshot kind {kind!r}")
@@ -976,31 +1078,42 @@ class FullAttentionLayer(nn.Module):
         v = parts["v"].reshape(b_sz, s_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         gate = parts["gate"]
 
+        use_quarot = bool(cache is not None and getattr(cache, "use_quarot", False))
         if rope_trig is not None:
             cos_a, sin_a = rope_trig
             q = apply_partial_rope_trig(q, cos_a, sin_a, self.rot_dims)
             k = apply_partial_rope_trig(k, cos_a, sin_a, self.rot_dims)
+            if use_quarot:
+                bank = get_hadamard_bank(self.head_dim)
+                qkv = bank.transform(mx.concatenate([q, k, v], axis=1), inverse=False)
+                q, k, v = mx.split(qkv, [self.num_q_heads, self.num_q_heads + self.num_kv_heads], axis=1)
         elif cache is not None:
-            # Cached inference: fuse [Q, K] into 1 RoPE kernel launch
+            # Cached inference: fuse [Q, K] into 1 RoPE kernel launch (+ [Q, K, V] single-launch FWHT-64 under QuaRot)
             qk = mx.concatenate([q, k], axis=1)
             qk = self.rope(qk, offset=cache.offset)
-            q, k = mx.split(qk, [self.num_q_heads], axis=1)
+            if use_quarot:
+                bank = get_hadamard_bank(self.head_dim)
+                qkv = bank.transform(mx.concatenate([qk, v], axis=1), inverse=False)
+                q, k, v = mx.split(qkv, [self.num_q_heads, self.num_q_heads + self.num_kv_heads], axis=1)
+            else:
+                q, k = mx.split(qk, [self.num_q_heads], axis=1)
         else:
             # Training / uncached (`cache is None`): keep Q and K RoPE separate to avoid MLX 0.32.4 B=1 split VJP bug
             q = self.rope(q)
             k = self.rope(k)
 
         if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-            eff_mask: str | mx.array | None = None if (s_len == 1 and attn_mask == "causal") else attn_mask
-            if self._use_apple10_force_fused and self.head_dim == 256:
-                attn_out = mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=self.scale, mask=eff_mask, force_fused=True
-                )
-            else:
-                attn_out = mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=self.scale, mask=eff_mask
-                )
+            attn_out = cache.attend(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                mask=attn_mask,
+                use_apple10_force_fused=self._use_apple10_force_fused,
+            )
+            if use_quarot:
+                # CRITICAL ALGEBRAIC INVARIANT: invert V FWHT-64 BEFORE elementwise `fused_sigmoid_attn_gate`!
+                attn_out = get_hadamard_bank(self.head_dim).transform(attn_out, inverse=True)
         else:
             # Training / uncached path: bypass Apple10 D=256 SDPA VJP NaNs when head_dim >= 256
             if self.head_dim >= 256:
@@ -1245,7 +1358,7 @@ class FastQwen3Model(nn.Module):
             return int(self.lm_head.weight.shape[0])
         return int(self.cfg.vocab_size)
 
-    def make_cache(self, *, kv_step: int = 256, kv_i8: bool = False) -> list[DeltaSlotCache | GrowingKVCache]:
+    def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False) -> list[DeltaSlotCache | GrowingKVCache]:
         return [
             DeltaSlotCache() if layer.is_linear else GrowingKVCache(step=kv_step, kv_i8=kv_i8)
             for layer in self.layers

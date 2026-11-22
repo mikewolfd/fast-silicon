@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import struct
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from fast_shared.embeddings import resolve_embedding_dim, truncate_and_normalize
+from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
 from .gpu import FastPplxGPU, _find_local_hf_snapshot, _resolve_max_length, get_mlx_runtime_telemetry
@@ -28,6 +31,30 @@ DEFAULT_ROPE_HALF = 32
 DEFAULT_PIPE_DEPTH = 4
 DEFAULT_ANE_MAX_SEQ_LEN = 512
 _VALID_MODES: tuple[str, ...] = ("auto", "gpu", "ane", "hetero", "hetero2")
+_VALID_PACK_STRATEGIES: tuple[str, ...] = ("ffd", "sequential")
+
+
+def resolve_hetero_schedule(
+    *,
+    is_apple10: bool,
+    batch_size: int,
+    pipe_depth: int,
+) -> tuple[int, int, int, int, int]:
+    """Return host-aware `(ane_chunk_take, steal_min_chunk, steal_cap, steal_num, steal_den)` for `hetero2`.
+
+    Base M5 (`Apple10` NAX) runs Metal GPU ~1.8x faster than M4 Pro (`Apple9`), so M5 GPU steals
+    earlier (down to smaller tail thresholds) in larger batches while ANE pulls lighter bites.
+    """
+    bs = max(1, int(batch_size))
+    pd = max(1, int(pipe_depth))
+    if is_apple10:
+        ane_take = max(4, min(8, pd * 2 - 2 if pd >= 4 else pd * 2))
+        steal_min = max(2, min(bs, 6))
+        steal_cap = max(bs * 2, 16)
+        return ane_take, steal_min, steal_cap, 2, 3
+    ane_take = max(8, pd * 2)
+    steal_min = max(4, min(bs, 16))
+    return ane_take, steal_min, bs, 1, 2
 
 
 class _PplxSlotBuffers(ctypes.Structure):
@@ -72,19 +99,68 @@ class _BucketStagingSlot:
     h_out_u16: np.ndarray
 
 
+def _append_packed_targets(
+    targets: list[PackedSpanTarget],
+    orig_idx: int,
+    n_tok: int,
+    start: int,
+    spans: Sequence[tuple[int, int]] | None,
+) -> None:
+    if spans is None:
+        targets.append(PackedSpanTarget(orig_idx, 0, start, start + n_tok))
+        return
+    for c_idx, (s0, s1) in enumerate(spans):
+        if s1 > s0:
+            targets.append(PackedSpanTarget(orig_idx, c_idx, start + int(s0), start + min(int(s1), n_tok)))
+        else:
+            targets.append(PackedSpanTarget(orig_idx, c_idx, 0, 0))
+
+
+def _finalize_packed_bin(
+    cur_toks: list[tuple[int, Sequence[int], int]],
+    cur_targets: list[PackedSpanTarget],
+    cur_pos: int,
+    doc_slot: int,
+    caps: tuple[int, ...],
+) -> PackedBucket:
+    max_cap = caps[-1]
+    cap = next((c for c in caps if c >= max(1, cur_pos)), max_cap)
+    tok_arr = np.zeros((cap,), dtype=np.int32)
+    doc_arr = np.full((cap,), -1, dtype=np.int32)
+    pos_arr = np.zeros((cap,), dtype=np.int32)
+    for st, ids, d_slot in cur_toks:
+        ln = len(ids)
+        if ln > 0:
+            tok_arr[st : st + ln] = np.asarray(ids, dtype=np.int32)
+            doc_arr[st : st + ln] = d_slot
+            pos_arr[st : st + ln] = np.arange(ln, dtype=np.int32)
+    return PackedBucket(
+        seq_len=cap,
+        token_ids=tok_arr,
+        doc_ids=doc_arr,
+        pos_ids=pos_arr,
+        targets=cur_targets,
+        n_docs=doc_slot,
+        used_tokens=cur_pos,
+    )
+
+
 def pack_ane_buckets(
     items: Sequence[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]],
     *,
     supported_caps: Sequence[int],
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     conv_gap: int = 3,
+    strategy: Literal["ffd", "sequential"] = "ffd",
 ) -> list[PackedBucket]:
     """Pack short `<= max_cap` token sequences into fixed ANE buckets with strict doc isolation.
 
-    Each packed document after the first starts at a `chunk_size` boundary with at least
-    `conv_gap` (`3` for `conv1d(k=4)`) zero-pad tokens after the previous document end.
-    `doc_ids[pad] = -1`, `pos_ids` reset to `0..L-1` per doc, and empty spans stay `(0, 0)`.
+    Defaults to First-Fit Decreasing (`strategy='ffd'`) across open buckets to maximize slot
+    density while preserving `conv_gap >= 3` zero-pad boundaries (`doc_ids[pad] = -1`), chunk
+    alignment, exact `PackedSpanTarget` item/chunk indices, and empty-doc targets.
     """
+    if strategy not in _VALID_PACK_STRATEGIES:
+        raise ValueError(f"Unsupported pack strategy {strategy!r}; choose from {_VALID_PACK_STRATEGIES}")
     caps = tuple(sorted(int(c) for c in supported_caps))
     if not caps:
         raise ValueError("supported_caps must be non-empty")
@@ -92,87 +168,95 @@ def pack_ane_buckets(
     if not items:
         return []
 
-    buckets: list[PackedBucket] = []
-    cur_pos = 0
-    doc_slot = 0
-    cur_toks: list[tuple[int, Sequence[int], int]] = []  # (start, ids, doc_slot)
-    cur_targets: list[PackedSpanTarget] = []
+    def _next_aligned_start(cur_pos: int, doc_slot: int) -> int:
+        if doc_slot == 0:
+            return 0
+        min_next = cur_pos + conv_gap
+        return ((min_next + chunk_size - 1) // chunk_size) * chunk_size
 
-    def _select_cap(used: int) -> int:
-        for cap in caps:
-            if cap >= used:
-                return cap
-        return max_cap
-
-    def _flush() -> None:
-        nonlocal cur_pos, doc_slot, cur_toks, cur_targets
-        if not cur_toks and not cur_targets:
-            return
-        cap = _select_cap(max(1, cur_pos))
-        tok_arr = np.zeros((cap,), dtype=np.int32)
-        doc_arr = np.full((cap,), -1, dtype=np.int32)
-        pos_arr = np.zeros((cap,), dtype=np.int32)
-        for st, ids, d_slot in cur_toks:
-            ln = len(ids)
-            if ln > 0:
-                tok_arr[st : st + ln] = np.asarray(ids, dtype=np.int32)
-                doc_arr[st : st + ln] = d_slot
-                pos_arr[st : st + ln] = np.arange(ln, dtype=np.int32)
-        buckets.append(
-            PackedBucket(
-                seq_len=cap,
-                token_ids=tok_arr,
-                doc_ids=doc_arr,
-                pos_ids=pos_arr,
-                targets=cur_targets,
-                n_docs=doc_slot,
-                used_tokens=cur_pos,
-            )
-        )
+    if strategy == "sequential":
+        buckets: list[PackedBucket] = []
         cur_pos = 0
         doc_slot = 0
-        cur_toks = []
-        cur_targets = []
+        cur_toks: list[tuple[int, Sequence[int], int]] = []
+        cur_targets: list[PackedSpanTarget] = []
 
+        def _flush_seq() -> None:
+            nonlocal cur_pos, doc_slot, cur_toks, cur_targets
+            if not cur_toks and not cur_targets:
+                return
+            buckets.append(_finalize_packed_bin(cur_toks, cur_targets, cur_pos, doc_slot, caps))
+            cur_pos = 0
+            doc_slot = 0
+            cur_toks = []
+            cur_targets = []
+
+        for orig_idx, tok_ids, spans in items:
+            n_tok = len(tok_ids)
+            if n_tok > max_cap:
+                raise ValueError(f"Item {orig_idx} length ({n_tok}) exceeds max ANE bucket ({max_cap})")
+            if n_tok == 0:
+                n_sp = 1 if spans is None else len(spans)
+                for c_idx in range(n_sp):
+                    cur_targets.append(PackedSpanTarget(orig_idx, c_idx, 0, 0))
+                continue
+            start = _next_aligned_start(cur_pos, doc_slot)
+            if doc_slot > 0 and start + n_tok > max_cap:
+                _flush_seq()
+                start = 0
+            cur_toks.append((start, tok_ids, doc_slot))
+            _append_packed_targets(cur_targets, orig_idx, n_tok, start, spans)
+            cur_pos = start + n_tok
+            doc_slot += 1
+
+        _flush_seq()
+        return buckets
+
+    empty_targets: list[PackedSpanTarget] = []
+    non_empty: list[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]] = []
     for orig_idx, tok_ids, spans in items:
         n_tok = len(tok_ids)
         if n_tok > max_cap:
             raise ValueError(f"Item {orig_idx} length ({n_tok}) exceeds max ANE bucket ({max_cap})")
-
         if n_tok == 0:
-            # No token run needed; record empty zero-vector target(s).
             n_sp = 1 if spans is None else len(spans)
             for c_idx in range(n_sp):
-                cur_targets.append(PackedSpanTarget(orig_idx, c_idx, 0, 0))
-            continue
-
-        if doc_slot == 0:
-            start = 0
+                empty_targets.append(PackedSpanTarget(orig_idx, c_idx, 0, 0))
         else:
-            min_next = cur_pos + conv_gap
-            start = ((min_next + chunk_size - 1) // chunk_size) * chunk_size
+            non_empty.append((orig_idx, tok_ids, spans))
 
-        if doc_slot > 0 and start + n_tok > max_cap:
-            _flush()
-            start = 0
+    non_empty.sort(key=lambda it: len(it[1]), reverse=True)
+    open_bins: list[dict[str, Any]] = []
+    for orig_idx, tok_ids, spans in non_empty:
+        n_tok = len(tok_ids)
+        placed_bin: dict[str, Any] | None = None
+        placed_start = 0
+        for b in open_bins:
+            start = _next_aligned_start(b["cur_pos"], b["doc_slot"])
+            if start + n_tok <= max_cap:
+                placed_bin = b
+                placed_start = start
+                break
+        if placed_bin is None:
+            placed_bin = {"cur_pos": 0, "doc_slot": 0, "toks": [], "targets": []}
+            open_bins.append(placed_bin)
+            placed_start = 0
+        d_slot = placed_bin["doc_slot"]
+        placed_bin["toks"].append((placed_start, tok_ids, d_slot))
+        _append_packed_targets(placed_bin["targets"], orig_idx, n_tok, placed_start, spans)
+        placed_bin["cur_pos"] = placed_start + n_tok
+        placed_bin["doc_slot"] = d_slot + 1
 
-        cur_toks.append((start, tok_ids, doc_slot))
-        if spans is None:
-            cur_targets.append(PackedSpanTarget(orig_idx, 0, start, start + n_tok))
-        else:
-            for c_idx, (s0, s1) in enumerate(spans):
-                if s1 > s0:
-                    cur_targets.append(
-                        PackedSpanTarget(orig_idx, c_idx, start + int(s0), start + min(int(s1), n_tok))
-                    )
-                else:
-                    cur_targets.append(PackedSpanTarget(orig_idx, c_idx, 0, 0))
+    if not open_bins:
+        return [_finalize_packed_bin([], empty_targets, 0, 0, caps)] if empty_targets else []
 
-        cur_pos = start + n_tok
-        doc_slot += 1
+    if empty_targets:
+        open_bins[0]["targets"].extend(empty_targets)
 
-    _flush()
-    return buckets
+    return [
+        _finalize_packed_bin(b["toks"], b["targets"], b["cur_pos"], b["doc_slot"], caps)
+        for b in open_bins
+    ]
 
 
 def _load_io_lib(dylib_path: Path) -> ctypes.CDLL:
@@ -841,8 +925,10 @@ class FastPplx:
     """
 
     model_name: str = DEFAULT_MODEL_NAME
+    dim: int = EMBED_DIM
     max_dim: int = MAX_EMBED_DIM
     supports_dimensions: bool = True
+    is_mrl_trained: bool = False
     mrl_dimensions: tuple[int, ...] = MRL_DIMENSIONS
     cpu_sme_available: bool = False
 
@@ -854,6 +940,7 @@ class FastPplx:
         model_dir: str | Path | None = None,
         dtype: str = "float16",
         state_dtype: str | None = None,
+        quantize_weights: Literal["none", "w8"] = "none",
         use_mapped_embedding: bool = True,
         cache_limit_mb: int = 512,
         local_files_only: bool = True,
@@ -873,9 +960,13 @@ class FastPplx:
             raise ValueError(
                 f"Unsupported ane_profile {ane_profile!r}; choose from ('fast', 'balanced', 'parity', 'custom')"
             )
+        eff_qw = str(quantize_weights).strip().lower()
+        if eff_qw not in ("none", "w8"):
+            raise ValueError(f"Unsupported quantize_weights {quantize_weights!r}; expected 'none' or 'w8'")
 
         self.paths: RepoPaths = resolve_paths(home)
         self.dtype_name = dtype
+        self.quantize_weights: Literal["none", "w8"] = "w8" if eff_qw == "w8" else "none"
         self.pipe_depth = int(pipe_depth)
         self.deterministic = bool(deterministic)
         self._requested_ane_profile: str | None = ane_profile
@@ -883,7 +974,10 @@ class FastPplx:
         self._stats_lock = threading.Lock()
         self._latest_stats: dict[str, Any] = {}
         self._gpu_lock = threading.Lock()
-        self.runtime_telemetry: dict[str, Any] = get_mlx_runtime_telemetry()
+        self.runtime_telemetry: dict[str, Any] = {
+            **get_mlx_runtime_telemetry(),
+            "quantize_weights": self.quantize_weights,
+        }
 
         # 1. GPU / MLX backend (always loaded unless explicitly testing ANE-only with mock)
         self.gpu: Any = _gpu_backend
@@ -893,6 +987,7 @@ class FastPplx:
                 model_dir=model_dir,
                 dtype=dtype,
                 state_dtype=state_dtype,
+                quantize_weights=self.quantize_weights,
                 use_mapped_embedding=use_mapped_embedding,
                 cache_limit_mb=cache_limit_mb,
                 local_files_only=local_files_only,
@@ -1248,8 +1343,12 @@ class FastPplx:
         mu = threading.Lock()
         errors: list[BaseException] = []
         counts = {"ane_items": 0, "ane_buckets": 0, "gpu_items": 0, "gpu_stolen_items": 0}
-        steal_min_chunk = max(4, min(batch_size, 16))
-        ane_chunk_take = max(8, self.pipe_depth * 2)
+        is_apple10 = bool(self.runtime_telemetry.get("is_apple10", False))
+        ane_chunk_take, steal_min_chunk, steal_cap, steal_num, steal_den = resolve_hetero_schedule(
+            is_apple10=is_apple10,
+            batch_size=batch_size,
+            pipe_depth=self.pipe_depth,
+        )
 
         def ane_worker() -> None:
             try:
@@ -1281,10 +1380,10 @@ class FastPplx:
                 if allow_stealing:
                     while True:
                         with mu:
-                            # Leave at least a few small items if almost done so ANE finishes cleanly.
+                            # Leave small tail items when almost empty so ANE finishes cleanly without racing.
                             if len(short_dq) < steal_min_chunk:
                                 break
-                            take_n = min(batch_size, max(1, len(short_dq) // 2))
+                            take_n = min(len(short_dq), steal_cap, max(1, (len(short_dq) * steal_num) // steal_den))
                             stolen = [short_dq.pop() for _ in range(take_n)]
                         _run_gpu_subset(stolen)
                         with mu:
@@ -1603,6 +1702,176 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             mode=mode,
+        )
+
+    def encode_documents_multivector(
+        self,
+        texts: Sequence[str] | str,
+        *,
+        window_tokens: int = 1024,
+        context_tokens: int = 2048,
+        overlap: int = 0,
+        repeat_header_tokens: int | None = 128,
+        batch_size: int = 16,
+        dimensions: int | None = None,
+        output_dtype: str = "float32",
+        normalize: bool = True,
+        mode: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Encode `4K-32K` documents into `(window_vecs [W, D], doc_offsets [N_docs + 1])` for `MaxSim`.
+
+        Packs `<= 512`-token sub-chunks into `context_tokens=2048` contextual windows with
+        `repeat_header_tokens=128` (`2.31x` faster GPU encode and `2.48x` lower Metal peak RAM
+        than `32K` whole-doc attention, while lifting `32K` `LongEmbed` passkey `nDCG@10` from
+        `0.047 -> 1.000` per-split / `0.674` pooled and `2wikimqa` from `0.8945 -> 0.985-0.987`).
+        """
+        if window_tokens <= 0:
+            raise ValueError(f"window_tokens must be positive, got {window_tokens}")
+        if context_tokens < 256:
+            raise ValueError(f"context_tokens must be >= 256, got {context_tokens}")
+
+        docs = [texts] if isinstance(texts, str) else list(texts)
+        target_dim = resolve_embedding_dim(
+            dimensions, max_dim=self.max_dim, default_dim=self.dim, supports_dimensions=True
+        )
+        if not docs:
+            return self._format_empty(0, target_dim, output_dtype), np.zeros((1,), dtype=np.int32)
+
+        base_chunk = min(512, int(window_tokens))
+        group_k = max(1, (int(window_tokens) + base_chunk - 1) // base_chunk)
+
+        def _encode_doc_windows(txt: str) -> list[tuple[list[int], list[tuple[int, int]]]]:
+            if not txt or not txt.strip():
+                return []
+            planned = self.tokenizer.plan_contextual_windows(
+                txt,
+                chunk_tokens=base_chunk,
+                context_tokens=int(context_tokens),
+                overlap=int(overlap),
+                repeat_header_tokens=repeat_header_tokens,
+            )
+            doc_wins: list[tuple[list[int], list[tuple[int, int]]]] = []
+            for w in planned:
+                ids, spans = self.tokenizer.encode_contextual_document(
+                    w.chunks, return_spans=True, max_length=int(context_tokens)
+                )
+                raw_emit = [
+                    (int(a), int(b))
+                    for a, b in spans[w.emit_start : w.emit_start + len(w.spans)]
+                    if int(b) > int(a)
+                ]
+                if not raw_emit:
+                    continue
+                if group_k <= 1:
+                    grouped_spans = raw_emit
+                else:
+                    grouped_spans = [
+                        (raw_emit[i][0], raw_emit[min(i + group_k - 1, len(raw_emit) - 1)][1])
+                        for i in range(0, len(raw_emit), group_k)
+                    ]
+                doc_wins.append((ids, grouped_spans))
+            return doc_wins
+
+        encoded_wins: list[tuple[list[int], list[tuple[int, int]]]] = []
+        win_owners: list[int] = []
+        if len(docs) >= 8:
+            max_workers = min(4, max(2, os.cpu_count() or 2), len(docs))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                per_doc_wins = list(pool.map(_encode_doc_windows, docs))
+        else:
+            per_doc_wins = [_encode_doc_windows(txt) for txt in docs]
+        for d_idx, doc_wins in enumerate(per_doc_wins):
+            for win_item in doc_wins:
+                encoded_wins.append(win_item)
+                win_owners.append(d_idx)
+
+        per_doc: list[list[np.ndarray]] = [[] for _ in range(len(docs))]
+        if encoded_wins:
+            mats = self.encode_contextual_tokens(
+                encoded_wins,
+                batch_size=batch_size,
+                dimensions=dimensions,
+                output_dtype=output_dtype,
+                normalize=normalize,
+                mode=mode,
+            )
+            for owner, mat in zip(win_owners, mats):
+                per_doc[owner].append(np.asarray(mat))
+
+        offsets = [0]
+        chunks_out: list[np.ndarray] = []
+        for d_idx, blks in enumerate(per_doc):
+            if blks:
+                cat = np.vstack(blks)
+                chunks_out.append(cat)
+                offsets.append(offsets[-1] + int(cat.shape[0]))
+            else:
+                # Guarantee >=1 vector even for empty/whitespace-only docs so doc_offsets stays strictly increasing.
+                z = self._format_empty(1, target_dim, output_dtype)
+                z.fill(0)
+                chunks_out.append(z)
+                offsets.append(offsets[-1] + 1)
+
+        all_vecs = np.vstack(chunks_out) if chunks_out else self._format_empty(0, target_dim, output_dtype)
+        return all_vecs, np.asarray(offsets, dtype=np.int32)
+
+    def build_index(
+        self,
+        corpus: Sequence[str] | Sequence[Sequence[int]] | np.ndarray,
+        *,
+        multivector: bool = False,
+        window_tokens: int = 1024,
+        context_tokens: int = 2048,
+        repeat_header_tokens: int | None = 128,
+        doc_offsets: np.ndarray | Sequence[int] | None = None,
+        mode: IndexMode = "auto",
+        mrl_dim: int | None = None,
+        binary_bits: int | None = None,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+        batch_size: int = 16,
+        encode_mode: str | None = None,
+    ) -> CompactRetrievalIndex:
+        """Build a `CompactRetrievalIndex` (`1024d sym_int8` default, `binary_int8`, or `MaxSim` multivector)."""
+        eff_offsets: np.ndarray | list[int] | None = (
+            list(doc_offsets) if doc_offsets is not None and not isinstance(doc_offsets, np.ndarray) else doc_offsets
+        )
+        if isinstance(corpus, np.ndarray):
+            vecs = corpus
+        elif not corpus:
+            vecs = np.empty((0, self.max_dim), dtype=np.float32)
+        elif multivector:
+            if not isinstance(corpus[0], str):
+                raise TypeError("multivector=True requires a sequence of raw document strings")
+            vecs, eff_offsets = self.encode_documents_multivector(
+                corpus,  # type: ignore[arg-type]
+                window_tokens=window_tokens,
+                context_tokens=context_tokens,
+                repeat_header_tokens=repeat_header_tokens,
+                batch_size=batch_size,
+                dimensions=self.max_dim,
+                output_dtype="float32",
+                normalize=True,
+                mode=encode_mode,
+            )
+        else:
+            vecs = self.encode_corpus(
+                corpus,
+                batch_size=batch_size,
+                dimensions=self.max_dim,
+                output_dtype="float32",
+                normalize=True,
+                mode=encode_mode,
+            )
+        return CompactRetrievalIndex(
+            vecs,
+            doc_offsets=eff_offsets,
+            mode=mode,
+            is_mrl_trained=self.is_mrl_trained,
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
         )
 
     def close(self) -> None:

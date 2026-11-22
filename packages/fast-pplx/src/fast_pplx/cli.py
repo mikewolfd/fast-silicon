@@ -50,6 +50,12 @@ def _add_common_engine_args(
         help="Model activation weight dtype (default: float16)",
     )
     parser.add_argument(
+        "--quantize-weights",
+        choices=("none", "w8"),
+        default="none",
+        help="Optional Metal linear projection weight quantization: 'none' (default) or 'w8' (8-bit group_size=64)",
+    )
+    parser.add_argument(
         "--no-mapped-embedding",
         action="store_true",
         help="Load embed_tokens onto Metal GPU instead of CPU safetensors mmap",
@@ -78,6 +84,7 @@ def _make_engine(args: argparse.Namespace, *, deterministic: bool = False) -> An
         home=getattr(args, "home", None),
         mode=eff_mode,
         dtype=getattr(args, "model_dtype", "float16"),
+        quantize_weights=getattr(args, "quantize_weights", "none"),
         use_mapped_embedding=not getattr(args, "no_mapped_embedding", False),
         cache_limit_mb=getattr(args, "cache_limit_mb", 512),
         ane_profile=getattr(args, "ane_profile", None),
@@ -587,7 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ane-profile",
         choices=("fast", "balanced", "parity"),
         default=None,
-        help="Preset ANE speed/parity profile: 'fast' (silu+prescale, default), 'balanced' (tanh_gdn+max_abs), "
+        help="Preset ANE speed/parity profile: 'balanced' (tanh_gdn+max_abs, default), 'fast' (silu+prescale), "
         "or 'parity' (tanh_all+max_abs). 'parity'/'balanced' is recommended for --dtype int8 or --dimensions 128 "
         "(prescale 1/64 inflates 2^-14 to 0.25 unscaled eps). Explicit --silu-mode/--rmsnorm-mode override the preset.",
     )
