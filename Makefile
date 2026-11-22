@@ -49,6 +49,7 @@ test-cpu: hw-check
 		packages/fast-shared/tests/test_parquet_pipeline_v2_cpu.py \
 		packages/fast-shared/tests/test_croq_extractconf_cpu.py \
 		packages/fast-shared/tests/test_ane_ffn_cpu.py \
+		packages/fast-shared/tests/test_v23_track_b_cpu.py \
 		packages/fast-shared/tests/test_bench_memory.py \
 		packages/fast-decision-models/tests/test_decision_models_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \

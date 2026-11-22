@@ -43,6 +43,10 @@ from .embeddings import (
     tile_aligned_slices,
     truncate_and_normalize,
 )
+from .coreai_pipeline import (
+    assess_calibration_batch_diversity,
+    evaluate_multi_batch_calibration_gate,
+)
 from .croq import (
     VALID_SCORE_MODES,
     ConformalGrammarRouter,
@@ -158,12 +162,14 @@ try:
         DEFAULT_TEXT_COLUMNS,
         ParquetEmbedSummary,
         embed_parquet,
+        resolve_embedding_device_mode,
         resolve_input_files,
         resolve_text_column,
         slice_ocr_pages_utf8,
     )
     from .paths import resolve_home_dir
     from .pipeline_llm import (
+        ExtractRetryRequest,
         ParquetExtractSummary,
         extract_jsonl,
         extract_parquet,
@@ -171,6 +177,8 @@ try:
         prune_optional_nullable_fields,
         resolve_engine_whitespace_flexible,
         resolve_llm_text_column,
+        run_deferred_retries,
+        run_deferred_retries_async,
         slice_first_pages_utf8,
     )
 except ImportError as _exc:
@@ -183,9 +191,11 @@ except ImportError as _exc:
         "DEFAULT_TEXT_COLUMNS",
         "ParquetEmbedSummary",
         "embed_parquet",
+        "resolve_embedding_device_mode",
         "resolve_input_files",
         "resolve_text_column",
         "slice_ocr_pages_utf8",
+        "ExtractRetryRequest",
         "ParquetExtractSummary",
         "extract_jsonl",
         "extract_parquet",
@@ -193,6 +203,8 @@ except ImportError as _exc:
         "prune_optional_nullable_fields",
         "resolve_engine_whitespace_flexible",
         "resolve_llm_text_column",
+        "run_deferred_retries",
+        "run_deferred_retries_async",
         "slice_first_pages_utf8",
     ):
         _OPTIONAL_IMPORT_ERRORS[_sym] = _exc
@@ -320,6 +332,7 @@ __all__ = [
     "EXTRACTCONF_FEATURE_NAMES",
     "EmbeddingHTTPServer",
     "ExtractConfCalibrator",
+    "ExtractRetryRequest",
     "ExtractionTelemetry",
     "FaultInjectionCase",
     "FaultInjectionResult",
@@ -369,6 +382,7 @@ __all__ = [
     "WIRED_MEMORY_CEILING_FRACTION",
     "accepts_kwarg",
     "advise_nocache_paths",
+    "assess_calibration_batch_diversity",
     "audit_safetensors_weights",
     "build_block_diagonal_mask",
     "build_chat_completion",
@@ -400,6 +414,7 @@ __all__ = [
     "embedding_health_payload",
     "estimate_host_memory_bytes",
     "evaluate_hardware_support",
+    "evaluate_multi_batch_calibration_gate",
     "eval_ffn_fp32_ref",
     "eval_ffn_w8a8",
     "extract_coreml_compute_plan_ops",
@@ -452,6 +467,7 @@ __all__ = [
     "read_safetensors_headers",
     "recommend_silicon_budget",
     "resolve_dynamic_execution_plan",
+    "resolve_embedding_device_mode",
     "resolve_embedding_dim",
     "resolve_engine_whitespace_flexible",
     "resolve_hf_model_dir",
@@ -459,6 +475,8 @@ __all__ = [
     "resolve_input_files",
     "resolve_llm_text_column",
     "resolve_text_column",
+    "run_deferred_retries",
+    "run_deferred_retries_async",
     "run_embedding_request",
     "run_fault_injection_suite",
     "sample_host_memory",
