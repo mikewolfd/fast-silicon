@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from contextlib import ExitStack
 from dataclasses import dataclass
 import glob
@@ -11,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -29,6 +31,7 @@ from .runtime_lessons import (
     LiveMemoryGovernor,
     nocache_open,
 )
+from .tokenizer import plan_header_anchored_windows
 
 DEFAULT_TEXT_COLUMNS = ("body", "page_text", "text", "content")
 _SUPPORTED_DTYPES = ("float32", "float16", "int8")
@@ -61,6 +64,12 @@ class CorpusBackfillConfig:
     encode_batch_rows: int = 4096
     shard_rows: int = 65536
     sink_format: str | None = None
+    snap_sentences: bool = False
+    header_anchored: bool = False
+    anchor_max_chars: int = 2048
+    pin_non_hetero_cutoffs: bool | None = None
+    non_hetero_min_batch: int = 12
+    non_hetero_min_tokens: int = 1024
 
 
 @dataclass
@@ -259,6 +268,441 @@ def _resolve_parquet_compression(
     }
 
 
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?…][\"'\)\]]*|\n)(?=\s|$)")
+_WHITESPACE_BOUNDARY_RE = re.compile(r"\s+")
+_DEFAULT_NON_HETERO_MIN_BATCH = 12
+_DEFAULT_NON_HETERO_MIN_TOKENS = 1024
+
+
+def resolve_embedding_device_mode(
+    engine: Any,
+    tok_lists: Sequence[Sequence[int]],
+    *,
+    mode: str | None = None,
+    pin_non_hetero_cutoffs: bool | None = None,
+    non_hetero_min_batch: int | None = None,
+    non_hetero_min_tokens: int | None = None,
+) -> str | None:
+    """Resolve `mode='auto'` and small/ANE-ineligible sub-batches to the fastest pinned single device."""
+    norm_mode = str(mode).strip().lower() if mode is not None else None
+    if norm_mode in ("gpu", "ane", "cpu"):
+        return norm_mode
+
+    ane_attr = getattr(engine, "ane_available", None)
+    if norm_mode is None and pin_non_hetero_cutoffs is False:
+        return None
+    if norm_mode is None and pin_non_hetero_cutoffs is None and ane_attr is None:
+        return None
+    if norm_mode in ("hetero", "hetero2") and pin_non_hetero_cutoffs is False:
+        return "hetero"
+    if norm_mode in ("hetero", "hetero2") and pin_non_hetero_cutoffs is None:
+        return norm_mode
+    if not tok_lists:
+        if norm_mode == "auto":
+            return "ane" if bool(ane_attr) else "gpu"
+        return norm_mode
+
+    ane_avail = bool(ane_attr)
+    if not ane_avail:
+        return "gpu" if (norm_mode == "auto" or ane_attr is not None) else norm_mode
+
+    ane_max_len = int(
+        getattr(engine, "ane_query_max_len", None)
+        or getattr(engine, "ane_max_seq_len", None)
+        or getattr(engine, "max_seq_len", None)
+        or 512
+    )
+    lengths = [len(t) for t in tok_lists]
+    n_docs = len(lengths)
+    tot_toks = sum(lengths)
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    if min_len > ane_max_len:
+        return "gpu"
+
+    min_batch = (
+        int(non_hetero_min_batch)
+        if non_hetero_min_batch is not None
+        else int(getattr(engine, "non_hetero_min_batch", _DEFAULT_NON_HETERO_MIN_BATCH))
+    )
+    min_tokens = (
+        int(non_hetero_min_tokens)
+        if non_hetero_min_tokens is not None
+        else int(getattr(engine, "non_hetero_min_tokens", _DEFAULT_NON_HETERO_MIN_TOKENS))
+    )
+    if n_docs < min_batch or tot_toks < min_tokens:
+        return "ane" if max_len <= ane_max_len else "gpu"
+    return "hetero"
+
+
+def _snap_end_char(
+    text: str,
+    c0: int,
+    raw_c1: int,
+    *,
+    min_fraction: float = 0.55,
+    prefer_paragraph: bool = True,
+) -> int:
+    n_txt = len(text)
+    hi = min(n_txt, max(c0, raw_c1))
+    if hi >= n_txt or hi <= c0:
+        return hi
+    span = hi - c0
+    min_c1 = c0 + max(1, int(span * max(0.25, min(0.95, float(min_fraction)))))
+    window = text[c0:hi]
+    rel_min = max(0, min_c1 - c0)
+
+    if prefer_paragraph:
+        para = window.rfind("\n\n", rel_min)
+        if para != -1:
+            return c0 + para + 2
+
+    last_sent_end: int | None = None
+    for m in _SENTENCE_BOUNDARY_RE.finditer(window, rel_min):
+        last_sent_end = m.end()
+    if last_sent_end is not None:
+        return c0 + last_sent_end
+
+    last_ws_start: int | None = None
+    for m in _WHITESPACE_BOUNDARY_RE.finditer(window, rel_min):
+        if m.start() > rel_min or last_sent_end is None:
+            last_ws_start = m.start()
+    if last_ws_start is not None and (c0 + last_ws_start) > c0:
+        return c0 + last_ws_start
+    return hi
+
+
+def _chunk_from_token_offsets(
+    text: str,
+    body_ids: list[int],
+    offsets: list[tuple[int, int]],
+    *,
+    tokenizer: Any,
+    lead_ids: list[int],
+    tail_ids: list[int],
+    eff_max_body: int,
+    overlap: int,
+    max_chunk_tokens: int,
+    snap_sentences: bool,
+    snap_min_fraction: float,
+) -> list[tuple[list[int], int, int]]:
+    finalize = tokenizer._finalize_ids
+    n = len(body_ids)
+    if not n:
+        return [(finalize([*lead_ids, *tail_ids], max_chunk_tokens), 0, len(text))]
+
+    doc_chunks: list[tuple[list[int], int, int]] = []
+    pos = 0
+    while pos < n:
+        end = min(n, pos + eff_max_body)
+        c0 = 0 if pos == 0 else offsets[pos][0]
+        while end > pos and end < n and offsets[end - 1][1] > offsets[end][0]:
+            end -= 1
+        if end <= pos:
+            raise ValueError("A source character or token span cannot fit max_chunk_tokens with its prefix")
+
+        raw_c1 = len(text) if end == n else max(offsets[end - 1][1], offsets[end][0])
+        if snap_sentences and end < n and raw_c1 > c0:
+            snap_c1 = _snap_end_char(text, c0, raw_c1, min_fraction=snap_min_fraction)
+            if snap_c1 < raw_c1:
+                tok_ends = [offsets[k][1] for k in range(pos, end)]
+                k_fit = bisect_right(tok_ends, snap_c1)
+                cand_end = pos + k_fit
+                while cand_end > pos and cand_end < n and offsets[cand_end - 1][1] > offsets[cand_end][0]:
+                    cand_end -= 1
+                if cand_end > pos:
+                    end = cand_end
+
+        c1 = len(text) if end == n else max(offsets[end - 1][1], offsets[end][0])
+        win_ids = finalize([*lead_ids, *body_ids[pos:end], *tail_ids], max_chunk_tokens)
+        doc_chunks.append((win_ids, c0, c1))
+        if end >= n:
+            break
+
+        if overlap <= 0:
+            pos = end
+            continue
+
+        raw_next = max(pos + 1, end - min(overlap, eff_max_body - 1))
+        next_pos = raw_next
+        while next_pos > 0 and next_pos < n and offsets[next_pos - 1][1] > offsets[next_pos][0]:
+            next_pos -= 1
+        if snap_sentences and next_pos > pos and next_pos < end:
+            # Prefer snapping the next window start onto the start of the nearest sentence/word boundary.
+            start_ch = offsets[next_pos][0]
+            scan_hi = offsets[min(end - 1, next_pos + max(4, overlap // 3))][1]
+            sub_win = text[start_ch:scan_hi]
+            m_sent = _SENTENCE_BOUNDARY_RE.search(sub_win)
+            target_ch = None
+            if m_sent is not None and m_sent.end() < len(sub_win):
+                target_ch = start_ch + m_sent.end()
+            else:
+                m_ws = _WHITESPACE_BOUNDARY_RE.search(sub_win)
+                if m_ws is not None and m_ws.end() < len(sub_win):
+                    target_ch = start_ch + m_ws.end()
+            if target_ch is not None:
+                cand_starts = [offsets[k][0] for k in range(next_pos, end)]
+                k_off = bisect_right(cand_starts, target_ch - 1)
+                cand_pos = next_pos + k_off
+                if pos < cand_pos < end:
+                    while cand_pos < end and offsets[cand_pos - 1][1] > offsets[cand_pos][0]:
+                        cand_pos += 1
+                    if pos < cand_pos < end:
+                        next_pos = cand_pos
+        if next_pos <= pos:
+            next_pos = raw_next
+            while next_pos < end and offsets[next_pos - 1][1] > offsets[next_pos][0]:
+                next_pos += 1
+        pos = next_pos
+    return doc_chunks
+
+
+def _compute_header_anchor(
+    unit_text: str,
+    *,
+    tokenizer: Any,
+    anchor_max_chars: int,
+    max_anchor_tokens: int,
+) -> tuple[str, int]:
+    raw_hdr = unit_text[: max(0, int(anchor_max_chars))]
+    if not raw_hdr:
+        return "", 0
+    if len(raw_hdr) < len(unit_text):
+        snapped_len = _snap_end_char(raw_hdr, 0, len(raw_hdr), min_fraction=0.35, prefer_paragraph=True)
+        raw_hdr = raw_hdr[:snapped_len].rstrip() or raw_hdr.rstrip()
+    raw_tok = getattr(tokenizer, "_tok", None)
+    if raw_tok is not None and hasattr(raw_tok, "encode"):
+        enc = raw_tok.encode(raw_hdr, add_special_tokens=False)
+        if len(enc.ids) > max_anchor_tokens > 0 and enc.offsets:
+            cutoff = enc.offsets[max_anchor_tokens - 1][1]
+            clipped = raw_hdr[:cutoff]
+            snapped = _snap_end_char(clipped, 0, len(clipped), min_fraction=0.45, prefer_paragraph=True)
+            cand = clipped[:snapped].rstrip() or clipped.rstrip()
+            if cand:
+                raw_hdr = cand
+                enc = raw_tok.encode(raw_hdr, add_special_tokens=False)
+        return raw_hdr, len(enc.ids)
+    toks = tokenizer.encode(raw_hdr)
+    if len(toks) > max_anchor_tokens > 0:
+        ratio = max_anchor_tokens / max(1, len(toks))
+        cand_len = max(1, int(len(raw_hdr) * ratio))
+        raw_hdr = raw_hdr[:_snap_end_char(raw_hdr, 0, cand_len, min_fraction=0.45)].rstrip() or raw_hdr[:cand_len]
+    return raw_hdr, min(len(toks), max_anchor_tokens)
+
+
+def _chunk_units_with_options(
+    unit_texts: Sequence[str],
+    *,
+    tokenizer: Any,
+    eff_prefix: str,
+    max_body_tokens: int | None,
+    overlap: int,
+    max_chunk_tokens: int,
+    snap_sentences: bool = False,
+    snap_min_fraction: float = 0.55,
+    header_anchored: bool = False,
+    anchor_max_chars: int = 2048,
+    anchor_max_tokens: int | None = None,
+) -> tuple[list[list[tuple[list[int], int, int]]], list[list[bool]]]:
+    """Chunk texts with optional sentence-boundary snapping and `plan_header_anchored_windows`."""
+    if not unit_texts:
+        return [], []
+
+    if not snap_sentences and not header_anchored:
+        if hasattr(tokenizer, "chunk_texts_batch"):
+            wins = tokenizer.chunk_texts_batch(
+                unit_texts,
+                max_body_tokens=max_body_tokens,
+                overlap=overlap,
+                prefix=eff_prefix,
+                max_chunk_tokens=max_chunk_tokens,
+            )
+        else:
+            wins = [
+                tokenizer.chunk_text(
+                    u_txt,
+                    max_body_tokens=max_body_tokens,
+                    overlap=overlap,
+                    prefix=eff_prefix,
+                    max_chunk_tokens=max_chunk_tokens,
+                )
+                for u_txt in unit_texts
+            ]
+        return wins, [[False] * len(w) for w in wins]
+
+    has_fast_tok = (
+        getattr(tokenizer, "_tok", None) is not None
+        and callable(getattr(tokenizer, "_resolve_special_and_prefix_ids", None))
+        and callable(getattr(tokenizer, "_finalize_ids", None))
+    )
+    if not has_fast_tok:
+        if hasattr(tokenizer, "chunk_texts_batch"):
+            base_wins = tokenizer.chunk_texts_batch(
+                unit_texts,
+                max_body_tokens=max_body_tokens,
+                overlap=overlap,
+                prefix=eff_prefix,
+                max_chunk_tokens=max_chunk_tokens,
+            )
+        else:
+            base_wins = [
+                tokenizer.chunk_text(
+                    u_txt,
+                    max_body_tokens=max_body_tokens,
+                    overlap=overlap,
+                    prefix=eff_prefix,
+                    max_chunk_tokens=max_chunk_tokens,
+                )
+                for u_txt in unit_texts
+            ]
+        if not header_anchored:
+            return base_wins, [[False] * len(w) for w in base_wins]
+        # Generic fallback with plan_header_anchored_windows + re-encoding via encode_batch/encode
+        all_windows: list[list[tuple[list[int], int, int]]] = []
+        all_flags: list[list[bool]] = []
+        for u_txt, w_list in zip(unit_texts, base_wins):
+            if len(w_list) <= 1:
+                all_windows.append(w_list)
+                all_flags.append([False] * len(w_list))
+                continue
+            piece_strs = [u_txt[c0:c1] for _, c0, c1 in w_list]
+            planned = plan_header_anchored_windows(
+                piece_strs,
+                max_window_tokens=max_chunk_tokens,
+                header_max_chars=anchor_max_chars,
+                tokenizer=tokenizer,
+                overhead_tokens=2,
+                per_chunk_extra_tokens=0,
+            )
+            doc_out: list[tuple[list[int], int, int]] = []
+            doc_flags: list[bool] = []
+            for pw in planned:
+                c0 = w_list[pw.chunk_indices[0]][1]
+                c1 = w_list[pw.chunk_indices[-1]][2]
+                ids = tokenizer.encode("\n".join(pw.chunks), prefix=eff_prefix, max_length=max_chunk_tokens)
+                doc_out.append((ids, c0, c1))
+                doc_flags.append(bool(pw.has_anchor))
+            all_windows.append(doc_out)
+            all_flags.append(doc_flags)
+        return all_windows, all_flags
+
+    lead_ids, tail_ids = tokenizer._resolve_special_and_prefix_ids(eff_prefix)
+    overhead = len(lead_ids) + len(tail_ids)
+    eff_max_body = int(max_body_tokens) if max_body_tokens is not None else max(1, max_chunk_tokens - overhead)
+    if eff_max_body <= 0:
+        raise ValueError("max_chunk_tokens is too small to fit special tokens and prefix")
+    if eff_max_body + overhead > max_chunk_tokens:
+        raise ValueError("max_body_tokens plus special/prefix tokens exceeds max_chunk_tokens")
+    if overlap < 0 or overlap >= eff_max_body:
+        raise ValueError(f"overlap must be in [0, {eff_max_body - 1}]")
+
+    raw_tok = tokenizer._tok
+    encs = raw_tok.encode_batch(list(unit_texts), add_special_tokens=False)
+    if not header_anchored:
+        wins_out = [
+            _chunk_from_token_offsets(
+                u_txt,
+                enc.ids,
+                enc.offsets,
+                tokenizer=tokenizer,
+                lead_ids=lead_ids,
+                tail_ids=tail_ids,
+                eff_max_body=eff_max_body,
+                overlap=overlap,
+                max_chunk_tokens=max_chunk_tokens,
+                snap_sentences=snap_sentences,
+                snap_min_fraction=snap_min_fraction,
+            )
+            for u_txt, enc in zip(unit_texts, encs)
+        ]
+        return wins_out, [[False] * len(w) for w in wins_out]
+
+    # Header-anchored window planning: reserve compact header anchor tokens so continuation chunks fit clean in max_chunk_tokens.
+    max_anc_cap = int(anchor_max_tokens) if anchor_max_tokens is not None else min(96, max(16, eff_max_body // 4))
+    anchored_encode_texts: list[str] = []
+    anchored_meta: list[tuple[int, int, int, int, bool]] = []  # (doc_i, chunk_idx_in_doc, c0, c1, has_anchor)
+    doc_results: list[list[tuple[list[int], int, int]]] = [[] for _ in unit_texts]
+    doc_flags: list[list[bool]] = [[] for _ in unit_texts]
+
+    for doc_i, (u_txt, enc) in enumerate(zip(unit_texts, encs)):
+        if len(enc.ids) <= eff_max_body:
+            base = _chunk_from_token_offsets(
+                u_txt,
+                enc.ids,
+                enc.offsets,
+                tokenizer=tokenizer,
+                lead_ids=lead_ids,
+                tail_ids=tail_ids,
+                eff_max_body=eff_max_body,
+                overlap=overlap,
+                max_chunk_tokens=max_chunk_tokens,
+                snap_sentences=snap_sentences,
+                snap_min_fraction=snap_min_fraction,
+            )
+            doc_results[doc_i] = base
+            doc_flags[doc_i] = [False] * len(base)
+            continue
+
+        hdr_text, hdr_toks = _compute_header_anchor(
+            u_txt,
+            tokenizer=tokenizer,
+            anchor_max_chars=anchor_max_chars,
+            max_anchor_tokens=max_anc_cap,
+        )
+        eff_sub_body = max(16, eff_max_body - hdr_toks - 2)
+        eff_sub_overlap = min(overlap, max(0, eff_sub_body - 1))
+        sub_chunks = _chunk_from_token_offsets(
+            u_txt,
+            enc.ids,
+            enc.offsets,
+            tokenizer=tokenizer,
+            lead_ids=lead_ids,
+            tail_ids=tail_ids,
+            eff_max_body=eff_sub_body,
+            overlap=eff_sub_overlap,
+            max_chunk_tokens=max_chunk_tokens,
+            snap_sentences=snap_sentences,
+            snap_min_fraction=snap_min_fraction,
+        )
+        if len(sub_chunks) <= 1 or not hdr_text:
+            doc_results[doc_i] = sub_chunks
+            doc_flags[doc_i] = [False] * len(sub_chunks)
+            continue
+
+        # Ensure piece_strs[0][:eff_hdr_chars] equals hdr_text cleanly for plan_header_anchored_windows.
+        piece_strs = [u_txt[c0:c1] for _, c0, c1 in sub_chunks]
+        eff_hdr_chars = min(len(hdr_text), len(piece_strs[0]))
+        planned = plan_header_anchored_windows(
+            piece_strs,
+            max_window_tokens=max_chunk_tokens,
+            header_max_chars=eff_hdr_chars,
+            tokenizer=tokenizer,
+            overhead_tokens=overhead,
+            per_chunk_extra_tokens=1,
+        )
+        for pw in planned:
+            c0 = sub_chunks[pw.chunk_indices[0]][1]
+            c1 = sub_chunks[pw.chunk_indices[-1]][2]
+            if not pw.has_anchor and len(pw.chunks) == 1:
+                slot = len(doc_results[doc_i])
+                doc_results[doc_i].append((sub_chunks[pw.chunk_indices[0]][0], c0, c1))
+                doc_flags[doc_i].append(False)
+                continue
+            slot = len(doc_results[doc_i])
+            doc_results[doc_i].append(([], c0, c1))
+            doc_flags[doc_i].append(bool(pw.has_anchor))
+            anchored_encode_texts.append("\n".join(pw.chunks))
+            anchored_meta.append((doc_i, slot, c0, c1, bool(pw.has_anchor)))
+
+    if anchored_encode_texts:
+        encoded_batch = tokenizer.encode_batch(anchored_encode_texts, prefix=eff_prefix, max_length=max_chunk_tokens)
+        for (doc_i, slot, c0, c1, _), tok_ids in zip(anchored_meta, encoded_batch):
+            doc_results[doc_i][slot] = (tok_ids, c0, c1)
+
+    return doc_results, doc_flags
+
+
 def _prepare_batch_rows(
     rb: pa.RecordBatch,
     *,
@@ -279,6 +723,11 @@ def _prepare_batch_rows(
     prompt_name: str | None,
     add_query_prefix: bool,
     add_document_prefix: bool,
+    snap_sentences: bool = False,
+    snap_min_fraction: float = 0.55,
+    header_anchored: bool = False,
+    anchor_max_chars: int = 2048,
+    anchor_max_tokens: int | None = None,
 ) -> tuple[pa.Table, list[list[int]]]:
     schema_names = rb.schema.names
     if keep_cols is not None:
@@ -360,33 +809,28 @@ def _prepare_batch_rows(
     char_ends: list[int] = []
     tok_counts: list[int] = []
     chunk_texts: list[str] = []
+    anchor_flags: list[bool] = []
 
     row_chunk_counter: dict[int, int] = {}
     unit_texts = [u_txt for _, _, u_txt in all_units]
 
     if chunk:
-        if hasattr(tokenizer, "chunk_texts_batch"):
-            unit_windows = tokenizer.chunk_texts_batch(
-                unit_texts,
-                max_body_tokens=max_body_tokens,
-                overlap=overlap,
-                prefix=eff_prefix,
-                max_chunk_tokens=max_chunk_tokens,
-            )
-        else:
-            unit_windows = [
-                tokenizer.chunk_text(
-                    u_txt,
-                    max_body_tokens=max_body_tokens,
-                    overlap=overlap,
-                    prefix=eff_prefix,
-                    max_chunk_tokens=max_chunk_tokens,
-                )
-                for u_txt in unit_texts
-            ]
-        for (row_i, pnum, unit_text), win_list in zip(all_units, unit_windows):
+        unit_windows, unit_anchor_flags = _chunk_units_with_options(
+            unit_texts,
+            tokenizer=tokenizer,
+            eff_prefix=eff_prefix,
+            max_body_tokens=max_body_tokens,
+            overlap=overlap,
+            max_chunk_tokens=max_chunk_tokens,
+            snap_sentences=snap_sentences,
+            snap_min_fraction=snap_min_fraction,
+            header_anchored=header_anchored,
+            anchor_max_chars=anchor_max_chars,
+            anchor_max_tokens=anchor_max_tokens,
+        )
+        for (row_i, pnum, unit_text), win_list, fl_list in zip(all_units, unit_windows, unit_anchor_flags):
             c_idx = row_chunk_counter.get(row_i, 0)
-            for win_ids, c0, c1 in win_list:
+            for (win_ids, c0, c1), has_anc in zip(win_list, fl_list):
                 expanded_row_idx.append(row_i)
                 expanded_tok_lists.append(win_ids)
                 if per_ocr_page:
@@ -397,6 +841,8 @@ def _prepare_batch_rows(
                 tok_counts.append(len(win_ids))
                 if include_chunk_text:
                     chunk_texts.append(unit_text[c0:c1])
+                if header_anchored:
+                    anchor_flags.append(bool(has_anc))
                 c_idx += 1
             row_chunk_counter[row_i] = c_idx
     else:
@@ -453,6 +899,8 @@ def _prepare_batch_rows(
         meta_table = meta_table.append_column("char_start", pa.array(char_starts, type=pa.int32()))
         meta_table = meta_table.append_column("char_end", pa.array(char_ends, type=pa.int32()))
         meta_table = meta_table.append_column("token_count", pa.array(tok_counts, type=pa.int32()))
+        if header_anchored:
+            meta_table = meta_table.append_column("has_header_anchor", pa.array(anchor_flags, type=pa.bool_()))
     if include_chunk_text:
         meta_table = meta_table.append_column("chunk_text", pa.array(chunk_texts, type=pa.string()))
     return meta_table, expanded_tok_lists
@@ -681,6 +1129,14 @@ def embed_parquet(
     chunk: bool = False,
     max_body_tokens: int | None = None,
     overlap: int = 51,
+    snap_sentences: bool = False,
+    snap_min_fraction: float = 0.55,
+    header_anchored: bool = False,
+    anchor_max_chars: int = 2048,
+    anchor_max_tokens: int | None = None,
+    pin_non_hetero_cutoffs: bool | None = None,
+    non_hetero_min_batch: int | None = None,
+    non_hetero_min_tokens: int | None = None,
     max_length: int | None = None,
     max_chunk_tokens: int = 512,
     skip_empty: bool = False,
@@ -745,10 +1201,26 @@ def embed_parquet(
     )
     encode_fn = getattr(engine, "encode_corpus", None) or getattr(engine, "encode_tokens")
     corpus_kw: dict[str, Any] = {}
-    if accepts_kwarg(encode_fn, "mode"):
+    accepts_mode = accepts_kwarg(encode_fn, "mode")
+    if accepts_mode:
         corpus_kw["mode"] = mode
     if req_dim is not None and accepts_kwarg(encode_fn, "dimensions"):
         corpus_kw["dimensions"] = dim
+
+    def _call_encode_fn(sub_toks: list[list[int]]) -> np.ndarray:
+        if not accepts_mode:
+            return encode_fn(sub_toks, **corpus_kw)
+        eff_batch_mode = resolve_embedding_device_mode(
+            engine,
+            sub_toks,
+            mode=mode,
+            pin_non_hetero_cutoffs=pin_non_hetero_cutoffs,
+            non_hetero_min_batch=non_hetero_min_batch,
+            non_hetero_min_tokens=non_hetero_min_tokens,
+        )
+        call_kw = dict(corpus_kw)
+        call_kw["mode"] = eff_batch_mode
+        return encode_fn(sub_toks, **call_kw)
 
     eff_macro_tokens = resolve_macro_window_tokens(macro_window_tokens)
     engine_max_length = int(getattr(engine, "max_seq_len", 512))
@@ -795,6 +1267,9 @@ def embed_parquet(
         "chunk": chunk,
         "max_body_tokens": max_body_tokens,
         "overlap": overlap,
+        "snap_sentences": snap_sentences,
+        "header_anchored": header_anchored,
+        "anchor_max_chars": anchor_max_chars if header_anchored else None,
         "max_encode_length": max_encode_length,
         "max_chunk_tokens": max_chunk_tokens,
         "skip_empty": skip_empty,
@@ -890,6 +1365,11 @@ def embed_parquet(
                     chunk=chunk,
                     max_body_tokens=max_body_tokens,
                     overlap=overlap,
+                    snap_sentences=snap_sentences,
+                    snap_min_fraction=snap_min_fraction,
+                    header_anchored=header_anchored,
+                    anchor_max_chars=anchor_max_chars,
+                    anchor_max_tokens=anchor_max_tokens,
                     max_encode_length=max_encode_length,
                     max_chunk_tokens=max_chunk_tokens,
                     skip_empty=skip_empty,
@@ -996,16 +1476,16 @@ def embed_parquet(
 
     def _encode_sorted_chunk(sub_toks: list[list[int]]) -> np.ndarray:
         if len(sub_toks) <= encode_batch_rows:
-            out_vecs = _normalize_truncated(encode_fn(sub_toks, **corpus_kw), dim)
+            out_vecs = _normalize_truncated(_call_encode_fn(sub_toks), dim)
             clear_mlx_arena(256)
             return out_vecs
-        first = _normalize_truncated(encode_fn(sub_toks[:encode_batch_rows], **corpus_kw), dim)
+        first = _normalize_truncated(_call_encode_fn(sub_toks[:encode_batch_rows]), dim)
         clear_mlx_arena(256)
         vecs = np.empty((len(sub_toks), dim), dtype=first.dtype)
         vecs[:encode_batch_rows] = first
         for start in range(encode_batch_rows, len(sub_toks), encode_batch_rows):
             end = min(start + encode_batch_rows, len(sub_toks))
-            vecs[start:end] = _normalize_truncated(encode_fn(sub_toks[start:end], **corpus_kw), dim)
+            vecs[start:end] = _normalize_truncated(_call_encode_fn(sub_toks[start:end]), dim)
             clear_mlx_arena(256)
         return vecs
 
@@ -1268,6 +1748,12 @@ def build_backfill_cli_parser(
     p.add_argument("--chunk", action="store_true")
     p.add_argument("--max-chunk-tokens", type=int, default=512)
     p.add_argument("--overlap", type=int, default=51)
+    p.add_argument("--snap-sentences", action="store_true", default=cfg.snap_sentences)
+    p.add_argument("--header-anchored", action="store_true", default=cfg.header_anchored)
+    p.add_argument("--anchor-max-chars", type=int, default=cfg.anchor_max_chars)
+    p.add_argument("--pin-non-hetero-cutoffs", action="store_true", default=cfg.pin_non_hetero_cutoffs)
+    p.add_argument("--non-hetero-min-batch", type=int, default=cfg.non_hetero_min_batch)
+    p.add_argument("--non-hetero-min-tokens", type=int, default=cfg.non_hetero_min_tokens)
     p.add_argument("--compression", default=cfg.compression)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--limit", type=int, default=None)
@@ -1299,6 +1785,12 @@ def run_corpus_backfill(
         "encode_batch_rows": cfg.encode_batch_rows,
         "shard_rows": cfg.shard_rows,
         "sink_format": cfg.sink_format,
+        "snap_sentences": cfg.snap_sentences,
+        "header_anchored": cfg.header_anchored,
+        "anchor_max_chars": cfg.anchor_max_chars,
+        "pin_non_hetero_cutoffs": cfg.pin_non_hetero_cutoffs,
+        "non_hetero_min_batch": cfg.non_hetero_min_batch,
+        "non_hetero_min_tokens": cfg.non_hetero_min_tokens,
         "_clamp_mrl_dim": True,
     }
     kw.update(overrides)
