@@ -8,6 +8,7 @@ import gc
 import glob
 import json
 import math
+import os
 from pathlib import Path
 import struct
 from typing import Any
@@ -24,6 +25,12 @@ from fast_shared.kv_quant import (
 )
 
 from ._mpp_linear import install_qwen_mpp_linears
+from .gdn_kernels import (
+    gdn_delta_update,
+    normalize_gdn_state_mode,
+    quantize_gdn_state_blk32,
+    resolve_gdn_state_mode,
+)
 from .kernels import (
     RMSNormGated,
     SpecBucketedLinearGroup,
@@ -197,14 +204,147 @@ class Qwen3Config:
         )
 
 
+def _use_gdn_metal_override() -> bool | None:
+    raw = os.environ.get("FAST_QWEN3_USE_GDN_METAL", "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _run_gdn_recurrence(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    prev_rec: mx.array | tuple[mx.array, mx.array] | None,
+    *,
+    state_mode: str,
+) -> tuple[mx.array, mx.array | tuple[mx.array, mx.array]]:
+    env_metal = _use_gdn_metal_override()
+    use_gdn_kernel = (
+        state_mode == "int8_blk32"
+        or (state_mode == "bf16" and env_metal is not False)
+        or (env_metal is True)
+    )
+    if use_gdn_kernel:
+        return gdn_delta_update(q, k, v, g, beta, prev_rec, state_mode=state_mode)
+    if isinstance(prev_rec, tuple):
+        prev_dense: mx.array | None = dequantize_gdn_state_int8(
+            prev_rec[0], prev_rec[1], dtype=mx.float32
+        )
+    else:
+        prev_dense = prev_rec
+    y, new_rec = mx.fast.gated_delta_update(q, k, v, g, beta, prev_dense)
+    if state_mode == "bf16" and new_rec.dtype != mx.bfloat16:
+        new_rec = new_rec.astype(mx.bfloat16)
+    return y, new_rec
+
+
 class DeltaSlotCache:
     """Fixed-size `O(1)` depthwise-conv + recurrent state for a `GatedDeltaNet` layer, with zero-GEMM rollback."""
 
-    def __init__(self, conv_state: mx.array | None = None, rec_state: mx.array | None = None) -> None:
+    def __init__(
+        self,
+        conv_state: mx.array | None = None,
+        rec_state: mx.array | None = None,
+        *,
+        state_mode: str = "fp32",
+        rec_codes: mx.array | None = None,
+        rec_scales: mx.array | None = None,
+    ) -> None:
         self.conv_state = conv_state
-        self.rec_state = rec_state
+        self.state_mode: str = normalize_gdn_state_mode(state_mode)
+        self._rec_state: mx.array | None = None
+        self.rec_codes: mx.array | None = None
+        self.rec_scales: mx.array | None = None
         self.record_verify_trace: bool = False
-        self._verify_trace: tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array | None] | None = None
+        self._verify_trace: (
+            tuple[
+                mx.array,
+                mx.array,
+                mx.array,
+                mx.array,
+                mx.array,
+                mx.array,
+                mx.array | tuple[mx.array, mx.array] | None,
+            ]
+            | None
+        ) = None
+        if rec_codes is not None and rec_scales is not None:
+            if self.state_mode == "int8_blk32":
+                self.rec_codes = rec_codes
+                self.rec_scales = rec_scales
+            else:
+                target_dt = mx.bfloat16 if self.state_mode == "bf16" else mx.float32
+                self._rec_state = dequantize_gdn_state_int8(rec_codes, rec_scales, dtype=target_dt)
+        elif rec_state is not None:
+            self.rec_state = rec_state
+
+    @property
+    def rec_state(self) -> mx.array | None:
+        if self.state_mode == "int8_blk32" and self.rec_codes is not None and self.rec_scales is not None:
+            return dequantize_gdn_state_int8(self.rec_codes, self.rec_scales, dtype=mx.float32)
+        return self._rec_state
+
+    @rec_state.setter
+    def rec_state(self, value: mx.array | tuple[mx.array, mx.array] | None) -> None:
+        if value is None:
+            self._rec_state = None
+            self.rec_codes = None
+            self.rec_scales = None
+            return
+        if isinstance(value, tuple):
+            codes, scales = value
+            if self.state_mode == "int8_blk32":
+                self.rec_codes = codes
+                self.rec_scales = scales
+                self._rec_state = None
+            else:
+                target_dt = mx.bfloat16 if self.state_mode == "bf16" else mx.float32
+                self._rec_state = dequantize_gdn_state_int8(codes, scales, dtype=target_dt)
+                self.rec_codes = None
+                self.rec_scales = None
+            return
+        if (
+            self.state_mode == "int8_blk32"
+            and value.ndim == 4
+            and int(value.shape[-1]) >= 32
+            and int(value.shape[-1]) % 32 == 0
+        ):
+            self.rec_codes, self.rec_scales = quantize_gdn_state_blk32(value)
+            self._rec_state = None
+        else:
+            if self.state_mode == "bf16" and value.dtype != mx.bfloat16:
+                self._rec_state = value.astype(mx.bfloat16)
+            elif self.state_mode == "fp32" and value.dtype != mx.float32:
+                self._rec_state = value.astype(mx.float32)
+            else:
+                self._rec_state = value
+            self.rec_codes = None
+            self.rec_scales = None
+
+    def _raw_rec_snapshot(self) -> mx.array | tuple[mx.array, mx.array] | None:
+        if self.state_mode == "int8_blk32" and self.rec_codes is not None and self.rec_scales is not None:
+            return (self.rec_codes, self.rec_scales)
+        return self._rec_state
+
+    def _store_rec_output(self, new_rec: mx.array | tuple[mx.array, mx.array] | None) -> None:
+        if new_rec is None:
+            self._rec_state = None
+            self.rec_codes = None
+            self.rec_scales = None
+        elif isinstance(new_rec, tuple):
+            self.rec_codes, self.rec_scales = new_rec
+            self._rec_state = None
+        else:
+            self._rec_state = new_rec
+            self.rec_codes = None
+            self.rec_scales = None
 
     def clear_verify_trace(self) -> None:
         self._verify_trace = None
@@ -218,17 +358,19 @@ class DeltaSlotCache:
         n_acc = int(accepted_tokens)
         if n_acc <= 0:
             self.conv_state = mx.contiguous(conv_in[:, : conv_k - 1, :])
-            self.rec_state = prev_rec
+            self._store_rec_output(prev_rec)
         else:
             self.conv_state = mx.contiguous(conv_in[:, n_acc : n_acc + conv_k - 1, :])
-            _, self.rec_state = mx.fast.gated_delta_update(
+            _, new_rec = _run_gdn_recurrence(
                 q[:, :n_acc],
                 k[:, :n_acc],
                 v[:, :n_acc],
                 g[:, :n_acc],
                 beta[:, :n_acc],
                 prev_rec,
+                state_mode=self.state_mode,
             )
+            self._store_rec_output(new_rec)
         self.clear_verify_trace()
 
 
@@ -423,15 +565,41 @@ def snapshot_hybrid_cache(
     for entry in cache:
         if isinstance(entry, DeltaSlotCache):
             conv = mx.contiguous(entry.conv_state) if entry.conv_state is not None else None
-            if entry.rec_state is None:
+            if entry.state_mode == "int8_blk32" and entry.rec_codes is not None and entry.rec_scales is not None:
+                if compress_gdn_int8:
+                    codes = mx.contiguous(entry.rec_codes)
+                    scales = mx.contiguous(entry.rec_scales)
+                    if conv is not None:
+                        mx.eval(conv, codes, scales)
+                    else:
+                        mx.eval(codes, scales)
+                    saved.append(("gdn_i8", conv, codes, scales, mx.float32))
+                else:
+                    rec = mx.contiguous(
+                        dequantize_gdn_state_int8(entry.rec_codes, entry.rec_scales, dtype=mx.float32)
+                    )
+                    if conv is not None:
+                        mx.eval(conv, rec)
+                    else:
+                        mx.eval(rec)
+                    saved.append(("gdn_raw", conv, rec))
+            elif entry._rec_state is None:
+                if conv is not None:
+                    mx.eval(conv)
                 saved.append(("gdn_none", conv))
-            elif compress_gdn_int8 and int(entry.rec_state.shape[-1]) % 32 == 0:
-                codes, scales = quantize_gdn_state_int8(entry.rec_state)
-                mx.eval(codes, scales)
-                saved.append(("gdn_i8", conv, codes, scales, entry.rec_state.dtype))
+            elif compress_gdn_int8 and int(entry._rec_state.shape[-1]) % 32 == 0:
+                codes, scales = quantize_gdn_state_int8(entry._rec_state)
+                if conv is not None:
+                    mx.eval(conv, codes, scales)
+                else:
+                    mx.eval(codes, scales)
+                saved.append(("gdn_i8", conv, codes, scales, entry._rec_state.dtype))
             else:
-                rec = mx.contiguous(entry.rec_state)
-                mx.eval(rec)
+                rec = mx.contiguous(entry._rec_state)
+                if conv is not None:
+                    mx.eval(conv, rec)
+                else:
+                    mx.eval(rec)
                 saved.append(("gdn_raw", conv, rec))
         elif isinstance(entry, GrowingKVCache):
             off = entry.offset
@@ -457,27 +625,51 @@ def restore_hybrid_cache(
     batch_size: int = 1,
     kv_step: int = 256,
     kv_i8: bool | str = False,
+    gdn_state_mode: str = "auto",
 ) -> list[DeltaSlotCache | GrowingKVCache]:
     """Materialize an isolated `B=batch_size` hybrid cache from a `HybridPrefixSnapshot`."""
     b = max(1, int(batch_size))
+    inferred_dk = 128
+    for item in snapshot.layer_states:
+        if item[0] in ("gdn_i8", "gdn_raw"):
+            inferred_dk = int(item[2].shape[-1])
+            break
     restored: list[DeltaSlotCache | GrowingKVCache] = []
     for item in snapshot.layer_states:
         kind = item[0]
         if kind == "gdn_none":
             conv = item[1]
             c_b = mx.repeat(conv, b, axis=0) if (conv is not None and b > 1) else conv
-            restored.append(DeltaSlotCache(conv_state=c_b, rec_state=None))
+            eff_mode = resolve_gdn_state_mode(gdn_state_mode, batch_size=b, head_k_dim=inferred_dk)
+            restored.append(DeltaSlotCache(conv_state=c_b, rec_state=None, state_mode=eff_mode))
         elif kind == "gdn_i8":
             _, conv, codes, scales, orig_dtype = item
-            rec1 = dequantize_gdn_state_int8(codes, scales, dtype=orig_dtype)
+            dk_i = int(codes.shape[-1])
+            eff_mode = resolve_gdn_state_mode(gdn_state_mode, batch_size=b, head_k_dim=dk_i)
             c_b = mx.repeat(conv, b, axis=0) if (conv is not None and b > 1) else conv
-            r_b = mx.repeat(rec1, b, axis=0) if b > 1 else rec1
-            restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b))
+            if eff_mode == "int8_blk32":
+                codes_b = mx.repeat(codes, b, axis=0) if b > 1 else codes
+                scales_b = mx.repeat(scales, b, axis=0) if b > 1 else scales
+                restored.append(
+                    DeltaSlotCache(
+                        conv_state=c_b,
+                        state_mode="int8_blk32",
+                        rec_codes=codes_b,
+                        rec_scales=scales_b,
+                    )
+                )
+            else:
+                target_dt = mx.bfloat16 if eff_mode == "bf16" else orig_dtype
+                rec1 = dequantize_gdn_state_int8(codes, scales, dtype=target_dt)
+                r_b = mx.repeat(rec1, b, axis=0) if b > 1 else rec1
+                restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b, state_mode=eff_mode))
         elif kind == "gdn_raw":
             _, conv, rec1 = item
+            dk_i = int(rec1.shape[-1])
+            eff_mode = resolve_gdn_state_mode(gdn_state_mode, batch_size=b, head_k_dim=dk_i)
             c_b = mx.repeat(conv, b, axis=0) if (conv is not None and b > 1) else conv
             r_b = mx.repeat(rec1, b, axis=0) if b > 1 else rec1
-            restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b))
+            restored.append(DeltaSlotCache(conv_state=c_b, rec_state=r_b, state_mode=eff_mode))
         elif kind == "kv_q":
             _, src_mode, off, kw, ks, kb, vw, vs, vb = item
             kv = GrowingKVCache(step=kv_step, kv_i8=kv_i8)
@@ -524,9 +716,13 @@ def compact_hybrid_cache(
             if entry.conv_state is not None:
                 entry.conv_state = mx.take(entry.conv_state, idx_mx, axis=0)
                 to_eval.append(entry.conv_state)
-            if entry.rec_state is not None:
-                entry.rec_state = mx.take(entry.rec_state, idx_mx, axis=0)
-                to_eval.append(entry.rec_state)
+            if entry.state_mode == "int8_blk32" and entry.rec_codes is not None and entry.rec_scales is not None:
+                entry.rec_codes = mx.take(entry.rec_codes, idx_mx, axis=0)
+                entry.rec_scales = mx.take(entry.rec_scales, idx_mx, axis=0)
+                to_eval.extend([entry.rec_codes, entry.rec_scales])
+            elif entry._rec_state is not None:
+                entry._rec_state = mx.take(entry._rec_state, idx_mx, axis=0)
+                to_eval.append(entry._rec_state)
         elif isinstance(entry, GrowingKVCache):
             if entry.keys is not None:
                 entry.keys = mx.take(entry.keys, idx_mx, axis=0)
@@ -962,7 +1158,7 @@ class GatedDeltaLayer(nn.Module):
         if valid_token_scale is not None:
             qkv = qkv * valid_token_scale.astype(qkv.dtype)
 
-        prev_rec = None if (cache is None or cache.rec_state is None) else cache.rec_state
+        prev_rec = None if cache is None else cache._raw_rec_snapshot()
         if cache is None or cache.conv_state is None:
             conv_in = mx.pad(qkv, [(0, 0), (self.conv_k - 1, 0), (0, 0)])
         else:
@@ -997,9 +1193,18 @@ class GatedDeltaLayer(nn.Module):
         if cache is not None and cache.record_verify_trace:
             cache._verify_trace = (conv_in, q, k, v, g, beta, prev_rec)
 
-        y, new_rec = mx.fast.gated_delta_update(q, k, v, g, beta, prev_rec)
+        state_mode = cache.state_mode if cache is not None else "fp32"
+        y, new_rec = _run_gdn_recurrence(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            prev_rec,
+            state_mode=state_mode,
+        )
         if cache is not None:
-            cache.rec_state = new_rec
+            cache._store_rec_output(new_rec)
 
         normed = self.norm(y, z).reshape(b_sz, s_len, self.value_dim)
         res = self.out_proj(normed)
@@ -1435,9 +1640,23 @@ class FastQwen3Model(nn.Module):
             return int(self.lm_head.weight.shape[0])
         return int(self.cfg.vocab_size)
 
-    def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False) -> list[DeltaSlotCache | GrowingKVCache]:
+    def make_cache(
+        self,
+        *,
+        kv_step: int = 256,
+        kv_i8: bool | str = False,
+        gdn_state_mode: str | None = "auto",
+        batch_size: int = 1,
+    ) -> list[DeltaSlotCache | GrowingKVCache]:
+        resolved_gdn = resolve_gdn_state_mode(
+            gdn_state_mode,
+            batch_size=int(batch_size),
+            head_k_dim=int(self.cfg.linear_key_head_dim),
+        )
         return [
-            DeltaSlotCache() if layer.is_linear else GrowingKVCache(step=kv_step, kv_i8=kv_i8)
+            DeltaSlotCache(state_mode=resolved_gdn)
+            if layer.is_linear
+            else GrowingKVCache(step=kv_step, kv_i8=kv_i8)
             for layer in self.layers
         ]
 

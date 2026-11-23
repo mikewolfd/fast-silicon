@@ -315,6 +315,9 @@ class AutoOCRPipeline:
         auto_loop_recover: bool = True,
         memory_limit_gb: float | None = None,
         cache_limit_gb: float | None = None,
+        kv_i8: bool | str | None = None,
+        gdn_state_mode: str | None = None,
+        drop_white_patches: bool | None = None,
     ) -> None:
         if backend not in _VALID_BACKENDS:
             raise ValueError(f"Unsupported backend {backend!r}; expected one of {sorted(_VALID_BACKENDS)}")
@@ -356,6 +359,9 @@ class AutoOCRPipeline:
         self.auto_loop_recover: bool = bool(auto_loop_recover)
         self.memory_limit_gb: float | None = memory_limit_gb
         self.cache_limit_gb: float | None = cache_limit_gb
+        self.kv_i8: bool | str | None = kv_i8
+        self.gdn_state_mode: str | None = gdn_state_mode
+        self.drop_white_patches: bool | None = drop_white_patches
 
         self._vision: Any | None = vision_ocr
         self._ovis: Any | None = ovis_engine
@@ -397,6 +403,9 @@ class AutoOCRPipeline:
                 "auto_loop_recover": self.auto_loop_recover,
                 "memory_limit_gb": self.memory_limit_gb,
                 "cache_limit_gb": self.cache_limit_gb,
+                "kv_i8": self.kv_i8,
+                "gdn_state_mode": self.gdn_state_mode,
+                "drop_white_patches": self.drop_white_patches,
             }
             if not has_var_kw:
                 if "model_path" not in params and "model_dir" in params:

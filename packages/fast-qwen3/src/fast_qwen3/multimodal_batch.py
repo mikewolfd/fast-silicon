@@ -7,12 +7,16 @@ so neither duplicates ragged prefill, ViT frame bucketing, MRoPE decode, or cach
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import os
 import time
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import mlx.core as mx
 import numpy as np
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from fast_shared.grammar import (
     GrammarHelper,
@@ -186,6 +190,102 @@ def pack_length_waves(
     return waves
 
 
+def compute_safe_white_patch_keep_mask(
+    image: Image.Image,
+    target_h: int,
+    target_w: int,
+    *,
+    patch_size: int = 16,
+    merge_size: int = 2,
+    min_keep_tokens: int = 16,
+) -> np.ndarray:
+    """Compute a conservative row-major visual-token keep mask preserving hairlines, faint punctuation, and ink.
+
+    Resizes `image` (RGB) to `(target_w, target_h)` with `BICUBIC` if needed, groups pixels into
+    `(grid_h // merge_size) * (grid_w // merge_size)` row-major `(patch_size * merge_size)^2` blocks
+    matching `build_qwen_vision_inputs`, and drops a merged visual token iff:
+    `(max_ch_std < 1.5) & (min_rgb >= 250) & (edge_grad_max_rgb <= 4)`.
+
+    If fewer than `min_keep_tokens` (or 0) tokens survive, returns an all-True mask so visual spans
+    are never empty.
+    """
+    from PIL import Image as _PILImage
+
+    ps = int(patch_size)
+    ms = int(merge_size)
+    block = ps * ms
+    th = int(target_h)
+    tw = int(target_w)
+    if ps <= 0 or ms <= 0 or th <= 0 or tw <= 0 or (th % block) != 0 or (tw % block) != 0:
+        raise ValueError(
+            f"target_h={target_h} and target_w={target_w} must be positive multiples of patch_size*merge_size={block}"
+        )
+
+    rgb = image.convert("RGB") if image.mode != "RGB" else image
+    if rgb.size != (tw, th):
+        rgb = rgb.resize((tw, th), resample=_PILImage.Resampling.BICUBIC)
+
+    grid_h = th // ps
+    grid_w = tw // ps
+    mh = grid_h // ms
+    mw = grid_w // ms
+    n_tok = mh * mw
+
+    arr_u8 = np.asarray(rgb, dtype=np.uint8)
+    blocks = arr_u8.reshape(mh, block, mw, block, 3).transpose(0, 2, 1, 3, 4).reshape(n_tok, block, block, 3)
+
+    max_ch_std = blocks.astype(np.float32).std(axis=(1, 2)).max(axis=1)
+    min_rgb = blocks.min(axis=(1, 2, 3))
+    if block > 1:
+        blk_i16 = blocks.astype(np.int16)
+        gx = np.abs(blk_i16[:, :, 1:, :] - blk_i16[:, :, :-1, :]).max(axis=(1, 2, 3))
+        gy = np.abs(blk_i16[:, 1:, :, :] - blk_i16[:, :-1, :, :]).max(axis=(1, 2, 3))
+        edge_grad_max_rgb = np.maximum(gx, gy)
+    else:
+        edge_grad_max_rgb = np.zeros((n_tok,), dtype=np.int16)
+
+    drop = (max_ch_std < 1.5) & (min_rgb >= 250) & (edge_grad_max_rgb <= 4)
+    keep = np.asarray(~drop, dtype=np.bool_)
+    req_keep = max(1, int(min_keep_tokens))
+    if int(keep.sum()) < req_keep:
+        return np.ones((n_tok,), dtype=np.bool_)
+    return keep
+
+
+def _make_hybrid_cache(
+    lm: Any,
+    *,
+    kv_step: int,
+    kv_i8: KVMode | bool,
+    gdn_state_mode: str = "auto",
+    batch_size: int = 1,
+) -> list[DeltaSlotCache | GrowingKVCache]:
+    """Call `lm.make_cache` passing `gdn_state_mode`/`batch_size` safely whether or not the LM supports them."""
+    make_fn = lm.make_cache
+    supports_gdn = False
+    supports_bs = False
+    has_var_kw = False
+    try:
+        sig = inspect.signature(make_fn)
+        params = sig.parameters
+        supports_gdn = "gdn_state_mode" in params
+        supports_bs = "batch_size" in params
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        pass
+    kw: dict[str, Any] = {"kv_step": kv_step, "kv_i8": kv_i8}
+    if supports_gdn or (has_var_kw and str(gdn_state_mode) != "auto"):
+        kw["gdn_state_mode"] = gdn_state_mode
+    if supports_bs:
+        kw["batch_size"] = int(batch_size)
+    try:
+        return make_fn(**kw)
+    except TypeError:
+        if supports_gdn or supports_bs:
+            raise
+        return make_fn(kv_step=kv_step, kv_i8=kv_i8)
+
+
 @dataclass
 class BatchedMMItemResult:
     """Per-item completion outputs and attributed stage latencies from batched multimodal decode."""
@@ -199,6 +299,7 @@ class BatchedMMItemResult:
     decode_ms: float
     image_grids: list[tuple[int, int, int]] = field(default_factory=list)
     telemetry: list[dict[str, float]] | None = None
+    dropped_visual_tokens: int = 0
 
 
 def batched_multimodal_generate(
@@ -227,6 +328,10 @@ def batched_multimodal_generate(
     max_wave_tokens: int | None = None,
     min_pixels: int = 65536,
     max_pixels: int = 16777216,
+    drop_white_patches: bool = False,
+    min_pixels_per_item: Sequence[int | None] | None = None,
+    max_pixels_per_item: Sequence[int | None] | None = None,
+    gdn_state_mode: str = "auto",
     stop_ids: frozenset[int],
     pad_token_id: int,
     prefill_chunk_size: int = 512,
@@ -235,29 +340,74 @@ def batched_multimodal_generate(
     """Run grid-bucketed ViT + 3D MRoPE chunked prefill + active-compacted decode over mixed items."""
     n_items = len(images_per_item)
     if n_items == 0:
-        return [], {"waves": 0, "compactions": 0, "vit_ms": 0.0, "prefill_ms": 0.0, "decode_ms": 0.0}
+        return [], {
+            "waves": 0,
+            "compactions": 0,
+            "vit_ms": 0.0,
+            "prefill_ms": 0.0,
+            "decode_ms": 0.0,
+            "dropped_visual_tokens": 0,
+        }
+
+    if min_pixels_per_item is not None and len(min_pixels_per_item) != n_items:
+        raise ValueError(f"Expected {n_items} min_pixels_per_item entries, got {len(min_pixels_per_item)}")
+    if max_pixels_per_item is not None and len(max_pixels_per_item) != n_items:
+        raise ValueError(f"Expected {n_items} max_pixels_per_item entries, got {len(max_pixels_per_item)}")
 
     patch_sz = int(getattr(getattr(vision_model, "cfg", None), "patch_size", 16))
     tps = int(getattr(getattr(vision_model, "cfg", None), "temporal_patch_size", 2))
     merge_sz = int(getattr(getattr(vision_model, "cfg", None), "spatial_merge_size", 2))
+    block_sz = patch_sz * merge_sz
 
     # 1. Preprocess every item's image list into CPU QwenVisionInputs
     flat_slots: list[tuple[int, int, QwenVisionInputs]] = []
     item_vins: list[list[QwenVisionInputs]] = [[] for _ in range(n_items)]
+    item_keep_masks: list[list[np.ndarray | None]] = [[] for _ in range(n_items)]
     for i, imgs in enumerate(images_per_item):
         if not imgs:
             continue
+        item_min_px = (
+            int(min_pixels_per_item[i])
+            if (min_pixels_per_item is not None and min_pixels_per_item[i] is not None)
+            else int(min_pixels)
+        )
+        item_max_px = (
+            int(max_pixels_per_item[i])
+            if (max_pixels_per_item is not None and max_pixels_per_item[i] is not None)
+            else int(max_pixels)
+        )
         for j, im in enumerate(imgs):
+            pil_im = load_image(im)
             vi = build_qwen_vision_inputs(
-                load_image(im),
+                pil_im,
                 patch_size=patch_sz,
                 temporal_patch_size=tps,
                 merge_size=merge_sz,
-                min_pixels=int(min_pixels),
-                max_pixels=int(max_pixels),
+                min_pixels=item_min_px,
+                max_pixels=item_max_px,
             )
             item_vins[i].append(vi)
             flat_slots.append((i, j, vi))
+            km_or_none: np.ndarray | None = None
+            if (
+                drop_white_patches
+                and block_sz > 0
+                and vi.resized_height > 0
+                and vi.resized_width > 0
+                and (vi.resized_height % block_sz) == 0
+                and (vi.resized_width % block_sz) == 0
+                and ((vi.resized_height // block_sz) * (vi.resized_width // block_sz)) == vi.num_visual_tokens
+            ):
+                km = compute_safe_white_patch_keep_mask(
+                    pil_im,
+                    vi.resized_height,
+                    vi.resized_width,
+                    patch_size=patch_sz,
+                    merge_size=merge_sz,
+                )
+                if int(km.sum()) < vi.num_visual_tokens:
+                    km_or_none = km
+            item_keep_masks[i].append(km_or_none)
 
     # 2. Uniform-grid batched ViT encoding (B <= 16 frames per call)
     t_vit0 = time.perf_counter()
@@ -290,6 +440,7 @@ def batched_multimodal_generate(
     hit_eos_all = [False] * n_items
     hit_max_all = [False] * n_items
     prompt_len_raw = [0] * n_items
+    dropped_vis_all = [0] * n_items
     matchers_all: list[Any | None] = [
         grammars[i].new_matcher() if grammars[i] is not None else None for i in range(n_items)
     ]
@@ -301,7 +452,8 @@ def batched_multimodal_generate(
     for i in range(n_items):
         counts_i = [vi.num_visual_tokens for vi in item_vins[i]]
         p_ids, v_spans = prompt_builder(i, counts_i)
-        prompt_len_raw[i] = len(p_ids)
+        raw_len_i = len(p_ids)
+        prompt_len_raw[i] = raw_len_i
         g_i = grammars[i]
         m_i = matchers_all[i]
         up_clean: list[int] = []
@@ -342,7 +494,55 @@ def batched_multimodal_generate(
             mrope_section=mrope_section if mrope_section is not None else getattr(lm.cfg, "mrope_section", (11, 11, 10)),
             dtype=mx.bfloat16,
         )
-        pending_meta.append((i, p_ids, v_spans, int(rope_delta), r_cos[0], r_sin[0]))
+        eff_rope_delta = int(rope_delta)
+        masks_i = item_keep_masks[i]
+        if v_spans and any(m is not None for m in masks_i):
+            new_p_ids: list[int] = []
+            new_v_spans: list[tuple[int, int]] = []
+            seq_keep_parts: list[np.ndarray] = []
+            cur_pos = 0
+            actual_dropped = 0
+            for k_im, (s0, s1) in enumerate(v_spans):
+                if s0 > cur_pos:
+                    new_p_ids.extend(p_ids[cur_pos:s0])
+                    seq_keep_parts.append(np.arange(cur_pos, s0, dtype=np.int32))
+                m_k = masks_i[k_im] if k_im < len(masks_i) else None
+                span_len = s1 - s0
+                vf_k = vis_feats[i][k_im] if k_im < len(vis_feats[i]) else None
+                if (
+                    m_k is not None
+                    and vf_k is not None
+                    and len(m_k) == span_len
+                    and int(vf_k.shape[0]) == span_len
+                    and int(m_k.sum()) < span_len
+                ):
+                    kept_local = np.flatnonzero(m_k).astype(np.int32)
+                    n_kept = int(kept_local.size)
+                    vis_feats[i][k_im] = mx.take(vf_k, mx.array(kept_local, dtype=mx.int32), axis=0)
+                    ns0 = len(new_p_ids)
+                    new_p_ids.extend([int(image_token_id)] * n_kept)
+                    new_v_spans.append((ns0, ns0 + n_kept))
+                    seq_keep_parts.append(int(s0) + kept_local)
+                    actual_dropped += span_len - n_kept
+                else:
+                    ns0 = len(new_p_ids)
+                    new_p_ids.extend(p_ids[s0:s1])
+                    new_v_spans.append((ns0, ns0 + span_len))
+                    seq_keep_parts.append(np.arange(s0, s1, dtype=np.int32))
+                cur_pos = s1
+            if cur_pos < len(p_ids):
+                new_p_ids.extend(p_ids[cur_pos:])
+                seq_keep_parts.append(np.arange(cur_pos, len(p_ids), dtype=np.int32))
+            if actual_dropped > 0:
+                seq_keep_mx = mx.array(np.concatenate(seq_keep_parts, axis=0), dtype=mx.int32)
+                r_cos = mx.take(r_cos, seq_keep_mx, axis=2)
+                r_sin = mx.take(r_sin, seq_keep_mx, axis=2)
+                p_ids = new_p_ids
+                v_spans = new_v_spans
+                eff_rope_delta = int(rope_delta) + int(actual_dropped)
+                dropped_vis_all[i] = int(actual_dropped)
+                prompt_len_raw[i] = raw_len_i - int(actual_dropped)
+        pending_meta.append((i, p_ids, v_spans, eff_rope_delta, r_cos[0], r_sin[0]))
 
     pending_meta.sort(key=lambda row: len(row[1]))
     waves = pack_length_waves(
@@ -424,7 +624,13 @@ def batched_multimodal_generate(
             kv_i8_resolver(b_sz, est_ctx) if callable(kv_i8_resolver) else kv_i8_resolver
         )
         eff_kv_step = max(256, min(int(kv_step), est_ctx))
-        cache: list[DeltaSlotCache | GrowingKVCache] = lm.make_cache(kv_step=eff_kv_step, kv_i8=use_kvi8)
+        cache = _make_hybrid_cache(
+            lm,
+            kv_step=eff_kv_step,
+            kv_i8=use_kvi8,
+            gdn_state_mode=gdn_state_mode,
+            batch_size=b_sz,
+        )
 
         slot_cur_h: list[mx.array | None] = [None] * b_sz
         for c0 in range(0, max_s, chunk_sz):
@@ -703,6 +909,7 @@ def batched_multimodal_generate(
             decode_ms=dec_ms_item[i],
             image_grids=[vi.grid_thw for vi in item_vins[i]],
             telemetry=tels_all[i],
+            dropped_visual_tokens=dropped_vis_all[i],
         )
         for i in range(n_items)
     ]
@@ -712,12 +919,14 @@ def batched_multimodal_generate(
         "vit_ms": round(total_vit_ms, 2),
         "prefill_ms": round(pf_ms_total, 2),
         "decode_ms": round(dec_ms_total, 2),
+        "dropped_visual_tokens": int(sum(dropped_vis_all)),
     }
 
 
 __all__ = [
     "BatchedMMItemResult",
     "batched_multimodal_generate",
+    "compute_safe_white_patch_keep_mask",
     "compute_step_telemetry",
     "default_wave_token_budget",
     "host_phys_memory_gb",

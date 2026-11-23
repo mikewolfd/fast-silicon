@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import AbstractSet, Any, Callable, Mapping, Sequence
 
@@ -23,9 +24,15 @@ from fast_shared.grammar import (
     safe_argmax_1d,
     sample_unconstrained,
 )
+from fast_shared.kv_quant import KVMode, normalize_kv_mode
 from fast_qwen3.model import FastQwen3Model, Qwen3Config
 from fast_qwen3.mtp_drafter import verify_draft_sequence_b1
-from fast_qwen3.multimodal_batch import batched_multimodal_generate, host_phys_memory_gb
+from fast_qwen3.multimodal_batch import (
+    _make_hybrid_cache,
+    batched_multimodal_generate,
+    compute_safe_white_patch_keep_mask,
+    host_phys_memory_gb,
+)
 from fast_qwen3.tokenizer import ENDOFTEXT, IM_END, IM_START, THINK_CLOSE, THINK_OPEN, FastQwen3Tokenizer, QwenVocabRemapper
 
 from .apple_vision import AppleVisionOCR, deskew_document_image
@@ -88,7 +95,71 @@ DEFAULT_GFM_STRICT_PROMPT: str = (
     "(| col1 | col2 |). Format formulas as LaTeX. Preserve all original text and numbers verbatim."
 )
 
-_OCR_EXTRA_CHARS: str = "—–“”‘’•§¶°±×÷€£¥¢½¼¾©®™✓✔✗☐☑"
+_OCR_EXTRA_CHARS: str = (
+    "—–“”‘’•§¶°±×÷€£¥¢½¼¾©®™✓✔✗☐☑"
+    "−→←↑↓≤≥≠≈∞√∑∫†‡‑"
+    "αβγδεζηθλμνξπρστφχψωΔΘΛΞΠΣΦΨΩ"
+    "₀₁₂₃₄₅₆₇₈₉"
+)
+
+_LATIN_LANG_CODES: frozenset[str] = frozenset({
+    "en", "eng", "fr", "fra", "fre", "de", "deu", "ger", "es", "spa", "pt", "por",
+    "it", "ita", "nl", "nld", "dut", "da", "dan", "sv", "swe", "no", "nob", "nno",
+    "nb", "nn", "fi", "fin", "is", "isl", "pl", "pol", "cs", "ces", "cze", "sk",
+    "slk", "slo", "sl", "slv", "hr", "hrv", "hu", "hun", "ro", "ron", "rum",
+    "tr", "tur", "az", "aze", "et", "est", "lv", "lav", "lt", "lit", "ca", "cat",
+    "eu", "eus", "gl", "glg", "ga", "gle", "cy", "cym", "mt", "mlt", "sq", "sqi",
+    "id", "ind", "ms", "msa", "tl", "tgl", "sw", "swa", "af", "afr", "la", "lat",
+    "latin", "latn",
+})
+_NON_LATIN_SCRIPTS: frozenset[str] = frozenset({
+    "hans", "hant", "jpan", "kore", "arab", "cyrl", "deva", "grek", "hebr",
+    "thai", "hang", "kana", "hira", "beng", "taml", "telu", "gujr", "guru",
+    "knda", "mlym", "orya", "sinh", "mymr", "khmr", "laoo", "geor", "armn", "ethi",
+})
+
+
+def _languages_use_latin_only(languages: Sequence[str] | None) -> bool:
+    """Return False when `languages` contains any non-Latin language or script tag."""
+    if not languages:
+        return True
+    for raw in languages:
+        tag = str(raw or "").strip().lower()
+        if not tag:
+            continue
+        parts = [p for p in re.split(r"[-_]", tag) if p]
+        if not parts:
+            continue
+        if "latn" in parts:
+            continue
+        if any(p in _NON_LATIN_SCRIPTS for p in parts):
+            return False
+        if parts[0] not in _LATIN_LANG_CODES:
+            return False
+    return True
+
+
+def resolve_ovis_kv_mode(
+    kv_i8: KVMode | bool | str,
+    *,
+    batch_size: int,
+    alloc_ctx: int,
+    host_mem_gb: float | None = None,
+    head_dim: int = 256,
+) -> KVMode:
+    """Resolve KV cache precision for Ovis OCR (`'auto'` uses `'q4_quarot'` under batch/context pressure)."""
+    if isinstance(kv_i8, bool):
+        return "q8" if kv_i8 else "bf16"
+    raw_s = str(kv_i8).strip().lower()
+    if raw_s != "auto":
+        return normalize_kv_mode(kv_i8)
+    if int(head_dim) % 64 != 0:
+        return "bf16"
+    host_gb = float(host_mem_gb) if host_mem_gb is not None else host_phys_memory_gb()
+    ctx_cutoff = 4096 if host_gb <= 28.0 else 8192
+    if int(batch_size) >= 8 or int(alloc_ctx) >= ctx_cutoff:
+        return "q4_quarot"
+    return "bf16"
 
 
 def _find_local_hf_snapshot(repo_id: str) -> Path | None:
@@ -199,23 +270,31 @@ def build_ocr_vocab_subset(
     full_vocab_size: int,
     special_ids: Sequence[int] = (),
     target_size: int | None = None,
-) -> QwenVocabRemapper:
-    """Build a lossless OCR vocabulary subset preserving special tokens, HTML/LaTeX markup, and symbols."""
+    latin_only: bool = True,
+    languages: Sequence[str] | None = None,
+) -> QwenVocabRemapper | None:
+    """Build a lossless OCR vocabulary subset preserving special tokens, HTML/LaTeX markup, and symbols.
+
+    Returns `None` (keep full vocabulary) when `latin_only=False` or `languages` includes non-Latin scripts.
+    """
+    if not latin_only or not _languages_use_latin_only(languages):
+        return None
     base = QwenVocabRemapper.build_ascii_latin_subset(
         tokenizer.backend_tokenizer,
         full_vocab_size=int(full_vocab_size),
         target_size=target_size,
     )
     if target_size is None:
-        # Ensure explicit vision/ChatML specials & common OCR punctuation are never dropped
+        # Ensure explicit vision/ChatML specials & OCR symbols (bare and space-prefixed) are never dropped
         extra_keep: set[int] = {int(x) for x in base.new_to_old.tolist()}
         for sid in special_ids:
             if 0 <= int(sid) < int(full_vocab_size):
                 extra_keep.add(int(sid))
         for sym in _OCR_EXTRA_CHARS:
-            for tid in tokenizer.encode(sym, add_special_tokens=False):
-                if 0 <= int(tid) < int(full_vocab_size):
-                    extra_keep.add(int(tid))
+            for cand in (sym, " " + sym):
+                for tid in tokenizer.encode(cand, add_special_tokens=False):
+                    if 0 <= int(tid) < int(full_vocab_size):
+                        extra_keep.add(int(tid))
         for tok_str in (IM_START, IM_END, ENDOFTEXT, THINK_OPEN, THINK_CLOSE):
             tid = tokenizer.backend_tokenizer.token_to_id(tok_str)
             if tid is not None and 0 <= int(tid) < int(full_vocab_size):
@@ -423,6 +502,22 @@ def _token_tail_repeat_4gram_rate(token_ids: Sequence[int], *, tail_len: int = 2
     return float(dups) / float(m)
 
 
+def _normalize_per_item_int(
+    value: int | Sequence[int | None] | None,
+    n_items: int,
+    name: str,
+) -> tuple[int | None, list[int | None] | None]:
+    """Normalize a scalar or per-item int sequence into `(scalar_override, per_item_list)`."""
+    if value is None:
+        return None, None
+    if isinstance(value, (int, np.integer)):
+        return int(value), None
+    seq = [None if x is None else int(x) for x in value]
+    if len(seq) != n_items:
+        raise ValueError(f"Expected {n_items} {name} entries, got {len(seq)}")
+    return None, seq
+
+
 class FastOvisOCREngine:
     """Zero-training high-speed Qwen3.5 VLM OCR engine built on `fast-qwen3` + `FastQwen35VisionModel`."""
 
@@ -447,6 +542,11 @@ class FastOvisOCREngine:
         max_tokens: int = 8192,
         loop_breaker: bool = False,
         auto_loop_recover: bool = True,
+        kv_i8: KVMode | bool | str = "auto",
+        gdn_state_mode: str = "auto",
+        drop_white_patches: bool = False,
+        latin_only: bool = True,
+        languages: Sequence[str] | None = None,
         enable_fusion: bool = True,
         warmup: bool = False,
         memory_limit_gb: float | None = None,
@@ -467,6 +567,9 @@ class FastOvisOCREngine:
             if cache_bytes is not None and callable(getattr(mx, "set_cache_limit", None)):
                 self._prev_mlx_cache_limit = int(mx.set_cache_limit(cache_bytes))
 
+        if not isinstance(kv_i8, bool) and str(kv_i8).strip().lower() != "auto":
+            _ = normalize_kv_mode(kv_i8)
+
         self.model_dir = resolve_ocr_model_dir(model_path)
         self.raw_config: dict[str, Any] = json.loads((self.model_dir / "config.json").read_text(encoding="utf-8"))
         self.output_format: OutputFormat = output_format
@@ -485,6 +588,11 @@ class FastOvisOCREngine:
         self.max_tokens: int = max(1, int(max_tokens))
         self.loop_breaker: bool = bool(loop_breaker)
         self.auto_loop_recover: bool = bool(auto_loop_recover)
+        self.kv_i8: KVMode | bool | str = kv_i8
+        self.gdn_state_mode: str = str(gdn_state_mode)
+        self.drop_white_patches: bool = bool(drop_white_patches)
+        self.latin_only: bool = bool(latin_only)
+        self.languages: tuple[str, ...] | None = tuple(languages) if languages is not None else None
 
         self.image_token_id: int = int(self.raw_config.get("image_token_id", 248056))
         self.vision_start_token_id: int = int(self.raw_config.get("vision_start_token_id", 248053))
@@ -499,14 +607,16 @@ class FastOvisOCREngine:
             self.vision_end_token_id,
             self.video_token_id,
         )
-        self.vocab_remap = build_ocr_vocab_subset(
+        self.vocab_remap: QwenVocabRemapper | None = build_ocr_vocab_subset(
             self.tokenizer,
             full_vocab_size=lm_cfg.vocab_size,
             special_ids=specials,
             target_size=vocab_size,
+            latin_only=self.latin_only,
+            languages=self.languages,
         )
-        if self.vocab_remap.vocab_size >= lm_cfg.vocab_size:
-            self.vocab_remap = None  # type: ignore[assignment]
+        if self.vocab_remap is not None and self.vocab_remap.vocab_size >= lm_cfg.vocab_size:
+            self.vocab_remap = None
 
         self.vision_model = FastQwen35VisionModel.from_pretrained(
             self.model_dir,
@@ -585,6 +695,7 @@ class FastOvisOCREngine:
         deskew: bool | None = None,
         min_pixels: int | None = None,
         max_pixels: int | None = None,
+        drop_white_patches: bool | None = None,
         native_pdf_text: str | None = None,
         speculative: SpeculativeMode | None = None,
         draft_k: int | None = None,
@@ -604,6 +715,11 @@ class FastOvisOCREngine:
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
         do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
+        eff_drop_white = (
+            bool(getattr(self, "drop_white_patches", False))
+            if drop_white_patches is None
+            else bool(drop_white_patches)
+        )
         spec_req: SpeculativeMode = self.speculative if speculative is None else speculative
         has_native_pdf = bool(native_pdf_text and str(native_pdf_text).strip())
         if draft_k is None:
@@ -686,6 +802,29 @@ class FastOvisOCREngine:
             mrope_section=tuple(int(x) for x in mrope_sec),
             dtype=mx.bfloat16,
         )
+        patch_sz = int(getattr(getattr(self.vision_model, "cfg", None), "patch_size", 16))
+        merge_sz = int(getattr(self.vision_model, "spatial_merge_size", 2))
+        block_sz = patch_sz * merge_sz
+        keep_mask: np.ndarray | None = None
+        if (
+            eff_drop_white
+            and block_sz > 0
+            and vi.resized_height > 0
+            and vi.resized_width > 0
+            and (vi.resized_height % block_sz) == 0
+            and (vi.resized_width % block_sz) == 0
+            and ((vi.resized_height // block_sz) * (vi.resized_width // block_sz)) == vi.num_visual_tokens
+        ):
+            km = compute_safe_white_patch_keep_mask(
+                img,
+                vi.resized_height,
+                vi.resized_width,
+                patch_size=patch_sz,
+                merge_size=merge_sz,
+            )
+            if int(km.sum()) < vi.num_visual_tokens:
+                keep_mask = km
+
         px_mx = mx.array(vi.pixel_values)
         mx.eval(cos_a, sin_a, px_mx)
         prep_ms = (time.perf_counter() - t_prep0) * 1000.0
@@ -696,10 +835,37 @@ class FastOvisOCREngine:
         vit_ms = (time.perf_counter() - t_vit0) * 1000.0
 
         t_prefill0 = time.perf_counter()
+        img_start = prompt_ids.index(self.image_token_id)
+        n_full_vis = int(vis_feats.shape[0])
+        n_dropped_vis = 0
+        if keep_mask is not None and len(keep_mask) == n_full_vis:
+            kept_vis_idx = np.flatnonzero(keep_mask).astype(np.int32)
+            n_kept_vis = int(kept_vis_idx.size)
+            if 0 < n_kept_vis < n_full_vis:
+                n_dropped_vis = n_full_vis - n_kept_vis
+                full_seq_len = len(prompt_ids)
+                vis_feats = mx.take(vis_feats, mx.array(kept_vis_idx, dtype=mx.int32), axis=0)
+                prompt_ids = (
+                    prompt_ids[:img_start]
+                    + ([self.image_token_id] * n_kept_vis)
+                    + prompt_ids[img_start + n_full_vis :]
+                )
+                seq_keep = np.concatenate(
+                    [
+                        np.arange(0, img_start, dtype=np.int32),
+                        int(img_start) + kept_vis_idx,
+                        np.arange(img_start + n_full_vis, full_seq_len, dtype=np.int32),
+                    ],
+                    axis=0,
+                )
+                seq_keep_mx = mx.array(seq_keep, dtype=mx.int32)
+                cos_a = mx.take(cos_a, seq_keep_mx, axis=2)
+                sin_a = mx.take(sin_a, seq_keep_mx, axis=2)
+                rope_delta = int(rope_delta) + int(n_dropped_vis)
+
         seq_len = len(prompt_ids)
         prompt_mx = mx.array([prompt_ids], dtype=mx.int32)
         text_emb = self.lm.embed_tokens(prompt_mx)
-        img_start = prompt_ids.index(self.image_token_id)
         img_end = img_start + int(vis_feats.shape[0])
         inputs_embeds = mx.concatenate(
             [
@@ -711,7 +877,21 @@ class FastOvisOCREngine:
         )
 
         kv_step = max(256, min(512, seq_len + tok_cap + 64))
-        cache = self.lm.make_cache(kv_step=kv_step, kv_i8=False)
+        head_dim = int(getattr(getattr(self.lm, "cfg", None), "head_dim", 256))
+        use_kv_mode = resolve_ovis_kv_mode(
+            getattr(self, "kv_i8", "auto"),
+            batch_size=1,
+            alloc_ctx=seq_len + tok_cap,
+            head_dim=head_dim,
+        )
+        use_gdn_mode = str(getattr(self, "gdn_state_mode", "auto"))
+        cache = _make_hybrid_cache(
+            self.lm,
+            kv_step=kv_step,
+            kv_i8=use_kv_mode,
+            gdn_state_mode=use_gdn_mode,
+            batch_size=1,
+        )
         if self.prefill_chunk_size > 0 and seq_len > self.prefill_chunk_size:
             last_h: mx.array | None = None
             for c0 in range(0, seq_len, self.prefill_chunk_size):
@@ -1102,6 +1282,7 @@ class FastOvisOCREngine:
                 deskew=False,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
+                drop_white_patches=eff_drop_white,
                 native_pdf_text=native_pdf_text,
                 speculative=spec_req,
                 draft_k=k_draft,
@@ -1194,6 +1375,8 @@ class FastOvisOCREngine:
             "rope_delta": int(rope_delta),
             "speculative_mode": eff_spec,
             "vocab_size": int(self.lm.vocab_n),
+            "kv_mode": use_kv_mode,
+            "dropped_visual_tokens": int(n_dropped_vis),
         }
         if eff_max_pixels < 16_777_216:
             metadata["adaptive_max_pixels"] = int(eff_max_pixels)
@@ -1233,7 +1416,7 @@ class FastOvisOCREngine:
                 total_ms=round(total_ms, 3),
                 decode_tps=round(decode_tps, 2),
                 prompt_tokens=int(seq_len),
-                visual_tokens=int(vi.num_visual_tokens),
+                visual_tokens=int(vis_feats.shape[0]),
                 generated_tokens=int(total_gen),
                 drafted_tokens=int(drafted_tokens),
                 accepted_draft_tokens=int(accepted_draft_tokens),
@@ -1380,8 +1563,9 @@ class FastOvisOCREngine:
         auto_orient: bool | None = None,
         adaptive_resolution: bool | None = None,
         deskew: bool | None = None,
-        min_pixels: int | None = None,
-        max_pixels: int | None = None,
+        min_pixels: int | Sequence[int | None] | None = None,
+        max_pixels: int | Sequence[int | None] | None = None,
+        drop_white_patches: bool | None = None,
         native_pdf_texts: Sequence[str | None] | None = None,
         speculative: SpeculativeMode | None = None,
         draft_k: int | None = None,
@@ -1397,27 +1581,31 @@ class FastOvisOCREngine:
         """Process multiple images: true `B >= 2` batched VLM waves or double-buffered ANE+PLD when `B=1`."""
         if not sources:
             return []
-        indices = list(range(len(sources))) if page_indices is None else [int(i) for i in page_indices]
-        if len(indices) != len(sources):
-            raise ValueError(f"Expected {len(sources)} page_indices, got {len(indices)}")
+        n_sources = len(sources)
+        indices = list(range(n_sources)) if page_indices is None else [int(i) for i in page_indices]
+        if len(indices) != n_sources:
+            raise ValueError(f"Expected {n_sources} page_indices, got {len(indices)}")
 
         pre_seq: list[OCRResult | None] = (
-            list(pre_analyses) if pre_analyses is not None else [None] * len(sources)
+            list(pre_analyses) if pre_analyses is not None else [None] * n_sources
         )
-        if len(pre_seq) != len(sources):
-            raise ValueError(f"Expected {len(sources)} pre_analyses, got {len(pre_seq)}")
+        if len(pre_seq) != n_sources:
+            raise ValueError(f"Expected {n_sources} pre_analyses, got {len(pre_seq)}")
 
         prompt_seq: list[str | None] = (
-            list(prompts) if prompts is not None else [prompt] * len(sources)
+            list(prompts) if prompts is not None else [prompt] * n_sources
         )
-        if len(prompt_seq) != len(sources):
-            raise ValueError(f"Expected {len(sources)} prompts, got {len(prompt_seq)}")
+        if len(prompt_seq) != n_sources:
+            raise ValueError(f"Expected {n_sources} prompts, got {len(prompt_seq)}")
 
         native_seq: list[str | None] = (
-            list(native_pdf_texts) if native_pdf_texts is not None else [None] * len(sources)
+            list(native_pdf_texts) if native_pdf_texts is not None else [None] * n_sources
         )
-        if len(native_seq) != len(sources):
-            raise ValueError(f"Expected {len(sources)} native_pdf_texts, got {len(native_seq)}")
+        if len(native_seq) != n_sources:
+            raise ValueError(f"Expected {n_sources} native_pdf_texts, got {len(native_seq)}")
+
+        min_px_scalar, min_px_per_item = _normalize_per_item_int(min_pixels, n_sources, "min_pixels")
+        max_px_scalar, max_px_per_item = _normalize_per_item_int(max_pixels, n_sources, "max_pixels")
 
         fmt: OutputFormat = output_format or self.output_format
         tmode: MarkdownTableMode = table_mode or self.table_mode
@@ -1427,19 +1615,34 @@ class FastOvisOCREngine:
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
         do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
+        eff_drop_white = (
+            bool(getattr(self, "drop_white_patches", False))
+            if drop_white_patches is None
+            else bool(drop_white_patches)
+        )
         spec_req: SpeculativeMode = self.speculative if speculative is None else speculative
         k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
         eff_loop_breaker = bool(getattr(self, "loop_breaker", False))
         eff_bs = 1 if batch_size is None else max(1, int(batch_size))
-        eff_min_pixels = 65_536 if min_pixels is None else max(1024, int(min_pixels))
-        eff_max_pixels = 16_777_216 if max_pixels is None else max(eff_min_pixels, int(max_pixels))
+        eff_min_pixels = 65_536 if min_px_scalar is None else max(1024, int(min_px_scalar))
+        eff_max_pixels = 16_777_216 if max_px_scalar is None else max(eff_min_pixels, int(max_px_scalar))
+
+        def _item_min_px(pos_i: int) -> int | None:
+            if min_px_per_item is not None:
+                return min_px_per_item[pos_i]
+            return min_px_scalar
+
+        def _item_max_px(pos_i: int) -> int | None:
+            if max_px_per_item is not None:
+                return max_px_per_item[pos_i]
+            return max_px_scalar
 
         # Single image or explicit B=1 path keeps double-buffered ANE Vision + B=1 PLD fast path
-        if len(sources) == 1 or eff_bs <= 1:
+        if n_sources == 1 or eff_bs <= 1:
             need_ane_prepass = do_orient or do_zoom or spec_req in ("auto", "vision+self")
-            if len(sources) == 1 or do_deskew or not need_ane_prepass or all(p is not None for p in pre_seq):
+            if n_sources == 1 or do_deskew or not need_ane_prepass or all(p is not None for p in pre_seq):
                 return [
                     self.ocr_image(
                         src,
@@ -1454,8 +1657,9 @@ class FastOvisOCREngine:
                         auto_orient=do_orient,
                         adaptive_resolution=do_adaptive,
                         deskew=do_deskew,
-                        min_pixels=min_pixels,
-                        max_pixels=max_pixels,
+                        min_pixels=_item_min_px(pos_i),
+                        max_pixels=_item_max_px(pos_i),
+                        drop_white_patches=eff_drop_white,
                         native_pdf_text=nat_i,
                         speculative=spec_req,
                         draft_k=draft_k,
@@ -1464,7 +1668,7 @@ class FastOvisOCREngine:
                         pre_analysis=pre,
                         auto_loop_recover=do_loop_recover,
                     )
-                    for src, idx, pre, pr_i, nat_i in zip(sources, indices, pre_seq, prompt_seq, native_seq)
+                    for pos_i, (src, idx, pre, pr_i, nat_i) in enumerate(zip(sources, indices, pre_seq, prompt_seq, native_seq))
                 ]
 
             def _run_ane(src: Any, idx: int) -> OCRResult | None:
@@ -1476,9 +1680,9 @@ class FastOvisOCREngine:
             results_b1: list[OCRResult] = []
             with ThreadPoolExecutor(max_workers=1) as pool:
                 cur_pre = pre_seq[0] if pre_seq[0] is not None else _run_ane(sources[0], indices[0])
-                for pos in range(len(sources)):
+                for pos in range(n_sources):
                     nxt_fut: Future[OCRResult | None] | None = None
-                    if pos + 1 < len(sources) and pre_seq[pos + 1] is None:
+                    if pos + 1 < n_sources and pre_seq[pos + 1] is None:
                         nxt_fut = pool.submit(_run_ane, sources[pos + 1], indices[pos + 1])
                     results_b1.append(
                         self.ocr_image(
@@ -1494,8 +1698,9 @@ class FastOvisOCREngine:
                             auto_orient=do_orient,
                             adaptive_resolution=do_adaptive,
                             deskew=False,
-                            min_pixels=min_pixels,
-                            max_pixels=max_pixels,
+                            min_pixels=_item_min_px(pos),
+                            max_pixels=_item_max_px(pos),
+                            drop_white_patches=eff_drop_white,
                             native_pdf_text=native_seq[pos],
                             speculative=spec_req,
                             draft_k=draft_k,
@@ -1507,7 +1712,7 @@ class FastOvisOCREngine:
                     )
                     if nxt_fut is not None:
                         cur_pre = nxt_fut.result()
-                    elif pos + 1 < len(sources):
+                    elif pos + 1 < n_sources:
                         cur_pre = pre_seq[pos + 1]
             return results_b1
 
@@ -1584,7 +1789,7 @@ class FastOvisOCREngine:
             if do_crop:
                 im, crop_box = crop_to_ink(im, pad_px=self.crop_pad_px)
             adap_cap: int | None = None
-            if max_pixels is None and do_adaptive and pre_i is not None and pre_i.analysis is not None:
+            if max_px_scalar is None and max_px_per_item is None and do_adaptive and pre_i is not None and pre_i.analysis is not None:
                 apx = compute_adaptive_max_pixels(
                     pre_i.analysis,
                     oriented_imgs[i].size,
@@ -1593,11 +1798,13 @@ class FastOvisOCREngine:
                 if apx < 16_777_216:
                     adap_cap = apx
                     if im.width * im.height > apx:
+                        eff_item_min_px = _item_min_px(i)
+                        eff_adapt_min_px = 65_536 if eff_item_min_px is None else max(1024, int(eff_item_min_px))
                         rh, rw = smart_resize_qwen(
                             im.height,
                             im.width,
                             factor=32,
-                            min_pixels=eff_min_pixels,
+                            min_pixels=eff_adapt_min_px,
                             max_pixels=apx,
                         )
                         if (rw, rh) != im.size:
@@ -1647,10 +1854,17 @@ class FastOvisOCREngine:
             for x in self.raw_config.get("text_config", {}).get("rope_parameters", {}).get("mrope_section", (11, 11, 10))
         )
 
-        def _ovis_kv_i8(b_slots: int, alloc_ctx: int) -> str:
-            if host_phys_memory_gb() <= 28.0 and (b_slots >= 48 or alloc_ctx >= 8192):
-                return "q8"
-            return "bf16"
+        kv_req = getattr(self, "kv_i8", "auto")
+        head_dim = int(getattr(getattr(self.lm, "cfg", None), "head_dim", 256))
+        use_gdn_mode = str(getattr(self, "gdn_state_mode", "auto"))
+
+        def _ovis_kv_i8(b_slots: int, alloc_ctx: int) -> KVMode:
+            return resolve_ovis_kv_mode(
+                kv_req,
+                batch_size=b_slots,
+                alloc_ctx=alloc_ctx,
+                head_dim=head_dim,
+            )
 
         mm_results, mm_stats = batched_multimodal_generate(
             lm=self.lm,
@@ -1668,12 +1882,16 @@ class FastOvisOCREngine:
             repeat_penalty=eff_loop_breaker,
             batch_size=eff_bs,
             kv_step=512,
-            kv_i8_resolver=_ovis_kv_i8,  # type: ignore[arg-type]
+            kv_i8_resolver=_ovis_kv_i8,
             compact_active=compact_active,
             max_pad_ratio=max_pad_ratio,
             max_wave_tokens=max_wave_tokens,
             min_pixels=eff_min_pixels,
             max_pixels=eff_max_pixels,
+            drop_white_patches=eff_drop_white,
+            min_pixels_per_item=min_px_per_item,
+            max_pixels_per_item=max_px_per_item,
+            gdn_state_mode=use_gdn_mode,
             stop_ids=self.tokenizer.stop_token_ids,
             pad_token_id=self.tokenizer.eos_token_id,
             prefill_chunk_size=min(512, int(self.prefill_chunk_size)) if self.prefill_chunk_size > 0 else 512,
@@ -1715,8 +1933,9 @@ class FastOvisOCREngine:
                     auto_orient=False,
                     adaptive_resolution=do_adaptive,
                     deskew=False,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
+                    min_pixels=_item_min_px(i),
+                    max_pixels=_item_max_px(i),
+                    drop_white_patches=eff_drop_white,
                     native_pdf_text=native_seq[i],
                     speculative=spec_req,
                     draft_k=draft_k,
@@ -1814,12 +2033,15 @@ class FastOvisOCREngine:
                         validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
 
             grid_thw = list(mm_res.image_grids[0]) if mm_res.image_grids else [1, 0, 0]
-            vis_toks = (grid_thw[0] * grid_thw[1] * grid_thw[2]) // 4 if len(grid_thw) == 3 else 0
+            full_vis_toks = (grid_thw[0] * grid_thw[1] * grid_thw[2]) // 4 if len(grid_thw) == 3 else 0
+            dropped_vis = int(getattr(mm_res, "dropped_visual_tokens", 0))
+            vis_toks = max(0, full_vis_toks - dropped_vis)
             metadata: dict[str, Any] = {
                 "grid_thw": grid_thw,
                 "speculative_mode": "batched",
                 "vocab_size": vocab_n,
                 "wave_stats": mm_stats,
+                "dropped_visual_tokens": dropped_vis,
             }
             if adaptive_caps[i] is not None:
                 metadata["adaptive_max_pixels"] = int(adaptive_caps[i])  # type: ignore[arg-type]
