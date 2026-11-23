@@ -15,10 +15,12 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import statistics
 import subprocess
@@ -184,6 +186,27 @@ OCR_FAMILY_PACKAGES: tuple[str, ...] = (
     "public-marker",
     "public-pypdfium2",
 )
+VISION_BENCHMARK_SPECS: tuple[OutcomePackageSpec, ...] = (
+    OutcomePackageSpec(
+        "fast-gemma4-vision",
+        5,
+        "FAST_GEMMA4_HOME",
+        "Gemma-4 lazy multimodal VLM OCR & visual JSON KIE (Cat 5)",
+    ),
+    OutcomePackageSpec(
+        "fast-embeddinggemma-2-vision",
+        5,
+        "FAST_EMBEDDINGGEMMA2_HOME",
+        "EmbeddingGemma-2 lazy cross-modal page-image retrieval (Cat 5)",
+    ),
+    OutcomePackageSpec(
+        "fast-pplx-vision",
+        5,
+        "FAST_PPLX_HOME",
+        "PPLX Qwen3.5-ViT multi-band MaxSim page-image retrieval (Cat 5)",
+    ),
+)
+VISION_BENCHMARK_PACKAGES: tuple[str, ...] = tuple(s.name for s in VISION_BENCHMARK_SPECS)
 PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     "fast-bge-small": ("public-bge-small", "coreml-bge-small"),
     "fast-embeddinggemma-2": (
@@ -196,9 +219,10 @@ PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     "fast-qwen3": ("public-qwen3.5", "coreai-qwen3.5-4b"),
     "fast-gpt-oss": ("public-gpt-oss",),
     "fast-ocr": ("public-ovis-mlx-vlm", "public-apple-vision", "public-pypdfium2"),
+    "fast-gemma4-vision": ("public-ovis-mlx-vlm", "public-apple-vision"),
 }
 _SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {
-    s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS, *COREML_BASELINE_SPECS)
+    s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS, *COREML_BASELINE_SPECS, *VISION_BENCHMARK_SPECS)
 }
 _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-bge-small": "fast-bge-small",
@@ -218,6 +242,9 @@ _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-gpt-oss": "fast-gpt-oss",
     "coreai-qwen3.5-4b": "fast-qwen3",
     "coreai-gemma4": "fast-gemma4",
+    "fast-gemma4-vision": "fast-gemma4",
+    "fast-embeddinggemma-2-vision": "fast-embeddinggemma-2",
+    "fast-pplx-vision": "fast-pplx",
     "public-ovis-mlx-vlm": "fast-ocr",
     "public-apple-vision": "fast-ocr",
     "public-pypdfium2": "fast-ocr",
@@ -546,6 +573,14 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--puredocbench-track", choices=("clean", "digital", "real"), default="clean")
     p.add_argument("--puredocbench-images-root", default=None)
     p.add_argument("--puredocbench-en-root", default=None)
+    # Multimodal vision & cross-modal page-image retrieval flags
+    p.add_argument("--max-soft-tokens", type=int, default=None)
+    p.add_argument("--vision-model-dir", default=None)
+    p.add_argument("--visual-retrieval-suites", default="default")
+    p.add_argument("--visual-index-mode", choices=("fp16", "int8", "binary_int8", "auto"), default="fp16")
+    p.add_argument("--visual-chunks", type=int, default=8)
+    p.add_argument("--no-visual-crop-margins", action="store_true", default=False)
+    p.add_argument("--grid-bucket-step", type=int, default=None)
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -2031,7 +2066,10 @@ def _run_llm_worker(
 # Category 5 Workers: fast-ocr + cross-family MLX VLMs / ANE / ONNX / CLI / PDF pipelines
 # ---------------------------------------------------------------------------
 
-_CAT5_PACKAGES: frozenset[str] = frozenset(OCR_FAMILY_PACKAGES)
+_CAT5_PACKAGES: frozenset[str] = frozenset(OCR_FAMILY_PACKAGES) | frozenset({"fast-gemma4-vision"})
+_VISUAL_RETRIEVAL_PACKAGES: frozenset[str] = frozenset({"fast-embeddinggemma-2-vision", "fast-pplx-vision"})
+_VISUAL_RETRIEVAL_ALL_SUITES: tuple[str, ...] = ("fintabnet_otsl", "omnidocbench_en", "cord_v2", "olmocr_bench")
+_VISUAL_RETRIEVAL_DEFAULT_SUITES: tuple[str, ...] = ("fintabnet_otsl", "omnidocbench_en", "cord_v2")
 _CAT5_ALL_SUITES: tuple[str, ...] = (
     "olmocr_bench",
     "fintabnet_otsl",
@@ -2167,7 +2205,7 @@ def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
     if raw == "all":
         requested = list(_CAT5_ALL_SUITES)
     elif raw == "gov":
-        if pkg_name == "public-nuextract3-mlx-vlm" or "nuextract" in ocr_model_low:
+        if pkg_name in ("public-nuextract3-mlx-vlm", "fast-gemma4-vision") or "nuextract" in ocr_model_low:
             requested = ["vrdu_ad_buy", "vrdu_registration", "doclaynet_gov", "us_gov_ocr"]
         else:
             requested = ["doclaynet_gov", "us_gov_ocr"]
@@ -2176,6 +2214,8 @@ def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
     elif raw == "default":
         if pkg_name == "public-pypdfium2":
             requested = ["olmocr_bench"]
+        elif pkg_name == "fast-gemma4-vision":
+            requested = ["olmocr_bench", "fintabnet_otsl", "omnidocbench_en", "cord_v2"]
         elif pkg_name == "public-nuextract3-mlx-vlm" or "nuextract" in ocr_model_low:
             requested = ["cord_v2", "olmocr_bench", "fintabnet_otsl"]
         else:
@@ -2365,6 +2405,11 @@ def _run_cat5_worker(
                 model_dirs.extend([p.resolve() for p in mdir.rglob("*") if p.is_file()])
             except Exception:
                 pass
+    elif pkg_name == "fast-gemma4-vision":
+        if extra.model_dir:
+            mdir = Path(extra.model_dir).expanduser().resolve()
+            if mdir.is_dir():
+                model_dirs.append(mdir)
     else:
         model_dirs.extend(stock_hf_model_files(pkg_name))
 
@@ -2495,6 +2540,7 @@ def _run_cat5_worker(
         return []
 
     fast_eng: Any = None
+    gemma4_eng: Any = None
     pub_ad: Any = None
     eff_backend: str
     eff_label: str
@@ -2559,6 +2605,28 @@ def _run_cat5_worker(
             default_family = "qwen3.5-ovis+ane"
         else:
             default_family = "qwen3.5-ovis"
+    elif pkg_name == "fast-gemma4-vision":
+        from fast_gemma4.engine import FastGemma4Engine
+
+        eff_mode = extra.mode or "gpu"
+        g4_kw: dict[str, Any] = {
+            "home": home,
+            "model_dir": extra.model_dir,
+            "default_mode": eff_mode,
+            "local_files_only": True,
+            "warmup": False,
+            "warmup_ane": False,
+        }
+        if extra.gemma_vocab_out is not None:
+            g4_kw["vocab_out"] = extra.gemma_vocab_out
+        if extra.kv_i8 is not None or extra.no_kv_i8:
+            g4_kw["kv_i8"] = False if extra.no_kv_i8 else bool(extra.kv_i8)
+        gemma4_eng = FastGemma4Engine(**g4_kw)
+        eff_backend = "fast-gemma4-vision"
+        soft_tag = f"_s{int(extra.max_soft_tokens)}" if getattr(extra, "max_soft_tokens", None) else ""
+        mdl_tag = f"_{Path(str(extra.model_dir)).name}" if extra.model_dir else ""
+        eff_label = config_label or f"gemma4_vision_{extra.table_mode}{soft_tag}{mdl_tag}"
+        default_family = "gemma4-vision"
     else:
         pub_ad = build_public_cat5_adapter(
             pkg_name,
@@ -2582,6 +2650,35 @@ def _run_cat5_worker(
             "vit_ms": float(res.timings.vit_ms),
             "prefill_ms": float(res.timings.prefill_ms),
         }
+
+    def _gemma4_result_meta(item: Any, stats: Mapping[str, Any] | None) -> dict[str, Any]:
+        st = dict(stats or {})
+        return {
+            "backend_used": "fast-gemma4-vision",
+            "model_family": default_family,
+            "generated_tokens": int(st.get("completion_tokens", getattr(item, "completion_tokens", 0)) or 0),
+            "prompt_tokens": int(st.get("prompt_tokens", getattr(item, "prompt_tokens", 0)) or 0),
+            "visual_tokens": int(st.get("vision_tokens", 0) or 0),
+            "decode_tps": float(st.get("decode_tok_s", 0.0) or 0.0),
+            "decode_ms": float(st.get("decode_sec", 0.0) or 0.0) * 1000.0,
+            "vit_ms": float(st.get("vision_sec", 0.0) or 0.0) * 1000.0,
+            "prefill_ms": float(st.get("prefill_sec", 0.0) or 0.0) * 1000.0,
+        }
+
+    def _default_gemma4_ocr_prompt(task_kind: str) -> str:
+        if task_kind == "table":
+            if extra.table_mode == "html":
+                return "Transcribe the table in this image as clean HTML <table>...</table> preserving every cell and number verbatim."
+            return "Transcribe the table in this image as a GitHub-Flavored Markdown pipe table preserving every cell and number verbatim."
+        if extra.table_mode == "html":
+            return (
+                "Extract all readable content from this page image in natural reading order as Markdown. "
+                "Format tables as HTML <table>...</table> and formulas as LaTeX. Preserve all text and numbers verbatim."
+            )
+        return (
+            "Extract all readable content from this page image in natural reading order as GitHub-Flavored Markdown. "
+            "Format tables as GFM pipe tables and formulas as LaTeX. Preserve all text and numbers verbatim."
+        )
 
     def _run_image_ocr(
         pil_img: Any,
@@ -2608,6 +2705,20 @@ def _run_cat5_worker(
             else:
                 res = fast_eng.ocr_image(pil_img)
             return res.text, res.finish_reason, _fast_result_meta(res)
+        if gemma4_eng is not None:
+            eff_prompt = prompt if prompt is not None else _default_gemma4_ocr_prompt(task_kind)
+            eff_schema = None if (schema is None or bool(extra.no_llguidance)) else dict(schema)
+            item = gemma4_eng.generate(
+                eff_prompt,
+                images=[pil_img],
+                json_schema=eff_schema,
+                max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                temperature=0.0,
+                enable_thinking=False,
+                max_soft_tokens=getattr(extra, "max_soft_tokens", None),
+            )
+            stats = getattr(gemma4_eng, "last_multimodal_stats", None)
+            return item.text, item.finish_reason, _gemma4_result_meta(item, stats)
         assert pub_ad is not None
         return pub_ad.ocr_image_fn(
             pil_img,
@@ -2660,6 +2771,9 @@ def _run_cat5_worker(
                 return res.text, res.finish_reason, _fast_result_meta(res)
             pil_img = _render_pdf_page_pil(pdf_path, dpi=int(extra.ocr_dpi), page_index=page_index)
             return _run_image_ocr(pil_img, task_kind=task_kind)
+        if gemma4_eng is not None:
+            pil_img = _render_pdf_page_pil(pdf_path, dpi=int(extra.ocr_dpi), page_index=page_index)
+            return _run_image_ocr(pil_img, task_kind=task_kind)
         assert pub_ad is not None
         if pub_ad.ocr_pdf_page_fn is not None and (not bool(extra.ocr_render_only) or not pub_ad.supports_images):
             return pub_ad.ocr_pdf_page_fn(pdf_path, page_index=int(page_index))
@@ -2680,23 +2794,20 @@ def _run_cat5_worker(
                 _ = fast_eng.ocr_image(tiny)
             else:
                 _ = fast_eng._get_vision_ocr().recognize_image(tiny, output_format="raw")
-                if any(
-                    s in suites
-                    for s in (
-                        "fintabnet_otsl",
-                        "omnidocbench_en",
-                        "cord_v2",
-                        "olmocr_bench",
-                        "vrdu_ad_buy",
-                        "vrdu_registration",
-                        "doclaynet_gov",
-                        "puredocbench_legal_gov",
-                        "us_gov_ocr",
-                    )
-                ):
+                if any(s in suites for s in _CAT5_ALL_SUITES):
                     _ = fast_eng._get_ovis_engine().ocr_image(
                         tiny, output_format="raw", crop_margins=False, auto_orient=False, speculative="off", max_tokens=2
                     )
+        elif gemma4_eng is not None:
+            tiny = Image.new("RGB", (64, 64), (255, 255, 255))
+            _ = gemma4_eng.generate(
+                "Transcribe any text.",
+                images=[tiny],
+                max_tokens=2,
+                temperature=0.0,
+                enable_thinking=False,
+                max_soft_tokens=getattr(extra, "max_soft_tokens", None),
+            )
         elif pub_ad is not None and pub_ad.supports_images:
             tiny = Image.new("RGB", (64, 64), (255, 255, 255))
             _ = pub_ad.ocr_image_fn(tiny, max_tokens_override=2, task_kind="page")
@@ -2919,7 +3030,10 @@ def _run_cat5_worker(
                 diag = {
                     "backend": eff_backend,
                     **rate_diag,
-                    "llguidance": bool(pkg_name == "fast-ocr" and eff_backend != "apple-vision"),
+                    "llguidance": bool(
+                        (pkg_name == "fast-ocr" and eff_backend != "apple-vision")
+                        or (pkg_name == "fast-gemma4-vision" and not bool(extra.no_llguidance))
+                    ),
                     "grounded_field_f1": ev["grounded_field_f1"],
                     "anls": ev["anls"],
                     "valid_json_rate": ev["valid_json_rate"],
@@ -2983,7 +3097,10 @@ def _run_cat5_worker(
                 diag = {
                     "backend": eff_backend,
                     **rate_diag,
-                    "llguidance": bool(pkg_name == "fast-ocr" and eff_backend != "apple-vision"),
+                    "llguidance": bool(
+                        (pkg_name == "fast-ocr" and eff_backend != "apple-vision")
+                        or (pkg_name == "fast-gemma4-vision" and not bool(extra.no_llguidance))
+                    ),
                     "grounded_field_f1": ev["grounded_field_f1"],
                     "anls": ev["anls"],
                     "valid_json_rate": ev["valid_json_rate"],
@@ -3240,9 +3357,429 @@ def _run_cat5_worker(
     finally:
         if pub_ad is not None:
             pub_ad.close()
+        if gemma4_eng is not None and hasattr(gemma4_eng, "close"):
+            gemma4_eng.close()
         if fast_eng is not None and hasattr(fast_eng, "close"):
             fast_eng.close()
     return records
+
+
+# ---------------------------------------------------------------------------
+# Category 5 Visual Page-Image Retrieval Workers (`fast-embeddinggemma-2-vision`, `fast-pplx-vision`)
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _resolve_visual_retrieval_suites(extra: argparse.Namespace) -> list[str]:
+    raw = str(getattr(extra, "visual_retrieval_suites", "default") or "default").strip().lower()
+    if raw == "default":
+        return list(_VISUAL_RETRIEVAL_DEFAULT_SUITES)
+    if raw == "all":
+        return list(_VISUAL_RETRIEVAL_ALL_SUITES)
+    requested = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    for tok in requested:
+        if tok not in _VISUAL_RETRIEVAL_ALL_SUITES:
+            raise ValueError(
+                f"Unknown --visual-retrieval-suites entry {tok!r}; expected subset of {_VISUAL_RETRIEVAL_ALL_SUITES}"
+            )
+    return requested
+
+
+def _flatten_json_leaf_values(obj: Any, out: list[str], *, limit: int = 16) -> None:
+    if len(out) >= limit or obj is None:
+        return
+    if isinstance(obj, Mapping):
+        for v in obj.values():
+            _flatten_json_leaf_values(v, out, limit=limit)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _flatten_json_leaf_values(v, out, limit=limit)
+    else:
+        s = _WS_COLLAPSE_RE.sub(" ", str(obj)).strip()
+        if s and s not in out:
+            out.append(s)
+
+
+def _extract_visual_retrieval_query(suite: str, item: Mapping[str, Any]) -> str:
+    """Deterministically build a short cross-modal text query strictly from pinned Category 5 GT."""
+    if suite == "fintabnet_otsl":
+        raw_html = str(item.get("gold_html") or item.get("html") or "")
+        plain = html.unescape(_HTML_TAG_RE.sub(" ", raw_html))
+        cleaned = _WS_COLLAPSE_RE.sub(" ", plain).strip()
+        return f"Financial table: {cleaned[:220]}".strip() if cleaned else ""
+    if suite == "omnidocbench_en":
+        blocks = item.get("text_blocks") or []
+        parts: list[str] = []
+        for blk in blocks:
+            txt = _WS_COLLAPSE_RE.sub(" ", str(blk.get("text") or "")).strip()
+            if txt:
+                parts.append(txt)
+            if sum(len(p) for p in parts) >= 220:
+                break
+        if not parts:
+            for tbl in item.get("tables") or []:
+                plain = html.unescape(_HTML_TAG_RE.sub(" ", str(tbl.get("html") or "")))
+                txt = _WS_COLLAPSE_RE.sub(" ", plain).strip()
+                if txt:
+                    parts.append(txt)
+                    break
+        return " ".join(parts)[:240].strip()
+    if suite == "cord_v2":
+        leaves: list[str] = []
+        _flatten_json_leaf_values(item.get("gt_parse") if item.get("gt_parse") is not None else item.get("gt_json"), leaves, limit=14)
+        cleaned = " ".join(leaves).strip()
+        return f"Receipt: {cleaned[:220]}".strip() if cleaned else ""
+    if suite == "olmocr_bench":
+        snippets: list[str] = []
+        for t in item.get("tests") or []:
+            if not isinstance(t, Mapping):
+                continue
+            ttype = str(t.get("type") or "")
+            if ttype == "present" and t.get("text"):
+                snippets.append(str(t["text"]))
+            elif ttype == "order" and t.get("before") and t.get("after"):
+                snippets.append(f"{t['before']} {t['after']}")
+            elif ttype == "table" and t.get("cell"):
+                hdr = " ".join(str(x) for x in (t.get("top_heading"), t.get("left_heading"), t.get("cell")) if x)
+                snippets.append(hdr)
+            elif ttype == "math" and t.get("math"):
+                snippets.append(str(t["math"]))
+            if sum(len(s) for s in snippets) >= 220:
+                break
+        cleaned = _WS_COLLAPSE_RE.sub(" ", " ".join(snippets)).strip()
+        return cleaned[:240]
+    return ""
+
+
+def _build_visual_retrieval_corpus(
+    suites: Sequence[str],
+    *,
+    tier: str,
+    max_items: int | None,
+    smoke: bool,
+    lock: Mapping[str, Any],
+    cache_dir: Path,
+    local_files_only: bool,
+    dpi: int = 150,
+) -> list[dict[str, Any]]:
+    """Build deterministic `(id, source, query, image)` pairs from pinned Category 5 datasets."""
+    from PIL import Image
+
+    per_src_cap = 2 if smoke else (max(1, int(max_items)) if max_items is not None else (6 if tier == "tier1" else 20))
+    corpus: list[dict[str, Any]] = []
+    for suite in suites:
+        if suite == "fintabnet_otsl":
+            raw_items = load_fintabnet_otsl(
+                tier=tier, max_items=per_src_cap, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only
+            )
+            for it in raw_items:
+                q = _extract_visual_retrieval_query(suite, it)
+                if len(q) < 4:
+                    continue
+                corpus.append(
+                    {
+                        "id": f"{suite}:{it['id']}",
+                        "source": suite,
+                        "query": q,
+                        "image": _bytes_to_pil(it["image_bytes"]),
+                    }
+                )
+        elif suite == "omnidocbench_en":
+            raw_items = load_omnidocbench_en(
+                tier=tier,
+                max_items=per_src_cap,
+                download_images=True,
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            for it in raw_items:
+                q = _extract_visual_retrieval_query(suite, it)
+                if len(q) < 4:
+                    continue
+                with Image.open(it["image_path"]) as im:
+                    pil = im.convert("RGB")
+                corpus.append({"id": f"{suite}:{it['id']}", "source": suite, "query": q, "image": pil})
+        elif suite == "cord_v2":
+            raw_items = load_cord_v2(
+                tier=tier, max_items=per_src_cap, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only
+            )
+            for it in raw_items:
+                q = _extract_visual_retrieval_query(suite, it)
+                if len(q) < 4:
+                    continue
+                corpus.append(
+                    {
+                        "id": f"{suite}:{it['id']}",
+                        "source": suite,
+                        "query": q,
+                        "image": _bytes_to_pil(it["image_bytes"]),
+                    }
+                )
+        elif suite == "olmocr_bench":
+            raw_items = load_olmocr_bench(
+                tier=tier,
+                max_pages=per_src_cap,
+                download_pdfs=True,
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            for it in raw_items:
+                q = _extract_visual_retrieval_query(suite, it)
+                if len(q) < 4:
+                    continue
+                pil = _render_pdf_first_page_pil(it["pdf_path"], dpi=int(dpi))
+                corpus.append({"id": f"{suite}:{it['id']}", "source": suite, "query": q, "image": pil})
+    return corpus
+
+
+def _score_visual_retrieval_matrix(
+    sims: np.ndarray,
+    corpus: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compute exact per-query MRR@10, R@1, R@5, and source breakdowns from `[N, N]` similarity scores."""
+    mat = np.asarray(sims, dtype=np.float32)
+    n = len(corpus)
+    if mat.shape != (n, n):
+        raise ValueError(f"Expected ({n}, {n}) visual retrieval score matrix, got {mat.shape}")
+
+    valid_flags: list[bool] = []
+    rr_scores: list[float] = []
+    hit1_scores: list[float] = []
+    hit5_scores: list[float] = []
+    ranks: list[int] = []
+    by_src_rr: dict[str, list[float]] = {}
+    by_src_r1: dict[str, list[float]] = {}
+
+    for i in range(n):
+        row = mat[i]
+        ok = bool(np.all(np.isfinite(row)))
+        valid_flags.append(ok)
+        if not ok:
+            rr, h1, h5, rk = 0.0, 0.0, 0.0, n + 1
+        else:
+            order = np.argsort(-row, kind="stable")
+            pos = int(np.where(order == i)[0][0])
+            rk = pos + 1
+            rr = (1.0 / float(rk)) if rk <= 10 else 0.0
+            h1 = 1.0 if rk == 1 else 0.0
+            h5 = 1.0 if rk <= 5 else 0.0
+        rr_scores.append(rr)
+        hit1_scores.append(h1)
+        hit5_scores.append(h5)
+        ranks.append(rk)
+        src = str(corpus[i].get("source") or "unknown")
+        by_src_rr.setdefault(src, []).append(rr)
+        by_src_r1.setdefault(src, []).append(h1)
+
+    query_ids = [str(c["id"]) for c in corpus]
+    id_bytes = json.dumps(query_ids, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    per_source = {
+        src: {
+            "n": len(vals),
+            "recall_at_1": round(float(np.mean(by_src_r1[src])), 4),
+            "mrr_at_10": round(float(np.mean(vals)), 4),
+        }
+        for src, vals in sorted(by_src_rr.items())
+    }
+    return {
+        "valid_flags": valid_flags,
+        "per_item_rr": rr_scores,
+        "ranks": ranks,
+        "mrr_at_10": round(float(np.mean(rr_scores)) if rr_scores else 0.0, 4),
+        "recall_at_1": round(float(np.mean(hit1_scores)) if hit1_scores else 0.0, 4),
+        "recall_at_5": round(float(np.mean(hit5_scores)) if hit5_scores else 0.0, 4),
+        "per_source": per_source,
+        "coverage": {
+            "n_queries": n,
+            "n_valid_queries": sum(valid_flags),
+            "ordered_query_ids_sha256": hashlib.sha256(id_bytes).hexdigest(),
+        },
+    }
+
+
+def _run_visual_retrieval_worker(
+    pkg_name: str,
+    *,
+    tier: str,
+    config_label: str,
+    extra: argparse.Namespace,
+    lock: Mapping[str, Any],
+    cache_dir: Path,
+    local_files_only: bool,
+    max_items: int | None,
+    smoke: bool,
+    home: Path,
+    host_mem_gb: float,
+) -> list[dict[str, Any]]:
+    """Run cross-modal text-to-page-image retrieval for `fast-embeddinggemma-2-vision` or `fast-pplx-vision`."""
+    from PIL import Image
+
+    suites = _resolve_visual_retrieval_suites(extra)
+    corpus = _build_visual_retrieval_corpus(
+        suites,
+        tier=tier,
+        max_items=max_items,
+        smoke=smoke,
+        lock=lock,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        dpi=int(extra.ocr_dpi),
+    )
+    if not corpus:
+        return []
+
+    model_dirs: list[Path] = [home / "artifacts"]
+    idx_mode = str(getattr(extra, "visual_index_mode", "fp16") or "fp16")
+    eff_batch = max(1, int(extra.batch_size)) if getattr(extra, "batch_size", None) is not None else 8
+    eng: Any = None
+    eff_label: str
+    extra_diag: dict[str, Any] = {}
+
+    if pkg_name == "fast-embeddinggemma-2-vision":
+        from fast_embeddinggemma_2.engine import FastEmbeddingGemma2
+
+        eff_mode = extra.mode or "gpu"
+        eng = FastEmbeddingGemma2(home=home, default_mode=eff_mode, warmup=False)
+        try:
+            vdir = eng._resolve_vision_model_dir(getattr(extra, "vision_model_dir", None))
+            model_dirs.append(vdir)
+        except Exception:
+            pass
+        soft_toks = getattr(extra, "max_soft_tokens", None)
+        soft_tag = f"_s{int(soft_toks)}" if soft_toks is not None else ""
+        eff_label = config_label or f"emb2_vision_{eff_mode}_{idx_mode}{soft_tag}"
+        extra_diag = {
+            "backend": "fast-embeddinggemma-2-vision",
+            "mode": eff_mode,
+            "index_mode": idx_mode,
+            "max_soft_tokens": soft_toks,
+            "batch_size": eff_batch,
+        }
+    elif pkg_name == "fast-pplx-vision":
+        from fast_pplx.engine import FastPplx
+
+        eff_mode = extra.mode or "gpu"
+        eff_chunks = max(1, int(getattr(extra, "visual_chunks", 8) or 8))
+        eff_crop = not bool(getattr(extra, "no_visual_crop_margins", False))
+        eff_gbs = getattr(extra, "grid_bucket_step", None)
+        eng = FastPplx(home=home, mode=eff_mode, ane_profile=extra.ane_profile, local_files_only=True)
+        if getattr(eng, "model_dir", None):
+            model_dirs.append(Path(eng.model_dir))
+        eff_label = config_label or f"pplx_vision_c{eff_chunks}_{idx_mode}{'_crop' if eff_crop else '_full'}"
+        extra_diag = {
+            "backend": "fast-pplx-vision",
+            "mode": eff_mode,
+            "index_mode": idx_mode,
+            "chunks": eff_chunks,
+            "crop_margins": eff_crop,
+            "grid_bucket_step": eff_gbs,
+            "batch_size": eff_batch,
+        }
+    else:
+        raise ValueError(f"Unsupported visual retrieval package: {pkg_name!r}")
+
+    probe = FourBucketMemoryProbe(model_directories=model_dirs)
+    guard = DeviceMemoryGuard()
+    guard_tripped = False
+    images = [c["image"] for c in corpus]
+    queries = [c["query"] for c in corpus]
+
+    try:
+        guard.arm()
+        # Untimed tiny warmup so lazy vision towers & text encoders load outside EOT timing.
+        tiny = Image.new("RGB", (64, 64), (255, 255, 255))
+        if pkg_name == "fast-embeddinggemma-2-vision":
+            _ = eng.encode_images(
+                [tiny],
+                max_soft_tokens=getattr(extra, "max_soft_tokens", None),
+                batch_size=1,
+                vision_model_dir=getattr(extra, "vision_model_dir", None),
+            )
+            _ = eng.encode_texts(["warmup query"], is_query=True, add_query_prefix=True, mode=extra.mode or "gpu")
+        else:
+            _ = eng.encode_images([tiny], chunks=1, batch_size=1, crop_margins=False)
+            _ = eng.encode_queries(["warmup query"], mode=extra.mode or "gpu", output_dtype="float32", normalize=True)
+        _mx_sync()
+        _mx_reset_peak()
+
+        t0 = time.perf_counter()
+        if pkg_name == "fast-embeddinggemma-2-vision":
+            t_img0 = time.perf_counter()
+            index = eng.build_image_index(
+                images,
+                max_soft_tokens=getattr(extra, "max_soft_tokens", None),
+                batch_size=eff_batch,
+                mode=idx_mode,
+                vision_model_dir=getattr(extra, "vision_model_dir", None),
+            )
+            _mx_sync()
+            img_sec = time.perf_counter() - t_img0
+            t_q0 = time.perf_counter()
+            q_vecs = eng.encode_texts(queries, is_query=True, add_query_prefix=True, mode=extra.mode or "gpu")
+            _mx_sync()
+            q_sec = time.perf_counter() - t_q0
+        else:
+            t_img0 = time.perf_counter()
+            index = eng.build_image_index(
+                images,
+                chunks=max(1, int(getattr(extra, "visual_chunks", 8) or 8)),
+                batch_size=eff_batch,
+                crop_margins=not bool(getattr(extra, "no_visual_crop_margins", False)),
+                grid_bucket_step=getattr(extra, "grid_bucket_step", None),
+                mode=idx_mode,
+                agg="maxsim",
+            )
+            _mx_sync()
+            img_sec = time.perf_counter() - t_img0
+            t_q0 = time.perf_counter()
+            q_vecs = eng.encode_queries(queries, mode=extra.mode or "gpu", output_dtype="float32", normalize=True)
+            _mx_sync()
+            q_sec = time.perf_counter() - t_q0
+        sims = index.score_all(q_vecs)
+        wall = time.perf_counter() - t0
+        _, ref = guard.check()
+        if ref is not None:
+            guard_tripped = True
+        mem4 = _memory_4bucket_dict(probe)
+        scored = _score_visual_retrieval_matrix(sims, corpus)
+        diag = {
+            **extra_diag,
+            "n_images": len(images),
+            "recall_at_1": scored["recall_at_1"],
+            "recall_at_5": scored["recall_at_5"],
+            "mrr_at_10": scored["mrr_at_10"],
+            "img_per_sec": round(float(len(images)) / max(img_sec, 1e-6), 3),
+            "encode_images_sec": round(img_sec, 4),
+            "encode_queries_sec": round(q_sec, 4),
+            "index_bytes": int(getattr(index, "nbytes", 0)),
+            "compression_ratio_vs_fp32": round(float(getattr(index, "compression_ratio_vs_fp32", 1.0)), 3),
+            "device_guard_tripped": guard_tripped,
+        }
+        return [
+            _build_record(
+                package=pkg_name,
+                category=5,
+                config_label=eff_label,
+                benchmark=f"VisualRetrieval({len(corpus)})",
+                valid_flags=scored["valid_flags"],
+                item_scores=scored["per_item_rr"],
+                wall_sec=wall,
+                diagnostics=diag,
+                memory_4bucket_gb=mem4,
+                sub_benchmarks={
+                    "by_source": scored["per_source"],
+                    "visual_retrieval": scored["coverage"],
+                },
+                host_mem_gb=host_mem_gb,
+            )
+        ]
+    finally:
+        if eng is not None and hasattr(eng, "close"):
+            eng.close()
 
 
 def _run_worker_main(args: argparse.Namespace) -> int:
@@ -3364,6 +3901,20 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                             "gate_verdict": "SKIP",
                         }
                     )
+        elif pkg_name in _VISUAL_RETRIEVAL_PACKAGES:
+            recs = _run_visual_retrieval_worker(
+                pkg_name,
+                tier=args.tier,
+                config_label=args.worker_label or "",
+                extra=extra,
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=bool(args.local_files_only),
+                max_items=args.max_items,
+                smoke=bool(args.smoke),
+                home=home,
+                host_mem_gb=host_mem,
+            )
         elif pkg_name in _CAT5_PACKAGES:
             try:
                 recs = _run_cat5_worker(
@@ -4019,6 +4570,8 @@ def compute_public_comparisons(
         ("fast-ocr", None, "public-tesseract"),
         ("fast-ocr", None, "public-docling"),
         ("fast-ocr", None, "public-marker"),
+        ("fast-gemma4-vision", None, "public-ovis-mlx-vlm"),
+        ("fast-gemma4-vision", None, "public-apple-vision"),
     )
     for fast_pkg, backend_filter, pub_pkg in pair_map:
         fast_cands = [
@@ -4140,12 +4693,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             for name in OCR_FAMILY_PACKAGES:
                 if name not in pkg_names:
                     pkg_names.append(name)
+        elif tok_p == "vision":
+            saw_group_token = True
+            for name in VISION_BENCHMARK_PACKAGES:
+                if name not in pkg_names:
+                    pkg_names.append(name)
         elif tok_p in _SPEC_BY_NAME or tok_p == "openai-chat":
             if tok_p not in pkg_names:
                 pkg_names.append(tok_p)
         else:
             raise ValueError(
-                f"Unknown package {tok_p!r}; choose from all, public, coreml, ocr-families, {', '.join(_SPEC_BY_NAME)}, openai-chat"
+                f"Unknown package {tok_p!r}; choose from all, public, coreml, ocr-families, vision, {', '.join(_SPEC_BY_NAME)}, openai-chat"
             )
 
     if getattr(args, "include_public_baselines", False):
@@ -4332,7 +4890,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument(
         "--packages",
         default="all",
-        help="Comma-separated package names or groups (all, public, coreml, ocr-families)",
+        help="Comma-separated package names or groups (all, public, coreml, ocr-families, vision)",
     )
     rn.add_argument("--abba-compare", nargs="+", default=None, help="Two 'label:flags' arms for interleaved ABBA")
     rn.add_argument("--abba-rounds", type=int, default=2, help="Interleaved ABBA rounds when --abba-compare is set")

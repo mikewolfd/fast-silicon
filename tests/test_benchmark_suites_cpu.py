@@ -2133,5 +2133,339 @@ def test_cat5_puredocbench_en_flags_and_batched_fast_ocr_dispatch(
     assert batch_calls == [(2, 16)]
 
 
+def test_cat5_auto_warmup_includes_puredocbench_en_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PIL import Image
+    import fast_ocr
+    from fast_ocr.types import OCRResult, OCRTimings
+
+    out = _load_script("test_pdb_en_auto_warmup", "benchmark_outcomes.py")
+    en_root = tmp_path / "puredocbench_en"
+    gt_dir = en_root / "gt" / "01_academic" / "01_paper"
+    img_dir = en_root / "images" / "clean" / "01_academic" / "01_paper"
+    gt_dir.mkdir(parents=True)
+    img_dir.mkdir(parents=True)
+    (en_root / "release_manifest_en.csv").write_text(
+        "page_id,category,subcategory,gt_rel,html_rel,clean_rel,digital_rel,real_rel\n"
+        "p0,01_academic,01_paper,01_academic/01_paper/p0.json,,01_academic/01_paper/p0.png,,\n",
+        encoding="utf-8",
+    )
+    (gt_dir / "p0.json").write_text(
+        json.dumps(
+            {
+                "page_info": {"page_attribute": {"language": "en"}},
+                "layout_dets": [{"category_type": "text_block", "order": 0, "text": "Hello world."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    Image.new("RGB", (32, 32), "white").save(img_dir / "p0.png")
+
+    events: list[str] = []
+
+    class _SpyAutoOCR:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def _get_vision_ocr(self) -> Any:
+            return SimpleNamespace(recognize_image=lambda *_a, **_kw: events.append("ane_warmup"))
+
+        def _get_ovis_engine(self) -> Any:
+            def _warm(*_a: Any, **_kw: Any) -> OCRResult:
+                events.append("ovis_warmup")
+                return OCRResult(text="", raw_text="", backend_used="ovis:stub", finish_reason="stop", timings=OCRTimings())
+
+            return SimpleNamespace(ocr_image=_warm)
+
+        def ocr_image(self, _img: Any, **_kw: Any) -> OCRResult:
+            events.append("timed_ocr")
+            return OCRResult(
+                text="Hello world.",
+                raw_text="Hello world.",
+                backend_used="auto:stub",
+                finish_reason="stop",
+                timings=OCRTimings(generated_tokens=2, decode_tps=50.0, decode_ms=40.0),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(fast_ocr, "FastOCR", _SpyAutoOCR)
+    extra = out._parse_extra_flags(
+        ["--ocr-backend", "auto", "--ocr-suites", "puredocbench_en", "--puredocbench-en-root", str(en_root)]
+    )
+    recs = out._run_cat5_worker(
+        "fast-ocr",
+        tier="tier1",
+        config_label="auto_pdb_en",
+        extra=extra,
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert len(recs) == 1 and recs[0]["benchmark"] == "PureDocBench-EN(1)"
+    assert events == ["ane_warmup", "ovis_warmup", "timed_ocr"]
+
+
+def test_vision_group_and_fast_gemma4_vision_worker_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import io
+    from PIL import Image
+    import fast_gemma4.engine as g4_engine_mod
+
+    out = _load_script("test_vision_gemma4_worker", "benchmark_outcomes.py")
+
+    rc = out.main(["run", "--dry-run", "--packages", "vision"])
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["packages"] == [
+        "fast-gemma4-vision",
+        "fast-embeddinggemma-2-vision",
+        "fast-pplx-vision",
+    ]
+    assert out._resolve_cat5_suites("fast-gemma4-vision", out._parse_extra_flags([])) == [
+        "olmocr_bench",
+        "fintabnet_otsl",
+        "omnidocbench_en",
+        "cord_v2",
+    ]
+    assert "vrdu_ad_buy" in out._resolve_cat5_suites("fast-gemma4-vision", out._parse_extra_flags(["--ocr-suites", "gov"]))
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), "white").save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    monkeypatch.setattr(
+        out,
+        "load_fintabnet_otsl",
+        lambda **_kw: [
+            {
+                "id": "ft0",
+                "image_bytes": png_bytes,
+                "gold_html": "<table><tr><th>Metric</th><th>2025</th></tr><tr><td>Revenue</td><td>100</td></tr></table>",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        out,
+        "load_cord_v2",
+        lambda **_kw: [
+            {
+                "id": "cd0",
+                "image_bytes": png_bytes,
+                "gt_parse": {"menu": [{"nm": "Coffee", "price": "4.50"}], "total": {"total_price": "4.50"}},
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "menu": {"type": "array"},
+                        "total": {"type": "object"},
+                    },
+                    "required": ["menu", "total"],
+                },
+            }
+        ],
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    class _SpyGemma4Engine:
+        def __init__(self, **_kw: Any) -> None:
+            self.last_multimodal_stats: dict[str, Any] = {}
+
+        def generate(self, prompt: str, *, images: Any = None, json_schema: Any = None, max_tokens: int = 512, max_soft_tokens: Any = None, **_kw: Any) -> Any:
+            calls.append(
+                {
+                    "n_images": len(images or []),
+                    "has_schema": json_schema is not None,
+                    "max_tokens": max_tokens,
+                    "max_soft_tokens": max_soft_tokens,
+                }
+            )
+            self.last_multimodal_stats = {
+                "vision_tokens": 280,
+                "prompt_tokens": 300,
+                "completion_tokens": 16,
+                "vision_sec": 0.05,
+                "prefill_sec": 0.04,
+                "decode_sec": 0.10,
+                "decode_tok_s": 160.0,
+            }
+            if max_tokens <= 2:
+                txt = "ok"
+            elif json_schema is not None:
+                txt = json.dumps({"menu": [{"nm": "Coffee", "price": "4.50"}], "total": {"total_price": "4.50"}})
+            else:
+                txt = "| Metric | 2025 |\n| --- | --- |\n| Revenue | 100 |"
+            return SimpleNamespace(text=txt, finish_reason="stop", prompt_tokens=300, completion_tokens=16)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(g4_engine_mod, "FastGemma4Engine", _SpyGemma4Engine)
+    extra = out._parse_extra_flags(["--ocr-suites", "fintabnet_otsl,cord_v2", "--max-soft-tokens", "560"])
+    recs = out._run_cat5_worker(
+        "fast-gemma4-vision",
+        tier="tier1",
+        config_label="gemma4_vis_test",
+        extra=extra,
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert [r["benchmark"] for r in recs] == ["FinTabNet-OTSL(1)", "CORD-v2(1)"]
+    assert all(r["gate_verdict"] == "PASS" for r in recs)
+    assert recs[1]["diagnostics"]["llguidance"] is True
+    assert calls[0]["max_tokens"] == 2 and calls[0]["n_images"] == 1 and calls[0]["max_soft_tokens"] == 560
+    assert calls[1]["has_schema"] is False and calls[2]["has_schema"] is True
+
+
+def test_visual_retrieval_workers_embeddinggemma2_and_pplx_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import numpy as np
+    from PIL import Image
+    from fast_shared.retrieval_index import CompactRetrievalIndex
+    import fast_embeddinggemma_2.engine as emb2_mod
+    import fast_pplx.engine as pplx_mod
+
+    out = _load_script("test_visual_retrieval_workers", "benchmark_outcomes.py")
+
+    # Verify deterministic query synthesis across all 4 supported sources using real loader keys.
+    assert "Revenue" in out._extract_visual_retrieval_query("fintabnet_otsl", {"gold_html": "<table><tr><td>Revenue</td><td>42</td></tr></table>"})
+    assert "Abstract" in out._extract_visual_retrieval_query("omnidocbench_en", {"text_blocks": [{"text": "Abstract overview"}]})
+    assert "Latte" in out._extract_visual_retrieval_query("cord_v2", {"gt_parse": {"menu": [{"nm": "Latte"}], "total": {"price": "5.00"}}})
+    assert "Theorem" in out._extract_visual_retrieval_query("olmocr_bench", {"tests": [{"type": "present", "text": "Theorem 1"}]})
+    assert "RESIDENTIAL" in out._extract_visual_retrieval_query(
+        "olmocr_bench", {"tests": [{"type": "table", "top_heading": "RESIDENTIAL", "cell": "NEWG"}]}
+    )
+
+    # Verify scoring metrics + NaN validity guard.
+    fake_corpus = [
+        {"id": "fintabnet_otsl:0", "source": "fintabnet_otsl"},
+        {"id": "omnidocbench_en:1", "source": "omnidocbench_en"},
+        {"id": "cord_v2:2", "source": "cord_v2"},
+    ]
+    sim_mat = np.array([[0.9, 0.2, 0.1], [0.8, 0.5, 0.1], [0.1, 0.2, np.nan]], dtype=np.float32)
+    sc = out._score_visual_retrieval_matrix(sim_mat, fake_corpus)
+    assert sc["valid_flags"] == [True, True, False]
+    assert sc["per_item_rr"] == [1.0, 0.5, 0.0]
+    assert sc["recall_at_1"] == pytest.approx(1.0 / 3.0, abs=1e-4)
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    omni_img = tmp_path / "omni0.png"
+    Image.new("RGB", (32, 32), "white").save(omni_img)
+
+    monkeypatch.setattr(out, "load_fintabnet_otsl", lambda **_kw: [{"id": "ft0", "image_bytes": png_bytes, "gold_html": "<table><td>Revenue 100</td></table>"}])
+    monkeypatch.setattr(out, "load_omnidocbench_en", lambda **_kw: [{"id": "od0", "image_path": str(omni_img), "text_blocks": [{"text": "Methods section"}]}])
+    monkeypatch.setattr(out, "load_cord_v2", lambda **_kw: [{"id": "cd0", "image_bytes": png_bytes, "gt_parse": {"menu": [{"nm": "Espresso"}]}}])
+
+    emb2_calls: list[dict[str, Any]] = []
+    pplx_calls: list[dict[str, Any]] = []
+    eye3 = np.eye(3, 8, dtype=np.float32)
+
+    class _SpyEmb2:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def _resolve_vision_model_dir(self, _vdir: Any = None) -> Path:
+            return tmp_path
+
+        def encode_images(self, images: list[Any], **kw: Any) -> np.ndarray:
+            emb2_calls.append({"op": "encode_images", "n": len(images), **kw})
+            return np.eye(len(images), 8, dtype=np.float32)
+
+        def build_image_index(self, images: list[Any], **kw: Any) -> CompactRetrievalIndex:
+            emb2_calls.append({"op": "build_image_index", "n": len(images), **kw})
+            return CompactRetrievalIndex(eye3[: len(images)], mode=kw.get("mode", "fp16"), is_mrl_trained=True)
+
+        def encode_texts(self, texts: list[str], **_kw: Any) -> np.ndarray:
+            return eye3[: len(texts)]
+
+        def close(self) -> None:
+            return None
+
+    class _SpyPplx:
+        model_dir = tmp_path
+
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def encode_images(self, images: list[Any], **kw: Any) -> list[np.ndarray]:
+            pplx_calls.append({"op": "encode_images", "n": len(images), **kw})
+            return [np.ones((1, 8), dtype=np.float32) for _ in images]
+
+        def build_image_index(self, images: list[Any], **kw: Any) -> CompactRetrievalIndex:
+            pplx_calls.append({"op": "build_image_index", "n": len(images), **kw})
+            # 2 bands per doc with MaxSim exact match on band 0.
+            bands = np.vstack([np.vstack([eye3[i : i + 1], np.zeros((1, 8), dtype=np.float32)]) for i in range(len(images))])
+            offsets = np.arange(0, 2 * len(images) + 1, 2, dtype=np.int32)
+            return CompactRetrievalIndex(bands, doc_offsets=offsets, mode=kw.get("mode", "fp16"), agg="maxsim")
+
+        def encode_queries(self, texts: list[str], **_kw: Any) -> np.ndarray:
+            return eye3[: len(texts)]
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(emb2_mod, "FastEmbeddingGemma2", _SpyEmb2)
+    monkeypatch.setattr(pplx_mod, "FastPplx", _SpyPplx)
+
+    r_emb2 = out._run_visual_retrieval_worker(
+        "fast-embeddinggemma-2-vision",
+        tier="tier1",
+        config_label="emb2_vis",
+        extra=out._parse_extra_flags(["--max-soft-tokens", "280", "--visual-index-mode", "fp16"]),
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    r_pplx = out._run_visual_retrieval_worker(
+        "fast-pplx-vision",
+        tier="tier1",
+        config_label="pplx_vis",
+        extra=out._parse_extra_flags(["--visual-chunks", "4", "--no-visual-crop-margins", "--grid-bucket-step", "4"]),
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert len(r_emb2) == 1 and len(r_pplx) == 1
+    assert r_emb2[0]["benchmark"] == r_pplx[0]["benchmark"] == "VisualRetrieval(3)"
+    assert r_emb2[0]["objective_score_e2e"] == 1.0 and r_pplx[0]["objective_score_e2e"] == 1.0
+    assert r_emb2[0]["diagnostics"]["recall_at_1"] == 1.0 and r_pplx[0]["diagnostics"]["recall_at_1"] == 1.0
+    assert (
+        r_emb2[0]["sub_benchmarks"]["visual_retrieval"]["ordered_query_ids_sha256"]
+        == r_pplx[0]["sub_benchmarks"]["visual_retrieval"]["ordered_query_ids_sha256"]
+    )
+    assert emb2_calls[0]["op"] == "encode_images" and emb2_calls[1]["max_soft_tokens"] == 280
+    assert pplx_calls[0]["op"] == "encode_images" and pplx_calls[1]["chunks"] == 4
+    assert pplx_calls[1]["crop_margins"] is False and pplx_calls[1]["grid_bucket_step"] == 4
+
+
+
 
 
