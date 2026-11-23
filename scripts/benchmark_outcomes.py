@@ -107,6 +107,7 @@ from fast_shared.outcome_eval import (
     resolve_cache_dir,
     stage_tier_datasets,
     stage_us_gov_ocr,
+    stratified_sha256_sample,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -525,14 +526,26 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--ocr-model", default=None)
     p.add_argument("--ocr-render-only", action="store_true", default=False)
     p.add_argument("--ocr-dpi", type=int, default=200)
+    p.add_argument("--triage-dpi", type=int, default=None)
+    p.add_argument("--ocr-batch-size", type=int, default=None)
+    p.add_argument("--ocr-kv-i8", default=None)
+    p.add_argument("--ocr-gdn-state-mode", choices=("auto", "fp32", "bf16", "int8_blk32"), default=None)
+    p.add_argument("--drop-white-patches", action="store_true", default=False)
+    p.add_argument("--no-latin-only", action="store_true", default=False)
     p.add_argument("--speculative", choices=("auto", "off", "self", "vision+self"), default="auto")
     p.add_argument("--no-crop-margins", action="store_true", default=False)
     p.add_argument("--no-auto-orient", action="store_true", default=False)
+    p.add_argument("--no-adaptive-resolution", action="store_true", default=False)
+    p.add_argument("--deskew", nargs="?", const="on", default=None, choices=("auto", "on", "off"))
+    p.add_argument("--no-deskew", action="store_const", dest="deskew", const="off")
+    p.add_argument("--region-routing", action="store_true", default=False)
+    p.add_argument("--zoom-recover", action="store_true", default=False)
     p.add_argument("--strict-markdown-grammar", action="store_true", default=False)
     p.add_argument("--ocr-max-tokens", type=int, default=4096)
     p.add_argument("--ocr-vocab-size", type=int, default=None)
     p.add_argument("--puredocbench-track", choices=("clean", "digital", "real"), default="clean")
     p.add_argument("--puredocbench-images-root", default=None)
+    p.add_argument("--puredocbench-en-root", default=None)
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -2028,9 +2041,124 @@ _CAT5_ALL_SUITES: tuple[str, ...] = (
     "vrdu_registration",
     "doclaynet_gov",
     "puredocbench_legal_gov",
+    "puredocbench_en",
     "us_gov_ocr",
 )
 _CAT5_PDF_NATIVE_SUITES: frozenset[str] = frozenset({"olmocr_bench", "doclaynet_gov", "us_gov_ocr"})
+
+_PUREDOCBENCH_EN_SUBDIR: dict[str, str] = {
+    "clean": "clean",
+    "digital": "digital_degraded",
+    "real": "real_degraded",
+}
+
+
+def load_puredocbench_en(
+    *,
+    track: str = "clean",
+    max_items: int | None = None,
+    en_root: str | Path | None = None,
+    images_root: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load locally staged full-corpus English `puredocbench_en` pages across `clean|digital|real` tracks."""
+    import csv
+
+    eff_track = str(track or "clean").strip().lower()
+    if eff_track not in _PUREDOCBENCH_EN_SUBDIR:
+        raise ValueError(f"Unsupported PureDocBench track={track!r}; expected 'clean', 'digital', or 'real'")
+
+    base_dir = Path(en_root).expanduser() if en_root is not None else (resolve_cache_dir(cache_dir) / "puredocbench_en")
+    manifest_p = base_dir / "release_manifest_en.csv"
+    if not manifest_p.is_file():
+        cand_manifest = base_dir / "release_manifest_candidate_1475.csv"
+        if cand_manifest.is_file():
+            manifest_p = cand_manifest
+        else:
+            raise FileNotFoundError(
+                f"PureDocBench EN manifest not found under {base_dir}; sync `puredocbench_en` or pass `--puredocbench-en-root`."
+            )
+    gt_root = base_dir / "gt"
+    if not gt_root.is_dir():
+        raise FileNotFoundError(f"PureDocBench EN ground-truth directory missing: {gt_root}")
+
+    img_root = Path(images_root).expanduser() if images_root is not None else (base_dir / "images")
+    track_subdir = _PUREDOCBENCH_EN_SUBDIR[eff_track]
+    rel_col = f"{eff_track}_rel"
+
+    items: list[dict[str, Any]] = []
+    with manifest_p.open("r", encoding="utf-8", newline="") as fp:
+        for row in csv.DictReader(fp):
+            gt_rel = str(row.get("gt_rel") or "").strip()
+            if not gt_rel:
+                continue
+            gt_path = gt_root / gt_rel
+            if not gt_path.is_file():
+                continue
+            img_rel = str(row.get(rel_col) or "").strip()
+            img_path: Path | None = None
+            if img_rel:
+                for cand in (img_root / track_subdir / img_rel, img_root / img_rel):
+                    if cand.is_file():
+                        img_path = cand
+                        break
+            if img_path is None:
+                continue
+
+            page = json.loads(gt_path.read_text(encoding="utf-8"))
+            pattr = ((page.get("page_info") or {}).get("page_attribute") or {})
+            raw_dets = [d for d in (page.get("layout_dets") or []) if isinstance(d, Mapping) and not d.get("ignore")]
+            raw_dets.sort(key=lambda d: (int(d["order"]) if d.get("order") is not None else 10**9, str(d.get("anno_id") or "")))
+
+            text_blocks: list[dict[str, Any]] = []
+            tables: list[dict[str, Any]] = []
+            equations: list[dict[str, Any]] = []
+            for d in raw_dets:
+                ctype = str(d.get("category_type") or "")
+                order_val = d.get("order")
+                if ctype in ("text_block", "title", "reference", "figure_caption", "table_caption", "equation_caption", "code_txt"):
+                    txt = str(d.get("text") or "").strip()
+                    if txt:
+                        text_blocks.append({"category_type": ctype, "order": order_val, "text": txt})
+                elif ctype == "table":
+                    html_s = str(d.get("html") or d.get("text") or "").strip()
+                    if html_s:
+                        tables.append({"order": order_val, "html": html_s})
+                elif ctype in ("equation_isolated", "equation_semantic"):
+                    ltx = str(d.get("latex") or d.get("text") or "").strip()
+                    if ltx:
+                        equations.append({"category_type": ctype, "order": order_val, "latex": ltx})
+
+            if not (text_blocks or tables or equations):
+                continue
+            cat = str(row.get("category") or (Path(gt_rel).parts[0] if Path(gt_rel).parts else "puredocbench_en"))
+            subcat = str(row.get("subcategory") or (Path(gt_rel).parts[1] if len(Path(gt_rel).parts) > 1 else cat))
+            items.append(
+                {
+                    "id": str(row.get("page_id") or gt_rel),
+                    "domain": cat,
+                    "subcategory": subcat,
+                    "track": eff_track,
+                    "image_rel": img_rel,
+                    "image_path": str(img_path),
+                    "data_source": str(pattr.get("data_source") or "puredocbench_en"),
+                    "text_blocks": text_blocks,
+                    "tables": tables,
+                    "equations": equations,
+                }
+            )
+
+    if not items:
+        raise FileNotFoundError(
+            f"No ready PureDocBench EN items with images found under {base_dir} (track={eff_track})."
+        )
+    return stratified_sha256_sample(
+        items,
+        dataset_key=f"puredocbench_en:{eff_track}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["domain"],
+        total_n=max_items,
+    )
 
 
 def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
@@ -2338,6 +2466,19 @@ def _run_cat5_worker(
             if not optional_on_all:
                 raise
             print(f"[fast-silicon] skipping optional puredocbench_legal_gov: {exc}", file=sys.stderr)
+    if "puredocbench_en" in suites:
+        try:
+            loaded["puredocbench_en"] = load_puredocbench_en(
+                track=str(getattr(extra, "puredocbench_track", "clean") or "clean"),
+                max_items=gov_cap if smoke else max_items,
+                en_root=getattr(extra, "puredocbench_en_root", None),
+                images_root=getattr(extra, "puredocbench_images_root", None),
+                cache_dir=cache_dir,
+            )
+        except FileNotFoundError as exc:
+            if not optional_on_all:
+                raise
+            print(f"[fast-silicon] skipping optional puredocbench_en: {exc}", file=sys.stderr)
     if "us_gov_ocr" in suites:
         try:
             gov_items = load_us_gov_ocr(
@@ -2360,23 +2501,50 @@ def _run_cat5_worker(
     default_family: str
     allow_html_tables = (extra.table_mode == "html") or (extra.output_format != "markdown")
 
+    eff_ocr_batch_size = (
+        max(1, int(extra.ocr_batch_size))
+        if getattr(extra, "ocr_batch_size", None) is not None
+        else (max(1, int(extra.batch_size)) if getattr(extra, "batch_size", None) is not None else 1)
+    )
     if pkg_name == "fast-ocr":
         from fast_ocr import FastOCR
 
         eff_backend = str(extra.ocr_backend)
         model_arg = _resolve_fast_ocr_model_arg(extra.ocr_model)
-        fast_eng = FastOCR(
-            backend=eff_backend,  # type: ignore[arg-type]
-            output_format=extra.output_format,  # type: ignore[arg-type]
-            table_mode=extra.table_mode,  # type: ignore[arg-type]
-            strict_markdown_grammar=bool(extra.strict_markdown_grammar),
-            model_path=model_arg,
-            crop_margins=not bool(extra.no_crop_margins),
-            auto_orient=not bool(extra.no_auto_orient),
-            speculative=extra.speculative,  # type: ignore[arg-type]
-            vocab_size=extra.ocr_vocab_size,
-            max_tokens=int(extra.ocr_max_tokens),
+        eff_ocr_kv = (
+            getattr(extra, "ocr_kv_i8", None)
+            if getattr(extra, "ocr_kv_i8", None) is not None
+            else getattr(extra, "kv_mode", None)
         )
+        fast_kw: dict[str, Any] = {
+            "backend": eff_backend,
+            "output_format": extra.output_format,
+            "table_mode": extra.table_mode,
+            "strict_markdown_grammar": bool(extra.strict_markdown_grammar),
+            "model_path": model_arg,
+            "crop_margins": not bool(extra.no_crop_margins),
+            "auto_orient": not bool(extra.no_auto_orient),
+            "speculative": extra.speculative,
+            "vocab_size": extra.ocr_vocab_size,
+            "max_tokens": int(extra.ocr_max_tokens),
+        }
+        if bool(getattr(extra, "no_adaptive_resolution", False)):
+            fast_kw["adaptive_resolution"] = False
+        if getattr(extra, "deskew", None) is not None:
+            fast_kw["deskew"] = str(extra.deskew)
+        if bool(getattr(extra, "region_routing", False)):
+            fast_kw["region_routing"] = True
+        if bool(getattr(extra, "zoom_recover", False)):
+            fast_kw["zoom_recover"] = True
+        if eff_ocr_kv is not None:
+            fast_kw["kv_i8"] = eff_ocr_kv
+        if getattr(extra, "ocr_gdn_state_mode", None) is not None:
+            fast_kw["gdn_state_mode"] = str(extra.ocr_gdn_state_mode)
+        if bool(getattr(extra, "drop_white_patches", False)):
+            fast_kw["drop_white_patches"] = True
+        if bool(getattr(extra, "no_latin_only", False)):
+            fast_kw["latin_only"] = False
+        fast_eng = FastOCR(**fast_kw)
         mode_tag = f"{eff_backend}_{extra.table_mode}"
         if extra.ocr_render_only:
             mode_tag += "_render"
@@ -2449,6 +2617,28 @@ def _run_cat5_worker(
             task_kind=task_kind,
         )
 
+    def _run_image_list_ocr(
+        pil_imgs: Sequence[Any],
+        *,
+        task_kind: str = "page",
+    ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+        if fast_eng is not None and eff_ocr_batch_size > 1 and len(pil_imgs) > 1:
+            outs = fast_eng.ocr_images(pil_imgs, batch_size=eff_ocr_batch_size)
+            return (
+                [r.text for r in outs],
+                [r.finish_reason for r in outs],
+                [_fast_result_meta(r) for r in outs],
+            )
+        preds_l: list[str] = []
+        reasons_l: list[str] = []
+        metas_l: list[dict[str, Any]] = []
+        for pil_img in pil_imgs:
+            tx, fr, md = _run_image_ocr(pil_img, task_kind=task_kind)
+            preds_l.append(tx)
+            reasons_l.append(fr)
+            metas_l.append(md)
+        return preds_l, reasons_l, metas_l
+
     def _run_pdf_page_ocr(
         pdf_path: str | Path,
         *,
@@ -2458,12 +2648,14 @@ def _run_cat5_worker(
         if fast_eng is not None:
             use_native = (not bool(extra.ocr_render_only)) and (eff_backend == "auto")
             if use_native:
-                outs = fast_eng.ocr_pdf(
-                    pdf_path,
-                    dpi=int(extra.ocr_dpi),
-                    page_indices=[int(page_index)],
-                    use_native_text=True,
-                )
+                pdf_kw: dict[str, Any] = {
+                    "dpi": int(extra.ocr_dpi),
+                    "page_indices": [int(page_index)],
+                    "use_native_text": True,
+                }
+                if getattr(extra, "triage_dpi", None) is not None:
+                    pdf_kw["triage_dpi"] = int(extra.triage_dpi)
+                outs = fast_eng.ocr_pdf(pdf_path, **pdf_kw)
                 res = outs[0]
                 return res.text, res.finish_reason, _fast_result_meta(res)
             pil_img = _render_pdf_page_pil(pdf_path, dpi=int(extra.ocr_dpi), page_index=page_index)
@@ -2523,18 +2715,16 @@ def _run_cat5_worker(
                 pre_imgs: list[Any] | None = None
                 if bool(extra.ocr_render_only) and (pub_ad is None or pub_ad.supports_images):
                     pre_imgs = [_render_pdf_first_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi)) for it in items]
-                preds: list[str] = []
-                reasons: list[str] = []
-                metas: list[dict[str, Any]] = []
                 t0 = time.perf_counter()
-                for idx_p, it in enumerate(items):
-                    if pre_imgs is not None:
-                        tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
-                    else:
+                if pre_imgs is not None:
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                else:
+                    preds, reasons, metas = [], [], []
+                    for it in items:
                         tx, fr, md = _run_pdf_page_ocr(it["pdf_path"], task_kind="page")
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                        preds.append(tx)
+                        reasons.append(fr)
+                        metas.append(md)
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2583,13 +2773,8 @@ def _run_cat5_worker(
 
             elif suite_name == "fintabnet_otsl":
                 pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
-                preds, reasons, metas = [], [], []
                 t0 = time.perf_counter()
-                for pil_img in pils:
-                    tx, fr, md = _run_image_ocr(pil_img, task_kind="table")
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="table")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2644,13 +2829,8 @@ def _run_cat5_worker(
 
             elif suite_name == "omnidocbench_en":
                 pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
-                preds, reasons, metas = [], [], []
                 t0 = time.perf_counter()
-                for pil_img in pils:
-                    tx, fr, md = _run_image_ocr(pil_img, task_kind="page")
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="page")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2664,16 +2844,17 @@ def _run_cat5_worker(
                 )
                 mem4 = _memory_4bucket_dict(probe)
                 rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                vocab_desc = (
+                    f"custom_{extra.ocr_vocab_size}"
+                    if extra.ocr_vocab_size
+                    else ("full_248k" if bool(getattr(extra, "no_latin_only", False)) else "ocr_latin_140k")
+                )
                 diag = {
                     "backend": eff_backend,
                     **rate_diag,
                     "table_mode": extra.table_mode,
                     "output_format": extra.output_format,
-                    "vocab_mode": (
-                        f"custom_{extra.ocr_vocab_size}" if extra.ocr_vocab_size else "ocr_latin_140k"
-                    )
-                    if (pkg_name == "fast-ocr" and eff_backend != "apple-vision")
-                    else "n/a",
+                    "vocab_mode": vocab_desc if (pkg_name == "fast-ocr" and eff_backend != "apple-vision") else "n/a",
                     "omnidoc_overall": ev["omnidoc_overall"],
                     "text_edit_distance": ev["text_edit_distance"],
                     "reading_order_sim": ev["reading_order_sim"],
@@ -2852,21 +3033,22 @@ def _run_cat5_worker(
                         else _bytes_to_pil(it["image_bytes"])
                         for it in suite_items
                     ]
-                preds, reasons, metas = [], [], []
                 t0 = time.perf_counter()
-                with tempfile.TemporaryDirectory(prefix="doclaynet_gov_") as tmp_dir:
-                    for idx_p, it in enumerate(suite_items):
-                        if pre_imgs is not None:
-                            tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
-                        elif it.get("pdf_bytes"):
-                            tmp_pdf = Path(tmp_dir) / f"page_{idx_p}.pdf"
-                            tmp_pdf.write_bytes(it["pdf_bytes"])
-                            tx, fr, md = _run_pdf_page_ocr(tmp_pdf, page_index=0, task_kind="page")
-                        else:
-                            tx, fr, md = _run_image_ocr(_bytes_to_pil(it["image_bytes"]), task_kind="page")
-                        preds.append(tx)
-                        reasons.append(fr)
-                        metas.append(md)
+                if pre_imgs is not None:
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                else:
+                    preds, reasons, metas = [], [], []
+                    with tempfile.TemporaryDirectory(prefix="doclaynet_gov_") as tmp_dir:
+                        for idx_p, it in enumerate(suite_items):
+                            if it.get("pdf_bytes"):
+                                tmp_pdf = Path(tmp_dir) / f"page_{idx_p}.pdf"
+                                tmp_pdf.write_bytes(it["pdf_bytes"])
+                                tx, fr, md = _run_pdf_page_ocr(tmp_pdf, page_index=0, task_kind="page")
+                            else:
+                                tx, fr, md = _run_image_ocr(_bytes_to_pil(it["image_bytes"]), task_kind="page")
+                            preds.append(tx)
+                            reasons.append(fr)
+                            metas.append(md)
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2918,15 +3100,10 @@ def _run_cat5_worker(
                     )
                 )
 
-            elif suite_name == "puredocbench_legal_gov":
+            elif suite_name in ("puredocbench_legal_gov", "puredocbench_en"):
                 pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
-                preds, reasons, metas = [], [], []
                 t0 = time.perf_counter()
-                for pil_img in pils:
-                    tx, fr, md = _run_image_ocr(pil_img, task_kind="page")
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="page")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2956,23 +3133,25 @@ def _run_cat5_worker(
                     "repeat_loop_count": ev["repeat_loop_count"],
                     "device_guard_tripped": guard_tripped,
                 }
+                bench_prefix = "PureDocBench-EN" if suite_name == "puredocbench_en" else "PureDocBench-LegalGov"
                 records.append(
                     _build_record(
                         package=pkg_name,
                         category=5,
                         config_label=eff_label,
-                        benchmark=f"PureDocBench-LegalGov({len(items)})",
+                        benchmark=f"{bench_prefix}({len(items)})",
                         valid_flags=ev["per_item_valid"],
                         item_scores=ev["per_item_scores"],
                         wall_sec=wall,
                         diagnostics=diag,
                         memory_4bucket_gb=mem4,
                         sub_benchmarks={
-                            "puredocbench_legal_gov": {
+                            suite_name: {
                                 "puredocbench_overall": ev["puredocbench_overall"],
                                 "text_similarity": ev["text_similarity"],
                                 "reading_order_sim": ev["reading_order_sim"],
                                 "table_teds": ev["table_teds"],
+                                "formula_norm_sim": ev["formula_norm_sim"],
                             }
                         },
                         host_mem_gb=host_mem_gb,
@@ -2995,22 +3174,23 @@ def _run_cat5_worker(
                         else Image.open(it["image_path"]).convert("RGB")
                         for it in suite_items
                     ]
-                preds, reasons, metas = [], [], []
                 t0 = time.perf_counter()
-                for idx_p, it in enumerate(suite_items):
-                    if pre_imgs is not None:
-                        tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
-                    elif it.get("pdf_path"):
-                        tx, fr, md = _run_pdf_page_ocr(
-                            it["pdf_path"],
-                            page_index=int(it.get("page_index", 0)),
-                            task_kind="page",
-                        )
-                    else:
-                        tx, fr, md = _run_image_ocr(Image.open(it["image_path"]).convert("RGB"), task_kind="page")
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                if pre_imgs is not None:
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                else:
+                    preds, reasons, metas = [], [], []
+                    for it in suite_items:
+                        if it.get("pdf_path"):
+                            tx, fr, md = _run_pdf_page_ocr(
+                                it["pdf_path"],
+                                page_index=int(it.get("page_index", 0)),
+                                task_kind="page",
+                            )
+                        else:
+                            tx, fr, md = _run_image_ocr(Image.open(it["image_path"]).convert("RGB"), task_kind="page")
+                        preds.append(tx)
+                        reasons.append(fr)
+                        metas.append(md)
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()

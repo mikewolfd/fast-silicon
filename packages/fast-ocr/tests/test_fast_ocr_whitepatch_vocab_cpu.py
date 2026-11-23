@@ -859,3 +859,98 @@ def test_pipeline_region_routing_crop_batch_cap_and_pdf_triage(monkeypatch: pyte
     assert [r.page_index for r in pdf_outs] == [0, 1]
     assert pdf_outs[1].text == "Routed PDF table 1"
     assert pdf_outs[1].metadata["triage_dpi"] == 150
+
+
+def test_cli_and_pipeline_wiring_for_kv_gdn_whitepatch_and_latin_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import fast_ocr.cli as cli_mod
+    import fast_ocr.ovis_engine as ovis_mod
+    import fast_ocr.pipeline as pipe_mod
+
+    parser = cli_mod.build_parser()
+    def_args = parser.parse_args(["run", "doc.png"])
+    assert def_args.kv_i8 is None
+    assert def_args.gdn_state_mode is None
+    assert def_args.drop_white_patches is False
+    assert def_args.no_latin_only is False
+
+    custom_args = parser.parse_args(
+        [
+            "parquet",
+            "in.parquet",
+            "out_dir",
+            "--kv-i8",
+            "off",
+            "--gdn-state-mode",
+            "int8_blk32",
+            "--drop-white-patches",
+            "--no-latin-only",
+        ]
+    )
+    assert custom_args.kv_i8 == "bf16"
+    assert custom_args.gdn_state_mode == "int8_blk32"
+    assert custom_args.drop_white_patches is True
+    assert custom_args.no_latin_only is True
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "doc.png", "--kv-i8", "invalid_mode"])
+
+    captured_ovis_kw: list[dict[str, Any]] = []
+
+    class _SpyOvis:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_ovis_kw.append(dict(kwargs))
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(ovis_mod, "FastOvisOCREngine", _SpyOvis)
+    with cli_mod._build_ocr_from_args(custom_args) as ocr:
+        _ = ocr._get_ovis_engine()
+    assert len(captured_ovis_kw) == 1
+    assert captured_ovis_kw[0]["kv_i8"] == "bf16"
+    assert captured_ovis_kw[0]["gdn_state_mode"] == "int8_blk32"
+    assert captured_ovis_kw[0]["drop_white_patches"] is True
+    assert captured_ovis_kw[0]["latin_only"] is False
+
+    pq_inits: list[dict[str, Any]] = []
+    pq_calls: list[dict[str, Any]] = []
+
+    class _SpyAutoPipe:
+        def __init__(self, **kwargs: Any) -> None:
+            pq_inits.append(dict(kwargs))
+
+        def __enter__(self) -> _SpyAutoPipe:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            return None
+
+        def ocr_parquet(self, inp: Any, out: Any, **kwargs: Any) -> dict[str, Any]:
+            pq_calls.append({"inp": inp, "out": out, **kwargs})
+            return {"ok": True}
+
+    monkeypatch.setattr(pipe_mod, "AutoOCRPipeline", _SpyAutoPipe)
+    res = pipe_mod.ocr_parquet(
+        tmp_path / "in.parquet",
+        tmp_path / "out",
+        adaptive_resolution=False,
+        deskew="off",
+        region_routing=True,
+        kv_i8="q4_quarot",
+        gdn_state_mode="bf16",
+        drop_white_patches=True,
+        latin_only=False,
+        triage_dpi=100,
+    )
+    assert res == {"ok": True}
+    assert pq_inits[-1]["adaptive_resolution"] is False
+    assert pq_inits[-1]["deskew"] == "off"
+    assert pq_inits[-1]["region_routing"] is True
+    assert pq_inits[-1]["kv_i8"] == "q4_quarot"
+    assert pq_inits[-1]["gdn_state_mode"] == "bf16"
+    assert pq_inits[-1]["drop_white_patches"] is True
+    assert pq_inits[-1]["latin_only"] is False
+    assert pq_calls[-1]["triage_dpi"] == 100

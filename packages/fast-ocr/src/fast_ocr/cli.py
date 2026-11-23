@@ -52,6 +52,37 @@ def _resolve_input_paths(raw_inputs: Sequence[str]) -> list[Path]:
     return resolved
 
 
+_CLI_KV_MODE_ALIASES: dict[str, str] = {
+    "auto": "auto",
+    "bf16": "bf16",
+    "fp16": "bf16",
+    "off": "bf16",
+    "false": "bf16",
+    "0": "bf16",
+    "none": "bf16",
+    "q8": "q8",
+    "true": "q8",
+    "1": "q8",
+    "on": "q8",
+    "i8": "q8",
+    "int8": "q8",
+    "q4": "q4_quarot",
+    "q4_quarot": "q4_quarot",
+    "quarot": "q4_quarot",
+}
+
+
+def _parse_cli_kv_mode(raw: str) -> str:
+    """Parse and validate `--kv-i8` CLI strings without eagerly importing MLX."""
+    key = str(raw).strip().lower()
+    norm = _CLI_KV_MODE_ALIASES.get(key)
+    if norm is None:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported --kv-i8 value {raw!r}; expected 'auto', 'q4_quarot', 'q8', 'bf16', or 'off'"
+        )
+    return norm
+
+
 def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool = False) -> None:
     backend_choices = ("apple-vision", "ovis", "auto", "all") if allow_all_backend else ("apple-vision", "ovis", "auto")
     p.add_argument(
@@ -145,7 +176,29 @@ def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool 
     p.add_argument("--draft-k", type=int, default=4, help="Maximum speculative draft lookahead tokens (default: 4)")
     p.add_argument("--max-tokens", type=int, default=8192, help="Maximum generated tokens per page for VLM backend")
     p.add_argument("--vocab-size", type=int, default=None, help="Optional pruned output vocab size for VLM")
+    p.add_argument(
+        "--no-latin-only",
+        action="store_true",
+        help="Disable Latin-subset 140K OCR vocab pruning and retain full multilingual vocabulary",
+    )
     p.add_argument("--vit-quant-bits", type=int, default=None, help="Optional ViT linear quantization bit width")
+    p.add_argument(
+        "--kv-i8",
+        type=_parse_cli_kv_mode,
+        default=None,
+        help="KV cache precision ('auto' [default: q4_quarot at B>=8 or long ctx], 'q4_quarot', 'q8', 'bf16', or 'off')",
+    )
+    p.add_argument(
+        "--gdn-state-mode",
+        choices=("auto", "fp32", "bf16", "int8_blk32"),
+        default=None,
+        help="GDN recurrent state mode ('auto' [default: fp32 at B<8 (<4 on <=28GB) else int8_blk32], 'fp32', 'bf16', 'int8_blk32')",
+    )
+    p.add_argument(
+        "--drop-white-patches",
+        action="store_true",
+        help="Enable opt-in dropping of interior uniform bright ViT patches before transformer blocks",
+    )
     p.add_argument(
         "--memory-limit-gb",
         type=float,
@@ -185,6 +238,10 @@ def _build_ocr_from_args(args: argparse.Namespace, *, backend_override: str | No
         speculative=args.speculative,
         vocab_size=args.vocab_size,
         vit_quant_bits=args.vit_quant_bits,
+        kv_i8=getattr(args, "kv_i8", None),
+        gdn_state_mode=getattr(args, "gdn_state_mode", None),
+        drop_white_patches=(True if bool(getattr(args, "drop_white_patches", False)) else None),
+        latin_only=(False if bool(getattr(args, "no_latin_only", False)) else None),
         draft_k=int(args.draft_k),
         max_tokens=int(args.max_tokens),
         memory_limit_gb=getattr(args, "memory_limit_gb", None),

@@ -96,14 +96,16 @@ All Category 5 datasets are pinned in `configs/outcome_benchmarks.lock.json` (`2
   --packages fast-ocr,public-apple-vision,public-pypdfium2 \
   --extra-args "--ocr-backend ovis --ocr-render-only" --json-out ocr_cat5_smoke.json
 
-# 4. Run Gov-Doc visual OCR suites (`doclaynet_gov`, `us_gov_ocr`), KIE (`vrdu_*`), or all available suites
-# Note: `--ocr-suites all` safely skips un-staged optional suites (`doclaynet_gov` on tier1 unless cached, `us_gov_ocr` without manifest, `puredocbench_legal_gov` without extracted images).
+# 4. Run Gov-Doc visual OCR suites (`doclaynet_gov`, `us_gov_ocr`), KIE (`vrdu_*`), PureDocBench (`puredocbench_legal_gov`, `puredocbench_en`), or all available suites
+# Note: `--ocr-suites all` safely skips un-staged optional suites (`doclaynet_gov` on tier1 unless cached, `us_gov_ocr` without manifest, `puredocbench_*` without local images).
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --smoke --local-files-only \
   --packages fast-ocr,public-pypdfium2 --extra-args "--ocr-backend ovis --ocr-render-only --ocr-suites gov"
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --smoke --local-files-only \
   --packages fast-ocr --extra-args "--ocr-model nuextract3 --ocr-suites vrdu_ad_buy,vrdu_registration"
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --smoke --local-files-only \
   --packages fast-ocr --extra-args "--ocr-backend ovis --ocr-render-only --ocr-suites puredocbench_legal_gov --puredocbench-track clean --puredocbench-images-root /path/to/pdb_images"
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --max-items 16 --local-files-only \
+  --packages fast-ocr --extra-args "--ocr-backend ovis --ocr-suites puredocbench_en --puredocbench-track clean --ocr-batch-size 16"
 
 # 5. Structured receipt JSON KIE with NuExtract3
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --packages fast-ocr \

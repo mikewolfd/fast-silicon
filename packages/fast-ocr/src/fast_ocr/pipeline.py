@@ -318,6 +318,7 @@ class AutoOCRPipeline:
         kv_i8: bool | str | None = None,
         gdn_state_mode: str | None = None,
         drop_white_patches: bool | None = None,
+        latin_only: bool | None = None,
     ) -> None:
         if backend not in _VALID_BACKENDS:
             raise ValueError(f"Unsupported backend {backend!r}; expected one of {sorted(_VALID_BACKENDS)}")
@@ -362,6 +363,7 @@ class AutoOCRPipeline:
         self.kv_i8: bool | str | None = kv_i8
         self.gdn_state_mode: str | None = gdn_state_mode
         self.drop_white_patches: bool | None = drop_white_patches
+        self.latin_only: bool | None = latin_only
 
         self._vision: Any | None = vision_ocr
         self._ovis: Any | None = ovis_engine
@@ -406,6 +408,7 @@ class AutoOCRPipeline:
                 "kv_i8": self.kv_i8,
                 "gdn_state_mode": self.gdn_state_mode,
                 "drop_white_patches": self.drop_white_patches,
+                "latin_only": self.latin_only,
             }
             if not has_var_kw:
                 if "model_path" not in params and "model_dir" in params:
@@ -1703,7 +1706,14 @@ def ocr_parquet(
     table_mode: MarkdownTableMode = "gfm",
     strict_markdown_grammar: bool = False,
     zoom_recover: bool = False,
+    adaptive_resolution: bool = True,
+    deskew: bool | str = "auto",
+    region_routing: bool = False,
     speculative: SpeculativeMode = "auto",
+    kv_i8: bool | str | None = None,
+    gdn_state_mode: str | None = None,
+    drop_white_patches: bool | None = None,
+    latin_only: bool | None = None,
     memory_limit_gb: float | None = None,
     cache_limit_gb: float | None = None,
     skip_errors: bool = False,
@@ -1736,7 +1746,14 @@ def ocr_parquet(
         strict_markdown_grammar=strict_markdown_grammar,
         zoom_recover=zoom_recover,
         model_path=model_path,
+        adaptive_resolution=adaptive_resolution,
+        deskew=deskew,
+        region_routing=region_routing,
         speculative=speculative,
+        kv_i8=kv_i8,
+        gdn_state_mode=gdn_state_mode,
+        drop_white_patches=drop_white_patches,
+        latin_only=latin_only,
         memory_limit_gb=memory_limit_gb,
         cache_limit_gb=cache_limit_gb,
     ) as pipe:

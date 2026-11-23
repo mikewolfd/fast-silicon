@@ -1965,5 +1965,173 @@ def test_cat5_optional_all_skipping_and_pypdfium_gov_filtering(
     assert len(pdf_calls) == 1 and img_calls == []
 
 
+def test_cat5_puredocbench_en_flags_and_batched_fast_ocr_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PIL import Image
+    import fast_ocr
+    from fast_ocr.types import OCRResult, OCRTimings
+
+    out = _load_script("test_pdb_en_worker", "benchmark_outcomes.py")
+
+    # 1. Parse all net-new Cat-5 runtime/batch/PureDocBench-EN flags cleanly.
+    ns = out._parse_extra_flags(
+        [
+            "--ocr-suites",
+            "puredocbench_en",
+            "--puredocbench-track",
+            "digital",
+            "--puredocbench-en-root",
+            str(tmp_path),
+            "--ocr-batch-size",
+            "16",
+            "--ocr-kv-i8",
+            "q4_quarot",
+            "--ocr-gdn-state-mode",
+            "int8_blk32",
+            "--drop-white-patches",
+            "--no-latin-only",
+            "--deskew",
+            "on",
+            "--no-adaptive-resolution",
+            "--region-routing",
+            "--zoom-recover",
+            "--triage-dpi",
+            "100",
+        ]
+    )
+    assert out._resolve_cat5_suites("fast-ocr", ns) == ["puredocbench_en"]
+    assert ns.puredocbench_track == "digital"
+    assert ns.ocr_batch_size == 16
+    assert ns.ocr_kv_i8 == "q4_quarot"
+    assert ns.ocr_gdn_state_mode == "int8_blk32"
+    assert ns.drop_white_patches is True
+    assert ns.no_latin_only is True
+    assert ns.deskew == "on"
+    assert ns.no_adaptive_resolution is True
+    assert ns.region_routing is True
+    assert ns.zoom_recover is True
+    assert ns.triage_dpi == 100
+
+    # 2. Build synthetic PureDocBench-EN tree on disk and verify clean/digital/real image resolution.
+    en_root = tmp_path / "puredocbench_en"
+    gt_dir = en_root / "gt" / "01_academic" / "01_paper"
+    gt_dir.mkdir(parents=True)
+    for tr_dir in ("clean", "digital_degraded", "real_degraded"):
+        (en_root / "images" / tr_dir / "01_academic" / "01_paper").mkdir(parents=True)
+
+    rows_csv = [
+        "page_id,category,subcategory,gt_rel,html_rel,clean_rel,digital_rel,real_rel",
+        "p0,01_academic,01_paper,01_academic/01_paper/p0.json,,01_academic/01_paper/p0.png,01_academic/01_paper/p0_d.png,01_academic/01_paper/p0_r.png",
+        "p1,01_academic,01_paper,01_academic/01_paper/p1.json,,01_academic/01_paper/p1.png,01_academic/01_paper/p1_d.png,01_academic/01_paper/p1_r.png",
+    ]
+    (en_root / "release_manifest_en.csv").write_text("\n".join(rows_csv) + "\n", encoding="utf-8")
+    for idx_i, pid in enumerate(("p0", "p1")):
+        gt_obj = {
+            "page_info": {"page_attribute": {"language": "en", "data_source": "synthetic"}},
+            "layout_dets": [{"category_type": "text_block", "order": 0, "text": f"Academic paragraph {idx_i}."}],
+        }
+        (gt_dir / f"{pid}.json").write_text(json.dumps(gt_obj), encoding="utf-8")
+        Image.new("RGB", (32, 32), "white").save(en_root / "images" / "clean" / "01_academic" / "01_paper" / f"{pid}.png")
+        Image.new("RGB", (32, 32), "white").save(en_root / "images" / "digital_degraded" / "01_academic" / "01_paper" / f"{pid}_d.png")
+        Image.new("RGB", (32, 32), "white").save(en_root / "images" / "real_degraded" / "01_academic" / "01_paper" / f"{pid}_r.png")
+
+    loaded_dig = out.load_puredocbench_en(track="digital", en_root=en_root)
+    assert len(loaded_dig) == 2
+    assert all("_d.png" in str(it["image_path"]) for it in loaded_dig)
+
+    with pytest.raises(FileNotFoundError, match="PureDocBench EN"):
+        out.load_puredocbench_en(track="clean", cache_dir=tmp_path / "missing_cache")
+
+    # 3. Verify `_run_cat5_worker` forwards FastOCR kwargs and dispatches `ocr_images(..., batch_size=16)`!
+    fast_inits: list[dict[str, Any]] = []
+    batch_calls: list[tuple[int, int]] = []
+
+    class _SpyFastOCR:
+        def __init__(self, **kwargs: Any) -> None:
+            fast_inits.append(dict(kwargs))
+
+        def _get_ovis_engine(self) -> _SpyFastOCR:
+            return self
+
+        def ocr_image(self, img: Any, **_kw: Any) -> OCRResult:
+            return OCRResult(
+                text="tiny",
+                raw_text="tiny",
+                backend_used="ovis:stub",
+                finish_reason="stop",
+                timings=OCRTimings(),
+            )
+
+        def ocr_images(self, imgs: list[Any], *, batch_size: int = 16, **_kw: Any) -> list[OCRResult]:
+            batch_calls.append((len(imgs), int(batch_size)))
+            return [
+                OCRResult(
+                    text=f"Academic paragraph {i}.",
+                    raw_text=f"Academic paragraph {i}.",
+                    backend_used="ovis:stub",
+                    page_index=i,
+                    finish_reason="stop",
+                    timings=OCRTimings(generated_tokens=4, decode_tps=100.0, decode_ms=40.0),
+                )
+                for i in range(len(imgs))
+            ]
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(fast_ocr, "FastOCR", _SpyFastOCR)
+    run_extra = out._parse_extra_flags(
+        [
+            "--ocr-backend",
+            "ovis",
+            "--ocr-suites",
+            "puredocbench_en",
+            "--puredocbench-track",
+            "digital",
+            "--puredocbench-en-root",
+            str(en_root),
+            "--ocr-batch-size",
+            "16",
+            "--ocr-kv-i8",
+            "q4_quarot",
+            "--ocr-gdn-state-mode",
+            "int8_blk32",
+            "--drop-white-patches",
+            "--no-latin-only",
+            "--deskew",
+            "on",
+            "--no-adaptive-resolution",
+            "--region-routing",
+            "--zoom-recover",
+        ]
+    )
+    recs = out._run_cat5_worker(
+        "fast-ocr",
+        tier="tier1",
+        config_label="cat5_batched_test",
+        extra=run_extra,
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=2,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert len(recs) == 1
+    assert recs[0]["benchmark"] == "PureDocBench-EN(2)"
+    assert fast_inits[0]["kv_i8"] == "q4_quarot"
+    assert fast_inits[0]["gdn_state_mode"] == "int8_blk32"
+    assert fast_inits[0]["drop_white_patches"] is True
+    assert fast_inits[0]["latin_only"] is False
+    assert fast_inits[0]["deskew"] == "on"
+    assert fast_inits[0]["adaptive_resolution"] is False
+    assert fast_inits[0]["region_routing"] is True
+    assert fast_inits[0]["zoom_recover"] is True
+    assert batch_calls == [(2, 16)]
+
+
 
 
