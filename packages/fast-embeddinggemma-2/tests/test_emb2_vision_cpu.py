@@ -127,6 +127,14 @@ def test_encode_images_token_sequence_scatter_and_mrl_dim(tmp_path) -> None:
     assert np.allclose(h_np[0, 2:eoi_pos0, :], 7.0, atol=1e-2)
     assert np.allclose(h_np[1, 2:eoi_pos1, :], 8.0, atol=1e-2)
     assert captured[1]["dim"] == 256
+    # Default budget is capped at 140 soft tokens (`4 + n_vis` <= 144 -> `eoi_pos0 - 2` <= 140)
+    assert (eoi_pos0 - 2) <= 140
+
+    # Explicit max_soft_tokens=280 overrides the default 140 cap cleanly
+    captured.clear()
+    _ = eng.encode_images([img1], max_soft_tokens=280, dimensions=256, batch_size=1)
+    eoi_280 = list(captured[0]["gathered_ids"]).index(258882)
+    assert (eoi_280 - 2) > 140
 
 
 def test_cli_embed_images_parser() -> None:

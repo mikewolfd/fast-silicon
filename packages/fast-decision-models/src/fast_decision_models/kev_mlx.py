@@ -1113,6 +1113,7 @@ class KevMlxBackend:
                 PrefixTree(
                     chunk_tokens=int(prefix_chunk_tokens),
                     byte_budget=recommended_prefix_budget_bytes(host_mem_bytes),
+                    admission_min_hits=2,
                 ),
                 True,
             )
@@ -1926,7 +1927,6 @@ class KevMlxBackend:
         has_tree = tree is not None and tree.byte_budget > 0
         chunk_sz = tree.chunk_tokens if tree is not None else DEFAULT_CHUNK_TOKENS
         eff_prof = getattr(self, "profile", "auto")
-        want_tree_writes = has_tree and tree.should_write_snapshots(eff_prof)  # type: ignore[union-attr]
 
         warm_groups: list[tuple[list[int], int, Any]] = []
         cold_groups: list[tuple[list[int], int, bool]] = []
@@ -1941,11 +1941,23 @@ class KevMlxBackend:
                         tree.record(m, restored=True)
                     warm_groups.append((members, int(m.reused_tokens), m))
                     continue
-                if want_tree_writes:
+                admit_fn = getattr(tree, "admit_prefix", None)
+                admitted = (
+                    bool(admit_fn(rep_state, profile=eff_prof, sightings=len(members)))
+                    if callable(admit_fn)
+                    else bool(tree.should_write_snapshots(eff_prof))
+                )
+                if admitted:
                     aligned_p = (lcp_len // chunk_sz) * chunk_sz
                     cold_groups.append((members, aligned_p, True))
                 else:
-                    tree.record(m, restored=False)
+                    tree.record(
+                        m,
+                        restored=False,
+                        count_for_circuit_breaker=(
+                            tree.circuit_breaker_open or getattr(tree, "admission_min_hits", 1) <= 1
+                        ),
+                    )
                     cold_groups.append((members, lcp_len, False))
             else:
                 cold_groups.append((members, lcp_len, False))
@@ -2184,12 +2196,28 @@ class KevMlxBackend:
                         leftover_order.append(orig_i)
                         continue
                     first_chunk = tuple(state_ids[:chunk_sz])
+                    m_leg = self.prefix_tree.match(state_ids, needs_snapshot=True)
+                    admit_fn = getattr(self.prefix_tree, "admit_prefix", None)
+                    eff_prof_leg = getattr(self, "profile", "auto")
                     use_prefix_tree = (
-                        n_nonempty_items == 1
+                        m_leg.reused_tokens >= chunk_sz
                         or prefix_counts[first_chunk] >= 2
-                        or self.prefix_tree.match(state_ids, needs_snapshot=True).reused_tokens >= chunk_sz
+                        or (
+                            n_nonempty_items == 1
+                            and (
+                                bool(admit_fn(state_ids, profile=eff_prof_leg, sightings=1))
+                                if callable(admit_fn)
+                                else self.prefix_tree.should_write_snapshots(eff_prof_leg)
+                            )
+                        )
                     )
                     if not use_prefix_tree:
+                        if n_nonempty_items == 1 and getattr(self.prefix_tree, "admission_min_hits", 1) > 1:
+                            self.prefix_tree.record(
+                                m_leg,
+                                restored=False,
+                                count_for_circuit_breaker=self.prefix_tree.circuit_breaker_open,
+                            )
                         leftover_order.append(orig_i)
                         continue
                     cache = self._prefill_state_with_prefix_tree(
@@ -2219,7 +2247,13 @@ class KevMlxBackend:
                 if has_tree and len(state_ids) >= chunk_sz:
                     assert self.prefix_tree is not None
                     m_one = self.prefix_tree.match(state_ids, limit=len(state_ids), needs_snapshot=True)
-                    if m_one.reused_tokens >= chunk_sz or self.prefix_tree.should_write_snapshots(eff_prof):
+                    admit_fn = getattr(self.prefix_tree, "admit_prefix", None)
+                    should_write = (
+                        bool(admit_fn(state_ids, profile=eff_prof, sightings=1))
+                        if callable(admit_fn)
+                        else bool(self.prefix_tree.should_write_snapshots(eff_prof))
+                    )
+                    if m_one.reused_tokens >= chunk_sz or should_write:
                         cache = self._prefill_state_with_prefix_tree(
                             state_ids,
                             eval_restored_concat=(len(rows) > br_chunk_lim),
@@ -2230,7 +2264,14 @@ class KevMlxBackend:
                         del cache
                         self._maybe_clear_wave_cache()
                         return out_by_orig
-                    self.prefix_tree.record(m_one, restored=False)
+                    self.prefix_tree.record(
+                        m_one,
+                        restored=False,
+                        count_for_circuit_breaker=(
+                            self.prefix_tree.circuit_breaker_open
+                            or getattr(self.prefix_tree, "admission_min_hits", 1) <= 1
+                        ),
+                    )
 
                 if supports_fused_1pass and len(rows) == 1:
                     self._run_one_pass_single_question_waves(

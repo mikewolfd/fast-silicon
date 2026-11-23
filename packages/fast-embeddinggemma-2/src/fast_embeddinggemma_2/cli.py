@@ -442,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     ei = sub.add_parser("embed-images", help="Embed image files using lazy vision tower")
     ei.add_argument("images", nargs="+", help="Image file paths to encode")
     ei.add_argument("--vision-model-dir", default=None, help="Override HF/MLX directory with vision weights")
-    ei.add_argument("--max-soft-tokens", type=int, default=None, help="Soft vision token budget per image")
+    ei.add_argument("--max-soft-tokens", type=int, default=None, help="Soft vision token budget per image (default: 140; supports 70/140/280/560/1120)")
     ei.add_argument("--batch-size", type=int, default=8, help="Batch size for ViT and trunk execution")
     ei.add_argument("--dimensions", type=int, default=None, help="Output MRL embedding dimension")
     ei.add_argument("--mode", choices=_MODES, default="gpu")

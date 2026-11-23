@@ -1014,6 +1014,7 @@ class FastGemma4Engine:
         temperature: float = 0.0,
         top_p: float = 1.0,
         seed: int = 42,
+        speculative: bool | None = None,
         use_chat_template: bool = True,
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
@@ -1072,22 +1073,47 @@ class FastGemma4Engine:
                     apply_softcap=True,
                 )
                 prefill_sec = time.perf_counter() - tp0
-                dec_res = run_decode_batch(
-                    self.model,
-                    self.tokenizer.stop_token_ids,
-                    grammar,
-                    lg0,
-                    ob0,
-                    cache,
-                    1,
-                    max_tokens=int(max_tokens),
+                mtp_drafter = self._maybe_ensure_mtp_drafter(
+                    use_ane=False,
+                    batch_w=1,
                     temperature=float(temperature),
-                    top_p=float(top_p),
-                    seed=int(seed),
-                    compact=False,
-                    tail_handoff_b=0,
-                    enable_ff_jump=True,
+                    speculative=speculative,
+                    has_grammar=(grammar is not None),
                 )
+                if mtp_drafter is not None and cache.get("_last_x_in") is not None:
+                    dec_res = run_decode_mtp(
+                        self.model,
+                        mtp_drafter,
+                        self.tokenizer.stop_token_ids,
+                        grammar,
+                        lg0,
+                        ob0,
+                        cache,
+                        1,
+                        max_tokens=int(max_tokens),
+                        draft_k=getattr(self, "mtp_draft_k", None),
+                        enable_ff_jump=True,
+                        doc_prompts=[prefill_ids],
+                        doc_indices=[0],
+                        apple10_nax=self._engine_apple10_nax(),
+                    )
+                else:
+                    dec_res = run_decode_batch(
+                        self.model,
+                        self.tokenizer.stop_token_ids,
+                        grammar,
+                        lg0,
+                        ob0,
+                        cache,
+                        1,
+                        max_tokens=int(max_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        seed=int(seed),
+                        compact=False,
+                        tail_handoff_b=0,
+                        enable_ff_jump=True,
+                    )
             finally:
                 del cache
                 gc.collect()
@@ -1120,6 +1146,9 @@ class FastGemma4Engine:
                 "decode_sec": dec_sec,
                 "elapsed_sec": elapsed,
                 "decode_tok_s": len(g_toks) / max(dec_sec, 1e-9),
+                "used_speculative": bool(dec_res.get("used_speculative", False)),
+                "speculative_backend": dec_res.get("speculative_backend"),
+                "mtp_accept_rate": float(dec_res.get("mtp_accept_rate", 0.0) or 0.0),
                 "peak_gb": mx.get_peak_memory() / (1024**3),
             }
             return GenerationItem(
@@ -1169,6 +1198,7 @@ class FastGemma4Engine:
                 temperature=temperature,
                 top_p=top_p,
                 seed=seed,
+                speculative=speculative,
                 use_chat_template=use_chat_template,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,

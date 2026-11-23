@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -170,3 +171,117 @@ def test_cli_generate_image_flags() -> None:
     assert args.image == ["/tmp/p1.png", "/tmp/p2.png"]
     assert args.max_soft_tokens == 1120
     assert args.prompt == "Read pages."
+
+
+def test_multimodal_generate_mtp_dispatch_and_fallbacks(monkeypatch) -> None:
+    """Verify greedy multimodal generate dispatches to `run_decode_mtp` when available and falls back cleanly."""
+    import threading
+    from types import SimpleNamespace
+    import fast_gemma4.engine as eng_mod
+
+    eng = object.__new__(FastGemma4Engine)
+    eng._gpu_lock = threading.Lock()
+    eng.mtp_draft_k = 3
+    eng._engine_apple10_nax = lambda: True  # type: ignore[method-assign]
+    eng._prepare_multimodal_prefill = lambda prompt, images, **kw: (  # type: ignore[method-assign]
+        [2, 10, 11],
+        mx.zeros((1, 3, 8), dtype=mx.bfloat16),
+        0.01,
+        2,
+    )
+    fake_grammar = SimpleNamespace(
+        upfront_ff=[101, 102],
+        validate_token_sequence=lambda ids: list(ids) == [101, 102, 201, 202],
+    )
+    eng.get_grammar = lambda schema, **kw: fake_grammar  # type: ignore[method-assign]
+
+    provide_last_x = True
+
+    class _FakeModel:
+        window_size = 512
+        embed_scale = mx.array(1.0, dtype=mx.bfloat16)
+
+        @staticmethod
+        def embed_tokens(arr: mx.array) -> mx.array:
+            return mx.zeros((int(arr.shape[0]), int(arr.shape[1]), 8), dtype=mx.bfloat16)
+
+        @staticmethod
+        def prefill_prefix(_xs: Any) -> dict[str, Any]:
+            return {}
+
+        @staticmethod
+        def make_batch_cache(_pkv: Any, **_kw: Any) -> dict[str, Any]:
+            return {"_last_x_in": mx.zeros((1, 1, 8), dtype=mx.bfloat16)} if provide_last_x else {}
+
+        @staticmethod
+        def prefill_multimodal_b1(pids: Any, _embeds: Any, _cache: Any, apply_softcap: bool = True):
+            assert apply_softcap is True
+            return mx.zeros((1, 1, 16)), mx.array([len(pids)], dtype=mx.int32)
+
+    eng.model = _FakeModel()  # type: ignore[assignment]
+    eng.tokenizer = SimpleNamespace(
+        stop_token_ids=frozenset({1}),
+        decode=lambda ids, skip_special_tokens=True: "{" + ",".join(str(x) for x in ids) + "}",
+    )  # type: ignore[assignment]
+
+    fake_drafter = object()
+    eng._maybe_ensure_mtp_drafter = (  # type: ignore[method-assign]
+        lambda *, use_ane, batch_w, temperature, speculative=None, has_grammar=False: (
+            fake_drafter if (not use_ane and batch_w == 1 and temperature <= 0.0 and speculative is not False) else None
+        )
+    )
+
+    calls: list[str] = []
+
+    def _fake_mtp(model, drafter, stop_ids, gram, lg0, ob0, cache, B, **kw):
+        calls.append("mtp")
+        assert drafter is fake_drafter and B == 1
+        assert kw["doc_prompts"] == [[2, 10, 11, 101, 102]]
+        return {
+            "decode_sec": 0.02,
+            "gen_toks": [[201, 202]],
+            "used_speculative": True,
+            "speculative_backend": "mtp",
+            "mtp_accept_rate": 0.75,
+        }
+
+    def _fake_batch(model, stop_ids, gram, lg0, ob0, cache, B, **kw):
+        calls.append("batch")
+        assert B == 1
+        return {
+            "decode_sec": 0.04,
+            "gen_toks": [[201, 202]],
+            "used_speculative": False,
+            "speculative_backend": None,
+        }
+
+    monkeypatch.setattr(eng_mod, "run_decode_mtp", _fake_mtp)
+    monkeypatch.setattr(eng_mod, "run_decode_batch", _fake_batch)
+
+    # 1. Default greedy call routes to MTP and prepends upfront_ff cleanly
+    it_mtp = eng.generate("Extract", images=[np.zeros((48, 48, 3), dtype=np.uint8)], json_schema={"type": "object"})
+    assert calls == ["mtp"]
+    assert it_mtp.token_ids == [101, 102, 201, 202]
+    assert it_mtp.text == "{101,102,201,202}"
+    assert it_mtp.valid_schema is True
+    assert eng.last_multimodal_stats["used_speculative"] is True
+    assert eng.last_multimodal_stats["speculative_backend"] == "mtp"
+    assert eng.last_multimodal_stats["mtp_accept_rate"] == 0.75
+
+    # 2. speculative=False falls back cleanly to run_decode_batch
+    calls.clear()
+    _ = eng.generate("Extract", images=[np.zeros((48, 48, 3), dtype=np.uint8)], speculative=False)
+    assert calls == ["batch"]
+    assert eng.last_multimodal_stats["used_speculative"] is False
+    assert eng.last_multimodal_stats["speculative_backend"] is None
+
+    # 3. Non-greedy temperature > 0.0 falls back cleanly to run_decode_batch
+    calls.clear()
+    _ = eng.generate("Extract", images=[np.zeros((48, 48, 3), dtype=np.uint8)], temperature=0.5)
+    assert calls == ["batch"]
+
+    # 4. Missing cache["_last_x_in"] falls back safely to run_decode_batch
+    calls.clear()
+    provide_last_x = False
+    _ = eng.generate("Extract", images=[np.zeros((48, 48, 3), dtype=np.uint8)])
+    assert calls == ["batch"]

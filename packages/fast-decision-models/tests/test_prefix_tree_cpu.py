@@ -641,3 +641,69 @@ def test_kev_exact_lcp_grouping_and_batched_shared_prefix_waves_cpu() -> None:
         np.testing.assert_allclose(got_doc[0][0], ref_doc[0][0], rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(got_doc[0][1], ref_doc[0][1], rtol=1e-5, atol=1e-3)
 
+
+def test_prefix_tree_two_hit_admission_and_kev_auto_routing_cpu() -> None:
+    """Verify bounded 2-hit admission prevents cold thrashing while accelerating subsequent repeated prefixes."""
+    # 1. Resolve 'auto' sets admission_min_hits=2 while explicit budgets and injected trees keep 1.
+    t_auto, owns_auto = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb="auto",
+        prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+        host_mem_bytes=24 << 30,
+    )
+    assert t_auto is not None and owns_auto is True
+    assert t_auto.admission_min_hits == 2
+
+    # 2. Pure PrefixTree unit behavior: bounded window + 1st-sight filter + 2nd-sight admit + interactive bypass.
+    pt = PrefixTree(chunk_tokens=4, byte_budget=1 << 20, admission_min_hits=2, admission_window=8)
+    for i in range(12):
+        toks = [1000 + i * 4 + k for k in range(6)]
+        assert pt.admit_prefix(toks, profile="auto", sightings=1) is False
+    st_pt = pt.stats()
+    assert st_pt["admission_min_hits"] == 2
+    assert st_pt["seen_first_chunks"] == 8  # bounded by admission_window!
+    assert pt.admit_prefix([1000 + 11 * 4 + k for k in range(6)], profile="auto", sightings=1) is True
+    assert pt.admit_prefix([9001, 9002, 9003, 9004], profile="interactive", sightings=1) is True
+    assert pt.admit_prefix([9101, 9102, 9103, 9104], profile="auto", sightings=2) is True
+
+    # 3. KevMlxBackend B=1 cold burst (24 unique long docs) must write 0 snapshots and NOT trip circuit breaker,
+    # then a subsequent repeated passage must admit on 2nd sight and hit on 3rd..5th!
+    tree = PrefixTree(chunk_tokens=4, byte_budget=1 << 20, admission_min_hits=2)
+    kev, bb, pt_calls = _make_fake_kev(prefix_tree=tree, batch_docs=8)
+    kev._batched_lcp_enabled = True
+    kev.profile = "auto"
+    kev_ref, _, _ = _make_fake_kev(prefix_tree=None, batch_docs=8)
+    kev_ref._batched_lcp_enabled = True
+    q1 = [{"id": 1}]
+    cold_24 = [([200 + i * 10 + j for j in range(10)], q1) for i in range(24)]
+    for item in cold_24:
+        got_c = kev.score_multi_states([item], batch_docs=1)
+        ref_c = kev_ref.score_multi_states([item], batch_docs=1)
+        np.testing.assert_allclose(got_c[0][0][0], ref_c[0][0][0], atol=1e-6)
+    assert tree.node_count == 0
+    assert tree.bytes_held == 0
+    assert tree.circuit_breaker_open is False
+    assert pt_calls == []
+
+    warm_doc = [777, 778, 779, 780, 781, 782, 783, 784, 785, 786]
+    warm_ref = kev_ref.score_multi_states([(warm_doc, q1)], batch_docs=1)
+    for rep_i in range(5):
+        got_w = kev.score_multi_states([(warm_doc, q1)], batch_docs=1)
+        np.testing.assert_allclose(got_w[0][0][0], warm_ref[0][0][0], atol=1e-6)
+    assert tree.hits == 3  # rep 0 filtered, rep 1 admitted+stored (miss), reps 2..4 hit!
+    assert tree.node_count == 2 and tree.reused_tokens == 24
+    assert tree.circuit_breaker_open is False
+
+    # 4. Intra-batch shared B>=2 admits immediately on first batch without waiting for a second call.
+    tree_b2 = PrefixTree(chunk_tokens=4, byte_budget=1 << 20, admission_min_hits=2)
+    kev_b2, _, pt_calls_b2 = _make_fake_kev(prefix_tree=tree_b2, batch_docs=8)
+    kev_b2._batched_lcp_enabled = True
+    kev_b2.profile = "auto"
+    shared = [500, 501, 502, 503, 504, 505, 506, 507]
+    _ = kev_b2.score_multi_states([(shared + [1, 2], q1), (shared + [3, 4], q1)], batch_docs=8)
+    assert tree_b2.node_count == 2
+    assert tree_b2.misses == 1 and tree_b2.hits == 1 and tree_b2.reused_tokens == 8
+    _ = kev_b2.score_multi_states([(shared + [5, 6], q1)], batch_docs=8)
+    assert tree_b2.hits == 2 and tree_b2.reused_tokens == 16
+
+

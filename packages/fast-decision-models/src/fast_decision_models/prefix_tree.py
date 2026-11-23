@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 import hashlib
 import struct
@@ -14,6 +14,8 @@ DEFAULT_CHUNK_TOKENS: int = 256
 DEFAULT_ROLLING_WINDOW: int = 32
 DEFAULT_MIN_HIT_RATE: float = 0.15
 DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS: int = 16
+DEFAULT_ADMISSION_MIN_HITS: int = 1
+DEFAULT_ADMISSION_WINDOW: int = 4096
 _MIB = 1 << 20
 _GIB = 1 << 30
 _INT32_MIN = -(1 << 31)
@@ -143,6 +145,8 @@ class PrefixTree:
         rolling_window: int = DEFAULT_ROLLING_WINDOW,
         min_hit_rate: float = DEFAULT_MIN_HIT_RATE,
         circuit_breaker_min_lookups: int = DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS,
+        admission_min_hits: int = DEFAULT_ADMISSION_MIN_HITS,
+        admission_window: int = DEFAULT_ADMISSION_WINDOW,
     ) -> None:
         if int(chunk_tokens) <= 0:
             raise ValueError(f"chunk_tokens must be positive, got {chunk_tokens}")
@@ -150,17 +154,24 @@ class PrefixTree:
             raise ValueError(f"byte_budget must be non-negative, got {byte_budget}")
         if int(rolling_window) <= 0:
             raise ValueError(f"rolling_window must be positive, got {rolling_window}")
+        if int(admission_min_hits) < 1:
+            raise ValueError(f"admission_min_hits must be >= 1, got {admission_min_hits}")
+        if int(admission_window) < 1:
+            raise ValueError(f"admission_window must be >= 1, got {admission_window}")
         self.chunk_tokens = int(chunk_tokens)
         self.byte_budget = int(byte_budget)
         self.rolling_window = int(rolling_window)
         self.min_hit_rate = float(min_hit_rate)
         self.circuit_breaker_min_lookups = max(1, int(circuit_breaker_min_lookups))
+        self.admission_min_hits = int(admission_min_hits)
+        self.admission_window = int(admission_window)
 
         self._lock = threading.RLock()
         self._nodes: dict[str, _PrefixNode] = {}
         self._clock: int = 0
         self._bytes_held: int = 0
         self._recent_outcomes: deque[bool] = deque(maxlen=self.rolling_window)
+        self._seen_first_chunks: OrderedDict[str, int] = OrderedDict()
 
         self.hits: int = 0
         self.misses: int = 0
@@ -205,6 +216,26 @@ class PrefixTree:
         if str(profile).strip().lower() == "interactive":
             return True
         return not self.circuit_breaker_open
+
+    def admit_prefix(self, tokens: Sequence[int], *, profile: str = "auto", sightings: int = 1) -> bool:
+        """Gate snapshot insertion behind bounded `admission_min_hits` sightings of the first chunk."""
+        if self.byte_budget <= 0:
+            return False
+        if str(profile).strip().lower() == "interactive":
+            return True
+        if self.circuit_breaker_open:
+            return False
+        if self.admission_min_hits <= 1 or len(tokens) < self.chunk_tokens:
+            return True
+        key = chain_key(ROOT_KEY, tokens[: self.chunk_tokens])
+        step = max(1, int(sightings))
+        with self._lock:
+            cnt = self._seen_first_chunks.get(key, 0) + step
+            self._seen_first_chunks[key] = cnt
+            self._seen_first_chunks.move_to_end(key)
+            while len(self._seen_first_chunks) > self.admission_window:
+                self._seen_first_chunks.popitem(last=False)
+            return cnt >= self.admission_min_hits
 
     def reset_circuit_breaker(self) -> None:
         """Clear rolling hit-rate history so snapshot writes re-arm immediately."""
@@ -260,7 +291,7 @@ class PrefixTree:
                 replayed_tokens=(len(path) - usable_depth) * ct,
             )
 
-    def record(self, match: PrefixMatch, *, restored: bool) -> None:
+    def record(self, match: PrefixMatch, *, restored: bool, count_for_circuit_breaker: bool = True) -> None:
         """Record a match outcome and bump LRU timestamps along matched nodes."""
         with self._lock:
             if match.keys:
@@ -277,7 +308,8 @@ class PrefixTree:
             elif match.is_empty:
                 self.misses += 1
                 self.matched_but_replayed_tokens += match.replayed_tokens
-                self._recent_outcomes.append(False)
+                if count_for_circuit_breaker:
+                    self._recent_outcomes.append(False)
 
     def insert(
         self,
@@ -385,6 +417,7 @@ class PrefixTree:
             self._nodes.clear()
             self._bytes_held = 0
             self._recent_outcomes.clear()
+            self._seen_first_chunks.clear()
             return freed
 
     shed = clear
@@ -405,6 +438,8 @@ class PrefixTree:
                 "hit_rate": hit_rate,
                 "rolling_hit_rate": self.rolling_hit_rate,
                 "circuit_breaker_open": self.circuit_breaker_open,
+                "admission_min_hits": self.admission_min_hits,
+                "seen_first_chunks": len(self._seen_first_chunks),
                 "reused_tokens": self.reused_tokens,
                 "matched_but_replayed_tokens": self.matched_but_replayed_tokens,
                 "evicted_nodes": self.evicted_nodes,
@@ -455,6 +490,8 @@ class PrefixTree:
 
 
 __all__ = [
+    "DEFAULT_ADMISSION_MIN_HITS",
+    "DEFAULT_ADMISSION_WINDOW",
     "DEFAULT_CHUNK_TOKENS",
     "DEFAULT_CIRCUIT_BREAKER_MIN_LOOKUPS",
     "DEFAULT_MIN_HIT_RATE",
