@@ -190,3 +190,38 @@ def test_ovis_engine_speculative_bit_identity_and_structured_markdown_hw(tmp_pat
             assert item.markdown_validation.valid is True
             assert "1,250.00" in item.text
             assert "3,400.50" in item.text
+
+
+def test_ovis_batched_ocr_images_and_parallel_apple_vision_hw(tmp_path: Path) -> None:
+    if platform.system() != "Darwin":
+        pytest.skip("Apple Silicon MLX test requires macOS")
+
+    pages = [_render_synthetic_table_page(tmp_path / f"batch_tbl_{i}.png", rotate_cw=0) for i in range(4)]
+    with FastOCR(backend="apple-vision", output_format="markdown") as pipe_vis:
+        vis_outs = pipe_vis.ocr_images(pages)
+    assert len(vis_outs) == 4
+    assert all(r.analysis is not None and len(r.lines) > 0 for r in vis_outs)
+    assert all("Office Supplies" in r.text for r in vis_outs)
+
+    model_dir = _has_cached_ovis()
+    if model_dir is None:
+        pytest.skip("Cached OvisOCR2 snapshot unavailable")
+
+    with _gpu_lock():
+        with FastOvisOCREngine(
+            model_path=model_dir,
+            crop_margins=True,
+            auto_orient=True,
+            zoom_recover=False,
+            max_tokens=512,
+        ) as eng:
+            single = eng.ocr_image(pages[0], output_format="markdown", table_mode="gfm", speculative="off")
+            batched = eng.ocr_images(pages, output_format="markdown", table_mode="gfm", batch_size=4)
+        assert len(batched) == 4
+        assert batched[0].text == single.text
+        for idx, res in enumerate(batched):
+            assert res.page_index == idx
+            assert res.metadata["speculative_mode"] == "batched"
+            assert "1,250.00" in res.text
+            assert "3,400.50" in res.text
+

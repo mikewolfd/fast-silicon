@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 import inspect
 from pathlib import Path
 import re
+import tempfile
 import time
 from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image
 
-from .apple_vision import AppleVisionOCR
+from .apple_vision import AppleVisionOCR, _NativeVisionRunner
 from .markdown_struct import canonicalize_markdown, validate_markdown
 from .preprocess import (
     DEFAULT_MAX_PDF_PIXELS,
@@ -64,6 +65,113 @@ def _supports_kwarg(fn: Any, name: str) -> bool:
         return False
     params = sig.parameters
     return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _estimate_source_pixels(src: Any) -> int:
+    """Cheaply estimate pixel count (`W * H`) for parallel ANE triage routing."""
+    if isinstance(src, Image.Image):
+        return int(src.width) * int(src.height)
+    if isinstance(src, np.ndarray):
+        return (int(src.shape[0]) * int(src.shape[1])) if src.ndim >= 2 else 0
+    if isinstance(src, (str, Path)):
+        try:
+            with Image.open(Path(src).expanduser()) as im:
+                return int(im.width) * int(im.height)
+        except Exception:
+            return 0
+    return 0
+
+
+def _recognize_vision_worker_chunk(
+    args: tuple[str, int, bool, tuple[str, ...], bool, int, OutputFormat, list[tuple[int, str]]],
+) -> list[OCRResult]:
+    """Top-level picklable worker running full `AppleVisionOCR.recognize_image` (no MLX import)."""
+    level, bands, language_correction, languages, auto_orient, min_long_edge, output_format, chunk = args
+    ocr = AppleVisionOCR(
+        level=level,
+        bands=bands,
+        language_correction=language_correction,
+        languages=languages,
+        auto_orient=auto_orient,
+        min_long_edge=min_long_edge,
+    )
+    return [ocr.recognize_image(path, page_index=page_idx, output_format=output_format) for page_idx, path in chunk]
+
+
+def run_vision_batch_parallel(
+    vision: Any,
+    sources: Sequence[str | Path | Image.Image | np.ndarray],
+    page_indices: Sequence[int],
+    *,
+    output_format: OutputFormat,
+    workers: int = 4,
+    min_batch: int = 4,
+    min_total_pixels: int = 2_000_000,
+) -> list[OCRResult] | None:
+    """Dispatch `>= min_batch` full-page Apple Vision requests across `ProcessPoolExecutor`, else `None`."""
+    if len(sources) < min_batch:
+        return None
+    if not isinstance(vision, AppleVisionOCR):
+        return None
+    injected_engine = getattr(vision, "_engine", None)
+    if injected_engine is not None and not isinstance(injected_engine, _NativeVisionRunner):
+        return None
+    if sum(_estimate_source_pixels(src) for src in sources) < min_total_pixels:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="fast_ocr_ane_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        paths: list[str] = []
+        for pos, src in enumerate(sources):
+            if isinstance(src, (str, Path)):
+                paths.append(str(Path(src).expanduser()))
+            else:
+                if isinstance(src, np.ndarray):
+                    arr = np.asarray(src)
+                    if arr.dtype != np.uint8:
+                        arr = np.clip(arr, 0, 255).astype(np.uint8)
+                    pil_im = Image.fromarray(arr)
+                elif isinstance(src, Image.Image):
+                    pil_im = src
+                else:
+                    return None
+                if pil_im.mode != "RGB":
+                    pil_im = pil_im.convert("RGB")
+                tmp_path = tmp_root / f"page_{pos}.png"
+                pil_im.save(tmp_path, format="PNG", compress_level=1)
+                paths.append(str(tmp_path))
+
+        n_workers = max(1, min(int(workers), len(paths)))
+        if n_workers <= 1:
+            return None
+        indexed = list(zip((int(i) for i in page_indices), paths))
+        chunks = [indexed[w::n_workers] for w in range(n_workers)]
+        tasks = [
+            (
+                str(vision.level),
+                int(vision.bands),
+                bool(vision.language_correction),
+                tuple(vision.languages),
+                bool(vision.auto_orient),
+                int(vision.min_long_edge),
+                output_format,
+                chunk,
+            )
+            for chunk in chunks
+            if chunk
+        ]
+        try:
+            with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
+                chunk_results = list(pool.map(_recognize_vision_worker_chunk, tasks))
+        except (OSError, PermissionError):
+            return None
+
+        ordered: list[OCRResult | None] = [None] * len(paths)
+        for worker_idx, res_list in enumerate(chunk_results):
+            for local_i, res in enumerate(res_list):
+                orig_pos = worker_idx + local_i * n_workers
+                ordered[orig_pos] = res
+        return [r for r in ordered if r is not None]
 
 
 def _is_likely_native_heading(line: str, *, prev_blank: bool, next_blank: bool) -> bool:
@@ -342,6 +450,27 @@ class AutoOCRPipeline:
         res = fn(source, **kw)
         return _merge_vision_prepass_timing(res, pre_analysis)
 
+    def _run_vision_batch(
+        self,
+        sources: Sequence[str | Path | Image.Image | np.ndarray],
+        page_indices: Sequence[int],
+        *,
+        output_format: OutputFormat,
+    ) -> list[OCRResult]:
+        par = run_vision_batch_parallel(
+            self._get_vision_ocr(),
+            sources,
+            page_indices,
+            output_format=output_format,
+            workers=4,
+        )
+        if par is not None:
+            return par
+        return [
+            self._run_vision_image(src, page_index=int(idx), output_format=output_format)
+            for src, idx in zip(sources, page_indices)
+        ]
+
     def _run_ovis_batch(
         self,
         sources: Sequence[str | Path | Image.Image | np.ndarray],
@@ -350,6 +479,7 @@ class AutoOCRPipeline:
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
         pre_analyses: Sequence[OCRResult | None] | None = None,
+        batch_size: int | None = None,
     ) -> list[OCRResult]:
         if not sources:
             return []
@@ -369,6 +499,8 @@ class AutoOCRPipeline:
                 "draft_k": self.draft_k,
                 "max_tokens": self.max_tokens,
             }
+            if batch_size is not None:
+                candidates["batch_size"] = int(batch_size)
             if pre_analyses is not None:
                 candidates["pre_analyses"] = list(pre_analyses)
             kw = _filter_accepted_kwargs(batch_fn, candidates)
@@ -434,9 +566,9 @@ class AutoOCRPipeline:
         page_indices: Sequence[int] | None = None,
         output_format: OutputFormat | None = None,
         table_mode: MarkdownTableMode | None = None,
-        batch_size: int = 8,
+        batch_size: int = 16,
     ) -> list[OCRResult]:
-        """Run OCR across multiple images, double-buffering ANE pre-analysis with VLM escalation in `auto` mode."""
+        """Run OCR across multiple images, parallelizing ANE pre-analysis and batching VLM escalation."""
         if not sources:
             return []
         indices = list(range(len(sources))) if page_indices is None else [int(i) for i in page_indices]
@@ -448,23 +580,16 @@ class AutoOCRPipeline:
         bs = max(1, int(batch_size))
 
         if self.backend == "apple-vision":
-            return [
-                self._run_vision_image(src, page_index=idx, output_format=fmt)
-                for src, idx in zip(sources, indices)
-            ]
+            return self._run_vision_batch(sources, indices, output_format=fmt)
 
         if self.backend == "ovis":
-            out: list[OCRResult] = []
-            for start in range(0, len(sources), bs):
-                out.extend(
-                    self._run_ovis_batch(
-                        sources[start : start + bs],
-                        page_indices=indices[start : start + bs],
-                        output_format=fmt,
-                        table_mode=tmode,
-                    )
-                )
-            return out
+            return self._run_ovis_batch(
+                sources,
+                page_indices=indices,
+                output_format=fmt,
+                table_mode=tmode,
+                batch_size=bs,
+            )
 
         # `auto` mode: pipeline ANE Vision pre-analysis of batch `k + 1` while VLM runs escalated pages of batch `k`
         batches: list[tuple[Sequence[Any], list[int]]] = [
@@ -476,10 +601,7 @@ class AutoOCRPipeline:
             batch_srcs: Sequence[str | Path | Image.Image | np.ndarray],
             batch_idxs: list[int],
         ) -> list[OCRResult]:
-            return [
-                self._run_vision_image(src, page_index=idx, output_format=fmt)
-                for src, idx in zip(batch_srcs, batch_idxs)
-            ]
+            return self._run_vision_batch(batch_srcs, batch_idxs, output_format=fmt)
 
         results: list[OCRResult] = []
         if len(batches) == 1:
@@ -543,6 +665,7 @@ class AutoOCRPipeline:
                 output_format=output_format,
                 table_mode=table_mode,
                 pre_analyses=esc_vis,
+                batch_size=max(1, len(esc_srcs)),
             )
             for pos, vlm_res in zip(esc_pos, vlm_results):
                 resolved[pos] = vlm_res
@@ -693,10 +816,7 @@ class AutoOCRPipeline:
         if not low_imgs:
             return []
 
-        low_vis = [
-            self._run_vision_image(src, page_index=idx, output_format=output_format)
-            for src, idx in zip(low_imgs, low_idxs)
-        ]
+        low_vis = self._run_vision_batch(low_imgs, low_idxs, output_format=output_format)
         by_page: dict[int, OCRResult] = {}
         esc_idxs: list[int] = []
         esc_vis: list[OCRResult] = []
@@ -719,20 +839,20 @@ class AutoOCRPipeline:
                 max_pixels=max_pixels,
             )
             bs = max(1, int(batch_size))
-            for start in range(0, len(hi_imgs), bs):
-                chunk_outs = self._run_ovis_batch(
-                    hi_imgs[start : start + bs],
-                    page_indices=hi_idxs[start : start + bs],
-                    output_format=output_format,
-                    table_mode=table_mode,
-                    pre_analyses=esc_vis[start : start + bs],
+            chunk_outs = self._run_ovis_batch(
+                hi_imgs,
+                page_indices=hi_idxs,
+                output_format=output_format,
+                table_mode=table_mode,
+                pre_analyses=esc_vis,
+                batch_size=bs,
+            )
+            for res in chunk_outs:
+                by_page[res.page_index] = self._fold_pdf_overhead(
+                    res,
+                    preprocess_extra_ms=per_page_low + per_page_hi,
+                    triage_dpi=eff_triage,
                 )
-                for res in chunk_outs:
-                    by_page[res.page_index] = self._fold_pdf_overhead(
-                        res,
-                        preprocess_extra_ms=per_page_low + per_page_hi,
-                        triage_dpi=eff_triage,
-                    )
 
         return [by_page[idx] for idx in low_idxs]
 
@@ -745,7 +865,7 @@ class AutoOCRPipeline:
         page_indices: Sequence[int] | None = None,
         output_format: OutputFormat | None = None,
         table_mode: MarkdownTableMode | None = None,
-        batch_size: int = 8,
+        batch_size: int = 16,
         use_native_text: bool | None = None,
         max_pixels: int | None = DEFAULT_MAX_PDF_PIXELS,
     ) -> list[OCRResult]:

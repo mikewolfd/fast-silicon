@@ -615,6 +615,7 @@ def _cmd_embed_images(args: argparse.Namespace) -> int:
     rotate_cw = int(getattr(args, "rotate_cw", 0))
     queries = list(getattr(args, "query", None) or ())
     want_index = bool(getattr(args, "build_index", False)) or bool(queries)
+    grid_step = getattr(args, "grid_bucket_step", None)
     eng = _make_engine(args)
     try:
         if not want_index or args.output:
@@ -627,6 +628,7 @@ def _cmd_embed_images(args: argparse.Namespace) -> int:
                 max_pixels=int(args.max_pixels),
                 crop_margins=bool(args.crop_margins),
                 rotations_cw=rotate_cw,
+                grid_bucket_step=grid_step,
                 dimensions=args.dimensions,
                 output_dtype=str(args.dtype),
                 normalize=not bool(args.no_normalize),
@@ -671,6 +673,7 @@ def _cmd_embed_images(args: argparse.Namespace) -> int:
                 max_pixels=int(args.max_pixels),
                 crop_margins=bool(args.crop_margins),
                 rotations_cw=rotate_cw,
+                grid_bucket_step=grid_step,
                 dimensions=args.dimensions,
             )
             dt_idx_ms = (time.perf_counter() - t_idx0) * 1000.0
@@ -856,7 +859,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Clockwise page rotation in degrees before encoding (0, 90, 180, 270)",
     )
-    p_img.add_argument("--batch-size", type=int, default=4, help="Max same-shape wave batch size (default: 4)")
+    p_img.add_argument("--batch-size", type=int, default=16, help="Max same-shape wave batch size (default: 16)")
+    p_img.add_argument(
+        "--grid-bucket-step",
+        type=int,
+        default=None,
+        help="Optional white-pad patch-step bucketing (e.g. 4) to merge nearby page aspect shapes",
+    )
     p_img.add_argument("--dimensions", type=int, default=None, help="Optional MRL truncation dimension")
     p_img.add_argument("--dtype", choices=("float32", "float16", "int8"), default="float32")
     p_img.add_argument("--no-normalize", action="store_true", help="Skip L2 normalization")

@@ -177,3 +177,76 @@ def test_apple10_mpp_prefill_parity_on_real_checkpoint() -> None:
         gc.collect()
         mx.clear_cache()
 
+
+@pytest.mark.gpu_ane
+def test_generate_batch_multimodal_parity_on_real_checkpoint() -> None:
+    import json
+    from PIL import Image, ImageDraw
+    from fast_qwen3 import FastQwen3Engine
+
+    from fast_shared.qwen35_vision import _inspect_hdr_keys, _normalize_vision_key
+
+    candidates: list[tuple[str, Path]] = list(_find_cached_qwen35_checkpoints())
+    hf_hub = Path.home() / ".cache" / "huggingface" / "hub"
+    for repo_glob in ("models--Qwen--Qwen3.5-*", "models--mlx-community--Qwen3.5-*"):
+        for snap in sorted(hf_hub.glob(f"{repo_glob}/snapshots/*")):
+            if (snap / "config.json").is_file() and list(snap.glob("*.safetensors")):
+                candidates.append((snap.parent.parent.name, snap))
+
+    vlm_ckpts: list[tuple[str, Path]] = []
+    seen_snaps: set[Path] = set()
+    for preset, snap in candidates:
+        res_snap = snap.resolve()
+        if res_snap in seen_snaps:
+            continue
+        seen_snaps.add(res_snap)
+        if "vision_config" not in json.loads((snap / "config.json").read_text(encoding="utf-8")):
+            continue
+        if any(
+            _normalize_vision_key(k) is not None
+            for sp in sorted(snap.glob("*.safetensors"))
+            for k in _inspect_hdr_keys(sp)
+        ):
+            vlm_ckpts.append((preset, snap))
+    if not vlm_ckpts:
+        pytest.skip("No cached multimodal Qwen3.5 checkpoint found locally")
+
+    _preset, snap = vlm_ckpts[0]
+    imgs = []
+    prompts = []
+    for idx, word in enumerate(("ALFA", "BETA", "GAMMA", "DELTA")):
+        im = Image.new("RGB", (280 + idx * 32, 180 + (idx % 2) * 32), (255, 255, 255))
+        ImageDraw.Draw(im).text((24, 56), f"Code: {word}", fill=(0, 0, 0))
+        imgs.append([im])
+        prompts.append("Return the code shown in the image in JSON.")
+
+    sch = {
+        "type": "object",
+        "properties": {"code": {"type": "string"}},
+        "required": ["code"],
+        "additionalProperties": False,
+    }
+    LOCK_PATH.touch(exist_ok=True)
+    with open(LOCK_PATH, "r+", encoding="utf-8") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        with FastQwen3Engine(model_dir=snap, warmup=False) as eng:
+            ref = [
+                eng.generate(p, images=im, json_schema=sch, max_tokens=24, temperature=0.0, speculative=False)
+                for p, im in zip(prompts, imgs)
+            ]
+            bat = eng.generate_batch(
+                prompts,
+                images=imgs,
+                json_schema=sch,
+                max_tokens=24,
+                temperature=0.0,
+                batch_size=4,
+                compact_active=True,
+            )
+            assert len(bat.items) == 4
+            assert int(bat.stats["waves"]) >= 1
+            for r_item, b_item in zip(ref, bat.items):
+                assert b_item.text == r_item.text
+                assert b_item.parsed == r_item.parsed
+
+

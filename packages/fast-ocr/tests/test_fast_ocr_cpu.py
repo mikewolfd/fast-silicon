@@ -1891,3 +1891,232 @@ def test_catastrophic_loop_detector_and_vision_tiny_crop_upscale() -> None:
     assert seen_dims[-1] == (258, 61)
     assert r_off.metadata["vision_upscale"] == 1.0
 
+
+def test_b_gt_8_defaults_parallel_ane_gate_and_ovis_batch_wiring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
+    import numpy as np
+    from fast_ocr.ovis_engine import FastOvisOCREngine
+    from fast_ocr.pipeline import run_vision_batch_parallel
+    from fast_ocr.types import OCRTimings
+
+    assert inspect.signature(FastOvisOCREngine.ocr_images).parameters["batch_size"].default == 16
+    assert inspect.signature(FastOCR.ocr_images).parameters["batch_size"].default == 16
+    assert inspect.signature(FastOCR.ocr_pdf).parameters["batch_size"].default == 16
+
+    # 1. Parallel ANE helper skips small batches (< 4), tiny total pixels (< 2.0 MP), and injected mock engines,
+    #    while still allowing an already-initialized `_NativeVisionRunner` instance.
+    from fast_ocr.apple_vision import _NativeVisionRunner
+
+    small_im = Image.new("RGB", (200, 200), "white")
+    real_vis_with_mock_engine = AppleVisionOCR(
+        engine=lambda _b, _w, _h: [("ok", 0.99, [0.1, 0.5, 0.4, 0.1])],
+        bands=1,
+    )
+    assert run_vision_batch_parallel(real_vis_with_mock_engine, [small_im] * 4, [0, 1, 2, 3], output_format="markdown") is None
+
+    big_ims = [Image.new("RGB", (1000, 800), "white") for _ in range(4)]  # 3.2 MP >= 2.0 MP
+    assert run_vision_batch_parallel(real_vis_with_mock_engine, big_ims, [0, 1, 2, 3], output_format="markdown") is None
+
+    pool_invoked: list[int] = []
+
+    class _FakePool:
+        def __init__(self, max_workers: int = 1) -> None:
+            pool_invoked.append(int(max_workers))
+
+        def __enter__(self) -> _FakePool:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def map(self, _fn: Any, tasks: list[Any]) -> list[list[OCRResult]]:
+            return [
+                [
+                    OCRResult(text=f"N {idx}", raw_text=f"N {idx}", backend_used="apple-vision:native", page_index=int(idx))
+                    for idx, _p in task[-1]
+                ]
+                for task in tasks
+            ]
+
+    vis_native_init = AppleVisionOCR(bands=1)
+    vis_native_init._engine = object.__new__(_NativeVisionRunner)  # type: ignore[assignment]
+    with monkeypatch.context() as mp_pool:
+        mp_pool.setattr("fast_ocr.pipeline.ProcessPoolExecutor", _FakePool)
+        nat_res = run_vision_batch_parallel(vis_native_init, big_ims, [0, 1, 2, 3], output_format="markdown")
+    assert pool_invoked == [4] and nat_res is not None
+    assert [r.text for r in nat_res] == ["N 0", "N 1", "N 2", "N 3"]
+    seen_parallel: dict[str, Any] = {}
+
+    def _fake_par(vision: Any, sources: Any, page_indices: Any, *, output_format: str, workers: int = 4):
+        seen_parallel["count"] = len(sources)
+        seen_parallel["workers"] = workers
+        seen_parallel["fmt"] = output_format
+        return [
+            OCRResult(
+                text=f"Page {idx}",
+                raw_text=f"Page {idx}",
+                backend_used="apple-vision:par",
+                page_index=int(idx),
+                output_format=output_format,  # type: ignore[arg-type]
+                timings=OCRTimings(total_ms=1.0),
+            )
+            for idx in page_indices
+        ]
+
+    monkeypatch.setattr("fast_ocr.pipeline.run_vision_batch_parallel", _fake_par)
+    with FastOCR(backend="apple-vision", vision_ocr=real_vis_with_mock_engine) as pipe:
+        par_outs = pipe.ocr_images(big_ims)
+        assert [r.text for r in par_outs] == ["Page 0", "Page 1", "Page 2", "Page 3"]
+    assert seen_parallel == {"count": 4, "workers": 4, "fmt": "markdown"}
+
+    # 2. FastOCR(backend="ovis") forwards batch_size=16 to FastOvisOCREngine.ocr_images
+    ovis_calls: list[dict[str, Any]] = []
+
+    class _SpyOvis:
+        def ocr_images(self, sources: Any, **kwargs: Any) -> list[OCRResult]:
+            ovis_calls.append({"n": len(sources), **kwargs})
+            return [
+                OCRResult(
+                    text=f"Ovis {idx}",
+                    raw_text=f"Ovis {idx}",
+                    backend_used="ovis:spy",
+                    page_index=int(idx),
+                    timings=OCRTimings(total_ms=2.0),
+                )
+                for idx in kwargs.get("page_indices", range(len(sources)))
+            ]
+
+    with FastOCR(backend="ovis", ovis_engine=_SpyOvis()) as pipe:
+        res_ovis = pipe.ocr_images([small_im, small_im, small_im])
+    assert len(res_ovis) == 3
+    assert len(ovis_calls) == 1 and ovis_calls[0]["batch_size"] == 16 and ovis_calls[0]["n"] == 3
+
+    # 3. Real FastOvisOCREngine.ocr_image caps kv_step <= 512 and FastOvisOCREngine.ocr_images delegates B>=2 to batched_multimodal_generate
+    import mlx.core as mx
+    from tokenizers import Tokenizer as HfTokenizer, AddedToken
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from fast_qwen3.tokenizer import FastQwen3Tokenizer
+    from fast_qwen3.multimodal_batch import BatchedMMItemResult
+
+    vocab: dict[str, int] = {ch: i for i, ch in enumerate(sorted(ByteLevel.alphabet()))}
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    bpe.add_special_tokens(
+        [
+            AddedToken("<|endoftext|>", special=True),
+            AddedToken("<|im_start|>", special=True),
+            AddedToken("<|im_end|>", special=True),
+            AddedToken("<think>", special=True),
+            AddedToken("</think>", special=True),
+            AddedToken("<|vision_start|>", special=True),
+            AddedToken("<|image_pad|>", special=True),
+            AddedToken("<|vision_end|>", special=True),
+        ]
+    )
+    tok_p = tmp_path / "tok_ovis.json"
+    bpe.save(str(tok_p))
+    ftok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+
+    kv_steps_seen: list[int] = []
+
+    class _StubLM:
+        vocab_n = ftok.vocab_size
+        has_full_vocab_fallback = False
+
+        class cfg:
+            rot_dims = 64
+            rope_theta = 1000000.0
+            mrope_section = (11, 11, 10)
+
+        def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False):
+            kv_steps_seen.append(int(kv_step))
+            return []
+
+        def embed_tokens(self, x: mx.array) -> mx.array:
+            return mx.zeros((int(x.shape[0]), int(x.shape[1]), 16), dtype=mx.bfloat16)
+
+        def forward_hidden(self, _ids: Any = None, _cache: Any = None, *, inputs_embeds: mx.array | None = None, **_kw: Any) -> mx.array:
+            b = int(inputs_embeds.shape[0]) if inputs_embeds is not None else 1
+            s = int(inputs_embeds.shape[1]) if inputs_embeds is not None else 1
+            return mx.zeros((b, s, 16), dtype=mx.bfloat16)
+
+        def project_logits(self, h: mx.array, **_kw: Any) -> mx.array:
+            out = np.full((int(h.shape[0]), int(h.shape[1]), ftok.vocab_size), -20.0, dtype=np.float32)
+            out[:, :, ftok.eos_token_id] = 10.0
+            return mx.array(out)
+
+    class _StubVision:
+        spatial_merge_size = 2
+
+        class cfg:
+            patch_size = 16
+            temporal_patch_size = 2
+            spatial_merge_size = 2
+
+        def __call__(self, px: mx.array, grids: list[tuple[int, int, int]]) -> mx.array:
+            n_vis = sum((t * h * w) // 4 for t, h, w in grids)
+            return mx.zeros((n_vis, 16), dtype=mx.bfloat16)
+
+    stub_eng = object.__new__(FastOvisOCREngine)
+    stub_eng.model_dir = tmp_path
+    stub_eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}
+    stub_eng.output_format = "markdown"
+    stub_eng.table_mode = "gfm"
+    stub_eng.strict_markdown_grammar = False
+    stub_eng.zoom_recover = False
+    stub_eng.crop_margins = False
+    stub_eng.crop_pad_px = 0
+    stub_eng.auto_orient = False
+    stub_eng.speculative = "off"
+    stub_eng.draft_k = 4
+    stub_eng.prefill_chunk_size = 1024
+    stub_eng.max_tokens = 4096
+    stub_eng.loop_breaker = False
+    stub_eng.auto_loop_recover = False
+    stub_eng.image_token_id = ftok.backend_tokenizer.token_to_id("<|image_pad|>")
+    stub_eng.tokenizer = ftok
+    stub_eng.vocab_remap = None
+    stub_eng.vision_model = _StubVision()
+    stub_eng.lm = _StubLM()
+    stub_eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    stub_eng._new_to_old_mx = None
+    stub_eng._old_to_new = None
+    stub_eng._vision_prepass = None
+
+    stub_eng.ocr_image(Image.new("RGB", (64, 64), "white"), max_tokens=4096)
+    assert kv_steps_seen and kv_steps_seen[-1] == 512
+
+    batched_calls: dict[str, Any] = {}
+
+    def _fake_batched_mm(**kw: Any):
+        batched_calls["n"] = len(kw["images_per_item"])
+        batched_calls["batch_size"] = kw["batch_size"]
+        batched_calls["kv_step"] = kw["kv_step"]
+        ids_hi = ftok.encode("Table text", add_special_tokens=False)
+        return [
+            BatchedMMItemResult(
+                generated_ids=ids_hi,
+                prompt_tokens=30,
+                hit_eos=True,
+                hit_max_tokens=False,
+                vit_ms=1.0,
+                prefill_ms=2.0,
+                decode_ms=3.0,
+                image_grids=[(1, 4, 4)],
+            )
+            for _ in kw["images_per_item"]
+        ], {"waves": 1, "compactions": 0, "vit_ms": 1.0, "prefill_ms": 2.0, "decode_ms": 3.0}
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.batched_multimodal_generate", _fake_batched_mm)
+    bat_res = stub_eng.ocr_images([Image.new("RGB", (64, 64), "white")] * 3, batch_size=16)
+    assert batched_calls == {"n": 3, "batch_size": 16, "kv_step": 512}
+    assert len(bat_res) == 3 and all("Table text" in r.text for r in bat_res)
+    assert all(r.metadata["speculative_mode"] == "batched" for r in bat_res)
+
+

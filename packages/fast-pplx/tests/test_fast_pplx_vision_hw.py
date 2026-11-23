@@ -35,3 +35,34 @@ def test_fast_pplx_encode_images_hardware_smoke() -> None:
 
     assert img_i8.shape == (1, 256)
     assert img_i8.dtype == np.int8
+
+
+@pytest.mark.gpu_ane
+def test_fast_pplx_encode_images_batched_whitepad_grid_bucket() -> None:
+    if _find_local_hf_snapshot(DEFAULT_MODEL_NAME) is None:
+        pytest.skip(f"Local HF snapshot not staged for {DEFAULT_MODEL_NAME}")
+
+    imgs = []
+    for i, (w, h, lbl) in enumerate(
+        [
+            (600, 780, "Municipal water pipeline budget 2026"),
+            (630, 810, "Quarterly electricity tariff schedule"),
+            (590, 765, "Bridge structural seismic inspection"),
+            (620, 800, "Stormwater retention culvert contract"),
+        ]
+    ):
+        im = Image.new("RGB", (w, h), (255, 255, 255))
+        ImageDraw.Draw(im).text((24, 30), f"DOC {i}: {lbl}", fill=(0, 0, 0))
+        imgs.append(im)
+
+    with FastPplx(mode="gpu", dtype="float16", local_files_only=True) as eng:
+        nat = eng.encode_images(imgs, chunks=1, batch_size=16, normalize=True)
+        bkt = eng.encode_images(imgs, chunks=1, batch_size=16, grid_bucket_step=4, normalize=True)
+        q = eng.encode_queries(["Bridge structural seismic inspection"], normalize=True)
+
+    assert len(nat) == 4 and len(bkt) == 4
+    scores_nat = [float((v[0] @ q[0])) for v in nat]
+    scores_bkt = [float((v[0] @ q[0])) for v in bkt]
+    assert int(np.argmax(scores_nat)) == 2
+    assert int(np.argmax(scores_bkt)) == 2
+

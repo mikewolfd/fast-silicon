@@ -191,3 +191,32 @@ def test_detect_apple10_d256_force_fused(monkeypatch) -> None:
 
     monkeypatch.setenv("MLX_METAL_NO_NAX", "1")
     assert detect_apple10_d256_force_fused({"device_name": "Apple M5", "architecture": "applegpu_g17"}, "27.2") is False
+
+
+def test_white_pad_to_grid_bucket_and_prepare_item_bucket() -> None:
+    from PIL import Image, ImageDraw
+    import numpy as np
+    from fast_shared.vision_preprocess import prepare_pplx_image_item, white_pad_to_grid_bucket
+
+    # Odd page sizes near ~336px -> bucketed to grid_h/grid_w divisible by step=4
+    im_a = Image.new("RGB", (340, 340), (255, 255, 255))
+    ImageDraw.Draw(im_a).rectangle([10, 10, 80, 80], fill=(15, 25, 35))
+    im_b = Image.new("RGB", (368, 348), (255, 255, 255))
+    ImageDraw.Draw(im_b).rectangle([12, 12, 90, 90], fill=(15, 25, 35))
+
+    pad_a = white_pad_to_grid_bucket(
+        im_a, bucket_step_patches=4, patch_size=16, min_pixels=16384, max_pixels=400_000
+    )
+    assert (pad_a.width // 16) % 4 == 0 and (pad_a.height // 16) % 4 == 0
+    arr_a = np.asarray(pad_a)
+    # Right/bottom padding added around the original canvas must be pure white
+    if pad_a.width > im_a.width:
+        assert np.all(arr_a[:, im_a.width :] == 255)
+    if pad_a.height > im_a.height:
+        assert np.all(arr_a[im_a.height :, :] == 255)
+
+    it_a = prepare_pplx_image_item(im_a, grid_bucket_step=4, min_pixels=16384, max_pixels=400_000)
+    it_b = prepare_pplx_image_item(im_b, grid_bucket_step=4, min_pixels=16384, max_pixels=400_000)
+    assert it_a.vision_inputs.grid_thw == it_b.vision_inputs.grid_thw
+    assert (it_a.vision_inputs.grid_thw[1] % 8 == 0) and (it_a.vision_inputs.grid_thw[2] % 8 == 0)
+

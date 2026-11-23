@@ -40,8 +40,13 @@ from .model import (
     FastQwen3Model,
     GrowingKVCache,
     HybridPrefixSnapshot,
+    compact_hybrid_cache,
     restore_hybrid_cache,
     snapshot_hybrid_cache,
+)
+from .multimodal_batch import (
+    batched_multimodal_generate,
+    pack_length_waves,
 )
 from .mtp_drafter import (
     Qwen3MtpDrafter,
@@ -689,8 +694,9 @@ class FastQwen3Engine:
                 )
 
         if inputs_embeds is not None:
-            kv_alloc = max(256, len(prompt_ids) + len(folded_ff) + max_tokens + 64)
-            use_kvi8 = self._resolve_kv_i8(1, kv_alloc)
+            est_mm_ctx = len(prompt_ids) + len(folded_ff) + max_tokens + 64
+            kv_alloc = max(256, min(512, est_mm_ctx))
+            use_kvi8 = self._resolve_kv_i8(1, est_mm_ctx)
             cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
             h_mm = self.model.forward_hidden(
                 None,
@@ -1096,6 +1102,7 @@ class FastQwen3Engine:
         top_p: float = 1.0,
         slot_seeds: Sequence[int | None] | None = None,
         collect_telemetry: bool,
+        compact_active: bool = True,
     ) -> list[GenerationItem]:
         """Right-padded batched prefill + multi-token FF + active-row `lm_head` decode wave (`B >= 2`, zero pad leakage)."""
         b_sz = len(wave_prompt_ids)
@@ -1156,13 +1163,15 @@ class FastQwen3Engine:
             ]
 
         suf_lens = [len(s) for s in aug_sufs]
+        min_suf = min(suf_lens)
         max_suf = max(suf_lens)
         any_ragged = any(sl < max_suf for sl in suf_lens)
         padded_suf = [s + [pad_id] * (max_suf - len(s)) for s in aug_sufs]
 
         lcp_len = len(prefix_snap.prefix_tokens) if prefix_snap is not None else 0
-        kv_alloc = max(256, lcp_len + max_suf + max_tokens + 64)
-        use_kvi8 = self._resolve_kv_i8(b_sz, kv_alloc)
+        est_ctx = lcp_len + max_suf + max_tokens + 64
+        kv_alloc = max(256, min(512, est_ctx))
+        use_kvi8 = self._resolve_kv_i8(b_sz, est_ctx)
         if prefix_snap is not None:
             cache = restore_hybrid_cache(prefix_snap, batch_size=b_sz, kv_step=kv_alloc, kv_i8=use_kvi8)
         else:
@@ -1179,7 +1188,7 @@ class FastQwen3Engine:
             valid_scale = None
             valid_lens_mx = None
 
-        if max_suf <= 256:
+        if max_suf <= 512:
             inp = mx.array(padded_suf, dtype=mx.int32)
             h = self.model.forward_hidden(
                 inp,
@@ -1195,15 +1204,16 @@ class FastQwen3Engine:
             else:
                 cur_h = h[:, -1, :]
         else:
-            # Chunked 256-token wave prefill bounds `S > 2048` peak intermediate RAM while capturing exact last-token `h[i]`.
+            # Chunked 512-token wave prefill bounds `S > 2048` peak intermediate RAM while capturing exact last-token `h[i]`.
             slot_cur_h: list[mx.array | None] = [None] * b_sz
-            for c0 in range(0, max_suf, 256):
-                c1 = min(max_suf, c0 + 256)
+            for c0 in range(0, max_suf, 512):
+                c1 = min(max_suf, c0 + 512)
                 inp_c = mx.array([row[c0:c1] for row in padded_suf], dtype=mx.int32)
-                v_scale_c = valid_scale[:, c0:c1, :] if valid_scale is not None else None
+                chunk_has_pad = any_ragged and (c1 > min_suf)
+                v_scale_c = valid_scale[:, c0:c1, :] if (chunk_has_pad and valid_scale is not None) else None
                 v_lens_c = (
                     mx.array([max(0, min(sl - c0, c1 - c0)) for sl in suf_lens], dtype=mx.int32)
-                    if any_ragged
+                    if chunk_has_pad
                     else None
                 )
                 ch_h = self.model.forward_hidden(
@@ -1221,15 +1231,15 @@ class FastQwen3Engine:
                         slot_cur_h[i] = ch_h[i, pos_i - c0, :]
             cur_h = mx.stack([slot_cur_h[i] for i in range(b_sz)], axis=0)  # type: ignore[misc]
 
-        def _project_needed_rows(h_2d: mx.array, need_rows: list[int]) -> dict[int, np.ndarray]:
+        def _project_needed_rows(h_2d: mx.array, need_rows: list[int], row_count: int) -> dict[int, np.ndarray]:
             if not need_rows:
                 mx.eval(h_2d)  # guard: allow-eval
                 return {}
-            if len(need_rows) == b_sz:
+            if len(need_rows) == row_count:
                 sl_all = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
                 mx.eval(h_2d, sl_all)  # guard: allow-eval
                 arr_all = np.asarray(sl_all.astype(mx.float32))
-                return {r: arr_all[r] for r in range(b_sz)}
+                return {r: arr_all[r] for r in range(row_count)}
             idx_mx = mx.array(need_rows, dtype=mx.int32)
             sub_h = mx.take(h_2d, idx_mx, axis=0)[:, None, :]
             sl_sub = self.model.project_logits(sub_h)[:, 0, :]
@@ -1237,53 +1247,61 @@ class FastQwen3Engine:
             arr_sub = np.asarray(sl_sub.astype(mx.float32))
             return {r: arr_sub[pos] for pos, r in enumerate(need_rows)}
 
-        cur_logits_map = _project_needed_rows(cur_h, [i for i in range(b_sz) if not done[i]])
-        true_pos = np.array([lcp_len + sl for sl in suf_lens], dtype=np.int32)
+        cur_logits_map = _project_needed_rows(cur_h, [i for i in range(b_sz) if not done[i]], b_sz)
+        true_pos = [lcp_len + sl for sl in suf_lens]
         kv_cursor = lcp_len + max_suf
-        suf_end_arr = mx.array([lcp_len + sl for sl in suf_lens], dtype=mx.int32)[:, None, None, None] if any_ragged else None
+        live_rows = list(range(b_sz))
+        any_ragged_live = any_ragged
+        suf_end_arr = (
+            mx.array([lcp_len + suf_lens[w_i] for w_i in live_rows], dtype=mx.int32)[:, None, None, None]
+            if any_ragged_live
+            else None
+        )
         pending_q: list[list[int]] = [[] for _ in range(b_sz)]
 
         for _step in range(max_tokens + 1):
-            for i in range(b_sz):
-                if done[i] or pending_q[i]:
+            cur_b = len(live_rows)
+            for r in range(cur_b):
+                w_i = live_rows[r]
+                if done[w_i] or pending_q[w_i]:
                     continue
-                m = matchers[i]
-                g = grammars[i]
-                if len(ans_ids[i]) >= max_tokens:
-                    done[i] = True
-                    hit_max[i] = not (m is not None and m.is_stopped() and m.is_accepting())
+                m = matchers[w_i]
+                g = grammars[w_i]
+                if len(ans_ids[w_i]) >= max_tokens:
+                    done[w_i] = True
+                    hit_max[w_i] = not (m is not None and m.is_stopped() and m.is_accepting())
                     continue
                 if m is not None and m.is_stopped():
-                    done[i] = True
+                    done[w_i] = True
                     continue
 
                 tid, tel = self._select_next_token(
-                    cur_logits_map[i],
-                    full_hidden_1d=cur_h[i],
+                    cur_logits_map[r],
+                    full_hidden_1d=cur_h[r],
                     matcher=m,
                     gram=g,
-                    recent_tokens=ans_ids[i],
+                    recent_tokens=ans_ids[w_i],
                     temperature=temperature,
                     top_p=top_p,
-                    rng=rngs[i],
+                    rng=rngs[w_i],
                     repeat_penalty=True,
                     collect_telemetry=collect_telemetry,
                 )
-                if tel is not None and tels[i] is not None:
-                    tels[i].append(tel)  # type: ignore[union-attr]
+                if tel is not None and tels[w_i] is not None:
+                    tels[w_i].append(tel)  # type: ignore[union-attr]
                 if tid in self.tokenizer.stop_token_ids:
-                    done[i] = True
+                    done[w_i] = True
                     continue
-                ans_ids[i].append(tid)
+                ans_ids[w_i].append(tid)
 
                 if m is not None:
                     m.consume_token(tid)
                     if m.is_stopped():
-                        done[i] = True
+                        done[w_i] = True
                         continue
-                    if len(ans_ids[i]) >= max_tokens:
-                        done[i] = True
-                        hit_max[i] = True
+                    if len(ans_ids[w_i]) >= max_tokens:
+                        done[w_i] = True
+                        hit_max[w_i] = True
                         continue
                     ff_clean: list[int] = []
                     stopped_by_ff = False
@@ -1292,49 +1310,63 @@ class FastQwen3Engine:
                         if fti in self.tokenizer.stop_token_ids:
                             stopped_by_ff = True
                             break
-                        if len(ans_ids[i]) + len(ff_clean) >= max_tokens:
+                        if len(ans_ids[w_i]) + len(ff_clean) >= max_tokens:
                             break
                         ff_clean.append(fti)
                     if ff_clean:
                         m.consume_tokens(ff_clean)
-                        ans_ids[i].extend(ff_clean)
+                        ans_ids[w_i].extend(ff_clean)
                     if stopped_by_ff or m.is_stopped():
-                        done[i] = True
+                        done[w_i] = True
                         continue
-                    if len(ans_ids[i]) >= max_tokens:
-                        done[i] = True
-                        hit_max[i] = True
+                    if len(ans_ids[w_i]) >= max_tokens:
+                        done[w_i] = True
+                        hit_max[w_i] = True
                         continue
-                    pending_q[i] = [tid] + ff_clean
+                    pending_q[w_i] = [tid] + ff_clean
                 else:
-                    if len(ans_ids[i]) >= max_tokens:
-                        done[i] = True
-                        hit_max[i] = True
+                    if len(ans_ids[w_i]) >= max_tokens:
+                        done[w_i] = True
+                        hit_max[w_i] = True
                         continue
-                    pending_q[i] = [tid]
+                    pending_q[w_i] = [tid]
 
-            alive = [i for i in range(b_sz) if not done[i]]
-            if not alive:
+            alive_r = [r for r, w_i in enumerate(live_rows) if not done[w_i]]
+            if not alive_r:
                 break
 
+            if compact_active and cur_b >= 4 and len(alive_r) < cur_b:
+                if len(alive_r) <= (cur_b * 5) // 8 or (cur_b - len(alive_r)) >= 4:
+                    compact_hybrid_cache(cache, alive_r)
+                    live_rows = [live_rows[r] for r in alive_r]
+                    cur_b = len(live_rows)
+                    alive_r = list(range(cur_b))
+                    any_ragged_live = any(suf_lens[w_i] < max_suf for w_i in live_rows)
+                    suf_end_arr = (
+                        mx.array([lcp_len + suf_lens[w_i] for w_i in live_rows], dtype=mx.int32)[:, None, None, None]
+                        if any_ragged_live
+                        else None
+                    )
+
             # Advance `step_w >= 1` common queued tokens across all alive slots in a single forward pass!
-            step_w = min(len(pending_q[i]) for i in alive)
+            step_w = min(len(pending_q[live_rows[r]]) for r in alive_r)
             step_rows: list[list[int]] = []
-            for i in range(b_sz):
-                if done[i]:
+            for r in range(cur_b):
+                w_i = live_rows[r]
+                if done[w_i]:
                     step_rows.append([pad_id] * step_w)
                 else:
-                    step_rows.append(pending_q[i][:step_w])
-                    del pending_q[i][:step_w]
+                    step_rows.append(pending_q[w_i][:step_w])
+                    del pending_q[w_i][:step_w]
 
             step_inp = mx.array(step_rows, dtype=mx.int32)
             kv_prev = kv_cursor
             kv_now = kv_prev + step_w
             kv_cursor = kv_now
 
-            if any_ragged:
+            if any_ragged_live:
                 assert suf_end_arr is not None
-                p_mat = true_pos[:, None] + np.arange(step_w, dtype=np.int32)[None, :]
+                p_mat = np.array([true_pos[w_i] for w_i in live_rows], dtype=np.int32)[:, None] + np.arange(step_w, dtype=np.int32)[None, :]
                 r_trig_s: tuple[mx.array, mx.array] | None = self.model.precompute_rope_trig(mx.array(p_mat, dtype=mx.int32))
                 k_pos = mx.arange(kv_now, dtype=mx.int32)[None, None, None, :]
                 in_pad = (k_pos >= suf_end_arr) & (k_pos < (lcp_len + max_suf))
@@ -1351,8 +1383,8 @@ class FastQwen3Engine:
                 d_mask_s = "causal"
 
             v_scale_s = (
-                mx.array([[[0.0] if done[i] else [1.0]] * step_w for i in range(b_sz)], dtype=mx.bfloat16)
-                if len(alive) < b_sz
+                mx.array([[[0.0] if done[live_rows[r]] else [1.0]] * step_w for r in range(cur_b)], dtype=mx.bfloat16)
+                if len(alive_r) < cur_b
                 else None
             )
             sh = self.model.forward_hidden(
@@ -1363,9 +1395,11 @@ class FastQwen3Engine:
                 rope_trig=r_trig_s,
             )
             cur_h = sh[:, -1, :]
-            need_rows = [i for i in alive if not pending_q[i]]
-            cur_logits_map = _project_needed_rows(cur_h, need_rows)
-            true_pos += step_w
+            need_rows = [r for r, w_i in enumerate(live_rows) if not done[w_i] and not pending_q[w_i]]
+            cur_logits_map = _project_needed_rows(cur_h, need_rows, cur_b)
+            for w_i in live_rows:
+                if not done[w_i]:
+                    true_pos[w_i] += step_w
 
         return [
             self._finalize_item(
@@ -1383,6 +1417,7 @@ class FastQwen3Engine:
         self,
         prompts: Sequence[PromptInput],
         *,
+        images: Sequence[Any] | None = None,
         system_prompt: str | None = None,
         json_schema: str | Mapping[str, Any] | None = None,
         json_schemas: Sequence[str | Mapping[str, Any] | None] | None = None,
@@ -1400,6 +1435,9 @@ class FastQwen3Engine:
         allow_short_thinking_budget: bool = False,
         reasoning_prefix_field: str | None = None,
         collect_telemetry: bool = False,
+        compact_active: bool = True,
+        max_pad_ratio: float | None = 1.8,
+        max_wave_tokens: int | None = None,
         **_ignored_kwargs: Any,
     ) -> GenerationBatchResult:
         """Generate structured or free-text completions over a batch of prompts with LCP hybrid caching."""
@@ -1456,21 +1494,21 @@ class FastQwen3Engine:
                     grammars.append(gh)
                     schema_objs.append(gh.schema_obj)
 
-        encoded = [
-            self.tokenizer.encode_chat(
-                p,
-                system_prompt=system_prompt,
-                enable_thinking=use_two_phase,
-            )
-            for p in prompts
-        ]
+        norm_images: list[list[Any]] | None = None
+        if images is not None:
+            if len(images) != n_docs:
+                raise ValueError(f"images len {len(images)} != prompts len {n_docs}")
 
-        sys_prefix_ids: list[int] = (
-            self.tokenizer.encode(f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n", add_special_tokens=False)
-            if system_prompt and all(isinstance(p, str) for p in prompts)
-            else []
-        )
+            def _norm_item_images(raw: Any) -> list[Any]:
+                if raw is None:
+                    return []
+                if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, np.ndarray)):
+                    return list(raw)
+                return [raw]
 
+            norm_images = [_norm_item_images(x) for x in images]
+
+        extra_stats: dict[str, Any] = {}
         with self._lock:
             base_wave_bs = int(batch_size) if batch_size is not None else min(n_docs, self.default_max_b_slots)
             eff_wave_bs = self._memory_governor.adapt(
@@ -1481,121 +1519,255 @@ class FastQwen3Engine:
             results: list[GenerationItem | None] = [None] * n_docs
             max_lcp_seen = 0
 
-            if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
-                b1_snap: HybridPrefixSnapshot | None = None
-                if (
-                    (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None)
-                    and len(sys_prefix_ids) >= 32
-                    and all(len(enc) > len(sys_prefix_ids) and enc[: len(sys_prefix_ids)] == sys_prefix_ids for enc in encoded)
-                ):
-                    b1_snap = self._lookup_or_build_prefix(sys_prefix_ids)
-                    max_lcp_seen = len(sys_prefix_ids)
-                for idx in range(n_docs):
-                    suf_i = encoded[idx][len(sys_prefix_ids) :] if b1_snap is not None else encoded[idx]
-                    results[idx] = self._decode_single(
-                        encoded[idx],
-                        prefix_snap=b1_snap,
-                        suffix_ids=suf_i,
-                        gram=grammars[idx],
-                        schema_obj=schema_objs[idx],
+            if norm_images is not None:
+                if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
+                    for idx in range(n_docs):
+                        seed_i = (int(seed) + idx) if seed is not None else None
+                        if norm_images[idx]:
+                            p_ids, inp_emb, r_trig, r_delta = self._prepare_multimodal_prefill(
+                                prompts[idx],
+                                norm_images[idx],
+                                system_prompt=system_prompt,
+                                enable_thinking=use_two_phase,
+                            )
+                            results[idx] = self._decode_single(
+                                p_ids,
+                                prefix_snap=None,
+                                suffix_ids=[],
+                                gram=grammars[idx],
+                                schema_obj=schema_objs[idx],
+                                max_tokens=int(max_tokens),
+                                temperature=float(temperature),
+                                top_p=float(top_p),
+                                seed=seed_i,
+                                thinking_budget=eff_budget,
+                                speculative=speculative,
+                                collect_telemetry=collect_telemetry,
+                                inputs_embeds=inp_emb,
+                                rope_trig=r_trig,
+                                rope_offset_delta=r_delta,
+                            )
+                        else:
+                            enc_i = self.tokenizer.encode_chat(
+                                prompts[idx],
+                                system_prompt=system_prompt,
+                                enable_thinking=use_two_phase,
+                            )
+                            results[idx] = self._decode_single(
+                                enc_i,
+                                prefix_snap=None,
+                                suffix_ids=enc_i,
+                                gram=grammars[idx],
+                                schema_obj=schema_objs[idx],
+                                max_tokens=int(max_tokens),
+                                temperature=float(temperature),
+                                top_p=float(top_p),
+                                seed=seed_i,
+                                thinking_budget=eff_budget,
+                                speculative=speculative,
+                                collect_telemetry=collect_telemetry,
+                            )
+                else:
+                    has_any_images = any(bool(xs) for xs in norm_images)
+                    vis = self._ensure_vision_model() if has_any_images else None
+                    img_pad_id, vis_start_id, vis_end_id, user_hdr_ids, nl_ids = self._mm_special_ids()
+                    if img_pad_id is None:
+                        raise ValueError("Tokenizer is missing `<|image_pad|>` token required for multimodal prompts")
+
+                    def _mm_prompt_builder(item_idx: int, vis_counts: list[int]) -> tuple[list[int], list[tuple[int, int]]]:
+                        return self._expand_multimodal_prompt_ids(
+                            prompts[item_idx],
+                            vis_counts,
+                            system_prompt=system_prompt,
+                            enable_thinking=False,
+                            img_pad_id=int(img_pad_id),
+                            vis_start_id=vis_start_id,
+                            vis_end_id=vis_end_id,
+                            user_hdr_ids=user_hdr_ids,
+                            nl_ids=nl_ids,
+                        )
+
+                    old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
+                    mm_items, extra_stats = batched_multimodal_generate(
+                        lm=self.model,
+                        vision_model=vis,
+                        tokenizer=self.tokenizer,
+                        images_per_item=norm_images,
+                        prompt_builder=_mm_prompt_builder,
+                        image_token_id=int(img_pad_id),
+                        new_to_old=self._new_to_old,
+                        old_to_new=old_to_new,
+                        grammars=grammars,
                         max_tokens=int(max_tokens),
                         temperature=float(temperature),
                         top_p=float(top_p),
-                        seed=(int(seed) + idx if seed is not None else None),
-                        thinking_budget=eff_budget,
-                        speculative=speculative,
+                        slot_seeds=[(int(seed) + i) if seed is not None else None for i in range(n_docs)],
+                        repeat_penalty=True,
                         collect_telemetry=collect_telemetry,
+                        batch_size=eff_wave_bs,
+                        kv_step=512,
+                        kv_i8_resolver=self._resolve_kv_i8,
+                        compact_active=compact_active,
+                        max_pad_ratio=max_pad_ratio,
+                        max_wave_tokens=max_wave_tokens,
+                        stop_ids=self.tokenizer.stop_token_ids,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        prefill_chunk_size=512,
                     )
-            else:
-                # Bucket by prompt length (`128`-tok buckets) first to bound ragged pad waste across mixed-schema batches,
-                # then group identical GrammarHelper instances inside each length bucket so FF steps align cleanly.
-                order = sorted(
-                    range(n_docs),
-                    key=lambda i: (len(encoded[i]) // 128, 0 if grammars[i] is None else id(grammars[i]), len(encoded[i])),
-                )
-                cursor = 0
-                for _wave in range(n_docs):
-                    if cursor >= n_docs:
-                        break
-                    cur_bs = self._memory_governor.adapt(
-                        eff_wave_bs,
-                        base_cache_limit_mb=self._mlx_cache_limit_mb,
-                        apply_mlx=True,
-                    ).b_slots
-                    chunk_idx = order[cursor : cursor + max(1, cur_bs)]
-                    cursor += len(chunk_idx)
-                    if len(chunk_idx) == 1:
-                        i0 = chunk_idx[0]
-                        b1_s = (
-                            self._lookup_or_build_prefix(sys_prefix_ids)
-                            if (
-                                (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None)
-                                and len(sys_prefix_ids) >= 32
-                                and len(encoded[i0]) > len(sys_prefix_ids)
-                                and encoded[i0][: len(sys_prefix_ids)] == sys_prefix_ids
-                            )
-                            else None
+                    for idx, mm_res in enumerate(mm_items):
+                        results[idx] = self._finalize_item(
+                            prompt_tokens=mm_res.prompt_tokens,
+                            answer_ids=mm_res.generated_ids,
+                            reasoning_text=None,
+                            hit_max_tokens=mm_res.hit_max_tokens,
+                            schema_obj=schema_objs[idx],
+                            telemetry=mm_res.telemetry,
                         )
-                        if b1_s is not None:
-                            max_lcp_seen = max(max_lcp_seen, len(sys_prefix_ids))
-                        results[i0] = self._decode_single(
-                            encoded[i0],
-                            prefix_snap=b1_s,
-                            suffix_ids=encoded[i0][len(sys_prefix_ids) :] if b1_s is not None else encoded[i0],
-                            gram=grammars[i0],
-                            schema_obj=schema_objs[i0],
+            else:
+                encoded = [
+                    self.tokenizer.encode_chat(
+                        p,
+                        system_prompt=system_prompt,
+                        enable_thinking=use_two_phase,
+                    )
+                    for p in prompts
+                ]
+
+                sys_prefix_ids: list[int] = (
+                    self.tokenizer.encode(
+                        f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n",
+                        add_special_tokens=False,
+                    )
+                    if system_prompt and all(isinstance(p, str) for p in prompts)
+                    else []
+                )
+
+                if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
+                    b1_snap: HybridPrefixSnapshot | None = None
+                    if (
+                        (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None)
+                        and len(sys_prefix_ids) >= 32
+                        and all(len(enc) > len(sys_prefix_ids) and enc[: len(sys_prefix_ids)] == sys_prefix_ids for enc in encoded)
+                    ):
+                        b1_snap = self._lookup_or_build_prefix(sys_prefix_ids)
+                        max_lcp_seen = len(sys_prefix_ids)
+                    for idx in range(n_docs):
+                        suf_i = encoded[idx][len(sys_prefix_ids) :] if b1_snap is not None else encoded[idx]
+                        results[idx] = self._decode_single(
+                            encoded[idx],
+                            prefix_snap=b1_snap,
+                            suffix_ids=suf_i,
+                            gram=grammars[idx],
+                            schema_obj=schema_objs[idx],
                             max_tokens=int(max_tokens),
                             temperature=float(temperature),
                             top_p=float(top_p),
-                            seed=(int(seed) + i0 if seed is not None else None),
-                            thinking_budget=0,
+                            seed=(int(seed) + idx if seed is not None else None),
+                            thinking_budget=eff_budget,
                             speculative=speculative,
                             collect_telemetry=collect_telemetry,
                         )
-                    else:
-                        wave_encs = [encoded[i] for i in chunk_idx]
-                        w_lcp, w_sufs = split_lcp_ids(wave_encs, min_lcp=32)
-                        w_snap = (
-                            self._lookup_or_build_prefix(w_lcp)
-                            if (w_lcp and (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None))
-                            else None
+                else:
+                    # Bucket by prompt length (`128`-tok buckets) first to bound ragged pad waste across mixed-schema batches,
+                    # then group identical GrammarHelper instances inside each length bucket so FF steps align cleanly.
+                    order = sorted(
+                        range(n_docs),
+                        key=lambda i: (len(encoded[i]) // 128, 0 if grammars[i] is None else id(grammars[i]), len(encoded[i])),
+                    )
+                    cursor = 0
+                    for _wave in range(n_docs):
+                        if cursor >= n_docs:
+                            break
+                        cur_bs = self._memory_governor.adapt(
+                            eff_wave_bs,
+                            base_cache_limit_mb=self._mlx_cache_limit_mb,
+                            apply_mlx=True,
+                        ).b_slots
+                        apply_pad_ratio = any(
+                            len(encoded[i]) > 512 for i in order[cursor : cursor + max(1, cur_bs)]
                         )
-                        if w_snap is None and w_lcp:
-                            w_sufs = wave_encs
-                        elif w_snap is not None:
-                            max_lcp_seen = max(max_lcp_seen, len(w_lcp))
-                        wave_items = self._decode_wave_batched(
-                            wave_encs,
-                            prefix_snap=w_snap,
-                            wave_suffix_ids=w_sufs,
-                            grammars=[grammars[i] for i in chunk_idx],
-                            schema_objs=[schema_objs[i] for i in chunk_idx],
-                            max_tokens=int(max_tokens),
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            slot_seeds=[(int(seed) + i) if seed is not None else None for i in chunk_idx],
-                            collect_telemetry=collect_telemetry,
+                        packed = pack_length_waves(
+                            order[cursor:],
+                            lambda idx: len(encoded[idx]),
+                            max(1, cur_bs),
+                            max_pad_ratio=(max_pad_ratio if apply_pad_ratio else None),
+                            max_wave_tokens=max_wave_tokens,
                         )
-                        for i, it in zip(chunk_idx, wave_items):
-                            results[i] = it
-                    if cursor < n_docs and hasattr(mx, "clear_cache"):
-                        mx.clear_cache()
+                        chunk_idx = packed[0] if packed else order[cursor : cursor + 1]
+                        cursor += len(chunk_idx)
+                        if len(chunk_idx) == 1:
+                            i0 = chunk_idx[0]
+                            b1_s = (
+                                self._lookup_or_build_prefix(sys_prefix_ids)
+                                if (
+                                    (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None)
+                                    and len(sys_prefix_ids) >= 32
+                                    and len(encoded[i0]) > len(sys_prefix_ids)
+                                    and encoded[i0][: len(sys_prefix_ids)] == sys_prefix_ids
+                                )
+                                else None
+                            )
+                            if b1_s is not None:
+                                max_lcp_seen = max(max_lcp_seen, len(sys_prefix_ids))
+                            results[i0] = self._decode_single(
+                                encoded[i0],
+                                prefix_snap=b1_s,
+                                suffix_ids=encoded[i0][len(sys_prefix_ids) :] if b1_s is not None else encoded[i0],
+                                gram=grammars[i0],
+                                schema_obj=schema_objs[i0],
+                                max_tokens=int(max_tokens),
+                                temperature=float(temperature),
+                                top_p=float(top_p),
+                                seed=(int(seed) + i0 if seed is not None else None),
+                                thinking_budget=0,
+                                speculative=speculative,
+                                collect_telemetry=collect_telemetry,
+                            )
+                        else:
+                            wave_encs = [encoded[i] for i in chunk_idx]
+                            w_lcp, w_sufs = split_lcp_ids(wave_encs, min_lcp=32)
+                            w_snap = (
+                                self._lookup_or_build_prefix(w_lcp)
+                                if (w_lcp and (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None))
+                                else None
+                            )
+                            if w_snap is None and w_lcp:
+                                w_sufs = wave_encs
+                            elif w_snap is not None:
+                                max_lcp_seen = max(max_lcp_seen, len(w_lcp))
+                            wave_items = self._decode_wave_batched(
+                                wave_encs,
+                                prefix_snap=w_snap,
+                                wave_suffix_ids=w_sufs,
+                                grammars=[grammars[i] for i in chunk_idx],
+                                schema_objs=[schema_objs[i] for i in chunk_idx],
+                                max_tokens=int(max_tokens),
+                                temperature=float(temperature),
+                                top_p=float(top_p),
+                                slot_seeds=[(int(seed) + i) if seed is not None else None for i in chunk_idx],
+                                collect_telemetry=collect_telemetry,
+                                compact_active=compact_active,
+                            )
+                            for i, it in zip(chunk_idx, wave_items):
+                                results[i] = it
+                        if cursor < n_docs and hasattr(mx, "clear_cache"):
+                            mx.clear_cache()
 
         elapsed = time.perf_counter() - t0
         final_items = [r for r in results if r is not None]
         total_comp = sum(it.completion_tokens for it in final_items)
-        return GenerationBatchResult(
-            items=final_items,
-            stats={
-                "docs": n_docs,
-                "lcp_tokens": max_lcp_seen,
-                "prefix_tree_reused_tokens": int(self.prefix_tree.reused_tokens) if self.prefix_tree is not None else 0,
-                "elapsed_sec": round(elapsed, 4),
-                "docs_per_sec": round(n_docs / max(elapsed, 1e-9), 3),
-                "decode_tok_s": round(total_comp / max(elapsed, 1e-9), 2),
-                "mode": mode or self.default_mode,
-            },
-        )
+        stats: dict[str, Any] = {
+            "docs": n_docs,
+            "lcp_tokens": max_lcp_seen,
+            "prefix_tree_reused_tokens": int(self.prefix_tree.reused_tokens) if self.prefix_tree is not None else 0,
+            "elapsed_sec": round(elapsed, 4),
+            "docs_per_sec": round(n_docs / max(elapsed, 1e-9), 3),
+            "decode_tok_s": round(total_comp / max(elapsed, 1e-9), 2),
+            "mode": mode or self.default_mode,
+        }
+        if extra_stats:
+            stats.update(extra_stats)
+        return GenerationBatchResult(items=final_items, stats=stats)
 
     def _ensure_vision_model(self) -> Any:
         if self._vision_model is None:
@@ -1616,37 +1788,30 @@ class FastQwen3Engine:
             self._vision_model = FastQwen35VisionModel.from_pretrained(self.model_dir, dtype=mx.bfloat16)
         return self._vision_model
 
-    def _prepare_multimodal_prefill(
+    def _mm_special_ids(self) -> tuple[int | None, int | None, int | None, list[int], list[int]]:
+        bt = self.tokenizer.backend_tokenizer
+        return (
+            bt.token_to_id("<|image_pad|>"),
+            bt.token_to_id("<|vision_start|>"),
+            bt.token_to_id("<|vision_end|>"),
+            self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False),
+            self.tokenizer.encode("\n", add_special_tokens=False),
+        )
+
+    def _expand_multimodal_prompt_ids(
         self,
         prompt: PromptInput,
-        images: Sequence[Any],
+        vis_token_counts: Sequence[int],
         *,
         system_prompt: str | None,
         enable_thinking: bool,
-    ) -> tuple[list[int], mx.array, tuple[mx.array, mx.array], int]:
-        from fast_shared.qwen35_vision import build_qwen_vision_inputs, compute_mrope_positions, precompute_mrope_trig
-
-        vis = self._ensure_vision_model()
-        img_pad_id = self.tokenizer.backend_tokenizer.token_to_id("<|image_pad|>")
-        vis_start_id = self.tokenizer.backend_tokenizer.token_to_id("<|vision_start|>")
-        vis_end_id = self.tokenizer.backend_tokenizer.token_to_id("<|vision_end|>")
-        if img_pad_id is None:
-            raise ValueError("Tokenizer is missing `<|image_pad|>` token required for multimodal prompts")
-
-        vinputs = [
-            build_qwen_vision_inputs(
-                im,
-                patch_size=int(vis.cfg.patch_size),
-                temporal_patch_size=int(vis.cfg.temporal_patch_size),
-                merge_size=int(vis.cfg.spatial_merge_size),
-            )
-            for im in images
-        ]
-        px_cat = mx.array(np.concatenate([vi.pixel_values for vi in vinputs], axis=0))
-        grids = [vi.grid_thw for vi in vinputs]
-        vis_feats = vis(px_cat, grids)
-
-        # Preserve ChatML prompt-injection sanitization while inserting trusted vision special tokens.
+        img_pad_id: int,
+        vis_start_id: int | None,
+        vis_end_id: int | None,
+        user_hdr_ids: list[int],
+        nl_ids: list[int],
+    ) -> tuple[list[int], list[tuple[int, int]]]:
+        """Sanitize ChatML prompt markers and expand image placeholders into token IDs + visual spans."""
         placeholder = "\x00__FAST_QWEN3_IMG_PAD__\x00"
         has_explicit_markers = False
         if isinstance(prompt, str):
@@ -1704,10 +1869,10 @@ class FastQwen3Engine:
 
         if has_explicit_markers:
             for seg_idx, seg in enumerate(rendered.split(placeholder)):
-                if seg_idx > 0 and img_cursor < len(vinputs):
+                if seg_idx > 0 and img_cursor < len(vis_token_counts):
                     if vis_start_id is not None:
                         expanded_ids.append(int(vis_start_id))
-                    n_vis_i = vinputs[img_cursor].num_visual_tokens
+                    n_vis_i = int(vis_token_counts[img_cursor])
                     s0 = len(expanded_ids)
                     expanded_ids.extend([int(img_pad_id)] * n_vis_i)
                     vis_spans.append((s0, s0 + n_vis_i))
@@ -1718,31 +1883,71 @@ class FastQwen3Engine:
                     expanded_ids.extend(self.tokenizer.encode(seg, add_special_tokens=False))
         else:
             base_ids = self.tokenizer.encode(rendered, add_special_tokens=False)
-            user_hdr = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
-            nl_ids = self.tokenizer.encode("\n", add_special_tokens=False)
             insert_at = 0
-            hdr_len = len(user_hdr)
+            hdr_len = len(user_hdr_ids)
             for idx in range(len(base_ids) - hdr_len, -1, -1):
-                if base_ids[idx : idx + hdr_len] == user_hdr:
+                if base_ids[idx : idx + hdr_len] == user_hdr_ids:
                     insert_at = idx + hdr_len
                     break
             expanded_ids.extend(base_ids[:insert_at])
-            for vi in vinputs:
+            for n_vis_raw in vis_token_counts:
+                n_vis_i = int(n_vis_raw)
                 if vis_start_id is not None:
                     expanded_ids.append(int(vis_start_id))
                 s0 = len(expanded_ids)
-                expanded_ids.extend([int(img_pad_id)] * vi.num_visual_tokens)
-                vis_spans.append((s0, s0 + vi.num_visual_tokens))
+                expanded_ids.extend([int(img_pad_id)] * n_vis_i)
+                vis_spans.append((s0, s0 + n_vis_i))
                 if vis_end_id is not None:
                     expanded_ids.append(int(vis_end_id))
                 expanded_ids.extend(nl_ids)
                 img_cursor += 1
             expanded_ids.extend(base_ids[insert_at:])
 
-        if img_cursor != len(vinputs):
+        if img_cursor != len(vis_token_counts):
             raise ValueError(
-                f"Expected {len(vinputs)} `<|image_pad|>` marker(s) in prompt, expanded {img_cursor}"
+                f"Expected {len(vis_token_counts)} `<|image_pad|>` marker(s) in prompt, expanded {img_cursor}"
             )
+        return expanded_ids, vis_spans
+
+    def _prepare_multimodal_prefill(
+        self,
+        prompt: PromptInput,
+        images: Sequence[Any],
+        *,
+        system_prompt: str | None,
+        enable_thinking: bool,
+    ) -> tuple[list[int], mx.array, tuple[mx.array, mx.array], int]:
+        from fast_shared.qwen35_vision import build_qwen_vision_inputs, compute_mrope_positions, precompute_mrope_trig
+
+        vis = self._ensure_vision_model()
+        img_pad_id, vis_start_id, vis_end_id, user_hdr_ids, nl_ids = self._mm_special_ids()
+        if img_pad_id is None:
+            raise ValueError("Tokenizer is missing `<|image_pad|>` token required for multimodal prompts")
+
+        vinputs = [
+            build_qwen_vision_inputs(
+                im,
+                patch_size=int(vis.cfg.patch_size),
+                temporal_patch_size=int(vis.cfg.temporal_patch_size),
+                merge_size=int(vis.cfg.spatial_merge_size),
+            )
+            for im in images
+        ]
+        px_cat = mx.array(np.concatenate([vi.pixel_values for vi in vinputs], axis=0))
+        grids = [vi.grid_thw for vi in vinputs]
+        vis_feats = vis(px_cat, grids)
+
+        expanded_ids, vis_spans = self._expand_multimodal_prompt_ids(
+            prompt,
+            [vi.num_visual_tokens for vi in vinputs],
+            system_prompt=system_prompt,
+            enable_thinking=enable_thinking,
+            img_pad_id=int(img_pad_id),
+            vis_start_id=vis_start_id,
+            vis_end_id=vis_end_id,
+            user_hdr_ids=user_hdr_ids,
+            nl_ids=nl_ids,
+        )
 
         base_emb = self.model.embed_tokens(mx.array([expanded_ids], dtype=mx.int32))
         parts: list[mx.array] = []

@@ -224,6 +224,51 @@ class PplxImageItem:
     cropped_box_px: tuple[int, int, int, int] | None = None
 
 
+def white_pad_to_grid_bucket(
+    image: Image.Image,
+    *,
+    bucket_step_patches: int = 4,
+    patch_size: int = 16,
+    merge_size: int = 2,
+    min_pixels: int = 65536,
+    max_pixels: int = 16777216,
+    fill_color: tuple[int, int, int] = (255, 255, 255),
+) -> Image.Image:
+    """Resize to native Qwen grid, then white-pad bottom-right to a coarser grid multiple for ViT batching."""
+    from PIL import Image as _PILImage
+
+    rgb = image.convert("RGB") if image.mode != "RGB" else image
+    factor = int(patch_size) * int(merge_size)
+    target_h, target_w = smart_resize_qwen(
+        rgb.height,
+        rgb.width,
+        factor=factor,
+        min_pixels=int(min_pixels),
+        max_pixels=int(max_pixels),
+    )
+    if (target_w, target_h) != (rgb.width, rgb.height):
+        rgb = rgb.resize((target_w, target_h), resample=_PILImage.Resampling.BICUBIC)
+
+    step = max(1, int(bucket_step_patches))
+    if step <= 1:
+        return rgb
+    step_px = factor * step
+    h_buck = ((target_h + step_px - 1) // step_px) * step_px
+    w_buck = ((target_w + step_px - 1) // step_px) * step_px
+    if h_buck * w_buck > int(max_pixels):
+        if h_buck * target_w <= int(max_pixels):
+            w_buck = target_w
+        elif target_h * w_buck <= int(max_pixels):
+            h_buck = target_h
+        else:
+            return rgb
+    if (w_buck, h_buck) == (target_w, target_h):
+        return rgb
+    canvas = _PILImage.new("RGB", (w_buck, h_buck), fill_color)
+    canvas.paste(rgb, (0, 0))
+    return canvas
+
+
 def prepare_pplx_image_item(
     source: str | Path | Image.Image | np.ndarray,
     *,
@@ -241,6 +286,7 @@ def prepare_pplx_image_item(
     rotation_cw: int = 0,
     crop_margins: bool = False,
     crop_pad_px: int = 24,
+    grid_bucket_step: int | None = None,
 ) -> PplxImageItem:
     """Build exact `pplx-embed-v2` token IDs, fractional 3D MRoPE positions, and row-band pooling spans."""
     n_chunks = max(1, int(chunks))
@@ -251,6 +297,15 @@ def prepare_pplx_image_item(
     crop_box: tuple[int, int, int, int] | None = None
     if crop_margins:
         img, crop_box = crop_to_ink(img, pad_px=crop_pad_px)
+    if grid_bucket_step is not None and int(grid_bucket_step) > 1:
+        img = white_pad_to_grid_bucket(
+            img,
+            bucket_step_patches=int(grid_bucket_step),
+            patch_size=patch_size,
+            merge_size=merge_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
 
     vi = build_qwen_vision_inputs(
         img,
@@ -332,4 +387,5 @@ __all__ = [
     "prepare_pplx_image_item",
     "rotate_image_cw",
     "smart_resize_qwen",
+    "white_pad_to_grid_bucket",
 ]

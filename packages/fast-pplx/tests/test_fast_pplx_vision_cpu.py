@@ -572,3 +572,39 @@ def test_cli_embed_images_rotate_build_index_and_query(
     out_txt = capsys.readouterr().out
     assert "Built image index: docs=2 windows=4" in out_txt
     assert "#1: [1] p1.png" in out_txt
+
+
+def test_encode_images_batch_size_16_default_and_grid_bucket_step_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import inspect
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.gpu import FastPplxGPU
+
+    for fn in (FastPplxGPU.encode_images, FastPplx.encode_images, FastPplx.build_image_index):
+        sig = inspect.signature(fn)
+        assert sig.parameters["batch_size"].default == 16
+        assert "grid_bucket_step" in sig.parameters
+        assert sig.parameters["grid_bucket_step"].default is None
+
+    img0 = tmp_path / "b0.png"
+    _make_doc_img(192, 192).save(img0)
+    captured: dict[str, Any] = {}
+
+    class _SpyEng:
+        dim = 1024
+
+        def encode_images(self, images: list[Any], **kwargs: Any) -> list[np.ndarray]:
+            captured["kwargs"] = dict(kwargs)
+            return [np.ones((2, 16), dtype=np.float32) for _ in images]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("fast_pplx.cli._make_engine", lambda _args: _SpyEng())
+    rc = pplx_cli_main(["embed-images", str(img0), "--grid-bucket-step", "4"])
+    assert rc == 0
+    assert captured["kwargs"]["batch_size"] == 16
+    assert captured["kwargs"]["grid_bucket_step"] == 4
+

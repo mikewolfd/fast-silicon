@@ -851,6 +851,7 @@ def test_prefix_tree_multi_chunk_wave_reuse_and_chunked_ragged_parity(tmp_path: 
         eng2.close()
     finally:
         eng.close()
+
         mx.set_cache_limit(prev_lim)
 
 
@@ -1086,6 +1087,7 @@ def test_fast_qwen3_lazy_multimodal_generate_cpu(tmp_path: Path) -> None:
         assert json.loads(r_json.text)["ok"] in (True, False)
     finally:
         eng.close()
+
         assert eng._vision_model is None
 
 
@@ -1269,6 +1271,149 @@ def test_qwen3_mpp_shared_group_budget_shed_and_lora_grad(
         assert mpp_model.mpp_linear_stats()["budget_skips"] >= 1
     finally:
         eng.close()
+
+
+def test_compact_hybrid_cache_pack_waves_and_generate_batch_images(tmp_path: Path) -> None:
+    """Verify `compact_hybrid_cache`, `pack_length_waves`, and batched `generate_batch(..., images=...)` parity."""
+    from PIL import Image, ImageDraw
+    from tokenizers import Tokenizer as HfTokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.qwen35_vision import FastQwen35VisionModel, Qwen35VisionConfig
+    from fast_qwen3.model import DeltaSlotCache, GrowingKVCache, compact_hybrid_cache
+    from fast_qwen3.multimodal_batch import pack_length_waves
+
+    # 1. Cache row compaction slices BF16 KV, q4_quarot packed KV, and GDN DeltaSlotCache rows identically
+    kv_bf16 = GrowingKVCache(step=16, kv_i8=False)
+    kv_bf16.update_and_fetch(
+        mx.arange(4, dtype=mx.float32)[:, None, None, None] * mx.ones((4, 2, 3, 8), dtype=mx.bfloat16),
+        mx.ones((4, 2, 3, 8), dtype=mx.bfloat16),
+    )
+    kv_q4 = GrowingKVCache(step=16, kv_i8="q4_quarot")
+    kv_q4.update_and_fetch(
+        (mx.arange(4, dtype=mx.float32)[:, None, None, None] + 1.0).astype(mx.bfloat16)
+        * mx.ones((4, 2, 3, 64), dtype=mx.bfloat16),
+        mx.ones((4, 2, 3, 64), dtype=mx.bfloat16),
+    )
+    gdn = DeltaSlotCache()
+    gdn.conv_state = mx.arange(4, dtype=mx.float32)[:, None, None] * mx.ones((4, 3, 8), dtype=mx.bfloat16)
+    gdn.rec_state = mx.arange(4, dtype=mx.float32)[:, None, None, None] * mx.ones((4, 2, 4, 4), dtype=mx.float32)
+
+    cache_list = [gdn, kv_bf16, kv_q4]
+    compact_hybrid_cache(cache_list, [1, 3])
+    assert kv_q4._qcache is not None
+    assert kv_q4._qcache.k_w is not None and kv_q4._qcache.k_s is not None and kv_q4._qcache.v_w is not None
+    assert kv_bf16.keys is not None and kv_bf16.values is not None
+    assert gdn.conv_state is not None and gdn.rec_state is not None
+    mx.eval(gdn.conv_state, gdn.rec_state, kv_bf16.keys, kv_q4._qcache.k_w, kv_q4._qcache.k_s)
+    assert kv_bf16.keys.shape[0] == 2 and kv_bf16.values.shape[0] == 2
+    assert float(kv_bf16.keys[0, 0, 0, 0].item()) == 1.0 and float(kv_bf16.keys[1, 0, 0, 0].item()) == 3.0
+    assert kv_q4._qcache.k_w.shape[0] == 2 and kv_q4._qcache.k_s.shape[0] == 2 and kv_q4._qcache.v_w.shape[0] == 2
+    k_dq, _ = kv_q4._qcache.fetch_dequantized()
+    mx.eval(k_dq)
+    assert abs(float(k_dq[0, 0, 0, 0].item()) - 2.0) < 0.25 and abs(float(k_dq[1, 0, 0, 0].item()) - 4.0) < 0.25
+    assert gdn.conv_state.shape[0] == 2 and float(gdn.rec_state[1, 0, 0, 0].item()) == 3.0
+
+    # 2. Wave packing handles out-of-order lengths, max_pad_ratio, and max_wave_tokens bounds
+    waves = pack_length_waves([100, 120, 260, 140], lambda x: x, 4, max_pad_ratio=1.5, max_wave_tokens=1000)
+    assert waves == [[100, 120], [260], [140]]
+
+    # 3. Synthetic VLM + tiny ViT: batched generate_batch(..., images=...) matches B=1 generate(..., images=...)
+    vocab: dict[str, int] = {}
+    for ch in sorted(ByteLevel.alphabet()):
+        if ch not in vocab:
+            vocab[ch] = len(vocab)
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    bpe.add_special_tokens(
+        [
+            AddedToken("<|endoftext|>", special=True),
+            AddedToken("<|im_start|>", special=True),
+            AddedToken("<|im_end|>", special=True),
+            AddedToken("<think>", special=True),
+            AddedToken("</think>", special=True),
+            AddedToken("<|vision_start|>", special=True),
+            AddedToken("<|image_pad|>", special=True),
+            AddedToken("<|vision_end|>", special=True),
+        ]
+    )
+    tok_p = tmp_path / "tok_vlm_batch.json"
+    bpe.save(str(tok_p))
+    tok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    weights = _make_synthetic_qwen3_weights(cfg, seed=43, include_mtp=False)
+    model = FastQwen3Model(cfg, weights, enable_fusion=True)
+    vcfg = Qwen35VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        in_channels=3,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        out_hidden_size=128,
+        num_position_embeddings=64,
+    )
+    tiny_vis = FastQwen35VisionModel(vcfg)
+    mx.eval(tiny_vis.parameters())
+
+    eng = FastQwen3Engine(model=model, tokenizer=tok, warmup=False, prefix_cache_mb=8)
+    eng._vision_model = tiny_vis
+    try:
+        im_sq = Image.new("RGB", (64, 64), (240, 240, 240))
+        ImageDraw.Draw(im_sq).rectangle([8, 8, 56, 56], fill=(20, 20, 20))
+        im_tall = Image.new("RGB", (64, 128), (235, 235, 235))
+        ImageDraw.Draw(im_tall).rectangle([10, 10, 54, 110], fill=(30, 60, 90))
+
+        sch = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        prompts = ["Alpha item", "Beta tall image", "Gamma text-only", "Delta square"]
+        imgs: list[Any] = [[im_sq], [im_tall], None, [im_sq]]
+        ref = [
+            eng.generate(
+                p,
+                images=(im_list if im_list else None),
+                json_schema=sch,
+                max_tokens=16,
+                temperature=0.0,
+                speculative=False,
+            )
+            for p, im_list in zip(prompts, imgs)
+        ]
+        bat = eng.generate_batch(
+            prompts,
+            images=imgs,
+            json_schema=sch,
+            max_tokens=16,
+            temperature=0.0,
+            batch_size=4,
+            compact_active=True,
+            max_pad_ratio=1.8,
+        )
+        assert len(bat.items) == 4
+        assert "waves" in bat.stats and "compactions" in bat.stats
+        for r_item, b_item in zip(ref, bat.items):
+            assert b_item.text == r_item.text
+            assert b_item.token_ids == r_item.token_ids
+            assert b_item.valid_schema is True
+
+        # 4. Text-only compact_active batched wave matches B=1 generate
+        txt_prompts = ["Short?", "Somewhat longer prompt alpha beta gamma", "Med prompt", "Another prompt here"]
+        txt_ref = [eng.generate(p, max_tokens=12, temperature=0.0, speculative=False) for p in txt_prompts]
+        txt_bat = eng.generate_batch(txt_prompts, max_tokens=12, temperature=0.0, batch_size=4, compact_active=True)
+        for r_item, b_item in zip(txt_ref, txt_bat.items):
+            assert b_item.token_ids == r_item.token_ids
+    finally:
+        eng.close()
+
 
 
 

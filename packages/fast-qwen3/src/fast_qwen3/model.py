@@ -511,6 +511,48 @@ def restore_hybrid_cache(
     return restored
 
 
+def compact_hybrid_cache(
+    cache: Sequence[DeltaSlotCache | GrowingKVCache],
+    keep_rows: Sequence[int],
+) -> list[int]:
+    """Compact batch axis=0 in-place across all DeltaSlotCache and GrowingKVCache layers."""
+    kept = [int(r) for r in keep_rows]
+    idx_mx = mx.array(kept, dtype=mx.int32)
+    to_eval: list[mx.array] = []
+    for entry in cache:
+        if isinstance(entry, DeltaSlotCache):
+            if entry.conv_state is not None:
+                entry.conv_state = mx.take(entry.conv_state, idx_mx, axis=0)
+                to_eval.append(entry.conv_state)
+            if entry.rec_state is not None:
+                entry.rec_state = mx.take(entry.rec_state, idx_mx, axis=0)
+                to_eval.append(entry.rec_state)
+        elif isinstance(entry, GrowingKVCache):
+            if entry.keys is not None:
+                entry.keys = mx.take(entry.keys, idx_mx, axis=0)
+                to_eval.append(entry.keys)
+            if entry.values is not None:
+                entry.values = mx.take(entry.values, idx_mx, axis=0)
+                to_eval.append(entry.values)
+            if entry.k_scales is not None:
+                entry.k_scales = mx.take(entry.k_scales, idx_mx, axis=0)
+                to_eval.append(entry.k_scales)
+            if entry.v_scales is not None:
+                entry.v_scales = mx.take(entry.v_scales, idx_mx, axis=0)
+                to_eval.append(entry.v_scales)
+            qc = entry._qcache
+            if qc is not None:
+                for attr in ("k_w", "k_s", "k_b", "v_w", "v_s", "v_b"):
+                    arr = getattr(qc, attr, None)
+                    if isinstance(arr, mx.array):
+                        sliced = mx.take(arr, idx_mx, axis=0)
+                        setattr(qc, attr, sliced)
+                        to_eval.append(sliced)
+    if to_eval:
+        mx.eval(*to_eval)  # guard: allow-eval
+    return kept
+
+
 def build_linear_from_weights(
     weights: Mapping[str, mx.array],
     stem: str,

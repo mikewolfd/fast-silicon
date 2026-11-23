@@ -3070,11 +3070,12 @@ class FastPplxGPU:
         images: Sequence[Any],
         *,
         chunks: int = 8,
-        batch_size: int = 4,
+        batch_size: int = 16,
         min_pixels: int = 16384,
         max_pixels: int = 1_800_000,
         crop_margins: bool = False,
         rotations_cw: int | Sequence[int] | None = None,
+        grid_bucket_step: int | None = None,
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
@@ -3113,6 +3114,7 @@ class FastPplxGPU:
                         max_pixels=int(max_pixels),
                         crop_margins=bool(crop_margins),
                         rotation_cw=rot_i,
+                        grid_bucket_step=grid_bucket_step,
                     )
                 )
 

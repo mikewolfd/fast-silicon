@@ -25,9 +25,10 @@ from fast_shared.grammar import (
 )
 from fast_qwen3.model import FastQwen3Model, Qwen3Config
 from fast_qwen3.mtp_drafter import verify_draft_sequence_b1
+from fast_qwen3.multimodal_batch import batched_multimodal_generate, host_phys_memory_gb
 from fast_qwen3.tokenizer import ENDOFTEXT, IM_END, IM_START, THINK_CLOSE, THINK_OPEN, FastQwen3Tokenizer, QwenVocabRemapper
 
-from .apple_vision import AppleVisionOCR
+from .apple_vision import AppleVisionOCR, deskew_document_image
 from .markdown_struct import DynamicTableRowGrammar, canonicalize_markdown, validate_markdown
 from .mrope import compute_mrope_positions, precompute_mrope_trig
 from .numeric_recovery import (
@@ -37,7 +38,19 @@ from .numeric_recovery import (
     find_recovered_numbers,
 )
 from .pld_drafter import OCRPLDDrafter
-from .preprocess import build_qwen_vision_inputs, crop_to_ink, load_image, render_pdf_pages, rotate_image_cw
+from .preprocess import (
+    build_qwen_vision_inputs,
+    crop_to_ink,
+    load_image,
+    render_pdf_pages,
+    rotate_image_cw,
+    smart_resize_qwen,
+)
+from .region_router import (
+    REGION_CROP_MIN_PIXELS,
+    build_ordered_pld_corpus,
+    compute_adaptive_max_pixels,
+)
 from .types import (
     MarkdownTableMode,
     OCRResult,
@@ -424,6 +437,8 @@ class FastOvisOCREngine:
         crop_margins: bool = True,
         crop_pad_px: int = 24,
         auto_orient: bool = True,
+        adaptive_resolution: bool = True,
+        deskew: bool = False,
         speculative: SpeculativeMode = "auto",
         draft_k: int = 4,
         vocab_size: int | None = None,
@@ -461,6 +476,8 @@ class FastOvisOCREngine:
         self.crop_margins: bool = bool(crop_margins)
         self.crop_pad_px: int = max(0, int(crop_pad_px))
         self.auto_orient: bool = bool(auto_orient)
+        self.adaptive_resolution: bool = bool(adaptive_resolution)
+        self.deskew: bool = bool(deskew)
         self.speculative: SpeculativeMode = speculative
         self.draft_k: int = max(1, int(draft_k))
         self.vit_quant_bits: int | None = vit_quant_bits
@@ -564,6 +581,11 @@ class FastOvisOCREngine:
         zoom_recover: bool | None = None,
         crop_margins: bool | None = None,
         auto_orient: bool | None = None,
+        adaptive_resolution: bool | None = None,
+        deskew: bool | None = None,
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
+        native_pdf_text: str | None = None,
         speculative: SpeculativeMode | None = None,
         draft_k: int | None = None,
         max_tokens: int | None = None,
@@ -573,15 +595,21 @@ class FastOvisOCREngine:
         _force_loop_breaker: bool = False,
         _loop_retry_depth: int = 0,
     ) -> OCRResult:
-        """Run end-to-end OCR on one image with Stage-0 crop/orient, MRoPE VLM decode, PLD, and Markdown cleanup."""
+        """Run end-to-end OCR on one image with Stage-0 crop/orient/adaptive-res, MRoPE VLM decode, PLD, and Markdown cleanup."""
         fmt: OutputFormat = output_format or self.output_format
         tmode: MarkdownTableMode = table_mode or self.table_mode
         strict_md = self.strict_markdown_grammar if strict_markdown_grammar is None else bool(strict_markdown_grammar)
         do_zoom = (self.zoom_recover if zoom_recover is None else bool(zoom_recover)) and (schema is None)
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
+        do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
+        do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
         spec_req: SpeculativeMode = self.speculative if speculative is None else speculative
-        k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
+        has_native_pdf = bool(native_pdf_text and str(native_pdf_text).strip())
+        if draft_k is None:
+            k_draft = max(self.draft_k, 6) if has_native_pdf else self.draft_k
+        else:
+            k_draft = max(1, int(draft_k))
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
         eff_loop_breaker = bool(getattr(self, "loop_breaker", False) or _force_loop_breaker)
@@ -600,6 +628,14 @@ class FastOvisOCREngine:
         t_prep0 = time.perf_counter()
         img = load_image(source)
         vision_res = pre_analysis
+        deskew_meta: dict[str, Any] | None = None
+        if do_deskew:
+            try:
+                img, deskew_meta = deskew_document_image(img)
+                if deskew_meta.get("applied"):
+                    vision_res = None
+            except Exception:
+                deskew_meta = {"applied": False, "reason": "deskew_error"}
         vision_ms = float(vision_res.timings.apple_vision_ms) if vision_res is not None else 0.0
 
         # Run lightweight ANE Vision pre-pass when needed for orientation, zoom recovery, or vision+self speculative drafting
@@ -619,7 +655,19 @@ class FastOvisOCREngine:
         if do_crop:
             img, crop_box = crop_to_ink(img, pad_px=self.crop_pad_px)
 
-        vi = build_qwen_vision_inputs(img)
+        eff_min_pixels = 65_536 if min_pixels is None else max(1024, int(min_pixels))
+        if max_pixels is not None:
+            eff_max_pixels = max(eff_min_pixels, int(max_pixels))
+        elif do_adaptive and vision_res is not None and vision_res.analysis is not None:
+            eff_max_pixels = compute_adaptive_max_pixels(
+                vision_res.analysis,
+                oriented_img.size,
+                cropped_size=img.size,
+            )
+        else:
+            eff_max_pixels = 16_777_216
+
+        vi = build_qwen_vision_inputs(img, min_pixels=eff_min_pixels, max_pixels=eff_max_pixels)
         prompt_ids = self._build_prompt_ids(vi.num_visual_tokens, instruction)
         pos_3d, rope_delta = compute_mrope_positions(
             prompt_ids,
@@ -659,7 +707,7 @@ class FastOvisOCREngine:
             axis=1,
         )
 
-        kv_step = max(256, seq_len + tok_cap + 64)
+        kv_step = max(256, min(512, seq_len + tok_cap + 64))
         cache = self.lm.make_cache(kv_step=kv_step, kv_i8=False)
         if self.prefill_chunk_size > 0 and seq_len > self.prefill_chunk_size:
             last_h: mx.array | None = None
@@ -702,22 +750,32 @@ class FastOvisOCREngine:
             else None
         )
 
-        vision_tok_ids: list[int] = []
-        if vision_res is not None and vision_res.raw_text:
-            vision_tok_ids = self.tokenizer.encode(vision_res.raw_text, add_special_tokens=False)
+        primary_pld_ids: list[int] = []
+        extra_pld_ids: list[list[int]] = []
+        primary_pld_txt, extra_pld_txts = build_ordered_pld_corpus(
+            vision_res,
+            native_pdf_text=native_pdf_text,
+        )
+        if primary_pld_txt:
+            primary_pld_ids = self.tokenizer.encode(primary_pld_txt, add_special_tokens=False)
+        for extra_txt in extra_pld_txts:
+            eids = self.tokenizer.encode(extra_txt, add_special_tokens=False)
+            if eids:
+                extra_pld_ids.append(eids)
 
         if spec_req == "off" or float(temperature) > 0.0:
             eff_spec = "off"
         elif spec_req == "auto":
-            eff_spec = "vision+self" if vision_tok_ids else "self"
-        elif spec_req == "vision+self" and not vision_tok_ids:
+            eff_spec = "vision+self" if primary_pld_ids else "self"
+        elif spec_req == "vision+self" and not primary_pld_ids:
             eff_spec = "self"
         else:
             eff_spec = spec_req
 
         drafter = (
             OCRPLDDrafter(
-                vision_tok_ids if eff_spec == "vision+self" else (),
+                primary_pld_ids if eff_spec == "vision+self" else (),
+                extra_token_ids=extra_pld_ids if eff_spec == "vision+self" else (),
                 max_ngram=4,
                 min_ngram=2,
                 max_k=k_draft,
@@ -1037,6 +1095,11 @@ class FastOvisOCREngine:
                 zoom_recover=do_zoom,
                 crop_margins=retry_crop,
                 auto_orient=False,
+                adaptive_resolution=adaptive_resolution,
+                deskew=False,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                native_pdf_text=native_pdf_text,
                 speculative=spec_req,
                 draft_k=k_draft,
                 max_tokens=tok_cap,
@@ -1307,81 +1370,417 @@ class FastOvisOCREngine:
         speculative: SpeculativeMode | None = None,
         draft_k: int | None = None,
         max_tokens: int | None = None,
+        temperature: float = 0.0,
         pre_analyses: Sequence[OCRResult | None] | None = None,
+        batch_size: int | None = 16,
+        compact_active: bool = True,
+        max_pad_ratio: float | None = 1.8,
+        max_wave_tokens: int | None = None,
+        auto_loop_recover: bool | None = None,
     ) -> list[OCRResult]:
-        """Process multiple images, double-buffering ANE Vision pre-analysis (`N + 1`) behind GPU (`N`)."""
+        """Process multiple images: true `B >= 2` batched VLM waves or double-buffered ANE+PLD when `B=1`."""
         if not sources:
             return []
         indices = list(range(len(sources))) if page_indices is None else [int(i) for i in page_indices]
         if len(indices) != len(sources):
             raise ValueError(f"Expected {len(sources)} page_indices, got {len(indices)}")
 
-        spec_eff = self.speculative if speculative is None else speculative
-        do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
-        do_zoom = (self.zoom_recover if zoom_recover is None else bool(zoom_recover)) and (schema is None)
-        need_ane_prepass = do_orient or do_zoom or spec_eff in ("auto", "vision+self")
-
         pre_seq: list[OCRResult | None] = (
             list(pre_analyses) if pre_analyses is not None else [None] * len(sources)
         )
+        if len(pre_seq) != len(sources):
+            raise ValueError(f"Expected {len(sources)} pre_analyses, got {len(pre_seq)}")
 
-        # Single image or all pre-analyses already supplied -> direct execution
-        if len(sources) == 1 or not need_ane_prepass or all(p is not None for p in pre_seq):
-            return [
-                self.ocr_image(
-                    src,
-                    page_index=idx,
-                    prompt=prompt,
-                    schema=schema,
-                    output_format=output_format,
-                    table_mode=table_mode,
-                    strict_markdown_grammar=strict_markdown_grammar,
-                    zoom_recover=zoom_recover,
-                    crop_margins=crop_margins,
-                    auto_orient=auto_orient,
-                    speculative=speculative,
-                    draft_k=draft_k,
-                    max_tokens=max_tokens,
-                    pre_analysis=pre,
-                )
-                for src, idx, pre in zip(sources, indices, pre_seq)
-            ]
+        fmt: OutputFormat = output_format or self.output_format
+        tmode: MarkdownTableMode = table_mode or self.table_mode
+        strict_md = self.strict_markdown_grammar if strict_markdown_grammar is None else bool(strict_markdown_grammar)
+        do_zoom = (self.zoom_recover if zoom_recover is None else bool(zoom_recover)) and (schema is None)
+        do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
+        do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
+        spec_req: SpeculativeMode = self.speculative if speculative is None else speculative
+        k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
+        tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
+        do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
+        eff_loop_breaker = bool(getattr(self, "loop_breaker", False))
+        eff_bs = 1 if batch_size is None else max(1, int(batch_size))
 
-        def _run_ane(src: Any, idx: int) -> OCRResult | None:
-            try:
-                return self._get_vision_prepass().recognize_image(src, page_index=idx, output_format="raw")
-            except Exception:
-                return None
-
-        results: list[OCRResult] = []
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            cur_pre = pre_seq[0] if pre_seq[0] is not None else _run_ane(sources[0], indices[0])
-            for pos in range(len(sources)):
-                nxt_fut: Future[OCRResult | None] | None = None
-                if pos + 1 < len(sources) and pre_seq[pos + 1] is None:
-                    nxt_fut = pool.submit(_run_ane, sources[pos + 1], indices[pos + 1])
-                results.append(
+        # Single image or explicit B=1 path keeps double-buffered ANE Vision + B=1 PLD fast path
+        if len(sources) == 1 or eff_bs <= 1:
+            need_ane_prepass = do_orient or do_zoom or spec_req in ("auto", "vision+self")
+            if len(sources) == 1 or not need_ane_prepass or all(p is not None for p in pre_seq):
+                return [
                     self.ocr_image(
-                        sources[pos],
-                        page_index=indices[pos],
+                        src,
+                        page_index=idx,
                         prompt=prompt,
                         schema=schema,
-                        output_format=output_format,
-                        table_mode=table_mode,
-                        strict_markdown_grammar=strict_markdown_grammar,
-                        zoom_recover=zoom_recover,
-                        crop_margins=crop_margins,
-                        auto_orient=auto_orient,
-                        speculative=speculative,
-                        draft_k=draft_k,
-                        max_tokens=max_tokens,
-                        pre_analysis=cur_pre,
+                        output_format=fmt,
+                        table_mode=tmode,
+                        strict_markdown_grammar=strict_md,
+                        zoom_recover=do_zoom,
+                        crop_margins=do_crop,
+                        auto_orient=do_orient,
+                        speculative=spec_req,
+                        draft_k=k_draft,
+                        max_tokens=tok_cap,
+                        temperature=temperature,
+                        pre_analysis=pre,
+                        auto_loop_recover=do_loop_recover,
+                    )
+                    for src, idx, pre in zip(sources, indices, pre_seq)
+                ]
+
+            def _run_ane(src: Any, idx: int) -> OCRResult | None:
+                try:
+                    return self._get_vision_prepass().recognize_image(src, page_index=idx, output_format="raw")
+                except Exception:
+                    return None
+
+            results_b1: list[OCRResult] = []
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                cur_pre = pre_seq[0] if pre_seq[0] is not None else _run_ane(sources[0], indices[0])
+                for pos in range(len(sources)):
+                    nxt_fut: Future[OCRResult | None] | None = None
+                    if pos + 1 < len(sources) and pre_seq[pos + 1] is None:
+                        nxt_fut = pool.submit(_run_ane, sources[pos + 1], indices[pos + 1])
+                    results_b1.append(
+                        self.ocr_image(
+                            sources[pos],
+                            page_index=indices[pos],
+                            prompt=prompt,
+                            schema=schema,
+                            output_format=fmt,
+                            table_mode=tmode,
+                            strict_markdown_grammar=strict_md,
+                            zoom_recover=do_zoom,
+                            crop_margins=do_crop,
+                            auto_orient=do_orient,
+                            speculative=spec_req,
+                            draft_k=k_draft,
+                            max_tokens=tok_cap,
+                            temperature=temperature,
+                            pre_analysis=cur_pre,
+                            auto_loop_recover=do_loop_recover,
+                        )
+                    )
+                    if nxt_fut is not None:
+                        cur_pre = nxt_fut.result()
+                    elif pos + 1 < len(sources):
+                        cur_pre = pre_seq[pos + 1]
+            return results_b1
+
+        # Batched `B >= 2` path: parallel ANE prepass + shared `batched_multimodal_generate` + per-page recovery
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        n_items = len(sources)
+
+        t_load0 = time.perf_counter()
+        raw_imgs = [load_image(src) for src in sources]
+        load_ms_each = ((time.perf_counter() - t_load0) * 1000.0) / max(1, n_items)
+
+        need_batch_ane = do_orient or do_zoom or (schema is not None)
+        if need_batch_ane:
+            missing_pos = [i for i, pre in enumerate(pre_seq) if pre is None]
+            if missing_pos:
+                par_res: list[OCRResult] | None = None
+                try:
+                    from .pipeline import run_vision_batch_parallel
+
+                    par_res = run_vision_batch_parallel(
+                        self._get_vision_prepass(),
+                        [raw_imgs[p] for p in missing_pos],
+                        [indices[p] for p in missing_pos],
+                        output_format="raw",
+                        workers=4,
+                    )
+                except Exception:
+                    par_res = None
+                if par_res is not None:
+                    for pos_i, vis_r in zip(missing_pos, par_res):
+                        pre_seq[pos_i] = vis_r
+                else:
+                    vp = self._get_vision_prepass()
+                    for pos_i in missing_pos:
+                        try:
+                            pre_seq[pos_i] = vp.recognize_image(
+                                raw_imgs[pos_i],
+                                page_index=indices[pos_i],
+                                output_format="raw",
+                            )
+                        except Exception:
+                            pre_seq[pos_i] = None
+
+        oriented_imgs: list[Image.Image] = []
+        proc_imgs: list[Image.Image] = []
+        rot_cws: list[int] = []
+        crop_boxes: list[tuple[int, int, int, int] | None] = []
+        vision_ms_arr: list[float] = []
+        prep_ms_arr: list[float] = []
+
+        for i in range(n_items):
+            t_p0 = time.perf_counter()
+            im = raw_imgs[i]
+            pre_i = pre_seq[i]
+            vision_ms_arr.append(float(pre_i.timings.apple_vision_ms) if pre_i is not None else 0.0)
+            rot_cw = resolve_vision_rotation_cw(pre_i, auto_orient=do_orient)
+            if rot_cw != 0:
+                im = rotate_image_cw(im, rot_cw)
+            oriented_imgs.append(im)
+            crop_box: tuple[int, int, int, int] | None = None
+            if do_crop:
+                im, crop_box = crop_to_ink(im, pad_px=self.crop_pad_px)
+            proc_imgs.append(im)
+            rot_cws.append(rot_cw)
+            crop_boxes.append(crop_box)
+            prep_ms_arr.append(load_ms_each + (time.perf_counter() - t_p0) * 1000.0)
+
+        if prompt is not None:
+            instruction = str(prompt)
+        elif strict_md and tmode == "gfm":
+            instruction = DEFAULT_GFM_STRICT_PROMPT
+        else:
+            instruction = DEFAULT_OVIS_PROMPT
+
+        pre_ids = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>", add_special_tokens=False)
+        suf_ids = self.tokenizer.encode(
+            f"<|vision_end|>\n{instruction}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            add_special_tokens=False,
+        )
+
+        def _prompt_builder(_item_idx: int, vis_counts: list[int]) -> tuple[list[int], list[tuple[int, int]]]:
+            nv = int(vis_counts[0]) if vis_counts else 0
+            s0 = len(pre_ids)
+            return pre_ids + ([self.image_token_id] * nv) + suf_ids, ([(s0, s0 + nv)] if nv > 0 else [])
+
+        json_gram: GrammarHelper | None = None
+        if schema is not None:
+            schema_norm = normalize_json_schema(schema)
+            json_gram = GrammarHelper(self.tokenizer.llguidance_tokenizer(), schema_norm, new_to_old=self._new_to_old)
+
+        table_grammars = (
+            [DynamicTableRowGrammar(self.tokenizer.llguidance_tokenizer()) for _ in range(n_items)]
+            if (strict_md and json_gram is None)
+            else None
+        )
+        mrope_sec = tuple(
+            int(x)
+            for x in self.raw_config.get("text_config", {}).get("rope_parameters", {}).get("mrope_section", (11, 11, 10))
+        )
+
+        def _ovis_kv_i8(b_slots: int, alloc_ctx: int) -> str:
+            if host_phys_memory_gb() <= 28.0 and (b_slots >= 48 or alloc_ctx >= 8192):
+                return "q8"
+            return "bf16"
+
+        mm_results, mm_stats = batched_multimodal_generate(
+            lm=self.lm,
+            vision_model=self.vision_model,
+            tokenizer=self.tokenizer,
+            images_per_item=[[im] for im in proc_imgs],
+            prompt_builder=_prompt_builder,
+            image_token_id=self.image_token_id,
+            new_to_old=self._new_to_old,
+            old_to_new=self._old_to_new,
+            grammars=[json_gram] * n_items,
+            table_grammars=table_grammars,
+            max_tokens=tok_cap,
+            temperature=temperature,
+            repeat_penalty=eff_loop_breaker,
+            batch_size=eff_bs,
+            kv_step=512,
+            kv_i8_resolver=_ovis_kv_i8,  # type: ignore[arg-type]
+            compact_active=compact_active,
+            max_pad_ratio=max_pad_ratio,
+            max_wave_tokens=max_wave_tokens,
+            stop_ids=self.tokenizer.stop_token_ids,
+            pad_token_id=self.tokenizer.eos_token_id,
+            prefill_chunk_size=min(512, int(self.prefill_chunk_size)) if self.prefill_chunk_size > 0 else 512,
+            mrope_section=(int(mrope_sec[0]), int(mrope_sec[1]), int(mrope_sec[2])),
+        )
+        batch_peak_gb = float(mx.get_peak_memory() / 1e9)
+        can_loop_recover = do_loop_recover and (not eff_loop_breaker)
+        vocab_n = int(getattr(self.lm, "vocab_n", len(self._new_to_old)))
+        decode_fn = lambda tids: self.tokenizer.decode(tids, skip_special_tokens=True)
+
+        results: list[OCRResult] = []
+        for i, mm_res in enumerate(mm_results):
+            gen_ids = mm_res.generated_ids
+            aborted_loop = detect_catastrophic_token_loop(gen_ids, decode_fn=decode_fn) if can_loop_recover else None
+            if (
+                aborted_loop is None
+                and can_loop_recover
+                and not mm_res.hit_eos
+                and len(gen_ids) >= max(128, tok_cap)
+                and _token_tail_repeat_4gram_rate(gen_ids) >= 0.65
+            ):
+                aborted_loop = (0, len(gen_ids))
+
+            vision_res = pre_seq[i]
+            if aborted_loop is not None and can_loop_recover:
+                retry_crop = False
+                retry_lb = crop_boxes[i] is None
+                retry_action = "retry_uncropped" if crop_boxes[i] is not None else "retry_loop_breaker"
+                retry_res = self.ocr_image(
+                    oriented_imgs[i],
+                    page_index=indices[i],
+                    prompt=prompt,
+                    schema=schema,
+                    output_format=fmt,
+                    table_mode=tmode,
+                    strict_markdown_grammar=strict_md,
+                    zoom_recover=do_zoom,
+                    crop_margins=retry_crop,
+                    auto_orient=False,
+                    speculative=spec_req,
+                    draft_k=k_draft,
+                    max_tokens=tok_cap,
+                    temperature=temperature,
+                    pre_analysis=vision_res,
+                    auto_loop_recover=True,
+                    _force_loop_breaker=retry_lb,
+                    _loop_retry_depth=1,
+                )
+                rt = retry_res.timings
+                merged_dec = mm_res.decode_ms + float(rt.decode_ms)
+                merged_gen = int(rt.generated_tokens)
+                merged_timings = replace(
+                    rt,
+                    preprocess_ms=round(prep_ms_arr[i] + float(rt.preprocess_ms), 3),
+                    apple_vision_ms=round(vision_ms_arr[i], 3),
+                    vit_ms=round(mm_res.vit_ms + float(rt.vit_ms), 3),
+                    prefill_ms=round(mm_res.prefill_ms + float(rt.prefill_ms), 3),
+                    decode_ms=round(merged_dec, 3),
+                    decode_tps=round((merged_gen / (merged_dec / 1000.0)) if merged_dec > 0.0 else 0.0, 2),
+                    peak_memory_gb=round(max(batch_peak_gb, float(rt.peak_memory_gb)), 4),
+                )
+                merged_meta = dict(retry_res.metadata)
+                merged_meta["loop_recovery"] = {
+                    "action": retry_action,
+                    "aborted_at_tokens": len(gen_ids),
+                    "detected_period": int(aborted_loop[0]),
+                    "detected_repeats": int(aborted_loop[1]),
+                    "prior_crop_box": list(crop_boxes[i]) if crop_boxes[i] is not None else None,
+                }
+                results.append(
+                    replace(
+                        retry_res,
+                        rotation_applied_cw=rot_cws[i],
+                        timings=merged_timings,
+                        metadata=merged_meta,
                     )
                 )
-                if nxt_fut is not None:
-                    cur_pre = nxt_fut.result()
-                elif pos + 1 < len(sources):
-                    cur_pre = pre_seq[pos + 1]
+                continue
+
+            t_post0 = time.perf_counter()
+            raw_text = decode_fn(gen_ids)
+            validation = None
+            if fmt == "markdown" and schema is None:
+                rendered = canonicalize_markdown(raw_text, table_mode=tmode)
+                validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
+            else:
+                rendered = raw_text
+            post_ms = (time.perf_counter() - t_post0) * 1000.0
+
+            prep_ms = prep_ms_arr[i]
+            vit_ms = mm_res.vit_ms
+            prefill_ms = mm_res.prefill_ms
+            dec_ms = mm_res.decode_ms
+            total_gen = len(gen_ids) + (1 if mm_res.hit_eos else 0)
+            drafted_tokens = 0
+            accepted_draft_tokens = 0
+            verify_passes = 0
+            peak_gb = batch_peak_gb
+            decode_tps = (total_gen / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
+
+            zoom_meta: dict[str, Any] | None = None
+            if do_zoom and vision_res is not None and vision_res.lines:
+                rendered, raw_text, z_res, zoom_meta = self._run_zoom_recovery(
+                    oriented_imgs[i],
+                    vision_res,
+                    rot_cw=rot_cws[i],
+                    rendered=rendered,
+                    raw_text=raw_text,
+                    page_index=indices[i],
+                    prompt=prompt,
+                    output_format=fmt,
+                    table_mode=tmode,
+                    strict_markdown_grammar=strict_md,
+                    speculative=spec_req,
+                    draft_k=k_draft,
+                    max_tokens=tok_cap,
+                    temperature=temperature,
+                )
+                if z_res is not None:
+                    prep_ms += float(z_res.timings.preprocess_ms)
+                    vit_ms += float(z_res.timings.vit_ms)
+                    prefill_ms += float(z_res.timings.prefill_ms)
+                    dec_ms += float(z_res.timings.decode_ms)
+                    post_ms += float(z_res.timings.postprocess_ms)
+                    total_gen += int(z_res.timings.generated_tokens)
+                    drafted_tokens += int(z_res.timings.drafted_tokens)
+                    accepted_draft_tokens += int(z_res.timings.accepted_draft_tokens)
+                    verify_passes += int(z_res.timings.verify_passes)
+                    peak_gb = max(peak_gb, float(z_res.timings.peak_memory_gb))
+                    if dec_ms > 0.0:
+                        decode_tps = total_gen / (dec_ms / 1000.0)
+                    if fmt == "markdown" and schema is None and zoom_meta and zoom_meta.get("appended"):
+                        validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
+
+            grid_thw = list(mm_res.image_grids[0]) if mm_res.image_grids else [1, 0, 0]
+            vis_toks = (grid_thw[0] * grid_thw[1] * grid_thw[2]) // 4 if len(grid_thw) == 3 else 0
+            metadata: dict[str, Any] = {
+                "grid_thw": grid_thw,
+                "speculative_mode": "batched",
+                "vocab_size": vocab_n,
+                "wave_stats": mm_stats,
+            }
+            if schema is not None and vision_res is not None:
+                line_rot = (int(rot_cws[i]) - int(vision_res.rotation_applied_cw)) % 360
+                metadata["field_boxes"] = align_json_values_to_lines(
+                    raw_text,
+                    vision_res.lines,
+                    image_size=oriented_imgs[i].size,
+                    rotation_cw=line_rot,
+                )
+            if zoom_meta is not None:
+                metadata["zoom_recovery"] = zoom_meta
+
+            item_total_ms = prep_ms + vision_ms_arr[i] + vit_ms + prefill_ms + dec_ms + post_ms
+            results.append(
+                OCRResult(
+                    text=rendered,
+                    raw_text=raw_text,
+                    backend_used=f"ovis:{self.model_dir.name}",
+                    page_index=int(indices[i]),
+                    output_format=fmt,
+                    table_mode=tmode,
+                    rotation_applied_cw=rot_cws[i],
+                    cropped_box_px=crop_boxes[i],
+                    lines=vision_res.lines if vision_res is not None else (),
+                    analysis=vision_res.analysis if vision_res is not None else None,
+                    markdown_validation=validation,
+                    timings=OCRTimings(
+                        preprocess_ms=round(prep_ms, 3),
+                        apple_vision_ms=round(vision_ms_arr[i], 3),
+                        vit_ms=round(vit_ms, 3),
+                        prefill_ms=round(prefill_ms, 3),
+                        decode_ms=round(dec_ms, 3),
+                        postprocess_ms=round(post_ms, 3),
+                        total_ms=round(item_total_ms, 3),
+                        decode_tps=round(decode_tps, 2),
+                        prompt_tokens=int(mm_res.prompt_tokens),
+                        visual_tokens=int(vis_toks),
+                        generated_tokens=int(total_gen),
+                        drafted_tokens=int(drafted_tokens),
+                        accepted_draft_tokens=int(accepted_draft_tokens),
+                        verify_passes=int(verify_passes),
+                        peak_memory_gb=round(peak_gb, 4),
+                    ),
+                    finish_reason=("length" if mm_res.hit_max_tokens else "stop"),
+                    metadata=metadata,
+                )
+            )
         return results
 
     def ocr_pdf(
