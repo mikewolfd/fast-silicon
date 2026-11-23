@@ -1453,21 +1453,21 @@ def _recursive_leaf_anls(pred: Any, gold: Any) -> float:
     return anls_score(str(pred), str(gold))
 
 
-def evaluate_cord_v2(
+def _score_structured_kie_suite(
     items: Sequence[Mapping[str, Any]],
     raw_outputs: Sequence[str],
     *,
     finish_reasons: Sequence[str] | None = None,
     token_ids_list: Sequence[Sequence[int]] | None = None,
+    gold_key: str = "gt_parse",
 ) -> dict[str, Any]:
-    """Evaluate visual JSON extraction on ``naver-clova-ix/cord-v2`` via ``grounded_field_f1`` + ANLS."""
     base = evaluate_structured_extraction(
         items,
         raw_outputs,
         finish_reasons=finish_reasons,
         token_ids_list=token_ids_list,
         schema_key="schema",
-        gold_key="gt_parse",
+        gold_key=gold_key,
     )
     anls_vals: list[float] = []
     for item, raw, valid in zip(items, raw_outputs, base["per_item_valid"]):
@@ -1476,12 +1476,294 @@ def evaluate_cord_v2(
             continue
         try:
             parsed = json.loads(_strip_json_fences(raw or ""))
-            anls_vals.append(_recursive_leaf_anls(parsed, item.get("gt_parse")))
+            anls_vals.append(_recursive_leaf_anls(parsed, item.get(gold_key)))
         except Exception:
             anls_vals.append(0.0)
     return {
         **base,
         "anls": round(float(np.mean(anls_vals)) if anls_vals else 0.0, 6),
+    }
+
+
+def evaluate_cord_v2(
+    items: Sequence[Mapping[str, Any]],
+    raw_outputs: Sequence[str],
+    *,
+    finish_reasons: Sequence[str] | None = None,
+    token_ids_list: Sequence[Sequence[int]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate visual JSON extraction on ``naver-clova-ix/cord-v2`` via ``grounded_field_f1`` + ANLS."""
+    return _score_structured_kie_suite(
+        items,
+        raw_outputs,
+        finish_reasons=finish_reasons,
+        token_ids_list=token_ids_list,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Suite 5–8: VRDU (FCC Ad-Buy / DOJ FARA), DocLayNet-Gov, PureDocBench, US Gov
+# ---------------------------------------------------------------------------
+
+_MONTH_MAP: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+    "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+_VRDU_MDY_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$")
+_VRDU_YMD_RE = re.compile(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$")
+_VRDU_TEXT_DATE_RE = re.compile(
+    r"(?:(\d{1,2})(?:st|nd|rd|th)?\s+(?:day\s+of\s+)?([a-z]+)[,\s\-]+(\d{2,4})|([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?[,\s\-]+(\d{2,4}))",
+    re.IGNORECASE,
+)
+
+
+def _expand_year(y_raw: str) -> int:
+    y = int(y_raw)
+    if len(y_raw) <= 2:
+        return (2000 + y) if y < 40 else (1900 + y)
+    return y
+
+
+def normalize_vrdu_value(val: Any, match_func: str) -> str | None:
+    """Canonicalize a VRDU scalar leaf according to its ``meta.json`` match function."""
+    if val is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(val)).translate(_UNICODE_PUNCT_TRANS)
+    s = _WS_RE.sub(" ", s).strip()
+    if not s:
+        return None
+
+    mf = str(match_func or "GeneralStringMatch")
+    if mf == "PriceMatch":
+        neg = s.startswith("(") and s.endswith(")")
+        cleaned = s[1:-1] if neg else s
+        cleaned = re.sub(r"[\$,\s]", "", cleaned)
+        try:
+            num = float(cleaned)
+            if neg:
+                num = -abs(num)
+            return f"{num:.2f}"
+        except ValueError:
+            return cleaned.lower()
+    if mf == "DateMatch":
+        m = _VRDU_YMD_RE.match(s)
+        if m:
+            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        m = _VRDU_MDY_RE.match(s)
+        if m:
+            mo, d, y = int(m.group(1)), int(m.group(2)), _expand_year(m.group(3))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+        m = _VRDU_TEXT_DATE_RE.search(s)
+        if m:
+            if m.group(1):
+                d, mo_s, y_s = int(m.group(1)), m.group(2).lower(), m.group(3)
+            else:
+                mo_s, d, y_s = m.group(4).lower(), int(m.group(5)), m.group(6)
+            mo = _MONTH_MAP.get(mo_s)
+            if mo is not None and 1 <= d <= 31:
+                return f"{_expand_year(y_s):04d}-{mo:02d}-{d:02d}"
+        return s.lower()
+    if mf == "NumericalStringMatch":
+        digits_only = re.sub(r"[\s,]", "", s)
+        return digits_only
+    return s
+
+
+def normalize_vrdu_parse(obj: Any, meta: Mapping[str, Any]) -> Any:
+    """Apply VRDU type-specific normalization across flat fields and nested ``line_items``."""
+    if not isinstance(obj, Mapping):
+        return obj
+    match_map = dict(meta.get("entity_name_to_match_func") or {})
+    out: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "line_items" and isinstance(v, list):
+            norm_rows: list[dict[str, Any]] = []
+            for row in v:
+                if not isinstance(row, Mapping):
+                    continue
+                nr: dict[str, Any] = {}
+                for rk, rv in row.items():
+                    nv = normalize_vrdu_value(rv, str(match_map.get(rk, "GeneralStringMatch")))
+                    if nv is not None:
+                        nr[str(rk)] = nv
+                if nr:
+                    norm_rows.append(nr)
+            out["line_items"] = norm_rows
+        else:
+            nv = normalize_vrdu_value(v, str(match_map.get(k, "GeneralStringMatch")))
+            if nv is not None:
+                out[str(k)] = nv
+    return out
+
+
+def evaluate_vrdu(
+    items: Sequence[Mapping[str, Any]],
+    raw_outputs: Sequence[str],
+    *,
+    finish_reasons: Sequence[str] | None = None,
+    token_ids_list: Sequence[Sequence[int]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate structured KIE on ``google-research-datasets/vrdu`` via type-normalized ``grounded_field_f1`` + ANLS."""
+    norm_items: list[dict[str, Any]] = []
+    norm_raws: list[str] = []
+    for item, raw in zip(items, raw_outputs):
+        meta = item.get("meta") if isinstance(item.get("meta"), Mapping) else {}
+        norm_gold = normalize_vrdu_parse(item.get("gt_parse") or {}, meta)
+        norm_items.append({**item, "_norm_gt": norm_gold})
+        try:
+            parsed = json.loads(_strip_json_fences(raw or ""))
+            norm_pred = normalize_vrdu_parse(parsed, meta)
+            norm_raws.append(json.dumps(norm_pred, ensure_ascii=False))
+        except Exception:
+            norm_raws.append(raw or "")
+    return _score_structured_kie_suite(
+        norm_items,
+        norm_raws,
+        finish_reasons=finish_reasons,
+        token_ids_list=token_ids_list,
+        gold_key="_norm_gt",
+    )
+
+
+def evaluate_doclaynet_gov(
+    pages: Sequence[Mapping[str, Any]],
+    predictions: Sequence[str],
+    *,
+    finish_reasons: Sequence[str] | None = None,
+    allow_html_tables: bool = True,
+) -> dict[str, Any]:
+    """Evaluate visual OCR on ``DocLayNet-v1.2`` gov/legal/patent pages using layout text cells & reading order."""
+    n = len(pages)
+    if len(predictions) != n:
+        raise ValueError(f"Mismatched pages={n} vs predictions={len(predictions)}")
+
+    per_valid: list[bool] = []
+    per_scores: list[float] = []
+    text_neds: list[float] = []
+    ro_sims: list[float] = []
+    hf_leaks: list[float] = []
+    repeat_rates: list[float] = []
+    md_valid_cnt = 0
+
+    for i, page in enumerate(pages):
+        pred = predictions[i] or ""
+        fr = finish_reasons[i] if finish_reasons is not None else "stop"
+        rep = repeat_4gram_rate(pred)
+        repeat_rates.append(rep)
+        md_val = validate_ocr_markdown(pred, allow_html_tables=allow_html_tables)
+        if md_val["valid"]:
+            md_valid_cnt += 1
+        is_valid = bool(pred.strip() and str(fr) != "length" and rep < 0.15)
+        per_valid.append(is_valid)
+
+        text_blocks = list(page.get("text_blocks") or [])
+        table_texts = [str(t) for t in (page.get("table_texts") or []) if str(t).strip()]
+        gold_parts = [str(b.get("text") or "") for b in text_blocks] + table_texts
+        gold_norm = normalize_ocr_text(" ".join(gold_parts), case_sensitive=False, strip_markdown=True)
+        pred_norm = normalize_ocr_text(
+            _strip_tables_and_images_for_prose(pred, strip_display_math=False),
+            case_sensitive=False,
+            strip_markdown=True,
+        )
+        ned = normalized_edit_distance(pred_norm, gold_norm)
+        text_neds.append(ned)
+        ro = _reading_order_concordance(pred, text_blocks) if text_blocks else 1.0
+        ro_sims.append(ro)
+
+        hf_texts = [str(h) for h in (page.get("header_footer_texts") or []) if len(str(h).strip()) >= 4]
+        if hf_texts:
+            leaked = 0
+            for h in hf_texts:
+                hn = normalize_ocr_text(h, case_sensitive=False, strip_markdown=True)
+                if hn and fuzzy_find_substring(hn, pred_norm, max_diffs=1)[0]:
+                    leaked += 1
+            hf_leaks.append(float(leaked) / float(len(hf_texts)))
+
+        per_scores.append(0.5 * (1.0 - ned) + 0.5 * ro)
+
+    mean_ned = float(np.mean(text_neds)) if text_neds else 0.0
+    mean_ro = float(np.mean(ro_sims)) if ro_sims else 1.0
+    overall = 0.5 * (1.0 - mean_ned) + 0.5 * mean_ro
+    return {
+        "n_pages": n,
+        "n_valid": int(sum(1 for v in per_valid if v)),
+        "valid_markdown_rate": round(float(md_valid_cnt) / float(max(1, n)), 6),
+        "doclaynet_overall": round(overall, 6),
+        "text_edit_distance": round(mean_ned, 6),
+        "text_similarity": round(1.0 - mean_ned, 6),
+        "reading_order_sim": round(mean_ro, 6),
+        "header_footer_leak_rate": round(float(np.mean(hf_leaks)) if hf_leaks else 0.0, 6),
+        "repeat_4gram_rate": round(float(np.mean(repeat_rates)) if repeat_rates else 0.0, 6),
+        "repeat_loop_count": int(sum(1 for r in repeat_rates if r >= 0.15)),
+        "per_item_valid": per_valid,
+        "per_item_scores": per_scores,
+    }
+
+
+def evaluate_puredocbench(
+    pages: Sequence[Mapping[str, Any]],
+    predictions: Sequence[str],
+    *,
+    finish_reasons: Sequence[str] | None = None,
+    allow_html_tables: bool = True,
+) -> dict[str, Any]:
+    """Evaluate PureDocBench pages via OmniDocBench metrics with track metadata."""
+    res = evaluate_omnidocbench(
+        pages,
+        predictions,
+        finish_reasons=finish_reasons,
+        allow_html_tables=allow_html_tables,
+    )
+    tracks = sorted({str(p.get("track") or "clean") for p in pages})
+    domains = sorted({str(p.get("domain") or "03_legal_gov") for p in pages})
+    return {
+        **res,
+        "puredocbench_overall": res["omnidoc_overall"],
+        "tracks": tracks,
+        "domains": domains,
+    }
+
+
+def evaluate_us_gov_ocr(
+    pages: Sequence[Mapping[str, Any]],
+    predictions: Sequence[str],
+    *,
+    finish_reasons: Sequence[str] | None = None,
+    allow_html_tables: bool = True,
+) -> dict[str, Any]:
+    """Evaluate paired U.S. Gov PDF<->XML/transcription pages with branch & source breakdowns."""
+    res = evaluate_omnidocbench(
+        pages,
+        predictions,
+        finish_reasons=finish_reasons,
+        allow_html_tables=allow_html_tables,
+    )
+    by_branch: dict[str, dict[str, Any]] = {}
+    by_source: dict[str, dict[str, Any]] = {}
+    for idx, page in enumerate(pages):
+        br = str(page.get("branch") or "unknown")
+        src = str(page.get("source") or "unknown")
+        sc = float(res["per_item_scores"][idx])
+        ok = bool(res["per_item_valid"][idx])
+        for bucket_map, key in ((by_branch, br), (by_source, src)):
+            entry = bucket_map.setdefault(key, {"_scores": [], "_valid": 0})
+            entry["_scores"].append(sc)
+            entry["_valid"] += int(ok)
+    for bucket_map in (by_branch, by_source):
+        for key, entry in bucket_map.items():
+            scs = entry.pop("_scores")
+            vld = entry.pop("_valid")
+            entry["n_pages"] = len(scs)
+            entry["n_valid"] = vld
+            entry["score"] = round(float(np.mean(scs)) if scs else 0.0, 6)
+    return {
+        **res,
+        "us_gov_overall": res["omnidoc_overall"],
+        "per_branch": by_branch,
+        "per_source": by_source,
     }
 
 
@@ -1495,14 +1777,20 @@ __all__ = [
     "compute_teds",
     "compute_teds_structure",
     "evaluate_cord_v2",
+    "evaluate_doclaynet_gov",
     "evaluate_fintabnet_otsl",
     "evaluate_olmocr_bench",
     "evaluate_omnidocbench",
+    "evaluate_puredocbench",
+    "evaluate_us_gov_ocr",
+    "evaluate_vrdu",
     "extract_latex_equations",
     "extract_tables_from_markdown",
     "fuzzy_find_substring",
     "levenshtein_distance",
     "normalize_ocr_text",
+    "normalize_vrdu_parse",
+    "normalize_vrdu_value",
     "normalized_edit_distance",
     "normalized_indel_similarity",
     "parse_gfm_table_lines",

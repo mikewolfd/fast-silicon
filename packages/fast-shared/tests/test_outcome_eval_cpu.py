@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import itertools
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 
 import numpy as np
 import pyarrow as pa
@@ -23,6 +27,7 @@ from fast_shared.outcome_eval import (
     build_clinc_stage1_qdef,
     build_clinc_stage2_qdef,
     build_cord_v2_schema,
+    build_vrdu_schema,
     canonicalize_latex,
     check_bfcl_ast_match,
     check_chat_validity,
@@ -49,6 +54,7 @@ from fast_shared.outcome_eval import (
     evaluate_bfcl_v3,
     evaluate_clinc_two_stage,
     evaluate_cord_v2,
+    evaluate_doclaynet_gov,
     evaluate_fintabnet_otsl,
     evaluate_instruction_following,
     evaluate_jsonschemabench_compiler,
@@ -61,10 +67,13 @@ from fast_shared.outcome_eval import (
     evaluate_olmocr_bench,
     evaluate_omnidocbench,
     evaluate_promotion_gates,
+    evaluate_puredocbench,
     evaluate_ragtruth_noul,
     evaluate_retrieval_rankings,
     evaluate_reward_bench_2,
     evaluate_structured_extraction,
+    evaluate_us_gov_ocr,
+    evaluate_vrdu,
     expected_reward_score,
     extract_boxed_answer,
     extract_mmlu_choice,
@@ -72,19 +81,28 @@ from fast_shared.outcome_eval import (
     filter_legalbench_subsets,
     filter_longembed_subsets,
     fuzzy_find_substring,
+    gpotable_to_html,
     grounded_field_f1,
     hungarian_min_cost,
     levenshtein_distance,
     linear_sum_assignment_max,
     load_cord_v2,
+    load_doclaynet_gov,
     load_fintabnet_otsl,
+    load_loc_btp_items,
     load_lockfile,
     load_olmocr_bench,
     load_omnidocbench_en,
+    load_puredocbench_legal_gov,
+    load_us_gov_ocr,
+    load_vrdu,
     math_answers_equivalent,
     merge_char_spans,
     normalize_cord_v2_parse,
+    normalize_vrdu_parse,
+    normalize_vrdu_value,
     parse_bfcl_tool_calls,
+    parse_govinfo_xml_gold,
     partition_banking77_clusters,
     project_mrl_dtype,
     read_arrow_ipc_rows,
@@ -93,6 +111,7 @@ from fast_shared.outcome_eval import (
     reconstruct_fintabnet_html,
     repeat_4gram_rate,
     run_olmocr_unit_test,
+    slice_gold_to_page_prefix,
     split_sentences,
     stratified_sha256_sample,
     validate_against_jsonschema,
@@ -141,6 +160,10 @@ def test_lockfile_pins_all_20_datasets_and_excludes_restricted_subsets(tmp_path:
         "fintabnet_otsl",
         "omnidocbench_en",
         "cord_v2",
+        "vrdu_ad_buy",
+        "vrdu_registration",
+        "doclaynet_gov",
+        "puredocbench_legal_gov",
     }
     assert set(ds.keys()) == expected_keys
     for key, entry in ds.items():
@@ -1654,6 +1677,457 @@ def test_cat5_cli_dry_run_and_public_comparison_pairing() -> None:
     assert comps[0]["stock_package"] == "public-ovis-mlx-vlm"
     assert comps[0]["eot_speedup_vs_stock"] == pytest.approx(3.0)
     assert comps[0]["lossless_quality_status"] == "PASS"
+
+
+def test_vrdu_loaders_and_type_normalized_evaluator(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    ad_dir = cache_root / "vrdu_ad_buy" / "ad-buy-form"
+    (ad_dir / "main" / "pdfs").mkdir(parents=True)
+    (ad_dir / "few_shot-splits").mkdir(parents=True)
+    reg_dir = cache_root / "vrdu_registration" / "registration-form"
+    (reg_dir / "main" / "pdfs").mkdir(parents=True)
+    (reg_dir / "few_shot-splits").mkdir(parents=True)
+
+    ad_meta = {
+        "dataset_name": "DeepForm",
+        "entity_name_to_match_func": {
+            "advertiser": "GeneralStringMatch",
+            "gross_amount": "PriceMatch",
+            "flight_from": "DateMatch",
+            "channel": "GeneralStringMatch",
+            "sub_amount": "PriceMatch",
+        },
+        "entity_appearance_pattern": {
+            "advertiser": "unrepeated",
+            "gross_amount": "unrepeated",
+            "flight_from": "unrepeated",
+            "channel": "line_item",
+            "sub_amount": "line_item",
+        },
+    }
+    reg_meta = {
+        "dataset_name": "FARA",
+        "entity_name_to_match_func": {
+            "file_date": "DateMatch",
+            "registrant_name": "NameMatch",
+            "registration_num": "NumericalStringMatch",
+        },
+    }
+    ad_meta_p = ad_dir / "main" / "meta.json"
+    ad_meta_p.write_text(json.dumps(ad_meta), encoding="utf-8")
+    reg_meta_p = reg_dir / "main" / "meta.json"
+    reg_meta_p.write_text(json.dumps(reg_meta), encoding="utf-8")
+
+    ad_split_p = ad_dir / "few_shot-splits" / "split.json"
+    ad_split_p.write_text(json.dumps({"test": ["ad1.pdf"]}), encoding="utf-8")
+    reg_split_p = reg_dir / "few_shot-splits" / "split.json"
+    reg_split_p.write_text(json.dumps({"test": ["reg1.pdf"]}), encoding="utf-8")
+
+    ad_rec = {
+        "filename": "ad1.pdf",
+        "ocr": {"bad": "google cloud ocr noise"},
+        "annotations": [
+            ["advertiser", [["Acme Civic PAC\n", [0, 0.1, 0.1, 0.3, 0.2], []]]],
+            ["gross_amount", [["$1,250.00", [0, 0.2, 0.2, 0.4, 0.3], []]]],
+            ["flight_from", [["03/29/20", [0, 0.2, 0.3, 0.4, 0.4], []]]],
+            ["channel", [["KMSP", [0, 0.1, 0.5, 0.2, 0.6], []]]],
+            ["sub_amount", [["$500", [0, 0.4, 0.5, 0.5, 0.6], []]]],
+        ],
+    }
+    reg_rec = {
+        "filename": "reg1.pdf",
+        "ocr": {"bad": "ignored"},
+        "annotations": [
+            ["file_date", [["23rd\nday of\nMarch\n-1962", [1, 0.1, 0.2, 0.3, 0.3], []]]],
+            ["registrant_name", [["Civic Group LLP", [1, 0.1, 0.4, 0.3, 0.5], []]]],
+            ["registration_num", [["3,712", [1, 0.4, 0.1, 0.5, 0.2], []]]],
+            ["registration_num", [["3,712", [0, 0.4, 0.1, 0.5, 0.2], []]]],
+        ],
+    }
+    ad_gz_p = ad_dir / "main" / "dataset.jsonl.gz"
+    ad_gz_p.write_bytes(gzip.compress((json.dumps(ad_rec) + "\n").encode("utf-8")))
+    reg_gz_p = reg_dir / "main" / "dataset.jsonl.gz"
+    reg_gz_p.write_bytes(gzip.compress((json.dumps(reg_rec) + "\n").encode("utf-8")))
+    (ad_dir / "main" / "pdfs" / "ad1.pdf").write_bytes(b"%PDF-1.4\n")
+    (reg_dir / "main" / "pdfs" / "reg1.pdf").write_bytes(b"%PDF-1.4\n")
+
+    fake_lock = {
+        "datasets": {
+            "vrdu_ad_buy": {
+                "source": "github",
+                "repo_id": "google-research-datasets/vrdu",
+                "revision": "0" * 40,
+                "gated": False,
+                "subdir": "ad-buy-form",
+                "split_file": "ad-buy-form/few_shot-splits/split.json",
+                "files": [
+                    "ad-buy-form/main/dataset.jsonl.gz",
+                    "ad-buy-form/main/meta.json",
+                    "ad-buy-form/few_shot-splits/split.json",
+                ],
+                "tier1": {"n": 5},
+                "pinned_files": {
+                    "ad-buy-form/main/dataset.jsonl.gz": {"sha256": compute_file_sha256(ad_gz_p)},
+                    "ad-buy-form/main/meta.json": {"sha256": compute_file_sha256(ad_meta_p)},
+                    "ad-buy-form/few_shot-splits/split.json": {"sha256": compute_file_sha256(ad_split_p)},
+                },
+            },
+            "vrdu_registration": {
+                "source": "github",
+                "repo_id": "google-research-datasets/vrdu",
+                "revision": "0" * 40,
+                "gated": False,
+                "subdir": "registration-form",
+                "split_file": "registration-form/few_shot-splits/split.json",
+                "files": [
+                    "registration-form/main/dataset.jsonl.gz",
+                    "registration-form/main/meta.json",
+                    "registration-form/few_shot-splits/split.json",
+                ],
+                "tier1": {"n": 5},
+                "pinned_files": {
+                    "registration-form/main/dataset.jsonl.gz": {"sha256": compute_file_sha256(reg_gz_p)},
+                    "registration-form/main/meta.json": {"sha256": compute_file_sha256(reg_meta_p)},
+                    "registration-form/few_shot-splits/split.json": {"sha256": compute_file_sha256(reg_split_p)},
+                },
+            },
+        }
+    }
+
+    ad_items = load_vrdu("vrdu_ad_buy", tier="tier1", lock=fake_lock, cache_dir=cache_root, local_files_only=True)
+    assert len(ad_items) == 1 and ad_items[0]["page_index"] == 0
+    assert validate_against_jsonschema(ad_items[0]["gt_parse"], build_vrdu_schema(ad_meta)) is True
+
+    pred_ad = json.dumps(
+        {
+            "advertiser": "Acme Civic PAC",
+            "gross_amount": "1250",
+            "flight_from": "2020-03-29",
+            "line_items": [{"channel": "KMSP", "sub_amount": "$500.00"}],
+        }
+    )
+    ev_ad = evaluate_vrdu(ad_items, [pred_ad])
+    assert ev_ad["grounded_field_f1"] == pytest.approx(1.0)
+    assert ev_ad["anls"] == pytest.approx(1.0)
+
+    reg_items = load_vrdu("vrdu_registration", tier="tier1", lock=fake_lock, cache_dir=cache_root, local_files_only=True)
+    assert len(reg_items) == 1 and reg_items[0]["page_index"] == 1
+    assert normalize_vrdu_value("1962-03-23", "DateMatch") == normalize_vrdu_value("23rd day of March -1962", "DateMatch")
+    pred_reg = json.dumps({"file_date": "1962-03-23", "registrant_name": "Civic Group LLP", "registration_num": "3712"})
+    ev_reg = evaluate_vrdu(reg_items, [pred_reg])
+    assert ev_reg["grounded_field_f1"] == pytest.approx(1.0)
+    assert normalize_vrdu_parse({"gross_amount": "($42.5)"}, ad_meta)["gross_amount"] == "-42.50"
+
+
+def test_doclaynet_gov_and_puredocbench_legal_gov_loaders(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    dl_dir = cache_root / "doclaynet_gov" / "data"
+    dl_dir.mkdir(parents=True)
+    dl_pq = dl_dir / "test-00003-of-00006.parquet"
+
+    dl_tbl = pa.table(
+        {
+            "image": [
+                {"bytes": b"\x89PNG\r\n\x1a\n", "path": "0.png"},
+                {"bytes": b"\x89PNG\r\n\x1a\n", "path": "1.png"},
+                {"bytes": b"\x89PNG\r\n\x1a\n", "path": "2.png"},
+            ],
+            "pdf": [b"%PDF-1.4\n", b"%PDF-1.4\n", b"%PDF-1.4\n"],
+            "category_id": [[10], [6, 8, 10, 9, 5], [10]],
+            "bboxes": [[[0.0, 0.0, 1.0, 1.0]], [[0, 0, 1, 1], [0, 1, 1, 2], [0, 2, 1, 3], [0, 3, 1, 4], [0, 4, 1, 5]], [[0, 0, 1, 1]]],
+            "pdf_cells": [
+                [[{"text": "第六十八条 测试中文法规文档内容用于过滤验证"}]],
+                [
+                    [{"text": "Federal Register Vol 90"}],
+                    [{"text": "Airspace Amendment"}],
+                    [{"text": "The FAA amends 14 CFR part 71 for terminal operations."}],
+                    [{"text": "Airport Runway 09"}],
+                    [{"text": "Page 42"}],
+                ],
+                [[{"text": "Annual corporate earnings report"}]],
+            ],
+            "metadata": [
+                {"doc_category": "laws_and_regulations", "collection": "chinese_laws", "image_id": 10, "original_filename": "zh.pdf", "page_no": 1},
+                {"doc_category": "laws_and_regulations", "collection": "faa_regulations", "image_id": 11, "original_filename": "faa.pdf", "page_no": 2},
+                {"doc_category": "financial_reports", "collection": "fin", "image_id": 12, "original_filename": "fin.pdf", "page_no": 1},
+            ],
+        }
+    )
+    pq.write_table(dl_tbl, dl_pq)
+
+    pdb_dir = cache_root / "puredocbench_legal_gov"
+    (pdb_dir / "gt").mkdir(parents=True)
+    img_root = pdb_dir / "images" / "03_legal_gov" / "01_gov_document"
+    img_root.mkdir(parents=True)
+    (img_root / "eo_01.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    tar_p = pdb_dir / "gt" / "puredocbench_gt_latest.tar.gz"
+    en_json = json.dumps(
+        {
+            "page_info": {"page_no": 0, "image_path": "03_legal_gov/01_gov_document/eo_01.png", "page_attribute": {"language": "english", "data_source": "synthetic_legal"}},
+            "layout_dets": [
+                {"category_type": "title", "order": 1, "anno_id": 1, "ignore": False, "text": "Executive Order 14110"},
+                {"category_type": "text_block", "order": 2, "anno_id": 2, "ignore": False, "text": "Sec. 1. Policy and Purpose."},
+                {"category_type": "table", "order": 3, "anno_id": 3, "ignore": False, "html": "<table><tr><th>Agency</th><th>Days</th></tr><tr><td>NIST</td><td>90</td></tr></table>"},
+            ],
+        }
+    ).encode("utf-8")
+    zh_json = json.dumps(
+        {
+            "page_info": {"page_no": 0, "image_path": "03_legal_gov/01_gov_document/zh_01.png", "page_attribute": {"language": "simplified_chinese", "data_source": "synthetic_legal"}},
+            "layout_dets": [{"category_type": "text_block", "order": 1, "anno_id": 1, "ignore": False, "text": "国务院文件"}],
+        }
+    ).encode("utf-8")
+    with tarfile.open(tar_p, "w:gz") as tf:
+        for rel, payload in [
+            ("gt/03_legal_gov/01_gov_document/eo_01.json", en_json),
+            ("gt/03_legal_gov/01_gov_document/zh_01.json", zh_json),
+        ]:
+            ti = tarfile.TarInfo(rel)
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+
+    csv_p = pdb_dir / "release_manifest_candidate_1475.csv"
+    with csv_p.open("w", encoding="utf-8", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["page_id", "category", "subcategory", "gt_rel", "clean_rel", "digital_rel", "real_rel"])
+        w.writerow(
+            [
+                "03_legal_gov/01_gov_document/eo_01",
+                "03_legal_gov",
+                "01_gov_document",
+                "03_legal_gov/01_gov_document/eo_01.json",
+                "03_legal_gov/01_gov_document/eo_01.png",
+                "03_legal_gov/01_gov_document/eo_01.png",
+                "03_legal_gov/01_gov_document/eo_01.png",
+            ]
+        )
+
+    fake_lock = {
+        "datasets": {
+            "doclaynet_gov": {
+                "repo_id": "docling-project/DocLayNet-v1.2",
+                "revision": "e" * 40,
+                "gated": False,
+                "doc_categories": ["laws_and_regulations", "government_tenders", "patents"],
+                "english_only": True,
+                "files": ["data/test-00003-of-00006.parquet"],
+                "tier2": {"files": ["data/test-00003-of-00006.parquet"], "n": 10},
+                "pinned_files": {"data/test-00003-of-00006.parquet": {"sha256": compute_file_sha256(dl_pq)}},
+            },
+            "puredocbench_legal_gov": {
+                "repo_id": "zhihengli-casia/puredocbench",
+                "revision": "f" * 40,
+                "gated": False,
+                "category_filter": "03_legal_gov",
+                "english_only": True,
+                "files": ["gt/puredocbench_gt_latest.tar.gz", "release_manifest_candidate_1475.csv"],
+                "tier1": {"n": 0},
+                "pinned_files": {
+                    "gt/puredocbench_gt_latest.tar.gz": {"sha256": compute_file_sha256(tar_p)},
+                    "release_manifest_candidate_1475.csv": {"sha256": compute_file_sha256(csv_p)},
+                },
+            },
+        }
+    }
+
+    dl_items = load_doclaynet_gov(tier="tier2", lock=fake_lock, cache_dir=cache_root, local_files_only=True)
+    assert len(dl_items) == 1 and dl_items[0]["collection"] == "faa_regulations"
+    ev_dl = evaluate_doclaynet_gov(
+        dl_items,
+        ["# Airspace Amendment\n\nThe FAA amends 14 CFR part 71 for terminal operations.\n\nAirport Runway 09\n"],
+        allow_html_tables=False,
+    )
+    assert ev_dl["doclaynet_overall"] > 0.95
+    assert ev_dl["header_footer_leak_rate"] == pytest.approx(0.0)
+
+    pdb_items = load_puredocbench_legal_gov(track="clean", lock=fake_lock, cache_dir=cache_root, local_files_only=True)
+    assert len(pdb_items) == 1 and pdb_items[0]["image_path"] is not None
+    ev_pdb = evaluate_puredocbench(
+        pdb_items,
+        ["# Executive Order 14110\n\nSec. 1. Policy and Purpose.\n\n| Agency | Days |\n| --- | ---: |\n| NIST | 90 |\n"],
+        allow_html_tables=False,
+    )
+    assert ev_pdb["puredocbench_overall"] > 0.95
+    assert ev_pdb["table_teds"] == pytest.approx(1.0)
+
+
+def test_gov_corpora_xml_gpotable_slicing_and_manifest(tmp_path: Path) -> None:
+    import xml.etree.ElementTree as ET
+
+    fr_xml = """<RULE><PREAMB><AGENCY>FEDERAL AVIATION ADMINISTRATION</AGENCY>
+    <CFR>14 CFR Part 71</CFR><SUBJECT>Airspace Rule</SUBJECT></PREAMB>
+    <SUPLINF><P>This rule amends Class E airspace.</P>
+    <GPOTABLE COLS="3"><BOXHD><CHED H="1">State</CHED><CHED H="1">Effective</CHED><CHED H="1">Code</CHED></BOXHD>
+    <ROW EXPSTB="02"><ENT I="21">Midwest Region</ENT></ROW>
+    <ROW><ENT>Missouri</ENT><ENT>2026-01-15</ENT><ENT>MO-01</ENT></ROW></GPOTABLE>
+    <P>Second page trailing paragraph not on page zero.</P></SUPLINF></RULE>"""
+
+    fr_gold = parse_govinfo_xml_gold(fr_xml)
+    assert len(fr_gold["tables"]) == 1
+    assert 'colspan="3"' in fr_gold["tables"][0]["html"] and "Missouri" in fr_gold["tables"][0]["html"]
+    assert any("Airspace Rule" in b["text"] for b in fr_gold["text_blocks"])
+
+    gt_root = ET.fromstring(fr_xml).find(".//GPOTABLE")
+    assert gt_root is not None
+    assert "<th>State</th>" in gpotable_to_html(gt_root)
+
+    sliced = slice_gold_to_page_prefix(
+        fr_gold,
+        "FEDERAL AVIATION ADMINISTRATION 14 CFR Part 71 Airspace Rule This rule amends Class E airspace. Midwest Region Missouri 2026-01-15 MO-01",
+        n_pdf_pages=2,
+    )
+    assert len(sliced["tables"]) == 1
+    assert all("Second page trailing" not in b["text"] for b in sliced["text_blocks"])
+
+    uslm_xml = """<pLaw xmlns="http://schemas.gpo.gov/xml/uslm"><meta><docNumber>35</docNumber></meta>
+    <main><section><heading>Short Title</heading><content><p>Clean Fiscal Continuity Act.</p></content></section></main></pLaw>"""
+    plaw_gold = parse_govinfo_xml_gold(uslm_xml)
+    assert [b["text"] for b in plaw_gold["text_blocks"]] == ["Short Title", "Clean Fiscal Continuity Act."]
+
+    cache_root = tmp_path / "cache"
+    gov_dir = cache_root / "us_gov_ocr" / "files" / "fr"
+    gov_dir.mkdir(parents=True)
+    pdf_p = gov_dir / "fr1.pdf"
+    pdf_p.write_bytes(b"%PDF-1.4\n")
+    xml_p = gov_dir / "fr1.xml"
+    xml_p.write_text(fr_xml, encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "items": [
+            {
+                "id": "fr:2026-0001",
+                "branch": "executive",
+                "source": "govinfo_fr",
+                "pdf_rel": "files/fr/fr1.pdf",
+                "pdf_sha256": compute_file_sha256(pdf_p),
+                "gold_rel": "files/fr/fr1.xml",
+                "gold_sha256": compute_file_sha256(xml_p),
+                "page_index": 0,
+                **sliced,
+            },
+            {
+                "id": "plaw:118-35",
+                "branch": "legislative",
+                "source": "govinfo_plaw",
+                "pdf_rel": "files/fr/fr1.pdf",
+                "pdf_sha256": compute_file_sha256(pdf_p),
+                "gold_rel": "files/fr/fr1.xml",
+                "gold_sha256": compute_file_sha256(xml_p),
+                "page_index": 0,
+                **plaw_gold,
+            },
+        ],
+    }
+    (cache_root / "us_gov_ocr" / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    gov_items = load_us_gov_ocr(cache_dir=cache_root, verify_checksums=True)
+    assert len(gov_items) == 2
+
+    pred_fr = (
+        "FEDERAL AVIATION ADMINISTRATION\n\n14 CFR Part 71\n\n# Airspace Rule\n\n"
+        "This rule amends Class E airspace.\n\n"
+        "<table><tr><th>State</th><th>Effective</th><th>Code</th></tr>"
+        "<tr><td colspan=\"3\">Midwest Region</td></tr>"
+        "<tr><td>Missouri</td><td>2026-01-15</td><td>MO-01</td></tr></table>\n"
+    )
+    pred_pl = "# Short Title\n\nClean Fiscal Continuity Act.\n"
+    preds_by_id = {"fr:2026-0001": pred_fr, "plaw:118-35": pred_pl}
+    ev_gov = evaluate_us_gov_ocr(gov_items, [preds_by_id[it["id"]] for it in gov_items], allow_html_tables=True)
+    assert ev_gov["us_gov_overall"] > 0.95
+    assert ev_gov["per_branch"]["executive"]["score"] > 0.95
+    assert ev_gov["per_branch"]["legislative"]["score"] > 0.95
+
+    btp_pq = tmp_path / "btp.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "AssetId": ["a1", "a2"],
+                "Campaign": ["Presidential Papers", "Short"],
+                "Transcription": ["Dear Sir, enclosed please find the official dispatch dated April 1865.", "Too short"],
+                "DownloadURL": ["https://example.org/a1.jpg", "https://example.org/a2.jpg"],
+            }
+        ),
+        btp_pq,
+    )
+    btp_items = load_loc_btp_items(btp_pq, download_images=False)
+    assert len(btp_items) == 1 and btp_items[0]["source"] == "loc_btp"
+
+    # Exercise `_stage_fr_items` GPOTABLE prioritization + `loc_btp_path` manifest staging & SHA-256 verification.
+    from fast_shared.outcome_eval import gov_corpora as gc
+
+    fr_notable_xml = "<RULE><PREAMB><SUBJECT>General Notice</SUBJECT></PREAMB><SUPLINF><P>Plain notice text.</P></SUPLINF></RULE>"
+    fake_fr_tbl = {
+        "results": [
+            {
+                "document_number": "2026-9001",
+                "title": "Table Rule",
+                "page_length": 2,
+                "pdf_url": "https://example.org/2026-9001.pdf",
+                "full_text_xml_url": "https://example.org/2026-9001.xml",
+            }
+        ]
+    }
+    fake_fr_gen = {
+        "results": [
+            {
+                "document_number": "2026-9002",
+                "title": "Plain Rule",
+                "page_length": 1,
+                "pdf_url": "https://example.org/2026-9002.pdf",
+                "full_text_xml_url": "https://example.org/2026-9002.xml",
+            }
+        ]
+    }
+
+    old_http = gc._http_get_bytes
+    old_extract = gc.extract_born_digital_pdf_page_blocks
+    try:
+        def _fake_http(url: str, *, timeout: int = 30) -> bytes:
+            if "term]=table" in url:
+                return json.dumps(fake_fr_tbl).encode("utf-8")
+            if "documents.json" in url:
+                return json.dumps(fake_fr_gen).encode("utf-8")
+            if url.endswith("2026-9001.xml"):
+                return fr_xml.encode("utf-8")
+            if url.endswith("2026-9002.xml"):
+                return fr_notable_xml.encode("utf-8")
+            if url.endswith(".pdf"):
+                return b"%PDF-1.4\n"
+            if url.endswith("a1.jpg"):
+                return b"\xff\xd8\xff\xe0fake-jpeg"
+            raise AssertionError(f"Unexpected URL {url}")
+
+        def _fake_extract(pdf_path: str | Path, *, page_index: int = 0) -> tuple[int, str, list[dict[str, Any]]]:
+            if page_index == 0:
+                return 2, "FEDERAL AVIATION ADMINISTRATION 14 CFR Part 71 Airspace Rule First page without table.", []
+            return (
+                2,
+                "Midwest Region Missouri 2026-01-15 MO-01 State Effective Code",
+                [{"category_type": "text_block", "order": 0, "text": "Missouri"}],
+            )
+
+        gc._http_get_bytes = _fake_http  # type: ignore[assignment]
+        gc.extract_born_digital_pdf_page_blocks = _fake_extract  # type: ignore[assignment]
+        staged = gc.stage_us_gov_ocr(
+            branches=("executive",),
+            per_source=1,
+            year=2025,
+            cache_dir=cache_root / "staged_test",
+            loc_btp_path=btp_pq,
+        )
+        assert staged["n_items"] == 2
+        assert staged["by_source"] == {"govinfo_fr": 1, "loc_btp": 1}
+        loaded_staged = load_us_gov_ocr(cache_dir=cache_root / "staged_test", verify_checksums=True)
+        assert len(loaded_staged) == 2
+        fr_loaded = next(it for it in loaded_staged if it["source"] == "govinfo_fr")
+        assert fr_loaded["page_index"] == 1
+        assert len(fr_loaded["tables"]) == 1
+        btp_loaded = next(it for it in loaded_staged if it["source"] == "loc_btp")
+        assert btp_loaded["image_path"] is not None and Path(btp_loaded["image_path"]).is_file()
+    finally:
+        gc._http_get_bytes = old_http  # type: ignore[assignment]
+        gc.extract_born_digital_pdf_page_blocks = old_extract  # type: ignore[assignment]
+
 
 
 

@@ -57,6 +57,7 @@ from fast_shared.outcome_eval import (
     evaluate_bfcl_v3,
     evaluate_clinc_two_stage,
     evaluate_cord_v2,
+    evaluate_doclaynet_gov,
     evaluate_fintabnet_otsl,
     evaluate_instruction_following,
     evaluate_jsonschemabench_compiler,
@@ -70,15 +71,19 @@ from fast_shared.outcome_eval import (
     evaluate_olmocr_bench,
     evaluate_omnidocbench,
     evaluate_promotion_gates,
+    evaluate_puredocbench,
     evaluate_ragtruth_noul,
     evaluate_retrieval_rankings,
     retrieval_coverage_errors,
     evaluate_reward_bench_2,
     evaluate_structured_extraction,
+    evaluate_us_gov_ocr,
+    evaluate_vrdu,
     load_banking77,
     load_bfcl_v3,
     load_clinc_oos,
     load_cord_v2,
+    load_doclaynet_gov,
     load_fintabnet_otsl,
     load_ifbench_test,
     load_ifeval,
@@ -93,11 +98,15 @@ from fast_shared.outcome_eval import (
     load_nanobeir_subset,
     load_olmocr_bench,
     load_omnidocbench_en,
+    load_puredocbench_legal_gov,
     load_ragtruth,
     load_reward_bench_2,
+    load_us_gov_ocr,
+    load_vrdu,
     partition_banking77_clusters,
     resolve_cache_dir,
     stage_tier_datasets,
+    stage_us_gov_ocr,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -522,6 +531,8 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--strict-markdown-grammar", action="store_true", default=False)
     p.add_argument("--ocr-max-tokens", type=int, default=4096)
     p.add_argument("--ocr-vocab-size", type=int, default=None)
+    p.add_argument("--puredocbench-track", choices=("clean", "digital", "real"), default="clean")
+    p.add_argument("--puredocbench-images-root", default=None)
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -2008,15 +2019,33 @@ def _run_llm_worker(
 # ---------------------------------------------------------------------------
 
 _CAT5_PACKAGES: frozenset[str] = frozenset(OCR_FAMILY_PACKAGES)
-_CAT5_ALL_SUITES: tuple[str, ...] = ("olmocr_bench", "fintabnet_otsl", "omnidocbench_en", "cord_v2")
+_CAT5_ALL_SUITES: tuple[str, ...] = (
+    "olmocr_bench",
+    "fintabnet_otsl",
+    "omnidocbench_en",
+    "cord_v2",
+    "vrdu_ad_buy",
+    "vrdu_registration",
+    "doclaynet_gov",
+    "puredocbench_legal_gov",
+    "us_gov_ocr",
+)
+_CAT5_PDF_NATIVE_SUITES: frozenset[str] = frozenset({"olmocr_bench", "doclaynet_gov", "us_gov_ocr"})
 
 
 def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
     raw = str(getattr(extra, "ocr_suites", "default") or "default").strip().lower()
+    ocr_model_low = str(getattr(extra, "ocr_model", None) or "").strip().lower()
     if raw == "all":
         requested = list(_CAT5_ALL_SUITES)
+    elif raw == "gov":
+        if pkg_name == "public-nuextract3-mlx-vlm" or "nuextract" in ocr_model_low:
+            requested = ["vrdu_ad_buy", "vrdu_registration", "doclaynet_gov", "us_gov_ocr"]
+        else:
+            requested = ["doclaynet_gov", "us_gov_ocr"]
+    elif raw == "gov-all":
+        requested = ["vrdu_ad_buy", "vrdu_registration", "doclaynet_gov", "us_gov_ocr"]
     elif raw == "default":
-        ocr_model_low = str(getattr(extra, "ocr_model", None) or "").strip().lower()
         if pkg_name == "public-pypdfium2":
             requested = ["olmocr_bench"]
         elif pkg_name == "public-nuextract3-mlx-vlm" or "nuextract" in ocr_model_low:
@@ -2024,7 +2053,7 @@ def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
         else:
             # Default Markdown/Table/Formula OCR families (`OvisOCR2`, `GLM-OCR`, `LightOnOCR-2`,
             # `DeepSeek-OCR-2`, `PaddleOCR-VL`, `Nemotron-Parse`, `Apple Vision`, `RapidOCR`,
-            # `Tesseract`, `Docling`, `Marker`). Pass `--ocr-suites all` or `cord_v2` for JSON KIE.
+            # `Tesseract`, `Docling`, `Marker`). Pass `--ocr-suites all|gov|gov-all` for JSON KIE / Gov suites.
             requested = ["olmocr_bench", "fintabnet_otsl", "omnidocbench_en"]
     else:
         requested = [tok.strip() for tok in raw.split(",") if tok.strip()]
@@ -2032,22 +2061,27 @@ def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
             if tok not in _CAT5_ALL_SUITES:
                 raise ValueError(f"Unknown --ocr-suites entry {tok!r}; expected subset of {_CAT5_ALL_SUITES}")
     if pkg_name == "public-pypdfium2":
-        requested = [s for s in requested if s == "olmocr_bench"]
+        requested = [s for s in requested if s in _CAT5_PDF_NATIVE_SUITES]
     return requested
 
 
-def _render_pdf_first_page_pil(pdf_path: str | Path, *, dpi: int) -> Any:
+def _render_pdf_page_pil(pdf_source: str | Path | bytes, *, dpi: int, page_index: int = 0) -> Any:
     import pypdfium2 as pdfium
 
-    doc = pdfium.PdfDocument(str(pdf_path))
+    doc = pdfium.PdfDocument(pdf_source if isinstance(pdf_source, (bytes, bytearray)) else str(pdf_source))
     try:
-        page = doc[0]
+        idx = max(0, min(int(page_index), len(doc) - 1))
+        page = doc[idx]
         bitmap = page.render(scale=float(dpi) / 72.0)
         pil = bitmap.to_pil().convert("RGB")
         page.close()
         return pil
     finally:
         doc.close()
+
+
+def _render_pdf_first_page_pil(pdf_path: str | Path, *, dpi: int) -> Any:
+    return _render_pdf_page_pil(pdf_path, dpi=dpi, page_index=0)
 
 
 def _bytes_to_pil(image_bytes: bytes) -> Any:
@@ -2064,6 +2098,15 @@ def _build_cord_v2_prompt(schema: Mapping[str, Any]) -> str:
         "Extract the receipt fields from this image as a single valid JSON object conforming strictly to "
         f"the following JSON Schema. Omit or set null for fields not visible on the receipt. Output ONLY JSON.\n"
         f"Schema: {compact}"
+    )
+
+
+def _build_vrdu_prompt(schema: Mapping[str, Any], corpus_label: str) -> str:
+    compact = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+    return (
+        f"Extract the {corpus_label} fields visible on this document page as a single valid JSON object "
+        f"conforming strictly to the following JSON Schema. Omit or set null for fields not visible on this page. "
+        f"Output ONLY JSON.\nSchema: {compact}"
     )
 
 
@@ -2204,11 +2247,14 @@ def _run_cat5_worker(
     suites = _resolve_cat5_suites(pkg_name, extra)
     if not suites:
         return []
+    raw_ocr_suites = str(getattr(extra, "ocr_suites", "default") or "default").strip().lower()
+    optional_on_all = raw_ocr_suites == "all"
 
     olm_cap = 4 if smoke else max_items
     ftn_cap = 2 if smoke else max_items
     od_cap = 2 if smoke else max_items
     cord_cap = 2 if smoke else max_items
+    gov_cap = 2 if smoke else max_items
 
     loaded: dict[str, list[dict[str, Any]]] = {}
     if "olmocr_bench" in suites:
@@ -2245,6 +2291,67 @@ def _run_cat5_worker(
             cache_dir=cache_dir,
             local_files_only=local_files_only,
         )
+    for vrdu_key in ("vrdu_ad_buy", "vrdu_registration"):
+        if vrdu_key in suites:
+            loaded[vrdu_key] = load_vrdu(
+                vrdu_key,
+                tier=tier,
+                max_items=gov_cap,
+                download_pdfs=True,
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+    if "doclaynet_gov" in suites:
+        try:
+            dl_items = load_doclaynet_gov(
+                tier="tier2" if tier == "tier1" else tier,
+                max_items=gov_cap,
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=True if (optional_on_all and tier == "tier1") else local_files_only,
+            )
+            if dl_items:
+                loaded["doclaynet_gov"] = dl_items
+        except FileNotFoundError as exc:
+            if not (optional_on_all and tier == "tier1"):
+                raise
+            print(f"[fast-silicon] skipping optional doclaynet_gov on tier1: {exc}", file=sys.stderr)
+    if "puredocbench_legal_gov" in suites:
+        try:
+            pdb_items = load_puredocbench_legal_gov(
+                track=str(getattr(extra, "puredocbench_track", "clean") or "clean"),
+                max_items=gov_cap,
+                images_root=getattr(extra, "puredocbench_images_root", None),
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            ready_pdb = [it for it in pdb_items if it.get("image_path") and Path(str(it["image_path"])).is_file()]
+            if not ready_pdb:
+                raise FileNotFoundError(
+                    "PureDocBench legal_gov page images are missing; extract pdb_full.tar and pass "
+                    "`--puredocbench-images-root <dir>` or place images under `cache_dir/puredocbench_legal_gov/images`."
+                )
+            loaded["puredocbench_legal_gov"] = ready_pdb
+        except FileNotFoundError as exc:
+            if not optional_on_all:
+                raise
+            print(f"[fast-silicon] skipping optional puredocbench_legal_gov: {exc}", file=sys.stderr)
+    if "us_gov_ocr" in suites:
+        try:
+            gov_items = load_us_gov_ocr(
+                max_items=gov_cap,
+                cache_dir=cache_dir,
+            )
+            if gov_items:
+                loaded["us_gov_ocr"] = gov_items
+        except FileNotFoundError as exc:
+            if not optional_on_all:
+                raise
+            print(f"[fast-silicon] skipping optional us_gov_ocr: {exc}", file=sys.stderr)
+    if not loaded:
+        return []
 
     fast_eng: Any = None
     pub_ad: Any = None
@@ -2342,24 +2449,29 @@ def _run_cat5_worker(
             task_kind=task_kind,
         )
 
-    def _run_pdf_page_ocr(pdf_path: str | Path, *, task_kind: str = "page") -> tuple[str, str, dict[str, Any]]:
+    def _run_pdf_page_ocr(
+        pdf_path: str | Path,
+        *,
+        page_index: int = 0,
+        task_kind: str = "page",
+    ) -> tuple[str, str, dict[str, Any]]:
         if fast_eng is not None:
             use_native = (not bool(extra.ocr_render_only)) and (eff_backend == "auto")
             if use_native:
                 outs = fast_eng.ocr_pdf(
                     pdf_path,
                     dpi=int(extra.ocr_dpi),
-                    page_indices=[0],
+                    page_indices=[int(page_index)],
                     use_native_text=True,
                 )
                 res = outs[0]
                 return res.text, res.finish_reason, _fast_result_meta(res)
-            pil_img = _render_pdf_first_page_pil(pdf_path, dpi=int(extra.ocr_dpi))
+            pil_img = _render_pdf_page_pil(pdf_path, dpi=int(extra.ocr_dpi), page_index=page_index)
             return _run_image_ocr(pil_img, task_kind=task_kind)
         assert pub_ad is not None
         if pub_ad.ocr_pdf_page_fn is not None and (not bool(extra.ocr_render_only) or not pub_ad.supports_images):
-            return pub_ad.ocr_pdf_page_fn(pdf_path, page_index=0)
-        pil_img = _render_pdf_first_page_pil(pdf_path, dpi=int(extra.ocr_dpi))
+            return pub_ad.ocr_pdf_page_fn(pdf_path, page_index=int(page_index))
+        pil_img = _render_pdf_page_pil(pdf_path, dpi=int(extra.ocr_dpi), page_index=page_index)
         return pub_ad.ocr_image_fn(pil_img, task_kind=task_kind)
 
     records: list[dict[str, Any]] = []
@@ -2376,7 +2488,20 @@ def _run_cat5_worker(
                 _ = fast_eng.ocr_image(tiny)
             else:
                 _ = fast_eng._get_vision_ocr().recognize_image(tiny, output_format="raw")
-                if any(s in suites for s in ("fintabnet_otsl", "omnidocbench_en", "cord_v2", "olmocr_bench")):
+                if any(
+                    s in suites
+                    for s in (
+                        "fintabnet_otsl",
+                        "omnidocbench_en",
+                        "cord_v2",
+                        "olmocr_bench",
+                        "vrdu_ad_buy",
+                        "vrdu_registration",
+                        "doclaynet_gov",
+                        "puredocbench_legal_gov",
+                        "us_gov_ocr",
+                    )
+                ):
                     _ = fast_eng._get_ovis_engine().ocr_image(
                         tiny, output_format="raw", crop_margins=False, auto_orient=False, speculative="off", max_tokens=2
                     )
@@ -2640,6 +2765,294 @@ def _run_cat5_worker(
                                 "valid_json_rate": ev["valid_json_rate"],
                                 "valid_schema_rate": ev["valid_schema_rate"],
                             }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name in ("vrdu_ad_buy", "vrdu_registration"):
+                corpus_label = "FCC political ad-buy invoice" if suite_name == "vrdu_ad_buy" else "DOJ FARA registration form"
+                bench_label = f"VRDU-AdBuy({len(items)})" if suite_name == "vrdu_ad_buy" else f"VRDU-Registration({len(items)})"
+                pils = [
+                    _render_pdf_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi), page_index=int(it.get("page_index", 0)))
+                    for it in items
+                ]
+                prompts = [_build_vrdu_prompt(it["schema"], corpus_label) for it in items]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for pil_img, pr, it in zip(pils, prompts, items):
+                    tx, fr, md = _run_image_ocr(
+                        pil_img,
+                        prompt=pr,
+                        schema=it["schema"],
+                        max_tokens_override=min(1536, int(extra.ocr_max_tokens)),
+                        task_kind="page",
+                    )
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_vrdu(items, preds, finish_reasons=reasons)
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "llguidance": bool(pkg_name == "fast-ocr" and eff_backend != "apple-vision"),
+                    "grounded_field_f1": ev["grounded_field_f1"],
+                    "anls": ev["anls"],
+                    "valid_json_rate": ev["valid_json_rate"],
+                    "valid_schema_rate": ev["valid_schema_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=bench_label,
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            suite_name: {
+                                "grounded_field_f1": ev["grounded_field_f1"],
+                                "anls": ev["anls"],
+                                "valid_json_rate": ev["valid_json_rate"],
+                                "valid_schema_rate": ev["valid_schema_rate"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "doclaynet_gov":
+                import tempfile
+
+                pdf_only_ad = pub_ad is not None and not pub_ad.supports_images
+                suite_items = [it for it in items if it.get("pdf_bytes")] if pdf_only_ad else list(items)
+                if not suite_items:
+                    continue
+                use_native_pdf = pdf_only_ad or (
+                    fast_eng is not None and (not bool(extra.ocr_render_only)) and (eff_backend == "auto")
+                )
+                pre_imgs = None
+                if not use_native_pdf:
+                    pre_imgs = [
+                        _render_pdf_page_pil(it["pdf_bytes"], dpi=int(extra.ocr_dpi), page_index=0)
+                        if (bool(extra.ocr_render_only) and it.get("pdf_bytes"))
+                        else _bytes_to_pil(it["image_bytes"])
+                        for it in suite_items
+                    ]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                with tempfile.TemporaryDirectory(prefix="doclaynet_gov_") as tmp_dir:
+                    for idx_p, it in enumerate(suite_items):
+                        if pre_imgs is not None:
+                            tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
+                        elif it.get("pdf_bytes"):
+                            tmp_pdf = Path(tmp_dir) / f"page_{idx_p}.pdf"
+                            tmp_pdf.write_bytes(it["pdf_bytes"])
+                            tx, fr, md = _run_pdf_page_ocr(tmp_pdf, page_index=0, task_kind="page")
+                        else:
+                            tx, fr, md = _run_image_ocr(_bytes_to_pil(it["image_bytes"]), task_kind="page")
+                        preds.append(tx)
+                        reasons.append(fr)
+                        metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_doclaynet_gov(
+                    suite_items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(suite_items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "render_only": bool(extra.ocr_render_only),
+                    "doclaynet_overall": ev["doclaynet_overall"],
+                    "text_edit_distance": ev["text_edit_distance"],
+                    "reading_order_sim": ev["reading_order_sim"],
+                    "header_footer_leak_rate": ev["header_footer_leak_rate"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"DocLayNet-Gov({len(suite_items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "doclaynet_gov": {
+                                "doclaynet_overall": ev["doclaynet_overall"],
+                                "text_similarity": ev["text_similarity"],
+                                "reading_order_sim": ev["reading_order_sim"],
+                                "header_footer_leak_rate": ev["header_footer_leak_rate"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "puredocbench_legal_gov":
+                pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for pil_img in pils:
+                    tx, fr, md = _run_image_ocr(pil_img, task_kind="page")
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_puredocbench(
+                    items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "puredocbench_track": str(getattr(extra, "puredocbench_track", "clean") or "clean"),
+                    "puredocbench_overall": ev["puredocbench_overall"],
+                    "text_edit_distance": ev["text_edit_distance"],
+                    "reading_order_sim": ev["reading_order_sim"],
+                    "table_teds": ev["table_teds"],
+                    "formula_norm_sim": ev["formula_norm_sim"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"PureDocBench-LegalGov({len(items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "puredocbench_legal_gov": {
+                                "puredocbench_overall": ev["puredocbench_overall"],
+                                "text_similarity": ev["text_similarity"],
+                                "reading_order_sim": ev["reading_order_sim"],
+                                "table_teds": ev["table_teds"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "us_gov_ocr":
+                suite_items = (
+                    [it for it in items if it.get("pdf_path")]
+                    if (pub_ad is not None and not pub_ad.supports_images)
+                    else list(items)
+                )
+                if not suite_items:
+                    continue
+                pre_imgs = None
+                if bool(extra.ocr_render_only) and (pub_ad is None or pub_ad.supports_images):
+                    pre_imgs = [
+                        _render_pdf_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi), page_index=int(it.get("page_index", 0)))
+                        if it.get("pdf_path")
+                        else Image.open(it["image_path"]).convert("RGB")
+                        for it in suite_items
+                    ]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for idx_p, it in enumerate(suite_items):
+                    if pre_imgs is not None:
+                        tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
+                    elif it.get("pdf_path"):
+                        tx, fr, md = _run_pdf_page_ocr(
+                            it["pdf_path"],
+                            page_index=int(it.get("page_index", 0)),
+                            task_kind="page",
+                        )
+                    else:
+                        tx, fr, md = _run_image_ocr(Image.open(it["image_path"]).convert("RGB"), task_kind="page")
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_us_gov_ocr(
+                    suite_items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(suite_items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "render_only": bool(extra.ocr_render_only),
+                    "us_gov_overall": ev["us_gov_overall"],
+                    "text_edit_distance": ev["text_edit_distance"],
+                    "reading_order_sim": ev["reading_order_sim"],
+                    "table_teds": ev["table_teds"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"US-Gov-OCR({len(suite_items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "by_branch": ev["per_branch"],
+                            "by_source": ev["per_source"],
                         },
                         host_mem_gb=host_mem_gb,
                     )
@@ -3214,6 +3627,19 @@ def _cmd_setup_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stage_gov(args: argparse.Namespace) -> int:
+    branches = tuple(x.strip() for x in str(args.branches).split(",") if x.strip())
+    report = stage_us_gov_ocr(
+        branches=branches,
+        per_source=int(args.per_source),
+        year=int(args.year),
+        cache_dir=args.cache_dir,
+        loc_btp_path=getattr(args, "loc_btp_path", None),
+    )
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def _compare_record_key(rec: Mapping[str, Any]) -> tuple[Any, ...]:
     """Disambiguating comparison key preventing Cat 2 (Laya/Kev) and Cat 4 (llg_on/llg_off) collisions."""
     diag = rec.get("diagnostics") or {}
@@ -3706,6 +4132,14 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--lockfile", default=None)
     sd.add_argument("--no-verify-checksums", action="store_true")
     sd.set_defaults(func=_cmd_setup_data)
+
+    sg = sub.add_parser("stage-gov", help="Stage paired Public-Domain U.S. Gov PDF<->XML benchmarks (0 GPU work)")
+    sg.add_argument("--branches", default="legislative,executive,judicial", help="Comma-separated branches")
+    sg.add_argument("--per-source", type=int, default=3, help="Sampled items per gov source")
+    sg.add_argument("--year", type=int, default=2025, help="Target sitemap year for legislative/judicial")
+    sg.add_argument("--loc-btp-path", default=None, help="Optional LoC By the People (btp-dataset) CSV/Parquet path")
+    sg.add_argument("--cache-dir", default=None)
+    sg.set_defaults(func=_cmd_stage_gov)
 
     rn = sub.add_parser("run", help="Run isolated Tier-1 / Tier-2 objective outcome benchmarks under GPU lock")
     rn.add_argument("--tier", choices=("tier1", "tier2"), default="tier1")

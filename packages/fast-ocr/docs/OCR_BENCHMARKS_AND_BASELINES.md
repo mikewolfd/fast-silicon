@@ -28,6 +28,20 @@ This document catalogs the 2025–2026 public OCR benchmark ecosystem across out
 | **LMM OCR Reasoning** | **OCRBench / v2** | `echo840/OCRBench` · `lmms-lab/OCRBench-v2` | Research | Exact/substring (`OCRBench` / 1000) · Macro (`OCRBench-v2`). | Broad VLM OCR QA benchmark. |
 | **Degraded Scans / HTR** | `olmOCR-bench` (`old_scans`), `IAM` | `allenai/olmOCR-bench` · `gagan3012/IAM` | `ODC-BY` / Academic | Pass rate (`old_scans`), **CER / WER** (`IAM`). | `old_scans` gives clean ODC-BY coverage of historical degraded prints. |
 
+### 1C. Government, Regulatory & Legal Suites (`Cat 5 Gov-Doc`)
+
+| Suite Key | Source / Repo | Branch & Content | License | Core Metrics | Notes & Ground-Truth Hygiene |
+|---|---|---|---|---|---|
+| **`doclaynet_gov`** | `docling-project/DocLayNet-v1.2` (`test-00003`, `test-00004`) | Legislative/Executive/Procurement (`laws_and_regulations`, `government_tenders`, `patents`), English/Latin-filtered. | `CDLA-Permissive-1.0` | `doclaynet_overall` (`1 - Text_NED`, reading-order concordance, header/footer leak rate). | Pinned in `outcome_benchmarks.lock.json` (`tier1: n=0`, `tier2: n=90`). Scores against PDF digital `pdf_cells` (no pseudo-OCR GT). |
+| **`vrdu_ad_buy`** / **`vrdu_registration`** | `google-research-datasets/vrdu` (GitHub commit `04a4df7`) | Executive regulatory filings: 641 FCC political ad-buy PDFs (nested `line_items`) + 1,915 DOJ FARA registration PDFs. | `CC-BY-4.0` / U.S. Pub Domain | **`grounded_field_f1`** + leaf **ANLS** with VRDU `PriceMatch` / `DateMatch` normalization. | Pinned in `outcome_benchmarks.lock.json`. Evaluates human KIE annotations visible on the primary annotated page; ignores `dataset.jsonl.gz` Google Cloud OCR tokens. |
+| **`puredocbench_legal_gov`** | `zhihengli-casia/puredocbench` (`03_legal_gov`) | Legal & government pages (`72` English / `151` total across *Clean*, *Digital*, *Real* tracks). | `CC-BY-4.0` (data) / `MIT` (code) | `puredocbench_overall` (`Text_NED`, `Table_TEDS`, `Formula_NormSim`, reading order). | GT tarball pinned (`tier1/2: n=0`); requires extracting `pdb_full.tar` locally (`--puredocbench-images-root`). |
+| **`us_gov_ocr`** | GovInfo (`FR`, `PLAW` USLM, `BILLS`, `USCOURTS`), Federal Register API, LoC `btp-dataset` | All 3 U.S. branches: 3-column `FR` notices + `<GPOTABLE>` HTML tables, `PLAW`/`BILLS` XML↔PDF, born-digital CM/ECF `USCOURTS` filings, and optional LoC scans (`--loc-btp-path`). | **U.S. Public Domain / CC0** | `us_gov_overall` (`OmniDocBench` suite + per-branch & per-source breakdowns). | Built via `stage-gov`; auto-selects a `<GPOTABLE>` page across pages `0..5` on `FR` when available (else page `0`), slices XML gold via page-text alignment, forces `--ocr-render-only` on visual runs, and filters raster-only items on `public-pypdfium2`. |
+
+**Excluded Pseudo-GT & Non-Benchmark Corpora (Never Score Clean VLMs Against These):**
+- *Automated OCR outputs masquerading as GT:* Harvard CAP `case.law` `casebody`/ALTO (raw ABBYY FineReader OCR; only metadata was human-reviewed), Chronicling America bulk ALTO XML, `aurelio-ai/jfk-files` / `HistoryLab/foiarchive`, and VRDU's token-level `ocr` field (Google Cloud OCR).
+- *Text-only / non-OCR-text / restricted datasets:* `pile-of-law/pile-of-law`, `common-pile/usgpo`, `free-law/Caselaw_Access_Project`, `mauricedalton/irs-990` (XML/Parquet without paired PDFs), `cernis-intelligence/cernis-legal-ocr` (model weights), `CommonForms` (AcroForm widget bboxes only), `UnbrokenCocoon/Hansard-OCR-Dataset` (synthetic renders), `FUNSD` (non-commercial), `Kleister` (no LICENSE file in repo root), `LeakageBench` (privacy DUA), and `DUDE`/`DocVQA`/`ViDoRe` (QA/retrieval only).
+- *Un-recovered / blocked public-domain sources (tracked in `mikewolfd/fast-silicon#1`):* `GovInfo BUDGET` (`BUDGET-2026-BUD.zip` ships metadata XML + PDFs without paired body XML; spreadsheets ship separately in `BUDGET-2026-TAB.xlsx`), `OLRC USCODE` (`uscode.house.gov/download/download.shtml` returned `HTTP 404`), `supremecourt.gov/xmls/current/` (HTML/JS challenge redirect), and default auto-fetch for `LoC btp-dataset`.
+
 ---
 
 ## 2. Published Baselines Benchmarked in 2025–2026 Literature
@@ -63,18 +77,34 @@ All Category 5 metrics are implemented in pure Python + NumPy with zero `dataset
 
 ## 4. `benchmark_outcomes.py` Workflows & Lockfile Integrity
 
-All 4 Category 5 datasets are pinned in `configs/outcome_benchmarks.lock.json` (`20` total datasets) with 40-char commit SHAs, file sizes, and SHA-256 checksums:
+All Category 5 datasets are pinned in `configs/outcome_benchmarks.lock.json` (`24` total datasets) with 40-char commit SHAs, file sizes, and SHA-256 checksums (plus optional keyless 3-branch Public-Domain `us_gov_ocr` staging):
 
 ```bash
-# 1. Stage & SHA-256 verify Tier-1 OCR datasets (~450 MB total, 0 GPU work)
+# 1. Stage & SHA-256 verify core Tier-1 OCR datasets (~450 MB total, 0 GPU work)
 .venv/bin/python scripts/benchmark_outcomes.py setup-data --tier tier1 --datasets olmocr_bench,fintabnet_otsl,omnidocbench_en,cord_v2
 
-# 2. Apples-to-apples visual OCR run (disables PDF text layer so native layers don't mask visual OCR)
+# 2. Stage Tier-1 VRDU (DOJ FARA + FCC Ad-Buy) & Tier-2 DocLayNet-Gov shards, plus paired 3-branch U.S. Gov PDFs
+.venv/bin/python scripts/benchmark_outcomes.py setup-data --tier tier1 --datasets vrdu_ad_buy,vrdu_registration
+.venv/bin/python scripts/benchmark_outcomes.py setup-data --tier tier2 --datasets doclaynet_gov
+.venv/bin/python scripts/benchmark_outcomes.py stage-gov --branches legislative,executive,judicial --per-source 3
+# Optional: append volunteer-transcribed LoC btp-dataset archival scans during staging
+.venv/bin/python scripts/benchmark_outcomes.py stage-gov --branches executive --per-source 3 --loc-btp-path /path/to/btp.parquet
+
+# 3. Apples-to-apples visual OCR run (disables PDF text layer so native layers don't mask visual OCR)
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --smoke --local-files-only \
   --packages fast-ocr,public-apple-vision,public-pypdfium2 \
   --extra-args "--ocr-backend ovis --ocr-render-only" --json-out ocr_cat5_smoke.json
 
-# 3. Structured receipt JSON KIE with NuExtract3
+# 4. Run Gov-Doc visual OCR suites (`doclaynet_gov`, `us_gov_ocr`), KIE (`vrdu_*`), or all available suites
+# Note: `--ocr-suites all` safely skips un-staged optional suites (`doclaynet_gov` on tier1 unless cached, `us_gov_ocr` without manifest, `puredocbench_legal_gov` without extracted images).
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --smoke --local-files-only \
+  --packages fast-ocr,public-pypdfium2 --extra-args "--ocr-backend ovis --ocr-render-only --ocr-suites gov"
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --smoke --local-files-only \
+  --packages fast-ocr --extra-args "--ocr-model nuextract3 --ocr-suites vrdu_ad_buy,vrdu_registration"
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --smoke --local-files-only \
+  --packages fast-ocr --extra-args "--ocr-backend ovis --ocr-render-only --ocr-suites puredocbench_legal_gov --puredocbench-track clean --puredocbench-images-root /path/to/pdb_images"
+
+# 5. Structured receipt JSON KIE with NuExtract3
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --packages fast-ocr \
   --extra-args "--ocr-model nuextract3 --ocr-suites cord_v2"
 ```
@@ -96,4 +126,5 @@ All 4 Category 5 datasets are pinned in `configs/outcome_benchmarks.lock.json` (
 
 Additional cross-silicon suite checks verified:
 - **M4 Pro (`Mac16,8`):** `make sync-check` (`copied=0 removed=0 unchanged=85`), `make guard` (`Summary: 0 errors, 0 warnings`), `make leak-check` (clean), `make test-cpu` (`384 passed, 3 skipped`, `22 passed`, `59 passed, 2 skipped`), `test_outcome_eval_cpu.py` (`29 passed in 1.56s`), `test_fast_pplx_vision_hw.py` (`1 passed in 0.74s`). Note earlier `olmOCR-bench(4)` and `CORD-v2(2)` smoke checks are also supported in `scripts/benchmark_outcomes.py`.
+- **Gov-Doc CPU Harness & Live Staging Smoke (`M4 Pro`):** `test_outcome_eval_cpu.py` + `test_benchmark_suites_cpu.py` (`62 passed`), `make test-cpu` (`398 passed, 3 skipped, 22 deselected`; `22 passed, 47 deselected`; `63 passed, 2 skipped, 17 deselected`), mirrored `fast-shared` `test_outcome_eval_cpu.py` (`32 passed`), live 3-branch `stage-gov` (`n=4` across `PLAW`, `BILLS`, `<GPOTABLE>` `FR` `fr:2025-15438`, `USCOURTS`) + `public-pypdfium2` CPU scoring (`US-Gov-OCR(4)`, `us_gov_overall=0.2800`), live `load_vrdu` & `load_puredocbench_legal_gov` GT smoke. M4 Pro / Base M5 GPU & ANE runs on the new Gov-Doc suites remain pending under the active GPU validation locks (`mikewolfd/fast-silicon#1`).
 - **Base M5 (`Mac17,2`):** `test_qwen35_vision_cpu.py + test_outcome_eval_cpu.py + test_fast_pplx_vision_cpu.py + test_fast_qwen3_cpu.py + test_fast_ocr_cpu.py` (`61 passed in 5.89s`), `test_fast_pplx_vision_hw.py` (`1 passed in 0.50s`).

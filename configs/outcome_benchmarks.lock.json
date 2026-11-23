@@ -1160,6 +1160,149 @@
           "sha256": "51c65f1788faff392abe2a0b55b023eb23e9be551c509138eaa3a832514224e7"
         }
       }
+    },
+    "vrdu_ad_buy": {
+      "category": 5,
+      "source": "github",
+      "repo_id": "google-research-datasets/vrdu",
+      "license": "CC-BY-4.0",
+      "format": "jsonl_pdf_github",
+      "subdir": "ad-buy-form",
+      "split_file": "ad-buy-form/few_shot-splits/DeepForm-unk_template-train_200-test_159-valid_100-SD_0.json",
+      "files": [
+        "ad-buy-form/main/dataset.jsonl.gz",
+        "ad-buy-form/main/meta.json",
+        "ad-buy-form/few_shot-splits/DeepForm-unk_template-train_200-test_159-valid_100-SD_0.json"
+      ],
+      "tier1": {
+        "n": 20
+      },
+      "tier2": {
+        "n": 100
+      },
+      "revision": "04a4df7ac5cc694e51c48115c03fe428f0e240cc",
+      "gated": false,
+      "pinned_files": {
+        "ad-buy-form/main/dataset.jsonl.gz": {
+          "size": 31986319,
+          "sha256": "5fbf579a023e1068433f3115006da109145307cdd3e1b64346b92c959384ef36"
+        },
+        "ad-buy-form/main/meta.json": {
+          "size": 1069,
+          "sha256": "312a229850651e982c995533fed5443e2073b2c50d50c32b9e95c0a50fd8911f"
+        },
+        "ad-buy-form/few_shot-splits/DeepForm-unk_template-train_200-test_159-valid_100-SD_0.json": {
+          "size": 25379,
+          "sha256": "3575a3df2af5988c6db4444320d1cb4a5f3c6631424b6155108f848494c32cf8"
+        }
+      }
+    },
+    "vrdu_registration": {
+      "category": 5,
+      "source": "github",
+      "repo_id": "google-research-datasets/vrdu",
+      "license": "CC-BY-4.0",
+      "format": "jsonl_pdf_github",
+      "subdir": "registration-form",
+      "split_file": "registration-form/few_shot-splits/FARA-lv1-single_Amendment-train_200-test_300-valid_100-SD_0.json",
+      "files": [
+        "registration-form/main/dataset.jsonl.gz",
+        "registration-form/main/meta.json",
+        "registration-form/few_shot-splits/FARA-lv1-single_Amendment-train_200-test_300-valid_100-SD_0.json"
+      ],
+      "tier1": {
+        "n": 20
+      },
+      "tier2": {
+        "n": 100
+      },
+      "revision": "04a4df7ac5cc694e51c48115c03fe428f0e240cc",
+      "gated": false,
+      "pinned_files": {
+        "registration-form/main/dataset.jsonl.gz": {
+          "size": 54839306,
+          "sha256": "9dd5f711e34861bdf9a98e05415355b522439e8658fcef763ef8d9b6b50cdc49"
+        },
+        "registration-form/main/meta.json": {
+          "size": 296,
+          "sha256": "248e2c1f9a127397f73c20e0b546ba29779a4a66f15acedd06b5d1d507c513da"
+        },
+        "registration-form/few_shot-splits/FARA-lv1-single_Amendment-train_200-test_300-valid_100-SD_0.json": {
+          "size": 43673,
+          "sha256": "465564ac5fc6440e7410b12b8a00338900f11a829d35a93f9b5ab1a73506dbf2"
+        }
+      }
+    },
+    "doclaynet_gov": {
+      "category": 5,
+      "repo_id": "docling-project/DocLayNet-v1.2",
+      "license": "CDLA-Permissive-1.0",
+      "format": "parquet",
+      "doc_categories": [
+        "laws_and_regulations",
+        "government_tenders",
+        "patents"
+      ],
+      "english_only": true,
+      "files": [
+        "data/test-00003-of-00006.parquet",
+        "data/test-00004-of-00006.parquet"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "files": [
+          "data/test-00003-of-00006.parquet",
+          "data/test-00004-of-00006.parquet"
+        ],
+        "n": 90,
+        "stratify_by": [
+          "collection"
+        ]
+      },
+      "revision": "0daf93102e2efce76c3e11a274a5e0d0969391d3",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00003-of-00006.parquet": {
+          "size": 458137785,
+          "sha256": "a94b2131b35176324cd7020bebb92eeb03b000ce93f5783ce85c94895600ae93"
+        },
+        "data/test-00004-of-00006.parquet": {
+          "size": 266503202,
+          "sha256": "509e91dd74cb3d04fb7600834ac64fd1c52f450770dbd5dc26e1a44e828e5ba9"
+        }
+      }
+    },
+    "puredocbench_legal_gov": {
+      "category": 5,
+      "repo_id": "zhihengli-casia/puredocbench",
+      "license": "CC-BY-4.0",
+      "format": "tar_json",
+      "category_filter": "03_legal_gov",
+      "english_only": true,
+      "files": [
+        "gt/puredocbench_gt_latest.tar.gz",
+        "release_manifest_candidate_1475.csv"
+      ],
+      "tier1": {
+        "n": 0
+      },
+      "tier2": {
+        "n": 0
+      },
+      "revision": "4665b40a3333f7643bad7c8675a9062b482511ad",
+      "gated": false,
+      "pinned_files": {
+        "gt/puredocbench_gt_latest.tar.gz": {
+          "size": 8044648,
+          "sha256": "4340c7120be012fe324ce13832c92869dd5eae7d384c473d335a7bed934ab534"
+        },
+        "release_manifest_candidate_1475.csv": {
+          "size": 941208,
+          "sha256": "ab1f61b6a1b23eb310f53f4555f8ab0bcbacc53df9ec7a6f276ec611718faaf7"
+        }
+      }
     }
   }
 }

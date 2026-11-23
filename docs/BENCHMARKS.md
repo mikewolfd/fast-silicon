@@ -549,11 +549,18 @@ All commands run from the `fast-silicon` repository root using `.venv/bin/python
 
 # Stage Category 5 public OCR datasets and run cross-family visual OCR benchmarks
 .venv/bin/python scripts/benchmark_outcomes.py setup-data \
-  --tier tier1 --datasets olmocr_bench,fintabnet_otsl,omnidocbench_en,cord_v2
+  --tier tier1 --datasets olmocr_bench,fintabnet_otsl,omnidocbench_en,cord_v2,vrdu_ad_buy,vrdu_registration
+.venv/bin/python scripts/benchmark_outcomes.py stage-gov \
+  --branches legislative,executive,judicial --per-source 3
 .venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --smoke --local-files-only \
   --packages ocr-families --public-python /path/to/stock-mlx-venv/bin/python \
   --extra-args "--ocr-backend ovis --ocr-render-only" --json-out artifacts/outcomes_cat5_smoke.json
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier2 --smoke --local-files-only \
+  --packages fast-ocr,public-pypdfium2 \
+  --extra-args "--ocr-backend ovis --ocr-render-only --ocr-suites gov"
 ```
+
+See also the [Category 5 & Gov-Doc OCR benchmark guide](../packages/fast-ocr/docs/OCR_BENCHMARKS_AND_BASELINES.md).
 
 ### 2. Post-Training, Speculative, Prefix-Tree & Parallel Compile (`scripts/benchmark_capabilities.py`)
 

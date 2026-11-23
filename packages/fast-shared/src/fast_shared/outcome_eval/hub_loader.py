@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
 import hashlib
 import html as _html
 import json
 import os
 from pathlib import Path
+import re
+import tarfile
 from typing import Any, Callable, Mapping, Sequence
+import urllib.parse
+import urllib.request
 
 import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
@@ -436,19 +442,44 @@ def download_pinned_file(
                 )
         return local_candidate
 
-    from huggingface_hub import hf_hub_download
-
-    dest_root.mkdir(parents=True, exist_ok=True)
-    downloaded = Path(
-        hf_hub_download(
-            repo_id=str(ds["repo_id"]),
-            filename=filename,
-            repo_type="dataset",
-            revision=str(ds["revision"]),
-            local_dir=str(dest_root),
-            local_files_only=local_files_only,
+    if str(ds.get("source") or "").strip().lower() == "github":
+        if local_files_only:
+            raise FileNotFoundError(
+                f"Offline mode enabled and GitHub pinned file missing from cache: {local_candidate}"
+            )
+        raw_url = (
+            f"https://raw.githubusercontent.com/{ds['repo_id']}/{ds['revision']}/"
+            f"{urllib.parse.quote(filename.lstrip('/'), safe='/')}"
         )
-    )
+        local_candidate.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = local_candidate.with_name(f".{local_candidate.name}.tmp.{os.getpid()}")
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "fast-silicon-outcome-eval/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, tmp_path.open("wb") as out_fp:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out_fp.write(chunk)
+            tmp_path.replace(local_candidate)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        downloaded = local_candidate
+    else:
+        from huggingface_hub import hf_hub_download
+
+        dest_root.mkdir(parents=True, exist_ok=True)
+        downloaded = Path(
+            hf_hub_download(
+                repo_id=str(ds["repo_id"]),
+                filename=filename,
+                repo_type="dataset",
+                revision=str(ds["revision"]),
+                local_dir=str(dest_root),
+                local_files_only=local_files_only,
+            )
+        )
     if verify_checksum and expected_sha:
         actual = compute_file_sha256(downloaded)
         if actual != expected_sha:
@@ -2019,6 +2050,468 @@ def load_cord_v2(
     return out
 
 
+DOCLAYNET_CLASS_LABELS: dict[int, str] = {
+    1: "Caption",
+    2: "Footnote",
+    3: "Formula",
+    4: "List-item",
+    5: "Page-footer",
+    6: "Page-header",
+    7: "Picture",
+    8: "Section-header",
+    9: "Table",
+    10: "Text",
+    11: "Title",
+}
+
+_NON_LATIN_SKIP_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\u0400-\u04ff\u0600-\u06ff\uac00-\ud7af]")
+
+
+def _is_latin_dominant(text: str, *, min_alpha: int = 12, min_ratio: float = 0.85) -> bool:
+    if not text:
+        return False
+    alpha = [ch for ch in text if ch.isalpha()]
+    if len(alpha) < min_alpha:
+        return False
+    if _NON_LATIN_SKIP_RE.search(text):
+        latin = sum(1 for ch in alpha if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ("\u00c0" <= ch <= "\u024f"))
+        return (float(latin) / float(len(alpha))) >= min_ratio
+    latin = sum(1 for ch in alpha if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ("\u00c0" <= ch <= "\u024f"))
+    return (float(latin) / float(len(alpha))) >= min_ratio
+
+
+def build_vrdu_schema(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Build Draft-2020-12 JSON Schema for a VRDU corpus from ``main/meta.json``."""
+    match_map = dict(meta.get("entity_name_to_match_func") or {})
+    patterns = dict(meta.get("entity_appearance_pattern") or {})
+    unrepeated_keys = [k for k in match_map if patterns.get(k, "unrepeated") != "line_item"]
+    line_item_keys = [k for k in match_map if patterns.get(k) == "line_item"]
+
+    opt_str: dict[str, Any] = {"type": ["string", "null"]}
+    props: dict[str, Any] = {k: dict(opt_str) for k in unrepeated_keys}
+    required = list(unrepeated_keys)
+    if line_item_keys:
+        props["line_items"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {k: dict(opt_str) for k in line_item_keys},
+                "additionalProperties": False,
+            },
+        }
+        required.append("line_items")
+    return {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+def _clean_vrdu_mention(val: Any) -> str:
+    return " ".join(str(val or "").split()).strip()
+
+
+def _extract_vrdu_page_gt(
+    annotations: Sequence[Any],
+    meta: Mapping[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Select the primary annotated page and build structured KIE ground truth visible on that page."""
+    patterns = dict(meta.get("entity_appearance_pattern") or {})
+    match_map = dict(meta.get("entity_name_to_match_func") or {})
+
+    # Bucket mentions by page_idx so visual single-page OCR is scored strictly on visible fields.
+    by_page: dict[int, dict[str, list[tuple[float, float, str]]]] = {}
+    for entry in annotations or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        field_name = str(entry[0])
+        if match_map and field_name not in match_map:
+            continue
+        mentions = entry[1] if isinstance(entry[1], Sequence) else []
+        for m in mentions:
+            if not isinstance(m, (list, tuple)) or not m:
+                continue
+            txt = _clean_vrdu_mention(m[0])
+            if not txt:
+                continue
+            bbox = m[1] if len(m) > 1 and isinstance(m[1], (list, tuple)) and len(m[1]) >= 5 else [0, 0.0, 0.0, 0.0, 0.0]
+            page_idx = int(bbox[0]) if bbox[0] is not None else 0
+            y1 = float(bbox[2] or 0.0)
+            x1 = float(bbox[1] or 0.0)
+            by_page.setdefault(page_idx, {}).setdefault(field_name, []).append((y1, x1, txt))
+
+    if not by_page:
+        return 0, ({ "line_items": [] } if any(v == "line_item" for v in patterns.values()) else {})
+
+    best_page = min(
+        by_page.keys(),
+        key=lambda p_idx: (-len(by_page[p_idx]), p_idx),
+    )
+    page_fields = by_page[best_page]
+
+    gt_parse: dict[str, Any] = {}
+    line_item_fields = [k for k in match_map if patterns.get(k) == "line_item"]
+    for k in match_map:
+        if patterns.get(k, "unrepeated") == "line_item":
+            continue
+        vals = sorted(page_fields.get(k) or [], key=lambda t: (t[0], t[1]))
+        dedup: list[str] = []
+        for _, _, v in vals:
+            if v not in dedup:
+                dedup.append(v)
+        if dedup:
+            gt_parse[k] = dedup[0]
+
+    if line_item_fields:
+        col_lists: dict[str, list[str]] = {}
+        max_rows = 0
+        for k in line_item_fields:
+            vals = [t[2] for t in sorted(page_fields.get(k) or [], key=lambda t: (t[0], t[1]))]
+            col_lists[k] = vals
+            max_rows = max(max_rows, len(vals))
+        rows: list[dict[str, str]] = []
+        for i in range(max_rows):
+            row_obj: dict[str, str] = {}
+            for k in line_item_fields:
+                if i < len(col_lists[k]):
+                    row_obj[k] = col_lists[k][i]
+            if row_obj:
+                rows.append(row_obj)
+        gt_parse["line_items"] = rows
+
+    return best_page, gt_parse
+
+
+def load_vrdu(
+    dataset_key: str = "vrdu_ad_buy",
+    *,
+    tier: str = "tier1",
+    max_items: int | None = None,
+    download_pdfs: bool = True,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``google-research-datasets/vrdu`` (``vrdu_ad_buy`` or ``vrdu_registration``) KIE items."""
+    if dataset_key not in ("vrdu_ad_buy", "vrdu_registration"):
+        raise ValueError(f"Unsupported VRDU dataset_key={dataset_key!r}")
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"][dataset_key]
+    t_cfg = ds.get(tier, ds.get("tier1", {}))
+    target_n = int(max_items) if max_items is not None else (int(t_cfg["n"]) if t_cfg.get("n") is not None else None)
+    if target_n is not None and target_n <= 0:
+        return []
+
+    subdir = str(ds.get("subdir") or ("ad-buy-form" if dataset_key == "vrdu_ad_buy" else "registration-form"))
+    data_file = str(ds.get("files", [f"{subdir}/main/dataset.jsonl.gz"])[0])
+    meta_file = str(ds.get("files", ["", f"{subdir}/main/meta.json"])[1])
+    split_file = str(ds.get("split_file") or "")
+
+    data_p = download_pinned_file(dataset_key, data_file, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
+    meta_p = download_pinned_file(dataset_key, meta_file, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    schema = build_vrdu_schema(meta)
+
+    allowed_test_files: set[str] | None = None
+    if split_file:
+        split_p = download_pinned_file(dataset_key, split_file, lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
+        split_obj = json.loads(split_p.read_text(encoding="utf-8"))
+        if isinstance(split_obj.get("test"), list) and split_obj["test"]:
+            allowed_test_files = {str(x) for x in split_obj["test"]}
+
+    raw_bytes = data_p.read_bytes()
+    text_blob = (gzip.decompress(raw_bytes) if data_p.suffix == ".gz" else raw_bytes).decode("utf-8")
+
+    candidates: list[dict[str, Any]] = []
+    for idx, line in enumerate(text_blob.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        rec = json.loads(s)
+        fname = str(rec.get("filename") or "").strip()
+        if not fname:
+            continue
+        if allowed_test_files is not None and fname not in allowed_test_files:
+            continue
+        page_idx, gt_parse = _extract_vrdu_page_gt(rec.get("annotations") or [], meta)
+        if not gt_parse:
+            continue
+        n_fields = len([k for k, v in gt_parse.items() if k != "line_items" and v]) + len(gt_parse.get("line_items") or [])
+        bucket = "rich" if n_fields >= 5 else "sparse"
+        candidates.append(
+            {
+                "id": fname,
+                "row_idx": idx,
+                "filename": fname,
+                "pdf_repo_path": f"{subdir}/main/pdfs/{fname}",
+                "pdf_path": None,
+                "page_index": page_idx,
+                "bucket": bucket,
+                "meta": meta,
+                "schema": schema,
+                "gt_parse": gt_parse,
+            }
+        )
+
+    selected = stratified_sha256_sample(
+        candidates,
+        dataset_key=f"{dataset_key}:{tier}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["bucket"],
+        total_n=target_n,
+    )
+
+    if download_pdfs:
+        for item in selected:
+            pdf_p = download_pinned_file(
+                dataset_key,
+                item["pdf_repo_path"],
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                verify_checksum=False,
+            )
+            item["pdf_path"] = str(pdf_p)
+    return selected
+
+
+def load_doclaynet_gov(
+    *,
+    tier: str = "tier2",
+    max_items: int | None = None,
+    english_only: bool | None = None,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``laws_and_regulations``, ``government_tenders``, and ``patents`` pages from ``docling-project/DocLayNet-v1.2``."""
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["doclaynet_gov"]
+    t_cfg = ds.get(tier, ds.get("tier2", {}))
+    target_n = int(max_items) if max_items is not None else (int(t_cfg["n"]) if t_cfg.get("n") is not None else None)
+    if target_n is not None and target_n <= 0:
+        return []
+
+    use_en = bool(ds.get("english_only", True) if english_only is None else english_only)
+    allowed_cats = set(str(c) for c in (ds.get("doc_categories") or ("laws_and_regulations", "government_tenders", "patents")))
+    shard_files = list(t_cfg.get("files") or ds.get("files") or [])
+
+    candidates: list[dict[str, Any]] = []
+    shard_tables: dict[str, Path] = {}
+    for rel_fn in shard_files:
+        pq_path = download_pinned_file(
+            "doclaynet_gov",
+            rel_fn,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        shard_tables[rel_fn] = pq_path
+        meta_tbl = pq.read_table(pq_path, columns=["metadata", "category_id", "bboxes", "pdf_cells"])
+        metas = meta_tbl.column("metadata").to_pylist()
+        cids_col = meta_tbl.column("category_id").to_pylist()
+        bboxes_col = meta_tbl.column("bboxes").to_pylist()
+        cells_col = meta_tbl.column("pdf_cells").to_pylist()
+
+        for row_idx, (meta, cids, bboxes, cell_groups) in enumerate(zip(metas, cids_col, bboxes_col, cells_col)):
+            if not isinstance(meta, Mapping):
+                continue
+            doc_cat = str(meta.get("doc_category") or "")
+            if doc_cat not in allowed_cats:
+                continue
+            collection = str(meta.get("collection") or doc_cat)
+            text_blocks: list[dict[str, Any]] = []
+            table_texts: list[str] = []
+            header_footer_texts: list[str] = []
+            all_parts: list[str] = []
+
+            for blk_i, cid in enumerate(cids or []):
+                cid_int = int(cid)
+                label = DOCLAYNET_CLASS_LABELS.get(cid_int, "Text")
+                cells = cell_groups[blk_i] if (cell_groups and blk_i < len(cell_groups)) else []
+                blk_txt = " ".join(str(c.get("text") or "").strip() for c in (cells or []) if isinstance(c, Mapping) and str(c.get("text") or "").strip()).strip()
+                if not blk_txt:
+                    continue
+                all_parts.append(blk_txt)
+                bbox = list(bboxes[blk_i]) if (bboxes and blk_i < len(bboxes)) else []
+                if cid_int in (5, 6):
+                    header_footer_texts.append(blk_txt)
+                elif cid_int == 9:
+                    table_texts.append(blk_txt)
+                elif cid_int != 7:
+                    text_blocks.append({"category_type": label, "order": blk_i, "text": blk_txt, "bbox": bbox})
+
+            joined_all = " ".join(all_parts)
+            if not text_blocks and not table_texts:
+                continue
+            if use_en and not _is_latin_dominant(joined_all):
+                continue
+
+            img_id = meta.get("image_id")
+            orig_name = str(meta.get("original_filename") or f"row_{row_idx}")
+            page_no = int(meta.get("page_no") or 0)
+            candidates.append(
+                {
+                    "id": f"{collection}:{orig_name}:p{page_no}:{img_id}",
+                    "_shard": rel_fn,
+                    "_row_idx": row_idx,
+                    "doc_category": doc_cat,
+                    "collection": collection,
+                    "page_no": page_no,
+                    "text_blocks": text_blocks,
+                    "table_texts": table_texts,
+                    "header_footer_texts": header_footer_texts,
+                }
+            )
+
+    selected = stratified_sha256_sample(
+        candidates,
+        dataset_key=f"doclaynet_gov:{tier}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["collection"],
+        total_n=target_n,
+    )
+
+    by_shard: dict[str, list[dict[str, Any]]] = {}
+    for item in selected:
+        by_shard.setdefault(item["_shard"], []).append(item)
+
+    for rel_fn, shard_items in by_shard.items():
+        pq_path = shard_tables[rel_fn]
+        sch_names = set(pq.read_schema(pq_path).names)
+        cols = [c for c in ("image", "pdf") if c in sch_names]
+        if not cols:
+            continue
+        idxs = [int(it["_row_idx"]) for it in shard_items]
+        taken = pq.read_table(pq_path, columns=cols).take(idxs)
+        img_col = taken.column("image").to_pylist() if "image" in cols else [None] * len(shard_items)
+        pdf_col = taken.column("pdf").to_pylist() if "pdf" in cols else [None] * len(shard_items)
+        for it, img_val, pdf_val in zip(shard_items, img_col, pdf_col):
+            it["image_bytes"] = _extract_image_bytes(img_val) if img_val is not None else b""
+            it["pdf_bytes"] = bytes(pdf_val) if isinstance(pdf_val, (bytes, bytearray, memoryview)) else b""
+
+    out: list[dict[str, Any]] = []
+    for it in selected:
+        out.append({k: v for k, v in it.items() if not k.startswith("_")})
+    return out
+
+
+def _puredocbench_is_english(lang_val: Any) -> bool:
+    if isinstance(lang_val, list):
+        return any("en" == str(x).strip().lower() or "english" == str(x).strip().lower() for x in lang_val)
+    low = str(lang_val or "").strip().lower()
+    return low in ("english", "en")
+
+
+def load_puredocbench_legal_gov(
+    *,
+    track: str = "clean",
+    max_items: int | None = None,
+    english_only: bool | None = None,
+    images_root: str | Path | None = None,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``03_legal_gov`` annotations from ``zhihengli-casia/puredocbench`` normalized for OmniDocBench scoring."""
+    eff_track = str(track or "clean").strip().lower()
+    if eff_track not in ("clean", "digital", "real"):
+        raise ValueError(f"Unsupported PureDocBench track={track!r}; expected 'clean', 'digital', or 'real'")
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["puredocbench_legal_gov"]
+    use_en = bool(ds.get("english_only", True) if english_only is None else english_only)
+    cat_filter = str(ds.get("category_filter") or "03_legal_gov")
+    files = list(ds.get("files") or ["gt/puredocbench_gt_latest.tar.gz", "release_manifest_candidate_1475.csv"])
+
+    gt_tar = download_pinned_file("puredocbench_legal_gov", files[0], lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
+    manifest_p = download_pinned_file("puredocbench_legal_gov", files[1], lock=lock, cache_dir=cache_dir, local_files_only=local_files_only)
+
+    manifest_map: dict[str, dict[str, str]] = {}
+    with manifest_p.open("r", encoding="utf-8", newline="") as fp:
+        for row in csv.DictReader(fp):
+            gt_rel = str(row.get("gt_rel") or "").strip()
+            if gt_rel:
+                manifest_map[gt_rel] = dict(row)
+
+    eff_img_root = Path(images_root).expanduser() if images_root is not None else (resolve_cache_dir(cache_dir) / "puredocbench_legal_gov" / "images")
+    rel_col = f"{eff_track}_rel"
+
+    items: list[dict[str, Any]] = []
+    prefix = f"gt/{cat_filter}/"
+    with tarfile.open(gt_tar, "r:gz") as tf:
+        for member in tf.getmembers():
+            if not (member.isfile() and member.name.startswith(prefix) and member.name.endswith(".json")):
+                continue
+            raw_fp = tf.extractfile(member)
+            if raw_fp is None:
+                continue
+            page = json.load(raw_fp)
+            pinfo = page.get("page_info") or {}
+            pattr = pinfo.get("page_attribute") or {}
+            if use_en and not _puredocbench_is_english(pattr.get("language")):
+                continue
+
+            gt_rel = member.name[len("gt/") :]
+            m_row = manifest_map.get(gt_rel, {})
+            img_rel = str(m_row.get(rel_col) or pinfo.get("image_path") or "").strip()
+            img_path = (eff_img_root / img_rel) if img_rel else None
+
+            raw_dets = [d for d in (page.get("layout_dets") or []) if isinstance(d, Mapping) and not d.get("ignore")]
+            raw_dets.sort(key=lambda d: (int(d["order"]) if d.get("order") is not None else 10**9, str(d.get("anno_id") or "")))
+
+            text_blocks: list[dict[str, Any]] = []
+            tables: list[dict[str, Any]] = []
+            equations: list[dict[str, Any]] = []
+            for d in raw_dets:
+                ctype = str(d.get("category_type") or "")
+                order_val = d.get("order")
+                if ctype in ("text_block", "title", "reference", "figure_caption", "table_caption", "equation_caption", "code_txt"):
+                    txt = str(d.get("text") or "").strip()
+                    if txt:
+                        text_blocks.append({"category_type": ctype, "order": order_val, "text": txt})
+                elif ctype == "table":
+                    html_s = str(d.get("html") or d.get("text") or "").strip()
+                    if html_s:
+                        tables.append({"order": order_val, "html": html_s})
+                elif ctype in ("equation_isolated", "equation_semantic"):
+                    ltx = str(d.get("latex") or d.get("text") or "").strip()
+                    if ltx:
+                        equations.append({"category_type": ctype, "order": order_val, "latex": ltx})
+
+            if not (text_blocks or tables or equations):
+                continue
+            subcat = str(m_row.get("subcategory") or Path(gt_rel).parts[1] if len(Path(gt_rel).parts) > 1 else "legal_gov")
+            items.append(
+                {
+                    "id": str(m_row.get("page_id") or gt_rel),
+                    "domain": cat_filter,
+                    "subcategory": subcat,
+                    "track": eff_track,
+                    "image_rel": img_rel,
+                    "image_path": str(img_path) if (img_path is not None and img_path.is_file()) else None,
+                    "data_source": str(pattr.get("data_source") or "synthetic_legal"),
+                    "text_blocks": text_blocks,
+                    "tables": tables,
+                    "equations": equations,
+                }
+            )
+
+    return stratified_sha256_sample(
+        items,
+        dataset_key=f"puredocbench_legal_gov:{eff_track}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["subcategory"],
+        total_n=max_items,
+    )
+
+
 def stage_tier_datasets(
     tier: str = "tier1",
     *,
@@ -2075,7 +2568,7 @@ def stage_tier_datasets(
                 files_to_fetch.append("test_unseen.parquet")
             if int(t_cfg.get("test", 0)) > 0:
                 files_to_fetch.append("test.parquet")
-        elif key == "fintabnet_otsl":
+        elif key in ("fintabnet_otsl", "doclaynet_gov"):
             t_cfg = ds.get(tier, {})
             n_val = t_cfg.get("n")
             if n_val is None or int(n_val) > 0:
@@ -2122,6 +2615,13 @@ def stage_tier_datasets(
                 if ip is not None and ip.is_file():
                     downloaded_count += 1
                     total_bytes += int(ip.stat().st_size)
+        elif key in ("vrdu_ad_buy", "vrdu_registration") and files_to_fetch:
+            vrdu_items = load_vrdu(key, tier=tier, download_pdfs=True, lock=lock, cache_dir=eff_cache, local_files_only=False)
+            for item in vrdu_items:
+                pp = Path(item["pdf_path"]) if item.get("pdf_path") else None
+                if pp is not None and pp.is_file():
+                    downloaded_count += 1
+                    total_bytes += int(pp.stat().st_size)
 
         staged_report["datasets"][key] = {
             "repo_id": ds["repo_id"],
@@ -2143,10 +2643,12 @@ __all__ = [
     "CLINC150_INTENT_TO_DOMAIN",
     "DEFAULT_CACHE_DIR",
     "DEFAULT_LOCK_FILENAME",
+    "DOCLAYNET_CLASS_LABELS",
     "FORBIDDEN_LEGALBENCH_SUBSETS",
     "FORBIDDEN_LONGEMBED_SUBSETS",
     "OLMOCR_BENCH_CATEGORIES",
     "build_cord_v2_schema",
+    "build_vrdu_schema",
     "compute_file_sha256",
     "download_pinned_file",
     "filter_legalbench_subsets",
@@ -2155,6 +2657,7 @@ __all__ = [
     "load_bfcl_v3",
     "load_clinc_oos",
     "load_cord_v2",
+    "load_doclaynet_gov",
     "load_extractbench",
     "load_fintabnet_otsl",
     "load_ifbench_test",
@@ -2170,8 +2673,10 @@ __all__ = [
     "load_nanobeir_subset",
     "load_olmocr_bench",
     "load_omnidocbench_en",
+    "load_puredocbench_legal_gov",
     "load_ragtruth",
     "load_reward_bench_2",
+    "load_vrdu",
     "normalize_cord_v2_parse",
     "read_arrow_ipc_rows",
     "read_jsonl_rows",

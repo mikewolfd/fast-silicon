@@ -1777,4 +1777,188 @@ def test_cat5_cross_family_and_m4_vs_m5_rates(tmp_path: Path, capsys: pytest.Cap
     assert md_file.read_text(encoding="utf-8").strip() == md_text.strip()
 
 
+def test_cat5_gov_suite_routing_and_stage_gov_parser() -> None:
+    out = _load_script("test_gov_suite_routing", "benchmark_outcomes.py")
+    ns_gov = out._parse_extra_flags(["--ocr-suites", "gov"])
+    assert out._resolve_cat5_suites("fast-ocr", ns_gov) == ["doclaynet_gov", "us_gov_ocr"]
+    assert out._resolve_cat5_suites("public-pypdfium2", ns_gov) == ["doclaynet_gov", "us_gov_ocr"]
+    assert out._resolve_cat5_suites("public-nuextract3-mlx-vlm", ns_gov) == [
+        "vrdu_ad_buy",
+        "vrdu_registration",
+        "doclaynet_gov",
+        "us_gov_ocr",
+    ]
+
+    ns_gov_all = out._parse_extra_flags(["--ocr-suites", "gov-all"])
+    assert out._resolve_cat5_suites("fast-ocr", ns_gov_all) == [
+        "vrdu_ad_buy",
+        "vrdu_registration",
+        "doclaynet_gov",
+        "us_gov_ocr",
+    ]
+    assert out._resolve_cat5_suites("public-pypdfium2", ns_gov_all) == ["doclaynet_gov", "us_gov_ocr"]
+
+    ns_pdb = out._parse_extra_flags(
+        ["--ocr-suites", "puredocbench_legal_gov", "--puredocbench-track", "real", "--puredocbench-images-root", "/tmp/pdb"]
+    )
+    assert out._resolve_cat5_suites("fast-ocr", ns_pdb) == ["puredocbench_legal_gov"]
+    assert ns_pdb.puredocbench_track == "real"
+    assert ns_pdb.puredocbench_images_root == "/tmp/pdb"
+
+    parser = out.build_parser()
+    parsed = parser.parse_args(
+        [
+            "stage-gov",
+            "--branches",
+            "legislative,executive",
+            "--per-source",
+            "2",
+            "--year",
+            "2025",
+            "--loc-btp-path",
+            "/tmp/btp.parquet",
+        ]
+    )
+    assert parsed.cmd == "stage-gov"
+    assert parsed.branches == "legislative,executive"
+    assert parsed.per_source == 2
+    assert parsed.year == 2025
+    assert parsed.loc_btp_path == "/tmp/btp.parquet"
+
+
+def test_cat5_optional_all_skipping_and_pypdfium_gov_filtering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import _outcome_public_backends as opb
+
+    out = _load_script("test_gov_worker_cpu", "benchmark_outcomes.py")
+    # Stub heavy/network core loaders so `--ocr-suites all` exercises optional skip paths cleanly on CPU.
+    monkeypatch.setattr(out, "load_olmocr_bench", lambda **kw: [])
+    monkeypatch.setattr(out, "load_fintabnet_otsl", lambda **kw: [])
+    monkeypatch.setattr(out, "load_omnidocbench_en", lambda **kw: [])
+    monkeypatch.setattr(out, "load_cord_v2", lambda **kw: [])
+    monkeypatch.setattr(out, "load_vrdu", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        out,
+        "load_doclaynet_gov",
+        lambda **kw: (_ for _ in ()).throw(FileNotFoundError("missing doclaynet_gov shard")),
+    )
+    monkeypatch.setattr(
+        out,
+        "load_puredocbench_legal_gov",
+        lambda **kw: [{"id": "pdb_0", "image_path": None, "text_blocks": [], "tables": [], "equations": []}],
+    )
+    monkeypatch.setattr(
+        out,
+        "load_us_gov_ocr",
+        lambda **kw: (_ for _ in ()).throw(FileNotFoundError("missing manifest.json")),
+    )
+
+    recs = out._run_cat5_worker(
+        "fast-ocr",
+        tier="tier1",
+        config_label="cpu_smoke",
+        extra=out._parse_extra_flags(["--ocr-suites", "all"]),
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=2,
+        smoke=True,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert recs == []
+
+    # Explicit `--ocr-suites puredocbench_legal_gov` must fail loudly when images are missing.
+    with pytest.raises(FileNotFoundError, match="PureDocBench"):
+        out._run_cat5_worker(
+            "fast-ocr",
+            tier="tier1",
+            config_label="cpu_smoke",
+            extra=out._parse_extra_flags(["--ocr-suites", "puredocbench_legal_gov"]),
+            lock={"datasets": {}},
+            cache_dir=tmp_path,
+            local_files_only=True,
+            max_items=2,
+            smoke=True,
+            home=tmp_path,
+            host_mem_gb=48.0,
+        )
+
+    # `public-pypdfium2` (`supports_images=False`) must skip image-only `loc_btp` entries inside `us_gov_ocr`.
+    fake_pdf = tmp_path / "fr.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4\n")
+    fake_img = tmp_path / "scan.jpg"
+    fake_img.write_bytes(b"jpg")
+    monkeypatch.setattr(
+        out,
+        "load_us_gov_ocr",
+        lambda **kw: [
+            {
+                "id": "fr:2026-1",
+                "branch": "executive",
+                "source": "govinfo_fr",
+                "pdf_path": str(fake_pdf),
+                "image_path": None,
+                "page_index": 0,
+                "text_blocks": [{"category_type": "text_block", "order": 0, "text": "Federal rule notice text."}],
+                "tables": [],
+                "equations": [],
+            },
+            {
+                "id": "loc_btp:a1",
+                "branch": "executive",
+                "source": "loc_btp",
+                "pdf_path": None,
+                "image_path": str(fake_img),
+                "text_blocks": [{"category_type": "text_block", "order": 0, "text": "Scanned letter text."}],
+                "tables": [],
+                "equations": [],
+            },
+        ],
+    )
+    pdf_calls: list[str] = []
+    img_calls: list[Any] = []
+
+    def _fake_pdf_fn(pdf_path: str | Path, **kw: Any) -> tuple[str, str, dict[str, Any]]:
+        pdf_calls.append(str(pdf_path))
+        return "Federal rule notice text.", "stop", {"generated_tokens": 5}
+
+    def _fake_img_fn(*args: Any, **kwargs: Any) -> tuple[str, str, dict[str, Any]]:
+        img_calls.append(args)
+        raise AssertionError("ocr_image_fn must not be called for supports_images=False")
+
+    fake_ad = SimpleNamespace(
+        package="public-pypdfium2",
+        default_label="pypdfium2",
+        model_family="pypdfium2-text",
+        supports_images=False,
+        supports_pdf_pages=True,
+        ocr_image_fn=_fake_img_fn,
+        ocr_pdf_page_fn=_fake_pdf_fn,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(opb, "build_public_cat5_adapter", lambda *a, **kw: fake_ad)
+    monkeypatch.setattr(opb, "stock_hf_model_files", lambda *a, **kw: [])
+
+    pdf_recs = out._run_cat5_worker(
+        "public-pypdfium2",
+        tier="tier1",
+        config_label="pypdfium2",
+        extra=out._parse_extra_flags(["--ocr-suites", "us_gov_ocr"]),
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=4,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert len(pdf_recs) == 1
+    assert pdf_recs[0]["benchmark"] == "US-Gov-OCR(1)"
+    assert len(pdf_calls) == 1 and img_calls == []
+
+
+
 

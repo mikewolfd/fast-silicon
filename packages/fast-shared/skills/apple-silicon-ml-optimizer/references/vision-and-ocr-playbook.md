@@ -130,14 +130,18 @@ Why **`OvisOCR2-8bit` (`0.85B`)** and **`NuExtract3` (`4B`)** lead local Apple S
 
 ## 6. Public OCR Benchmark & Validation Protocol (`Category 5`)
 
-All 4 pinned Category 5 suites in `configs/outcome_benchmarks.lock.json` run pure Python + NumPy evaluators (`fast_shared/outcome_eval/ocr.py` + `scripts/benchmark_outcomes.py`, zero `datasets` / `torch` / `scipy` / `rapidfuzz` / TeX binary deps):
+All `8` pinned Category 5 datasets in `configs/outcome_benchmarks.lock.json` (`24` total datasets) and the paired `us_gov_ocr` corpus run pure Python + NumPy evaluators (`fast_shared/outcome_eval/ocr.py`, `gov_corpora.py`, and `scripts/benchmark_outcomes.py`, zero `datasets` / `torch` / `scipy` / `rapidfuzz` / TeX binary deps):
 
-| Suite (`HF Repo`) | License | Tier-1 / Tier-2 | Deterministic Metrics (`s_i ∈ [0, 1]`) & Validity (`v_i`) |
+| Suite (`Repo / Source`) | License | Tier-1 / Tier-2 | Deterministic Metrics (`s_i ∈ [0, 1]`) & Validity (`v_i`) |
 |---|---|---|---|
 | **`olmocr_bench`** (`allenai/olmOCR-bench`) | `ODC-BY` | `42` / `210` pp | Binary pass rate across `present`, `absent`, `order`, `table`, canonicalized LaTeX `math`, and `baseline` + empty guard (`overall` & `overall_no_hf`). |
 | **`fintabnet_otsl`** (`docling-project/FinTabNet_OTSL`) | `CDLA-Permissive-1.0` | `30` / `150` tbls | **TEDS** (Zhang–Shasha tree edit similarity, lifting GFM pipes → canonical HTML), **TEDS-S**, **GriTS-Top**, **GriTS-Con**, **Numeric Cell F1** (`($1,250) -> -1250`). |
 | **`omnidocbench_en`** (`opendatalab/OmniDocBench`) | `Research-NonCommercial` (`code Apache-2.0`) | `24` / `120` EN pp | Composite `mean(1 - Text_NED, Reading_Order_Sim, Table_TEDS, Formula_NormSim)`; filtered to `language == "english"` for Latin-remapped vocab validation. |
 | **`cord_v2`** (`naver-clova-ix/cord-v2`) + visual **`ExtractBench`** | `CC-BY-4.0` / `Apache-2.0` | `30` / `100` rcpts | `grounded_field_f1` (Hungarian array matching + Draft-2020-12 JSON Schema) + leaf **ANLS**. |
+| **`vrdu_ad_buy`** / **`vrdu_registration`** (`google-research-datasets/vrdu`) | `CC-BY-4.0` | `20` / `100` each | Type-normalized `grounded_field_f1` + leaf **ANLS** on human KIE GT aligned to primary annotated page (`ocr` Cloud OCR tokens ignored). |
+| **`doclaynet_gov`** (`docling-project/DocLayNet-v1.2`) | `CDLA-Permissive-1.0` | `0` / `90` pp | `doclaynet_overall` (`1 - Text_NED`, reading-order concordance, header/footer leak rate) across `laws_and_regulations`, `government_tenders`, `patents` (EN/Latin filtered). |
+| **`puredocbench_legal_gov`** (`zhihengli-casia/puredocbench`) | `CC-BY-4.0` / `MIT` | `0` / `0` opt-in | `puredocbench_overall` (`03_legal_gov` English pages across `clean`, `digital`, `real` tracks with `--puredocbench-images-root`). |
+| **`us_gov_ocr`** (GovInfo `PLAW`/`BILLS`/`USCOURTS`, `FR` API, optional LoC `btp-dataset`) | `U.S. Public Domain` / `CC0` | `stage-gov` | `us_gov_overall` (`OmniDocBench` metrics + per-branch & per-source breakdowns; auto-selects `<GPOTABLE>` page on `FR`). |
 
 **Mandatory Validation Rules:**
 1. **Isolate Visual OCR vs. PDF Routing:** Run `--ocr-render-only` (`use_native_text=False`) on identical rendered PIL images when checking lossless parity vs stock `mlx_vlm`, and run `use_native_text=True` separately to measure end-to-end Tier-0/1/2 PDF `EOT`.
