@@ -167,3 +167,20 @@ The shared vision stack has been promoted into `packages/fast-shared` (with `fas
      - `speculative="off"` (AR baseline): `4,154.7 ms` wall (`2,469.9` / `1,637.0 ms` per-page), `TEDS=0.868746`, `TEDS-S=0.908472`, `Numeric Cell F1=0.929874`, `valid_markdown_rate=1.0`.
      - `speculative="vision+self"` (`draft_k=4`, clone-safe `DynamicTableRowGrammar`): **`2/2` exact text parity (`all_exact_parity=True`)**, **`3,632.8 ms` wall** (`2,117.6` / `1,082.2 ms` per-page, **`1.144×`** wall speedup), identical `TEDS=0.868746`, `TEDS-S=0.908472`, `Numeric Cell F1=0.929874`, `valid_markdown_rate=1.0`.
      - `speculative="vision+self"` + `zoom_recover=True`: `4,185.3 ms` wall (`0` zoom triggers needed on these two clean crops), identical `TEDS=0.868746` and `valid_markdown_rate=1.0`.
+
+---
+
+## 8. `B > 8` Batching, GDN/KV State Compression, Region Routing & Gov-Doc Expansion
+
+Following Sections 5–7, additional landed runtime optimizations and Category 5 Gov-Doc benchmarks include:
+
+1. **`B = 16` Vision Batching & Parallel ANE (`M4 Pro` verified):**
+   - `run_vision_batch_parallel` (`workers=4`) accelerated `n=16` `FinTabNet` `1024×512` crops **`1.592×`** (`6.04 -> 9.61 pp/s`; `9.47 pp/s` through `FastOCR.ocr_images(..., batch_size=16)`) with `16/16` exact text parity.
+   - Batched `OvisOCR2-8bit` decode (`batch_size=16`, `pack_length_waves`, `compact_hybrid_cache`, `512`-tok prefill chunking, `kv_step <= 512`) lifted `FinTabNet-OTSL(16)` **`1.663×`** (`21.621s` `0.74 pp/s` `281.6 tok/s` -> **`12.998s` `1.231 pp/s` `468.0 tok/s`**, identical `TEDS=0.8675` / `NumF1=0.8945`, `15/16` parity). Keep `B=1` `ANE+PLD` on long dense prose (`olmOCR-bench(8)` @ `150 DPI`: `73.0` vs `64.7 tok/s` `B=8` AR).
+2. **`INT8-blk32` GDN Metal State, `Auto` `q4_quarot` KV & Opt-In White-Patch Dropping (`fast-qwen3` / `fast-ocr`):**
+   - Quantizing the `18` GDN `float32` recurrent state matrices in symmetric `INT8` block-32 (`gdn_state_mode="auto"`, enabled at `B >= 8` or `B >= 4` on `<= 28 GB` hosts; `3.76×` DRAM reduction, `y_cos_dec512=0.999793`) alongside `auto` `q4_quarot` KV (`resolve_ovis_kv_mode`) and strict uniform bright-patch filtering (`drop_white_patches=True`: `(max_ch_std < 1.5) & (min_rgb >= 250) & (edge_grad_max_rgb <= 4)`, `0` false drops across `357K` blocks, `-22.2%` `FinTabNet` tokens) delivered **`160/160` exact greedy parity** (`3.57×` KV cut) on `FinTabNet` and **`100%` text parity** (`3.55×` KV cut) on `OmniDocBench` PPT.
+3. **Reading-Order PLD, `24px` Adaptive Resolution, Camera-Gated `--deskew auto`, and `--region-routing`:**
+   - Reading-order PLD with windowed cursor relocking (`1.026×–1.038×` lossless), lossless `24px`/line `adaptive_resolution=True` (`1.057×–1.140×`), camera-photo gate `is_likely_camera_photo` (`deskew="auto"` default: catches `39/39` `CORD-v2` photos for `+10.94%` recall & `1.637×` while rejecting `0/12` archive scans, `0/24` `OmniDocBench` pages, and `0/40` cropped tables), opt-in `region_routing=True` (`1.84×` on mixed prose+table with `REGION_CROP_MIN_PIXELS=1024..4096` and `allow_formula_regions=False`), and Latin-gated scientific math/footnote glyphs in the `140K` OCR subset.
+4. **3-Branch Category 5 Gov-Doc Corpus (`configs/outcome_benchmarks.lock.json` `24` Datasets + `us_gov_ocr`):**
+   - Integrated `vrdu_ad_buy`, `vrdu_registration`, `doclaynet_gov`, opt-in `puredocbench_legal_gov` (`453` `03_legal_gov` images staged on Base M5 across `clean`/`digital`/`real`; `72/72` EN resolved), and 8-source `us_gov_ocr` (`PLAW`, `BILLS`, `USCODE`, `FR` `<GPOTABLE>`, `BUDGET` `.xlsx`, `USCOURTS`, `scotus_opinions`, auto-staged LoC `btp-data`).
+   - Initial Base M5 CPU baseline (`public-pypdfium2` on `US-Gov-OCR(27)`, filtering `4` raster `loc_btp` scans) scored `1.0` on single-column `uscourts`/`scotus` yet `0.2979` overall and **`0.0` `table_teds`** (`govinfo_budget=0.0104`, `govinfo_bills=0.2073`, `govinfo_fr=0.5135`, `govinfo_uscode=0.5761`), highlighting the need for multi-column/table layout escalation rather than blind Tier-0 plain-text bypass on digital government PDFs. See [`OCR_BENCHMARKS_AND_BASELINES.md`](OCR_BENCHMARKS_AND_BASELINES.md) for setup and CLI details.
