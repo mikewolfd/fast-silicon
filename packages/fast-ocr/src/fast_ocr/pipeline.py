@@ -598,6 +598,7 @@ class AutoOCRPipeline:
         *,
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
+        batch_size: int | None = None,
     ) -> dict[int, OCRResult]:
         """Opt-in prose+table region-only VLM escalation (`region_routing=True`, formula pages excluded)."""
         if not self.region_routing or output_format != "markdown" or not sources:
@@ -661,7 +662,11 @@ class AutoOCRPipeline:
                     "speculative": crop_spec,
                     "draft_k": self.draft_k,
                     "max_tokens": crop_tok_cap,
-                    "batch_size": max(2, len(all_crops)),
+                    "batch_size": (
+                        max(2, len(all_crops))
+                        if batch_size is None
+                        else max(1, min(int(batch_size), len(all_crops)))
+                    ),
                 },
             )
             crop_results = list(batch_fn(all_crops, **batch_kw))
@@ -882,6 +887,7 @@ class AutoOCRPipeline:
                         cur_vis,
                         output_format=fmt,
                         table_mode=tmode,
+                        batch_size=bs,
                         native_pdf_texts=native_pdf_texts,
                         deskew_already_applied=self.deskew,
                     )
@@ -889,6 +895,71 @@ class AutoOCRPipeline:
                 if next_future is not None:
                     cur_vis = next_future.result()
         return results
+
+    def _dispatch_escalated_vlm(
+        self,
+        esc_srcs: Sequence[str | Path | Image.Image | np.ndarray],
+        esc_idxs: Sequence[int],
+        esc_vis: Sequence[OCRResult],
+        *,
+        output_format: OutputFormat,
+        table_mode: MarkdownTableMode,
+        batch_size: int | None = None,
+        native_pdf_texts: Mapping[int, str] | None = None,
+        deskew_override: bool | None = None,
+    ) -> list[OCRResult]:
+        """Run opt-in region routing on mixed prose+table pages, then batch remaining pages through Ovis."""
+        if not esc_srcs:
+            return []
+        eff_bs = max(1, int(batch_size)) if batch_size is not None else max(1, len(esc_srcs))
+        out: list[OCRResult | None] = [None] * len(esc_srcs)
+        rem_pos: list[int] = list(range(len(esc_srcs)))
+        rem_srcs: list[str | Path | Image.Image | np.ndarray] = list(esc_srcs)
+        rem_idxs: list[int] = [int(i) for i in esc_idxs]
+        rem_vis: list[OCRResult] = list(esc_vis)
+
+        if self.region_routing and output_format == "markdown":
+            routed_map = self._try_region_route_pages(
+                rem_srcs,
+                rem_idxs,
+                rem_vis,
+                output_format=output_format,
+                table_mode=table_mode,
+                batch_size=eff_bs,
+            )
+            if routed_map:
+                next_pos: list[int] = []
+                next_srcs: list[str | Path | Image.Image | np.ndarray] = []
+                next_idxs: list[int] = []
+                next_vis: list[OCRResult] = []
+                for local_i, (orig_pos, src, idx, v_res) in enumerate(
+                    zip(rem_pos, rem_srcs, rem_idxs, rem_vis)
+                ):
+                    if local_i in routed_map:
+                        out[orig_pos] = routed_map[local_i]
+                    else:
+                        next_pos.append(orig_pos)
+                        next_srcs.append(src)
+                        next_idxs.append(idx)
+                        next_vis.append(v_res)
+                rem_pos, rem_srcs, rem_idxs, rem_vis = next_pos, next_srcs, next_idxs, next_vis
+
+        if rem_srcs:
+            esc_nat = [native_pdf_texts.get(int(idx)) for idx in rem_idxs] if native_pdf_texts else None
+            vlm_results = self._run_ovis_batch(
+                rem_srcs,
+                page_indices=rem_idxs,
+                output_format=output_format,
+                table_mode=table_mode,
+                pre_analyses=rem_vis,
+                native_pdf_texts=esc_nat,
+                batch_size=min(eff_bs, len(rem_srcs)),
+                deskew_override=deskew_override,
+            )
+            for orig_pos, vlm_res in zip(rem_pos, vlm_results):
+                out[orig_pos] = vlm_res
+
+        return [r for r in out if r is not None]
 
     def _resolve_auto_batch(
         self,
@@ -898,6 +969,7 @@ class AutoOCRPipeline:
         *,
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
+        batch_size: int | None = None,
         native_pdf_texts: Mapping[int, str] | None = None,
         deskew_already_applied: bool = False,
     ) -> list[OCRResult]:
@@ -916,42 +988,18 @@ class AutoOCRPipeline:
             else:
                 resolved[pos] = v_res
 
-        if esc_srcs and self.region_routing and output_format == "markdown":
-            routed_map = self._try_region_route_pages(
+        if esc_srcs:
+            esc_outs = self._dispatch_escalated_vlm(
                 esc_srcs,
                 esc_idxs,
                 esc_vis,
                 output_format=output_format,
                 table_mode=table_mode,
-            )
-            if routed_map:
-                rem_pos: list[int] = []
-                rem_srcs: list[str | Path | Image.Image | np.ndarray] = []
-                rem_idxs: list[int] = []
-                rem_vis: list[OCRResult] = []
-                for local_i, (orig_pos, src, idx, v_res) in enumerate(zip(esc_pos, esc_srcs, esc_idxs, esc_vis)):
-                    if local_i in routed_map:
-                        resolved[orig_pos] = routed_map[local_i]
-                    else:
-                        rem_pos.append(orig_pos)
-                        rem_srcs.append(src)
-                        rem_idxs.append(idx)
-                        rem_vis.append(v_res)
-                esc_pos, esc_srcs, esc_idxs, esc_vis = rem_pos, rem_srcs, rem_idxs, rem_vis
-
-        if esc_srcs:
-            esc_nat = [native_pdf_texts.get(int(idx)) for idx in esc_idxs] if native_pdf_texts else None
-            vlm_results = self._run_ovis_batch(
-                esc_srcs,
-                page_indices=esc_idxs,
-                output_format=output_format,
-                table_mode=table_mode,
-                pre_analyses=esc_vis,
-                native_pdf_texts=esc_nat,
-                batch_size=max(1, len(esc_srcs)),
+                batch_size=batch_size,
+                native_pdf_texts=native_pdf_texts,
                 deskew_override=False if deskew_already_applied else None,
             )
-            for pos, vlm_res in zip(esc_pos, vlm_results):
+            for pos, vlm_res in zip(esc_pos, esc_outs):
                 resolved[pos] = vlm_res
 
         return [r for r in resolved if r is not None]
@@ -1125,15 +1173,14 @@ class AutoOCRPipeline:
                 max_pixels=max_pixels,
             )
             bs = max(1, int(batch_size))
-            esc_nat = [native_pdf_texts.get(int(idx)) for idx in hi_idxs] if native_pdf_texts else None
-            chunk_outs = self._run_ovis_batch(
+            chunk_outs = self._dispatch_escalated_vlm(
                 hi_imgs,
-                page_indices=hi_idxs,
+                hi_idxs,
+                esc_vis,
                 output_format=output_format,
                 table_mode=table_mode,
-                pre_analyses=esc_vis,
-                native_pdf_texts=esc_nat,
                 batch_size=bs,
+                native_pdf_texts=native_pdf_texts,
             )
             for res in chunk_outs:
                 by_page[res.page_index] = self._fold_pdf_overhead(

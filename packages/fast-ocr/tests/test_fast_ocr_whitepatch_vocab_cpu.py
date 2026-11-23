@@ -665,3 +665,197 @@ def test_pipeline_passes_kv_gdn_whitepatch_args_to_ovis_engine(monkeypatch: pyte
     assert seen[-1]["kv_i8"] == "auto"
     assert seen[-1]["gdn_state_mode"] == "auto"
     assert seen[-1]["drop_white_patches"] is False
+
+
+def test_ocr_images_zoom_recovery_forwards_per_item_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fast_ocr.types import OCRBox, OCRLine, OCRResult
+
+    ftok = _make_bpe_tokenizer(tmp_path)
+    img_tok_id = int(ftok.backend_tokenizer.token_to_id("<|image_pad|>"))
+
+    stub_eng = object.__new__(FastOvisOCREngine)
+    stub_eng.model_dir = tmp_path
+    stub_eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}
+    stub_eng.output_format = "markdown"
+    stub_eng.table_mode = "gfm"
+    stub_eng.strict_markdown_grammar = False
+    stub_eng.zoom_recover = True
+    stub_eng.crop_margins = False
+    stub_eng.crop_pad_px = 0
+    stub_eng.auto_orient = False
+    stub_eng.adaptive_resolution = False
+    stub_eng.deskew = False
+    stub_eng.speculative = "off"
+    stub_eng.draft_k = 4
+    stub_eng.prefill_chunk_size = 512
+    stub_eng.max_tokens = 256
+    stub_eng.loop_breaker = False
+    stub_eng.auto_loop_recover = False
+    stub_eng.kv_i8 = "auto"
+    stub_eng.gdn_state_mode = "auto"
+    stub_eng.drop_white_patches = False
+    stub_eng.image_token_id = img_tok_id
+    stub_eng.tokenizer = ftok
+    stub_eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    stub_eng._old_to_new = None
+    stub_eng._vision_prepass = None
+    stub_eng.vision_model = object()  # type: ignore[assignment]
+    stub_eng.lm = type("LM", (), {"vocab_n": ftok.vocab_size, "cfg": type("Cfg", (), {"head_dim": 256})()})()  # type: ignore[assignment]
+
+    def _fake_mm(**kw: Any):
+        return [
+            BatchedMMItemResult(
+                generated_ids=ftok.encode("ok", add_special_tokens=False),
+                prompt_tokens=16,
+                hit_eos=True,
+                hit_max_tokens=False,
+                vit_ms=1.0,
+                prefill_ms=1.0,
+                decode_ms=1.0,
+                image_grids=[(1, 4, 4)],
+            )
+            for _ in kw["images_per_item"]
+        ], {"waves": 1}
+
+    seen_zoom_prompts: list[Any] = []
+
+    def _spy_zoom(*args: Any, **kw: Any):
+        seen_zoom_prompts.append(kw.get("prompt"))
+        return str(kw.get("rendered", "")), str(kw.get("raw_text", "")), None, None
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.batched_multimodal_generate", _fake_mm)
+    monkeypatch.setattr(stub_eng, "_run_zoom_recovery", _spy_zoom)
+
+    pre = OCRResult(
+        text="row",
+        raw_text="row",
+        backend_used="apple-vision:accurate",
+        lines=(OCRLine(text="row 123", confidence=0.95, box=OCRBox(0.1, 0.1, 0.8, 0.2)),),
+    )
+    imgs = [Image.new("RGB", (64, 64), "white"), Image.new("RGB", (64, 64), "white")]
+    _ = stub_eng.ocr_images(
+        imgs,
+        prompts=["ZOOM_PROMPT_0", "ZOOM_PROMPT_1"],
+        pre_analyses=[pre, pre],
+        zoom_recover=True,
+        batch_size=2,
+    )
+    assert seen_zoom_prompts == ["ZOOM_PROMPT_0", "ZOOM_PROMPT_1"]
+
+
+def test_pipeline_region_routing_crop_batch_cap_and_pdf_triage(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fast_ocr import pipeline as pipe_mod
+    from fast_ocr.region_router import PageSegment
+    from fast_ocr.types import OCRBox, OCRLine, OCRResult, PageAnalysis
+
+    crop_batch_sizes: list[int] = []
+
+    class _FakeCropOvis:
+        def ocr_images(self, sources: Any, **kw: Any):
+            crop_batch_sizes.append(int(kw["batch_size"]))
+            return [
+                OCRResult(
+                    text=f"| h |\n| --- |\n| {i} |",
+                    raw_text=f"| h |\n| --- |\n| {i} |",
+                    backend_used="ovis:test",
+                    timings=OCRTimings(generated_tokens=8),
+                )
+                for i in range(len(sources))
+            ]
+
+    monkeypatch.setattr(
+        pipe_mod,
+        "extract_escalation_regions",
+        lambda *_a, **_kw: (
+            [
+                PageSegment(kind="prose", markdown="Intro", line_count=4),
+                PageSegment(kind="table", crop_box_px=(0, 10, 40, 30), prompt="T1", line_count=2),
+                PageSegment(kind="table", crop_box_px=(0, 30, 40, 50), prompt="T2", line_count=2),
+            ],
+            True,
+        ),
+    )
+
+    pipe = pipe_mod.AutoOCRPipeline(backend="auto", region_routing=True, ovis_engine=_FakeCropOvis())
+    vis = OCRResult(
+        text="Intro",
+        raw_text="Intro",
+        backend_used="apple-vision:accurate",
+        lines=(OCRLine(text="Intro", confidence=0.95, box=OCRBox(0.0, 0.0, 0.5, 0.1)),),
+    )
+    imgs = [Image.new("RGB", (64, 64), "white"), Image.new("RGB", (64, 64), "white")]
+    routed = pipe._try_region_route_pages(
+        imgs, [0, 1], [vis, vis], output_format="markdown", table_mode="gfm", batch_size=2
+    )
+    assert set(routed.keys()) == {0, 1}
+    assert crop_batch_sizes == [2]
+
+    # Two-stage PDF triage (`triage_dpi < dpi`) routes escalated pages through `_dispatch_escalated_vlm`
+    # so opt-in `region_routing=True` runs on re-rendered high-DPI pages and preserves order.
+    rendered_calls: list[tuple[int, list[int] | None]] = []
+
+    def _fake_render_subset(_path: Any, *, dpi: int, page_indices: Any = None, **_kw: Any):
+        idxs = [0, 1] if page_indices is None else list(page_indices)
+        rendered_calls.append((int(dpi), idxs))
+        return [Image.new("RGB", (64, 64), "white") for _ in idxs], idxs, 5.0
+
+    res_keep = OCRResult(
+        text="Clean page 0",
+        raw_text="Clean page 0",
+        backend_used="apple-vision:accurate",
+        page_index=0,
+        analysis=PageAnalysis(
+            width=64, height=64, line_count=5, char_count=40, digit_ratio=0.05,
+            currency_hits=0, mean_confidence=0.98, low_conf_line_ratio=0.0,
+            median_line_height=0.03, inferred_rotation_cw=0, ink_crop_box_px=None,
+            ink_area_ratio=0.4, estimated_columns=1, table_score=0.0,
+            needs_vlm=False, escalation_reasons=(),
+        ),
+    )
+    res_esc = OCRResult(
+        text="Table page 1",
+        raw_text="Table page 1",
+        backend_used="apple-vision:accurate",
+        page_index=1,
+        analysis=PageAnalysis(
+            width=64, height=64, line_count=6, char_count=45, digit_ratio=0.25,
+            currency_hits=1, mean_confidence=0.90, low_conf_line_ratio=0.0,
+            median_line_height=0.03, inferred_rotation_cw=0, ink_crop_box_px=None,
+            ink_area_ratio=0.4, estimated_columns=2, table_score=0.60,
+            needs_vlm=True, escalation_reasons=("financial_table",),
+        ),
+    )
+    routed_pdf_res = OCRResult(
+        text="Routed PDF table 1",
+        raw_text="Routed PDF table 1",
+        backend_used="ovis:test+ane-regions",
+        page_index=1,
+        metadata={"region_routing": {"enabled": True, "crops": 1}},
+    )
+    monkeypatch.setattr(pipe, "_render_pdf_subset", _fake_render_subset)
+    monkeypatch.setattr(pipe, "_run_vision_batch", lambda *_a, **_kw: [res_keep, res_esc])
+    seen_route_bs: list[int | None] = []
+
+    def _spy_route(srcs: Any, idxs: Any, vrs: Any, *, output_format: Any, table_mode: Any, batch_size: int | None = None):
+        seen_route_bs.append(batch_size)
+        return {0: routed_pdf_res}
+
+    monkeypatch.setattr(pipe, "_try_region_route_pages", _spy_route)
+    monkeypatch.setattr(pipe, "_run_ovis_batch", lambda *_a, **_kw: pytest.fail("Should not call full-page Ovis when region routing handled page"))
+
+    pdf_outs = pipe._run_raster_pdf_pages(
+        Path("dummy.pdf"),
+        dpi=300,
+        triage_dpi=150,
+        page_indices=None,
+        output_format="markdown",
+        table_mode="gfm",
+        batch_size=3,
+    )
+    assert rendered_calls == [(150, [0, 1]), (300, [1])]
+    assert seen_route_bs == [3]
+    assert [r.page_index for r in pdf_outs] == [0, 1]
+    assert pdf_outs[1].text == "Routed PDF table 1"
+    assert pdf_outs[1].metadata["triage_dpi"] == 150

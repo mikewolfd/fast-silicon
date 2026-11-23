@@ -2007,7 +2007,7 @@ class FastOvisOCREngine:
                     rendered=rendered,
                     raw_text=raw_text,
                     page_index=indices[i],
-                    prompt=prompt,
+                    prompt=prompt_seq[i],
                     output_format=fmt,
                     table_mode=tmode,
                     strict_markdown_grammar=strict_md,
