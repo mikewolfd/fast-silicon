@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-fast-shared = { path = "../fast-shared", editable = true }
+fast-shared = { workspace = true }
 
 [project.optional-dependencies]
 dev = [

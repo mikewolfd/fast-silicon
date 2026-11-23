@@ -24,6 +24,11 @@ docs = eng.encode_documents(["First long passage...", "Second passage..."], titl
 # Build a 6x-smaller 512d INT8 / binary+INT8 search index (uses rerank_top_r=256 when binary):
 index = eng.build_index(["First long passage...", "Second passage..."], titles=["2025 Capex Note", "Summary"])
 top_ids, top_scores = index.search(q, k=5)
+
+# Optional lazy image encoding (install extra: `uv pip install -e ".[vision]"`).
+# Text-only calls never import Pillow or load vision_tower weights (0 text overhead).
+img_index = eng.build_image_index(["page_1.png", "page_2.png"])
+page_hits, page_scores = img_index.search(eng.encode_texts("revenue table", is_query=True), k=1)
 ```
 
 ```bash
@@ -63,6 +68,12 @@ Prepending document headers when chunking Parquet windows raised 175-query legal
 
 Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum cosine similarity against the FP16 reference is `0.999998` on GPU, `0.999728` in `hetero2`, and `0.999887` on a single 24-token ANE query.
 
+### 3. Optional lazy image encoding & cross-modal retrieval (M4 Pro)
+
+With optional `[vision]` installed (`uv pip install -e ".[vision]"`), `encode_images()` and `build_image_index()` lazily load the shared `gemma4_vision` tower only when image inputs are passed (text-only workloads never import `PIL` or `fast_shared.gemma4_vision`):
+- **Stock `mlx-vlm` parity (8 Category-5 pages):** `min_cos = 0.999819` (`bf16`, `3.39 img/s` `B=1` / `2.91 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.24 GB`) and `min_cos = 0.999701` (`8bit`, `3.51 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.00 GB`).
+- **Cross-modal text-to-page retrieval (`16` Category-5 pages):** **`15/16` (`93.75%`) `Recall@1` and `0.950` `MRR` at `4.36 img/s`** (`1.59 GB` MLX / `2.98 GB` RSS) vs `FastPplx` (`14/16` `87.5%` `R@1`, `0.903` `MRR` at `2.17 img/s`, `1.85 GB` MLX / `3.51 GB` RSS) — `2.01×` faster image encoding with compact single-vector embeddings. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
+
 ## What keeps it fast
 
 | Component | How it works | Source |
@@ -84,6 +95,9 @@ Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum c
 
 # OpenAI-compatible HTTP server (/v1/embeddings with optional "dimensions")
 .venv/bin/embeddinggemma-2 serve --host 127.0.0.1 --port 8080 --dimensions 256
+
+# Optional lazy image embedding CLI (requires `[vision]` extra)
+.venv/bin/embeddinggemma-2 embed-images page_1.png page_2.png --batch-size 8 --json
 
 # Rebuild ANE bundles (optional [ane-build] extra) and run tests
 python scripts/build_ane_models.py --mode all

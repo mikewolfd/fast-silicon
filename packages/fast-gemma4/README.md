@@ -36,11 +36,15 @@ with closing(FastGemma4Engine(default_mode="gpu", mtp_drafter=None)) as engine:
 
 On the M4 Pro this printed `{'entity': 'Ocean Lab', 'topic': 'coral'}`. For compact output on disk or over the wire, serialize `item.parsed` after validation with `json.dumps(item.parsed, ensure_ascii=False, separators=(",", ":"))`.
 
+Optional lazy multimodal image support is available via the `[vision]` extra (`uv pip install -e ".[vision]"`): pass `images=[...]` and `max_soft_tokens=280` to `engine.generate(...)`. Text-only calls keep `_vision_model=None` and never import `PIL` or load vision weights (`0` text-side overhead).
+
 ## CLI, Parquet & HTTP server
 
 ```bash
 # Structured generation, resumable Parquet/JSONL extraction, and OpenAI SSE server
 .venv/bin/gemma4 generate --json 'Extract entity: Acme Cloud grew 12%.'
+# Optional lazy multimodal image input (install extra: `uv pip install -e ".[vision]"`)
+.venv/bin/gemma4 generate --image receipt.png --max-soft-tokens 280 'Transcribe totals as Markdown.'
 .venv/bin/gemma4 parquet docs.parquet out_shards/ --model-dir /ckpt \
   --schema schema.json --system-file sys.txt --max-pages 2 --max-chars 8000 --drop-text-col --resume
 .venv/bin/gemma4 extract docs.jsonl out.jsonl --schema schema.json --system-file sys.txt
@@ -74,6 +78,10 @@ On the M4 Pro this printed `{'entity': 'Ocean Lab', 'topic': 'coral'}`. For comp
 | **Shared-prefix `PrefixTree` reuse** | Zero system-KV cloning across batch slots | Up to **2.59×** faster across 4–8 shared-prefix candidates | Automatically reuses shared prompt prefixes (`>= 32` tokens). |
 | **Local 8-bit `QLoRA` adapter training** | **80.5–87.7 sup tok/s** in 4.85–6.76 GiB (`pack=1024, accum=2`) | **545.8 tok/s** packed 8-bit (`pack=2048`) | Sizing to `pack_tokens=1024, grad_accum=2, ckpt_tokens=512` eliminates 24 GB OOMs with matching loss and gradients. |
 | **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61–3.38 rollouts/s** (8.68 GB peak) | **1.81–3.15 rollouts/s** (7.11 GB vs 19.38 GB GPU critic) | Runs critic scoring on the Neural Engine concurrently with GPU rollouts and backward passes. |
+
+#### Optional lazy multimodal vision (M4 Pro quick check)
+
+On M4 Pro (`48 GB`), optional `generate(..., images=...)` leaves text-only latency and RAM unchanged (`63.09 tok/s`, `3.33 GB` MLX peak, `_vision_model=None`), while `Gemma-4 E2B-4bit` (`4.24–4.30 GB` MLX / `5.43 GB` RSS) scored `0.7665` TEDS (`@280` soft tokens, `0.170 pp/s`) → `0.8293` TEDS (`@1120`, `0.9053` NumF1) on `FinTabNet`, `1.000` schema validity (`0.2566` F1, `0.506 pp/s`, `95.9 tok/s`) on `CORD-v2`, `0.5128` (`0.364 pp/s`) on `OmniDocBench-EN(2)`, and `0.1667` on `olmOCR-bench(2)`. `E4B-bf16` (`14.9–15.1 GB` MLX / `17.05 GB` RSS, `16–29 tok/s`) lifted `olmOCR-bench(2)` to `0.500` (`3/3` `old_scans_math`) while trailing E2B on `FinTabNet` (`0.3932`) and `CORD-v2` (`0.1146`). Use `fast-ocr` (`OvisOCR2-8bit`) for dedicated document OCR and `fast-gemma4` vision for lightweight multimodal extraction/VQA. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
 
 ## Automatic hardware dispatch (`"auto"` defaults)
 
