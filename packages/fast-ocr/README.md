@@ -51,6 +51,8 @@ Measured on Apple M4 Pro (`48 GB`, `macOS 26.6`) and Base Apple M5 (`24 GB`, `ma
 | **`FinTabNet-OTSL(2)`** | **`fast-ocr` (`OvisOCR2-8bit`)** | **`0.8687` TEDS (`0.674 pp/s`)** | **`0.8687` TEDS (`0.733 pp/s`)** | **`1.22×` (M4 Pro) / `1.72×` (M5) `pp/s` vs stock `OvisOCR2`; `LightOnOCR-2` looped (`0.00`)** |
 | **`OmniDocBench-EN(2)`** | **`fast-ocr` (`OvisOCR2-8bit`)** | **`0.9093` (`0.117 pp/s`)** | **`0.9093` (`0.124 pp/s`)** | **`1.51×` (M4 Pro) / `1.53×` (M5) `pp/s` vs stock `OvisOCR2`; `2.44×`–`2.74×` M5 vs `GLM-OCR`/`LightOnOCR-2`** |
 | **Strict GFM PLD (`--strict-markdown-grammar`)** | `fast-ocr` (`vision+self`, `K=4`) | **`1.85×` decode** (`315.2 tok/s`, `6/6` parity) | **`1.144×` wall** (`2/2` parity, `0.8687` TEDS) | `DynamicTableRowGrammar.clone()` keeps PLD active under column lock; `1.11×–1.80×` on `CORD-v2` JSON |
+| **`B=16` Table Batch (`FinTabNet-OTSL(16)`)** | `fast-ocr` (`OvisOCR2-8bit`) | **`1.231 pp/s` (`468.0 tok/s`, `1.663×` vs `B=1`)** | *(pending wake)* | Identical `0.8675` TEDS & `0.8945` NumF1 (`15/16` parity, `4.362 GB` phys); `B=1` PLD remains faster on long ANE prose (`olmOCR-bench`) |
+| **Parallel ANE (`FinTabNet` `n=16`, `1024×512`)** | `AppleVisionOCR` (`workers=4`) | **`9.61 pp/s` (`1.665 s`, `1.592×`, `16/16` parity)** | *(pending wake)* | `FastOCR.ocr_images(..., batch_size=16)` runs `9.47 pp/s` with lazy `_NativeVisionRunner` reuse |
 | **Tiny table crops (`FinTabNet-OTSL(2)`)** | `AppleVisionOCR` (`ANE`) | **`0.6121` (`7.03 pp/s`)** | **`0.5914` (`25.16 pp/s`, `14.88` EOT)** | `_prepare_vision_image` upscaling fixes macOS 27.2.1 tiny-crop drops (`0.0000 -> 0.5914`) |
 
 ## Scope & License
