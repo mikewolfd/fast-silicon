@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .apple_vision import AppleVisionOCR
+from .apple_vision import (
+    AppleVisionOCR,
+    deskew_document_image,
+    detect_document_quad,
+    perspective_deskew_image,
+)
 from .markdown_struct import (
     DynamicTableRowGrammar,
     canonicalize_markdown,
@@ -19,6 +24,17 @@ from .numeric_recovery import (
     find_filtered_missing_numbers,
 )
 from .pipeline import AutoOCRPipeline, FastOCR, ocr_parquet
+from .region_router import (
+    REGION_CROP_MIN_PIXELS,
+    REGION_FORMULA_PROMPT,
+    REGION_TABLE_PROMPT,
+    PageSegment,
+    build_ordered_pld_corpus,
+    compute_adaptive_max_pixels,
+    estimate_visual_tokens,
+    extract_escalation_regions,
+    merge_region_markdown,
+)
 from .types import (
     MarkdownTableMode,
     MarkdownValidation,
@@ -50,15 +66,27 @@ __all__ = [
     "OCRTimings",
     "OutputFormat",
     "PageAnalysis",
+    "PageSegment",
     "Qwen35VisionConfig",
+    "REGION_CROP_MIN_PIXELS",
+    "REGION_FORMULA_PROMPT",
+    "REGION_TABLE_PROMPT",
     "SpeculativeMode",
     "align_json_values_to_lines",
+    "build_ordered_pld_corpus",
     "canonicalize_markdown",
+    "compute_adaptive_max_pixels",
     "compute_missing_numeric_crop_box_px",
     "compute_missing_numeric_crop_boxes_px",
+    "deskew_document_image",
+    "detect_document_quad",
+    "estimate_visual_tokens",
+    "extract_escalation_regions",
     "extract_normalized_numbers",
     "find_filtered_missing_numbers",
+    "merge_region_markdown",
     "ocr_parquet",
+    "perspective_deskew_image",
     "resolve_ocr_mlx_limits",
     "synthesize_markdown_from_lines",
     "validate_markdown",

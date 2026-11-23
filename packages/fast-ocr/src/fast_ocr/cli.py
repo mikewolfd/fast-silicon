@@ -112,6 +112,21 @@ def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool 
     p.add_argument("--no-crop", action="store_true", help="Disable tight foreground ink-bbox cropping before VLM ViT")
     p.add_argument("--no-orient", action="store_true", help="Disable automatic 90-degree orientation detection/rotation")
     p.add_argument(
+        "--no-adaptive-resolution",
+        action="store_true",
+        help="Disable lossless line-height adaptive visual resolution cap (default: enabled, 24px/line floor)",
+    )
+    p.add_argument(
+        "--deskew",
+        action="store_true",
+        help="Enable opt-in ANE perspective deskew via VNDetectDocumentSegmentationRequest (best for receipt/camera photos)",
+    )
+    p.add_argument(
+        "--region-routing",
+        action="store_true",
+        help="Enable opt-in fast prose+table region-only VLM escalation (formula pages stay full-page VLM)",
+    )
+    p.add_argument(
         "--speculative",
         choices=("auto", "off", "self", "vision+self"),
         default="auto",
@@ -133,7 +148,12 @@ def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool 
         default=None,
         help="Optional MLX buffer cache limit in GiB (default: auto host-budget cap)",
     )
-    p.add_argument("--batch-size", type=int, default=8, help="Batch size for multi-image/PDF double-buffered routing")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Batch size for multi-image/PDF batched VLM & parallel ANE routing (default: 16)",
+    )
 
 
 def _build_ocr_from_args(args: argparse.Namespace, *, backend_override: str | None = None) -> FastOCR:
@@ -149,6 +169,9 @@ def _build_ocr_from_args(args: argparse.Namespace, *, backend_override: str | No
         language_correction=(False if bool(getattr(args, "no_language_correction", False)) else None),
         crop_margins=not bool(args.no_crop),
         auto_orient=not bool(args.no_orient),
+        adaptive_resolution=not bool(getattr(args, "no_adaptive_resolution", False)),
+        deskew=bool(getattr(args, "deskew", False)),
+        region_routing=bool(getattr(args, "region_routing", False)),
         speculative=args.speculative,
         vocab_size=args.vocab_size,
         vit_quant_bits=args.vit_quant_bits,

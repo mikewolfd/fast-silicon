@@ -181,6 +181,155 @@ class _NativeVisionRunner:
             return out
 
 
+def _solve_perspective_coeffs(
+    src_quad_px: Sequence[tuple[float, float]],
+    dst_rect_px: Sequence[tuple[float, float]],
+) -> tuple[float, ...]:
+    """Solve 8-coefficient perspective transform mapping `(dst_x, dst_y) -> (src_x, src_y)` for PIL."""
+    rows: list[list[float]] = []
+    rhs: list[float] = []
+    for (sx, sy), (dx, dy) in zip(src_quad_px, dst_rect_px):
+        rows.append([dx, dy, 1.0, 0.0, 0.0, 0.0, -sx * dx, -sx * dy])
+        rhs.append(sx)
+        rows.append([0.0, 0.0, 0.0, dx, dy, 1.0, -sy * dx, -sy * dy])
+        rhs.append(sy)
+    coeffs = np.linalg.solve(np.asarray(rows, dtype=np.float64), np.asarray(rhs, dtype=np.float64))
+    return tuple(float(c) for c in coeffs.tolist())
+
+
+def _polygon_area_norm(quad: Sequence[tuple[float, float]]) -> float:
+    acc = 0.0
+    n = len(quad)
+    for i in range(n):
+        x0, y0 = quad[i]
+        x1, y1 = quad[(i + 1) % n]
+        acc += x0 * y1 - x1 * y0
+    return 0.5 * abs(acc)
+
+
+def detect_document_quad(
+    source: str | Path | Image.Image | np.ndarray,
+) -> tuple[tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]], float] | None:
+    """Detect the dominant document quadrilateral `(tl, tr, br, bl)` in top-left `[0, 1]` coords via macOS Vision ANE.
+
+    Uses public `VNDetectDocumentSegmentationRequest` with zero-leak `CFData` CGImage wrapping and zero MLX.
+    """
+    if platform.system() != "Darwin":
+        return None
+    import Foundation
+    import Quartz
+    import Vision
+    import objc
+
+    img = load_image(source)
+    w, h = img.size
+    rgb_bytes = img.tobytes()
+    with objc.autorelease_pool():
+        ns_data = Foundation.NSData.dataWithBytes_length_(rgb_bytes, len(rgb_bytes))
+        provider = Quartz.CGDataProviderCreateWithCFData(ns_data)
+        cg_img = Quartz.CGImageCreate(
+            w,
+            h,
+            8,
+            24,
+            w * 3,
+            Quartz.CGColorSpaceCreateDeviceRGB(),
+            Quartz.kCGBitmapByteOrderDefault | Quartz.kCGImageAlphaNone,
+            provider,
+            None,
+            False,
+            Quartz.kCGRenderingIntentDefault,
+        )
+        req = Vision.VNDetectDocumentSegmentationRequest.alloc().init()
+        handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_img, None)
+        done = handler.performRequests_error_([req], None)
+        ok, err = done if isinstance(done, tuple) else (bool(done), None)
+        if not ok or err is not None:
+            return None
+        results = list(req.results() or ())
+        if not results:
+            return None
+        best = max(results, key=lambda r: float(r.confidence()))
+        # Vision rectangle points use bottom-left origin; convert to top-left normalized `(x, y)`.
+        tl = (float(best.topLeft().x), 1.0 - float(best.topLeft().y))
+        tr = (float(best.topRight().x), 1.0 - float(best.topRight().y))
+        br = (float(best.bottomRight().x), 1.0 - float(best.bottomRight().y))
+        bl = (float(best.bottomLeft().x), 1.0 - float(best.bottomLeft().y))
+        return (tl, tr, br, bl), float(best.confidence())
+
+
+def perspective_deskew_image(
+    image: Image.Image,
+    quad_norm: Sequence[tuple[float, float]],
+    *,
+    min_area_frac: float = 0.15,
+    max_unwarped_area_frac: float = 0.90,
+    min_skew_offset: float = 0.025,
+) -> tuple[Image.Image, bool]:
+    """Perspective-warp `image` from top-left normalized quad `(tl, tr, br, bl)` into an upright rectangle.
+
+    Leaves already-flat, full-frame pages untouched (`(image, False)`) when `quad_norm` fills the
+    frame (`area >= max_unwarped_area_frac`) with negligible skew (`max_corner_offset < min_skew_offset`).
+    """
+    if len(quad_norm) != 4:
+        return image, False
+    area = _polygon_area_norm(quad_norm)
+    if area < float(min_area_frac) or area > 1.05:
+        return image, False
+
+    tl, tr, br, bl = [(float(x), float(y)) for x, y in quad_norm]
+    # Measure deviation from an axis-aligned rectangle covering the full canvas.
+    corner_offsets = (
+        math.hypot(tl[0] - 0.0, tl[1] - 0.0),
+        math.hypot(tr[0] - 1.0, tr[1] - 0.0),
+        math.hypot(br[0] - 1.0, br[1] - 1.0),
+        math.hypot(bl[0] - 0.0, bl[1] - 1.0),
+    )
+    edge_tilt = max(abs(tr[1] - tl[1]), abs(br[1] - bl[1]), abs(bl[0] - tl[0]), abs(br[0] - tr[0]))
+    if area >= float(max_unwarped_area_frac) and edge_tilt < float(min_skew_offset) and max(corner_offsets) < float(min_skew_offset) * 1.5:
+        return image, False
+
+    w, h = image.size
+    src_px = [(x * w, y * h) for x, y in (tl, tr, br, bl)]
+    top_w = math.hypot(src_px[1][0] - src_px[0][0], src_px[1][1] - src_px[0][1])
+    bot_w = math.hypot(src_px[2][0] - src_px[3][0], src_px[2][1] - src_px[3][1])
+    left_h = math.hypot(src_px[3][0] - src_px[0][0], src_px[3][1] - src_px[0][1])
+    right_h = math.hypot(src_px[2][0] - src_px[1][0], src_px[2][1] - src_px[1][1])
+    out_w = max(64, int(round(max(top_w, bot_w))))
+    out_h = max(64, int(round(max(left_h, right_h))))
+    dst_px = [(0.0, 0.0), (float(out_w), 0.0), (float(out_w), float(out_h)), (0.0, float(out_h))]
+    try:
+        coeffs = _solve_perspective_coeffs(src_px, dst_px)
+    except np.linalg.LinAlgError:
+        return image, False
+    warped = image.transform((out_w, out_h), Image.Transform.PERSPECTIVE, coeffs, resample=Image.Resampling.BICUBIC)
+    return warped, True
+
+
+def deskew_document_image(
+    source: str | Path | Image.Image | np.ndarray,
+    *,
+    min_confidence: float = 0.70,
+    quad_detector: Callable[[Image.Image], tuple[Sequence[tuple[float, float]], float] | None] | None = None,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Detect and perspective-deskew photographed documents/receipts via `VNDetectDocumentSegmentationRequest`."""
+    img = load_image(source)
+    det = quad_detector(img) if quad_detector is not None else detect_document_quad(img)
+    if det is None:
+        return img, {"applied": False, "reason": "no_quad_detected"}
+    quad, conf = det
+    if float(conf) < float(min_confidence):
+        return img, {"applied": False, "confidence": round(float(conf), 4), "reason": "low_confidence"}
+    warped, applied = perspective_deskew_image(img, quad)
+    return warped, {
+        "applied": applied,
+        "confidence": round(float(conf), 4),
+        "quad_norm": [[round(float(x), 4), round(float(y), 4)] for x, y in quad],
+        "orig_size": list(img.size),
+        "out_size": list(warped.size),
+    }
+
+
 def _recognize_banded_with_vectors(
     engine: Callable[[bytes, int, int], list[tuple[str, float, list[float]]]],
     rgb_bytes: bytes,

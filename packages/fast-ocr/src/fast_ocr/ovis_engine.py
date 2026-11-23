@@ -667,7 +667,10 @@ class FastOvisOCREngine:
         else:
             eff_max_pixels = 16_777_216
 
-        vi = build_qwen_vision_inputs(img, min_pixels=eff_min_pixels, max_pixels=eff_max_pixels)
+        if eff_min_pixels == 65_536 and eff_max_pixels == 16_777_216:
+            vi = build_qwen_vision_inputs(img)
+        else:
+            vi = build_qwen_vision_inputs(img, min_pixels=eff_min_pixels, max_pixels=eff_max_pixels)
         prompt_ids = self._build_prompt_ids(vi.num_visual_tokens, instruction)
         pos_3d, rope_delta = compute_mrope_positions(
             prompt_ids,
@@ -1192,6 +1195,10 @@ class FastOvisOCREngine:
             "speculative_mode": eff_spec,
             "vocab_size": int(self.lm.vocab_n),
         }
+        if eff_max_pixels < 16_777_216:
+            metadata["adaptive_max_pixels"] = int(eff_max_pixels)
+        if deskew_meta is not None:
+            metadata["deskew"] = deskew_meta
         if schema is not None and vision_res is not None:
             line_rot = (int(rot_cw) - int(vision_res.rotation_applied_cw)) % 360
             metadata["field_boxes"] = align_json_values_to_lines(
@@ -1295,6 +1302,9 @@ class FastOvisOCREngine:
                 zoom_recover=False,
                 crop_margins=False,
                 auto_orient=False,
+                adaptive_resolution=False,
+                deskew=False,
+                min_pixels=REGION_CROP_MIN_PIXELS,
                 speculative=z_spec,
                 draft_k=draft_k,
                 max_tokens=min(max_tokens, 2048),
@@ -1360,6 +1370,7 @@ class FastOvisOCREngine:
         *,
         page_indices: Sequence[int] | None = None,
         prompt: str | None = None,
+        prompts: Sequence[str | None] | None = None,
         schema: str | Mapping[str, Any] | None = None,
         output_format: OutputFormat | None = None,
         table_mode: MarkdownTableMode | None = None,
@@ -1367,6 +1378,11 @@ class FastOvisOCREngine:
         zoom_recover: bool | None = None,
         crop_margins: bool | None = None,
         auto_orient: bool | None = None,
+        adaptive_resolution: bool | None = None,
+        deskew: bool | None = None,
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
+        native_pdf_texts: Sequence[str | None] | None = None,
         speculative: SpeculativeMode | None = None,
         draft_k: int | None = None,
         max_tokens: int | None = None,
@@ -1391,28 +1407,44 @@ class FastOvisOCREngine:
         if len(pre_seq) != len(sources):
             raise ValueError(f"Expected {len(sources)} pre_analyses, got {len(pre_seq)}")
 
+        prompt_seq: list[str | None] = (
+            list(prompts) if prompts is not None else [prompt] * len(sources)
+        )
+        if len(prompt_seq) != len(sources):
+            raise ValueError(f"Expected {len(sources)} prompts, got {len(prompt_seq)}")
+
+        native_seq: list[str | None] = (
+            list(native_pdf_texts) if native_pdf_texts is not None else [None] * len(sources)
+        )
+        if len(native_seq) != len(sources):
+            raise ValueError(f"Expected {len(sources)} native_pdf_texts, got {len(native_seq)}")
+
         fmt: OutputFormat = output_format or self.output_format
         tmode: MarkdownTableMode = table_mode or self.table_mode
         strict_md = self.strict_markdown_grammar if strict_markdown_grammar is None else bool(strict_markdown_grammar)
         do_zoom = (self.zoom_recover if zoom_recover is None else bool(zoom_recover)) and (schema is None)
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
+        do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
+        do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
         spec_req: SpeculativeMode = self.speculative if speculative is None else speculative
         k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
         eff_loop_breaker = bool(getattr(self, "loop_breaker", False))
         eff_bs = 1 if batch_size is None else max(1, int(batch_size))
+        eff_min_pixels = 65_536 if min_pixels is None else max(1024, int(min_pixels))
+        eff_max_pixels = 16_777_216 if max_pixels is None else max(eff_min_pixels, int(max_pixels))
 
         # Single image or explicit B=1 path keeps double-buffered ANE Vision + B=1 PLD fast path
         if len(sources) == 1 or eff_bs <= 1:
             need_ane_prepass = do_orient or do_zoom or spec_req in ("auto", "vision+self")
-            if len(sources) == 1 or not need_ane_prepass or all(p is not None for p in pre_seq):
+            if len(sources) == 1 or do_deskew or not need_ane_prepass or all(p is not None for p in pre_seq):
                 return [
                     self.ocr_image(
                         src,
                         page_index=idx,
-                        prompt=prompt,
+                        prompt=pr_i,
                         schema=schema,
                         output_format=fmt,
                         table_mode=tmode,
@@ -1420,14 +1452,19 @@ class FastOvisOCREngine:
                         zoom_recover=do_zoom,
                         crop_margins=do_crop,
                         auto_orient=do_orient,
+                        adaptive_resolution=do_adaptive,
+                        deskew=do_deskew,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                        native_pdf_text=nat_i,
                         speculative=spec_req,
-                        draft_k=k_draft,
+                        draft_k=draft_k,
                         max_tokens=tok_cap,
                         temperature=temperature,
                         pre_analysis=pre,
                         auto_loop_recover=do_loop_recover,
                     )
-                    for src, idx, pre in zip(sources, indices, pre_seq)
+                    for src, idx, pre, pr_i, nat_i in zip(sources, indices, pre_seq, prompt_seq, native_seq)
                 ]
 
             def _run_ane(src: Any, idx: int) -> OCRResult | None:
@@ -1447,7 +1484,7 @@ class FastOvisOCREngine:
                         self.ocr_image(
                             sources[pos],
                             page_index=indices[pos],
-                            prompt=prompt,
+                            prompt=prompt_seq[pos],
                             schema=schema,
                             output_format=fmt,
                             table_mode=tmode,
@@ -1455,8 +1492,13 @@ class FastOvisOCREngine:
                             zoom_recover=do_zoom,
                             crop_margins=do_crop,
                             auto_orient=do_orient,
+                            adaptive_resolution=do_adaptive,
+                            deskew=False,
+                            min_pixels=min_pixels,
+                            max_pixels=max_pixels,
+                            native_pdf_text=native_seq[pos],
                             speculative=spec_req,
-                            draft_k=k_draft,
+                            draft_k=draft_k,
                             max_tokens=tok_cap,
                             temperature=temperature,
                             pre_analysis=cur_pre,
@@ -1476,6 +1518,17 @@ class FastOvisOCREngine:
 
         t_load0 = time.perf_counter()
         raw_imgs = [load_image(src) for src in sources]
+        deskew_metas: list[dict[str, Any] | None] = [None] * n_items
+        if do_deskew:
+            for i in range(n_items):
+                try:
+                    warped_i, d_meta = deskew_document_image(raw_imgs[i])
+                    deskew_metas[i] = d_meta
+                    if d_meta.get("applied"):
+                        raw_imgs[i] = warped_i
+                        pre_seq[i] = None
+                except Exception:
+                    deskew_metas[i] = {"applied": False, "reason": "deskew_error"}
         load_ms_each = ((time.perf_counter() - t_load0) * 1000.0) / max(1, n_items)
 
         need_batch_ane = do_orient or do_zoom or (schema is not None)
@@ -1514,6 +1567,7 @@ class FastOvisOCREngine:
         proc_imgs: list[Image.Image] = []
         rot_cws: list[int] = []
         crop_boxes: list[tuple[int, int, int, int] | None] = []
+        adaptive_caps: list[int | None] = []
         vision_ms_arr: list[float] = []
         prep_ms_arr: list[float] = []
 
@@ -1529,29 +1583,54 @@ class FastOvisOCREngine:
             crop_box: tuple[int, int, int, int] | None = None
             if do_crop:
                 im, crop_box = crop_to_ink(im, pad_px=self.crop_pad_px)
+            adap_cap: int | None = None
+            if max_pixels is None and do_adaptive and pre_i is not None and pre_i.analysis is not None:
+                apx = compute_adaptive_max_pixels(
+                    pre_i.analysis,
+                    oriented_imgs[i].size,
+                    cropped_size=im.size,
+                )
+                if apx < 16_777_216:
+                    adap_cap = apx
+                    if im.width * im.height > apx:
+                        rh, rw = smart_resize_qwen(
+                            im.height,
+                            im.width,
+                            factor=32,
+                            min_pixels=eff_min_pixels,
+                            max_pixels=apx,
+                        )
+                        if (rw, rh) != im.size:
+                            im = im.resize((rw, rh), Image.Resampling.BICUBIC)
             proc_imgs.append(im)
             rot_cws.append(rot_cw)
             crop_boxes.append(crop_box)
+            adaptive_caps.append(adap_cap)
             prep_ms_arr.append(load_ms_each + (time.perf_counter() - t_p0) * 1000.0)
 
-        if prompt is not None:
-            instruction = str(prompt)
-        elif strict_md and tmode == "gfm":
-            instruction = DEFAULT_GFM_STRICT_PROMPT
-        else:
-            instruction = DEFAULT_OVIS_PROMPT
-
-        pre_ids = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>", add_special_tokens=False)
-        suf_ids = self.tokenizer.encode(
-            f"<|vision_end|>\n{instruction}<|im_end|>\n"
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            add_special_tokens=False,
+        default_instruction = (
+            DEFAULT_GFM_STRICT_PROMPT if (strict_md and tmode == "gfm") else DEFAULT_OVIS_PROMPT
         )
+        pre_ids = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>", add_special_tokens=False)
+        suf_cache: dict[str, list[int]] = {}
+        suf_ids_per_item: list[list[int]] = []
+        for pr_i in prompt_seq:
+            inst_i = str(pr_i) if pr_i is not None else default_instruction
+            cached_suf = suf_cache.get(inst_i)
+            if cached_suf is None:
+                cached_suf = self.tokenizer.encode(
+                    f"<|vision_end|>\n{inst_i}<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    add_special_tokens=False,
+                )
+                suf_cache[inst_i] = cached_suf
+            suf_ids_per_item.append(cached_suf)
 
-        def _prompt_builder(_item_idx: int, vis_counts: list[int]) -> tuple[list[int], list[tuple[int, int]]]:
+        def _prompt_builder(item_idx: int, vis_counts: list[int]) -> tuple[list[int], list[tuple[int, int]]]:
             nv = int(vis_counts[0]) if vis_counts else 0
             s0 = len(pre_ids)
-            return pre_ids + ([self.image_token_id] * nv) + suf_ids, ([(s0, s0 + nv)] if nv > 0 else [])
+            suf_i = suf_ids_per_item[item_idx]
+            return pre_ids + ([self.image_token_id] * nv) + suf_i, ([(s0, s0 + nv)] if nv > 0 else [])
 
         json_gram: GrammarHelper | None = None
         if schema is not None:
@@ -1593,6 +1672,8 @@ class FastOvisOCREngine:
             compact_active=compact_active,
             max_pad_ratio=max_pad_ratio,
             max_wave_tokens=max_wave_tokens,
+            min_pixels=eff_min_pixels,
+            max_pixels=eff_max_pixels,
             stop_ids=self.tokenizer.stop_token_ids,
             pad_token_id=self.tokenizer.eos_token_id,
             prefill_chunk_size=min(512, int(self.prefill_chunk_size)) if self.prefill_chunk_size > 0 else 512,
@@ -1624,7 +1705,7 @@ class FastOvisOCREngine:
                 retry_res = self.ocr_image(
                     oriented_imgs[i],
                     page_index=indices[i],
-                    prompt=prompt,
+                    prompt=prompt_seq[i],
                     schema=schema,
                     output_format=fmt,
                     table_mode=tmode,
@@ -1632,8 +1713,13 @@ class FastOvisOCREngine:
                     zoom_recover=do_zoom,
                     crop_margins=retry_crop,
                     auto_orient=False,
+                    adaptive_resolution=do_adaptive,
+                    deskew=False,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                    native_pdf_text=native_seq[i],
                     speculative=spec_req,
-                    draft_k=k_draft,
+                    draft_k=draft_k,
                     max_tokens=tok_cap,
                     temperature=temperature,
                     pre_analysis=vision_res,
@@ -1735,6 +1821,10 @@ class FastOvisOCREngine:
                 "vocab_size": vocab_n,
                 "wave_stats": mm_stats,
             }
+            if adaptive_caps[i] is not None:
+                metadata["adaptive_max_pixels"] = int(adaptive_caps[i])  # type: ignore[arg-type]
+            if deskew_metas[i] is not None:
+                metadata["deskew"] = deskew_metas[i]
             if schema is not None and vision_res is not None:
                 line_rot = (int(rot_cws[i]) - int(vision_res.rotation_applied_cw)) % 360
                 metadata["field_boxes"] = align_json_values_to_lines(
@@ -1797,9 +1887,21 @@ class FastOvisOCREngine:
         zoom_recover: bool | None = None,
     ) -> list[OCRResult]:
         """Render a PDF via `pypdfium2` and run double-buffered Qwen3.5 VLM OCR across pages."""
-        rendered = render_pdf_pages(pdf_path, dpi=int(dpi), page_indices=page_indices, include_native_text=False)
-        imgs = [rp.image for rp in rendered if rp.image is not None]
-        idxs = [rp.page_index for rp in rendered if rp.image is not None]
+        rendered = render_pdf_pages(pdf_path, dpi=int(dpi), page_indices=page_indices, include_native_text=True)
+        valid_pages = [rp for rp in rendered if rp.image is not None]
+        imgs = [rp.image for rp in valid_pages]
+        idxs = [rp.page_index for rp in valid_pages]
+        nat_hints = [
+            rp.native_text.strip()
+            if (
+                rp.native_control_char_count == 0
+                and rp.native_garbled_ratio < 0.02
+                and rp.native_text
+                and len(rp.native_text.strip()) >= 20
+            )
+            else None
+            for rp in valid_pages
+        ]
         return self.ocr_images(
             imgs,
             page_indices=idxs,
@@ -1809,6 +1911,7 @@ class FastOvisOCREngine:
             table_mode=table_mode,
             strict_markdown_grammar=strict_markdown_grammar,
             zoom_recover=zoom_recover,
+            native_pdf_texts=nat_hints if any(nat_hints) else None,
         )
 
     def close(self) -> None:

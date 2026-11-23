@@ -9,18 +9,26 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 
-from .apple_vision import AppleVisionOCR, _NativeVisionRunner
+from .apple_vision import AppleVisionOCR, _NativeVisionRunner, deskew_document_image
 from .markdown_struct import canonicalize_markdown, validate_markdown
 from .preprocess import (
     DEFAULT_MAX_PDF_PIXELS,
     RenderedPDFPage,
     extract_native_pdf_text,
+    load_image,
     render_pdf_pages,
+    rotate_image_cw,
+)
+from .region_router import (
+    REGION_CROP_MIN_PIXELS,
+    PageSegment,
+    extract_escalation_regions,
+    merge_region_markdown,
 )
 from .types import (
     MarkdownTableMode,
@@ -292,6 +300,9 @@ class AutoOCRPipeline:
         language_correction: bool | None = None,
         crop_margins: bool = True,
         auto_orient: bool = True,
+        adaptive_resolution: bool = True,
+        deskew: bool = False,
+        region_routing: bool = False,
         speculative: SpeculativeMode = "auto",
         vocab_size: int | None = None,
         vit_quant_bits: int | None = None,
@@ -332,6 +343,9 @@ class AutoOCRPipeline:
         self.language_correction: bool = eff_lc
         self.crop_margins: bool = bool(crop_margins)
         self.auto_orient: bool = bool(auto_orient)
+        self.adaptive_resolution: bool = bool(adaptive_resolution)
+        self.deskew: bool = bool(deskew)
+        self.region_routing: bool = bool(region_routing)
         self.speculative: SpeculativeMode = speculative
         self.vocab_size: int | None = vocab_size
         self.vit_quant_bits: int | None = vit_quant_bits
@@ -372,6 +386,8 @@ class AutoOCRPipeline:
                 "zoom_recover": self.zoom_recover,
                 "crop_margins": self.crop_margins,
                 "auto_orient": self.auto_orient,
+                "adaptive_resolution": self.adaptive_resolution,
+                "deskew": self.deskew,
                 "speculative": self.speculative,
                 "vocab_size": self.vocab_size,
                 "vit_quant_bits": self.vit_quant_bits,
@@ -395,13 +411,29 @@ class AutoOCRPipeline:
             self._ovis = FastOvisOCREngine(**filtered)
         return self._ovis
 
+    def _maybe_deskew_source(
+        self,
+        source: str | Path | Image.Image | np.ndarray,
+    ) -> tuple[str | Path | Image.Image | np.ndarray, dict[str, Any] | None]:
+        if not self.deskew:
+            return source, None
+        try:
+            warped, info = deskew_document_image(source)
+            if info.get("applied"):
+                return warped, info
+            return source, info
+        except Exception:
+            return source, {"applied": False, "reason": "deskew_error"}
+
     def _run_vision_image(
         self,
         source: str | Path | Image.Image | np.ndarray,
         *,
         page_index: int,
         output_format: OutputFormat,
+        apply_deskew: bool = True,
     ) -> OCRResult:
+        eff_src, deskew_info = self._maybe_deskew_source(source) if apply_deskew else (source, None)
         vision = self._get_vision_ocr()
         fn = getattr(vision, "recognize_image", None)
         if fn is None:
@@ -415,7 +447,12 @@ class AutoOCRPipeline:
                 "output_format": output_format,
             },
         )
-        return fn(source, **kw)
+        res = fn(eff_src, **kw)
+        if deskew_info is not None:
+            meta = dict(res.metadata)
+            meta["deskew"] = deskew_info
+            res = replace(res, metadata=meta)
+        return res
 
     def _run_ovis_image(
         self,
@@ -425,6 +462,8 @@ class AutoOCRPipeline:
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
         pre_analysis: OCRResult | None = None,
+        native_pdf_text: str | None = None,
+        deskew_override: bool | None = None,
     ) -> OCRResult:
         ovis = self._get_ovis_engine()
         fn = getattr(ovis, "ocr_image", None)
@@ -440,12 +479,16 @@ class AutoOCRPipeline:
             "zoom_recover": self.zoom_recover,
             "crop_margins": self.crop_margins,
             "auto_orient": self.auto_orient,
+            "adaptive_resolution": self.adaptive_resolution,
+            "deskew": self.deskew if deskew_override is None else bool(deskew_override),
             "speculative": self.speculative,
             "draft_k": self.draft_k,
             "max_tokens": self.max_tokens,
         }
         if pre_analysis is not None:
             candidates["pre_analysis"] = pre_analysis
+        if native_pdf_text:
+            candidates["native_pdf_text"] = native_pdf_text
         kw = _filter_accepted_kwargs(fn, candidates)
         res = fn(source, **kw)
         return _merge_vision_prepass_timing(res, pre_analysis)
@@ -456,7 +499,13 @@ class AutoOCRPipeline:
         page_indices: Sequence[int],
         *,
         output_format: OutputFormat,
+        apply_deskew: bool = True,
     ) -> list[OCRResult]:
+        if apply_deskew and self.deskew:
+            return [
+                self._run_vision_image(src, page_index=int(idx), output_format=output_format, apply_deskew=True)
+                for src, idx in zip(sources, page_indices)
+            ]
         par = run_vision_batch_parallel(
             self._get_vision_ocr(),
             sources,
@@ -467,7 +516,7 @@ class AutoOCRPipeline:
         if par is not None:
             return par
         return [
-            self._run_vision_image(src, page_index=int(idx), output_format=output_format)
+            self._run_vision_image(src, page_index=int(idx), output_format=output_format, apply_deskew=False)
             for src, idx in zip(sources, page_indices)
         ]
 
@@ -479,7 +528,9 @@ class AutoOCRPipeline:
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
         pre_analyses: Sequence[OCRResult | None] | None = None,
+        native_pdf_texts: Sequence[str | None] | None = None,
         batch_size: int | None = None,
+        deskew_override: bool | None = None,
     ) -> list[OCRResult]:
         if not sources:
             return []
@@ -495,6 +546,8 @@ class AutoOCRPipeline:
                 "zoom_recover": self.zoom_recover,
                 "crop_margins": self.crop_margins,
                 "auto_orient": self.auto_orient,
+                "adaptive_resolution": self.adaptive_resolution,
+                "deskew": self.deskew if deskew_override is None else bool(deskew_override),
                 "speculative": self.speculative,
                 "draft_k": self.draft_k,
                 "max_tokens": self.max_tokens,
@@ -503,6 +556,8 @@ class AutoOCRPipeline:
                 candidates["batch_size"] = int(batch_size)
             if pre_analyses is not None:
                 candidates["pre_analyses"] = list(pre_analyses)
+            if native_pdf_texts is not None and any(native_pdf_texts):
+                candidates["native_pdf_texts"] = list(native_pdf_texts)
             kw = _filter_accepted_kwargs(batch_fn, candidates)
             results = list(batch_fn(list(sources), **kw))
             if pre_analyses is not None:
@@ -511,7 +566,8 @@ class AutoOCRPipeline:
 
         out: list[OCRResult] = []
         pre_seq: Sequence[OCRResult | None] = pre_analyses if pre_analyses is not None else [None] * len(sources)
-        for src, idx, pre in zip(sources, page_indices, pre_seq):
+        nat_seq: Sequence[str | None] = native_pdf_texts if native_pdf_texts is not None else [None] * len(sources)
+        for src, idx, pre, nat in zip(sources, page_indices, pre_seq, nat_seq):
             out.append(
                 self._run_ovis_image(
                     src,
@@ -519,9 +575,163 @@ class AutoOCRPipeline:
                     output_format=output_format,
                     table_mode=table_mode,
                     pre_analysis=pre,
+                    native_pdf_text=nat,
+                    deskew_override=deskew_override,
                 )
             )
         return out
+
+    def _try_region_route_pages(
+        self,
+        sources: Sequence[str | Path | Image.Image | np.ndarray],
+        page_indices: Sequence[int],
+        vision_results: Sequence[OCRResult],
+        *,
+        output_format: OutputFormat,
+        table_mode: MarkdownTableMode,
+    ) -> dict[int, OCRResult]:
+        """Opt-in prose+table region-only VLM escalation (`region_routing=True`, formula pages excluded)."""
+        if not self.region_routing or output_format != "markdown" or not sources:
+            return {}
+
+        page_plans: list[tuple[int, int, OCRResult, int, list[PageSegment], int, int]] = []
+        all_crops: list[Image.Image] = []
+        all_prompts: list[str | None] = []
+
+        for pos, (src, idx, v_res) in enumerate(zip(sources, page_indices, vision_results)):
+            if not v_res.lines:
+                continue
+            img = load_image(src)
+            rot_cw = 0
+            if self.auto_orient:
+                applied = int(v_res.rotation_applied_cw) % 360
+                if applied != 0:
+                    rot_cw = applied
+                elif v_res.analysis is not None:
+                    rot_cw = int(v_res.analysis.inferred_rotation_cw) % 360
+            oriented = rotate_image_cw(img, rot_cw) if rot_cw != 0 else img
+            line_rot = (rot_cw - int(v_res.rotation_applied_cw)) % 360
+            segs, ok = extract_escalation_regions(
+                v_res,
+                oriented.size,
+                rotation_cw=line_rot,
+                allow_formula_regions=False,
+            )
+            if not ok:
+                continue
+            start_c = len(all_crops)
+            for seg in segs:
+                if seg.kind != "prose" and seg.crop_box_px is not None:
+                    all_crops.append(oriented.crop(seg.crop_box_px))
+                    all_prompts.append(seg.prompt)
+            end_c = len(all_crops)
+            if end_c > start_c:
+                page_plans.append((pos, int(idx), v_res, rot_cw, segs, start_c, end_c))
+
+        if not page_plans:
+            return {}
+
+        ovis = self._get_ovis_engine()
+        crop_tok_cap = min(1024, self.max_tokens)
+        crop_spec: SpeculativeMode = "off" if self.speculative == "off" else "self"
+        batch_fn = getattr(ovis, "ocr_images", None)
+        if len(all_crops) >= 2 and callable(batch_fn) and _supports_kwarg(batch_fn, "prompts"):
+            batch_kw = _filter_accepted_kwargs(
+                batch_fn,
+                {
+                    "prompts": all_prompts,
+                    "output_format": "raw",
+                    "table_mode": table_mode,
+                    "strict_markdown_grammar": False,
+                    "zoom_recover": False,
+                    "crop_margins": False,
+                    "auto_orient": False,
+                    "adaptive_resolution": False,
+                    "deskew": False,
+                    "min_pixels": REGION_CROP_MIN_PIXELS,
+                    "speculative": crop_spec,
+                    "draft_k": self.draft_k,
+                    "max_tokens": crop_tok_cap,
+                    "batch_size": max(2, len(all_crops)),
+                },
+            )
+            crop_results = list(batch_fn(all_crops, **batch_kw))
+        else:
+            img_fn = getattr(ovis, "ocr_image", None) or getattr(ovis, "recognize_image", None)
+            if img_fn is None:
+                return {}
+            crop_results = []
+            for crop_im, crop_pr in zip(all_crops, all_prompts):
+                kw = _filter_accepted_kwargs(
+                    img_fn,
+                    {
+                        "prompt": crop_pr,
+                        "output_format": "raw",
+                        "table_mode": table_mode,
+                        "strict_markdown_grammar": False,
+                        "zoom_recover": False,
+                        "crop_margins": False,
+                        "auto_orient": False,
+                        "adaptive_resolution": False,
+                        "deskew": False,
+                        "min_pixels": REGION_CROP_MIN_PIXELS,
+                        "speculative": crop_spec,
+                        "draft_k": self.draft_k,
+                        "max_tokens": crop_tok_cap,
+                    },
+                )
+                crop_results.append(img_fn(crop_im, **kw))
+
+        routed: dict[int, OCRResult] = {}
+        for pos, page_idx, v_res, rot_cw, segs, start_c, end_c in page_plans:
+            sub = crop_results[start_c:end_c]
+            merged = merge_region_markdown(segs, [r.text for r in sub], table_mode=table_mode)
+            validation = validate_markdown(merged, allow_html_tables=(table_mode == "html"))
+            vis_ms = float(v_res.timings.apple_vision_ms)
+            prep_ms = sum(float(r.timings.preprocess_ms) for r in sub)
+            vit_ms = sum(float(r.timings.vit_ms) for r in sub)
+            prefill_ms = sum(float(r.timings.prefill_ms) for r in sub)
+            dec_ms = sum(float(r.timings.decode_ms) for r in sub)
+            post_ms = sum(float(r.timings.postprocess_ms) for r in sub)
+            gen_toks = sum(int(r.timings.generated_tokens) for r in sub)
+            tot_ms = vis_ms + sum(float(r.timings.total_ms) for r in sub)
+            dec_tps = (gen_toks / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
+            meta = dict(v_res.metadata)
+            meta["region_routing"] = {
+                "enabled": True,
+                "crops": len(sub),
+                "min_pixels": REGION_CROP_MIN_PIXELS,
+                "segment_kinds": [s.kind for s in segs],
+            }
+            routed[pos] = OCRResult(
+                text=merged,
+                raw_text=merged,
+                backend_used=f"{sub[0].backend_used}+ane-regions",
+                page_index=page_idx,
+                output_format=output_format,
+                table_mode=table_mode,
+                rotation_applied_cw=rot_cw,
+                lines=v_res.lines,
+                analysis=v_res.analysis,
+                markdown_validation=validation,
+                timings=OCRTimings(
+                    preprocess_ms=round(prep_ms, 3),
+                    apple_vision_ms=round(vis_ms, 3),
+                    vit_ms=round(vit_ms, 3),
+                    prefill_ms=round(prefill_ms, 3),
+                    decode_ms=round(dec_ms, 3),
+                    postprocess_ms=round(post_ms, 3),
+                    total_ms=round(tot_ms, 3),
+                    decode_tps=round(dec_tps, 2),
+                    prompt_tokens=sum(int(r.timings.prompt_tokens) for r in sub),
+                    visual_tokens=sum(int(r.timings.visual_tokens) for r in sub),
+                    generated_tokens=gen_toks,
+                    peak_memory_gb=max((float(r.timings.peak_memory_gb) for r in sub), default=0.0),
+                ),
+                finish_reason="stop",
+                metadata=meta,
+            )
+        return routed
 
     def ocr_image(
         self,
@@ -548,14 +758,39 @@ class AutoOCRPipeline:
                 pre_analysis=pre_analysis,
             )
 
-        vision_res = pre_analysis or self._run_vision_image(source, page_index=page_index, output_format=fmt)
+        eff_src, deskew_info = self._maybe_deskew_source(source) if pre_analysis is None else (source, None)
+        if pre_analysis is not None:
+            vision_res = pre_analysis
+        else:
+            vision = self._get_vision_ocr()
+            fn = getattr(vision, "recognize_image", None) or getattr(vision, "ocr_image", None)
+            if fn is None:
+                raise TypeError("Injected `vision_ocr` must provide `recognize_image` or `ocr_image`")
+            kw = _filter_accepted_kwargs(fn, {"page_index": int(page_index), "output_format": fmt})
+            vision_res = fn(eff_src, **kw)
+            if deskew_info is not None:
+                meta = dict(vision_res.metadata)
+                meta["deskew"] = deskew_info
+                vision_res = replace(vision_res, metadata=meta)
+
         if vision_res.analysis is not None and vision_res.analysis.needs_vlm:
+            if self.region_routing and fmt == "markdown":
+                routed = self._try_region_route_pages(
+                    [eff_src],
+                    [page_index],
+                    [vision_res],
+                    output_format=fmt,
+                    table_mode=tmode,
+                )
+                if 0 in routed:
+                    return routed[0]
             return self._run_ovis_image(
-                source,
+                eff_src,
                 page_index=page_index,
                 output_format=fmt,
                 table_mode=tmode,
                 pre_analysis=vision_res,
+                deskew_override=False if deskew_info is not None else None,
             )
         return vision_res
 
@@ -567,6 +802,7 @@ class AutoOCRPipeline:
         output_format: OutputFormat | None = None,
         table_mode: MarkdownTableMode | None = None,
         batch_size: int = 16,
+        native_pdf_texts: Mapping[int, str] | None = None,
     ) -> list[OCRResult]:
         """Run OCR across multiple images, parallelizing ANE pre-analysis and batching VLM escalation."""
         if not sources:
@@ -583,25 +819,32 @@ class AutoOCRPipeline:
             return self._run_vision_batch(sources, indices, output_format=fmt)
 
         if self.backend == "ovis":
+            nat_list = [native_pdf_texts.get(int(idx)) for idx in indices] if native_pdf_texts else None
             return self._run_ovis_batch(
                 sources,
                 page_indices=indices,
                 output_format=fmt,
                 table_mode=tmode,
+                native_pdf_texts=nat_list,
                 batch_size=bs,
             )
 
+        # If opt-in deskew is enabled in `auto` mode, deskew once upfront so ANE Vision and VLM share identical coordinates.
+        eff_sources: Sequence[Any] = (
+            [self._maybe_deskew_source(src)[0] for src in sources] if self.deskew else sources
+        )
+
         # `auto` mode: pipeline ANE Vision pre-analysis of batch `k + 1` while VLM runs escalated pages of batch `k`
         batches: list[tuple[Sequence[Any], list[int]]] = [
-            (sources[start : start + bs], indices[start : start + bs])
-            for start in range(0, len(sources), bs)
+            (eff_sources[start : start + bs], indices[start : start + bs])
+            for start in range(0, len(eff_sources), bs)
         ]
 
         def _vision_batch(
             batch_srcs: Sequence[str | Path | Image.Image | np.ndarray],
             batch_idxs: list[int],
         ) -> list[OCRResult]:
-            return self._run_vision_batch(batch_srcs, batch_idxs, output_format=fmt)
+            return self._run_vision_batch(batch_srcs, batch_idxs, output_format=fmt, apply_deskew=False)
 
         results: list[OCRResult] = []
         if len(batches) == 1:
@@ -612,6 +855,8 @@ class AutoOCRPipeline:
                 vis_batch,
                 output_format=fmt,
                 table_mode=tmode,
+                native_pdf_texts=native_pdf_texts,
+                deskew_already_applied=self.deskew,
             )
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -628,6 +873,8 @@ class AutoOCRPipeline:
                         cur_vis,
                         output_format=fmt,
                         table_mode=tmode,
+                        native_pdf_texts=native_pdf_texts,
+                        deskew_already_applied=self.deskew,
                     )
                 )
                 if next_future is not None:
@@ -642,6 +889,8 @@ class AutoOCRPipeline:
         *,
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
+        native_pdf_texts: Mapping[int, str] | None = None,
+        deskew_already_applied: bool = False,
     ) -> list[OCRResult]:
         resolved: list[OCRResult | None] = [None] * len(batch_srcs)
         esc_pos: list[int] = []
@@ -658,14 +907,40 @@ class AutoOCRPipeline:
             else:
                 resolved[pos] = v_res
 
+        if esc_srcs and self.region_routing and output_format == "markdown":
+            routed_map = self._try_region_route_pages(
+                esc_srcs,
+                esc_idxs,
+                esc_vis,
+                output_format=output_format,
+                table_mode=table_mode,
+            )
+            if routed_map:
+                rem_pos: list[int] = []
+                rem_srcs: list[str | Path | Image.Image | np.ndarray] = []
+                rem_idxs: list[int] = []
+                rem_vis: list[OCRResult] = []
+                for local_i, (orig_pos, src, idx, v_res) in enumerate(zip(esc_pos, esc_srcs, esc_idxs, esc_vis)):
+                    if local_i in routed_map:
+                        resolved[orig_pos] = routed_map[local_i]
+                    else:
+                        rem_pos.append(orig_pos)
+                        rem_srcs.append(src)
+                        rem_idxs.append(idx)
+                        rem_vis.append(v_res)
+                esc_pos, esc_srcs, esc_idxs, esc_vis = rem_pos, rem_srcs, rem_idxs, rem_vis
+
         if esc_srcs:
+            esc_nat = [native_pdf_texts.get(int(idx)) for idx in esc_idxs] if native_pdf_texts else None
             vlm_results = self._run_ovis_batch(
                 esc_srcs,
                 page_indices=esc_idxs,
                 output_format=output_format,
                 table_mode=table_mode,
                 pre_analyses=esc_vis,
+                native_pdf_texts=esc_nat,
                 batch_size=max(1, len(esc_srcs)),
+                deskew_override=False if deskew_already_applied else None,
             )
             for pos, vlm_res in zip(esc_pos, vlm_results):
                 resolved[pos] = vlm_res
@@ -782,6 +1057,7 @@ class AutoOCRPipeline:
         table_mode: MarkdownTableMode,
         batch_size: int,
         max_pixels: int | None = DEFAULT_MAX_PDF_PIXELS,
+        native_pdf_texts: Mapping[int, str] | None = None,
     ) -> list[OCRResult]:
         eff_triage = (
             int(triage_dpi)
@@ -803,6 +1079,7 @@ class AutoOCRPipeline:
                 output_format=output_format,
                 table_mode=table_mode,
                 batch_size=batch_size,
+                native_pdf_texts=native_pdf_texts,
             )
             return [self._fold_pdf_overhead(r, preprocess_extra_ms=per_page_ren) for r in ocr_outs]
 
@@ -839,12 +1116,14 @@ class AutoOCRPipeline:
                 max_pixels=max_pixels,
             )
             bs = max(1, int(batch_size))
+            esc_nat = [native_pdf_texts.get(int(idx)) for idx in hi_idxs] if native_pdf_texts else None
             chunk_outs = self._run_ovis_batch(
                 hi_imgs,
                 page_indices=hi_idxs,
                 output_format=output_format,
                 table_mode=table_mode,
                 pre_analyses=esc_vis,
+                native_pdf_texts=esc_nat,
                 batch_size=bs,
             )
             for res in chunk_outs:
@@ -883,6 +1162,7 @@ class AutoOCRPipeline:
             ordered_results: dict[int, OCRResult] = {}
             ordered_indices = [p.page_index for p in native_pages]
             raster_indices: list[int] = []
+            raster_native_hints: dict[int, str] = {}
             for p in native_pages:
                 eff_chars = p.native_body_char_count if p.native_body_char_count is not None else p.native_char_count
                 is_clean = p.native_control_char_count == 0 and p.native_garbled_ratio < _NATIVE_MAX_GARBLED_RATIO
@@ -895,6 +1175,8 @@ class AutoOCRPipeline:
                     )
                 else:
                     raster_indices.append(p.page_index)
+                    if is_clean and p.native_text and len(p.native_text.strip()) >= 20:
+                        raster_native_hints[p.page_index] = p.native_text.strip()
 
             if raster_indices:
                 for res in self._run_raster_pdf_pages(
@@ -906,6 +1188,7 @@ class AutoOCRPipeline:
                     table_mode=tmode,
                     batch_size=batch_size,
                     max_pixels=max_pixels,
+                    native_pdf_texts=raster_native_hints or None,
                 ):
                     ordered_results[res.page_index] = res
 
