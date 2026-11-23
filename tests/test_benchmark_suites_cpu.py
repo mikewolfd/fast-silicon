@@ -1811,19 +1811,24 @@ def test_cat5_gov_suite_routing_and_stage_gov_parser() -> None:
             "stage-gov",
             "--branches",
             "legislative,executive",
+            "--sources",
+            "uscode,budget,scotus",
             "--per-source",
             "2",
             "--year",
             "2025",
             "--loc-btp-path",
             "/tmp/btp.parquet",
+            "--no-loc-btp",
         ]
     )
     assert parsed.cmd == "stage-gov"
     assert parsed.branches == "legislative,executive"
+    assert parsed.sources == "uscode,budget,scotus"
     assert parsed.per_source == 2
     assert parsed.year == 2025
     assert parsed.loc_btp_path == "/tmp/btp.parquet"
+    assert parsed.no_loc_btp is True
 
 
 def test_cat5_optional_all_skipping_and_pypdfium_gov_filtering(

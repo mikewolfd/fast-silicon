@@ -3629,12 +3629,16 @@ def _cmd_setup_data(args: argparse.Namespace) -> int:
 
 def _cmd_stage_gov(args: argparse.Namespace) -> int:
     branches = tuple(x.strip() for x in str(args.branches).split(",") if x.strip())
+    raw_sources = str(getattr(args, "sources", "all") or "all").strip()
+    sources = None if raw_sources.lower() == "all" else tuple(x.strip() for x in raw_sources.split(",") if x.strip())
     report = stage_us_gov_ocr(
         branches=branches,
         per_source=int(args.per_source),
         year=int(args.year),
         cache_dir=args.cache_dir,
         loc_btp_path=getattr(args, "loc_btp_path", None),
+        auto_loc_btp=not bool(getattr(args, "no_loc_btp", False)),
+        sources=sources,
     )
     print(json.dumps(report, indent=2))
     return 0
@@ -4133,11 +4137,13 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--no-verify-checksums", action="store_true")
     sd.set_defaults(func=_cmd_setup_data)
 
-    sg = sub.add_parser("stage-gov", help="Stage paired Public-Domain U.S. Gov PDF<->XML benchmarks (0 GPU work)")
+    sg = sub.add_parser("stage-gov", help="Stage paired Public-Domain U.S. Gov PDF<->XML/HTML/XLSX/scan benchmarks (0 GPU work)")
     sg.add_argument("--branches", default="legislative,executive,judicial", help="Comma-separated branches")
+    sg.add_argument("--sources", default="all", help="Comma-separated sources or 'all'")
     sg.add_argument("--per-source", type=int, default=3, help="Sampled items per gov source")
     sg.add_argument("--year", type=int, default=2025, help="Target sitemap year for legislative/judicial")
     sg.add_argument("--loc-btp-path", default=None, help="Optional LoC By the People (btp-dataset) CSV/Parquet path")
+    sg.add_argument("--no-loc-btp", action="store_true", help="Skip default LoC By the People archival scan staging")
     sg.add_argument("--cache-dir", default=None)
     sg.set_defaults(func=_cmd_stage_gov)
 

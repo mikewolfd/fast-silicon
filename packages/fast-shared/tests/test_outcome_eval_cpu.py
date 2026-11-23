@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import io
 import itertools
 import json
@@ -2082,7 +2083,7 @@ def test_gov_corpora_xml_gpotable_slicing_and_manifest(tmp_path: Path) -> None:
     old_http = gc._http_get_bytes
     old_extract = gc.extract_born_digital_pdf_page_blocks
     try:
-        def _fake_http(url: str, *, timeout: int = 30) -> bytes:
+        def _fake_http(url: str, *, timeout: int = 30, headers: Any = None) -> bytes:
             if "term]=table" in url:
                 return json.dumps(fake_fr_tbl).encode("utf-8")
             if "documents.json" in url:
@@ -2114,6 +2115,7 @@ def test_gov_corpora_xml_gpotable_slicing_and_manifest(tmp_path: Path) -> None:
             year=2025,
             cache_dir=cache_root / "staged_test",
             loc_btp_path=btp_pq,
+            sources=("fr", "loc_btp"),
         )
         assert staged["n_items"] == 2
         assert staged["by_source"] == {"govinfo_fr": 1, "loc_btp": 1}
@@ -2127,6 +2129,130 @@ def test_gov_corpora_xml_gpotable_slicing_and_manifest(tmp_path: Path) -> None:
     finally:
         gc._http_get_bytes = old_http  # type: ignore[assignment]
         gc.extract_born_digital_pdf_page_blocks = old_extract  # type: ignore[assignment]
+
+
+def test_recovered_gov_sources_uscode_budget_scotus_and_btp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zipfile
+    from fast_shared.outcome_eval import gov_corpora as gc
+    from fast_shared.outcome_eval import parse_budget_xlsx_tables, parse_uscode_html_gold
+
+    # 1. USCODE HTML parser skips pre-documentid banner and extracts headings, paragraphs & spans in tables.
+    usc_htm = """<html><body>
+    <span>From GPO Banner To Ignore</span>
+    <!-- documentid:4_1 documentPDFPage:1 -->
+    <h3 class="section-head">&sect;1. Flag; stripes and stars</h3>
+    <p class="statutory-body">The flag of the United States shall be thirteen horizontal stripes.</p>
+    <table class="uscflagdimensions"><tr><th rowspan="2">Size</th><th colspan="2">Dimensions</th></tr>
+    <tr><td>1.0</td><td>1.9</td></tr></table>
+    </body></html>"""
+    usc_gold = parse_uscode_html_gold(usc_htm)
+    assert [b["text"] for b in usc_gold["text_blocks"]] == [
+        "§1. Flag; stripes and stars",
+        "The flag of the United States shall be thirteen horizontal stripes.",
+    ]
+    assert len(usc_gold["tables"]) == 1
+    assert 'rowspan="2"' in usc_gold["tables"][0]["html"] and 'colspan="2"' in usc_gold["tables"][0]["html"]
+
+    # 2. BUDGET XLSX parser handles sharedStrings, mergeCells, dot-leader cleanup, and skips web-only sheets.
+    xls_buf = io.BytesIO()
+    with zipfile.ZipFile(xls_buf, "w") as xzf:
+        xzf.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Table 10-4" r:id="rId1"/><sheet name="9-6 (web only)" r:id="rId2"/></sheets></workbook>',
+        )
+        xzf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>',
+        )
+        xzf.writestr(
+            "xl/sharedStrings.xml",
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            "<si><t>Table 10-4. Outlay Estimates</t></si>"
+            "<si><t>(in millions of dollars)</t></si>"
+            "<si><t>Program</t></si>"
+            "<si><t>Energy bonds..........</t></si>"
+            "<si><t>1/ Footnote omitted from table grid.</t></si>"
+            "</sst>",
+        )
+        xzf.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            '<row r="1"><c r="A1" t="s"><v>0</v></c></row>'
+            '<row r="2"><c r="A2" t="s"><v>1</v></c></row>'
+            '<row r="3"><c r="A3" t="s"><v>2</v></c><c r="B3"><v>2025</v></c><c r="C3"><v>2026</v></c></row>'
+            '<row r="4"><c r="A4" t="s"><v>3</v></c><c r="B4"><v>30</v></c><c r="C4"><v>40</v></c></row>'
+            '<row r="5"><c r="A5" t="s"><v>4</v></c></row>'
+            "</sheetData></worksheet>",
+        )
+        xzf.writestr(
+            "xl/worksheets/sheet2.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            '<row r="1"><c r="A1" t="s"><v>0</v></c></row>'
+            "</sheetData></worksheet>",
+        )
+    parsed_tbls = parse_budget_xlsx_tables(xls_buf.getvalue())
+    assert len(parsed_tbls) == 1
+    assert parsed_tbls[0]["table_id"] == ("10", "4")
+    tbl_html = parsed_tbls[0]["tables"][0]["html"]
+    assert "<th>Program</th><th>2025</th><th>2026</th>" in tbl_html
+    assert "<td>Energy bonds</td><td>30</td><td>40</td>" in tbl_html
+    assert "Footnote" not in tbl_html
+
+    # 3. LoC BTP accepts DownloadUrl, AssetStatus filtering, and upgrades tile.loc.gov URLs to https.
+    btp_csv = tmp_path / "btp_loc.csv"
+    btp_csv.write_text(
+        "Campaign,AssetId,AssetStatus,DownloadUrl,Transcription\n"
+        "Anthony,id1,completed,http://tile.loc.gov/image/1.jpg,My dear friend please find the enclosed resolution drafted for the convention.\n"
+        "Anthony,id2,in_progress,http://tile.loc.gov/image/2.jpg,Unfinished transcription should be skipped cleanly because review is pending.\n",
+        encoding="utf-8",
+    )
+    btp_loaded = load_loc_btp_items(btp_csv, download_images=False)
+    assert len(btp_loaded) == 1
+    assert btp_loaded[0]["id"] == "loc_btp:id1"
+    assert btp_loaded[0]["image_url"] == "https://tile.loc.gov/image/1.jpg"
+
+    # 4. SCOTUS opinion staging rejects OCR/image PDFs and accepts SHA-verified born-digital PDFs.
+    good_pdf = b"%PDF-1.4\n%scotus-valid\n"
+    bad_pdf = b"%PDF-1.4\n%scotus-scanned\n"
+    pq_path = tmp_path / "OT2026.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": ["opinions/26pdf/26a1.pdf", "opinions/26pdf/bad.pdf"],
+                "docket": ["26A1", "26A2"],
+                "title": ["Case Good", "Case Scanned"],
+                "image_pages": [0, 2],
+                "ocr_pages": [0, 2],
+                "xcheck_equal": [True, True],
+                "media_type": ["application/pdf", "application/pdf"],
+                "file": [good_pdf, bad_pdf],
+                "file_sha256": [hashlib.sha256(good_pdf).hexdigest(), hashlib.sha256(bad_pdf).hexdigest()],
+            }
+        ),
+        pq_path,
+    )
+    pq_bytes = pq_path.read_bytes()
+    pq_sha = hashlib.sha256(pq_bytes).hexdigest()
+    monkeypatch.setattr(gc, "_SCOTUS_PARQUETS", (("opinions-of-the-court/data/OT2026.parquet", pq_sha),))
+    monkeypatch.setattr(gc, "_http_get_bytes", lambda url, **kw: pq_bytes)
+    monkeypatch.setattr(
+        gc,
+        "extract_born_digital_pdf_page_blocks",
+        lambda p, page_index=0: (
+            5,
+            "SUPREME COURT OF THE UNITED STATES Slip Opinion Syllabus " * 5,
+            [{"category_type": "text_block", "order": 0, "text": "SUPREME COURT OF THE UNITED STATES Slip Opinion"}],
+        ),
+    )
+    scotus_root = tmp_path / "gov_cache" / "us_gov_ocr"
+    scotus_items = gc._stage_scotus_items(scotus_root, per_source=2)
+    assert len(scotus_items) == 1
+    assert scotus_items[0]["source"] == "scotus_opinions"
+    assert scotus_items[0]["pdf_sha256"] == hashlib.sha256(good_pdf).hexdigest()
 
 
 

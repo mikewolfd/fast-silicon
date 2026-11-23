@@ -150,7 +150,7 @@ All `8` pinned Category 5 datasets in `configs/outcome_benchmarks.lock.json` (`2
 | **`vrdu_ad_buy`** / **`vrdu_registration`** (`google-research-datasets/vrdu`) | `CC-BY-4.0` | `20` / `100` each | Type-normalized `grounded_field_f1` + leaf **ANLS** on human KIE GT aligned to primary annotated page (`ocr` Cloud OCR tokens ignored). |
 | **`doclaynet_gov`** (`docling-project/DocLayNet-v1.2`) | `CDLA-Permissive-1.0` | `0` / `90` pp | `doclaynet_overall` (`1 - Text_NED`, reading-order concordance, header/footer leak rate) across `laws_and_regulations`, `government_tenders`, `patents` (EN/Latin filtered). |
 | **`puredocbench_legal_gov`** (`zhihengli-casia/puredocbench`) | `CC-BY-4.0` / `MIT` | `0` / `0` opt-in | `puredocbench_overall` (`03_legal_gov` English pages across `clean`, `digital`, `real` tracks with `--puredocbench-images-root`). |
-| **`us_gov_ocr`** (GovInfo `PLAW`/`BILLS`/`USCOURTS`, `FR` API, optional LoC `btp-dataset`) | `U.S. Public Domain` / `CC0` | `stage-gov` | `us_gov_overall` (`OmniDocBench` metrics + per-branch & per-source breakdowns; auto-selects `<GPOTABLE>` page on `FR`). |
+| **`us_gov_ocr`** (GovInfo `PLAW`/`BILLS`/`USCODE`/`FR`/`BUDGET` `.xlsx`/`USCOURTS`, `us-scotus-opinions`, LoC `btp-data`) | `U.S. Public Domain` / `CC0` | `stage-gov` | `us_gov_overall` (`OmniDocBench` metrics + per-branch & per-source breakdowns; auto-selects `<GPOTABLE>` & OMB single-page `.xlsx` tables). |
 
 **Mandatory Validation Rules:**
 1. **Isolate Visual OCR vs. PDF Routing:** Run `--ocr-render-only` (`use_native_text=False`) on identical rendered PIL images when checking lossless parity vs stock `mlx_vlm`, and run `use_native_text=True` separately to measure end-to-end Tier-0/1/2 PDF `EOT`.
