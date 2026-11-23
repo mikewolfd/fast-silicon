@@ -1163,3 +1163,26 @@ class FastEmbeddingGemma2GPU:
         out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
         mx.eval(out)
         return np.asarray(out[0], dtype=np.float32).copy()
+
+    def encode_embedded_batch(
+        self,
+        h_mx: mx.array,
+        msk_mx: mx.array,
+        *,
+        dimensions: int | None = None,
+    ) -> np.ndarray:
+        """Execute the compiled GPU trunk + MRL projection + L2 norm on pre-embedded `[B*L, 512]` FP16 states."""
+        b_sz, seq_l = int(msk_mx.shape[0]), int(msk_mx.shape[1])
+        expected_rows = b_sz * seq_l
+        if h_mx.ndim != 2 or int(h_mx.shape[0]) != expected_rows or int(h_mx.shape[1]) != HIDDEN_SIZE:
+            raise ValueError(f"Expected h_mx shape ({expected_rows}, {HIDDEN_SIZE}), got {tuple(h_mx.shape)}")
+        h_in = h_mx.astype(mx.float16) if h_mx.dtype != mx.float16 else h_mx
+        m_in = msk_mx.astype(mx.bool_) if msk_mx.dtype != mx.bool_ else msk_mx
+        if b_sz == 1 and bool(mx.all(m_in).item()):
+            pooled = self._over_unpadded_single_compiled(h_in)
+        else:
+            pooled = self._over_compiled(h_in, m_in)
+        p = pooled @ self._proj_wT(dimensions)
+        out = p * mx.rsqrt(mx.maximum((p * p).sum(axis=-1, keepdims=True), 1e-12))
+        mx.eval(out)
+        return np.asarray(out, dtype=np.float32).copy()

@@ -301,6 +301,9 @@ class FastGemma4Engine:
 
         try:
             self.paths: Gemma4Paths = resolve_paths(home)
+            self._vision_model: Any = None
+            self._vision_init_lock = threading.Lock()
+            self.last_multimodal_stats: dict[str, Any] | None = None
             model_kwargs: dict[str, Any] = {
                 "paths": self.paths,
                 "model_dir": model_dir,
@@ -453,6 +456,7 @@ class FastGemma4Engine:
     def close(self) -> None:
         self.mtp_drafter = None
         self._mtp_drafter_auto_attempted = False
+        self._vision_model = None
         self.release_ane_resources()
         model = getattr(self, "model", None)
         if model is not None:
@@ -825,10 +829,317 @@ class FastGemma4Engine:
                 )
         return self.tokenizer.encode_batch(raw_texts, add_special_tokens=False)
 
+    def _ensure_vision_model(self) -> Any:
+        if self._vision_model is None:
+            with self._vision_init_lock:
+                if self._vision_model is None:
+                    from fast_shared.gemma4_vision import FastGemma4VisionModel
+
+                    self._vision_model = FastGemma4VisionModel.from_pretrained(self.model.model_dir, dtype=mx.bfloat16)
+        return self._vision_model
+
+    def _expand_multimodal_prompt_ids(
+        self,
+        prompt: PromptInput,
+        vis_token_counts: Sequence[int],
+        *,
+        system_prompt: str | None,
+        use_chat_template: bool,
+        enable_thinking: bool,
+        boi_token_id: int,
+        image_token_id: int,
+        eoi_token_id: int,
+    ) -> tuple[list[int], list[tuple[int, int]]]:
+        """Format Gemma-4 prompt and expand `<|image|>` / image parts into `boi + img*n + eoi`."""
+        placeholder = "\x00__FAST_GEMMA4_IMG__\x00"
+        has_explicit = False
+        if isinstance(prompt, str):
+            san = prompt.replace("<|image><|image|><image|>", "<|image|>")
+            if "<|image|>" in san:
+                has_explicit = True
+                san_prompt: PromptInput = san.replace("<|image|>", placeholder)
+            else:
+                san_prompt = prompt
+            if use_chat_template:
+                content = f"{system_prompt}\n\n{san_prompt}" if system_prompt else san_prompt
+                rendered = self.tokenizer.format_chat(
+                    [{"role": "user", "content": content}],
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            else:
+                rendered = f"{system_prompt}\n\n{san_prompt}" if system_prompt else str(san_prompt)
+        else:
+            msgs_out: list[dict[str, Any]] = []
+            for m in prompt:
+                md = dict(m)
+                raw_c = md.get("content", "")
+                if isinstance(raw_c, list):
+                    parts_out: list[dict[str, Any]] = []
+                    for part in raw_c:
+                        if isinstance(part, dict) and part.get("type") == "image":
+                            has_explicit = True
+                            parts_out.append({"type": "text", "text": placeholder})
+                        elif isinstance(part, dict):
+                            txt = str(part.get("text", ""))
+                            if "<|image|>" in txt:
+                                has_explicit = True
+                                txt = txt.replace("<|image><|image|><image|>", placeholder).replace("<|image|>", placeholder)
+                            parts_out.append({"type": "text", "text": txt})
+                    md["content"] = parts_out
+                else:
+                    s_c = str(raw_c).replace("<|image><|image|><image|>", "<|image|>")
+                    if "<|image|>" in s_c:
+                        has_explicit = True
+                        md["content"] = s_c.replace("<|image|>", placeholder)
+                msgs_out.append(md)
+            if system_prompt and msgs_out and msgs_out[0].get("role") not in ("system", "developer"):
+                msgs_out = [{"role": "system", "content": system_prompt}] + msgs_out
+            rendered = self.tokenizer.format_chat(
+                msgs_out,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+
+        expanded_ids: list[int] = []
+        vis_spans: list[tuple[int, int]] = []
+        img_cursor = 0
+
+        if has_explicit:
+            for seg_idx, seg in enumerate(rendered.split(placeholder)):
+                if seg_idx > 0 and img_cursor < len(vis_token_counts):
+                    n_vis_i = int(vis_token_counts[img_cursor])
+                    expanded_ids.append(int(boi_token_id))
+                    s0 = len(expanded_ids)
+                    expanded_ids.extend([int(image_token_id)] * n_vis_i)
+                    vis_spans.append((s0, s0 + n_vis_i))
+                    expanded_ids.append(int(eoi_token_id))
+                    img_cursor += 1
+                if seg:
+                    expanded_ids.extend(self.tokenizer.encode(seg, add_special_tokens=False))
+        else:
+            base_ids = self.tokenizer.encode(rendered, add_special_tokens=False)
+            user_hdr_ids = self.tokenizer.encode("<|turn>user\n", add_special_tokens=False)
+            insert_at = 1 if (base_ids and base_ids[0] == int(self.tokenizer.bos_token_id)) else 0
+            hdr_len = len(user_hdr_ids)
+            if hdr_len > 0:
+                for idx in range(len(base_ids) - hdr_len, -1, -1):
+                    if base_ids[idx : idx + hdr_len] == user_hdr_ids:
+                        insert_at = idx + hdr_len
+                        break
+            expanded_ids.extend(base_ids[:insert_at])
+            for n_vis_raw in vis_token_counts:
+                n_vis_i = int(n_vis_raw)
+                expanded_ids.append(int(boi_token_id))
+                s0 = len(expanded_ids)
+                expanded_ids.extend([int(image_token_id)] * n_vis_i)
+                vis_spans.append((s0, s0 + n_vis_i))
+                expanded_ids.append(int(eoi_token_id))
+                img_cursor += 1
+            expanded_ids.extend(base_ids[insert_at:])
+
+        if img_cursor != len(vis_token_counts):
+            raise ValueError(
+                f"Expected {len(vis_token_counts)} `<|image|>` marker(s) in prompt, expanded {img_cursor}"
+            )
+        return expanded_ids, vis_spans
+
+    def _prepare_multimodal_prefill(
+        self,
+        prompt: PromptInput,
+        images: Sequence[Any],
+        *,
+        system_prompt: str | None,
+        use_chat_template: bool,
+        enable_thinking: bool,
+        max_soft_tokens: int | None,
+    ) -> tuple[list[int], mx.array, float, int]:
+        from fast_shared.gemma4_vision import preprocess_gemma4_image
+
+        vis = self._ensure_vision_model()
+        eff_soft = int(max_soft_tokens) if max_soft_tokens is not None else int(vis.cfg.default_output_length)
+        vinputs = [
+            preprocess_gemma4_image(
+                im,
+                patch_size=int(vis.cfg.patch_size),
+                pooling_kernel_size=int(vis.cfg.pooling_kernel_size),
+                max_soft_tokens=eff_soft,
+            )
+            for im in images
+        ]
+        tv0 = time.perf_counter()
+        vis_feats = vis.encode_images(vinputs, batch_size=8)
+        vision_sec = time.perf_counter() - tv0
+
+        boi_id = int(getattr(vis.cfg, "boi_token_id", getattr(self.model, "boi_token_id", 255999)))
+        img_id = int(getattr(vis.cfg, "image_token_id", getattr(self.model, "image_token_id", 258880)))
+        eoi_id = int(getattr(vis.cfg, "eoi_token_id", getattr(self.model, "eoi_token_id", 258882)))
+
+        vis_counts = [int(vi.num_soft_tokens) for vi in vinputs]
+        expanded_ids, vis_spans = self._expand_multimodal_prompt_ids(
+            prompt,
+            vis_counts,
+            system_prompt=system_prompt,
+            use_chat_template=use_chat_template,
+            enable_thinking=enable_thinking,
+            boi_token_id=boi_id,
+            image_token_id=img_id,
+            eoi_token_id=eoi_id,
+        )
+
+        text_ids = [0 if int(t) == img_id else int(t) for t in expanded_ids]
+        base_emb = self.model.embed_tokens(mx.array([text_ids], dtype=mx.int32)) * self.model.embed_scale
+        parts: list[mx.array] = []
+        tok_cursor = 0
+        for img_idx, (s0, s1) in enumerate(vis_spans):
+            if s0 > tok_cursor:
+                parts.append(base_emb[:, tok_cursor:s0, :])
+            slen = s1 - s0
+            vf = vis_feats[img_idx][:slen]
+            parts.append(vf[None, :, :].astype(base_emb.dtype))
+            tok_cursor = s1
+        if tok_cursor < len(expanded_ids):
+            parts.append(base_emb[:, tok_cursor:, :])
+        inputs_embeds = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+        return expanded_ids, inputs_embeds, vision_sec, sum(vis_counts)
+
+    def _generate_multimodal(
+        self,
+        prompt: PromptInput,
+        images: Sequence[Any],
+        *,
+        system_prompt: str | None = None,
+        json_schema: str | dict[str, Any] | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+        use_chat_template: bool = True,
+        enable_thinking: bool = False,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
+        whitespace_flexible: bool | None = None,
+        max_whitespace_run: int | None = None,
+        max_soft_tokens: int | None = None,
+    ) -> GenerationItem:
+        eff_thinking = bool(enable_thinking)
+        if not eff_thinking and json_schema is None:
+            if reasoning_effort is not None and str(reasoning_effort).strip().lower() not in ("", "none", "skip", "off", "0"):
+                eff_thinking = True
+            elif reasoning_budget is not None and int(reasoning_budget) > 0:
+                eff_thinking = True
+
+        with self._gpu_lock:
+            mx.reset_peak_memory()
+            t_all0 = time.perf_counter()
+            prompt_ids, inputs_embeds, vision_sec, vis_toks = self._prepare_multimodal_prefill(
+                prompt,
+                images,
+                system_prompt=system_prompt,
+                use_chat_template=use_chat_template,
+                enable_thinking=eff_thinking,
+                max_soft_tokens=max_soft_tokens,
+            )
+            grammar = (
+                self.get_grammar(
+                    json_schema,
+                    whitespace_flexible=whitespace_flexible,
+                    max_whitespace_run=max_whitespace_run,
+                )
+                if json_schema is not None
+                else None
+            )
+            upfront_ff = list(grammar.upfront_ff) if grammar is not None else []
+            if upfront_ff:
+                up_emb = self.model.embed_tokens(mx.array([upfront_ff], dtype=mx.int32)) * self.model.embed_scale
+                prefill_ids = prompt_ids + upfront_ff
+                prefill_embeds = mx.concatenate([inputs_embeds, up_emb.astype(inputs_embeds.dtype)], axis=1)
+            else:
+                prefill_ids = prompt_ids
+                prefill_embeds = inputs_embeds
+
+            min_swa = _next_pow2(max(512, int(getattr(self.model, "window_size", 512))))
+            cap_full = max(len(prefill_ids) + int(max_tokens) + 64, 128)
+            swa_cap = max(min_swa, 512 if cap_full <= int(getattr(self.model, "window_size", 512)) else 1024)
+            pkv = self.model.prefill_prefix([])
+            cache = self.model.make_batch_cache(pkv, batch_size=1, doc_cap_full=cap_full, swa_ring_cap=swa_cap)
+            try:
+                tp0 = time.perf_counter()
+                lg0, ob0 = self.model.prefill_multimodal_b1(
+                    prefill_ids,
+                    prefill_embeds,
+                    cache,
+                    apply_softcap=True,
+                )
+                prefill_sec = time.perf_counter() - tp0
+                dec_res = run_decode_batch(
+                    self.model,
+                    self.tokenizer.stop_token_ids,
+                    grammar,
+                    lg0,
+                    ob0,
+                    cache,
+                    1,
+                    max_tokens=int(max_tokens),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    seed=int(seed),
+                    compact=False,
+                    tail_handoff_b=0,
+                    enable_ff_jump=True,
+                )
+            finally:
+                del cache
+                gc.collect()
+                if callable(getattr(mx, "clear_cache", None)):
+                    mx.clear_cache()
+
+            g_toks = list(dec_res["gen_toks"][0])
+            full_out_ids = upfront_ff + g_toks
+            txt = self.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+            parsed = None
+            is_json = False
+            is_schema = grammar is None
+            try:
+                parsed = json.loads(txt)
+                is_json = True
+            except Exception:
+                pass
+            if grammar is not None:
+                is_schema = bool(grammar.validate_token_sequence(full_out_ids))
+            finish_reason = "length" if len(g_toks) >= int(max_tokens) and not (grammar is not None and is_schema) else "stop"
+            elapsed = time.perf_counter() - t_all0
+            dec_sec = float(dec_res.get("decode_sec", 0.0))
+            self.last_multimodal_stats = {
+                "images": len(images),
+                "vision_tokens": vis_toks,
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": len(full_out_ids),
+                "vision_sec": vision_sec,
+                "prefill_sec": prefill_sec,
+                "decode_sec": dec_sec,
+                "elapsed_sec": elapsed,
+                "decode_tok_s": len(g_toks) / max(dec_sec, 1e-9),
+                "peak_gb": mx.get_peak_memory() / (1024**3),
+            }
+            return GenerationItem(
+                text=txt,
+                parsed=parsed,
+                token_ids=full_out_ids,
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(full_out_ids),
+                valid_json=is_json,
+                valid_schema=is_schema,
+                finish_reason=finish_reason,
+                telemetry=None,
+            )
+
     def generate(
         self,
         prompt: PromptInput,
         *,
+        images: Sequence[Any] | None = None,
+        max_soft_tokens: int | None = None,
         system_prompt: str | None = None,
         json_schema: str | dict[str, Any] | None = None,
         max_tokens: int = 512,
@@ -848,6 +1159,24 @@ class FastGemma4Engine:
         collect_telemetry: bool = False,
         collect_valid_lse: bool = False,
     ) -> GenerationItem:
+        if images:
+            return self._generate_multimodal(
+                prompt,
+                images,
+                system_prompt=system_prompt,
+                json_schema=json_schema,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                use_chat_template=use_chat_template,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                reasoning_budget=reasoning_budget,
+                whitespace_flexible=whitespace_flexible,
+                max_whitespace_run=max_whitespace_run,
+                max_soft_tokens=max_soft_tokens,
+            )
         res = self.generate_batch(
             [prompt],
             system_prompt=system_prompt,

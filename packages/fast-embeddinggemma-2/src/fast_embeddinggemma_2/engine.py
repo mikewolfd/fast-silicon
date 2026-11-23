@@ -414,8 +414,14 @@ class FastEmbeddingGemma2:
         mlx_cache_limit_mb: int | None = 512,
         set_wired_limit: bool = True,
         llm_coexec: bool = False,
+        vision_model_dir: str | Path | None = None,
     ) -> None:
         self.dim = resolve_embedding_dim(dimensions, max_dim=EMBED_DIM)
+        self._vision_model_dir: Path | None = (
+            Path(vision_model_dir).expanduser().resolve() if vision_model_dir else None
+        )
+        self._vision_model: Any = None
+        self._vision_init_lock = threading.Lock()
         self._openinfinity_dir: Path | None = Path(openinfinity_dir).expanduser().resolve() if openinfinity_dir else None
         if self._openinfinity_dir is not None:
             self.paths = resolve_paths(home)
@@ -767,6 +773,7 @@ class FastEmbeddingGemma2:
         if tbl is not None:
             tbl.close()
             self._token_table = None
+        self._vision_model = None
         self.ane_available = False
         self.cpu_sme_available = False
         prev = getattr(self, "_prev_wired_limit", None)
@@ -1529,6 +1536,195 @@ class FastEmbeddingGemma2:
         return CompactRetrievalIndex(
             vecs,
             doc_offsets=list(doc_offsets) if doc_offsets is not None and not isinstance(doc_offsets, np.ndarray) else doc_offsets,
+            mode=mode,
+            is_mrl_trained=self.is_mrl_trained,
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
+        )
+
+    def _resolve_vision_model_dir(self, vision_model_dir: str | Path | None = None) -> Path:
+        if vision_model_dir is not None:
+            cand = Path(vision_model_dir).expanduser().resolve()
+            if not cand.is_dir():
+                raise FileNotFoundError(f"Vision model directory does not exist: {cand}")
+            return cand
+        if self._vision_model_dir is not None:
+            if not self._vision_model_dir.is_dir():
+                raise FileNotFoundError(f"Vision model directory does not exist: {self._vision_model_dir}")
+            return self._vision_model_dir
+        env_dir = os.environ.get("FAST_EMBEDDINGGEMMA2_VISION_DIR")
+        if env_dir:
+            cand = Path(env_dir).expanduser().resolve()
+            if cand.is_dir():
+                return cand
+        from fast_shared.hf import resolve_hf_model_dir
+
+        hub_roots: list[Path] = []
+        if os.environ.get("HF_HUB_CACHE"):
+            hub_roots.append(Path(os.environ["HF_HUB_CACHE"]).expanduser().resolve())
+        if os.environ.get("HF_HOME"):
+            hub_roots.append(Path(os.environ["HF_HOME"]).expanduser().resolve() / "hub")
+        hub_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+        for repo_id in ("mlx-community/embeddinggemma-2-bf16", "mlx-community/embeddinggemma-2-8bit"):
+            repo_root = next((r / f"models--{repo_id.replace('/', '--')}" for r in hub_roots if (r / f"models--{repo_id.replace('/', '--')}").is_dir()), None)
+            if repo_root is not None:
+                snaps_dir = repo_root / "snapshots"
+                ref_main = repo_root / "refs" / "main"
+                cands: list[Path] = []
+                if ref_main.is_file():
+                    rev = ref_main.read_text(encoding="utf-8").strip()
+                    if rev:
+                        cands.append(snaps_dir / rev)
+                if snaps_dir.is_dir():
+                    cands.extend(sorted((p for p in snaps_dir.iterdir() if p.is_dir()), reverse=True))
+                for snap in cands:
+                    if (snap / "config.json").is_file() and any(snap.glob("*.safetensors")):
+                        return snap.resolve()
+            try:
+                return resolve_hf_model_dir(None, repo_id, local_files_only=True)
+            except Exception:
+                continue
+        raise FileNotFoundError(
+            "Could not locate a local EmbeddingGemma-2 checkpoint containing vision weights "
+            "(pass `vision_model_dir=...` or set FAST_EMBEDDINGGEMMA2_VISION_DIR)."
+        )
+
+    def _ensure_vision_model(self, vision_model_dir: str | Path | None = None) -> Any:
+        if self._vision_model is None or vision_model_dir is not None:
+            with self._vision_init_lock:
+                if self._vision_model is None or vision_model_dir is not None:
+                    from fast_shared.gemma4_vision import FastGemma4VisionModel
+
+                    resolved_dir = self._resolve_vision_model_dir(vision_model_dir)
+                    self._vision_model = FastGemma4VisionModel.from_pretrained(resolved_dir, dtype=mx.bfloat16)
+        return self._vision_model
+
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        texts: Sequence[str | None] | None = None,
+        max_soft_tokens: int | None = None,
+        batch_size: int = 8,
+        dimensions: int | None = None,
+        vision_model_dir: str | Path | None = None,
+    ) -> np.ndarray:
+        """Lazily encode images (and optional paired text) into `(N, dim)` L2-normalized embeddings."""
+        items = list(images)
+        eff_dim = self._resolve_dim(dimensions)
+        if texts is not None and len(texts) != len(items):
+            raise ValueError(f"texts length ({len(texts)}) must match images length ({len(items)})")
+        if not items:
+            return np.empty((0, eff_dim), dtype=np.float32)
+
+        from fast_shared.gemma4_vision import preprocess_gemma4_image
+
+        vis = self._ensure_vision_model(vision_model_dir)
+        v_cfg = getattr(vis, "cfg", None)
+        patch_sz = int(getattr(v_cfg, "patch_size", 16))
+        pool_k = int(getattr(v_cfg, "pooling_kernel_size", 3))
+        eff_soft = int(max_soft_tokens) if max_soft_tokens is not None else int(getattr(v_cfg, "default_output_length", 280))
+        boi_id = int(getattr(v_cfg, "boi_token_id", 255999))
+        eoi_id = int(getattr(v_cfg, "eoi_token_id", 258882))
+        bos_id = int(getattr(self.tokenizer, "bos_id", 2))
+        eos_id = int(getattr(self.tokenizer, "eos_id", 1))
+        pad_id = int(getattr(self.tokenizer, "pad_id", 0))
+
+        vinputs = [
+            preprocess_gemma4_image(
+                im,
+                patch_size=patch_sz,
+                pooling_kernel_size=pool_k,
+                max_soft_tokens=eff_soft,
+            )
+            for im in items
+        ]
+
+        bs_cap = max(1, int(batch_size))
+        n_items = len(items)
+        tok_lists: list[list[int]] = []
+        raw_texts = [t for t in texts] if texts is not None else []
+        encoded_texts: list[list[int] | None] = [None] * n_items
+        if raw_texts and any(t for t in raw_texts):
+            non_empty_idxs = [idx for idx, t in enumerate(raw_texts) if t]
+            enc_batch = self.tokenizer.encode_batch([str(raw_texts[idx]) for idx in non_empty_idxs])
+            for idx, tids in zip(non_empty_idxs, enc_batch):
+                seq = [int(tok) for tok in tids]
+                if seq and seq[0] == bos_id:
+                    seq = seq[1:]
+                if seq and seq[-1] == eos_id:
+                    seq = seq[:-1]
+                encoded_texts[idx] = seq
+
+        for i, vi in enumerate(vinputs):
+            n_vis = int(vi.num_soft_tokens)
+            seq = [bos_id, boi_id] + ([pad_id] * n_vis) + [eoi_id]
+            txt_toks = encoded_texts[i]
+            if txt_toks:
+                room = max(0, MAX_SEQ_LEN - len(seq) - 1)
+                seq.extend(txt_toks[:room])
+            seq.append(eos_id)
+            tok_lists.append(seq)
+
+        with self._gpu_lock:
+            gpu = self.gpu
+            vis_feats = vis.encode_images(vinputs, batch_size=bs_cap)
+            outs = np.empty((n_items, eff_dim), dtype=np.float32)
+            for c0 in range(0, n_items, bs_cap):
+                c1 = min(n_items, c0 + bs_cap)
+                b_cur = c1 - c0
+                chunk_seqs = tok_lists[c0:c1]
+                max_sl = max(len(s) for s in chunk_seqs)
+                l_pad = max(64, ((max_sl + 63) // 64) * 64)
+                ids_np = np.full((b_cur, l_pad), -1, dtype=np.int32)
+                msk_np = np.zeros((b_cur, l_pad), dtype=np.bool_)
+                for b_idx, seq in enumerate(chunk_seqs):
+                    sl = min(len(seq), l_pad)
+                    ids_np[b_idx, :sl] = seq[:sl]
+                    msk_np[b_idx, :sl] = True
+                h_np = gpu.token_table.gather_scaled_f16(ids_np.reshape(b_cur * l_pad)).reshape(
+                    b_cur, l_pad, HIDDEN_SIZE
+                )
+                for b_idx in range(b_cur):
+                    n_vis = int(vinputs[c0 + b_idx].num_soft_tokens)
+                    vf = vis_feats[c0 + b_idx]
+                    vf_np = np.asarray(vf.astype(mx.float16) if isinstance(vf, mx.array) else vf, dtype=np.float16)
+                    h_np[b_idx, 2 : 2 + n_vis, :] = vf_np[:n_vis]
+                outs[c0:c1] = gpu.encode_embedded_batch(
+                    mx.array(h_np.reshape(b_cur * l_pad, HIDDEN_SIZE)),
+                    mx.array(msk_np),
+                    dimensions=eff_dim,
+                )
+            return outs
+
+    def build_image_index(
+        self,
+        images: Sequence[Any],
+        *,
+        texts: Sequence[str | None] | None = None,
+        max_soft_tokens: int | None = None,
+        batch_size: int = 8,
+        mode: IndexMode = "auto",
+        mrl_dim: int | None = None,
+        binary_bits: int | None = None,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+        vision_model_dir: str | Path | None = None,
+    ) -> CompactRetrievalIndex:
+        """Build a `CompactRetrievalIndex` over visual embeddings of images (plus optional captions)."""
+        vecs = self.encode_images(
+            images,
+            texts=texts,
+            max_soft_tokens=max_soft_tokens,
+            batch_size=batch_size,
+            dimensions=EMBED_DIM,
+            vision_model_dir=vision_model_dir,
+        )
+        return CompactRetrievalIndex(
+            vecs,
             mode=mode,
             is_mrl_trained=self.is_mrl_trained,
             mrl_dim=mrl_dim,

@@ -402,6 +402,29 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_embed_images(args: argparse.Namespace) -> int:
+    import json
+
+    eng = _make_engine(args)
+    try:
+        vecs = eng.encode_images(
+            args.images,
+            max_soft_tokens=args.max_soft_tokens,
+            batch_size=args.batch_size,
+            dimensions=args.dimensions,
+            vision_model_dir=args.vision_model_dir,
+        )
+        if args.json:
+            print(json.dumps({"count": int(vecs.shape[0]), "dim": int(vecs.shape[1]), "embeddings": vecs.tolist()}))
+        else:
+            for path, row in zip(args.images, vecs):
+                preview = " ".join(f"{float(v):.4f}" for v in row[:8])
+                print(f"{path}\tdim={len(row)}\t[{preview} ...]")
+        return 0
+    finally:
+        eng.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="embeddinggemma-2", description="Apple Silicon fast-embeddinggemma-2 CLI")
     p.add_argument("--home", default=None, help="Override FAST_EMBEDDINGGEMMA2_HOME directory")
@@ -415,6 +438,17 @@ def build_parser() -> argparse.ArgumentParser:
     em = sub.add_parser("embed", help="Embed text arguments or --stdin lines")
     add_embed_arguments(em, mode_choices=_MODES, default_mode="hetero", allow_doc_prefix=True, allow_dimensions=True)
     em.set_defaults(func=lambda a: run_embed_command(a, _make_engine))
+
+    ei = sub.add_parser("embed-images", help="Embed image files using lazy vision tower")
+    ei.add_argument("images", nargs="+", help="Image file paths to encode")
+    ei.add_argument("--vision-model-dir", default=None, help="Override HF/MLX directory with vision weights")
+    ei.add_argument("--max-soft-tokens", type=int, default=None, help="Soft vision token budget per image")
+    ei.add_argument("--batch-size", type=int, default=8, help="Batch size for ViT and trunk execution")
+    ei.add_argument("--dimensions", type=int, default=None, help="Output MRL embedding dimension")
+    ei.add_argument("--mode", choices=_MODES, default="gpu")
+    ei.add_argument("--no-warmup", action="store_true", help="Skip text shape warmup before encoding images")
+    ei.add_argument("--json", action="store_true", help="Emit full JSON output")
+    ei.set_defaults(func=_cmd_embed_images)
 
     pq_p = sub.add_parser("parquet", help="Stream-embed a Parquet file, directory, or glob")
     add_parquet_arguments(

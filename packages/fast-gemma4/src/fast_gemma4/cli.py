@@ -121,6 +121,8 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         spec = True if args.speculative else (False if args.no_speculative else None)
         item = eng.generate(
             prompt,  # type: ignore[arg-type]
+            images=getattr(args, "image", None),
+            max_soft_tokens=getattr(args, "max_soft_tokens", None),
             system_prompt=sys_txt,
             json_schema=schema_str,
             max_tokens=args.max_tokens,
@@ -522,6 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--system", default=None)
     gn.add_argument("--system-file", default=None)
     gn.add_argument("--messages-json", default=None)
+    gn.add_argument("--image", action="append", default=None, help="Attach image file path (repeatable)")
+    gn.add_argument("--max-soft-tokens", type=int, default=None, help="Soft vision token budget per image")
     gn.add_argument("--schema", default=None, help="Path to JSON Schema file")
     gn.add_argument("--max-tokens", type=int, default=512)
     gn.add_argument("--temperature", type=float, default=0.0)

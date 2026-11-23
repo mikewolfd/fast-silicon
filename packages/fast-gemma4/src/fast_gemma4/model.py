@@ -982,6 +982,10 @@ class FastGemma4Model:
         self.swa_head_dim = int(tcfg.get("head_dim", 256))
         self.full_head_dim = int(tcfg.get("global_head_dim") or self.swa_head_dim)
         self.tie_word_embeddings = bool(tcfg.get("tie_word_embeddings", cfg.get("tie_word_embeddings", True)))
+        self.use_bidirectional_vision = bool(tcfg.get("use_bidirectional_attention") == "vision")
+        self.boi_token_id = int(cfg.get("boi_token_id", 255999))
+        self.image_token_id = int(cfg.get("image_token_id", cfg.get("image_token_index", 258880)))
+        self.eoi_token_id = int(cfg.get("eoi_token_id", 258882))
 
         sf_files = sorted(self.model_dir.glob("model*.safetensors"))
         if not sf_files:
@@ -3737,3 +3741,389 @@ class FastGemma4Model:
         out_p.parent.mkdir(parents=True, exist_ok=True)
         np.savez(out_p, **arrays)
         return out_p
+
+    # ------------------------------------------------------------------
+    # Lazy Multimodal Prefill (Isolated from Text-Only Kernels & Decode)
+    # ------------------------------------------------------------------
+    def _compute_pli_from_embeds(
+        self,
+        inputs_embeds: mx.array,
+        ple_toks: mx.array,
+        *,
+        early14: bool = False,
+    ) -> mx.array | None:
+        """Compute per-layer inputs from pre-scattered `inputs_embeds` and text-only `ple_toks`."""
+        if getattr(self, "ple_dim", 256) <= 0:
+            return None
+        b_sz, seq_l = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+        if early14:
+            if self._n_early_pli_layers <= 0:
+                return None
+            n_l = self._n_early_pli_layers
+            n_cols = n_l * self.ple_dim
+            if getattr(self, "_ple_mmap_i8", None) is not None:
+                pli_tok = self._gather_mmap_ple_rows(ple_toks, n_cols)
+            else:
+                etpl = self.embed_tokens_per_layer
+                assert etpl is not None
+                if self._etpl_14_groups > 0:
+                    w_sub = etpl.weight[ple_toks][..., : self._etpl_14_wcols]
+                    s_sub = etpl.scales[ple_toks][..., : self._etpl_14_groups]
+                    b_sub = etpl.biases[ple_toks][..., : self._etpl_14_groups] if etpl.biases is not None else None
+                    pli_tok = mx.dequantize(
+                        w_sub,
+                        scales=s_sub,
+                        biases=b_sub,
+                        group_size=etpl.group_size,
+                        bits=etpl.bits,
+                        mode=etpl.mode,
+                    ) * self.embed_tokens_per_layer_scale
+                else:
+                    raw_etpl = etpl(ple_toks)[..., :n_cols] if isinstance(etpl, nn.QuantizedEmbedding) else etpl.weight[ple_toks][..., :n_cols]
+                    pli_tok = raw_etpl.astype(self.act_dtype) * self.embed_tokens_per_layer_scale
+            pli_tok = pli_tok.reshape(b_sz, seq_l, n_l, self.ple_dim)
+            assert self.pli_proj_14 is not None
+            pli_mod = (self.pli_proj_14(inputs_embeds) * self.per_layer_projection_scale).reshape(
+                b_sz, seq_l, n_l, self.ple_dim
+            )
+            pli_mod = mx.fast.rms_norm(pli_mod, self.per_layer_projection_norm_w, self.eps)
+            return (pli_mod + pli_tok) * self.per_layer_input_scale
+
+        tot_cols = self.num_layers * self.ple_dim
+        if getattr(self, "_ple_mmap_i8", None) is not None:
+            pli_raw = self._gather_mmap_ple_rows(ple_toks, tot_cols).reshape(b_sz, seq_l, self.num_layers, self.ple_dim)
+        else:
+            assert self.embed_tokens_per_layer is not None
+            pli_raw = (self.embed_tokens_per_layer(ple_toks) * self.embed_tokens_per_layer_scale).reshape(
+                b_sz, seq_l, self.num_layers, self.ple_dim
+            )
+        assert self.per_layer_model_projection is not None
+        pmp_out = self.per_layer_model_projection(inputs_embeds)
+        proj = (pmp_out * self.per_layer_projection_scale).reshape(b_sz, seq_l, self.num_layers, self.ple_dim)
+        proj = mx.fast.rms_norm(proj, self.per_layer_projection_norm_w, self.eps)
+        return (proj + pli_raw) * self.per_layer_input_scale
+
+    def _build_vision_sdpa_mask(
+        self,
+        q_start: int,
+        q_len: int,
+        k_start: int,
+        kv_len: int,
+        vis_group_ids: np.ndarray,
+        *,
+        is_full: bool,
+    ) -> mx.array:
+        """Build `0.0 / -inf` `act_dtype` mask combining causal/SWA rules with same-image bidirectional overlay."""
+        q_pos = np.arange(q_start, q_start + q_len, dtype=np.int32)[:, None]
+        k_pos = np.arange(k_start, k_start + kv_len, dtype=np.int32)[None, :]
+        allowed = q_pos >= k_pos
+        if not is_full:
+            allowed = allowed & ((q_pos - k_pos) < int(self.window_size))
+
+        total_g = int(vis_group_ids.shape[0])
+        q_clamped = np.clip(np.arange(q_start, q_start + q_len, dtype=np.int32), 0, max(total_g - 1, 0))
+        q_valid = (np.arange(q_start, q_start + q_len, dtype=np.int32) >= 0) & (
+            np.arange(q_start, q_start + q_len, dtype=np.int32) < total_g
+        )
+        q_gid = np.where(q_valid, vis_group_ids[q_clamped], -1)[:, None]
+
+        k_idx = np.arange(k_start, k_start + kv_len, dtype=np.int32)
+        k_valid = (k_idx >= 0) & (k_idx < total_g)
+        k_gid = np.where(k_valid, vis_group_ids[np.clip(k_idx, 0, max(total_g - 1, 0))], -1)[None, :]
+
+        same_block = (q_gid >= 0) & (q_gid == k_gid)
+        if not is_full:
+            same_block = same_block & (np.abs(q_pos - k_pos) < int(self.window_size))
+        allowed = allowed | same_block
+        zero = mx.array(0.0, dtype=self.act_dtype)
+        neg_inf = mx.array(-float("inf"), dtype=self.act_dtype)
+        return mx.where(mx.array(allowed, dtype=mx.bool_), zero, neg_inf)
+
+    def _forward_step_embeds_b1(
+        self,
+        inputs_embeds: mx.array,
+        ple_toks: mx.array,
+        cache: dict[str, Any],
+        off_b: mx.array,
+        *,
+        apply_softcap: bool = True,
+    ) -> mx.array:
+        l_sys = cache["l_sys"]
+        k_sys_l = cache["k_sys"]
+        v_sys_l = cache["v_sys"]
+        doc_layers = cache["layers"]
+
+        h = inputs_embeds.astype(self.act_dtype)
+        pli = self._compute_pli_from_embeds(h, ple_toks, early14=False)
+        x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
+        default_n_q = getattr(self, "n_q_heads", 8)
+        default_n_kv = getattr(self, "n_kv_heads", 1)
+
+        for i, l in enumerate(self.layers):
+            kv_idx = l["prev_kv"]
+            c = doc_layers[kv_idx]
+            cap = c["cap"]
+            ring_cap = cap if c["ring"] else 0
+            n_q = l.get("n_q_heads", default_n_q)
+            n_kv = l.get("n_kv_heads", default_n_kv)
+
+            if not l["is_shared"]:
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
+                q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
+                    qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
+                )
+                scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
+            else:
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
+                q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
+
+            if l["is_full"]:
+                att = mqa8_sdpa_prefix_ragged(
+                    q_rot,
+                    k_sys_l[kv_idx],
+                    v_sys_l[kv_idx],
+                    c["k"],
+                    c["v"],
+                    off_b,
+                    window_size=0,
+                    doc_ring_cap=0,
+                    n_splits=cache["ns_full"],
+                    meta=cache["meta_full"],
+                    vec4_reduce=self.vec4_reduce,
+                )
+            else:
+                att = mqa8_sdpa_prefix_ragged(
+                    q_rot,
+                    k_sys_l[kv_idx],
+                    v_sys_l[kv_idx],
+                    c["k"],
+                    c["v"],
+                    off_b,
+                    window_size=self.window_size,
+                    doc_ring_cap=cap,
+                    n_splits=cache["ns_swa"],
+                    meta=cache["meta_swa"],
+                    vec4_reduce=self.vec4_reduce,
+                )
+            attn_out = self._apply_qlinear(l, "o_proj", att)
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
+
+        cache["_last_x_in"] = x_in
+        return self._apply_lm_head(x_in, apply_softcap=apply_softcap)
+
+    def prefill_multimodal_b1(
+        self,
+        prompt_ids: Sequence[int],
+        inputs_embeds: mx.array,
+        cache: dict[str, Any],
+        *,
+        image_token_id: int | None = None,
+        chunk_sz: int = 256,
+        apply_softcap: bool = True,
+    ) -> tuple[mx.array, mx.array]:
+        """Prefill `[1, L, H]` multimodal prompt into `batch_size=1` cache and emit last-token logits."""
+        if int(cache["batch_size"]) != 1:
+            raise ValueError(f"prefill_multimodal_b1 requires cache batch_size=1, got {cache['batch_size']}")
+        seq_len = len(prompt_ids)
+        if seq_len <= 0 or int(inputs_embeds.shape[1]) != seq_len:
+            raise ValueError(f"Mismatched prompt_ids len ({seq_len}) vs inputs_embeds ({inputs_embeds.shape})")
+
+        l_sys = int(cache["l_sys"])
+        k_sys_l = cache["k_sys"]
+        v_sys_l = cache["v_sys"]
+        doc_layers = cache["layers"]
+        default_n_q = getattr(self, "n_q_heads", 8)
+        default_n_kv = getattr(self, "n_kv_heads", 1)
+        img_tid = self.image_token_id if image_token_id is None else int(image_token_id)
+        ple_ids_np = np.array([0 if int(t) == img_tid else int(t) for t in prompt_ids], dtype=np.int32)
+
+        pre_len = seq_len - 1
+        if pre_len > 0:
+            vis_group_ids = np.full((seq_len,), -1, dtype=np.int32)
+            grp_id = -1
+            in_grp = False
+            for idx_t in range(seq_len):
+                if int(prompt_ids[idx_t]) == img_tid:
+                    if not in_grp:
+                        grp_id += 1
+                        in_grp = True
+                    vis_group_ids[idx_t] = grp_id
+                else:
+                    in_grp = False
+
+            vg_list = [int(x) for x in vis_group_ids]
+            eff_step = max(chunk_sz, 2048) if self.use_bidirectional_vision else chunk_sz
+            chunks: list[tuple[int, int]] = []
+            s0 = 0
+            while s0 < pre_len:
+                s1 = min(pre_len, s0 + eff_step)
+                if self.use_bidirectional_vision and s1 < pre_len:
+                    g_edge = vg_list[s1 - 1]
+                    if g_edge >= 0 and vg_list[s1] == g_edge:
+                        # Avoid splitting a bidirectional vision block across chunks
+                        start_of_g = s1 - 1
+                        while start_of_g > s0 and vg_list[start_of_g - 1] == g_edge:
+                            start_of_g -= 1
+                        if start_of_g > s0:
+                            s1 = start_of_g
+                        else:
+                            while s1 < pre_len and vg_list[s1] == g_edge:
+                                s1 += 1
+                chunks.append((s0, s1))
+                s0 = s1
+
+            b_idx = mx.array([0], dtype=mx.int32)
+            for s0, s1 in chunks:
+                lc = s1 - s0
+                off = l_sys + s0
+                off_meta = mx.array([off, lc], dtype=mx.int32)
+                off_bg = mx.array([off], dtype=mx.int32)
+                h = inputs_embeds[:, s0:s1, :].astype(self.act_dtype)
+                ple_c = mx.array(ple_ids_np[s0:s1][None, :], dtype=mx.int32)
+                pli = self._compute_pli_from_embeds(h, ple_c, early14=True)
+                x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
+                masks: dict[tuple[str, int, int, int], Any] = {}
+
+                for i in range(self.first_kv_shared):
+                    l = self.layers[i]
+                    d_head = l["head_dim"]
+                    n_q = l.get("n_q_heads", default_n_q)
+                    n_kv = l.get("n_kv_heads", default_n_kv)
+                    c = doc_layers[i]
+                    cap = c["cap"]
+                    is_4d = c["k"].ndim == 4
+
+                    if i == self.first_kv_shared - 1:
+                        kv = self._apply_qlinear(l, "kv_proj_only", x_in)
+                        k_rot, v_norm = fused_kv_only_norm_rope_ragged(
+                            kv, l["w_kn"], l["inv_freq"], off_bg, self.eps, n_kv=n_kv
+                        )
+                        k_store = k_rot if is_4d else k_rot.reshape(1, lc, d_head)
+                        v_store = v_norm if is_4d else v_norm.reshape(1, lc, d_head)
+                        if c["ring"]:
+                            slots = mx.arange(s0, s1, dtype=mx.int32) & (cap - 1)
+                            c["k"][b_idx[:, None], slots[None, :]] = k_store
+                            c["v"][b_idx[:, None], slots[None, :]] = v_store
+                        else:
+                            c["k"][b_idx, s0:s1] = k_store
+                            c["v"][b_idx, s0:s1] = v_store
+                        break
+
+                    qkv = self._apply_qlinear(l, "qkv_proj", x_in)
+                    q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope(
+                        qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_meta, self.eps, n_q=n_q, n_kv=n_kv
+                    )
+                    k_store = k_rot if is_4d else k_rot.reshape(1, lc, d_head)
+                    v_store = v_norm if is_4d else v_norm.reshape(1, lc, d_head)
+                    k_chunk_sdpa = k_rot.transpose(0, 2, 1, 3) if k_rot.ndim == 4 else k_rot[:, None, :, :]
+                    v_chunk_sdpa = v_norm.transpose(0, 2, 1, 3) if v_norm.ndim == 4 else v_norm[:, None, :, :]
+
+                    if not c["ring"]:
+                        c["k"][b_idx, s0:s1] = k_store
+                        c["v"][b_idx, s0:s1] = v_store
+                        parts_k: list[mx.array] = []
+                        parts_v: list[mx.array] = []
+                        if l_sys > 0:
+                            ks_i = (
+                                k_sys_l[i].transpose(1, 0, 2)[None]
+                                if k_sys_l[i].ndim == 3
+                                else k_sys_l[i][None, None]
+                            )
+                            vs_i = (
+                                v_sys_l[i].transpose(1, 0, 2)[None]
+                                if v_sys_l[i].ndim == 3
+                                else v_sys_l[i][None, None]
+                            )
+                            parts_k.append(mx.broadcast_to(ks_i, (1, n_kv, l_sys, d_head)))
+                            parts_v.append(mx.broadcast_to(vs_i, (1, n_kv, l_sys, d_head)))
+                        if s0 == 0:
+                            parts_k.append(k_chunk_sdpa)
+                            parts_v.append(v_chunk_sdpa)
+                        else:
+                            kp_prev = c["k"][b_idx, :s1]
+                            vp_prev = c["v"][b_idx, :s1]
+                            parts_k.append(kp_prev.transpose(0, 2, 1, 3) if is_4d else kp_prev[:, None, :, :])
+                            parts_v.append(vp_prev.transpose(0, 2, 1, 3) if is_4d else vp_prev[:, None, :, :])
+                        kf = parts_k[0] if len(parts_k) == 1 else mx.concatenate(parts_k, axis=2)
+                        vf = parts_v[0] if len(parts_v) == 1 else mx.concatenate(parts_v, axis=2)
+                        mk = ("full", off, lc, int(kf.shape[2]))
+                        if mk not in masks:
+                            if self.use_bidirectional_vision:
+                                masks[mk] = self._build_vision_sdpa_mask(
+                                    s0, lc, -l_sys, int(kf.shape[2]), vis_group_ids, is_full=True
+                                )
+                            else:
+                                masks[mk] = _select_sdpa_mask(
+                                    lc, off, is_full=True, window_size=None, dtype=self.act_dtype
+                                )
+                    else:
+                        slots = mx.arange(s0, s1, dtype=mx.int32) & (cap - 1)
+                        t_start = max(0, off - self.window_size + 1)
+                        k_parts: list[mx.array] = []
+                        v_parts: list[mx.array] = []
+                        if t_start < l_sys:
+                            ks_sl = k_sys_l[i][t_start:l_sys]
+                            vs_sl = v_sys_l[i][t_start:l_sys]
+                            ks_b = ks_sl.transpose(1, 0, 2)[None] if ks_sl.ndim == 3 else ks_sl[None, None]
+                            vs_b = vs_sl.transpose(1, 0, 2)[None] if vs_sl.ndim == 3 else vs_sl[None, None]
+                            k_parts.append(mx.broadcast_to(ks_b, (1, n_kv, l_sys - t_start, d_head)))
+                            v_parts.append(mx.broadcast_to(vs_b, (1, n_kv, l_sys - t_start, d_head)))
+                        priv_lo = max(0, t_start - l_sys)
+                        if priv_lo < s0:
+                            p_slots = mx.arange(priv_lo, s0, dtype=mx.int32) & (cap - 1)
+                            kp_old = c["k"][b_idx[:, None], p_slots[None, :]]
+                            vp_old = c["v"][b_idx[:, None], p_slots[None, :]]
+                            k_parts.append(kp_old.transpose(0, 2, 1, 3) if is_4d else kp_old[:, None, :, :])
+                            v_parts.append(vp_old.transpose(0, 2, 1, 3) if is_4d else vp_old[:, None, :, :])
+                        if priv_lo < s1:
+                            chunk_lo = max(0, priv_lo - s0)
+                            k_parts.append(k_chunk_sdpa if chunk_lo == 0 else k_chunk_sdpa[:, :, chunk_lo:, :])
+                            v_parts.append(v_chunk_sdpa if chunk_lo == 0 else v_chunk_sdpa[:, :, chunk_lo:, :])
+                        c["k"][b_idx[:, None], slots[None, :]] = k_store
+                        c["v"][b_idx[:, None], slots[None, :]] = v_store
+                        kf = k_parts[0] if len(k_parts) == 1 else mx.concatenate(k_parts, axis=2)
+                        vf = v_parts[0] if len(v_parts) == 1 else mx.concatenate(v_parts, axis=2)
+                        mk = ("swa", off - t_start, lc, int(kf.shape[2]))
+                        if mk not in masks:
+                            if self.use_bidirectional_vision:
+                                masks[mk] = self._build_vision_sdpa_mask(
+                                    s0, lc, t_start - l_sys, int(kf.shape[2]), vis_group_ids, is_full=False
+                                )
+                            else:
+                                masks[mk] = _select_sdpa_mask(
+                                    lc, off - t_start, is_full=False, window_size=self.window_size, dtype=self.act_dtype
+                                )
+
+                    att = (
+                        mx.fast.scaled_dot_product_attention(
+                            q_rot.transpose(0, 2, 1, 3), kf, vf, scale=1.0, mask=masks[mk]
+                        )
+                        .transpose(0, 2, 1, 3)
+                        .reshape(1, lc, n_q * d_head)
+                    )
+                    attn_out = self._apply_qlinear(l, "o_proj", att)
+                    h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
+                mx.eval(*[(c["k"], c["v"]) for c in doc_layers])
+            if callable(getattr(mx, "clear_cache", None)):
+                mx.clear_cache()
+
+        last_tid = int(prompt_ids[-1])
+        last_off = mx.array([l_sys + seq_len - 1], dtype=mx.int32)
+        if last_tid != img_tid:
+            lg = self.forward_step_ragged(
+                mx.array([[last_tid]], dtype=mx.int32),
+                cache,
+                last_off,
+                apply_softcap=apply_softcap,
+            )
+        else:
+            lg = self._forward_step_embeds_b1(
+                inputs_embeds[:, -1:, :],
+                mx.zeros((1, 1), dtype=mx.int32),
+                cache,
+                last_off,
+                apply_softcap=apply_softcap,
+            )
+        next_off = mx.array([l_sys + seq_len], dtype=mx.int32)
+        mx.eval(lg, next_off)
+        return lg, next_off

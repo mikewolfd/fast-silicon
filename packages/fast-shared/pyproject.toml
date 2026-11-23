@@ -24,6 +24,9 @@ dev = [
 llm = [
     "llguidance>=1.0.0",
 ]
+vision = [
+    "pillow>=10.0.0",
+]
 
 [project.scripts]
 fast-silicon-hw-check = "fast_shared.hw_check:main"
