@@ -566,3 +566,102 @@ def test_phase_b_engine_pipeline_cli_wiring(tmp_path: Path, monkeypatch: pytest.
     )
     proc_z = subprocess.run([sys.executable, "-B", "-c", sub_zero], capture_output=True, text=True, check=False)
     assert proc_z.returncode == 0, proc_z.stderr
+
+
+def test_ovis_auto_upscales_small_markdown_tables_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+    from PIL import Image
+    from tokenizers import AddedToken, Tokenizer as HfTokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_qwen3.multimodal_batch import BatchedMMItemResult
+    from fast_qwen3.tokenizer import FastQwen3Tokenizer
+    from fast_ocr.ovis_engine import FastOvisOCREngine, _resolve_ovis_min_pixels
+
+    # Pure resolver contract: upscale tiny unpinned Markdown tables (<150K px, min_side>=80), preserve overrides/raw/JSON.
+    assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=None, output_format="markdown", schema=None) == 262_144
+    assert _resolve_ovis_min_pixels((320, 200), min_pixels=REGION_CROP_MIN_PIXELS, max_pixels=None, output_format="markdown", schema=None) == REGION_CROP_MIN_PIXELS
+    assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=786_432, output_format="markdown", schema=None) == 65_536
+    assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=None, output_format="raw", schema=None) == 65_536
+    assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=None, output_format="markdown", schema={"type": "object"}) == 65_536
+    assert _resolve_ovis_min_pixels((64, 64), min_pixels=None, max_pixels=None, output_format="markdown", schema=None) == 65_536
+    assert _resolve_ovis_min_pixels((600, 400), min_pixels=None, max_pixels=None, output_format="markdown", schema=None) == 65_536
+
+    vocab = {ch: idx for idx, ch in enumerate(sorted(ByteLevel.alphabet()))}
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    bpe.add_special_tokens(
+        [AddedToken(tok, special=True) for tok in ("<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>")]
+    )
+    tok_p = tmp_path / "tok_tiny.json"
+    bpe.save(str(tok_p))
+    ftok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+    img_tok_id = int(ftok.backend_tokenizer.token_to_id("<|image_pad|>"))
+    eng = object.__new__(FastOvisOCREngine)
+    eng.model_dir = tmp_path
+    eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}
+    eng.output_format = "markdown"
+    eng.table_mode = "gfm"
+    eng.strict_markdown_grammar = False
+    eng.zoom_recover = False
+    eng.crop_margins = False
+    eng.crop_pad_px = 0
+    eng.auto_orient = False
+    eng.adaptive_resolution = True
+    eng.deskew = "off"
+    eng.speculative = "off"
+    eng.draft_k = 4
+    eng.prefill_chunk_size = 512
+    eng.max_tokens = 256
+    eng.loop_breaker = False
+    eng.auto_loop_recover = False
+    eng.kv_i8 = "auto"
+    eng.gdn_state_mode = "auto"
+    eng.drop_white_patches = False
+    eng.image_token_id = img_tok_id
+    eng.tokenizer = ftok
+    eng.vocab_remap = None
+    eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    eng._new_to_old_mx = None
+    eng._old_to_new = None
+    eng._vision_prepass = None
+    eng.vision_model = object()  # type: ignore[assignment]
+
+    class _DummyLM:
+        vocab_n = ftok.vocab_size
+
+        class cfg:
+            head_dim = 256
+
+    eng.lm = _DummyLM()  # type: ignore[assignment]
+
+    seen_per_item: list[Any] = []
+
+    def _spy_mm(**kw: Any):
+        seen_per_item.append(kw["min_pixels_per_item"])
+        return [
+            BatchedMMItemResult(
+                generated_ids=ftok.encode("| A |\n| --- |\n| 1 |", add_special_tokens=False),
+                prompt_tokens=20,
+                hit_eos=True,
+                hit_max_tokens=False,
+                vit_ms=1.0,
+                prefill_ms=1.0,
+                decode_ms=1.0,
+                image_grids=[(1, 4, 4)],
+            )
+            for _ in kw["images_per_item"]
+        ], {"waves": 1}
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.batched_multimodal_generate", _spy_mm)
+    tiny_tbl = Image.new("RGB", (320, 200), "white")
+    big_pg = Image.new("RGB", (800, 800), "white")
+    _ = eng.ocr_images([tiny_tbl, big_pg], batch_size=4)
+    assert seen_per_item[-1] == [262_144, 65_536]
+    _ = eng.ocr_images([tiny_tbl, big_pg], schemas=[{"type": "object"}, None], batch_size=4)
+    assert seen_per_item[-1] is None

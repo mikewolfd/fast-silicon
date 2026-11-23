@@ -849,7 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_img.add_argument("--mode", choices=("auto", "gpu"), default="auto", help="Execution mode (default: auto)")
     p_img.add_argument("--chunks", type=int, default=8, help="Horizontal contextual chunk bands per page (default: 8)")
     p_img.add_argument("--min-pixels", type=int, default=16384, help="Minimum resized pixel area (default: 16384)")
-    p_img.add_argument("--max-pixels", type=int, default=1_800_000, help="Maximum resized pixel area (default: 1800000)")
+    p_img.add_argument("--max-pixels", type=int, default=786_432, help="Maximum resized pixel area (default: 786432)")
     p_img.add_argument("--dpi", type=int, default=100, help="PDF rasterization DPI (default: 100)")
     p_img.add_argument("--crop-margins", action="store_true", help="Trim whitespace margins before visual encoding")
     p_img.add_argument(

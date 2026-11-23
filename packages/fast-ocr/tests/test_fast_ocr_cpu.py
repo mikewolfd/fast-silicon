@@ -2366,4 +2366,71 @@ def test_ovis_engine_ocr_images_per_item_schemas_cpu(monkeypatch: pytest.MonkeyP
     assert seen_b1_schemas == [schema_a, schema_b]
 
 
+def test_triage_dpi_refreshes_only_rotated_or_low_conf_escalations(tmp_path: Path) -> None:
+    from fast_ocr.types import OCRBox, OCRLine, OCRResult, OCRTimings, PageAnalysis
+
+    pdf_p = tmp_path / "triage_mixed.pdf"
+    p0 = Image.new("RGB", (600, 800), "white")
+    p1 = Image.new("RGB", (450, 100), "white")
+    p0.save(pdf_p, "PDF", resolution=180.0, save_all=True, append_images=[p1])
+
+    vision_calls: list[tuple[int, tuple[int, int]]] = []
+
+    class _MockVision:
+        def recognize_image(self, src: Image.Image, *, page_index: int = 0, output_format: str = "markdown") -> OCRResult:
+            vision_calls.append((int(page_index), src.size))
+            is_low_p1 = (page_index == 1 and min(src.size) < 90)
+            return OCRResult(
+                text="raw",
+                raw_text="raw",
+                backend_used="apple-vision:accurate",
+                output_format=output_format,  # type: ignore[arg-type]
+                page_index=int(page_index),
+                lines=(OCRLine("cell", 0.99 if not is_low_p1 else 0.55, OCRBox(0.1, 0.1, 0.4, 0.2)),),
+                analysis=PageAnalysis(
+                    width=src.width,
+                    height=src.height,
+                    line_count=10,
+                    char_count=80,
+                    digit_ratio=0.3,
+                    currency_hits=1,
+                    mean_confidence=0.99 if not is_low_p1 else 0.65,
+                    low_conf_line_ratio=0.0 if not is_low_p1 else 0.4,
+                    median_line_height=0.02,
+                    inferred_rotation_cw=(90 if is_low_p1 else 0),
+                    ink_crop_box_px=None,
+                    ink_area_ratio=1.0,
+                    estimated_columns=2,
+                    table_score=0.6,
+                    needs_vlm=True,
+                    escalation_reasons=(("rotated_page", "low_vision_confidence") if is_low_p1 else ("financial_table",)),
+                ),
+                timings=OCRTimings(apple_vision_ms=3.0, total_ms=3.0),
+            )
+
+    seen_pre: list[tuple[int, int]] = []
+
+    class _MockOvis:
+        def ocr_images(self, sources: list[Image.Image], **kw: Any) -> list[OCRResult]:
+            for pre in kw["pre_analyses"]:
+                seen_pre.append((int(pre.page_index), int(pre.analysis.inferred_rotation_cw)))
+            return [
+                OCRResult(
+                    text=f"pg{pre.page_index}",
+                    raw_text=f"pg{pre.page_index}",
+                    backend_used="ovis:stub",
+                    page_index=int(pre.page_index),
+                    timings=OCRTimings(decode_ms=2.0, total_ms=3.0, generated_tokens=2),
+                )
+                for pre in kw["pre_analyses"]
+            ]
+
+    with FastOCR(backend="auto", vision_ocr=_MockVision(), ovis_engine=_MockOvis()) as pipe:
+        outs = pipe.ocr_pdf(pdf_p, dpi=180, triage_dpi=100, batch_size=4)
+
+    assert len(outs) == 2
+    # Page 0 stays at single low-DPI pass; Page 1 gets refreshed at 180 DPI so Ovis receives rot=0 for both.
+    assert [idx for idx, _sz in vision_calls] == [0, 1, 1]
+    assert seen_pre == [(0, 0), (1, 0)]
+
 

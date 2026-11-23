@@ -1273,7 +1273,10 @@ def test_qwen3_mpp_shared_group_budget_shed_and_lora_grad(
         eng.close()
 
 
-def test_compact_hybrid_cache_pack_waves_and_generate_batch_images(tmp_path: Path) -> None:
+def test_compact_hybrid_cache_pack_waves_and_generate_batch_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify `compact_hybrid_cache`, `pack_length_waves`, and batched `generate_batch(..., images=...)` parity."""
     from PIL import Image, ImageDraw
     from tokenizers import Tokenizer as HfTokenizer
@@ -1404,6 +1407,39 @@ def test_compact_hybrid_cache_pack_waves_and_generate_batch_images(tmp_path: Pat
             assert b_item.text == r_item.text
             assert b_item.token_ids == r_item.token_ids
             assert b_item.valid_schema is True
+
+        # 3b. Short multimodal waves (<=1024 tok) ignore max_pad_ratio=1.8 to avoid extra decode waves,
+        #     while long waves (>1024 tok) still forward max_pad_ratio cleanly.
+        from fast_qwen3 import multimodal_batch as mm_mod
+
+        im_wide = Image.new("RGB", (256, 64), (225, 225, 225))
+        bat_short = eng.generate_batch(
+            ["Short", "Medium"],
+            images=[[im_sq], [im_wide]],
+            max_tokens=4,
+            temperature=0.0,
+            batch_size=4,
+            max_pad_ratio=1.8,
+        )
+        assert bat_short.stats["waves"] == 1
+
+        seen_ratios: list[float | None] = []
+        real_pack = mm_mod.pack_length_waves
+
+        def _spy_pack(*args: Any, **kwargs: Any):
+            seen_ratios.append(kwargs.get("max_pad_ratio"))
+            return real_pack(*args, **kwargs)
+
+        monkeypatch.setattr(mm_mod, "pack_length_waves", _spy_pack)
+        _ = eng.generate_batch(
+            ["w " * 560, "tiny"],
+            images=[[im_sq], [im_sq]],
+            max_tokens=2,
+            temperature=0.0,
+            batch_size=4,
+            max_pad_ratio=1.8,
+        )
+        assert seen_ratios[-1] == 1.8
 
         # 4. Text-only compact_active batched wave matches B=1 generate
         txt_prompts = ["Short?", "Somewhat longer prompt alpha beta gamma", "Med prompt", "Another prompt here"]

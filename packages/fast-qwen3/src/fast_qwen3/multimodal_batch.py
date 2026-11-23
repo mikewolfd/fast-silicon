@@ -545,11 +545,14 @@ def batched_multimodal_generate(
         pending_meta.append((i, p_ids, v_spans, eff_rope_delta, r_cos[0], r_sin[0]))
 
     pending_meta.sort(key=lambda row: len(row[1]))
+    # Mirror text generate_batch: don't split short multimodal waves (<=1024 tok) over padding ratio alone,
+    # while keeping explicit pack_length_waves(...) strict and guarding mixed long-prompt waves (>1024 tok).
+    apply_pad_ratio = max_pad_ratio is not None and any(len(row[1]) > 1024 for row in pending_meta)
     waves = pack_length_waves(
         pending_meta,
         lambda row: len(row[1]),
         batch_size,
-        max_pad_ratio=max_pad_ratio,
+        max_pad_ratio=(max_pad_ratio if apply_pad_ratio else None),
         max_wave_tokens=max_wave_tokens,
     )
 

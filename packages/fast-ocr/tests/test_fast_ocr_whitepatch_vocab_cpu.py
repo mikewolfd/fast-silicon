@@ -442,9 +442,13 @@ def test_ovis_b1_white_patch_drop_and_kv_mode(tmp_path: Path, monkeypatch: pytes
     assert cache_calls[0]["kv_i8"] == "bf16"
     assert cache_calls[0]["gdn_state_mode"] == "int8"
 
-    # At max_tokens=4096 on 24 GB host -> B=1 selects q4_quarot!
+    # On Apple9 (non-NAX) 24 GB host -> B=1 selects q4_quarot at max_tokens=4096; Apple10 NAX stays bf16.
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: False)
     eng.ocr_image(img, drop_white_patches=True, max_tokens=4096)
     assert cache_calls[-1]["kv_i8"] == "q4_quarot"
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
+    eng.ocr_image(img, drop_white_patches=True, max_tokens=4096)
+    assert cache_calls[-1]["kv_i8"] == "bf16"
 
 
 def test_build_ocr_vocab_subset_extra_symbols_leading_space_and_cjk_bypass(tmp_path: Path) -> None:
@@ -580,16 +584,30 @@ def test_ocr_images_signature_prompt_builder_and_kv_resolver(tmp_path: Path, mon
 
     kv_res = captured["kv_i8_resolver"]
     monkeypatch.setattr("fast_ocr.ovis_engine.host_phys_memory_gb", lambda: 24.0)
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: False)
     assert kv_res(4, 2048) == "bf16"
-    assert kv_res(8, 2048) == "q4_quarot"
-    assert kv_res(16, 2048) == "q4_quarot"
+    assert kv_res(8, 2048) == "bf16"
+    assert kv_res(16, 2048) == "bf16"
+    assert kv_res(32, 2048) == "q4_quarot"
     assert kv_res(2, 4096) == "q4_quarot"
 
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
+    assert kv_res(16, 2048) == "bf16"
+    assert kv_res(32, 5120) == "bf16"
+    assert kv_res(64, 2048) == "bf16"
+    assert kv_res(64, 4096) == "q4_quarot"
+    assert kv_res(2, 16384) == "q4_quarot"
+
     monkeypatch.setattr("fast_ocr.ovis_engine.host_phys_memory_gb", lambda: 64.0)
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: False)
     assert kv_res(4, 4096) == "bf16"
-    assert kv_res(8, 2048) == "q4_quarot"
-    assert kv_res(16, 2048) == "q4_quarot"
+    assert kv_res(16, 2048) == "bf16"
+    assert kv_res(32, 2048) == "q4_quarot"
     assert kv_res(2, 8192) == "q4_quarot"
+
+    monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
+    assert kv_res(32, 8192) == "bf16"
+    assert kv_res(2, 32768) == "q4_quarot"
 
     # Explicit kv_i8 overrides auto
     assert resolve_ovis_kv_mode("bf16", batch_size=32, alloc_ctx=16384, host_mem_gb=24.0) == "bf16"
@@ -954,3 +972,117 @@ def test_cli_and_pipeline_wiring_for_kv_gdn_whitepatch_and_latin_only(
     assert pq_inits[-1]["drop_white_patches"] is True
     assert pq_inits[-1]["latin_only"] is False
     assert pq_calls[-1]["triage_dpi"] == 100
+
+
+def test_ovis_batched_loop_recovery_unrotates_raw_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fast_ocr.types import OCRResult, OCRTimings, PageAnalysis
+
+    ftok = _make_bpe_tokenizer(tmp_path)
+    img_tok_id = int(ftok.backend_tokenizer.token_to_id("<|image_pad|>"))
+
+    eng = object.__new__(FastOvisOCREngine)
+    eng.model_dir = tmp_path
+    eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}
+    eng.output_format = "markdown"
+    eng.table_mode = "gfm"
+    eng.strict_markdown_grammar = False
+    eng.zoom_recover = False
+    eng.crop_margins = False
+    eng.crop_pad_px = 0
+    eng.auto_orient = True
+    eng.adaptive_resolution = False
+    eng.deskew = "off"
+    eng.speculative = "off"
+    eng.draft_k = 4
+    eng.prefill_chunk_size = 512
+    eng.max_tokens = 128
+    eng.loop_breaker = False
+    eng.auto_loop_recover = True
+    eng.kv_i8 = "auto"
+    eng.gdn_state_mode = "auto"
+    eng.drop_white_patches = False
+    eng.image_token_id = img_tok_id
+    eng.tokenizer = ftok
+    eng.vocab_remap = None
+    eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    eng._new_to_old_mx = None
+    eng._old_to_new = None
+    eng._vision_prepass = None
+    eng.vision_model = object()  # type: ignore[assignment]
+
+    class _DummyLM:
+        vocab_n = ftok.vocab_size
+
+        class cfg:
+            head_dim = 256
+
+    eng.lm = _DummyLM()  # type: ignore[assignment]
+
+    rot_pre = OCRResult(
+        text="raw",
+        raw_text="raw",
+        backend_used="apple-vision:accurate",
+        lines=(),
+        analysis=PageAnalysis(
+            width=450,
+            height=110,
+            line_count=12,
+            char_count=100,
+            digit_ratio=0.2,
+            currency_hits=0,
+            mean_confidence=0.69,
+            low_conf_line_ratio=0.3,
+            median_line_height=0.04,
+            inferred_rotation_cw=90,
+            ink_crop_box_px=None,
+            ink_area_ratio=1.0,
+            estimated_columns=2,
+            table_score=0.5,
+            needs_vlm=True,
+            escalation_reasons=("rotated_page",),
+        ),
+        timings=OCRTimings(apple_vision_ms=5.0, total_ms=5.0),
+    )
+
+    loop_tok = ftok.encode("a", add_special_tokens=False)[0]
+    monkeypatch.setattr(
+        "fast_ocr.ovis_engine.batched_multimodal_generate",
+        lambda **_kw: (
+            [
+                BatchedMMItemResult(
+                    generated_ids=[loop_tok] * 128,
+                    prompt_tokens=64,
+                    hit_eos=False,
+                    hit_max_tokens=True,
+                    vit_ms=1.0,
+                    prefill_ms=1.0,
+                    decode_ms=20.0,
+                    image_grids=[(1, 4, 4)],
+                )
+            ]
+            * 2,
+            {"waves": 1, "compactions": 0},
+        ),
+    )
+
+    retry_seen: list[dict[str, Any]] = []
+
+    def _spy_retry(src: Any, **kw: Any) -> OCRResult:
+        retry_seen.append({"size": src.size, **kw})
+        return OCRResult(
+            text="clean upright",
+            raw_text="clean upright",
+            backend_used="ovis:stub",
+            timings=OCRTimings(decode_ms=4.0, total_ms=6.0, generated_tokens=4),
+        )
+
+    monkeypatch.setattr(eng, "ocr_image", _spy_retry)
+    imgs = [Image.new("RGB", (450, 110), "white"), Image.new("RGB", (450, 110), "white")]
+    outs = eng.ocr_images(imgs, pre_analyses=[rot_pre, rot_pre], batch_size=2, max_tokens=128)
+    assert len(retry_seen) == 2
+    assert all(call["size"] == (450, 110) for call in retry_seen)
+    assert all(call["pre_analysis"] is None and call["auto_orient"] is False for call in retry_seen)
+    assert all(r.rotation_applied_cw == 0 and r.metadata["loop_recovery"]["action"] == "retry_unrotated" for r in outs)

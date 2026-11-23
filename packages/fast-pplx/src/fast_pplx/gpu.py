@@ -3072,7 +3072,7 @@ class FastPplxGPU:
         chunks: int = 8,
         batch_size: int = 16,
         min_pixels: int = 16384,
-        max_pixels: int = 1_800_000,
+        max_pixels: int = 786_432,
         crop_margins: bool = False,
         rotations_cw: int | Sequence[int] | None = None,
         grid_bucket_step: int | None = None,

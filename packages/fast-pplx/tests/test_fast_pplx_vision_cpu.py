@@ -585,8 +585,10 @@ def test_encode_images_batch_size_16_default_and_grid_bucket_step_forwarding(
     for fn in (FastPplxGPU.encode_images, FastPplx.encode_images, FastPplx.build_image_index):
         sig = inspect.signature(fn)
         assert sig.parameters["batch_size"].default == 16
+        assert sig.parameters["max_pixels"].default == 786_432
         assert "grid_bucket_step" in sig.parameters
         assert sig.parameters["grid_bucket_step"].default is None
+    assert build_parser().parse_args(["embed-images", "a.png"]).max_pixels == 786_432
 
     img0 = tmp_path / "b0.png"
     _make_doc_img(192, 192).save(img0)

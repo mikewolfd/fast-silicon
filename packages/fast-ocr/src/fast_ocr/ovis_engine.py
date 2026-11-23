@@ -139,6 +139,21 @@ def _languages_use_latin_only(languages: Sequence[str] | None) -> bool:
     return True
 
 
+_CACHED_APPLE10_NAX: bool | None = None
+
+
+def _host_supports_apple10_nax() -> bool:
+    global _CACHED_APPLE10_NAX
+    if _CACHED_APPLE10_NAX is None:
+        try:
+            from fast_shared.hw_check import supports_apple10_nax
+
+            _CACHED_APPLE10_NAX = bool(supports_apple10_nax())
+        except Exception:
+            _CACHED_APPLE10_NAX = False
+    return _CACHED_APPLE10_NAX
+
+
 def resolve_ovis_kv_mode(
     kv_i8: KVMode | bool | str,
     *,
@@ -146,8 +161,9 @@ def resolve_ovis_kv_mode(
     alloc_ctx: int,
     host_mem_gb: float | None = None,
     head_dim: int = 256,
+    apple10_nax: bool | None = None,
 ) -> KVMode:
-    """Resolve KV cache precision for Ovis OCR (`'auto'` uses `'q4_quarot'` under batch/context pressure)."""
+    """Resolve KV cache precision for Ovis OCR, keeping NAX/medium batches on BF16 and guarding extreme pressure."""
     if isinstance(kv_i8, bool):
         return "q8" if kv_i8 else "bf16"
     raw_s = str(kv_i8).strip().lower()
@@ -156,10 +172,41 @@ def resolve_ovis_kv_mode(
     if int(head_dim) % 64 != 0:
         return "bf16"
     host_gb = float(host_mem_gb) if host_mem_gb is not None else host_phys_memory_gb()
+    is_nax = _host_supports_apple10_nax() if apple10_nax is None else bool(apple10_nax)
+    bs = max(1, int(batch_size))
+    ctx = max(1, int(alloc_ctx))
+    if is_nax:
+        # OvisOCR2 has only 6 Full-Attn KV layers (18 GDN): Apple10 NAX BF16 SDPA beats q4_quarot through L=5120 / B=64.
+        if host_gb <= 28.0:
+            if ctx >= 16384 or (bs * ctx) >= 262_144:
+                return "q4_quarot"
+        elif ctx >= 32768 or (bs * ctx) >= 524_288:
+            return "q4_quarot"
+        return "bf16"
     ctx_cutoff = 4096 if host_gb <= 28.0 else 8192
-    if int(batch_size) >= 8 or int(alloc_ctx) >= ctx_cutoff:
+    if bs >= 32 or ctx >= ctx_cutoff:
         return "q4_quarot"
     return "bf16"
+
+
+def _resolve_ovis_min_pixels(
+    image_size: tuple[int, int],
+    *,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    output_format: OutputFormat = "markdown",
+    schema: Any = None,
+) -> int:
+    """Resolve `min_pixels` for ViT preprocessing, auto-upscaling small Markdown tables (<150K px) when unpinned."""
+    if min_pixels is not None:
+        return max(1024, int(min_pixels))
+    if max_pixels is None and output_format == "markdown" and schema is None:
+        w, h = int(image_size[0]), int(image_size[1])
+        area = w * h
+        min_side = min(w, h)
+        if 0 < area < 150_000 and min_side >= 80 and (float(max(w, h)) / float(min_side)) <= 6.0:
+            return 262_144
+    return 65_536
 
 
 def _find_local_hf_snapshot(repo_id: str) -> Path | None:
@@ -775,7 +822,13 @@ class FastOvisOCREngine:
         if do_crop:
             img, crop_box = crop_to_ink(img, pad_px=self.crop_pad_px)
 
-        eff_min_pixels = 65_536 if min_pixels is None else max(1024, int(min_pixels))
+        eff_min_pixels = _resolve_ovis_min_pixels(
+            img.size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            output_format=fmt,
+            schema=schema,
+        )
         if max_pixels is not None:
             eff_max_pixels = max(eff_min_pixels, int(max_pixels))
         elif do_adaptive and vision_res is not None and vision_res.analysis is not None:
@@ -1820,7 +1873,13 @@ class FastOvisOCREngine:
                     adap_cap = apx
                     if im.width * im.height > apx:
                         eff_item_min_px = _item_min_px(i)
-                        eff_adapt_min_px = 65_536 if eff_item_min_px is None else max(1024, int(eff_item_min_px))
+                        eff_adapt_min_px = _resolve_ovis_min_pixels(
+                            im.size,
+                            min_pixels=eff_item_min_px,
+                            max_pixels=_item_max_px(i),
+                            output_format=fmt,
+                            schema=schema_seq[i],
+                        )
                         rh, rw = smart_resize_qwen(
                             im.height,
                             im.width,
@@ -1903,6 +1962,21 @@ class FastOvisOCREngine:
                 head_dim=head_dim,
             )
 
+        eff_min_px_per_item = min_px_per_item
+        if min_px_scalar is None and min_px_per_item is None:
+            auto_mins = [
+                _resolve_ovis_min_pixels(
+                    proc_imgs[i].size,
+                    min_pixels=None,
+                    max_pixels=_item_max_px(i),
+                    output_format=fmt,
+                    schema=schema_seq[i],
+                )
+                for i in range(n_items)
+            ]
+            if any(m != eff_min_pixels for m in auto_mins):
+                eff_min_px_per_item = auto_mins
+
         mm_results, mm_stats = batched_multimodal_generate(
             lm=self.lm,
             vision_model=self.vision_model,
@@ -1926,7 +2000,7 @@ class FastOvisOCREngine:
             min_pixels=eff_min_pixels,
             max_pixels=eff_max_pixels,
             drop_white_patches=eff_drop_white,
-            min_pixels_per_item=min_px_per_item,
+            min_pixels_per_item=eff_min_px_per_item,
             max_pixels_per_item=max_px_per_item,
             gdn_state_mode=use_gdn_mode,
             stop_ids=self.tokenizer.stop_token_ids,
@@ -1954,11 +2028,18 @@ class FastOvisOCREngine:
 
             vision_res = pre_seq[i]
             if aborted_loop is not None and can_loop_recover:
+                retry_rot_reset = rot_cws[i] != 0
+                retry_src = raw_imgs[i] if retry_rot_reset else oriented_imgs[i]
                 retry_crop = False
-                retry_lb = crop_boxes[i] is None
-                retry_action = "retry_uncropped" if crop_boxes[i] is not None else "retry_loop_breaker"
+                retry_lb = (crop_boxes[i] is None) and (not retry_rot_reset)
+                if retry_rot_reset:
+                    retry_action = "retry_unrotated"
+                elif crop_boxes[i] is not None:
+                    retry_action = "retry_uncropped"
+                else:
+                    retry_action = "retry_loop_breaker"
                 retry_res = self.ocr_image(
-                    oriented_imgs[i],
+                    retry_src,
                     page_index=indices[i],
                     prompt=prompt_seq[i],
                     schema=schema_seq[i],
@@ -1978,7 +2059,7 @@ class FastOvisOCREngine:
                     draft_k=draft_k,
                     max_tokens=tok_cap,
                     temperature=temperature,
-                    pre_analysis=vision_res,
+                    pre_analysis=(None if retry_rot_reset else vision_res),
                     auto_loop_recover=True,
                     _force_loop_breaker=retry_lb,
                     _loop_retry_depth=1,
@@ -2003,11 +2084,12 @@ class FastOvisOCREngine:
                     "detected_period": int(aborted_loop[0]),
                     "detected_repeats": int(aborted_loop[1]),
                     "prior_crop_box": list(crop_boxes[i]) if crop_boxes[i] is not None else None,
+                    "prior_rotation_cw": int(rot_cws[i]),
                 }
                 results.append(
                     replace(
                         retry_res,
-                        rotation_applied_cw=rot_cws[i],
+                        rotation_applied_cw=(0 if retry_rot_reset else rot_cws[i]),
                         timings=merged_timings,
                         metadata=merged_meta,
                     )

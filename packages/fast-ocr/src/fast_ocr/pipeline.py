@@ -1192,10 +1192,12 @@ class AutoOCRPipeline:
         by_page: dict[int, OCRResult] = {}
         esc_idxs: list[int] = []
         esc_vis: list[OCRResult] = []
-        for idx, v_res in zip(low_idxs, low_vis):
+        esc_low_sizes: list[tuple[int, int]] = []
+        for low_im, idx, v_res in zip(low_imgs, low_idxs, low_vis):
             if v_res.analysis is not None and v_res.analysis.needs_vlm:
                 esc_idxs.append(idx)
                 esc_vis.append(v_res)
+                esc_low_sizes.append(low_im.size)
             else:
                 by_page[idx] = self._fold_pdf_overhead(
                     v_res,
@@ -1210,6 +1212,29 @@ class AutoOCRPipeline:
                 page_indices=esc_idxs,
                 max_pixels=max_pixels,
             )
+            # Blurry low-DPI triage can hallucinate rotation or lose fine lines on small/dense pages
+            # (e.g., 254x62 at 100 DPI -> spurious 90deg rotation -> 8192-tok loop). Re-run Vision at hi DPI
+            # only on escalated pages whose triage detection looks rotated, low-confidence, or sub-160px.
+            refresh_pos: list[int] = []
+            for pos_e, (v_res, low_sz) in enumerate(zip(esc_vis, esc_low_sizes)):
+                an = v_res.analysis
+                reasons = set(an.escalation_reasons) if an is not None else set()
+                if (
+                    an is None
+                    or int(an.inferred_rotation_cw) % 360 != 0
+                    or "rotated_page" in reasons
+                    or "low_vision_confidence" in reasons
+                    or min(low_sz) < 160
+                ):
+                    refresh_pos.append(pos_e)
+            if refresh_pos:
+                refreshed = self._run_vision_batch(
+                    [hi_imgs[p] for p in refresh_pos],
+                    [hi_idxs[p] for p in refresh_pos],
+                    output_format=output_format,
+                )
+                for p_e, hi_r in zip(refresh_pos, refreshed):
+                    esc_vis[p_e] = hi_r
             bs = max(1, int(batch_size))
             chunk_outs = self._dispatch_escalated_vlm(
                 hi_imgs,
