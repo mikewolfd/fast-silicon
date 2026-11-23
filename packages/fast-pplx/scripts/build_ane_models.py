@@ -125,8 +125,8 @@ def resolve_ane_profile(
 ) -> tuple[str, str, str]:
     """Resolve `(--ane-profile, --silu-mode, --rmsnorm-mode)` -> `(canonical_profile, silu_mode, rmsnorm_mode)`.
 
-    `ane_profile="fast"` selects `("silu", "prescale")` (default peak speed);
-    `ane_profile="balanced"` selects `("tanh_gdn", "max_abs")` (~5% throughput cost, `>=0.999` cos);
+    `ane_profile="balanced"` selects `("tanh_gdn", "max_abs")` (default: `~0%` throughput cost on mixed/short chunks, `>=0.999` cos);
+    `ane_profile="fast"` selects `("silu", "prescale")` (legacy peak raw ANE ops profile);
     `ane_profile="parity"` selects `("tanh_all", "max_abs")` (max ANE/GPU parity, recommended for
     `--dtype int8` or `--dimensions 128`).
     Explicit `silu_mode` / `rmsnorm_mode` flags override the preset and record `"custom"`

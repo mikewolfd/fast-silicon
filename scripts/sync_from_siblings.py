@@ -19,7 +19,7 @@ PACKAGES: tuple[str, ...] = (
     "fast-gemma4",
     "fast-decision-models",
 )
-MONOREPO_ONLY_PACKAGES: tuple[str, ...] = ("fast-pplx", "fast-qwen3")
+MONOREPO_ONLY_PACKAGES: tuple[str, ...] = ("fast-pplx", "fast-qwen3", "fast-ocr")
 
 IGNORED_DIR_PARTS = {
     ".git",

@@ -8,7 +8,7 @@ Implements the empirically validated retrieval winners across `fast-silicon` enc
      on MRL-trained `FastEmbeddingGemma2`, while protecting non-MRL `FastPplx` & `FastBgeSmall`
      from premature dimension truncation).
   3. Two-stage `1-bit` packed binary Hamming pre-filter (`vcntq_u8` ARM NEON / `uint8` LUT)
-     followed by exact `INT8` dot-product rerank (`0.43-0.54 ms` at `100K` chunks = `9x` faster).
+     followed by exact `INT8` dot-product rerank (`rerank_top_r=256` default; `0.43-0.54 ms` @ `top64` on `100K` chunks).
   4. Multi-vector `MaxSim` / `Hybrid` / `Top-2` window aggregation over `[doc_offsets[d]:doc_offsets[d+1]]`,
      lifting `32K` `LongEmbed` passkey `nDCG@10` from `0.047 -> 1.000` (`0.7510 -> 0.9923` combined).
 """
@@ -673,7 +673,7 @@ class CompactRetrievalIndex:
         query_vecs: np.ndarray,
         k: int = 10,
         *,
-        rerank_top_r: int = 64,
+        rerank_top_r: int = 256,
         agg: WindowAgg | None = None,
         hybrid_alpha: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:

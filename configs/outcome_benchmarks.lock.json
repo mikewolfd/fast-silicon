@@ -997,6 +997,169 @@
           "sha256": "3373bfdd44077f852b8f60e1d5b878a582c0c9517b22bcc5f4ec0d28f2ada36c"
         }
       }
+    },
+    "olmocr_bench": {
+      "category": 5,
+      "repo_id": "allenai/olmOCR-bench",
+      "license": "ODC-BY",
+      "format": "jsonl_pdf",
+      "categories": [
+        "arxiv_math",
+        "headers_footers",
+        "long_tiny_text",
+        "multi_column",
+        "old_scans",
+        "old_scans_math",
+        "table_tests"
+      ],
+      "files": [
+        "bench_data/arxiv_math.jsonl",
+        "bench_data/headers_footers.jsonl",
+        "bench_data/long_tiny_text.jsonl",
+        "bench_data/multi_column.jsonl",
+        "bench_data/old_scans.jsonl",
+        "bench_data/old_scans_math.jsonl",
+        "bench_data/table_tests.jsonl"
+      ],
+      "tier1": {
+        "per_category": 6,
+        "n": 42
+      },
+      "tier2": {
+        "per_category": 30,
+        "n": 210
+      },
+      "revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711",
+      "gated": false,
+      "pinned_files": {
+        "bench_data/arxiv_math.jsonl": {
+          "size": 720212,
+          "sha256": "5c1ba4770168a2312bf248c8b0125ed2279ec9f664ce64ba7cb52e3c41e4987c"
+        },
+        "bench_data/headers_footers.jsonl": {
+          "size": 325565,
+          "sha256": "315822b0fcd684eab7099bfb162ea45dc2384b23874be9529d60cd85b7e9c274"
+        },
+        "bench_data/long_tiny_text.jsonl": {
+          "size": 167783,
+          "sha256": "9ebe6a5fa690e78098e088b9eb677c4bb4212ed9b946be80b2d79a1a6c2a0e1a"
+        },
+        "bench_data/multi_column.jsonl": {
+          "size": 503239,
+          "sha256": "50192fd72f18434f3303b501bc9347763fb4b865238b7636604d3f6ebdf01595"
+        },
+        "bench_data/old_scans.jsonl": {
+          "size": 194580,
+          "sha256": "0cb14b2a5c3a08383f256931f79d1deea737e2635e0f1766b0fe0377f9416a0d"
+        },
+        "bench_data/old_scans_math.jsonl": {
+          "size": 122403,
+          "sha256": "aa514fb0c4c06aa077cadf316c2aede9716f62088ea1011683e059f7be67a8bd"
+        },
+        "bench_data/table_tests.jsonl": {
+          "size": 442926,
+          "sha256": "e37a99bd60de56c62cd3f4c1b7910b603641901c15ae119f849ffefa86cde120"
+        }
+      }
+    },
+    "fintabnet_otsl": {
+      "category": 5,
+      "repo_id": "docling-project/FinTabNet_OTSL",
+      "license": "CDLA-Permissive-1.0",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00002-7d6f82c6161b0377.parquet",
+        "data/test-00001-of-00002-7104c7ad37a00357.parquet"
+      ],
+      "tier1": {
+        "files": [
+          "data/test-00000-of-00002-7d6f82c6161b0377.parquet"
+        ],
+        "n": 30,
+        "stratify_by": [
+          "has_span",
+          "size_bucket"
+        ]
+      },
+      "tier2": {
+        "files": [
+          "data/test-00000-of-00002-7d6f82c6161b0377.parquet",
+          "data/test-00001-of-00002-7104c7ad37a00357.parquet"
+        ],
+        "n": 150,
+        "stratify_by": [
+          "has_span",
+          "size_bucket"
+        ]
+      },
+      "revision": "1fe37f0f9478b4c571c51c5c4d11e3ef357e75c4",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00002-7d6f82c6161b0377.parquet": {
+          "size": 142048252,
+          "sha256": "fa4e457e3abe55eb6f41ea3b9ebb3bb2731e933f09d3dc28c9edbf882d79e734"
+        },
+        "data/test-00001-of-00002-7104c7ad37a00357.parquet": {
+          "size": 145670615,
+          "sha256": "edcc356f75f8613cae806dea32d1ab7a1b95553ff81bcffa0d080e6ef9f94e41"
+        }
+      }
+    },
+    "omnidocbench_en": {
+      "category": 5,
+      "repo_id": "opendatalab/OmniDocBench",
+      "license": "Research-NonCommercial (code Apache-2.0)",
+      "format": "json_images",
+      "language_filter": "english",
+      "files": [
+        "OmniDocBench.json"
+      ],
+      "tier1": {
+        "n": 24,
+        "stratify_by": [
+          "data_source"
+        ]
+      },
+      "tier2": {
+        "n": 120,
+        "stratify_by": [
+          "data_source"
+        ]
+      },
+      "revision": "aa1ee96d106dbe53d0ae59474d75c6e6d9b53fec",
+      "gated": false,
+      "pinned_files": {
+        "OmniDocBench.json": {
+          "size": 42208096,
+          "sha256": "a45cd84b04ad8b793e775089640e6b681209abea33ead54c1828ddca35fae496"
+        }
+      }
+    },
+    "cord_v2": {
+      "category": 5,
+      "repo_id": "naver-clova-ix/cord-v2",
+      "license": "CC-BY-4.0",
+      "format": "parquet",
+      "files": [
+        "data/test-00000-of-00001-9c204eb3f4e11791.parquet"
+      ],
+      "tier1": {
+        "n": 30,
+        "stratify_by": [
+          "menu_bucket"
+        ]
+      },
+      "tier2": {
+        "n": 100
+      },
+      "revision": "7f0115a4b758a71d6473b8d085751692da2fef98",
+      "gated": false,
+      "pinned_files": {
+        "data/test-00000-of-00001-9c204eb3f4e11791.parquet": {
+          "size": 234202795,
+          "sha256": "51c65f1788faff392abe2a0b55b023eb23e9be551c509138eaa3a832514224e7"
+        }
+      }
     }
   }
 }

@@ -76,7 +76,7 @@ def test_gpu_trace_and_all_16_reference_cases() -> None:
                 cid = case["id"]
                 if case["task"] == "query":
                     flat_q = [row[0] for row in case["documents"]]
-                    proj = gpu.encode_queries(flat_q, output_dtype="float32", normalize=False)
+                    proj = gpu.encode_queries(flat_q, output_dtype="float32", normalize=False, apply_tanh=False)
                     i8 = gpu.encode_queries(flat_q, output_dtype="int8", normalize=False)
                     exp_proj = ref[f"{cid}/projected"].reshape(-1, 1024)
                     f_cos = np.sum(proj * exp_proj, axis=-1) / (
@@ -92,7 +92,7 @@ def test_gpu_trace_and_all_16_reference_cases() -> None:
                     assert int(np.max(np.abs(i8.astype(np.int32) - exp_i8.astype(np.int32)))) <= 1
                 else:
                     docs = case["documents"]
-                    proj_list = gpu.encode_contextual_chunks(docs, output_dtype="float32", normalize=False)
+                    proj_list = gpu.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, apply_tanh=False)
                     i8_list = gpu.encode_contextual_chunks(docs, output_dtype="int8", normalize=False)
                     exp_proj_all = ref[f"{cid}/projected"]
                     for di, doc in enumerate(docs):
@@ -120,6 +120,14 @@ def test_gpu_trace_and_all_16_reference_cases() -> None:
                             assert f_cos >= 0.9999, f"{cid}[{di}][{ci}] f32 cos={f_cos}"
                             assert i8_cos >= 0.9997, f"{cid}[{di}][{ci}] i8 cos={i8_cos}"
                             assert abs_d <= 1, f"{cid}[{di}][{ci}] max_abs_diff={abs_d}"
+                    if cid == "non_contextual":
+                        nd = gpu.encode_documents([d[0] for d in docs], output_dtype="float32", normalize=True)
+                        exp_nd = np.concatenate([ref[f"{cid}/encoded/{di}"] for di in range(len(docs))], axis=0).astype(
+                            np.float32
+                        )
+                        exp_nd /= np.maximum(np.linalg.norm(exp_nd, axis=-1, keepdims=True), 1e-12)
+                        nd_cos = np.sum(nd * exp_nd, axis=-1)
+                        assert float(nd_cos.min()) >= 0.9998, f"encode_documents upstream cos={nd_cos}"
 
 
 @pytest.mark.gpu_ane
@@ -265,11 +273,11 @@ def test_gpu_real_model_s4096_streamed_vs_whole_parity(
             assert len(toks) == 4096
 
             monkeypatch.setattr(pplx_gpu_mod, "_STREAMED_SEQ_THRESHOLD", 10_000)
-            whole_p = gpu.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False)
+            whole_p = gpu.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, apply_tanh=False)
             whole_i = gpu.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False)
 
             monkeypatch.setattr(pplx_gpu_mod, "_STREAMED_SEQ_THRESHOLD", 2048)
-            stream_p = gpu.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False)
+            stream_p = gpu.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, apply_tanh=False)
             stream_i = gpu.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False)
 
             cos = float(

@@ -959,4 +959,104 @@ def test_embed_parquet_cross_shard_lookahead_resume_and_nocache_cpu(tmp_path: Pa
     assert np.allclose(np.asarray(tbl_single.column("vector").to_pylist(), dtype=np.float32), vec_base, atol=1e-6)
 
 
+def test_embed_parquet_header_col_and_text_chunking(tmp_path: Path) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+
+    vocab_tokens = [
+        "<pad>", "<eos>", "<bos>", "<unk>",
+        "doc:", "title:", "|", "text:", "DocA", "DocB", "FallbackHdr",
+        "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8",
+    ]
+    vocab = {t: i for i, t in enumerate(vocab_tokens)}
+    raw_tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", 2), ("<eos>", 1)],
+    )
+    tok_path = tmp_path / "hdr_tok.json"
+    raw_tok.save(str(tok_path))
+
+    class _PlainHeaderTokenizer(BaseFastTokenizer):
+        pass
+
+    class _TitlePrefixTokenizer(BaseFastTokenizer):
+        def format_document_prefix(self, title: str | None = None) -> str:
+            clean = title.strip() if (title and title.strip()) else "none"
+            return f"title: {clean} | text: "
+
+    in_pq = tmp_path / "docs_hdr.parquet"
+    bodies = ["t1 t2 t3 t4 t5 t6", "t7 t8 t1 t2 t3 t4"]
+    pq.write_table(
+        pa.table({"id": [0, 1], "title": ["DocA", None], "body": bodies}),
+        in_pq,
+    )
+
+    # 1. Missing header_col raises KeyError explicitly
+    plain_tok = _PlainHeaderTokenizer(tok_path, bos_token="<bos>", eos_token="<eos>", pad_token="<pad>", document_prefix="doc: ")
+    eng_plain = _LengthSensitiveEngine(plain_tok)
+    with pytest.raises(KeyError, match="missing_hdr"):
+        embed_parquet(eng_plain, in_pq, tmp_path / "err.parquet", header_col="missing_hdr", progress_every=0)
+
+    # 2. Standard tokenizer prepends "{base_prefix}{header}\n" with header_text fallback when cell is None
+    out_plain = tmp_path / "out_plain.parquet"
+    embed_parquet(
+        eng_plain,
+        in_pq,
+        out_plain,
+        chunk=True,
+        max_chunk_tokens=7,
+        overlap=0,
+        header_col="title",
+        header_text="FallbackHdr",
+        include_chunk_text=True,
+        sort_macro_window=False,
+        progress_every=0,
+    )
+    tbl_p = pq.read_table(out_plain)
+    assert tbl_p.num_rows >= 4
+    # Reconstructed chunk_text with exact char_start/char_end slices matches original bodies cleanly
+    for doc_id in (0, 1):
+        rows_d = [
+            (r_c0, r_c1, r_txt)
+            for r_id, r_c0, r_c1, r_txt in zip(
+                tbl_p.column("id").to_pylist(),
+                tbl_p.column("char_start").to_pylist(),
+                tbl_p.column("char_end").to_pylist(),
+                tbl_p.column("chunk_text").to_pylist(),
+            )
+            if r_id == doc_id
+        ]
+        assert "".join(bodies[doc_id][c0:c1] for c0, c1, _ in rows_d) == bodies[doc_id]
+        assert all(txt == bodies[doc_id][c0:c1] for c0, c1, txt in rows_d)
+    flat_calls_p = [ids for call in eng_plain.calls for ids in call]
+    assert any(vocab["DocA"] in ids for ids in flat_calls_p)
+    assert any(vocab["FallbackHdr"] in ids for ids in flat_calls_p)
+
+    # 3. Title-aware tokenizer uses format_document_prefix ("title: DocA | text: ")
+    title_tok = _TitlePrefixTokenizer(tok_path, bos_token="<bos>", eos_token="<eos>", pad_token="<pad>", document_prefix="")
+    eng_title = _LengthSensitiveEngine(title_tok)
+    out_title = tmp_path / "out_title.parquet"
+    embed_parquet(
+        eng_title,
+        in_pq,
+        out_title,
+        chunk=True,
+        max_chunk_tokens=10,
+        overlap=0,
+        header_col="title",
+        header_text="FallbackHdr",
+        sort_macro_window=False,
+        progress_every=0,
+    )
+    flat_calls_t = [ids for call in eng_title.calls for ids in call]
+    assert all(vocab["title:"] in ids and vocab["|"] in ids and vocab["text:"] in ids for ids in flat_calls_t)
+    assert any(vocab["DocA"] in ids for ids in flat_calls_t)
+    assert any(vocab["FallbackHdr"] in ids for ids in flat_calls_t)
+
+
+
 

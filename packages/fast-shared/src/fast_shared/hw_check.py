@@ -647,6 +647,42 @@ def supports_apple10_nax(hw: dict[str, Any] | None = None) -> bool:
     return True
 
 
+def detect_apple10_d256_force_fused(
+    device_info: Mapping[str, Any] | None = None,
+    macos_version: str | None = None,
+) -> bool:
+    """Return True on Apple10 (M5+) + macOS >= 26.2 + MLX supporting `force_fused` D=256 SDPA."""
+    if os.environ.get("MLX_METAL_NO_NAX") == "1":
+        return False
+    try:
+        import inspect
+        import mlx.core as mx
+
+        sig = inspect.signature(mx.fast.scaled_dot_product_attention)
+        if "force_fused" not in sig.parameters:
+            return False
+    except Exception:
+        return False
+
+    info = dict(device_info) if device_info is not None else {}
+    if not info:
+        try:
+            import mlx.core as mx
+
+            info = dict(mx.device_info())
+        except Exception:
+            return False
+    dev_name = str(info.get("device_name", "")).lower()
+    arch = str(info.get("architecture", "")).lower()
+    is_m5_plus = ("m5" in dev_name) or ("m6" in dev_name) or ("apple10" in arch) or ("g17" in arch)
+    if not is_m5_plus:
+        return False
+    mac_ver = parse_version_tuple(platform.mac_ver()[0] if macos_version is None else macos_version)
+    if mac_ver and not _version_ge(mac_ver, (26, 2)):
+        return False
+    return True
+
+
 def supports_metal4_fp16(hw: dict[str, Any] | None = None) -> bool:
     """Return True if host supports Metal 4 MPP FP16 tensor operations (macOS >= 26.0, Apple9/Apple10)."""
     info = hw if hw is not None else probe_host_hardware()
@@ -1100,6 +1136,7 @@ __all__ = [
     "TESTED_REFERENCE_HARDWARE",
     "coreai_specialization_cache_key_parts",
     "default_roofline_ceilings",
+    "detect_apple10_d256_force_fused",
     "evaluate_hardware_support",
     "extract_coreml_compute_plan_ops",
     "format_hardware_summary",

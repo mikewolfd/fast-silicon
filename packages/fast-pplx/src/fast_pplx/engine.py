@@ -15,7 +15,7 @@ import time
 from typing import Any, Literal, Sequence
 
 import numpy as np
-from fast_shared.embeddings import resolve_embedding_dim, truncate_and_normalize
+from fast_shared.embeddings import accepts_kwarg, resolve_embedding_dim, truncate_and_normalize
 from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
@@ -965,6 +965,7 @@ class FastPplx:
             raise ValueError(f"Unsupported quantize_weights {quantize_weights!r}; expected 'none' or 'w8'")
 
         self.paths: RepoPaths = resolve_paths(home)
+        self._requested_mode: str = mode
         self.dtype_name = dtype
         self.quantize_weights: Literal["none", "w8"] = "w8" if eff_qw == "w8" else "none"
         self.pipe_depth = int(pipe_depth)
@@ -1219,6 +1220,7 @@ class FastPplx:
         output_dtype: str,
         normalize: bool,
         contextual: bool = False,
+        apply_tanh: bool = True,
     ) -> np.ndarray | list[np.ndarray]:
         eff_mode = self._resolve_mode(mode)
         if output_dtype not in ("float32", "float16", "int8"):
@@ -1241,20 +1243,40 @@ class FastPplx:
         ) -> np.ndarray | list[np.ndarray]:
             with self._gpu_lock:
                 if contextual:
-                    return self.gpu.encode_contextual_tokens(
-                        [(ids, spans or ()) for _, ids, spans in sub_items],
-                        batch_size=batch_size,
-                        dimensions=target_dim,
-                        output_dtype=output_dtype,
-                        normalize=normalize,
-                    )
-                return self.gpu.encode_tokens(
-                    [it[1] for it in sub_items],
-                    batch_size=batch_size,
-                    dimensions=target_dim,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                )
+                    fn = self.gpu.encode_contextual_tokens
+                    kw: dict[str, Any] = {
+                        "batch_size": batch_size,
+                        "dimensions": target_dim,
+                        "output_dtype": output_dtype,
+                        "normalize": normalize,
+                    }
+                    if accepts_kwarg(fn, "apply_tanh"):
+                        kw["apply_tanh"] = apply_tanh
+                    return fn([(ids, spans or ()) for _, ids, spans in sub_items], **kw)
+                if any(it[2] is not None for it in sub_items) and hasattr(self.gpu, "encode_contextual_tokens"):
+                    fn = self.gpu.encode_contextual_tokens
+                    kw = {
+                        "batch_size": batch_size,
+                        "dimensions": target_dim,
+                        "output_dtype": output_dtype,
+                        "normalize": normalize,
+                    }
+                    if accepts_kwarg(fn, "apply_tanh"):
+                        kw["apply_tanh"] = apply_tanh
+                    mats = fn([(ids, spans or [(0, len(ids))]) for _, ids, spans in sub_items], **kw)
+                    if not mats:
+                        return self._format_empty(0, target_dim, output_dtype)
+                    return np.vstack([np.asarray(m)[0:1] for m in mats])
+                fn = self.gpu.encode_tokens
+                kw = {
+                    "batch_size": batch_size,
+                    "dimensions": target_dim,
+                    "output_dtype": output_dtype,
+                    "normalize": normalize,
+                }
+                if accepts_kwarg(fn, "apply_tanh"):
+                    kw["apply_tanh"] = apply_tanh
+                return fn([it[1] for it in sub_items], **kw)
 
         if eff_mode == "gpu":
             res = _encode_gpu(items)
@@ -1289,7 +1311,7 @@ class FastPplx:
         else:
             flat_out = np.zeros((n_items, target_dim), dtype=np_dt)
 
-        apply_tanh_int8 = output_dtype == "int8"
+        apply_tanh_int8 = (output_dtype == "int8") or bool(apply_tanh)
         apply_l2 = normalize and output_dtype != "int8"
 
         def _store_ane_results(done_list: list[tuple[PackedBucket, np.ndarray]]) -> None:
@@ -1334,6 +1356,46 @@ class FastPplx:
                 }
             )
             return ctx_out if contextual else flat_out
+
+        # Zero-thread inline fast path for single-item short inputs:
+        # - Base M5+ (Apple10 NAX) `hetero2`: Metal GPU is ~1.5x faster (~6.1ms vs ~9.0ms ANE) at exact FP16 parity.
+        # - M4 Pro (Apple9) or deterministic `hetero`: single ANE slot beats Metal GPU without thread-spawn overhead.
+        if n_items == 1 and not contextual and len(short_items) == 1:
+            is_apple10_q = bool(self.runtime_telemetry.get("is_apple10", False))
+            if eff_mode == "hetero2" and self.gpu is not None and is_apple10_q:
+                res = _encode_gpu(items)
+                self._set_call_stats(
+                    {
+                        "mode": eff_mode,
+                        "ane_items": 0,
+                        "ane_buckets": 0,
+                        "gpu_items": 1,
+                        "gpu_stolen_items": 1,
+                        "deterministic": False,
+                        "elapsed_s": round(time.perf_counter() - t0, 4),
+                    }
+                )
+                return res
+            buckets = pack_ane_buckets(short_items, supported_caps=ane_caps)
+            done = self.ane.run_buckets(
+                buckets,
+                out_dim=target_dim,
+                apply_tanh_int8=apply_tanh_int8,
+                apply_l2_norm=apply_l2,
+            )
+            _store_ane_results(done)
+            self._set_call_stats(
+                {
+                    "mode": eff_mode,
+                    "ane_items": 1,
+                    "ane_buckets": len(buckets),
+                    "gpu_items": 0,
+                    "gpu_stolen_items": 0,
+                    "deterministic": eff_mode == "hetero",
+                    "elapsed_s": round(time.perf_counter() - t0, 4),
+                }
+            )
+            return flat_out
 
         # Concurrent hetero (deterministic static split) vs hetero2 (dynamic work-stealing):
         # - `hetero`: ANE owns all short <= max_ane_cap items deterministically; GPU owns > max_ane_cap items.
@@ -1420,8 +1482,14 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        exclude_document_prefix: bool = False,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
-        items = [(idx, list(toks), None) for idx, toks in enumerate(token_lists)]
+        use_span = bool(exclude_document_prefix and hasattr(self.tokenizer, "document_prefix_span"))
+        items = [
+            (idx, list(toks), [self.tokenizer.document_prefix_span(toks)] if use_span else None)
+            for idx, toks in enumerate(token_lists)
+        ]
         res = self._dispatch_token_items(
             items,
             mode=mode,
@@ -1429,6 +1497,7 @@ class FastPplx:
             dimensions=dimensions,
             output_dtype=output_dtype,
             normalize=normalize,
+            apply_tanh=apply_tanh,
         )
         assert isinstance(res, np.ndarray)
         return res
@@ -1444,21 +1513,31 @@ class FastPplx:
         normalize: bool = True,
         is_query: bool = False,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         items_txt = [texts] if isinstance(texts, str) else list(texts)
         eff_max = _resolve_max_length(max_length, self.max_seq_len)
         if is_query:
-            token_lists = [self.tokenizer.encode_query(t, max_length=eff_max) for t in items_txt]
+            items: list[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]] = [
+                (idx, self.tokenizer.encode_query(t, max_length=eff_max), None) for idx, t in enumerate(items_txt)
+            ]
         else:
-            token_lists = [self.tokenizer.encode_document(t, max_length=eff_max) for t in items_txt]
-        return self.encode_tokens(
-            token_lists,
+            items = [
+                (idx, *self.tokenizer.encode_contextual_document([t], return_spans=True, max_length=eff_max))
+                for idx, t in enumerate(items_txt)
+            ]
+        res = self._dispatch_token_items(
+            items,
+            mode=mode,
             batch_size=batch_size,
             dimensions=dimensions,
             output_dtype=output_dtype,
             normalize=normalize,
-            mode=mode,
+            contextual=False,
+            apply_tanh=apply_tanh,
         )
+        assert isinstance(res, np.ndarray)
+        return res
 
     def encode_queries(
         self,
@@ -1470,6 +1549,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         return self.encode(
             queries,
@@ -1480,6 +1560,7 @@ class FastPplx:
             normalize=normalize,
             is_query=True,
             mode=mode,
+            apply_tanh=apply_tanh,
         )
 
     def encode_documents(
@@ -1492,6 +1573,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         return self.encode(
             texts,
@@ -1502,6 +1584,7 @@ class FastPplx:
             normalize=normalize,
             is_query=False,
             mode=mode,
+            apply_tanh=apply_tanh,
         )
 
     def encode_contextual_chunks(
@@ -1514,6 +1597,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> list[np.ndarray]:
         eff_max = _resolve_max_length(max_length, self.max_seq_len)
         items: list[tuple[int, list[int], list[tuple[int, int]]]] = []
@@ -1530,6 +1614,7 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             contextual=True,
+            apply_tanh=apply_tanh,
         )
         assert isinstance(res, list)
         return res
@@ -1543,6 +1628,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> list[np.ndarray]:
         """Encode pre-tokenized `(token_ids, chunk_spans)` contextual documents without re-tokenization."""
         items = [
@@ -1557,9 +1643,55 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             contextual=True,
+            apply_tanh=apply_tanh,
         )
         assert isinstance(res, list)
         return res
+
+    def _ensure_gpu(self) -> Any:
+        if self.gpu is None:
+            if self._requested_mode == "ane":
+                raise RuntimeError(
+                    "encode_images requires the Metal GPU backend (not available when mode='ane')"
+                )
+            raise RuntimeError("Metal GPU backend is not initialized")
+        return self.gpu
+
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        chunks: int = 8,
+        batch_size: int = 4,
+        min_pixels: int = 16384,
+        max_pixels: int = 1_800_000,
+        crop_margins: bool = False,
+        rotations_cw: int | Sequence[int] | None = None,
+        dimensions: int | None = None,
+        output_dtype: str = "float32",
+        normalize: bool = True,
+        apply_tanh: bool = True,
+    ) -> list[np.ndarray]:
+        """Encode page/document images into contextual chunk embeddings via shared Qwen3.5 ViT + MRoPE."""
+        from .gpu import normalize_rotations_cw
+
+        gpu = self._ensure_gpu()
+        img_list = list(images)
+        norm_rotations = normalize_rotations_cw(rotations_cw, len(img_list))
+        with self._gpu_lock:
+            return gpu.encode_images(
+                img_list,
+                chunks=chunks,
+                batch_size=batch_size,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                crop_margins=crop_margins,
+                rotations_cw=norm_rotations,
+                dimensions=dimensions,
+                output_dtype=output_dtype,
+                normalize=normalize,
+                apply_tanh=apply_tanh,
+            )
 
     def encode_texts(
         self,
@@ -1567,7 +1699,7 @@ class FastPplx:
         *,
         is_query: bool = False,
         add_query_prefix: bool = False,
-        add_document_prefix: bool = False,
+        add_document_prefix: bool | None = None,
         prefix: str | None = None,
         prompt_name: str | None = None,
         max_length: int | None = None,
@@ -1576,15 +1708,43 @@ class FastPplx:
         normalize: bool = True,
         batch_size: int = 16,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         items_txt = [texts] if isinstance(texts, str) else list(texts)
         eff_max = _resolve_max_length(max_length, self.max_seq_len)
+        eff_add_doc = (
+            (not is_query and not add_query_prefix and prefix is None and prompt_name is None)
+            if add_document_prefix is None
+            else bool(add_document_prefix)
+        )
         eff_prefix = self.tokenizer.resolve_prefix(
             prefix=prefix,
             prompt_name=prompt_name,
             add_query_prefix=bool(is_query or add_query_prefix),
-            add_document_prefix=add_document_prefix,
+            add_document_prefix=eff_add_doc,
         )
+        if (
+            eff_prefix
+            and eff_prefix.startswith(self.tokenizer.document_prefix)
+            and hasattr(self.tokenizer, "encode_contextual_document")
+        ):
+            user_pfx = eff_prefix[len(self.tokenizer.document_prefix) :]
+            items: list[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]] = [
+                (idx, *self.tokenizer.encode_contextual_document([user_pfx + t], return_spans=True, max_length=eff_max))
+                for idx, t in enumerate(items_txt)
+            ]
+            res = self._dispatch_token_items(
+                items,
+                mode=mode,
+                batch_size=batch_size,
+                dimensions=dimensions,
+                output_dtype=output_dtype,
+                normalize=normalize,
+                contextual=False,
+                apply_tanh=apply_tanh,
+            )
+            assert isinstance(res, np.ndarray)
+            return res
         tok_lists = self.tokenizer.encode_batch(items_txt, prefix=eff_prefix, max_length=eff_max)
         return self.encode_tokens(
             tok_lists,
@@ -1593,6 +1753,7 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             mode=mode,
+            apply_tanh=apply_tanh,
         )
 
     def encode_query(
@@ -1603,6 +1764,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         if isinstance(query, str):
             mat = self.encode_queries(
@@ -1611,6 +1773,7 @@ class FastPplx:
                 output_dtype=output_dtype,
                 normalize=normalize,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
         else:
             mat = self.encode_tokens(
@@ -1619,6 +1782,7 @@ class FastPplx:
                 output_dtype=output_dtype,
                 normalize=normalize,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
         return np.asarray(mat[0])
 
@@ -1632,6 +1796,8 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        exclude_document_prefix: bool = False,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         if not corpus:
             target_dim = resolve_embedding_dim(dimensions, max_dim=self.max_dim, default_dim=self.dim, supports_dimensions=True)
@@ -1646,6 +1812,7 @@ class FastPplx:
                 output_dtype=output_dtype,
                 normalize=normalize,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
         return self.encode_tokens(
             corpus,  # type: ignore[arg-type]
@@ -1654,6 +1821,8 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             mode=mode,
+            exclude_document_prefix=exclude_document_prefix,
+            apply_tanh=apply_tanh,
         )
 
     def embed(
@@ -1667,6 +1836,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> np.ndarray | list[np.ndarray]:
         if isinstance(inputs, str):
             return self.encode(
@@ -1678,6 +1848,7 @@ class FastPplx:
                 normalize=normalize,
                 is_query=is_query,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
         seq = list(inputs)
         if not seq:
@@ -1693,6 +1864,7 @@ class FastPplx:
                 normalize=normalize,
                 is_query=is_query,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
         return self.encode_contextual_chunks(
             seq,  # type: ignore[arg-type]
@@ -1702,6 +1874,7 @@ class FastPplx:
             output_dtype=output_dtype,
             normalize=normalize,
             mode=mode,
+            apply_tanh=apply_tanh,
         )
 
     def encode_documents_multivector(
@@ -1717,6 +1890,7 @@ class FastPplx:
         output_dtype: str = "float32",
         normalize: bool = True,
         mode: str | None = None,
+        apply_tanh: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Encode `4K-32K` documents into `(window_vecs [W, D], doc_offsets [N_docs + 1])` for `MaxSim`.
 
@@ -1794,6 +1968,7 @@ class FastPplx:
                 output_dtype=output_dtype,
                 normalize=normalize,
                 mode=mode,
+                apply_tanh=apply_tanh,
             )
             for owner, mat in zip(win_owners, mats):
                 per_doc[owner].append(np.asarray(mat))
@@ -1866,6 +2041,90 @@ class FastPplx:
         return CompactRetrievalIndex(
             vecs,
             doc_offsets=eff_offsets,
+            mode=mode,
+            is_mrl_trained=self.is_mrl_trained,
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
+        )
+
+    def build_image_index(
+        self,
+        images: Sequence[Any],
+        *,
+        chunks: int = 8,
+        batch_size: int = 4,
+        min_pixels: int = 16384,
+        max_pixels: int = 1_800_000,
+        crop_margins: bool = True,
+        rotations_cw: int | Sequence[int] | None = None,
+        dimensions: int | None = None,
+        mode: IndexMode = "auto",
+        mrl_dim: int | None = None,
+        binary_bits: int | None = None,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+    ) -> CompactRetrievalIndex:
+        """Encode document/page images into contextual bands and build a CompactRetrievalIndex."""
+        img_list = list(images)
+        if dimensions is None:
+            enc_dim = self.max_dim
+        else:
+            if isinstance(dimensions, bool) or not isinstance(dimensions, (int, np.integer)):
+                raise ValueError(f"dimensions must be an integer, got {dimensions!r}")
+            enc_dim = int(dimensions)
+            if enc_dim <= 0 or enc_dim > self.max_dim:
+                raise ValueError(
+                    f"dimensions must be in [1, {self.max_dim}], got {enc_dim}"
+                )
+
+        per_page = self.encode_images(
+            img_list,
+            chunks=chunks,
+            batch_size=batch_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            crop_margins=crop_margins,
+            rotations_cw=rotations_cw,
+            dimensions=enc_dim,
+            output_dtype="float32",
+            normalize=True,
+        )
+        if not per_page:
+            return CompactRetrievalIndex(
+                np.empty((0, enc_dim), dtype=np.float32),
+                doc_offsets=np.zeros((1,), dtype=np.int32),
+                mode=mode,
+                is_mrl_trained=self.is_mrl_trained,
+                mrl_dim=mrl_dim,
+                binary_bits=binary_bits,
+                agg=agg,
+                hybrid_alpha=hybrid_alpha,
+            )
+
+        vec_dim = enc_dim
+        for mat in per_page:
+            arr_m = np.asarray(mat)
+            if arr_m.ndim == 2 and arr_m.shape[1] > 0:
+                vec_dim = int(arr_m.shape[1])
+                break
+
+        offsets = [0]
+        chunks_out: list[np.ndarray] = []
+        for mat in per_page:
+            arr = np.asarray(mat, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[0] > 0:
+                chunks_out.append(arr)
+                offsets.append(offsets[-1] + int(arr.shape[0]))
+            else:
+                chunks_out.append(np.zeros((1, vec_dim), dtype=np.float32))
+                offsets.append(offsets[-1] + 1)
+
+        all_vecs = np.vstack(chunks_out)
+        return CompactRetrievalIndex(
+            all_vecs,
+            doc_offsets=np.asarray(offsets, dtype=np.int32),
             mode=mode,
             is_mrl_trained=self.is_mrl_trained,
             mrl_dim=mrl_dim,

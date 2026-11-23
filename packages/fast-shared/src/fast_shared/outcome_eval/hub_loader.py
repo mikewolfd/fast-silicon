@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import json
 import os
 from pathlib import Path
@@ -1470,6 +1471,554 @@ def load_extractbench(
     return selected
 
 
+# ---------------------------------------------------------------------------
+# Category 5 Loaders: olmOCR-Bench, FinTabNet-OTSL, OmniDocBench-EN, CORD-v2
+# ---------------------------------------------------------------------------
+
+OLMOCR_BENCH_CATEGORIES: tuple[str, ...] = (
+    "arxiv_math",
+    "headers_footers",
+    "long_tiny_text",
+    "multi_column",
+    "old_scans",
+    "old_scans_math",
+    "table_tests",
+)
+
+_CORD_MENU_KEYS: tuple[str, ...] = (
+    "nm",
+    "num",
+    "cnt",
+    "unitprice",
+    "price",
+    "discountprice",
+    "itemsubtotal",
+    "etc",
+)
+_CORD_SUBTOTAL_KEYS: tuple[str, ...] = (
+    "subtotal_price",
+    "discount_price",
+    "service_price",
+    "tax_price",
+    "etc",
+)
+_CORD_TOTAL_KEYS: tuple[str, ...] = (
+    "total_price",
+    "cashprice",
+    "changeprice",
+    "creditcardprice",
+    "emoneyprice",
+    "menuqty_cnt",
+    "menutype_cnt",
+    "total_etc",
+)
+
+
+def _extract_image_bytes(img_cell: Any) -> bytes:
+    """Extract raw image bytes from a HuggingFace Parquet image struct or raw bytes cell."""
+    if isinstance(img_cell, (bytes, bytearray, memoryview)):
+        return bytes(img_cell)
+    if isinstance(img_cell, Mapping):
+        raw = img_cell.get("bytes")
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            return bytes(raw)
+    return b""
+
+
+def reconstruct_fintabnet_html(html_tokens: Sequence[str], cells: Sequence[Any]) -> str:
+    """Reconstruct complete HTML ``<table>`` ground truth by pairing ``html`` tokens with ``cells`` text."""
+    if isinstance(cells, Sequence) and cells and isinstance(cells[0], list):
+        cell_list: Sequence[Any] = cells[0]
+    else:
+        cell_list = cells
+
+    cell_texts: list[str] = []
+    for cell in cell_list:
+        if isinstance(cell, Mapping):
+            toks = cell.get("tokens")
+            if isinstance(toks, Sequence) and not isinstance(toks, (str, bytes)):
+                raw = "".join(str(t) for t in toks)
+            else:
+                raw = str(cell.get("text") or "")
+        else:
+            raw = str(cell or "")
+        cell_texts.append(" ".join(raw.split()))
+
+    out_parts: list[str] = []
+    c_idx = 0
+    for tok in html_tokens:
+        s = str(tok)
+        low = s.strip().lower()
+        if low in ("</td>", "</th>"):
+            if c_idx < len(cell_texts):
+                txt = cell_texts[c_idx]
+                c_idx += 1
+                if txt:
+                    out_parts.append(_html.escape(txt, quote=False))
+            out_parts.append(s)
+        else:
+            out_parts.append(s)
+
+    joined = "".join(out_parts).strip()
+    if not joined:
+        return "<table></table>"
+    if not joined.lower().startswith("<table"):
+        return f"<table>{joined}</table>"
+    return joined
+
+
+def _coerce_cord_scalar(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = " ".join(val.split()).strip()
+        return s or None
+    if isinstance(val, list):
+        parts = [_coerce_cord_scalar(el) for el in val]
+        kept = [p for p in parts if p]
+        return " / ".join(kept) if kept else None
+    if isinstance(val, Mapping):
+        parts = [_coerce_cord_scalar(v) for v in val.values()]
+        kept = [p for p in parts if p]
+        return " ".join(kept) if kept else None
+    s = " ".join(str(val).split()).strip()
+    return s or None
+
+
+def normalize_cord_v2_parse(gt_parse: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize CORD-v2 ``gt_parse`` into a uniform Draft-2020-12 receipt extraction object."""
+    raw_menu = gt_parse.get("menu")
+    if isinstance(raw_menu, Mapping):
+        menu_seq: list[Any] = [raw_menu]
+    elif isinstance(raw_menu, list):
+        menu_seq = raw_menu
+    else:
+        menu_seq = []
+
+    norm_menu: list[dict[str, str]] = []
+    for entry in menu_seq:
+        if not isinstance(entry, Mapping):
+            continue
+        item_obj: dict[str, str] = {}
+        for k in _CORD_MENU_KEYS:
+            val = _coerce_cord_scalar(entry.get(k))
+            if val is not None:
+                item_obj[k] = val
+        if item_obj:
+            norm_menu.append(item_obj)
+
+    norm_sub: dict[str, str] = {}
+    raw_sub = gt_parse.get("sub_total")
+    if isinstance(raw_sub, Mapping):
+        for k in _CORD_SUBTOTAL_KEYS:
+            val = _coerce_cord_scalar(raw_sub.get(k))
+            if val is not None:
+                norm_sub[k] = val
+
+    norm_total: dict[str, str] = {}
+    raw_total = gt_parse.get("total")
+    if isinstance(raw_total, Mapping):
+        for k in _CORD_TOTAL_KEYS:
+            val = _coerce_cord_scalar(raw_total.get(k))
+            if val is not None:
+                norm_total[k] = val
+
+    out: dict[str, Any] = {"menu": norm_menu, "total": norm_total}
+    if norm_sub:
+        out["sub_total"] = norm_sub
+    return out
+
+
+def build_cord_v2_schema() -> dict[str, Any]:
+    """Return canonical Draft-2020-12 JSON Schema for normalized CORD-v2 receipt extraction."""
+    opt_str: dict[str, Any] = {"type": ["string", "null"]}
+    return {
+        "type": "object",
+        "properties": {
+            "menu": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {k: dict(opt_str) for k in _CORD_MENU_KEYS},
+                    "additionalProperties": False,
+                },
+            },
+            "sub_total": {
+                "type": ["object", "null"],
+                "properties": {k: dict(opt_str) for k in _CORD_SUBTOTAL_KEYS},
+                "additionalProperties": False,
+            },
+            "total": {
+                "type": "object",
+                "properties": {k: dict(opt_str) for k in _CORD_TOTAL_KEYS},
+                "additionalProperties": False,
+            },
+        },
+        "required": ["menu", "total"],
+        "additionalProperties": False,
+    }
+
+
+def load_olmocr_bench(
+    *,
+    tier: str = "tier1",
+    categories: Sequence[str] | None = None,
+    max_pages: int | None = None,
+    download_pdfs: bool = True,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``allenai/olmOCR-bench`` single-page PDFs grouped with their binary unit tests."""
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["olmocr_bench"]
+    t_cfg = ds.get(tier, ds.get("tier1", {}))
+    allowed_cats = list(ds.get("categories") or OLMOCR_BENCH_CATEGORIES)
+    eff_cats = list(categories) if categories is not None else allowed_cats
+    for cat in eff_cats:
+        if cat not in allowed_cats:
+            raise ValueError(f"Unknown olmOCR-bench category {cat!r}; expected one of {allowed_cats}")
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for cat in eff_cats:
+        jl_path = download_pinned_file(
+            "olmocr_bench",
+            f"bench_data/{cat}.jsonl",
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        for row in read_jsonl_rows(jl_path):
+            pdf_rel = str(row.get("pdf") or "").strip()
+            if not pdf_rel:
+                continue
+            key = (cat, pdf_rel)
+            rec = grouped.get(key)
+            if rec is None:
+                rec = {
+                    "id": f"{cat}:{pdf_rel}",
+                    "category": cat,
+                    "pdf_rel": pdf_rel,
+                    "pdf_repo_path": f"bench_data/pdfs/{pdf_rel}",
+                    "pdf_path": None,
+                    "tests": [],
+                }
+                grouped[key] = rec
+            rec["tests"].append(dict(row))
+
+    all_pages = [grouped[k] for k in sorted(grouped)]
+    if max_pages is not None:
+        selected = stratified_sha256_sample(
+            all_pages,
+            dataset_key=f"olmocr_bench:{tier}",
+            id_fn=lambda r: r["id"],
+            stratum_fn=lambda r: r["category"],
+            total_n=int(max_pages),
+        )
+    else:
+        per_cat = t_cfg.get("per_category")
+        tot_n = t_cfg.get("n")
+        selected = stratified_sha256_sample(
+            all_pages,
+            dataset_key=f"olmocr_bench:{tier}",
+            id_fn=lambda r: r["id"],
+            stratum_fn=lambda r: r["category"],
+            per_stratum=int(per_cat) if per_cat is not None else None,
+            total_n=int(tot_n) if (per_cat is None and tot_n is not None) else None,
+        )
+
+    if download_pdfs:
+        for item in selected:
+            pdf_p = download_pinned_file(
+                "olmocr_bench",
+                item["pdf_repo_path"],
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                verify_checksum=False,
+            )
+            item["pdf_path"] = str(pdf_p)
+    return selected
+
+
+def load_fintabnet_otsl(
+    *,
+    tier: str = "tier1",
+    max_items: int | None = None,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``docling-project/FinTabNet_OTSL`` test tables with exact reconstructed HTML GT."""
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["fintabnet_otsl"]
+    t_cfg = ds.get(tier, ds.get("tier1", {}))
+    target_n = int(max_items) if max_items is not None else (int(t_cfg["n"]) if t_cfg.get("n") is not None else None)
+    if target_n is not None and target_n <= 0:
+        return []
+    shard_files = list(t_cfg.get("files") or ds.get("files") or [])
+
+    meta_cols = ["filename", "imgid", "cols", "rows", "otsl", "html", "cells"]
+    shard_paths: list[Path] = []
+    candidates: list[dict[str, Any]] = []
+    for s_idx, fn in enumerate(shard_files):
+        p = download_pinned_file(
+            "fintabnet_otsl",
+            fn,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        shard_paths.append(p)
+        tbl = pq.read_table(p, columns=meta_cols)
+        filenames = tbl.column("filename").to_pylist()
+        imgids = tbl.column("imgid").to_pylist()
+        cols_list = tbl.column("cols").to_pylist()
+        rows_list = tbl.column("rows").to_pylist()
+        otsl_list = tbl.column("otsl").to_pylist()
+        html_list = tbl.column("html").to_pylist()
+        cells_list = tbl.column("cells").to_pylist()
+        for r_idx in range(tbl.num_rows):
+            n_rows = int(rows_list[r_idx] or 0)
+            n_cols = int(cols_list[r_idx] or 0)
+            otsl_toks = otsl_list[r_idx] or []
+            has_span = any(str(tok) in ("lcel", "ucel", "xcel") for tok in otsl_toks)
+            area = n_rows * n_cols
+            size_bucket = "small" if area <= 24 else ("medium" if area <= 80 else "large")
+            rec_id = str(filenames[r_idx] or imgids[r_idx] or f"{s_idx}:{r_idx}")
+            candidates.append(
+                {
+                    "id": rec_id,
+                    "filename": str(filenames[r_idx] or rec_id),
+                    "imgid": imgids[r_idx],
+                    "rows": n_rows,
+                    "cols": n_cols,
+                    "has_span": bool(has_span),
+                    "size_bucket": size_bucket,
+                    "stratum": f"{int(has_span)}:{size_bucket}",
+                    "_shard_idx": s_idx,
+                    "_row_idx": r_idx,
+                    "_html": html_list[r_idx] or [],
+                    "_cells": cells_list[r_idx] or [],
+                }
+            )
+
+    selected = stratified_sha256_sample(
+        candidates,
+        dataset_key=f"fintabnet_otsl:{tier}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["stratum"],
+        total_n=target_n,
+    )
+
+    # Read embedded image bytes strictly for selected rows to avoid loading 5K+ PNGs into RAM.
+    rows_by_shard: dict[int, list[int]] = {}
+    for item in selected:
+        rows_by_shard.setdefault(int(item["_shard_idx"]), []).append(int(item["_row_idx"]))
+    img_by_loc: dict[tuple[int, int], bytes] = {}
+    for s_idx, r_idxs in rows_by_shard.items():
+        img_col = pq.read_table(shard_paths[s_idx], columns=["image"]).column("image")
+        taken = img_col.take(r_idxs).to_pylist()
+        for r_idx, img_val in zip(r_idxs, taken):
+            img_by_loc[(s_idx, r_idx)] = _extract_image_bytes(img_val)
+
+    out: list[dict[str, Any]] = []
+    for item in selected:
+        s_idx = int(item["_shard_idx"])
+        r_idx = int(item["_row_idx"])
+        out.append(
+            {
+                "id": item["id"],
+                "filename": item["filename"],
+                "imgid": item["imgid"],
+                "rows": item["rows"],
+                "cols": item["cols"],
+                "has_span": item["has_span"],
+                "size_bucket": item["size_bucket"],
+                "gold_html": reconstruct_fintabnet_html(item["_html"], item["_cells"]),
+                "image_bytes": img_by_loc.get((s_idx, r_idx), b""),
+            }
+        )
+    return out
+
+
+def load_omnidocbench_en(
+    *,
+    tier: str = "tier1",
+    max_items: int | None = None,
+    download_images: bool = True,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load English subset of ``opendatalab/OmniDocBench`` with ordered layout/table/formula annotations."""
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["omnidocbench_en"]
+    t_cfg = ds.get(tier, ds.get("tier1", {}))
+    target_n = int(max_items) if max_items is not None else (int(t_cfg["n"]) if t_cfg.get("n") is not None else None)
+    if target_n is not None and target_n <= 0:
+        return []
+    lang_filter = str(ds.get("language_filter") or "english").strip().lower()
+
+    json_path = download_pinned_file(
+        "omnidocbench_en",
+        ds["files"][0],
+        lock=lock,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
+    raw_pages = json.loads(json_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_pages, list):
+        raise ValueError(f"Expected JSON list in {json_path}")
+
+    items: list[dict[str, Any]] = []
+    for idx, page in enumerate(raw_pages):
+        pinfo = page.get("page_info") or {}
+        pattr = pinfo.get("page_attribute") or {}
+        lang = str(pattr.get("language") or pinfo.get("language") or "").strip().lower()
+        if lang_filter and lang != lang_filter:
+            continue
+        img_name = str(pinfo.get("image_path") or "").strip()
+        if not img_name:
+            continue
+        data_source = str(pattr.get("data_source") or pinfo.get("data_source") or "unknown").strip()
+
+        raw_dets = [d for d in (page.get("layout_dets") or []) if isinstance(d, Mapping) and not d.get("ignore")]
+        raw_dets.sort(key=lambda d: (int(d["order"]) if d.get("order") is not None else 10**9, str(d.get("anno_id") or "")))
+
+        text_blocks: list[dict[str, Any]] = []
+        tables: list[dict[str, Any]] = []
+        equations: list[dict[str, Any]] = []
+        for d in raw_dets:
+            ctype = str(d.get("category_type") or "")
+            order_val = d.get("order")
+            if ctype in ("text_block", "title", "reference", "figure_caption", "table_caption", "equation_caption", "code_txt"):
+                txt = str(d.get("text") or "").strip()
+                if txt:
+                    text_blocks.append({"category_type": ctype, "order": order_val, "text": txt})
+            elif ctype == "table":
+                html_s = str(d.get("html") or d.get("text") or "").strip()
+                if html_s:
+                    tables.append({"order": order_val, "html": html_s})
+            elif ctype in ("equation_isolated", "equation_semantic"):
+                ltx = str(d.get("latex") or d.get("text") or "").strip()
+                if ltx:
+                    equations.append({"category_type": ctype, "order": order_val, "latex": ltx})
+
+        if not (text_blocks or tables or equations):
+            continue
+        items.append(
+            {
+                "id": img_name,
+                "page_no": int(pinfo.get("page_no") or idx),
+                "image_name": img_name,
+                "image_repo_path": f"images/{img_name}",
+                "image_path": None,
+                "data_source": data_source,
+                "layout": str(pattr.get("layout") or ""),
+                "subset": str(pattr.get("subset") or ""),
+                "text_blocks": text_blocks,
+                "tables": tables,
+                "equations": equations,
+            }
+        )
+
+    selected = stratified_sha256_sample(
+        items,
+        dataset_key=f"omnidocbench_en:{tier}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["data_source"],
+        total_n=target_n,
+    )
+
+    if download_images:
+        for item in selected:
+            img_p = download_pinned_file(
+                "omnidocbench_en",
+                item["image_repo_path"],
+                lock=lock,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                verify_checksum=False,
+            )
+            item["image_path"] = str(img_p)
+    return selected
+
+
+def load_cord_v2(
+    *,
+    tier: str = "tier1",
+    max_items: int | None = None,
+    lock: Mapping[str, Any] | None = None,
+    lock_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load ``naver-clova-ix/cord-v2`` test receipts normalized for ``grounded_field_f1`` + ANLS."""
+    if lock is None:
+        lock, _ = load_lockfile(lock_path)
+    ds = lock["datasets"]["cord_v2"]
+    t_cfg = ds.get(tier, ds.get("tier1", {}))
+    target_n = int(max_items) if max_items is not None else (int(t_cfg["n"]) if t_cfg.get("n") is not None else None)
+    if target_n is not None and target_n <= 0:
+        return []
+
+    p = download_pinned_file(
+        "cord_v2",
+        ds["files"][0],
+        lock=lock,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
+    gt_col = pq.read_table(p, columns=["ground_truth"]).column("ground_truth").to_pylist()
+    schema_obj = build_cord_v2_schema()
+    candidates: list[dict[str, Any]] = []
+    for idx, raw_gt in enumerate(gt_col):
+        parsed = json.loads(raw_gt) if isinstance(raw_gt, str) else (raw_gt or {})
+        gt_parse = parsed.get("gt_parse") if isinstance(parsed, Mapping) else {}
+        norm = normalize_cord_v2_parse(gt_parse if isinstance(gt_parse, Mapping) else {})
+        n_menu = len(norm.get("menu") or [])
+        bucket = "1" if n_menu <= 1 else ("2_4" if n_menu <= 4 else "5plus")
+        candidates.append(
+            {
+                "id": f"cord_test_{idx:04d}",
+                "_row_idx": idx,
+                "menu_bucket": bucket,
+                "gt_parse": norm,
+                "schema": schema_obj,
+            }
+        )
+
+    selected = stratified_sha256_sample(
+        candidates,
+        dataset_key=f"cord_v2:{tier}",
+        id_fn=lambda r: r["id"],
+        stratum_fn=lambda r: r["menu_bucket"],
+        total_n=target_n,
+    )
+
+    sel_idxs = [int(it["_row_idx"]) for it in selected]
+    img_vals = pq.read_table(p, columns=["image"]).column("image").take(sel_idxs).to_pylist()
+    out: list[dict[str, Any]] = []
+    for item, img_val in zip(selected, img_vals):
+        out.append(
+            {
+                "id": item["id"],
+                "menu_bucket": item["menu_bucket"],
+                "gt_parse": item["gt_parse"],
+                "schema": item["schema"],
+                "image_bytes": _extract_image_bytes(img_val),
+            }
+        )
+    return out
+
+
 def stage_tier_datasets(
     tier: str = "tier1",
     *,
@@ -1526,6 +2075,11 @@ def stage_tier_datasets(
                 files_to_fetch.append("test_unseen.parquet")
             if int(t_cfg.get("test", 0)) > 0:
                 files_to_fetch.append("test.parquet")
+        elif key == "fintabnet_otsl":
+            t_cfg = ds.get(tier, {})
+            n_val = t_cfg.get("n")
+            if n_val is None or int(n_val) > 0:
+                files_to_fetch.extend(t_cfg.get("files") or ds.get("files", []))
         else:
             t_cfg = ds.get(tier, {})
             n_val = t_cfg.get("n")
@@ -1554,6 +2108,20 @@ def stage_tier_datasets(
                 if cp.is_file():
                     downloaded_count += 1
                     total_bytes += int(cp.stat().st_size)
+        elif key == "olmocr_bench" and files_to_fetch:
+            olm_pages = load_olmocr_bench(tier=tier, download_pdfs=True, lock=lock, cache_dir=eff_cache, local_files_only=False)
+            for item in olm_pages:
+                pp = Path(item["pdf_path"]) if item.get("pdf_path") else None
+                if pp is not None and pp.is_file():
+                    downloaded_count += 1
+                    total_bytes += int(pp.stat().st_size)
+        elif key == "omnidocbench_en" and files_to_fetch:
+            od_pages = load_omnidocbench_en(tier=tier, download_images=True, lock=lock, cache_dir=eff_cache, local_files_only=False)
+            for item in od_pages:
+                ip = Path(item["image_path"]) if item.get("image_path") else None
+                if ip is not None and ip.is_file():
+                    downloaded_count += 1
+                    total_bytes += int(ip.stat().st_size)
 
         staged_report["datasets"][key] = {
             "repo_id": ds["repo_id"],
@@ -1577,6 +2145,8 @@ __all__ = [
     "DEFAULT_LOCK_FILENAME",
     "FORBIDDEN_LEGALBENCH_SUBSETS",
     "FORBIDDEN_LONGEMBED_SUBSETS",
+    "OLMOCR_BENCH_CATEGORIES",
+    "build_cord_v2_schema",
     "compute_file_sha256",
     "download_pinned_file",
     "filter_legalbench_subsets",
@@ -1584,7 +2154,9 @@ __all__ = [
     "load_banking77",
     "load_bfcl_v3",
     "load_clinc_oos",
+    "load_cord_v2",
     "load_extractbench",
+    "load_fintabnet_otsl",
     "load_ifbench_test",
     "load_ifeval",
     "load_jsonschemabench",
@@ -1596,12 +2168,16 @@ __all__ = [
     "load_math_500",
     "load_mmlu_redux",
     "load_nanobeir_subset",
+    "load_olmocr_bench",
+    "load_omnidocbench_en",
     "load_ragtruth",
     "load_reward_bench_2",
+    "normalize_cord_v2_parse",
     "read_arrow_ipc_rows",
     "read_jsonl_rows",
     "read_parquet_class_names",
     "read_parquet_rows",
+    "reconstruct_fintabnet_html",
     "resolve_cache_dir",
     "resolve_lockfile_path",
     "sha256_sort_key",

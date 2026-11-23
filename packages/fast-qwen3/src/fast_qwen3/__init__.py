@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ._mpp_linear import should_use_qwen_mpp_linear
 from .engine import FastQwen3Engine, GenerationBatchResult, GenerationItem, split_lcp_ids
 from .kernels import (
     QwenDoubleQuantError,
@@ -63,6 +64,7 @@ __all__ = [
     "resolve_paths",
     "resolve_preset_repo",
     "restore_hybrid_cache",
+    "should_use_qwen_mpp_linear",
     "snapshot_hybrid_cache",
     "split_lcp_ids",
     "validate_thinking_budget",

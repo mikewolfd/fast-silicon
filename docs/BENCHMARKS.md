@@ -31,6 +31,7 @@ Model format and input limits can differ within a model family. For example, Flu
 10. [v2.3 Cross-Silicon Accuracy, Precision & Contextual Validation (2026-11-22)](#10-v23-cross-silicon-accuracy-precision--contextual-validation-2026-11-22)
 11. [`fast-qwen3` Hybrid GatedDeltaNet + OptiQ + LoRA Validation (2026-11-22)](#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 12. [v2.5 Cross-Model R&D Winners & Negative Gates (2026-11-22)](#12-v25-cross-model-rd-winners--negative-gates-2026-11-22)
+13. [Vision, OCR (`Category 5`) & Apple10 NAX Prefill Validation (2026-11-23)](#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -543,8 +544,15 @@ All commands run from the `fast-silicon` repository root using `.venv/bin/python
 
 # Check quality, memory and throughput between two saved reports
 .venv/bin/python scripts/benchmark_outcomes.py compare \
-  --gate-profile lossless --min-eot-ratio 1.00 \
+  --gate-profile lossless --min-eot-ratio 1.00 --markdown \
   artifacts/outcomes_base.json artifacts/outcomes_cand.json
+
+# Stage Category 5 public OCR datasets and run cross-family visual OCR benchmarks
+.venv/bin/python scripts/benchmark_outcomes.py setup-data \
+  --tier tier1 --datasets olmocr_bench,fintabnet_otsl,omnidocbench_en,cord_v2
+.venv/bin/python scripts/benchmark_outcomes.py run --tier tier1 --smoke --local-files-only \
+  --packages ocr-families --public-python /path/to/stock-mlx-venv/bin/python \
+  --extra-args "--ocr-backend ovis --ocr-render-only" --json-out artifacts/outcomes_cat5_smoke.json
 ```
 
 ### 2. Post-Training, Speculative, Prefix-Tree & Parallel Compile (`scripts/benchmark_capabilities.py`)
@@ -787,3 +795,48 @@ Evaluated across `NanoBEIR-en` (`150` queries) and `LegalBench-RAG` (`175` queri
 | **`fast-pplx` `FFD` `pack_ane_buckets` + Host-Aware `hetero2` + Async Parquet + Opt-In `W8` (`T4.1–T4.5`)** | **`26` vs `32` ANE bins (`-18.8%`)**, **`648` vs `1,638` pad toks (`-60.4%`)**; Mixed-64 **`19,443 tok/s`** M5 (`1.17×`) / **`17,793 tok/s`** M4 (**`1.84×`** vs GPU); `w8` **`-46.4%` weights** (`460.8 -> 247.0 MB`) | `binary_int8` `multivector=True` (`72` wins): **`1.70 ms` M5 / `6.43 ms` M4**; `w8` 16-case `min_f32_cos = 0.99883` (`0.95×` FP16 M5 speed, opt-in `default="none"`). `S=768/1024` ANE MIL: M4 GPU fallback (`all_on_target=False`) & M5 GPU `1.40×` faster (`0.69–0.72×`) | **PROMOTED** (`FFD` / `hetero2` / async; `w8` opt-in; `S<=512` kept) |
 | **`SpecBucketedLinearGroup` + `compress_gdn_prefix_int8="auto"` in `fast-decision-models` (`Kev-0.8B` / `Kev-4B`)** | **`3.76×` smaller GDN `PrefixTree` (`1.57 MB -> 0.42 MB`/node on `Kev-4B`)** + `2` GEMMs vs `4` on mixed `4b`/`8b` layers | `0.0`-ULP mixed-bit `(4, 8, 4, 4)` projection parity and `0.0`-logit-delta cold-vs-warm `PrefixTree` round-trip (`9/9` CPU + `stdlib_isolated_ok`) | **PROMOTED** (`kev_mlx.py`) |
 | **Base M5 `macOS 27.2.1` `CoreAI Qwen3.5-4B` (`.aimodel` `w4` / `fp4_fp8`)** | **`0` ANE ops** (`64/64` GPU ops, `0.21×` EOT, `1.5×` RAM) | `6.92–9.04 tok/s` (`0.12×–0.16×` `fast-qwen3` `57.45 tok/s`), `Cat-4` `0.838` (`258.5s`, `0.162 EOT`, `7.94 GB` peak) vs `fast-qwen3` **`0.9024` (`58.3s`, `0.774 EOT`, `5.26 GB`)**; Python `CoreAI` API lacks `GatedDeltaNet` recurrent state carry | **`NEGATIVE_NOT_PROMOTED`** (harness baseline only) |
+
+---
+
+## 13. Vision, OCR (`Category 5`) & Apple10 NAX Prefill Validation (2026-11-23)
+
+All visual OCR runs in this section compare forced VLM/vision decoding on identical rendered page images (`--ocr-backend ovis --ocr-render-only`, disabling native PDF bypasses so visual recognizers are scored apples-to-apples) across **Apple M4 Pro (`48 GB`, `macOS 26.6`, `25G5057c`)** and **Base Apple M5 (`24 GB`, `macOS 27.2.1`, `26B131`)**. Detailed architecture notes and per-stage probe receipts live in [`packages/fast-ocr/docs/OCR_RESEARCH_AND_ARCHITECTURE.md`](../packages/fast-ocr/docs/OCR_RESEARCH_AND_ARCHITECTURE.md) and [`packages/fast-ocr/docs/OCR_BENCHMARKS_AND_BASELINES.md`](../packages/fast-ocr/docs/OCR_BENCHMARKS_AND_BASELINES.md).
+
+### 13.1 Category 5 Cross-Family Visual OCR (`--ocr-render-only`)
+
+Post-fix live smoke runs passed **`12/12`** checks across M4 Pro and Base M5 (`fast-ocr` with `auto_loop_recover=True` and `AppleVisionOCR` tiny-crop `_prepare_vision_image` upscaling; default `--ocr-backend auto` additionally routes clean digital PDF pages via `pypdfium2` at `138.8–220.2 pp/s` and single-column scans via zero-MLX ANE at `1–7.5 pp/s`):
+
+| Baseline (`mlx_vlm`) / Family | Benchmark | M4 Pro `pp/s` Ratio (`fast-ocr` vs. Baseline) | M4 Pro Dec `tok/s` Ratio | M4 Pro `EOT` Ratio | Base M5 `pp/s` Ratio (`fast-ocr` vs. Baseline) | Base M5 Dec `tok/s` Ratio | Base M5 `EOT` Ratio |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **`OvisOCR2-8bit` (same weights)** | `olmOCR-bench(4)` | **1.43×** | **1.81×** | **1.44×** | **2.02×** | **2.29×** | **2.05×** |
+| **`OvisOCR2-8bit` (same weights)** | `FinTabNet-OTSL(2)` | **1.22×** | **1.42×** | **1.22×** | **1.72×** | **1.85×** | **1.65×** |
+| **`OvisOCR2-8bit` (same weights)** | `OmniDocBench-EN(2)` | **1.51×** | **1.69×** | **1.51×** | **1.53×** | **1.57×** | **1.53×** |
+| **`GLM-OCR-bf16`** | `olmOCR-bench(4)` | **2.54×** | **2.56×** | **3.57×** | **3.47×** | **3.72×** | **5.00×** |
+| **`GLM-OCR-bf16`** | `FinTabNet-OTSL(2)` | **1.46×** | **1.72×** | **1.87×** | **2.23×** | **2.44×** | **2.85×** |
+| **`GLM-OCR-bf16`** | `OmniDocBench-EN(2)` | **2.19×** | **2.01×** | **2.10×** | **2.44×** | **2.47×** | **2.35×** |
+| **`LightOnOCR-2-1B-bf16`** | `olmOCR-bench(4)` | **2.41×** | **2.99×** | **2.41×** | **3.66×** | **3.98×** | **3.75×** |
+| **`LightOnOCR-2-1B-bf16`** | `FinTabNet-OTSL(2)` | **13.0×*** | **2.20×** | *(baseline `0.00`)* | **20.2×*** | **3.07×** | *(baseline `0.00`)* |
+| **`LightOnOCR-2-1B-bf16`** | `OmniDocBench-EN(2)` | **1.97×** | **1.93×** | **1.91×** | **2.74×** | **2.66×** | **2.63×** |
+
+*\*`LightOnOCR-2-1B-bf16` hit degenerate repetition loops on cropped `FinTabNet-OTSL` tables (`0/2` valid).*
+
+- **`fast-ocr` scores & resource receipts:** On `olmOCR-bench(4)` (after `auto_loop_recover=True` uncapped retry on dense multi-column page `[2]`), `fast-ocr` improved from `3/4` (`0.5938`) to **`4/4` (`0.8438 PASS`)** on both hosts: **`0.082` EOT** (`323.3` dec / `210.5` E2E `tok/s`, `5.75 GB` vs `7.82 GB` pre-fix) on M4 Pro and **`0.090` EOT** (**`2.05×`** vs stock `0.044`, `1.11×` vs M4 Pro, `286.1` dec / `232.7` E2E `tok/s`, `5.01 GB` vs `6.61 GB`) on Base M5. On `FinTabNet-OTSL(2)` and `OmniDocBench-EN(2)`, `fast-ocr` passed at **`0.8687` TEDS** (`0.674` M4 Pro / `0.733` M5 `pp/s`) and **`0.9093`** (`0.117` M4 Pro / `0.124` M5 `pp/s`), whereas stock `mlx_vlm` slowed `0.64×–0.81×` on Base M5.
+- **`public-apple-vision` & non-VLM local baselines:** After adding tiny-crop bicubic upscaling (`_prepare_vision_image`: `min_long_edge=960`, `min_short_edge=240`, `max_scale=3.0`; `1.0×` unchanged on full pages), `public-apple-vision` on `FinTabNet-OTSL(2)` lifted from `0.5161` to **`0.6121 PASS`** (`7.03 pp/s`) on M4 Pro (`macOS 26.6`, `rev=3`) and from `0/2` (`0.0000`) to **`2/2` (`0.5914 PASS`)** at **`25.16 pp/s`** (`0.04 s/page`, `14.88` EOT) on Base M5 (`macOS 27.2.1`, `rev=3`), with full-page ANE throughput holding at `4.97–7.55 pp/s`. Pure CPU baselines (`pypdfium2` `138.8` / `220.2 pp/s` native text; M4 Pro `Docling` `0.130–2.514 pp/s` `0.4397` OmniDoc / `0.4547` FinTabNet; `Tesseract` `0.589–12.305 pp/s` `0.2717` OmniDoc; `RapidOCR` `0.261–1.488 pp/s` `0.1458` OmniDoc) trail VLM accuracy on complex scans.
+
+### 13.2 Grammar-Locked PLD, `zoom_recover`, Triage & PDF Hygiene (`fast-ocr`)
+
+- **Ink cropping, ByteLevel vocab pruning & double buffering (`OvisOCR2-8bit`):** Foreground `crop_to_ink` (`-56.3%` to `-61.4%` ViT tokens) cut Page A ViT latency **`4.47×`** on M4 Pro (`7,726 -> 1,728 ms`) and **`5.68×`** on Base M5 (`6,542 -> 1,152 ms`); ByteLevel-decoded `build_ocr_vocab_subset(target_size=None)` (`248,320 -> 140,307`) sped decode `1.10–1.12×` at `100.0%` token parity; overlapping ANE `N+1` behind GPU `N` hid `100.0%` of ANE pre-pass work (`0.03 ms` wait). In Wave-3 (`[prose, Page A, Page B, Page C]`), `fast-ocr` finished in `29,422 ms` (`M4 Pro`, `441.3 tok/s` batch Page C) and **`28,219 ms`** (`Base M5`, `1.18×` faster Page B end-to-end) with `4/4 valid=True` and `45/45` Page C dollar amounts.
+- **Grammar-locked `OCRPLDDrafter` (`DynamicTableRowGrammar.clone()` / `LLMatcher.deep_copy()`):** Keeping PLD active under `--strict-markdown-grammar` delivered **`1.85×` decode speedup** (`170.0 -> 315.2 tok/s`, `6/6` exact parity on `FinTabNet` `n=6` M4 Pro) and **`1.144×` wall speedup** (`4,154.7 -> 3,632.8 ms`, `2/2` exact parity, identical `TEDS=0.868746` on `FinTabNet-OTSL` `n=2` Base M5); JSON-schema PLD on `CORD-v2` (`n=4`) ran **`1.11×–1.80×` `tok/s`** with exact parity and zero-cost `metadata["field_boxes"]` provenance.
+- **ANE-guided `--zoom-recover`, `--triage-dpi`, and PDF hygiene:** Hamming-1 filtered numeric zoom recovery (`_is_single_digit_substitution`) lifted `FinTabNet` (`n=6`) numeric recall **`0.994 -> 1.000`** without wasting crops on `FT[5]`; `triage_dpi=100` cut 10-page packet triage **`16.62×`** (`44,762 -> 2,694 ms`); PDF routing strips running typesetting stamps (`strip_running_pdf_boilerplate`), rejects any C0/C1/`\ufffd` control char (`count_control_garble_chars == 0`), checks `FPDF_PAGEOBJ_IMAGE` so vector-outlined pages still rasterize, and clamps oversized renders at `--max-pdf-pixels` (`20M` default, `min_dpi=36`).
+
+### 13.3 `fast-pplx` Visual Embeddings & `fast-qwen3` Compiled Kernels / `Apple10` NAX Prefill
+
+| Component / Mode | M4 Pro (`Apple9`) | Base M5 (`Apple10 NAX`) | Parity & Comparison Notes |
+|---|---:|---:|---|
+| **`fast-pplx` `encode_images` (`100 DPI`, `chunks=8`, `fp16`)** | **`159.12 ms/p`** (`6.28 pp/s`, `1.87 GB`) | **`109.24 ms/p`** (`9.15 pp/s`, `1.72 GB`) | **`3.60×`** (M4 Pro) / **`5.25×`** (M5) vs PyTorch MPS (`573.40 ms/p`); `mean_cos = 0.99970`, `0.0` MRoPE diff, `1.000000` `90/180/270` CW rotation parity, `build_image_index` `6/6` R@1 (`10/10` intra-packet) |
+| **`fast-pplx` `encode_images` (`150 DPI`, `chunks=8`, `fp16`)** | **`688.48 ms/p`** (`1.45 pp/s`, `2.33 GB`) | **`424.87 ms/p`** (`2.35 pp/s`, `2.33 GB`) | **`2.95×`** (M4 Pro) / **`4.79×`** (M5) vs PyTorch MPS (`2,033.55 ms/p`); `mean_cos = 0.99983–0.99984` |
+| **`fast-qwen3` `@mx.compile` GDN/RoPE kernels** | **`1.053×–1.303×`** (`0.0` `max_abs_diff`) | **`1.038×–1.440×`** (`0.0` `max_abs_diff`) | `RMSNormGated`, `normalize_gdn_qk` (`shapeless=True`), and `apply_partial_rope_trig` |
+| **`fast-qwen3` NAX `W4A8` default (`_mpp_linear.py`, `M>=128`)** | Disabled (`Apple9`) | **`1.06×–1.10×`** prefill (`4B`/`9B` `L=512`) · **`+4.6%` EOT** (`9B` Cat 4, `0.4128 -> 0.4316`) | `50/50 valid`, **`0.8857` exact `S_obj,e2e` parity** (`delta_mean=0.0`), `107.28 -> 102.61 s` (`12.57 GB` vs `10.07 GB`), `28%` RAM pack cap + `.vjp` LoRA preserved |
+| **`fast-qwen3` NAX `W8A8` opt-in (`FAST_SILICON_QWEN3_MPP_W8A8=1`)** | Disabled (`Apple9`) | **`1.14×–1.18×`** prefill (`4B`/`9B`) · **`+8.3%` EOT** (`9B` Cat 4, `0.4469`) · **`-7.1%` LM prefill** (`OvisOCR2`) | `50/50 valid`, `delta=-0.00153` (`se=0.00193`); `OvisOCR2-8bit` `1024×7168` / `3584×1024` wins `1.29×–2.48×` micro (`cos >= 0.999974`) and `909.8 -> 845.6 ms` LM prefill on `6` `cord_v2` receipts |
+
+**Rejected Apple10 NAX probes (kept out of defaults):** Uneven ViT block-diagonal/padded SDPA (`0.21×–0.43×` slower than `mx.split`), ViT MPP MLP fusion (`~1.01×–1.10×`, high drift), wide `64×128` / `128×64` / `128×128` MPP tiles (`~5×` slower than `64×64s4`), `M <= 64` `W4A8`/`W8A8` (`0.33×–0.90×`), Gemma-4's `should_use_mpp_w4a8` heuristics on Qwen3.5 shapes, `FastVLM-0.5B` (`0.089` FinTabNet recall), `MobileCLIP2-S0` (`0.199` FP16 cos / `1/35` R@1), and macOS 26 `VNRecognizeDocumentsRequest` (`0` tables on `FT[3]`/`FT[5]`).

@@ -93,6 +93,7 @@ from .hw_check import (
     TESTED_REFERENCE_HARDWARE,
     coreai_specialization_cache_key_parts,
     default_roofline_ceilings,
+    detect_apple10_d256_force_fused,
     evaluate_hardware_support,
     extract_coreml_compute_plan_ops,
     format_hardware_summary,
@@ -121,49 +122,8 @@ from .ir_dtype_guard import (
 )
 _OPTIONAL_IMPORT_ERRORS: dict[str, ImportError] = {}
 
-try:
-    from .kv_quant import (
-        VALID_KV_MODES,
-        HadamardTransformBank,
-        KVMode,
-        QuantizedKVCache,
-        SpecBucketedLinearGroup,
-        build_rademacher_signs,
-        build_sylvester_hadamard,
-        concat_compatible_linears,
-        fused_quantized_sdpa,
-        get_hadamard_bank,
-        linear_quant_spec_key,
-        normalize_kv_mode,
-    )
-    from .metal_mpp import (
-        HEADER_MPP,
-        HEADER_SIMDGROUP,
-        HEADER_STD,
-        make_mpp_gemm_source,
-        make_mpp_matmul_kernel,
-    )
-    from .metal_mpp_bf16 import (
-        fused_geglu_split,
-        make_mpp_bf16_geglu_kernel,
-        make_mpp_bf16_linear_kernel,
-        mpp_fused_geglu_bf16,
-        mpp_linear_bf16,
-    )
-    from .metal_mpp_int8 import (
-        get_or_pack_affine_module_weights,
-        mpp_quantized_linear,
-        pack_affine_weights_for_mpp_i8,
-        quantize_activations_i8_k64,
-        should_use_mpp_int8_linear,
-        should_use_mpp_w4a8,
-        should_use_mpp_w8a8,
-    )
-except ImportError as _exc:
-    _err_name = getattr(_exc, "name", None) or ""
-    if _err_name != "mlx" and not _err_name.startswith("mlx.") and "mlx" not in str(_exc):
-        raise
-    for _sym in (
+_LAZY_MLX_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    ".kv_quant": (
         "VALID_KV_MODES",
         "HadamardTransformBank",
         "KVMode",
@@ -176,16 +136,22 @@ except ImportError as _exc:
         "get_hadamard_bank",
         "linear_quant_spec_key",
         "normalize_kv_mode",
+    ),
+    ".metal_mpp": (
         "HEADER_MPP",
         "HEADER_SIMDGROUP",
         "HEADER_STD",
         "make_mpp_gemm_source",
         "make_mpp_matmul_kernel",
+    ),
+    ".metal_mpp_bf16": (
         "fused_geglu_split",
         "make_mpp_bf16_geglu_kernel",
         "make_mpp_bf16_linear_kernel",
         "mpp_fused_geglu_bf16",
         "mpp_linear_bf16",
+    ),
+    ".metal_mpp_int8": (
         "get_or_pack_affine_module_weights",
         "mpp_quantized_linear",
         "pack_affine_weights_for_mpp_i8",
@@ -193,8 +159,11 @@ except ImportError as _exc:
         "should_use_mpp_int8_linear",
         "should_use_mpp_w4a8",
         "should_use_mpp_w8a8",
-    ):
-        _OPTIONAL_IMPORT_ERRORS[_sym] = _exc
+    ),
+}
+_LAZY_MLX_SYMBOL_MAP: dict[str, str] = {
+    sym: mod_name for mod_name, syms in _LAZY_MLX_MODULES.items() for sym in syms
+}
 
 try:
     from .parquet_pipeline import (
@@ -467,6 +436,7 @@ __all__ = [
     "cos_sim",
     "default_roofline_ceilings",
     "dequantize_int8_symmetric",
+    "detect_apple10_d256_force_fused",
     "dispatch_chat_completion",
     "dispatch_completion",
     "embed_parquet",
@@ -576,6 +546,22 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
+    mod_rel = _LAZY_MLX_SYMBOL_MAP.get(name)
+    if mod_rel is not None:
+        import importlib
+
+        try:
+            mod = importlib.import_module(mod_rel, package=__name__)
+        except ImportError as exc:
+            err_name = getattr(exc, "name", None) or ""
+            if err_name == "mlx" or err_name.startswith("mlx.") or "mlx" in str(exc):
+                raise ImportError(
+                    f"fast_shared.{name} requires an optional dependency that is not installed ({exc})."
+                ) from exc
+            raise
+        val = getattr(mod, name)
+        globals()[name] = val
+        return val
     if name in _OPTIONAL_IMPORT_ERRORS:
         exc = _OPTIONAL_IMPORT_ERRORS[name]
         raise ImportError(

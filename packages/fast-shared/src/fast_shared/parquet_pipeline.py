@@ -726,6 +726,29 @@ def _chunk_units_with_options(
     return doc_results, doc_flags
 
 
+def _format_row_prefix(tokenizer: Any, base_prefix: str, header: str | None) -> str:
+    """Format an optional per-row header prefix (`title: {hdr} | text: ` when supported, else `{base}{hdr}\\n`)."""
+    clean_hdr = header.strip() if isinstance(header, str) else ""
+    if not clean_hdr:
+        return base_prefix
+    fmt_fn = getattr(tokenizer, "format_document_prefix", None)
+    if callable(fmt_fn):
+        return str(fmt_fn(clean_hdr))
+    return f"{base_prefix}{clean_hdr}\n"
+
+
+def _encode_units_with_prefix(
+    tokenizer: Any,
+    texts: Sequence[str],
+    *,
+    prefix: str,
+    max_length: int,
+) -> list[list[int]]:
+    if hasattr(tokenizer, "encode_batch"):
+        return list(tokenizer.encode_batch(texts, prefix=prefix, max_length=max_length))
+    return [list(tokenizer.encode(t, prefix=prefix, max_length=max_length)) for t in texts]
+
+
 def _prepare_batch_rows(
     rb: pa.RecordBatch,
     *,
@@ -746,6 +769,8 @@ def _prepare_batch_rows(
     prompt_name: str | None,
     add_query_prefix: bool,
     add_document_prefix: bool,
+    header_col: str | None = None,
+    header_text: str | None = None,
     snap_sentences: bool = False,
     snap_min_fraction: float = 0.55,
     header_anchored: bool = False,
@@ -759,6 +784,18 @@ def _prepare_batch_rows(
         meta_cols = [c for c in schema_names if not (drop_text_col and c == text_col)]
 
     raw_texts = rb.column(text_col).to_pylist()
+    static_hdr = header_text.strip() if isinstance(header_text, str) and header_text.strip() else None
+    if header_col is not None:
+        if header_col not in schema_names:
+            raise KeyError(f"Requested header column {header_col!r} not in schema columns: {schema_names}")
+        raw_hdrs = rb.column(header_col).to_pylist()
+        row_headers = [
+            (h.strip() if isinstance(h, str) and h.strip() else (str(h).strip() if h is not None and str(h).strip() else static_hdr))
+            for h in raw_hdrs
+        ]
+    else:
+        row_headers = [static_hdr] * rb.num_rows
+
     if ocr_pages_only or per_ocr_page:
         offsets_col = rb.column("page_offsets").to_pylist() if "page_offsets" in schema_names else [None] * rb.num_rows
         ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in schema_names else [None] * rb.num_rows
@@ -789,15 +826,29 @@ def _prepare_batch_rows(
             if len(keep_indices) < len(texts):
                 rb = rb.take(keep_indices)
                 texts = [texts[i] for i in keep_indices]
+                row_headers = [row_headers[i] for i in keep_indices]
 
-        tok_lists = tokenizer.encode_batch(texts, prefix=eff_prefix, max_length=max_encode_length)
+        row_prefixes = [_format_row_prefix(tokenizer, eff_prefix, h) for h in row_headers]
+        if all(p == eff_prefix for p in row_prefixes):
+            tok_lists = _encode_units_with_prefix(tokenizer, texts, prefix=eff_prefix, max_length=max_encode_length)
+        else:
+            tok_lists = [[] for _ in texts]
+            by_pfx: dict[str, list[int]] = {}
+            for idx, rp in enumerate(row_prefixes):
+                by_pfx.setdefault(rp, []).append(idx)
+            for rp, idxs in by_pfx.items():
+                enc_sub = _encode_units_with_prefix(tokenizer, [texts[i] for i in idxs], prefix=rp, max_length=max_encode_length)
+                for idx, ids in zip(idxs, enc_sub):
+                    tok_lists[idx] = ids
         meta_table = pa.Table.from_batches([rb]).select(meta_cols)
         return meta_table, tok_lists
 
     meta_only_cols = [c for c in meta_cols if c != "page_offsets"]
     all_units: list[tuple[int, int, str]] = []
+    unit_headers: list[str | None] = []
     for i in range(rb.num_rows):
         t = raw_texts[i] if isinstance(raw_texts[i], str) else ""
+        r_hdr = row_headers[i]
         if per_ocr_page and offsets_col is not None and ocr_pages_col is not None:
             raw_bytes = t.encode("utf-8")
             po = offsets_col[i] or []
@@ -812,13 +863,16 @@ def _prepare_batch_rows(
                     seg = raw_bytes[b0:b1].decode("utf-8", errors="replace")
                     if seg.strip() or not skip_empty:
                         all_units.append((i, int(pnum), seg))
+                        unit_headers.append(r_hdr)
         elif ocr_pages_only and offsets_col is not None and ocr_pages_col is not None:
             seg = slice_ocr_pages_utf8(t, offsets_col[i], ocr_pages_col[i])
             if seg or not skip_empty:
                 all_units.append((i, -1, seg))
+                unit_headers.append(r_hdr)
         else:
             if t.strip() or not skip_empty:
                 all_units.append((i, -1, t))
+                unit_headers.append(r_hdr)
 
     if not all_units:
         empty = pa.Table.from_batches([rb.slice(0, 0)]).select(meta_only_cols)
@@ -836,21 +890,46 @@ def _prepare_batch_rows(
 
     row_chunk_counter: dict[int, int] = {}
     unit_texts = [u_txt for _, _, u_txt in all_units]
+    unit_prefixes = [_format_row_prefix(tokenizer, eff_prefix, uh) for uh in unit_headers]
 
     if chunk:
-        unit_windows, unit_anchor_flags = _chunk_units_with_options(
-            unit_texts,
-            tokenizer=tokenizer,
-            eff_prefix=eff_prefix,
-            max_body_tokens=max_body_tokens,
-            overlap=overlap,
-            max_chunk_tokens=max_chunk_tokens,
-            snap_sentences=snap_sentences,
-            snap_min_fraction=snap_min_fraction,
-            header_anchored=header_anchored,
-            anchor_max_chars=anchor_max_chars,
-            anchor_max_tokens=anchor_max_tokens,
-        )
+        if all(p == eff_prefix for p in unit_prefixes):
+            unit_windows, unit_anchor_flags = _chunk_units_with_options(
+                unit_texts,
+                tokenizer=tokenizer,
+                eff_prefix=eff_prefix,
+                max_body_tokens=max_body_tokens,
+                overlap=overlap,
+                max_chunk_tokens=max_chunk_tokens,
+                snap_sentences=snap_sentences,
+                snap_min_fraction=snap_min_fraction,
+                header_anchored=header_anchored,
+                anchor_max_chars=anchor_max_chars,
+                anchor_max_tokens=anchor_max_tokens,
+            )
+        else:
+            unit_windows = [[] for _ in unit_texts]
+            unit_anchor_flags = [[] for _ in unit_texts]
+            by_pfx: dict[str, list[int]] = {}
+            for u_i, up in enumerate(unit_prefixes):
+                by_pfx.setdefault(up, []).append(u_i)
+            for up, idxs in by_pfx.items():
+                sub_wins, sub_flags = _chunk_units_with_options(
+                    [unit_texts[i] for i in idxs],
+                    tokenizer=tokenizer,
+                    eff_prefix=up,
+                    max_body_tokens=max_body_tokens,
+                    overlap=overlap,
+                    max_chunk_tokens=max_chunk_tokens,
+                    snap_sentences=snap_sentences,
+                    snap_min_fraction=snap_min_fraction,
+                    header_anchored=header_anchored,
+                    anchor_max_chars=anchor_max_chars,
+                    anchor_max_tokens=anchor_max_tokens,
+                )
+                for u_i, w_l, f_l in zip(idxs, sub_wins, sub_flags):
+                    unit_windows[u_i] = w_l
+                    unit_anchor_flags[u_i] = f_l
         for (row_i, pnum, unit_text), win_list, fl_list in zip(all_units, unit_windows, unit_anchor_flags):
             c_idx = row_chunk_counter.get(row_i, 0)
             for (win_ids, c0, c1), has_anc in zip(win_list, fl_list):
@@ -869,10 +948,17 @@ def _prepare_batch_rows(
                 c_idx += 1
             row_chunk_counter[row_i] = c_idx
     else:
-        if hasattr(tokenizer, "encode_batch"):
-            encoded_units = tokenizer.encode_batch(unit_texts, prefix=eff_prefix, max_length=max_encode_length)
+        if all(p == eff_prefix for p in unit_prefixes):
+            encoded_units = _encode_units_with_prefix(tokenizer, unit_texts, prefix=eff_prefix, max_length=max_encode_length)
         else:
-            encoded_units = [tokenizer.encode(u_txt, prefix=eff_prefix, max_length=max_encode_length) for u_txt in unit_texts]
+            encoded_units = [[] for _ in unit_texts]
+            by_pfx = {}
+            for u_i, up in enumerate(unit_prefixes):
+                by_pfx.setdefault(up, []).append(u_i)
+            for up, idxs in by_pfx.items():
+                enc_sub = _encode_units_with_prefix(tokenizer, [unit_texts[i] for i in idxs], prefix=up, max_length=max_encode_length)
+                for u_i, ids in zip(idxs, enc_sub):
+                    encoded_units[u_i] = ids
         for (row_i, pnum, unit_text), ids in zip(all_units, encoded_units):
             c_idx = row_chunk_counter.get(row_i, 0)
             expanded_row_idx.append(row_i)
@@ -1168,6 +1254,8 @@ def embed_parquet(
     prompt_name: str | None = None,
     add_query_prefix: bool = False,
     add_document_prefix: bool = False,
+    header_col: str | None = None,
+    header_text: str | None = None,
     dimensions: int | None = None,
     mrl_dim: int | None = None,
     truncate_dim: int | None = None,
@@ -1269,6 +1357,8 @@ def embed_parquet(
     files = resolve_input_files(input_path)
     first_schema = pq.ParquetFile(files[0]).schema_arrow
     eff_text_col = resolve_text_column(first_schema, text_col)
+    if header_col is not None and header_col not in first_schema.names:
+        raise KeyError(f"Requested header column {header_col!r} not in schema columns: {first_schema.names}")
 
     lance_mode = eff_sink == "lance"
     single_file_mode = (not lance_mode) and (out_p.suffix.lower() == ".parquet")
@@ -1301,6 +1391,8 @@ def embed_parquet(
         "prompt_name": prompt_name,
         "add_query_prefix": add_query_prefix,
         "add_document_prefix": add_document_prefix,
+        "header_col": header_col,
+        "header_text": header_text,
         "input_files": [[f.name, f.stat().st_size] for f in files],
     }
     manifest_path = out_p / _MANIFEST_FILENAME
@@ -1313,7 +1405,10 @@ def embed_parquet(
     manifest_lock = threading.Lock()
 
     if keep_cols is not None:
-        needed = list(dict.fromkeys([*keep_cols, eff_text_col]))
+        needed_raw = [*keep_cols, eff_text_col]
+        if header_col is not None:
+            needed_raw.append(header_col)
+        needed = list(dict.fromkeys(needed_raw))
     else:
         needed = list(first_schema.names)
     for aux in ("is_ocr", "ocr_pages", "page_offsets"):
@@ -1401,6 +1496,8 @@ def embed_parquet(
                     prompt_name=prompt_name,
                     add_query_prefix=add_query_prefix,
                     add_document_prefix=add_document_prefix,
+                    header_col=header_col,
+                    header_text=header_text,
                 )
                 if len(tok_lists) > 0 and not _put_prep((rb.num_rows, meta_tbl, tok_lists)):
                     break

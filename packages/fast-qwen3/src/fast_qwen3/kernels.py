@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fast_shared.grammar import compute_loop_breaker_penalties
+from fast_shared.hw_check import detect_apple10_d256_force_fused
 from fast_shared.kv_quant import (
     SpecBucketedLinearGroup,
     concat_compatible_linears,
@@ -15,9 +16,7 @@ from fast_shared.prefix_tree import (
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from functools import partial
-import inspect
 import os
-import platform
 import re
 from typing import Any
 
@@ -28,47 +27,6 @@ import numpy as np
 
 class QwenDoubleQuantError(ValueError):
     """Raised when attempting 2-pass `dequant -> merge LoRA -> 4-bit requant` (grid-snap erasure)."""
-
-
-def _parse_ver_tuple(ver_str: str) -> tuple[int, ...]:
-    out: list[int] = []
-    for tok in str(ver_str).split("."):
-        m = re.match(r"(\d+)", tok)
-        if not m:
-            break
-        out.append(int(m.group(1)))
-    return tuple(out)
-
-
-def detect_apple10_d256_force_fused(
-    device_info: Mapping[str, Any] | None = None,
-    macos_version: str | None = None,
-) -> bool:
-    """Return True on Apple10 (M5+) + macOS >= 26.2 + MLX supporting `force_fused` D=256 SDPA."""
-    if os.environ.get("MLX_METAL_NO_NAX") == "1":
-        return False
-    try:
-        sig = inspect.signature(mx.fast.scaled_dot_product_attention)
-        if "force_fused" not in sig.parameters:
-            return False
-    except (TypeError, ValueError):
-        return False
-
-    info = dict(device_info) if device_info is not None else {}
-    if not info:
-        try:
-            info = dict(mx.device_info())
-        except Exception:
-            return False
-    dev_name = str(info.get("device_name", "")).lower()
-    arch = str(info.get("architecture", "")).lower()
-    is_m5_plus = ("m5" in dev_name) or ("m6" in dev_name) or ("apple10" in arch) or ("g17" in arch)
-    if not is_m5_plus:
-        return False
-    mac_ver = _parse_ver_tuple(platform.mac_ver()[0] if macos_version is None else macos_version)
-    if mac_ver and mac_ver < (26, 2):
-        return False
-    return True
 
 
 def detect_rmsnorm_add_one(
@@ -91,6 +49,18 @@ def detect_rmsnorm_add_one(
     return abs(mean_val - 1.0) > abs(mean_val)
 
 
+@partial(mx.compile, shapeless=True)
+def _rmsnorm_gated_compiled(
+    y: mx.array,
+    z: mx.array,
+    weight: mx.array,
+    eps: float,
+) -> mx.array:
+    yf = mx.fast.rms_norm(y.astype(mx.float32), weight.astype(mx.float32), eps)
+    zf = nn.silu(z.astype(mx.float32))
+    return (yf * zf).astype(y.dtype)
+
+
 class RMSNormGated(nn.Module):
     """Unshifted Gated RMSNorm (`y_norm * silu(z)` in `float32`) used inside `GatedDeltaNet`."""
 
@@ -100,9 +70,7 @@ class RMSNormGated(nn.Module):
         self.eps = float(eps)
 
     def __call__(self, y: mx.array, z: mx.array) -> mx.array:
-        yf = mx.fast.rms_norm(y.astype(mx.float32), self.weight.astype(mx.float32), self.eps)
-        zf = nn.silu(z.astype(mx.float32))
-        return (yf * zf).astype(y.dtype)
+        return _rmsnorm_gated_compiled(y, z, self.weight, self.eps)
 
 
 @partial(mx.compile, shapeless=True)
@@ -130,6 +98,7 @@ def compute_gdn_gates(
     return g, beta
 
 
+@partial(mx.compile, shapeless=True)
 def normalize_gdn_qk(
     q: mx.array,
     k: mx.array,
@@ -142,6 +111,7 @@ def normalize_gdn_qk(
     return qf.astype(q.dtype), kf.astype(k.dtype)
 
 
+@mx.compile
 def apply_partial_rope_trig(
     x: mx.array,
     cos_a: mx.array,

@@ -233,6 +233,7 @@ def verify_draft_sequence_b1(
     *,
     pick_token_fn: Any,
     stop_token_ids: frozenset[int],
+    rope_offset_delta: int = 0,
 ) -> tuple[list[int], mx.array, int]:
     """Verify `K` draft tokens on `target_model` (`B=1`) in one `L_q = K + 1` pass with exact GDN rollback.
 
@@ -260,7 +261,7 @@ def verify_draft_sequence_b1(
         elif isinstance(entry, DeltaSlotCache):
             entry.record_verify_trace = True
 
-    hidden = target_model.forward_hidden(inp, cache)
+    hidden = target_model.forward_hidden(inp, cache, rope_offset_delta=rope_offset_delta)
     logits = target_model.project_logits(hidden)
     mx.eval(hidden, logits)
     logits_np = np.asarray(logits[0].astype(mx.float32))

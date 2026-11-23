@@ -16,10 +16,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from fast_shared.bench import clear_mlx_arena
-from fast_shared.embeddings import resolve_embedding_dim
+from fast_shared.embeddings import accepts_kwarg, resolve_embedding_dim
 from fast_shared.parquet_pipeline import (
     DEFAULT_TEXT_COLUMNS,
     ParquetEmbedSummary,
+    _decode_temp_dict_columns,
+    _iter_source_batches,
+    _prepare_batch_rows,
     embed_parquet as _shared_embed_parquet,
     resolve_input_files,
     resolve_text_column,
@@ -134,6 +137,20 @@ def _make_vector_column(vecs: np.ndarray, *, dim: int, dtype: str) -> pa.Array:
     return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=elem_type), dim)
 
 
+class _DocPrefixSpanEngineProxy:
+    """Delegate engine calls while stripping leading `[D] ` tokens from pooling."""
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    def encode_corpus(self, *args: Any, **kwargs: Any) -> np.ndarray:
+        kwargs.setdefault("exclude_document_prefix", True)
+        return self._engine.encode_corpus(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+
 def embed_parquet(
     engine: Any,
     input_path: str | Path,
@@ -160,7 +177,9 @@ def embed_parquet(
     prefix: str | None = None,
     prompt_name: str | None = None,
     add_query_prefix: bool = False,
-    add_document_prefix: bool = False,
+    add_document_prefix: bool | None = None,
+    header_col: str | None = None,
+    header_text: str | None = None,
     dimensions: int | None = None,
     compression: str = "zstd",
     resume: bool = False,
@@ -171,9 +190,17 @@ def embed_parquet(
     if dtype not in _SUPPORTED_VECTOR_DTYPES:
         raise ValueError(f"Unsupported vector dtype {dtype!r}; expected one of {_SUPPORTED_VECTOR_DTYPES}")
 
+    eff_add_doc_prefix = (
+        (not add_query_prefix and prefix is None and prompt_name is None)
+        if add_document_prefix is None
+        else bool(add_document_prefix)
+    )
+    use_doc_span = bool(eff_add_doc_prefix and accepts_kwarg(engine.encode_corpus, "exclude_document_prefix"))
+
     if dtype in ("float32", "float16"):
+        eff_engine = _DocPrefixSpanEngineProxy(engine) if use_doc_span else engine
         summary = _shared_embed_parquet(
-            engine,
+            eff_engine,
             input_path,
             output_path,
             text_col=text_col,
@@ -197,7 +224,9 @@ def embed_parquet(
             prefix=prefix,
             prompt_name=prompt_name,
             add_query_prefix=add_query_prefix,
-            add_document_prefix=add_document_prefix,
+            add_document_prefix=eff_add_doc_prefix,
+            header_col=header_col,
+            header_text=header_text,
             dimensions=dimensions,
             compression=compression,
             resume=resume,
@@ -215,6 +244,8 @@ def embed_parquet(
     files = resolve_input_files(input_path)
     first_schema = pq.ParquetFile(files[0]).schema_arrow
     eff_text_col = resolve_text_column(first_schema, text_col)
+    if header_col is not None and header_col not in first_schema.names:
+        raise KeyError(f"Requested header column {header_col!r} not in schema columns: {first_schema.names}")
     max_dim = int(getattr(engine, "max_dim", getattr(engine, "dim", PplxConfig().embedding_dim)))
     default_dim = int(getattr(engine, "dim", max_dim))
     target_dim = resolve_embedding_dim(dimensions, max_dim=max_dim, default_dim=default_dim, supports_dimensions=True)
@@ -232,7 +263,10 @@ def embed_parquet(
         for c in (list(first_schema.names) if keep_cols is None else [c for c in keep_cols if c in first_schema.names])
         if not (drop_text_col and c == eff_text_col)
     ]
-    read_cols = list(dict.fromkeys([*keep_names, eff_text_col]))
+    read_cols_raw = [*keep_names, eff_text_col]
+    if header_col is not None:
+        read_cols_raw.append(header_col)
+    read_cols = list(dict.fromkeys(read_cols_raw))
     for aux in ("is_ocr", "ocr_pages", "page_offsets"):
         if aux in first_schema.names and aux not in read_cols:
             read_cols.append(aux)
@@ -240,12 +274,6 @@ def embed_parquet(
     tokenizer = engine.tokenizer
     engine_max_len = int(getattr(engine, "max_seq_len", 32768))
     eff_max_len = engine_max_len if max_length is None else min(int(max_length), engine_max_len)
-    eff_prefix = tokenizer.resolve_prefix(
-        prefix=prefix,
-        prompt_name=prompt_name,
-        add_query_prefix=add_query_prefix,
-        add_document_prefix=add_document_prefix,
-    )
 
     tmp_single = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
     single_writer: pq.ParquetWriter | None = None
@@ -266,6 +294,8 @@ def embed_parquet(
                 "output_dtype": "int8",
                 "normalize": False,
             }
+            if use_doc_span:
+                kw["exclude_document_prefix"] = True
             if mode is not None:
                 kw["mode"] = mode
             out_mat[st:en] = np.asarray(engine.encode_corpus(tok_lists[st:en], **kw), dtype=np.int8)
@@ -279,7 +309,9 @@ def embed_parquet(
         shard_path: Path,
         tmp_shard: Path,
     ) -> tuple[int, int]:
-        out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
+        out_tbl = _decode_temp_dict_columns(meta_tbl).append_column(
+            "vector", _make_vector_column(vecs, dim=target_dim, dtype="int8")
+        )
         try:
             with pq.ParquetWriter(tmp_shard, out_tbl.schema, compression=compression) as writer:
                 writer.write_table(out_tbl)
@@ -291,7 +323,9 @@ def embed_parquet(
 
     def _write_single_sync(meta_tbl: pa.Table, vecs: np.ndarray, tok_count: int) -> tuple[int, int]:
         nonlocal single_writer
-        out_tbl = meta_tbl.append_column("vector", _make_vector_column(vecs, dim=target_dim, dtype="int8"))
+        out_tbl = _decode_temp_dict_columns(meta_tbl).append_column(
+            "vector", _make_vector_column(vecs, dim=target_dim, dtype="int8")
+        )
         if single_writer is None:
             single_writer = pq.ParquetWriter(tmp_single, out_tbl.schema, compression=compression)
         single_writer.write_table(out_tbl)
@@ -325,7 +359,7 @@ def embed_parquet(
             return
         if not final and len(pending_toks) < int(shard_rows):
             return
-        merged_meta = pa.concat_tables(pending_meta, promote_options="default") if len(pending_meta) > 1 else pending_meta[0]
+        merged_meta = pa.concat_tables([_decode_temp_dict_columns(t) for t in pending_meta], promote_options="default") if len(pending_meta) > 1 else _decode_temp_dict_columns(pending_meta[0])
         cur_meta = merged_meta
         cur_toks = pending_toks
         pending_meta = []
@@ -343,37 +377,37 @@ def embed_parquet(
                 pending_toks = cur_toks
 
     def _iter_prepared_batches() -> Iterator[tuple[pa.Table, list[list[int]]]]:
-        for fpath in files:
-            pf = pq.ParquetFile(fpath)
-            avail = [c for c in read_cols if c in pf.schema_arrow.names]
-            for rb in pf.iter_batches(batch_size=max(1, int(batch_rows)), columns=avail):
-                if limit is not None and rows_read_box[0] >= int(limit):
-                    return
-                if limit is not None and rows_read_box[0] + rb.num_rows > int(limit):
-                    rb = rb.slice(0, max(0, int(limit) - rows_read_box[0]))
-                rows_read_box[0] += rb.num_rows
-                py_rows = rb.to_pylist()
-                keep_idx: list[int] = []
-                texts: list[str] = []
-                for idx_r, r in enumerate(py_rows):
-                    if filter_ocr:
-                        is_ocr = bool(r.get("is_ocr"))
-                        ocr_p = r.get("ocr_pages")
-                        if not (is_ocr or (ocr_p and len(ocr_p) > 0)):
-                            continue
-                    txt = r.get(eff_text_col)
-                    if ocr_pages_only:
-                        txt = slice_ocr_pages_utf8(txt, r.get("page_offsets"), r.get("ocr_pages"))
-                    txt_s = txt if isinstance(txt, str) else ""
-                    if skip_empty and not txt_s.strip():
-                        continue
-                    keep_idx.append(idx_r)
-                    texts.append(txt_s)
-                if not keep_idx:
-                    continue
-                sub_rb = rb.take(keep_idx)
-                meta_tbl = pa.Table.from_batches([sub_rb]).select([c for c in keep_names if c in sub_rb.schema.names])
-                tok_lists = tokenizer.encode_batch(texts, prefix=eff_prefix, max_length=eff_max_len)
+        for rb in _iter_source_batches(
+            files,
+            read_cols,
+            max(1, int(batch_rows)),
+            filter_ocr=filter_ocr,
+            limit=limit,
+        ):
+            rows_read_box[0] += rb.num_rows
+            meta_tbl, tok_lists = _prepare_batch_rows(
+                rb,
+                tokenizer=tokenizer,
+                text_col=eff_text_col,
+                keep_cols=keep_cols,
+                drop_text_col=drop_text_col,
+                ocr_pages_only=ocr_pages_only,
+                per_ocr_page=per_ocr_page,
+                chunk=chunk,
+                max_body_tokens=max_body_tokens,
+                overlap=overlap,
+                max_encode_length=eff_max_len,
+                max_chunk_tokens=max_chunk_tokens,
+                skip_empty=skip_empty,
+                include_chunk_text=include_chunk_text,
+                prefix=prefix,
+                prompt_name=prompt_name,
+                add_query_prefix=add_query_prefix,
+                add_document_prefix=eff_add_doc_prefix,
+                header_col=header_col,
+                header_text=header_text,
+            )
+            if tok_lists:
                 yield meta_tbl, tok_lists
 
     try:
@@ -430,7 +464,7 @@ def embed_contextual_parquet(
     drop_text_col: bool = False,
     chunk_tokens: int = 256,
     context_tokens: int = 2048,
-    overlap: int = 32,
+    overlap: int = 0,
     header_text: str | None = None,
     header_col: str | None = None,
     repeat_header_tokens: int | None = None,
@@ -524,12 +558,13 @@ def embed_contextual_parquet(
 
     tokenizer = engine.tokenizer
     eff_prefix = ""
-    if prefix is not None or prompt_name is not None or add_query_prefix or add_document_prefix:
+    # encode_contextual_document always prepends [D] and excludes it from pooling; do not double-prepend document_prefix.
+    if prefix is not None or prompt_name is not None or add_query_prefix:
         eff_prefix = tokenizer.resolve_prefix(
             prefix=prefix,
             prompt_name=prompt_name,
             add_query_prefix=add_query_prefix,
-            add_document_prefix=add_document_prefix,
+            add_document_prefix=False,
         )
 
     eff_window_batch = max(1, int(encode_batch_windows))

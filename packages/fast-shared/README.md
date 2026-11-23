@@ -31,12 +31,13 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | Capability | Module | What it provides |
 |---|---|---|
 | **Dynamic silicon dispatch** | `fast_shared.runtime_lessons` | Routes workloads by chip (`Apple9` M4 vs `Apple10+` M5 `NAX`), unified memory budget (`<= 80%` wired ceiling; `pack=1024, grad_accum=2` on 24 GB Macs), and batch regime, alongside first-fit-decreasing sequence packing. |
-| **Compact retrieval & `MaxSim`** | `fast_shared.retrieval_index` | `CompactRetrievalIndex` compresses embeddings 4–6× into symmetric INT8 (with model-aware Matryoshka sizing) and adds an ARM64 NEON 1-bit Hamming prefilter that searches 100,000 vectors in **0.50–0.66 ms/query** (3.0–4.4× faster than FP32 BLAS), plus multi-window `MaxSim` document scoring. |
+| **Compact retrieval & `MaxSim`** | `fast_shared.retrieval_index` | `CompactRetrievalIndex` compresses embeddings 4–6× into symmetric INT8 (with model-aware Matryoshka sizing) and adds an ARM64 NEON 1-bit Hamming prefilter (`rerank_top_r=256` default in `search()`) that searches 100,000 vectors in **0.50–0.66 ms/query** (`top64`, 3.0–4.4× faster than FP32 BLAS), plus multi-window `MaxSim` document scoring. |
 | **Quantized KV & mixed-bit fusion** | `fast_shared.kv_quant` | `QuantizedKVCache` runs attention directly over packed 8-bit (`q8`) and rotated 4-bit (`q4_quarot`, 3.56× smaller KV, 2.13× faster than 8-bit KV at 16K context) caches with zero F1 loss vs BF16, alongside `SpecBucketedLinearGroup` mixed-bit projection fusion. |
+| **Shared Qwen3.5 vision & OCR** | `fast_shared.qwen35_vision`, `vision_preprocess` | Ported `FastQwen35VisionModel`, integer/fractional 3D MRoPE helpers (`rope_offset_delta`), `crop_to_ink`, Apple10 NAX `head_dim=256` SDPA workaround (`detect_apple10_d256_force_fused`), lazy MLX imports, and Category 5 OCR evaluators (`outcome_eval.ocr`). |
 | **Hybrid `PrefixTree` cache** | `fast_shared.prefix_tree` | Chained SHA-256 256-token prefix cache for both KV caches and block-32 INT8 recurrent `GatedDeltaNet` states (3.76× smaller), with a rolling hit-rate circuit breaker. |
 | **Schema grammars & resumable ETL** | `fast_shared.grammar`, `pipeline_llm`, `parquet_pipeline` | Per-document `llguidance` JSON Schema enforcement, cycle/4-gram loop breaking, automatic retry on length-truncated outputs, header-anchored Parquet chunking (+33–46% legal retrieval lift), and resumable shard writers. |
 | **Core ML & Core AI build guards** | `fast_shared.coreai_pipeline`, `parallel_coreml`, `ir_dtype_guard` | Crash-safe `spawn`-parallel Core ML bucket compilation (2.0–2.1× faster), FP16 `.aimodel` ANE lowering on macOS 27.2.1, multi-batch calibration checks, and static AST/MIL dtype linting (`fast-ir-guard`). |
-| **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic Category 1–4 task evaluators and interleaved ABBA gates. |
+| **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic Category 1–5 task evaluators and interleaved ABBA gates. |
 
 ## Provided modules
 
@@ -44,6 +45,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 |---|---|
 | `fast_shared.runtime_lessons` | `DynamicSiliconPolicy`, `resolve_dynamic_execution_plan`, `recommend_silicon_budget`, `pack_sequences_ffd` |
 | `fast_shared.retrieval_index` | `CompactRetrievalIndex`, `quantize_int8_symmetric`, `pack_binary_bits`, `score_document_windows` |
+| `fast_shared.qwen35_vision` / `vision_preprocess` | `FastQwen35VisionModel`, `crop_to_ink`, `build_qwen_vision_inputs`, `prepare_pplx_image_item` |
 | `fast_shared.kv_quant` | `QuantizedKVCache`, `HadamardTransformBank`, `SpecBucketedLinearGroup`, `fused_quantized_sdpa` |
 | `fast_shared.prefix_tree` | `PrefixTree`, `PrefixMatch`, `quantize_gdn_state_block32`, `dequantize_gdn_state_block32` |
 | `fast_shared.embeddings` | `MappedEmbedding`, `truncate_and_normalize`, `tile_aligned_slices`, `set_mlx_cache_limit` |
@@ -51,7 +53,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.grammar` / `pipeline_llm` | `GrammarHelper`, `compute_loop_breaker_penalties`, `extract_parquet`, `run_deferred_retries` |
 | `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
-| `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates` |
+| `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates`, `outcome_eval.ocr` |
 | `fast_shared.hw_check` / `ir_dtype_guard` / `roofline` | `fast-silicon-hw-check`, `fast-ir-guard`, `fast-silicon-probe`, `fast-silicon-audit` |
 | `fast_shared.metal_mpp` / `ane_ffn` / `include/*` | `HEADER_MPP`, `mpp_linear_bf16`, `AneWave`, C++/ObjC++ Core ML & Accelerate headers |
 
@@ -66,6 +68,7 @@ The shared CLI and `embed_parquet` separate source reading (`--batch-rows`), enc
 | `--shard-rows` | Output rows per stored shard (with `--resume`) | `65536` |
 | `--max-chunk-tokens` | Final chunk limit including prefix and special tokens | `512` |
 | `--overlap` | Repeated body tokens between adjacent chunks | `51` |
+| `--header-col` / `--header-text` | Per-row column or static document title/header prepended to each row or chunk | `None` |
 
 ```bash
 embeddinggemma-2 parquet \
@@ -91,10 +94,11 @@ Effective outcome throughput (EOT) divides total task score on valid outputs by 
 | [`fast-gemma4`](../fast-gemma4) | Schema-constrained Gemma 4 E2B | 1.84 EOT (300/300 valid, 0.946 F1) | 2.41 EOT *(historical 150K minified)* | 1.22× unconstrained stock `mlx-vlm` on M5 |
 | [`fast-qwen3`](../fast-qwen3) | Schema-constrained Qwen 3.5 / 3.6 | 0.513 EOT (`4B`, 50/50 valid, 0.902 score) | 0.396 EOT (`4B`, 50/50 valid, 0.902 score) | 1.53× (M5) / 1.38× (M4 Pro) unconstrained stock `mlx-lm` |
 | [`fast-gpt-oss`](../fast-gpt-oss) | Schema-constrained `gpt-oss-20b` | Skipped on 24 GB | 0.318 EOT (49/50 valid; 454 tok/s @ B=128) | 1.61× unconstrained stock `mlx-lm` on M4 Pro |
+| [`fast-ocr`](../fast-ocr) | `OvisOCR2-8bit` + Apple Vision ANE | 0.090 EOT (`olmOCR-bench(4)`, `4/4`, 5.01 GB) | 0.082 EOT (`olmOCR-bench(4)`, `4/4`, 5.75 GB) | 1.53–2.05× (M5) / 1.22–1.51× (M4 Pro) stock `mlx_vlm` `OvisOCR2` |
 
 ## Optimizer skill plugin & tests
 
-`fast-shared` ships [`skills/apple-silicon-ml-optimizer/`](skills/apple-silicon-ml-optimizer/SKILL.md) alongside a queryable [12,032-entry M4/M5 capability matrix](skills/apple-silicon-ml-optimizer/references/m4-m5-capability-matrix.md):
+`fast-shared` ships [`skills/apple-silicon-ml-optimizer/`](skills/apple-silicon-ml-optimizer/SKILL.md) alongside a queryable [12,032-entry M4/M5 capability matrix](skills/apple-silicon-ml-optimizer/references/m4-m5-capability-matrix.md) and [Vision, Multimodal Embeddings & OCR Playbook](skills/apple-silicon-ml-optimizer/references/vision-and-ocr-playbook.md):
 
 ```bash
 claude --plugin-dir /path/to/fast-shared

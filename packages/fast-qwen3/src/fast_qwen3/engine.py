@@ -155,6 +155,7 @@ class FastQwen3Engine:
         self._lock = threading.RLock()
         self._grammar_cache: OrderedDict[tuple[str, bool | None], GrammarHelper] = OrderedDict()
         self._prefix_cache: OrderedDict[tuple[int, ...], HybridPrefixSnapshot] = OrderedDict()
+        self._vision_model: Any | None = None
         self._memory_governor = LiveMemoryGovernor(min_b_slots=1)
 
         try:
@@ -265,6 +266,8 @@ class FastQwen3Engine:
         self._prefix_cache.clear()
         if self.prefix_tree is not None:
             self.prefix_tree.clear()
+        if hasattr(self, "model") and hasattr(self.model, "clear_mpp_packed_weights"):
+            self.model.clear_mpp_packed_weights()
 
     def close(self) -> None:
         cb = getattr(self, "_governor_shed_cb", None)
@@ -274,6 +277,9 @@ class FastQwen3Engine:
         if self.prefix_tree is not None:
             self.prefix_tree.clear()
         self._grammar_cache.clear()
+        self._vision_model = None
+        if hasattr(self, "model") and hasattr(self.model, "clear_mpp_packed_weights"):
+            self.model.clear_mpp_packed_weights()
         gc.collect()
         prev_cl = getattr(self, "_prev_cache_limit", None)
         if prev_cl is not None and hasattr(mx, "set_cache_limit"):
@@ -643,6 +649,9 @@ class FastQwen3Engine:
         thinking_budget: int,
         speculative: bool | None,
         collect_telemetry: bool,
+        inputs_embeds: mx.array | None = None,
+        rope_trig: tuple[mx.array, mx.array] | None = None,
+        rope_offset_delta: int = 0,
     ) -> GenerationItem:
         rng = np.random.default_rng(int(seed)) if seed is not None else None
         matcher = gram.new_matcher() if gram is not None else None
@@ -679,13 +688,35 @@ class FastQwen3Engine:
                     telemetry=telemetry,
                 )
 
-        cache, hidden, prefill_in = self._prefill_single_with_caches(
-            prompt_ids,
-            prefix_snap=prefix_snap,
-            suffix_ids=suffix_ids,
-            max_tokens=max_tokens,
-            extra_tail_ids=folded_ff,
-        )
+        if inputs_embeds is not None:
+            kv_alloc = max(256, len(prompt_ids) + len(folded_ff) + max_tokens + 64)
+            use_kvi8 = self._resolve_kv_i8(1, kv_alloc)
+            cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+            h_mm = self.model.forward_hidden(
+                None,
+                cache,
+                inputs_embeds=inputs_embeds,
+                rope_trig=rope_trig,
+                rope_offset_delta=rope_offset_delta,
+            )
+            hidden = h_mm[:, -129:, :] if int(h_mm.shape[1]) > 129 else h_mm
+            mx.eval(hidden)
+            prefill_in = list(prompt_ids)
+            if folded_ff:
+                hidden = self._prefill_tail_chunked(cache, folded_ff) if rope_offset_delta == 0 else self.model.forward_hidden(
+                    mx.array([folded_ff], dtype=mx.int32),
+                    cache,
+                    rope_offset_delta=rope_offset_delta,
+                )
+                prefill_in.extend(folded_ff)
+        else:
+            cache, hidden, prefill_in = self._prefill_single_with_caches(
+                prompt_ids,
+                prefix_snap=prefix_snap,
+                suffix_ids=suffix_ids,
+                max_tokens=max_tokens,
+                extra_tail_ids=folded_ff,
+            )
         last_h = hidden[:, -1:, :]
         logits = self.model.project_logits(last_h)
         mx.eval(last_h, logits)
@@ -722,7 +753,7 @@ class FastQwen3Engine:
                     closed_naturally = True
                     break
                 step_in = mx.array([[tid]], dtype=mx.int32)
-                sh = self.model.forward_hidden(step_in, cache)
+                sh = self.model.forward_hidden(step_in, cache, rope_offset_delta=rope_offset_delta)
                 sl = self.model.project_logits(sh)
                 mx.eval(sh, sl)  # guard: allow-eval
                 cur_h = sh[0, 0]
@@ -736,7 +767,7 @@ class FastQwen3Engine:
                 else self.tokenizer.encode_think_close_suffix(trailing_newline_before_close=True)
             )
             suf_arr = mx.array([close_suffix], dtype=mx.int32)
-            sh = self.model.forward_hidden(suf_arr, cache)
+            sh = self.model.forward_hidden(suf_arr, cache, rope_offset_delta=rope_offset_delta)
             last_h = sh[:, -1:, :]
             logits = self.model.project_logits(last_h)
             mx.eval(last_h, logits)
@@ -771,7 +802,7 @@ class FastQwen3Engine:
                 )
             elif ff0_cap:
                 ff_arr = mx.array([ff0_cap], dtype=mx.int32)
-                sh = self.model.forward_hidden(ff_arr, cache)
+                sh = self.model.forward_hidden(ff_arr, cache, rope_offset_delta=rope_offset_delta)
                 last_h = sh[:, -1:, :]
                 logits = self.model.project_logits(last_h)
                 mx.eval(last_h, logits)
@@ -955,6 +986,7 @@ class FastQwen3Engine:
                         drafts,
                         pick_token_fn=_pick_greedy,
                         stop_token_ids=self.tokenizer.stop_token_ids,
+                        rope_offset_delta=rope_offset_delta,
                     )
 
                     cur_h_1d = acc_h[0, -1]
@@ -992,7 +1024,7 @@ class FastQwen3Engine:
 
             # Standard 1-step (or multi-FF-token) advance
             step_arr = mx.array([pending_tokens], dtype=mx.int32)
-            sh = self.model.forward_hidden(step_arr, cache)
+            sh = self.model.forward_hidden(step_arr, cache, rope_offset_delta=rope_offset_delta)
             last_h = sh[:, -1:, :]
             sl = self.model.project_logits(last_h)
             mx.eval(last_h, sl)  # guard: allow-eval
@@ -1565,10 +1597,188 @@ class FastQwen3Engine:
             },
         )
 
+    def _ensure_vision_model(self) -> Any:
+        if self._vision_model is None:
+            if self.model_dir is None:
+                raise ValueError(
+                    "Multimodal image inputs require a model checkpoint directory (`model_dir`) with `vision_config`"
+                )
+            cfg_p = Path(self.model_dir) / "config.json"
+            if not cfg_p.is_file():
+                raise ValueError(f"Checkpoint config.json missing in {self.model_dir}")
+            raw_cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
+            if "vision_config" not in raw_cfg:
+                raise ValueError(
+                    f"Checkpoint {self.model_dir} is text-only (missing 'vision_config' in config.json)"
+                )
+            from fast_shared.qwen35_vision import FastQwen35VisionModel
+
+            self._vision_model = FastQwen35VisionModel.from_pretrained(self.model_dir, dtype=mx.bfloat16)
+        return self._vision_model
+
+    def _prepare_multimodal_prefill(
+        self,
+        prompt: PromptInput,
+        images: Sequence[Any],
+        *,
+        system_prompt: str | None,
+        enable_thinking: bool,
+    ) -> tuple[list[int], mx.array, tuple[mx.array, mx.array], int]:
+        from fast_shared.qwen35_vision import build_qwen_vision_inputs, compute_mrope_positions, precompute_mrope_trig
+
+        vis = self._ensure_vision_model()
+        img_pad_id = self.tokenizer.backend_tokenizer.token_to_id("<|image_pad|>")
+        vis_start_id = self.tokenizer.backend_tokenizer.token_to_id("<|vision_start|>")
+        vis_end_id = self.tokenizer.backend_tokenizer.token_to_id("<|vision_end|>")
+        if img_pad_id is None:
+            raise ValueError("Tokenizer is missing `<|image_pad|>` token required for multimodal prompts")
+
+        vinputs = [
+            build_qwen_vision_inputs(
+                im,
+                patch_size=int(vis.cfg.patch_size),
+                temporal_patch_size=int(vis.cfg.temporal_patch_size),
+                merge_size=int(vis.cfg.spatial_merge_size),
+            )
+            for im in images
+        ]
+        px_cat = mx.array(np.concatenate([vi.pixel_values for vi in vinputs], axis=0))
+        grids = [vi.grid_thw for vi in vinputs]
+        vis_feats = vis(px_cat, grids)
+
+        # Preserve ChatML prompt-injection sanitization while inserting trusted vision special tokens.
+        placeholder = "\x00__FAST_QWEN3_IMG_PAD__\x00"
+        has_explicit_markers = False
+        if isinstance(prompt, str):
+            has_explicit_markers = "<|image_pad|>" in prompt
+            san_prompt: PromptInput = (
+                prompt.replace("<|vision_start|>", "")
+                .replace("<|vision_end|>", "")
+                .replace("<|image_pad|>", placeholder)
+                if has_explicit_markers
+                else prompt
+            )
+        else:
+            msgs_out: list[dict[str, Any]] = []
+            for m in prompt:
+                md = dict(m)
+                raw_c = md.get("content", "")
+                if isinstance(raw_c, list):
+                    norm_parts: list[dict[str, Any]] = []
+                    for part in raw_c:
+                        if isinstance(part, Mapping) and part.get("type") == "image":
+                            has_explicit_markers = True
+                            norm_parts.append({"type": "text", "text": placeholder})
+                        elif isinstance(part, Mapping):
+                            txt = str(part.get("text", ""))
+                            if "<|image_pad|>" in txt:
+                                has_explicit_markers = True
+                                txt = (
+                                    txt.replace("<|vision_start|>", "")
+                                    .replace("<|vision_end|>", "")
+                                    .replace("<|image_pad|>", placeholder)
+                                )
+                            norm_parts.append({"type": "text", "text": txt})
+                    md["content"] = norm_parts
+                else:
+                    s_c = str(raw_c)
+                    if "<|image_pad|>" in s_c:
+                        has_explicit_markers = True
+                        md["content"] = (
+                            s_c.replace("<|vision_start|>", "")
+                            .replace("<|vision_end|>", "")
+                            .replace("<|image_pad|>", placeholder)
+                        )
+                msgs_out.append(md)
+            san_prompt = msgs_out
+
+        rendered = self.tokenizer.format_chat(
+            san_prompt,
+            system_prompt=system_prompt,
+            enable_thinking=enable_thinking,
+            sanitize=True,
+        )
+        expanded_ids: list[int] = []
+        vis_spans: list[tuple[int, int]] = []
+        img_cursor = 0
+
+        if has_explicit_markers:
+            for seg_idx, seg in enumerate(rendered.split(placeholder)):
+                if seg_idx > 0 and img_cursor < len(vinputs):
+                    if vis_start_id is not None:
+                        expanded_ids.append(int(vis_start_id))
+                    n_vis_i = vinputs[img_cursor].num_visual_tokens
+                    s0 = len(expanded_ids)
+                    expanded_ids.extend([int(img_pad_id)] * n_vis_i)
+                    vis_spans.append((s0, s0 + n_vis_i))
+                    if vis_end_id is not None:
+                        expanded_ids.append(int(vis_end_id))
+                    img_cursor += 1
+                if seg:
+                    expanded_ids.extend(self.tokenizer.encode(seg, add_special_tokens=False))
+        else:
+            base_ids = self.tokenizer.encode(rendered, add_special_tokens=False)
+            user_hdr = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+            nl_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+            insert_at = 0
+            hdr_len = len(user_hdr)
+            for idx in range(len(base_ids) - hdr_len, -1, -1):
+                if base_ids[idx : idx + hdr_len] == user_hdr:
+                    insert_at = idx + hdr_len
+                    break
+            expanded_ids.extend(base_ids[:insert_at])
+            for vi in vinputs:
+                if vis_start_id is not None:
+                    expanded_ids.append(int(vis_start_id))
+                s0 = len(expanded_ids)
+                expanded_ids.extend([int(img_pad_id)] * vi.num_visual_tokens)
+                vis_spans.append((s0, s0 + vi.num_visual_tokens))
+                if vis_end_id is not None:
+                    expanded_ids.append(int(vis_end_id))
+                expanded_ids.extend(nl_ids)
+                img_cursor += 1
+            expanded_ids.extend(base_ids[insert_at:])
+
+        if img_cursor != len(vinputs):
+            raise ValueError(
+                f"Expected {len(vinputs)} `<|image_pad|>` marker(s) in prompt, expanded {img_cursor}"
+            )
+
+        base_emb = self.model.embed_tokens(mx.array([expanded_ids], dtype=mx.int32))
+        parts: list[mx.array] = []
+        vf_cursor = 0
+        tok_cursor = 0
+        for s0, s1 in vis_spans:
+            if s0 > tok_cursor:
+                parts.append(base_emb[:, tok_cursor:s0, :])
+            slen = s1 - s0
+            parts.append(vis_feats[None, vf_cursor : vf_cursor + slen, :].astype(base_emb.dtype))
+            vf_cursor += slen
+            tok_cursor = s1
+        if tok_cursor < len(expanded_ids):
+            parts.append(base_emb[:, tok_cursor:, :])
+        inputs_embeds = mx.concatenate(parts, axis=1)
+
+        pos_3d, rope_delta = compute_mrope_positions(
+            expanded_ids,
+            image_grid_thw=grids,
+            image_token_id=int(img_pad_id),
+            spatial_merge_size=int(vis.cfg.spatial_merge_size),
+        )
+        rope_cos, rope_sin = precompute_mrope_trig(
+            pos_3d,
+            rot_dims=int(self.model.cfg.rot_dims),
+            rope_theta=float(self.model.cfg.rope_theta),
+            mrope_section=getattr(self.model.cfg, "mrope_section", (11, 11, 10)),
+            dtype=inputs_embeds.dtype,
+        )
+        return expanded_ids, inputs_embeds, (rope_cos, rope_sin), rope_delta
+
     def generate(
         self,
         prompt: PromptInput,
         *,
+        images: Sequence[Any] | None = None,
         system_prompt: str | None = None,
         json_schema: str | Mapping[str, Any] | None = None,
         max_tokens: int = 512,
@@ -1585,6 +1795,51 @@ class FastQwen3Engine:
         collect_telemetry: bool = False,
         **extra_kwargs: Any,
     ) -> GenerationItem:
+        if images:
+            eff_think = self.default_enable_thinking if enable_thinking is None else bool(enable_thinking)
+            raw_budget = (
+                self.default_thinking_budget if thinking_budget_tokens is None else int(thinking_budget_tokens)
+            )
+            eff_budget = validate_thinking_budget(
+                raw_budget if raw_budget > 0 else (None if eff_think else 0),
+                enable_thinking=eff_think,
+                allow_short_thinking_budget=allow_short_thinking_budget,
+            )
+            gram: GrammarHelper | None = None
+            schema_obj: dict[str, Any] | None = None
+            if json_schema is not None:
+                eff_sch = (
+                    inject_reasoning_prefix_property(json_schema, field_name=reasoning_prefix_field)
+                    if reasoning_prefix_field
+                    else json_schema
+                )
+                gram = self._get_grammar_helper(eff_sch, whitespace_flexible)
+                schema_obj = gram.schema_obj
+            prompt_ids, inputs_embeds, rope_trig, rope_delta = self._prepare_multimodal_prefill(
+                prompt,
+                list(images),
+                system_prompt=system_prompt,
+                enable_thinking=(eff_budget > 0),
+            )
+            with self._lock:
+                return self._decode_single(
+                    prompt_ids,
+                    prefix_snap=None,
+                    suffix_ids=[],
+                    gram=gram,
+                    schema_obj=schema_obj,
+                    max_tokens=int(max_tokens),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    seed=seed,
+                    thinking_budget=eff_budget,
+                    speculative=speculative,
+                    collect_telemetry=collect_telemetry,
+                    inputs_embeds=inputs_embeds,
+                    rope_trig=rope_trig,
+                    rope_offset_delta=rope_delta,
+                )
+
         batch_res = self.generate_batch(
             [prompt],
             system_prompt=system_prompt,

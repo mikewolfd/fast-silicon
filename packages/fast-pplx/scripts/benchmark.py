@@ -1474,11 +1474,11 @@ def _eval_s4096_streamed_parity(eng: Any) -> dict[str, Any]:
     orig_thresh = pplx_gpu_mod._STREAMED_SEQ_THRESHOLD
     try:
         pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = 10_000
-        whole_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu")
+        whole_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu", apply_tanh=False)
         whole_i = eng.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False, mode="gpu")
 
         pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = 2048
-        stream_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu")
+        stream_p = eng.encode_tokens([toks], batch_size=1, output_dtype="float32", normalize=False, mode="gpu", apply_tanh=False)
         stream_i = eng.encode_tokens([toks], batch_size=1, output_dtype="int8", normalize=False, mode="gpu")
     finally:
         pplx_gpu_mod._STREAMED_SEQ_THRESHOLD = orig_thresh
@@ -1565,7 +1565,7 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
 
                     if case["task"] == "query":
                         flat_q = [row[0] for row in docs]
-                        got_p = eng.encode_queries(flat_q, output_dtype="float32", normalize=False, mode=engine_mode)
+                        got_p = eng.encode_queries(flat_q, output_dtype="float32", normalize=False, mode=engine_mode, apply_tanh=False)
                         got_i = eng.encode_queries(flat_q, output_dtype="int8", normalize=False, mode=engine_mode)
                         exp_p = ref[f"{cid}/projected"].reshape(-1, 1024)
                         exp_i = np.concatenate([ref[f"{cid}/encoded/{k}"] for k in range(len(flat_q))], axis=0)
@@ -1578,7 +1578,7 @@ def cmd_parity(args: argparse.Namespace) -> dict[str, Any]:
                         i8_cos.append(float(ip["min_cos"]))
                         evaluated += 1
                     else:
-                        got_p_list = eng.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, mode=engine_mode)
+                        got_p_list = eng.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, mode=engine_mode, apply_tanh=False)
                         got_i_list = eng.encode_contextual_chunks(docs, output_dtype="int8", normalize=False, mode=engine_mode)
                         exp_p_all = ref[f"{cid}/projected"]
                         for di, doc in enumerate(docs):
@@ -1909,11 +1909,11 @@ def cmd_bit_identity(args: argparse.Namespace) -> dict[str, Any]:
                 if case["task"] == "query":
                     flat_q = [row[0] for row in case["documents"]]
                     vectors[f"{cid}/projected"] = eng.encode_queries(
-                        flat_q, output_dtype="float32", normalize=False, mode=args.mode
+                        flat_q, output_dtype="float32", normalize=False, mode=args.mode, apply_tanh=False
                     )
                 else:
                     mats = eng.encode_contextual_chunks(
-                        case["documents"], output_dtype="float32", normalize=False, mode=args.mode
+                        case["documents"], output_dtype="float32", normalize=False, mode=args.mode, apply_tanh=False
                     )
                     for di, mat in enumerate(mats):
                         vectors[f"{cid}/doc_{di}"] = mat

@@ -996,3 +996,280 @@ def test_fused_kv_q8_and_quarot_q4_with_prefix_tree_cpu(tmp_path: Path) -> None:
     assert tree_bytes["q4_quarot"] < tree_bytes["q8"]
 
 
+def test_fast_qwen3_lazy_multimodal_generate_cpu(tmp_path: Path) -> None:
+    """Verify lazy multimodal `generate(..., images=...)`, MRoPE expansion, JSON schema, and zero-ViT text isolation."""
+    from PIL import Image, ImageDraw
+    from tokenizers import Tokenizer as HfTokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_shared.qwen35_vision import FastQwen35VisionModel, Qwen35VisionConfig
+
+    vocab: dict[str, int] = {}
+    for ch in sorted(ByteLevel.alphabet()):
+        if ch not in vocab:
+            vocab[ch] = len(vocab)
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    specials = [
+        AddedToken("<|endoftext|>", special=True),
+        AddedToken("<|im_start|>", special=True),
+        AddedToken("<|im_end|>", special=True),
+        AddedToken("<think>", special=True),
+        AddedToken("</think>", special=True),
+        AddedToken("<|vision_start|>", special=True),
+        AddedToken("<|image_pad|>", special=True),
+        AddedToken("<|vision_end|>", special=True),
+    ]
+    bpe.add_special_tokens(specials)
+    tok_p = tmp_path / "tok_vlm.json"
+    bpe.save(str(tok_p))
+    tok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    weights = _make_synthetic_qwen3_weights(cfg, seed=41, include_mtp=False)
+    model = FastQwen3Model(cfg, weights, enable_fusion=True)
+
+    # 1. Text-only model_dir without vision_config raises clear ValueError on images, while text generate leaves _vision_model None
+    text_only_dir = tmp_path / "text_only_ckpt"
+    text_only_dir.mkdir()
+    (text_only_dir / "config.json").write_text(json.dumps({"hidden_size": 128}), encoding="utf-8")
+    model.model_dir = text_only_dir
+
+    im = Image.new("RGB", (64, 64), (240, 240, 240))
+    ImageDraw.Draw(im).rectangle([8, 8, 56, 56], fill=(20, 20, 20))
+
+    eng = FastQwen3Engine(model=model, tokenizer=tok, warmup=False, prefix_cache_mb=8)
+    try:
+        r_txt = eng.generate("Hello", max_tokens=4, temperature=0.0, speculative=False)
+        assert r_txt.completion_tokens >= 1
+        assert eng._vision_model is None
+        with pytest.raises(ValueError, match="vision_config"):
+            eng.generate("Describe", images=[im], max_tokens=4, temperature=0.0)
+
+        # 2. Inject synthetic tiny ViT (`out_hidden_size=128`) and verify multimodal prefill + MRoPE + JSON schema decode
+        vcfg = Qwen35VisionConfig(
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            in_channels=3,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            out_hidden_size=128,
+            num_position_embeddings=64,
+        )
+        tiny_vis = FastQwen35VisionModel(vcfg)
+        mx.eval(tiny_vis.parameters())
+        eng._vision_model = tiny_vis
+
+        r_mm = eng.generate("Extract", images=[im], max_tokens=5, temperature=0.0, speculative=False)
+        assert r_mm.prompt_tokens > r_txt.prompt_tokens
+        assert r_mm.completion_tokens >= 1
+
+        sch = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        r_json = eng.generate(
+            "JSON",
+            images=[im],
+            json_schema=sch,
+            max_tokens=16,
+            temperature=0.0,
+            speculative=False,
+        )
+        assert json.loads(r_json.text)["ok"] in (True, False)
+    finally:
+        eng.close()
+        assert eng._vision_model is None
+
+
+def test_qwen3_apple10_mpp_gating_and_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fast_qwen3 import should_use_qwen_mpp_linear
+
+    monkeypatch.delenv("FAST_SILICON_QWEN3_MPP", raising=False)
+    monkeypatch.delenv("FAST_SILICON_QWEN3_MPP_W8A8", raising=False)
+    monkeypatch.delenv("FAST_SILICON_MPP_W8A8", raising=False)
+
+    # Apple9 / M4 and earlier must stay disabled regardless of shape or batch length
+    for bits in (4, 8):
+        assert not should_use_qwen_mpp_linear(1024, 4096, 12288, bits=bits, apple10_nax=False, allow_w8a8=True)
+
+    # Qwen3.5-4B/9B 4-bit shapes: reject M<128 (0.33x..0.90x slower on M5), accept M>=128; reject <8M MACs
+    assert not should_use_qwen_mpp_linear(32, 2560, 9216, bits=4, apple10_nax=True)
+    assert not should_use_qwen_mpp_linear(64, 4096, 12288, bits=4, apple10_nax=True)
+    assert should_use_qwen_mpp_linear(128, 2560, 9216, bits=4, apple10_nax=True)
+    assert should_use_qwen_mpp_linear(256, 9216, 2560, bits=4, apple10_nax=True)
+    assert should_use_qwen_mpp_linear(128, 4096, 24576, bits=4, apple10_nax=True)
+    assert not should_use_qwen_mpp_linear(512, 4096, 1024, bits=4, apple10_nax=True)
+
+    # 8-bit defaults OFF without opt-in
+    assert not should_use_qwen_mpp_linear(512, 12288, 4096, bits=8, apple10_nax=True)
+    # 8-bit opt-in activates large >=8M @ M>=64 and medium OvisOCR2 (1024x7168, 3584x1024) @ M>=128
+    assert should_use_qwen_mpp_linear(64, 12288, 4096, bits=8, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_qwen_mpp_linear(64, 1024, 7168, bits=8, apple10_nax=True, allow_w8a8=True)
+    assert should_use_qwen_mpp_linear(128, 1024, 7168, bits=8, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_qwen_mpp_linear(64, 3584, 1024, bits=8, apple10_nax=True, allow_w8a8=True)
+    assert should_use_qwen_mpp_linear(128, 3584, 1024, bits=8, apple10_nax=True, allow_w8a8=True)
+    assert not should_use_qwen_mpp_linear(512, 1024, 1024, bits=8, apple10_nax=True, allow_w8a8=True)
+
+    # Env overrides: FAST_SILICON_QWEN3_MPP_W8A8, "w4a8", and "0"
+    monkeypatch.setenv("FAST_SILICON_QWEN3_MPP_W8A8", "1")
+    assert should_use_qwen_mpp_linear(64, 12288, 4096, bits=8, apple10_nax=True)
+    monkeypatch.setenv("FAST_SILICON_QWEN3_MPP", "w4a8")
+    assert should_use_qwen_mpp_linear(128, 4096, 12288, bits=4, apple10_nax=True)
+    assert not should_use_qwen_mpp_linear(128, 12288, 4096, bits=8, apple10_nax=True)
+    monkeypatch.setenv("FAST_SILICON_QWEN3_MPP", "0")
+    assert not should_use_qwen_mpp_linear(512, 4096, 12288, bits=4, apple10_nax=True)
+
+
+def test_qwen3_mpp_shared_group_budget_shed_and_lora_grad(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fast_qwen3._mpp_linear as mpp_mod
+
+    # Deterministic host-independent fake MPP kernels executing exact affine qmm
+    pack_calls = 0
+    quant_calls = 0
+    mpp_calls: list[tuple[int, bool]] = []
+
+    def _fake_pack(wq: mx.array, sq: mx.array, bq: mx.array, *, bits: int, group_size: int = 64):
+        nonlocal pack_calls
+        pack_calls += 1
+        return mx.zeros((wq.shape[0], int(sq.shape[-1]) * 64), dtype=mx.uint8), mx.zeros_like(sq)
+
+    def _fake_quant(x: mx.array):
+        nonlocal quant_calls
+        quant_calls += 1
+        m_i, k_i = int(x.shape[0]), int(x.shape[1])
+        return mx.zeros((m_i, k_i), dtype=mx.int8), mx.ones((m_i, k_i // 64), dtype=mx.bfloat16)
+
+    def _fake_mpp_linear(
+        x: mx.array,
+        wq: mx.array,
+        sq: mx.array,
+        bq: mx.array,
+        *,
+        bits: int,
+        group_size: int = 64,
+        mode: str = "affine",
+        bias: mx.array | None = None,
+        out_dtype: mx.Dtype | None = None,
+        packed_weights=None,
+        prequantized_x=None,
+    ) -> mx.array:
+        mpp_calls.append((int(bits), prequantized_x is not None))
+        assert packed_weights is not None
+        out = mx.quantized_matmul(
+            x, wq, scales=sq, biases=bq, transpose=True, group_size=group_size, bits=bits, mode=mode
+        )
+        if bias is not None:
+            out = out + bias
+        return out.astype(out_dtype or x.dtype)
+
+    monkeypatch.setattr(mpp_mod, "pack_affine_weights_for_mpp_i8", _fake_pack)
+    monkeypatch.setattr(mpp_mod, "quantize_activations_i8_k64", _fake_quant)
+    monkeypatch.setattr(mpp_mod, "mpp_quantized_linear", _fake_mpp_linear)
+
+    # Build a 1-layer full-attention Qwen3 model sized so MLP meets >=8M MACs (1536 x 6144 = 9.44M)
+    # with mixed 4-bit + 8-bit gate_up buckets -> tests shared prequantized_x + LoRA VJP!
+    cfg = Qwen3Config(
+        hidden_size=1536,
+        intermediate_size=6144,
+        num_hidden_layers=1,
+        num_attention_heads=6,
+        num_key_value_heads=2,
+        head_dim=256,
+        vocab_size=64,
+        layer_types=["full_attention"],
+        tie_word_embeddings=True,
+    )
+    rng = np.random.default_rng(7)
+
+    def r_w(rows: int, cols: int) -> mx.array:
+        return mx.array((rng.normal(scale=0.02, size=(rows, cols))).astype(np.float32), dtype=mx.bfloat16)
+
+    def q_tens(prefix: str, rows: int, cols: int, bits: int, out_w: dict[str, mx.array]) -> None:
+        wq, sq, bq = mx.quantize(r_w(rows, cols), group_size=64, bits=bits, mode="affine")
+        out_w[f"{prefix}.weight"] = wq
+        out_w[f"{prefix}.scales"] = sq
+        out_w[f"{prefix}.biases"] = bq
+
+    h, inter, v = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
+    w: dict[str, mx.array] = {
+        "model.embed_tokens.weight": r_w(v, h),
+        "model.norm.weight": mx.ones((h,), dtype=mx.bfloat16),
+        "model.layers.0.input_layernorm.weight": mx.ones((h,), dtype=mx.bfloat16),
+        "model.layers.0.post_attention_layernorm.weight": mx.ones((h,), dtype=mx.bfloat16),
+    }
+    q_tens("model.layers.0.self_attn.q_proj", 2 * 6 * 256, h, 4, w)
+    q_tens("model.layers.0.self_attn.k_proj", 2 * 256, h, 8, w)
+    q_tens("model.layers.0.self_attn.v_proj", 2 * 256, h, 8, w)
+    q_tens("model.layers.0.self_attn.o_proj", h, 6 * 256, 4, w)
+    w["model.layers.0.self_attn.q_norm.weight"] = mx.ones((256,), dtype=mx.bfloat16)
+    w["model.layers.0.self_attn.k_norm.weight"] = mx.ones((256,), dtype=mx.bfloat16)
+    q_tens("model.layers.0.mlp.gate_proj", inter, h, 4, w)
+    q_tens("model.layers.0.mlp.up_proj", inter, h, 8, w)
+    q_tens("model.layers.0.mlp.down_proj", h, inter, 4, w)
+    mx.eval(*w.values())
+
+    ref_model = FastQwen3Model(cfg, w, enable_fusion=True, enable_mpp_linear=False)
+    mpp_model = FastQwen3Model(cfg, w, enable_fusion=True, enable_mpp_linear=True, mpp_w8a8=True, apple10_nax=True)
+    # Tight enough to hold gate_proj (4b), up_proj (8b), and down_proj (4b) (~28.8 MB), tested below too
+    assert len(mpp_model.layers[0].mlp.gate_up.buckets) == 2
+
+    # 1. Decode / short sequence (L=32 < 64): zero MPP dispatches, zero pack calls
+    x_short = mx.array([list(range(32))], dtype=mx.int32)
+    y_short_mpp = mpp_model(x_short)
+    y_short_ref = ref_model(x_short)
+    mx.eval(y_short_mpp, y_short_ref)
+    assert pack_calls == 0 and mpp_model.mpp_linear_stats()["w4_calls"] == 0
+
+    # 2. Prefill L=128: triggers lazy pack, shared single quantize_activations_i8_k64 for both mixed gate_up buckets, exact parity
+    x_long = mx.array([[i % 64 for i in range(128)]], dtype=mx.int32)
+    y_long_mpp = mpp_model(x_long)
+    y_long_ref = ref_model(x_long)
+    mx.eval(y_long_mpp, y_long_ref)
+    assert float(mx.max(mx.abs(y_long_mpp - y_long_ref)).item()) == 0.0
+    st = mpp_model.mpp_linear_stats()
+    assert st["packed_modules"] == 3  # gate_proj(4b) + up_proj(8b) + down_proj(4b)
+    assert st["w4_calls"] == 2 and st["w8_calls"] == 1
+    assert st["shared_quant_calls"] == 1 and quant_calls == 1
+    assert any(b == 4 and shared for b, shared in mpp_calls)
+    assert any(b == 8 and shared for b, shared in mpp_calls)
+
+    # 3. Autograd + LoRA compatibility through MppQuantizedLinear & MppBucketedLinearGroup
+    la = mx.ones((4, h), dtype=mx.bfloat16) * 0.01
+    lb = mx.ones((inter, 4), dtype=mx.bfloat16) * 0.01
+    mpp_model.apply_lora_tensors({"model.layers.0.mlp.gate_proj": (la, lb, 2.0)})
+    embs = mpp_model.embed_tokens(x_long)
+
+    def _loss(e: mx.array) -> mx.array:
+        return mx.mean(mpp_model.forward_hidden(inputs_embeds=e) ** 2)
+
+    loss_val, g_emb = mx.value_and_grad(_loss)(embs)
+    mx.eval(loss_val, g_emb)
+    assert float(mx.sum(mx.abs(g_emb)).item()) > 0.0
+
+    # 4. Shed clears packed weights via engine._on_memory_shed & tight budget falls back cleanly
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    eng = FastQwen3Engine(model=mpp_model, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        eng._on_memory_shed()
+        assert mpp_model.mpp_linear_stats()["packed_modules"] == 0
+        mpp_model._mpp_state.max_pack_bytes = 1024  # force budget skip
+        y_fallback = mpp_model(x_long)
+        mx.eval(y_fallback)
+        assert mpp_model.mpp_linear_stats()["budget_skips"] >= 1
+    finally:
+        eng.close()
+
+
+
+

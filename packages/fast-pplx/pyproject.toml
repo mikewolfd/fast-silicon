@@ -28,6 +28,9 @@ dev = [
 ane-build = [
     "coremltools>=8.0",
 ]
+vision = [
+    "pillow>=10.0",
+]
 
 [project.scripts]
 fast-pplx = "fast_pplx.cli:main"

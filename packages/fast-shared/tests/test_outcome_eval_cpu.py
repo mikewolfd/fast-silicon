@@ -22,6 +22,8 @@ from fast_shared.outcome_eval import (
     build_bfcl_response_schema,
     build_clinc_stage1_qdef,
     build_clinc_stage2_qdef,
+    build_cord_v2_schema,
+    canonicalize_latex,
     check_bfcl_ast_match,
     check_chat_validity,
     check_embedding_validity,
@@ -35,13 +37,19 @@ from fast_shared.outcome_eval import (
     compute_corpus_outcome_metrics,
     compute_ece,
     compute_file_sha256,
+    compute_grits,
     compute_multiclass_nll,
+    compute_numeric_cell_f1,
     compute_outcome_metrics,
     compute_paired_se,
+    compute_teds,
+    compute_teds_structure,
     dcg_at_k,
     download_pinned_file,
     evaluate_bfcl_v3,
     evaluate_clinc_two_stage,
+    evaluate_cord_v2,
+    evaluate_fintabnet_otsl,
     evaluate_instruction_following,
     evaluate_jsonschemabench_compiler,
     evaluate_legalbench_spans,
@@ -50,6 +58,8 @@ from fast_shared.outcome_eval import (
     evaluate_memory_gate,
     evaluate_mmlu_redux,
     evaluate_mrl_dtype_grid,
+    evaluate_olmocr_bench,
+    evaluate_omnidocbench,
     evaluate_promotion_gates,
     evaluate_ragtruth_noul,
     evaluate_retrieval_rankings,
@@ -58,24 +68,35 @@ from fast_shared.outcome_eval import (
     expected_reward_score,
     extract_boxed_answer,
     extract_mmlu_choice,
+    extract_tables_from_markdown,
     filter_legalbench_subsets,
     filter_longembed_subsets,
+    fuzzy_find_substring,
     grounded_field_f1,
     hungarian_min_cost,
+    levenshtein_distance,
     linear_sum_assignment_max,
+    load_cord_v2,
+    load_fintabnet_otsl,
     load_lockfile,
+    load_olmocr_bench,
+    load_omnidocbench_en,
     math_answers_equivalent,
     merge_char_spans,
+    normalize_cord_v2_parse,
     parse_bfcl_tool_calls,
     partition_banking77_clusters,
     project_mrl_dtype,
     read_arrow_ipc_rows,
     read_jsonl_rows,
     read_parquet_rows,
+    reconstruct_fintabnet_html,
     repeat_4gram_rate,
+    run_olmocr_unit_test,
     split_sentences,
     stratified_sha256_sample,
     validate_against_jsonschema,
+    validate_ocr_markdown,
     verify_instruction,
 )
 
@@ -87,7 +108,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # ---------------------------------------------------------------------------
 
 
-def test_lockfile_pins_all_16_datasets_and_excludes_restricted_subsets(tmp_path: Path) -> None:
+def test_lockfile_pins_all_20_datasets_and_excludes_restricted_subsets(tmp_path: Path) -> None:
     lock_p = _REPO_ROOT / "configs" / "outcome_benchmarks.lock.json"
     if not lock_p.is_file():
         # Standalone fast-shared mirror without monorepo configs/: verify load_lockfile contract on synthetic lockfile.
@@ -116,6 +137,10 @@ def test_lockfile_pins_all_16_datasets_and_excludes_restricted_subsets(tmp_path:
         "bfcl_v3",
         "jsonschemabench",
         "extractbench",
+        "olmocr_bench",
+        "fintabnet_otsl",
+        "omnidocbench_en",
+        "cord_v2",
     }
     assert set(ds.keys()) == expected_keys
     for key, entry in ds.items():
@@ -1289,5 +1314,346 @@ def test_compiled_jsonschema_cache_parity_and_fallback_cpu(monkeypatch: pytest.M
     monkeypatch.setitem(sys.modules, "jsonschema", None)
     for obj, expected in cases:
         assert validate_against_jsonschema(obj, schema_2020) is expected
+
+
+# ---------------------------------------------------------------------------
+# 6. Category 5 OCR Benchmark Loaders, Pure-Python Scorers & CLI Wiring
+# ---------------------------------------------------------------------------
+
+
+def _naive_levenshtein(a: str, b: str) -> int:
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n]
+
+
+def _naive_semiglobal_min_dist(pat: str, txt: str) -> int:
+    m, n = len(pat), len(txt)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if pat[i - 1] == txt[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return min(dp[m])
+
+
+def test_myers_levenshtein_and_fuzzy_substring_match_naive_dp() -> None:
+    pairs = [
+        ("", ""),
+        ("", "abc"),
+        ("abc", ""),
+        ("kitten", "sitting"),
+        ("Revenue $1,234.50", "Revenue $1,235.50"),
+        ("aaaaaaaa", "aaabaaaa"),
+        ("x" * 120 + "abc", "x" * 120 + "abd"),
+        ("Total Operating Expenses", "Totl Operatng Expnses"),
+    ]
+    for a, b in pairs:
+        assert levenshtein_distance(a, b) == _naive_levenshtein(a, b)
+        assert levenshtein_distance(b, a) == _naive_levenshtein(b, a)
+
+    hay = "Section 2: Consolidated Revenue was $4,820.5 million in FY2025 across North America."
+    for pat in ("Consolidated Revenue", "Consoldated Revnue", "FY2025", "Totally Missing String"):
+        ref_d = _naive_semiglobal_min_dist(pat, hay)
+        ok, dist, end_idx = fuzzy_find_substring(pat, hay, max_diffs=2)
+        assert ok is (ref_d <= 2)
+        if not ok:
+            assert dist == ref_d
+        else:
+            assert dist <= 2 and end_idx > 0
+    # Empty text must never match a non-empty pattern.
+    assert fuzzy_find_substring("abc", "", max_diffs=5)[0] is False
+
+
+def test_fintabnet_reconstruct_teds_grits_and_numeric_f1() -> None:
+    html_toks = [
+        "<tr>", "<td>", "</td>", "<td", ' colspan="2"', ">", "</td>", "</tr>",
+        "<tr>", "<td>", "</td>", "<td>", "</td>", "<td>", "</td>", "</tr>",
+    ]
+    cells = [[
+        {"tokens": list("Metric")},
+        {"tokens": list("FY 2025")},
+        {"tokens": list("Cash Flow")},
+        {"tokens": list("($1,250)")},
+        {"tokens": list("$2,400.00")},
+    ]]
+    gold_html = reconstruct_fintabnet_html(html_toks, cells)
+    assert gold_html.startswith("<table>") and 'colspan="2"' in gold_html and "($1,250)" in gold_html
+
+    # Identical HTML hits 1.0 on TEDS, TEDS-S, GriTS, and numeric F1.
+    assert compute_teds(gold_html, gold_html) == pytest.approx(1.0)
+    assert compute_teds_structure(gold_html, gold_html) == pytest.approx(1.0)
+    gr = compute_grits(gold_html, gold_html)
+    assert gr["grits_top"] == pytest.approx(1.0)
+    assert gr["grits_con"] == pytest.approx(1.0)
+    assert compute_numeric_cell_f1(gold_html, gold_html) == pytest.approx(1.0)
+
+    # Same structure with one digit typo: TEDS-S stays 1.0 while TEDS & numeric F1 drop.
+    typo_html = gold_html.replace("$2,400.00", "$2,900.00")
+    assert compute_teds_structure(typo_html, gold_html) == pytest.approx(1.0)
+    assert 0.85 < compute_teds(typo_html, gold_html) < 1.0
+    assert compute_numeric_cell_f1(typo_html, gold_html) < 1.0
+
+    # Accounting parentheses `($1,250)` equals `-1250` in financial numeric F1.
+    gfm_equiv = "| Metric | FY 2025 | FY 2025 |\n| --- | ---: | ---: |\n| Cash Flow | -1250 | 2400 |"
+    tables = extract_tables_from_markdown(gfm_equiv)
+    assert len(tables) == 1
+    assert compute_numeric_cell_f1(tables[0], gold_html) == pytest.approx(1.0)
+
+    ev = evaluate_fintabnet_otsl(
+        [{"id": "t1", "gold_html": gold_html}, {"id": "t2", "gold_html": gold_html}],
+        [gold_html, "no table here"],
+    )
+    assert ev["per_item_valid"] == [True, False]
+    assert ev["per_item_scores"][0] == pytest.approx(1.0)
+    assert ev["per_item_scores"][1] == pytest.approx(0.0)
+
+
+def test_olmocr_bench_all_five_test_types_and_empty_guard() -> None:
+    md_good = (
+        "# Chapter 1\n\n"
+        "First column paragraph about quantum gravity.\n\n"
+        "Second column continuation discussing black hole entropy.\n\n"
+        "$$\\mathcal{V}(\\psi_m) \\to +\\infty$$\n\n"
+        "| Region | Q1 | Q2 |\n"
+        "| --- | ---: | ---: |\n"
+        "| BO | 0.569 | 0.712 |\n"
+        "| EU | 0.440 | 0.610 |\n"
+    )
+    assert validate_ocr_markdown(md_good, allow_html_tables=False)["valid"] is True
+
+    tests = [
+        {"type": "present", "text": "quantum gravity", "case_sensitive": True, "max_diffs": 0},
+        {"type": "absent", "text": "CONFIDENTIAL FOOTER 99", "case_sensitive": False, "max_diffs": 1},
+        {"type": "order", "before": "First column paragraph", "after": "Second column continuation", "max_diffs": 1},
+        {"type": "table", "cell": "0.569", "left_heading": "BO", "top_heading": "Q1", "right": "0.712", "down": "0.440", "max_diffs": 0},
+        {"type": "math", "math": r"{\mathcal{V}}(\psi_m)\rightarrow +\infty", "max_diffs": 0},
+        {"type": "baseline", "check_disallowed_characters": True},
+    ]
+    for ts in tests:
+        assert run_olmocr_unit_test(ts, md_good) is True, f"Failed test {ts}"
+        # Blank output MUST fail every assertion including `absent`!
+        assert run_olmocr_unit_test(ts, "") is False
+
+    # Swapped reading order fails `order`.
+    assert run_olmocr_unit_test(
+        {"type": "order", "before": "Second column continuation", "after": "First column paragraph", "max_diffs": 0},
+        md_good,
+    ) is False
+    assert canonicalize_latex(r"\left(\frac{1}{2}\right)") == canonicalize_latex(r"(\frac{1}{2})")
+
+    pages = [
+        {"id": "p1", "category": "table_tests", "tests": [tests[3], tests[5]]},
+        {"id": "p2", "category": "headers_footers", "tests": [tests[1]]},
+    ]
+    res = evaluate_olmocr_bench(pages, [md_good, md_good], allow_html_tables=False)
+    assert res["overall_macro"] == pytest.approx(1.0)
+    assert res["overall_no_hf"] == pytest.approx(1.0)
+    assert res["per_item_valid"] == [True, True]
+
+
+def test_omnidocbench_cord_v2_loaders_and_scorers(tmp_path: Path) -> None:
+    # 1. Synthetic OmniDocBench-EN loader & evaluator
+    od_dir = tmp_path / "cache" / "omnidocbench_en"
+    (od_dir / "images").mkdir(parents=True)
+    (od_dir / "images" / "page1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    od_json = [
+        {
+            "page_info": {
+                "page_no": 1,
+                "image_path": "page1.png",
+                "page_attribute": {"language": "english", "data_source": "academic_literature", "layout": "single_column"},
+            },
+            "layout_dets": [
+                {"category_type": "title", "ignore": False, "order": 1, "anno_id": "a1", "text": "Introduction to Silicon"},
+                {"category_type": "text_block", "ignore": False, "order": 2, "anno_id": "a2", "text": "Unified memory enables fast OCR."},
+                {"category_type": "table", "ignore": False, "order": 3, "anno_id": "a3", "html": "<table><tr><td>Chip</td><td>BW</td></tr><tr><td>M4</td><td>273</td></tr></table>"},
+                {"category_type": "equation_isolated", "ignore": False, "order": 4, "anno_id": "a4", "latex": "$$E = mc^2$$"},
+            ],
+        },
+        {
+            "page_info": {"page_no": 2, "image_path": "zh.png", "page_attribute": {"language": "simplified_chinese", "data_source": "book"}},
+            "layout_dets": [{"category_type": "text_block", "ignore": False, "order": 1, "text": "中文"}],
+        },
+    ]
+    od_path = od_dir / "OmniDocBench.json"
+    od_path.write_text(json.dumps(od_json), encoding="utf-8")
+
+    # 2. Synthetic CORD-v2 loader (testing single-dict `menu` + list-valued scalar normalization!)
+    cord_dir = tmp_path / "cache" / "cord_v2" / "data"
+    cord_dir.mkdir(parents=True)
+    cord_gt = {
+        "gt_parse": {
+            "menu": {"nm": "ICED LATTE", "cnt": "2", "price": "80.000"},
+            "sub_total": {"subtotal_price": ["80.000"], "tax_price": "8.000"},
+            "total": {"total_price": "88.000", "cashprice": ["100.000"]},
+        }
+    }
+    cord_tbl = pa.table(
+        {
+            "image": [{"bytes": b"\x89PNG\r\n\x1a\n", "path": "0.png"}],
+            "ground_truth": [json.dumps(cord_gt)],
+        }
+    )
+    cord_pq = cord_dir / "test.parquet"
+    pq.write_table(cord_tbl, cord_pq)
+
+    # 3. Synthetic FinTabNet_OTSL Parquet loader
+    ftn_dir = tmp_path / "cache" / "fintabnet_otsl" / "data"
+    ftn_dir.mkdir(parents=True)
+    ftn_tbl = pa.table(
+        {
+            "filename": ["t0.png"],
+            "imgid": [1],
+            "cols": [2],
+            "rows": [2],
+            "otsl": [["fcel", "fcel", "nl", "fcel", "fcel", "nl"]],
+            "html": [["<tr>", "<td>", "</td>", "<td>", "</td>", "</tr>", "<tr>", "<td>", "</td>", "<td>", "</td>", "</tr>"]],
+            "cells": [[[{"tokens": ["A"]}, {"tokens": ["B"]}, {"tokens": ["1"]}, {"tokens": ["2"]}]]],
+            "image": [{"bytes": b"\x89PNG\r\n\x1a\n", "path": "t0.png"}],
+        }
+    )
+    ftn_pq = ftn_dir / "test.parquet"
+    pq.write_table(ftn_tbl, ftn_pq)
+
+    # 4. Synthetic olmOCR-bench loader
+    olm_dir = tmp_path / "cache" / "olmocr_bench" / "bench_data"
+    (olm_dir / "pdfs" / "old_scans").mkdir(parents=True)
+    (olm_dir / "pdfs" / "old_scans" / "s1.pdf").write_bytes(b"%PDF-1.4\n")
+    olm_jl = olm_dir / "old_scans.jsonl"
+    olm_jl.write_text(json.dumps({"pdf": "old_scans/s1.pdf", "type": "present", "text": "Hello", "max_diffs": 0}) + "\n", encoding="utf-8")
+
+    fake_lock = {
+        "datasets": {
+            "omnidocbench_en": {
+                "repo_id": "opendatalab/OmniDocBench",
+                "revision": "a" * 40,
+                "gated": False,
+                "language_filter": "english",
+                "files": ["OmniDocBench.json"],
+                "tier1": {"n": 5},
+                "pinned_files": {"OmniDocBench.json": {"sha256": compute_file_sha256(od_path)}},
+            },
+            "cord_v2": {
+                "repo_id": "naver-clova-ix/cord-v2",
+                "revision": "b" * 40,
+                "gated": False,
+                "files": ["data/test.parquet"],
+                "tier1": {"n": 5},
+                "pinned_files": {"data/test.parquet": {"sha256": compute_file_sha256(cord_pq)}},
+            },
+            "fintabnet_otsl": {
+                "repo_id": "docling-project/FinTabNet_OTSL",
+                "revision": "c" * 40,
+                "gated": False,
+                "files": ["data/test.parquet"],
+                "tier1": {"files": ["data/test.parquet"], "n": 5},
+                "pinned_files": {"data/test.parquet": {"sha256": compute_file_sha256(ftn_pq)}},
+            },
+            "olmocr_bench": {
+                "repo_id": "allenai/olmOCR-bench",
+                "revision": "d" * 40,
+                "gated": False,
+                "categories": ["old_scans"],
+                "files": ["bench_data/old_scans.jsonl"],
+                "tier1": {"per_category": 2, "n": 2},
+                "pinned_files": {"bench_data/old_scans.jsonl": {"sha256": compute_file_sha256(olm_jl)}},
+            },
+        }
+    }
+
+    od_pages = load_omnidocbench_en(tier="tier1", lock=fake_lock, cache_dir=tmp_path / "cache", local_files_only=True)
+    assert len(od_pages) == 1 and od_pages[0]["id"] == "page1.png"
+    pred_od = "# Introduction to Silicon\n\nUnified memory enables fast OCR.\n\n| Chip | BW |\n| --- | ---: |\n| M4 | 273 |\n\n$$E = mc^2$$\n"
+    ev_od = evaluate_omnidocbench(od_pages, [pred_od], allow_html_tables=False)
+    assert ev_od["omnidoc_overall"] > 0.95
+    assert ev_od["table_teds"] == pytest.approx(1.0)
+    assert ev_od["formula_norm_sim"] == pytest.approx(1.0)
+
+    cord_items = load_cord_v2(tier="tier1", lock=fake_lock, cache_dir=tmp_path / "cache", local_files_only=True)
+    assert len(cord_items) == 1
+    assert isinstance(cord_items[0]["gt_parse"]["menu"], list)
+    assert validate_against_jsonschema(cord_items[0]["gt_parse"], build_cord_v2_schema()) is True
+    assert normalize_cord_v2_parse(cord_gt["gt_parse"]) == cord_items[0]["gt_parse"]
+    ev_cord = evaluate_cord_v2(cord_items, [json.dumps(cord_items[0]["gt_parse"])])
+    assert ev_cord["grounded_field_f1"] == pytest.approx(1.0)
+    assert ev_cord["anls"] == pytest.approx(1.0)
+    assert ev_cord["valid_schema_rate"] == pytest.approx(1.0)
+
+    ftn_items = load_fintabnet_otsl(tier="tier1", lock=fake_lock, cache_dir=tmp_path / "cache", local_files_only=True)
+    assert len(ftn_items) == 1 and "<td>A</td>" in ftn_items[0]["gold_html"]
+
+    olm_items = load_olmocr_bench(tier="tier1", lock=fake_lock, cache_dir=tmp_path / "cache", local_files_only=True)
+    assert len(olm_items) == 1 and olm_items[0]["pdf_path"].endswith("old_scans/s1.pdf")
+
+
+def test_cat5_cli_dry_run_and_public_comparison_pairing() -> None:
+    cli_script = _REPO_ROOT / "scripts" / "benchmark_outcomes.py"
+    if not cli_script.is_file():
+        return
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(cli_script),
+            "run",
+            "--packages",
+            "fast-ocr",
+            "--include-public-baselines",
+            "--dry-run",
+        ],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    plan = json.loads(proc.stdout)
+    assert plan["packages"] == ["fast-ocr", "public-ovis-mlx-vlm", "public-apple-vision", "public-pypdfium2"]
+
+    sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+    import benchmark_outcomes as bo
+
+    fake_rows = [
+        {
+            "package": "fast-ocr",
+            "category": 5,
+            "config_label": "ovis_gfm_render",
+            "benchmark": "olmOCR-bench(42)",
+            "status": "ok",
+            "n_items": 4,
+            "objective_score_e2e": 0.875,
+            "effective_outcome_per_sec": 0.42,
+            "per_item_effective_scores": [1.0, 0.75, 1.0, 0.75],
+            "diagnostics": {"backend": "ovis"},
+        },
+        {
+            "package": "public-ovis-mlx-vlm",
+            "category": 5,
+            "config_label": "ovis_mlx_vlm",
+            "benchmark": "olmOCR-bench(42)",
+            "status": "ok",
+            "n_items": 4,
+            "objective_score_e2e": 0.875,
+            "effective_outcome_per_sec": 0.14,
+            "per_item_effective_scores": [1.0, 0.75, 1.0, 0.75],
+            "diagnostics": {"backend": "public-ovis-mlx-vlm"},
+        },
+    ]
+    comps = bo.compute_public_comparisons(fake_rows)
+    assert len(comps) == 1
+    assert comps[0]["fast_package"] == "fast-ocr"
+    assert comps[0]["stock_package"] == "public-ovis-mlx-vlm"
+    assert comps[0]["eot_speedup_vs_stock"] == pytest.approx(3.0)
+    assert comps[0]["lossless_quality_status"] == "PASS"
+
 
 

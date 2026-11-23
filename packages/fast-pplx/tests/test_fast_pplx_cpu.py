@@ -453,7 +453,9 @@ def test_public_contextual_limit_and_chunk_order(tmp_path: Path, monkeypatch: py
     # Cut the second span after three tokens. Its successor and each empty chunk keep their zero row.
     expected = [[16 / 3, 19 / 3, 0], [8], [], [6, 0, 5]]
     with FastPplx(home=tmp_path, mode=mode, _gpu_backend=IdentityGPU(), _ane_backend=MeanANE(), _tokenizer=tok) as eng:
-        actual = eng.encode_contextual_chunks(docs, max_length=10, batch_size=2, mode=mode, dimensions=1, normalize=False)
+        actual = eng.encode_contextual_chunks(
+            docs, max_length=10, batch_size=2, mode=mode, dimensions=1, normalize=False, apply_tanh=False
+        )
         assert calls == [10] * len(docs)
         for vectors, means in zip(actual, expected, strict=True):
             np.testing.assert_allclose(vectors[:, 0], means, rtol=1e-6)
@@ -923,6 +925,7 @@ def test_max_length_validation_and_hetero2_contextual_work_stealing_cpu(tmp_path
         assert none_ok.shape == (1, 1)
 
         # 2. >= 6-document hetero2 contextual work-stealing (16 short + 1 long = 17 docs, steal_min_chunk=4)
+        gpu_stole_evt.clear()
         short_templates: list[tuple[list[str], list[float]]] = [
             (["hello"], [4.0]),
             (["world"], [5.0]),
@@ -943,7 +946,7 @@ def test_max_length_validation_and_hetero2_contextual_work_stealing_cpu(tmp_path
             expected.append(exp_means)
 
         actual = eng.encode_contextual_chunks(
-            docs, max_length=10, batch_size=4, mode="hetero2", dimensions=1, normalize=False
+            docs, max_length=10, batch_size=4, mode="hetero2", dimensions=1, normalize=False, apply_tanh=False
         )
         assert len(actual) == len(docs) == 17
         for vectors, means in zip(actual, expected, strict=True):
@@ -2005,4 +2008,268 @@ def test_parquet_async_pipeline_multivector_and_tmp_cleanup(tmp_path: Path, monk
         ref_flat = np.concatenate(ref_parts, axis=0)
         assert off_10.tolist() == [0] + list(np.cumsum([p.shape[0] for p in ref_parts]))
         assert np.max(np.abs(flat_10 - ref_flat)) == 0.0
+
+
+def test_single_item_inline_routing_and_parquet_header_col_cpu(tmp_path: Path) -> None:
+    """Verify Apple10 vs Apple9 B=1 inline routing and `embed_parquet(..., header_col=..., chunk=True)` in fp32 & int8."""
+    import threading
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from fast_pplx.config import PplxConfig
+    from fast_pplx.engine import FastPplx, PackedBucket
+    from fast_pplx.parquet_pipeline import embed_parquet
+    from fast_pplx.tokenizer import ContextualTokenizer
+
+    vocab_toks = [
+        "<|endoftext|>", "<|chunk_sep|>", "<unk>",
+        "HeaderA", "HeaderB", "alpha", "beta", "gamma", "delta",
+    ]
+    raw_tok = Tokenizer(WordLevel(vocab={t: i for i, t in enumerate(vocab_toks)}, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.add_special_tokens([
+        AddedToken("<|endoftext|>", single_word=False),
+        AddedToken("<|chunk_sep|>", single_word=False),
+        AddedToken("[Q] ", single_word=False),
+    ])
+    raw_tok.add_tokens([AddedToken("[D] ", single_word=False)])
+    tok_json = tmp_path / "tokenizer.json"
+    raw_tok.save(str(tok_json))
+    tok = ContextualTokenizer(tok_json, PplxConfig(hidden_size=8, embedding_dim=8))
+    assert tok.query_prefix_id is not None
+
+    class _StubGPU:
+        dtype = "float32"
+
+        def __init__(self) -> None:
+            self.seen_tokens: list[list[int]] = []
+
+        def encode_tokens(self, token_lists, *, batch_size=16, dimensions=None, output_dtype="float32", normalize=True):
+            del batch_size, normalize
+            self.seen_tokens.extend([list(x) for x in token_lists])
+            d = int(dimensions or 8)
+            if output_dtype == "int8":
+                return np.full((len(token_lists), d), 7, dtype=np.int8)
+            out = np.ones((len(token_lists), d), dtype=np.float32)
+            out /= np.linalg.norm(out, axis=1, keepdims=True)
+            return out
+
+        def close(self) -> None:
+            pass
+
+    class _StubANE:
+        caps = (64, 128, 256, 512)
+        max_cap = 512
+        manifest = {"ane_profile": "balanced"}
+
+        def __init__(self) -> None:
+            self.seen_buckets: list[PackedBucket] = []
+
+        def run_buckets(self, buckets, *, out_dim, apply_tanh_int8, apply_l2_norm):
+            del apply_tanh_int8, apply_l2_norm
+            self.seen_buckets.extend(buckets)
+            return [(b, np.ones((len([t for t in b.targets if t.end > t.start]), out_dim), dtype=np.float32)) for b in buckets]
+
+        def close(self) -> None:
+            pass
+
+    def _no_thread_spawn(*_a, **_kw):
+        raise AssertionError("B=1 inline fast path must not spawn worker threads")
+
+    for is_a10, req_mode, exp_gpu, exp_ane in (
+        (True, "hetero2", 1, 0),
+        (True, "hetero", 0, 1),
+        (True, "ane", 0, 1),
+        (False, "hetero2", 0, 1),
+    ):
+        g = _StubGPU()
+        a = _StubANE()
+        with FastPplx(home=tmp_path, mode="hetero2", dimensions=8, _gpu_backend=g, _ane_backend=a, _tokenizer=tok) as eng:
+            eng.runtime_telemetry["is_apple10"] = is_a10
+            orig_thread = threading.Thread
+            threading.Thread = _no_thread_spawn  # type: ignore[assignment]
+            try:
+                _ = eng.encode_queries(["alpha beta"], mode=req_mode)
+            finally:
+                threading.Thread = orig_thread  # type: ignore[assignment]
+            st = eng.last_stats
+            assert st["gpu_items"] == exp_gpu and st["ane_items"] == exp_ane
+
+    # Verify embed_parquet(..., header_col=..., chunk=True) in both float32 and int8 modes
+    in_pq = tmp_path / "docs.parquet"
+    pq.write_table(
+        pa.table({"id": [0, 1], "title": ["HeaderA", "HeaderB"], "body": ["alpha beta gamma delta", "delta gamma beta alpha"]}),
+        in_pq,
+    )
+    g_pq = _StubGPU()
+    a_pq = _StubANE()
+    hdr_a_id = raw_tok.token_to_id("HeaderA")
+    hdr_b_id = raw_tok.token_to_id("HeaderB")
+    with FastPplx(home=tmp_path, mode="gpu", dimensions=8, _gpu_backend=g_pq, _ane_backend=a_pq, _tokenizer=tok) as eng_pq:
+        out_f32 = tmp_path / "out_f32.parquet"
+        sum_f32 = embed_parquet(
+            eng_pq, in_pq, out_f32, text_col="body", header_col="title", chunk=True, max_chunk_tokens=6, overlap=0, dtype="float32"
+        )
+        assert sum_f32.rows_emitted >= 2
+        out_i8 = tmp_path / "out_i8.parquet"
+        sum_i8 = embed_parquet(
+            eng_pq, in_pq, out_i8, text_col="body", header_col="title", chunk=True, max_chunk_tokens=6, overlap=0, dtype="int8"
+        )
+        assert sum_i8.rows_emitted >= 2
+        tbl_i8 = pq.read_table(out_i8)
+        assert "chunk_index" in tbl_i8.column_names
+        assert any(hdr_a_id in row for row in g_pq.seen_tokens)
+        assert any(hdr_b_id in row for row in g_pq.seen_tokens)
+
+
+def test_upstream_alignment_doc_prefix_spans_tanh_and_ctx_overlap_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify upstream alignment: contextual overlap=0 default, [D] prefix + span exclusion, and tanh output."""
+    import inspect
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    import fast_pplx.cli as pplx_cli
+    from fast_pplx.config import PplxConfig
+    from fast_pplx.engine import FastPplx
+    from fast_pplx.gpu import FastPplxGPU
+    from fast_pplx.parquet_pipeline import embed_contextual_parquet, embed_parquet
+    from fast_pplx.tokenizer import ContextualTokenizer
+
+    # 1. Contextual windowing and CLI defaults use overlap=0
+    assert inspect.signature(ContextualTokenizer.plan_contextual_windows).parameters["overlap"].default == 0
+    assert inspect.signature(ContextualTokenizer.chunk_and_group_document).parameters["overlap"].default == 0
+    assert inspect.signature(embed_contextual_parquet).parameters["overlap"].default == 0
+    ctx_args = build_parser().parse_args(
+        ["parquet", "--input", "in.parquet", "--output", "out.parquet", "--context-tokens", "2048"]
+    )
+    assert ctx_args.overlap is None and ctx_args.document_prefix is None
+    captured_ctx: dict[str, Any] = {}
+    captured_flat: dict[str, Any] = {}
+    monkeypatch.setattr(pplx_cli, "_make_engine", lambda a, deterministic=False: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(
+        pplx_cli,
+        "embed_contextual_parquet",
+        lambda _e, _i, _o, **kw: (captured_ctx.update(kw), SimpleNamespace(
+            input_files=1, rows_read=1, rows_emitted=1, total_tokens=1, elapsed_seconds=0.1, output_path=_o
+        ))[1],
+    )
+    monkeypatch.setattr(
+        pplx_cli,
+        "embed_parquet",
+        lambda _e, _i, _o, **kw: (captured_flat.update(kw), SimpleNamespace(
+            input_files=1, rows_read=1, rows_emitted=1, total_tokens=1, elapsed_seconds=0.1,
+            tokens_per_sec=10.0, rows_per_sec=10.0, output_path=_o,
+        ))[1],
+    )
+    assert pplx_cli.main(["parquet", "--input", "in.parquet", "--output", "out.parquet", "--context-tokens", "2048"]) == 0
+    assert captured_ctx["overlap"] == 0 and captured_ctx["add_document_prefix"] is False
+    assert pplx_cli.main(["parquet", "--input", "in.parquet", "--output", "out.parquet"]) == 0
+    assert captured_flat["overlap"] == 51 and captured_flat["add_document_prefix"] is None
+    assert pplx_cli.main(["parquet", "--input", "in.parquet", "--output", "out.parquet", "--no-document-prefix"]) == 0
+    assert captured_flat["add_document_prefix"] is False
+
+    # 2. document_prefix_span + FastPplxGPU._format_output apply_tanh=True vs False + encode_documents span exclusion
+    vocab_toks = ["<|endoftext|>", "<|chunk_sep|>", "<unk>", "[D]", "HeaderA", "alpha", "beta"]
+    raw_tok = Tokenizer(WordLevel(vocab={t: i for i, t in enumerate(vocab_toks)}, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.add_special_tokens([
+        AddedToken("<|endoftext|>", single_word=False),
+        AddedToken("<|chunk_sep|>", single_word=False),
+        AddedToken("[Q] ", single_word=False),
+    ])
+    raw_tok.add_tokens([AddedToken("[D] ", single_word=False)])
+    tok_json = tmp_path / "tokenizer.json"
+    raw_tok.save(str(tok_json))
+    tok = ContextualTokenizer(tok_json, PplxConfig(hidden_size=4, embedding_dim=4))
+
+    doc_ids = tok.encode_document("alpha beta")
+    assert tok.document_prefix_span(doc_ids) == (1, len(doc_ids))
+    assert tok.document_prefix_span(tok.encode_document("")) == (0, 0)
+    assert tok.document_prefix_span([4, 5]) == (0, 2)
+
+    snap = _find_local_hf_snapshot(DEFAULT_MODEL_NAME)
+    if snap is not None:
+        real_tok = ContextualTokenizer(snap, PplxConfig.from_json(snap / "config.json"))
+        for sample in ("", "Hello world", "12345", "  leading spaces"):
+            ids_r, spans_r = real_tok.encode_contextual_document([sample], return_spans=True)
+            assert real_tok.document_prefix_span(ids_r) == spans_r[0]
+
+    # Identity GPU stub exercising real _format_output and span pooling on CPU
+    class _RealFormatGPU(FastPplxGPU):
+        def __init__(self) -> None:
+            self.tokenizer = tok
+            self.max_seq_len = 512
+            self.max_batch_size = 8
+            self.dim = 4
+            self.dtype_name = "float32"
+            self.model = SimpleNamespace(contextual_projection=lambda x: x)
+
+        def forward_hidden(self, input_ids, attention_mask=None, **kwargs):
+            return mx.array(np.broadcast_to(input_ids[..., None].astype(np.float32) * 0.25, (*input_ids.shape, 4)))
+
+        def _project_mean_pool(self, hidden, attention_mask):
+            with mx.stream(mx.cpu):
+                if attention_mask is None:
+                    return np.asarray(mx.mean(hidden, axis=1), dtype=np.float32)
+                m = attention_mask.astype(mx.float32)[..., None]
+                return np.asarray((hidden * m).sum(axis=1) / mx.maximum(m.sum(axis=1), 1.0), dtype=np.float32)
+
+        def _project_span_pool(self, hidden, spans):
+            with mx.stream(mx.cpu):
+                out = np.zeros((spans.shape[0], spans.shape[1], 4), dtype=np.float32)
+                h_np = np.asarray(hidden, dtype=np.float32)
+                for i in range(spans.shape[0]):
+                    for j in range(spans.shape[1]):
+                        s, e = int(spans[i, j, 0]), int(spans[i, j, 1])
+                        if e > s:
+                            out[i, j] = h_np[i, s:e].mean(axis=0)
+                return out
+
+    raw_vec = np.array([[0.8, -1.2, 0.3, 2.5]], dtype=np.float32)
+    gpu_fmt = _RealFormatGPU()
+    exp_tanh = np.clip(np.rint(np.tanh(raw_vec) * 127.0), -128.0, 127.0).astype(np.float32)
+    np.testing.assert_allclose(
+        gpu_fmt._format_output(raw_vec, dimensions=None, output_dtype="float32", normalize=False, apply_tanh=True),
+        exp_tanh,
+    )
+    np.testing.assert_allclose(
+        gpu_fmt._format_output(raw_vec, dimensions=None, output_dtype="float32", normalize=False, apply_tanh=False),
+        raw_vec,
+    )
+
+    with FastPplx(home=tmp_path, mode="gpu", dimensions=4, _gpu_backend=gpu_fmt, _tokenizer=tok) as eng:
+        v_doc = eng.encode_documents(["alpha beta"], output_dtype="float32", normalize=True)
+        v_ctx = eng.encode_contextual_chunks([["alpha", "beta"]], output_dtype="float32", normalize=True)[0]
+        v_one_ctx = eng.encode_contextual_chunks([["alpha beta"]], output_dtype="float32", normalize=True)[0]
+        v_txt_def = eng.encode_texts(["alpha beta"], output_dtype="float32", normalize=True)
+        v_txt_nopfx = eng.encode_texts(["alpha beta"], add_document_prefix=False, output_dtype="float32", normalize=True)
+        np.testing.assert_allclose(v_doc, v_one_ctx, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(v_txt_def, v_one_ctx, rtol=1e-6, atol=1e-6)
+        assert v_txt_nopfx.shape == (1, 4) and v_ctx.shape == (2, 4)
+
+        # Verify embed_parquet defaults to [D] + span exclusion (matching encode_documents) and opts out cleanly
+        in_pq = tmp_path / "u.parquet"
+        pq.write_table(pa.table({"id": [0], "text": ["alpha beta"]}), in_pq)
+        out_def_f32 = tmp_path / "u_def_f32.parquet"
+        embed_parquet(eng, in_pq, out_def_f32, text_col="text", dtype="float32")
+        vec_def_pq = np.asarray(pq.read_table(out_def_f32)["vector"].to_pylist(), dtype=np.float32)
+        np.testing.assert_allclose(vec_def_pq, v_doc, rtol=1e-6, atol=1e-6)
+
+        out_def_i8 = tmp_path / "u_def_i8.parquet"
+        embed_parquet(eng, in_pq, out_def_i8, text_col="text", dtype="int8")
+        vec_i8_pq = np.asarray(pq.read_table(out_def_i8)["vector"].to_pylist(), dtype=np.int8)
+        exp_i8 = eng.encode_documents(["alpha beta"], output_dtype="int8", normalize=False)
+        np.testing.assert_array_equal(vec_i8_pq, exp_i8)
+
+        out_nopfx_f32 = tmp_path / "u_nopfx.parquet"
+        embed_parquet(eng, in_pq, out_nopfx_f32, text_col="text", add_document_prefix=False, dtype="float32")
+        vec_nopfx_pq = np.asarray(pq.read_table(out_nopfx_f32)["vector"].to_pylist(), dtype=np.float32)
+        np.testing.assert_allclose(vec_nopfx_pq, v_txt_nopfx, rtol=1e-6, atol=1e-6)
+
 

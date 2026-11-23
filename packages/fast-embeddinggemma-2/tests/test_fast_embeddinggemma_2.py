@@ -1194,4 +1194,97 @@ def test_probe_tanh_mpp_kernels_uses_shared_gemm_source_and_fallback_cpu(monkeyp
     assert ok_fb is True and k_fb_g["name"] == "emb2_geglu_tanh64" and k_fb_p["name"] == "emb2_pg_tanh64"
 
 
+def test_document_title_formatting_and_parquet_header_col_cpu(tmp_path: Path) -> None:
+    """Verify native `title: {hdr} | text: ` formatting in tokenizer, `encode_documents(titles=...)`, and `embed_parquet`."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    from fast_shared.parquet_pipeline import embed_parquet
+    from fast_embeddinggemma_2.tokenizer import FastEmbeddingGemma2Tokenizer
+
+    vocab_toks = [
+        "<pad>", "<eos>", "<bos>", "<unk>",
+        "title:", "none", "|", "text:", "ReportA", "alpha", "beta", "gamma", "delta",
+    ]
+    raw_tok = Tokenizer(WordLevel(vocab={t: i for i, t in enumerate(vocab_toks)}, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", 2), ("<eos>", 1)],
+    )
+    tok_json = tmp_path / "tokenizer.json"
+    raw_tok.save(str(tok_json))
+
+    tok = FastEmbeddingGemma2Tokenizer(tok_json)
+    assert tok.format_document_prefix("  ReportA ") == "title: ReportA | text: "
+    assert tok.format_document_prefix(None) == "title: none | text: "
+    assert tok.format_document_text("alpha beta", "ReportA") == "title: ReportA | text: alpha beta"
+
+    class _StubEmb2:
+        dim = 768
+        max_dim = 768
+        max_seq_len = 512
+        default_mode = "gpu"
+        ane_available = False
+        supports_dimensions = True
+        is_mrl_trained = True
+
+        def __init__(self, t: FastEmbeddingGemma2Tokenizer) -> None:
+            self.tokenizer = t
+            self.seen_texts: list[str] = []
+            self.seen_tok_lists: list[list[int]] = []
+
+        def _resolve_dim(self, dimensions: int | None) -> int:
+            return int(dimensions or self.dim)
+
+        def encode_texts(self, texts, **_kw):
+            self.seen_texts.extend(texts)
+            return np.ones((len(texts), 768), dtype=np.float32)
+
+        def encode_corpus(self, token_lists, **_kw):
+            self.seen_tok_lists.extend([list(x) for x in token_lists])
+            out = np.ones((len(token_lists), 512), dtype=np.float32)
+            out /= np.linalg.norm(out, axis=1, keepdims=True)
+            return out
+
+    stub = _StubEmb2(tok)
+    stub.encode_documents = FastEmbeddingGemma2.encode_documents.__get__(stub, _StubEmb2)  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="titles length"):
+        stub.encode_documents(["alpha"], titles=["ReportA", "Extra"])
+    stub.encode_documents(["alpha beta", "gamma delta"], titles=["ReportA", None])
+    assert stub.seen_texts == [
+        "title: ReportA | text: alpha beta",
+        "title: none | text: gamma delta",
+    ]
+
+    in_pq = tmp_path / "in.parquet"
+    out_pq = tmp_path / "out.parquet"
+    pq.write_table(
+        pa.table({"id": [0, 1], "title": ["ReportA", None], "body": ["alpha beta gamma delta", "gamma delta alpha beta"]}),
+        in_pq,
+    )
+    embed_parquet(
+        stub,
+        in_pq,
+        out_pq,
+        chunk=True,
+        max_chunk_tokens=10,
+        overlap=0,
+        header_col="title",
+        dimensions=512,
+        sort_macro_window=False,
+        progress_every=0,
+    )
+    title_id = tok._tok.token_to_id("title:")
+    report_id = tok._tok.token_to_id("ReportA")
+    text_lbl_id = tok._tok.token_to_id("text:")
+    # Doc 0 chunks receive `title: ReportA | text: `, whereas Doc 1 (None header) has no title header injected.
+    assert any(title_id in ids and report_id in ids and text_lbl_id in ids for ids in stub.seen_tok_lists)
+    assert any(title_id not in ids for ids in stub.seen_tok_lists)
+
+
+
 

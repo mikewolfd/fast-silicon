@@ -2,7 +2,7 @@
 
 Extract schema-constrained JSON or call tools locally on Apple Silicon with Qwen 3.5 and Qwen 3.6 models (`0.8B` to `27B` dense and `35B-A3B` MoE). On 50 public extraction and tool tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returned **50/50 valid responses and scored 0.902** on both the 24 GB M5 and the 48 GB M4 Pro. Unconstrained stock `mlx-lm` on the same checkpoint returned 37/50 valid responses on M5 (0.662 score) and 35/50 on M4 Pro (0.623 score), giving `fast-qwen3` 1.53× and 1.38× the score per second. [Outcome tables and methodology](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 
-The engine runs Qwen’s hybrid 3:1 `GatedDeltaNet` + GQA architecture on MLX with mixed-bit `OptiQ` weight fusion, recurrent prefix caching, speculative multi-token prediction (`MTP`) on 9B+ models, rotated 4-bit KV compression (`QuaRot`) for long contexts, and hot-swappable LoRA adapters. Thinking mode defaults off (`<think>\n\n</think>\n\n`), which matches or beats thinking on structured JSON and tool calls at roughly one-third the latency.
+The engine runs Qwen’s hybrid 3:1 `GatedDeltaNet` + GQA architecture on MLX with mixed-bit `OptiQ` weight fusion, Apple10+ NAX `W4A8`/`W8A8` prefill acceleration, compiled GDN/RoPE kernels, recurrent prefix caching, speculative multi-token prediction (`MTP`) on 9B+ models, rotated 4-bit KV compression (`QuaRot`) for long contexts, lazy Qwen3.5 vision (`generate(..., images=...)`), and hot-swappable LoRA adapters. Thinking mode defaults off (`<think>\n\n</think>\n\n`), which matches or beats thinking on structured JSON and tool calls at roughly one-third the latency. [Vision, OCR & NAX prefill validation](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23)
 
 ## Quick start
 
@@ -67,14 +67,17 @@ Measurements compare the 24 GB base M5 and the 48 GB M4 Pro under lock-serialize
 | `9B-OptiQ` (`9b-optiq`, 65K Latin vocab) | Speculative MTP batch 1 / batch 8 | 42.3 / 105.7 tok/s | 50.2 / 115.9 tok/s | 16.7 / 16.9 GB peak |
 | `0.8B` (`0.8b-bf16`, 65K Latin vocab) | Shared-prefix strict JSON, batch 1 / batch 8 | 178.3 / 658.5 tok/s | 240.3 / 767.5 tok/s | 4.81 / 4.99 GB peak |
 | `4B-OptiQ` (`kv_i8="q4_quarot"`) | 16K context decode, batch 4 | Matches BF16 F1 (0.946, 18/18 passkeys) | 91.7 tok/s (2.13× 8-bit KV) | 576 MB KV vs 2,048 MB BF16 |
+| `9B-OptiQ` (`Apple10` NAX `W4A8` / opt-in `W8A8`) | 50 public extraction + tool tasks (`B=8`) | 0.886 / 0.884 score, 50/50 valid (`+4.6%` / `+8.3%` EOT) | Native `qmm` (`Apple9`) | 12.57 / 14.59 GB peak (`10.07 GB` base) |
+| `4B` / `9B-OptiQ` (`L=512` prefill + 16 tok) | Single-pass prefill (`W4A8` default / `W8A8` opt-in) | **1.06–1.14×** (`4B`), **1.10–1.18×** (`9B`) | Native `qmm` (`Apple9`) | 5.82–6.98 GB (`4B`), 10.72–12.78 GB (`9B`) |
 
-On zero-shot reasoning and instruction benchmarks (`IFBench`, `MMLU-Redux`, `MATH-500`) with `enable_thinking=False`, weak `IFBench` formatting adherence (0.16–0.24) held overall Category-3 averages to 0.533–0.573 despite 0.76–0.80 MMLU and 0.64–0.72 MATH scores. Enable thinking with a token budget of at least 384 tokens for multi-step reasoning tasks.
+On zero-shot reasoning and instruction benchmarks (`IFBench`, `MMLU-Redux`, `MATH-500`) with `enable_thinking=False`, weak `IFBench` formatting adherence (0.16–0.24) held overall Category-3 averages to 0.533–0.573 despite 0.76–0.80 MMLU and 0.64–0.72 MATH scores. Enable thinking with a token budget of at least 384 tokens for multi-step reasoning tasks. Compiled `@mx.compile` GDN/RoPE kernels (`RMSNormGated`, `normalize_gdn_qk`, `apply_partial_rope_trig`) provide a `1.053–1.303×` (M4 Pro) / `1.038–1.440×` (Base M5) bit-exact kernel speedup, and `generate(..., images=...)` lazily loads the shared Qwen3.5 ViT (`0` extra ViT RAM on text-only calls).
 
 ## Key options & defaults
 
 | Option | Default | What it does |
 | :--- | :--- | :--- |
 | `kv_i8` | `"auto"` | Uses BF16 KV on short requests and automatically switches to rotated 4-bit KV (`"q4_quarot"`, 3.56× smaller) at `>= 16K` tokens (`>= 8K` on 24 GB Macs) or batch `>= 16`. Pass `"q8"` for 8-bit KV or `False` for BF16 everywhere. |
+| `enable_mpp_linear` / `mpp_w8a8` | `"auto"` / `False` | Enables Apple10 (`M5+`) NAX `64×64` `W4A8` prefill on large 4-bit projections (`M >= 128`, `k,n >= 1536`) behind a `28%` RAM pack cap (`should_use_qwen_mpp_linear`). Set `mpp_w8a8=True` or `FAST_SILICON_QWEN3_MPP_W8A8=1` to also pack large 8-bit projections (e.g. `-7.1%` LM prefill on `OvisOCR2-8bit` `cord_v2`). |
 | `enable_thinking` | `False` | Skips `<think>` chains for fast, deterministic extraction and tool calling. When `True`, enforces a `>= 384`-token budget (1,024 default) so thoughts are not cut off mid-sentence. |
 | `mtp_drafter` | `"auto"` (`None` `< 9B`) | Loads the native 1-layer multi-token drafter (`draft_k=3`) on 9B+ checkpoints where speculative decoding speeds up single-stream generation (1.28–1.92×); stays off on smaller models where the 248K output head outweighs draft savings. |
 | `prefix_cache_mb` | `"auto"` | Shares 256-token prompt prefixes across calls in `PrefixTree`, compressing recurrent `GatedDeltaNet` states 3.76× in block-32 INT8 without breaking ragged batch parity. |

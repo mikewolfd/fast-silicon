@@ -1270,6 +1270,34 @@ _STOCK_HF_REPOS: dict[str, tuple[str, ...]] = {
         "mlx-community/Qwen3.5-4B-OptiQ-4bit",
         "Qwen/Qwen3.5-0.8B",
     ),
+    "public-ovis-mlx-vlm": (
+        "mlx-community/OvisOCR2-8bit",
+        "ATH-MaaS/OvisOCR2",
+    ),
+    "public-glm-ocr-mlx-vlm": (
+        "mlx-community/GLM-OCR-bf16",
+        "zai-org/GLM-OCR",
+    ),
+    "public-lightonocr2-mlx-vlm": (
+        "mlx-community/LightOnOCR-2-1B-bf16",
+        "lightonai/LightOnOCR-2-1B",
+    ),
+    "public-nuextract3-mlx-vlm": (
+        "numind/NuExtract3-mlx-4bits",
+        "mlx-community/NuExtract3-bf16",
+    ),
+    "public-deepseek-ocr2-mlx-vlm": (
+        "mlx-community/DeepSeek-OCR-2-4bit",
+        "deepseek-ai/DeepSeek-OCR-2",
+    ),
+    "public-paddleocr-vl-mlx-vlm": (
+        "jmbarrancoidener/PaddleOCR-VL-1.6-mlx-8bit",
+        "mlx-community/PaddleOCR-VL-1.5-8bit",
+    ),
+    "public-nemotron-parse-mlx-vlm": (
+        "mlx-community/NVIDIA-Nemotron-Parse-v1.1-8bit",
+        "nvidia/NVIDIA-Nemotron-Parse-v1.1",
+    ),
 }
 
 
@@ -2985,3 +3013,452 @@ def build_public_llm_adapter(
         )
 
     raise ValueError(f"Unsupported public LLM package: {pkg_name}")
+
+
+# ---------------------------------------------------------------------------
+# Category 5 Public OCR Baselines: cross-family MLX VLMs & local OCR pipelines
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PUBLIC_OCR_PROMPT = (
+    "Extract all readable content from the image in natural human reading order and output the result as a "
+    "single Markdown document. For charts or images, represent them using an HTML image tag: "
+    '<img src="images/bbox_{left}_{top}_{right}_{bottom}.jpg" />, where left, top, right, bottom are '
+    "bounding box coordinates scaled to [0, 1000). Format formulas as LaTeX. Format tables as HTML: "
+    "<table>...</table>. Transcribe all other text as standard Markdown. "
+    "Preserve the original text without translation or paraphrasing."
+)
+
+CAT5_FAMILY_BY_PACKAGE: dict[str, str] = {
+    "public-ovis-mlx-vlm": "qwen3.5-ovis",
+    "public-glm-ocr-mlx-vlm": "glm-ocr",
+    "public-lightonocr2-mlx-vlm": "lightonocr-2",
+    "public-nuextract3-mlx-vlm": "qwen3.5-nuextract3",
+    "public-deepseek-ocr2-mlx-vlm": "deepseek-ocr-2",
+    "public-paddleocr-vl-mlx-vlm": "paddleocr-vl",
+    "public-nemotron-parse-mlx-vlm": "nemotron-parse",
+    "public-apple-vision": "apple-vision-ane",
+    "public-pypdfium2": "pypdfium2-native",
+    "public-rapidocr": "rapidocr-onnx",
+    "public-tesseract": "tesseract-cli",
+    "public-docling": "docling-pipeline",
+    "public-marker": "marker-surya",
+}
+
+CAT5_NATIVE_PROMPTS: dict[str, dict[str, str]] = {
+    "public-ovis-mlx-vlm": {
+        "page": _DEFAULT_PUBLIC_OCR_PROMPT,
+        "table": _DEFAULT_PUBLIC_OCR_PROMPT,
+    },
+    "public-glm-ocr-mlx-vlm": {
+        "page": "Text Recognition:",
+        "table": "Table Recognition:",
+    },
+    "public-lightonocr2-mlx-vlm": {
+        "page": "",
+        "table": "",
+    },
+    "public-nuextract3-mlx-vlm": {
+        "page": _DEFAULT_PUBLIC_OCR_PROMPT,
+        "table": _DEFAULT_PUBLIC_OCR_PROMPT,
+    },
+    "public-deepseek-ocr2-mlx-vlm": {
+        "page": "<|grounding|>Convert the document to markdown.",
+        "table": "<|grounding|>Convert the document to markdown.",
+    },
+    "public-paddleocr-vl-mlx-vlm": {
+        "page": "OCR:",
+        "table": "Table Recognition:",
+    },
+    "public-nemotron-parse-mlx-vlm": {
+        "page": "Extract the document content as Markdown.",
+        "table": "Extract the table as HTML.",
+    },
+}
+
+_CAT5_MLX_VLM_PACKAGES: frozenset[str] = frozenset(CAT5_NATIVE_PROMPTS.keys())
+
+
+def resolve_cat5_native_prompt(pkg_name: str, *, task_kind: str = "page") -> str:
+    """Return the family-native OCR prompt for ``pkg_name`` and ``task_kind`` (``page`` | ``table``)."""
+    table = CAT5_NATIVE_PROMPTS.get(pkg_name)
+    if not table:
+        return _DEFAULT_PUBLIC_OCR_PROMPT
+    return table.get(task_kind, table["page"])
+
+
+def _has_complete_safetensors_snapshot(snap: Path | None) -> bool:
+    if snap is None or not snap.is_dir() or not (snap / "config.json").is_file():
+        return False
+    files = list(snap.glob("*.safetensors"))
+    return bool(files) and all(f.exists() and f.stat().st_size > 0 for f in files)
+
+
+@dataclass
+class PublicOcrAdapter:
+    """Unified Category 5 OCR baseline interface matching `scripts/benchmark_outcomes.py`."""
+
+    default_label: str
+    model_family: str
+    ocr_image_fn: Callable[..., tuple[str, str, dict[str, Any]]]
+    ocr_pdf_page_fn: Callable[..., tuple[str, str, dict[str, Any]]] | None = None
+    supports_images: bool = True
+    supports_json_schema: bool = False
+    close_fn: Callable[[], None] | None = None
+
+    def close(self) -> None:
+        if self.close_fn is not None:
+            self.close_fn()
+
+
+def _ensure_fast_ocr_on_path() -> None:
+    src = str(Path(__file__).resolve().parents[1] / "packages" / "fast-ocr" / "src")
+    if Path(src).is_dir() and src not in sys.path:
+        sys.path.insert(0, src)
+
+
+def build_public_cat5_adapter(
+    pkg_name: str,
+    *,
+    table_mode: str = "gfm",
+    output_format: str = "markdown",
+    max_tokens: int = 4096,
+) -> PublicOcrAdapter:
+    """Instantiate a cross-family public Category 5 OCR baseline (`mlx_vlm`, ANE, ONNX, CLI, or PDF pipeline)."""
+    family = CAT5_FAMILY_BY_PACKAGE.get(pkg_name, pkg_name)
+
+    if pkg_name == "public-apple-vision":
+        _ensure_fast_ocr_on_path()
+        from fast_ocr.apple_vision import AppleVisionOCR
+
+        vis = AppleVisionOCR(level="accurate", bands=1, language_correction=True, auto_orient=True)
+
+        def _vis_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del prompt, schema, max_tokens_override, task_kind
+            res = vis.recognize_image(pil_img, output_format=output_format)  # type: ignore[arg-type]
+            return res.text, res.finish_reason, {
+                "backend_used": res.backend_used,
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        return PublicOcrAdapter(
+            default_label="apple_vision_ane",
+            model_family=family,
+            ocr_image_fn=_vis_img,
+            supports_images=True,
+            supports_json_schema=False,
+        )
+
+    if pkg_name == "public-pypdfium2":
+        import pypdfium2 as pdfium
+
+        def _pdf_only(
+            pdf_path: str | Path,
+            *,
+            page_index: int = 0,
+        ) -> tuple[str, str, dict[str, Any]]:
+            doc = pdfium.PdfDocument(str(pdf_path))
+            try:
+                if page_index >= len(doc):
+                    return "", "stop", {"backend_used": "pypdfium2", "model_family": family, "generated_tokens": 0, "decode_tps": 0.0}
+                page = doc[page_index]
+                tp = page.get_textpage()
+                txt = tp.get_text_bounded() or ""
+                tp.close()
+                page.close()
+            finally:
+                doc.close()
+            return txt.strip(), "stop", {
+                "backend_used": "pypdfium2",
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        def _img_unsupported(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del pil_img, prompt, schema, max_tokens_override, task_kind
+            return "", "unsupported_image", {"backend_used": "pypdfium2", "model_family": family, "generated_tokens": 0, "decode_tps": 0.0}
+
+        return PublicOcrAdapter(
+            default_label="pypdfium2_native",
+            model_family=family,
+            ocr_image_fn=_img_unsupported,
+            ocr_pdf_page_fn=_pdf_only,
+            supports_images=False,
+            supports_json_schema=False,
+        )
+
+    if pkg_name == "public-rapidocr":
+        try:
+            from rapidocr import RapidOCR
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"rapidocr not installed in worker Python for {pkg_name}; pass --public-python with rapidocr ({exc})"
+            ) from exc
+
+        engine = RapidOCR()
+
+        def _rapid_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del prompt, schema, max_tokens_override, task_kind
+            out = engine(np.asarray(pil_img))
+            txts = getattr(out, "txts", None)
+            lines = [str(t).strip() for t in txts if str(t).strip()] if txts is not None else []
+            return "\n".join(lines), "stop", {
+                "backend_used": "rapidocr:onnx",
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        return PublicOcrAdapter(
+            default_label="rapidocr_onnx",
+            model_family=family,
+            ocr_image_fn=_rapid_img,
+            supports_images=True,
+            supports_json_schema=False,
+        )
+
+    if pkg_name == "public-tesseract":
+        import shutil as _shutil
+
+        tess_bin = _shutil.which("tesseract")
+        if not tess_bin:
+            raise FileNotFoundError("tesseract binary not found on PATH for public-tesseract")
+
+        def _tess_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del prompt, schema, max_tokens_override, task_kind
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
+                pil_img.save(tf.name)
+                proc = subprocess.run(
+                    [tess_bin, tf.name, "stdout", "--psm", "3"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            txt = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+            return txt, "stop", {
+                "backend_used": "tesseract:cli",
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        return PublicOcrAdapter(
+            default_label="tesseract_cli",
+            model_family=family,
+            ocr_image_fn=_tess_img,
+            supports_images=True,
+            supports_json_schema=False,
+        )
+
+    if pkg_name == "public-docling":
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"docling not installed in worker Python for {pkg_name}; pass --public-python with docling ({exc})"
+            ) from exc
+
+        converter = DocumentConverter()
+
+        def _docling_convert_path(src_path: str | Path) -> tuple[str, str, dict[str, Any]]:
+            conv = converter.convert(str(src_path))
+            doc = getattr(conv, "document", None)
+            md = doc.export_to_markdown() if doc is not None and hasattr(doc, "export_to_markdown") else ""
+            return str(md or "").strip(), "stop", {
+                "backend_used": "docling:DocumentConverter",
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        def _docling_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del prompt, schema, max_tokens_override, task_kind
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
+                pil_img.save(tf.name)
+                return _docling_convert_path(tf.name)
+
+        def _docling_pdf(pdf_path: str | Path, *, page_index: int = 0) -> tuple[str, str, dict[str, Any]]:
+            del page_index
+            return _docling_convert_path(pdf_path)
+
+        return PublicOcrAdapter(
+            default_label="docling_pipeline",
+            model_family=family,
+            ocr_image_fn=_docling_img,
+            ocr_pdf_page_fn=_docling_pdf,
+            supports_images=True,
+            supports_json_schema=False,
+        )
+
+    if pkg_name == "public-marker":
+        try:
+            from marker.converters.pdf import PdfConverter
+            from marker.models import create_model_dict
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"marker not installed in worker Python for {pkg_name}; pass --public-python with marker ({exc})"
+            ) from exc
+
+        converter = PdfConverter(artifact_dict=create_model_dict())
+
+        def _marker_convert_path(src_path: str | Path) -> tuple[str, str, dict[str, Any]]:
+            rendered = converter(str(src_path))
+            md = getattr(rendered, "markdown", str(rendered)) if rendered is not None else ""
+            return str(md or "").strip(), "stop", {
+                "backend_used": "marker:PdfConverter",
+                "model_family": family,
+                "generated_tokens": 0,
+                "decode_tps": 0.0,
+            }
+
+        def _marker_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            del prompt, schema, max_tokens_override, task_kind
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
+                pil_img.save(tf.name)
+                return _marker_convert_path(tf.name)
+
+        def _marker_pdf(pdf_path: str | Path, *, page_index: int = 0) -> tuple[str, str, dict[str, Any]]:
+            del page_index
+            return _marker_convert_path(pdf_path)
+
+        return PublicOcrAdapter(
+            default_label="marker_surya",
+            model_family=family,
+            ocr_image_fn=_marker_img,
+            ocr_pdf_page_fn=_marker_pdf,
+            supports_images=True,
+            supports_json_schema=False,
+        )
+
+    if pkg_name in _CAT5_MLX_VLM_PACKAGES:
+        try:
+            import mlx.core as mx
+            import mlx_vlm
+            from mlx_vlm.prompt_utils import apply_chat_template
+            from mlx_vlm.utils import load_config
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"Stock mlx_vlm not installed in worker Python for {pkg_name}; pass --public-python with mlx_vlm ({exc})"
+            ) from exc
+
+        snap = None
+        repos = _STOCK_HF_REPOS.get(pkg_name, ())
+        for repo_id in repos:
+            cand = resolve_hf_snapshot(repo_id)
+            if _has_complete_safetensors_snapshot(cand):
+                snap = cand
+                break
+        if snap is None:
+            raise FileNotFoundError(f"Missing complete cached HF snapshot for {pkg_name}; tried {repos}")
+
+        model, processor = mlx_vlm.load(str(snap))
+        cfg = load_config(str(snap))
+        tok = getattr(processor, "tokenizer", processor)
+        _ensure_fast_ocr_on_path()
+        try:
+            from fast_ocr.markdown_struct import canonicalize_markdown as _canon_md
+        except Exception:
+            _canon_md = None
+
+        def _vlm_img(
+            pil_img: Any,
+            *,
+            prompt: str | None = None,
+            schema: Mapping[str, Any] | None = None,
+            max_tokens_override: int | None = None,
+            task_kind: str = "page",
+        ) -> tuple[str, str, dict[str, Any]]:
+            eff_prompt = prompt if prompt is not None else resolve_cat5_native_prompt(pkg_name, task_kind=task_kind)
+            eff_max = int(max_tokens_override) if max_tokens_override is not None else int(max_tokens)
+            formatted = apply_chat_template(processor, cfg, eff_prompt, num_images=1)
+            res = mlx_vlm.generate(
+                model,
+                processor,
+                formatted,
+                image=[pil_img],
+                max_tokens=eff_max,
+                temp=0.0,
+                verbose=False,
+            )
+            if hasattr(mx, "synchronize"):
+                mx.synchronize()
+            raw_txt = getattr(res, "text", str(res)) if res is not None else ""
+            gen_toks = int(getattr(res, "generation_tokens", 0) or 0)
+            prompt_toks = int(getattr(res, "prompt_tokens", 0) or 0)
+            gen_tps = float(getattr(res, "generation_tps", 0.0) or 0.0)
+            prompt_tps = float(getattr(res, "prompt_tps", 0.0) or 0.0)
+            if gen_toks <= 0 and hasattr(tok, "encode"):
+                gen_toks = len(tok.encode(raw_txt, add_special_tokens=False))
+            fr = "length" if gen_toks >= eff_max - 1 else "stop"
+            if output_format == "markdown" and schema is None and _canon_md is not None:
+                out_txt = _canon_md(raw_txt, table_mode=table_mode)  # type: ignore[arg-type]
+            else:
+                out_txt = raw_txt
+            return out_txt, fr, {
+                "backend_used": f"mlx_vlm:{snap.name}",
+                "model_family": family,
+                "generated_tokens": gen_toks,
+                "prompt_tokens": prompt_toks,
+                "decode_tps": round(gen_tps, 2),
+                "prompt_tps": round(prompt_tps, 2),
+                "decode_ms": (float(gen_toks) / gen_tps * 1000.0) if (gen_toks > 0 and gen_tps > 0.0) else 0.0,
+            }
+
+        def _close_vlm() -> None:
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+
+        return PublicOcrAdapter(
+            default_label=f"{pkg_name.replace('public-', '').replace('-', '_')}",
+            model_family=family,
+            ocr_image_fn=_vlm_img,
+            supports_images=True,
+            supports_json_schema=(pkg_name in ("public-ovis-mlx-vlm", "public-nuextract3-mlx-vlm")),
+            close_fn=_close_vlm,
+        )
+
+    raise ValueError(f"Unsupported public Cat 5 OCR package: {pkg_name}")

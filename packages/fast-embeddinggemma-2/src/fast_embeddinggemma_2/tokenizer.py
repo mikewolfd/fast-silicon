@@ -50,3 +50,12 @@ class FastEmbeddingGemma2Tokenizer(BaseFastTokenizer):
             document_prefix=DOCUMENT_PREFIX,
             prompts=prompts,
         )
+
+    def format_document_prefix(self, title: str | None = None) -> str:
+        """Return native EmbeddingGemma-2 document prefix (`title: {title} | text: `)."""
+        clean = title.strip() if isinstance(title, str) and title.strip() else "none"
+        return f"title: {clean} | text: "
+
+    def format_document_text(self, text: str, title: str | None = None) -> str:
+        """Format document `text` with native `title: {title} | text: ` framing."""
+        return f"{self.format_document_prefix(title)}{text}"

@@ -15,6 +15,7 @@ dependencies = [
     "fast-decision-models",
     "fast-pplx",
     "fast-qwen3",
+    "fast-ocr",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +50,7 @@ fast-gpt-oss = { workspace = true }
 fast-decision-models = { workspace = true }
 fast-pplx = { workspace = true }
 fast-qwen3 = { workspace = true }
+fast-ocr = { workspace = true }
 
 [tool.pytest.ini_options]
 markers = [

@@ -20,10 +20,9 @@ from fast_shared.cli_common import (
     add_embed_arguments,
     add_parquet_arguments,
     add_serve_arguments,
-    run_embed_command,
-    run_parquet_command,
     run_serve_command,
 )
+from fast_shared.embeddings import accepts_kwarg
 from fast_shared.hf import copy_tokenizer_files, resolve_hf_model_dir
 from fast_shared.hw_check import warn_if_untested_hardware
 
@@ -179,9 +178,6 @@ def _cmd_setup_ane(args: argparse.Namespace) -> int:
 
 def _cmd_embed(args: argparse.Namespace) -> int:
     out_dtype = getattr(args, "dtype", "float32")
-    if out_dtype == "float32":
-        return run_embed_command(args, _make_engine)
-
     texts = list(args.texts)
     if args.stdin:
         texts.extend(line.rstrip("\r\n") for line in sys.stdin if line.rstrip("\r\n"))
@@ -194,7 +190,7 @@ def _cmd_embed(args: argparse.Namespace) -> int:
         kw: dict[str, Any] = {
             "is_query": args.query,
             "add_query_prefix": args.query_prefix,
-            "add_document_prefix": bool(getattr(args, "document_prefix", False)),
+            "add_document_prefix": getattr(args, "document_prefix", None),
             "prefix": getattr(args, "prefix", None),
             "prompt_name": getattr(args, "prompt_name", None),
             "dimensions": getattr(args, "dimensions", None),
@@ -353,7 +349,10 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                             continue
                     if case["task"] == "query":
                         flat_q = [row[0] for row in docs]
-                        gp = eng.encode_queries(flat_q, output_dtype="float32", normalize=False, mode=m)
+                        q_kw: dict[str, Any] = {"output_dtype": "float32", "normalize": False, "mode": m}
+                        if accepts_kwarg(eng.encode_queries, "apply_tanh"):
+                            q_kw["apply_tanh"] = False
+                        gp = eng.encode_queries(flat_q, **q_kw)
                         gi = eng.encode_queries(flat_q, output_dtype="int8", normalize=False, mode=m)
                         ep = ref[f"{cid}/projected"].reshape(-1, 1024)
                         ei = np.concatenate([ref[f"{cid}/encoded/{k}"] for k in range(len(flat_q))], axis=0)
@@ -363,7 +362,10 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                         exact_fracs.append(float(np.mean(diff == 0)))
                         evaluated += 1
                     else:
-                        gp_list = eng.encode_contextual_chunks(docs, output_dtype="float32", normalize=False, mode=m)
+                        d_kw: dict[str, Any] = {"output_dtype": "float32", "normalize": False, "mode": m}
+                        if accepts_kwarg(eng.encode_contextual_chunks, "apply_tanh"):
+                            d_kw["apply_tanh"] = False
+                        gp_list = eng.encode_contextual_chunks(docs, **d_kw)
                         gi_list = eng.encode_contextual_chunks(docs, output_dtype="int8", normalize=False, mode=m)
                         ep_all = ref[f"{cid}/projected"]
                         for di, doc in enumerate(docs):
@@ -377,6 +379,13 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                             )
                             max_i8_err = max(max_i8_err, int(diff.max()))
                             exact_fracs.append(float(np.mean(diff == 0)))
+                        if cid == "non_contextual":
+                            gd = eng.encode_documents([d[0] for d in docs], output_dtype="float32", normalize=True, mode=m)
+                            ed_i8 = np.concatenate([ref[f"{cid}/encoded/{di}"] for di in range(len(docs))], axis=0).astype(
+                                np.float64
+                            )
+                            ed_i8 /= np.maximum(np.linalg.norm(ed_i8, axis=-1, keepdims=True), 1e-12)
+                            min_cos = min(min_cos, _cos_row_min(gd, ed_i8))
                         evaluated += 1
 
                 # Deterministic GPU uses strict parity bar; ANE/hetero/hetero2 uses profile-aware drift tolerance.
@@ -569,6 +578,129 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         eng.close()
 
 
+def _load_image_or_pdf_pages(paths: Sequence[str], *, dpi: int) -> tuple[list[Any], list[str]]:
+    from fast_shared.vision_preprocess import load_image
+
+    imgs: list[Any] = []
+    sources: list[str] = []
+    for raw_p in paths:
+        p = Path(raw_p).expanduser().resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"Input file not found: {p}")
+        if p.suffix.lower() == ".pdf":
+            try:
+                import pypdfium2 as pdfium  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise RuntimeError("PDF input requires `pypdfium2` to rasterize pages") from exc
+            doc = pdfium.PdfDocument(str(p))
+            try:
+                scale = float(dpi) / 72.0
+                for page_idx in range(len(doc)):
+                    page = doc[page_idx]
+                    bmp = page.render(scale=scale, rotation=0)
+                    imgs.append(bmp.to_pil().convert("RGB"))
+                    bmp.close()
+                    page.close()
+                    sources.append(f"{p}#page={page_idx + 1}")
+            finally:
+                doc.close()
+        else:
+            imgs.append(load_image(p))
+            sources.append(str(p))
+    return imgs, sources
+
+
+def _cmd_embed_images(args: argparse.Namespace) -> int:
+    images, sources = _load_image_or_pdf_pages(args.paths, dpi=int(args.dpi))
+    rotate_cw = int(getattr(args, "rotate_cw", 0))
+    queries = list(getattr(args, "query", None) or ())
+    want_index = bool(getattr(args, "build_index", False)) or bool(queries)
+    eng = _make_engine(args)
+    try:
+        if not want_index or args.output:
+            t0 = time.perf_counter()
+            vecs = eng.encode_images(
+                images,
+                chunks=int(args.chunks),
+                batch_size=int(args.batch_size),
+                min_pixels=int(args.min_pixels),
+                max_pixels=int(args.max_pixels),
+                crop_margins=bool(args.crop_margins),
+                rotations_cw=rotate_cw,
+                dimensions=args.dimensions,
+                output_dtype=str(args.dtype),
+                normalize=not bool(args.no_normalize),
+            )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            for idx, (src, mat) in enumerate(zip(sources, vecs)):
+                preview = mat[0, :6].tolist() if mat.shape[0] > 0 else []
+                print(f"[{idx}] {Path(src).name} shape={tuple(mat.shape)} dtype={mat.dtype} c0[:6]={preview}")
+            print(f"Encoded {len(vecs)} page(s) in {dt_ms:.2f} ms ({len(vecs) / max(dt_ms / 1000.0, 1e-9):.2f} pages/s)")
+
+            if args.output:
+                out_p = Path(args.output).expanduser().resolve()
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                if out_p.suffix.lower() == ".json":
+                    payload = {
+                        "sources": sources,
+                        "dtype": str(args.dtype),
+                        "embeddings": [m.tolist() for m in vecs],
+                    }
+                    out_p.write_text(json.dumps(payload), encoding="utf-8")
+                else:
+                    flat = np.concatenate(vecs, axis=0) if vecs else np.zeros((0, eng.dim), dtype=np.float32)
+                    offsets = np.zeros(len(vecs) + 1, dtype=np.int64)
+                    for i, m in enumerate(vecs):
+                        offsets[i + 1] = offsets[i] + int(m.shape[0])
+                    np.savez(
+                        out_p,
+                        embeddings=flat,
+                        offsets=offsets,
+                        sources=np.asarray(sources),
+                        **{f"page_{i}": m for i, m in enumerate(vecs)},
+                    )
+                print(f"Saved -> {out_p}")
+
+        if want_index:
+            t_idx0 = time.perf_counter()
+            index = eng.build_image_index(
+                images,
+                chunks=int(args.chunks),
+                batch_size=int(args.batch_size),
+                min_pixels=int(args.min_pixels),
+                max_pixels=int(args.max_pixels),
+                crop_margins=bool(args.crop_margins),
+                rotations_cw=rotate_cw,
+                dimensions=args.dimensions,
+            )
+            dt_idx_ms = (time.perf_counter() - t_idx0) * 1000.0
+            print(
+                f"Built image index: docs={index.num_docs} windows={index.num_windows} "
+                f"mode={index.mode} dim={index.dim} bytes={index.nbytes} "
+                f"ratio={index.compression_ratio_vs_fp32:.2f}x ({dt_idx_ms:.2f} ms)"
+            )
+            if queries and index.num_docs > 0:
+                q_vecs = eng.encode_queries(
+                    queries,
+                    dimensions=args.dimensions,
+                    output_dtype="float32",
+                    normalize=True,
+                )
+                top_k = min(max(1, int(getattr(args, "top_k", 5))), index.num_docs)
+                top_idx, top_scores = index.search(q_vecs, k=top_k)
+                for qi, q_text in enumerate(queries):
+                    print(f"Query[{qi}] {q_text!r}:")
+                    for rank in range(int(top_idx.shape[1])):
+                        doc_i = int(top_idx[qi, rank])
+                        if doc_i < 0:
+                            continue
+                        src_name = Path(sources[doc_i]).name if doc_i < len(sources) else str(doc_i)
+                        print(f"  #{rank + 1}: [{doc_i}] {src_name} score={float(top_scores[qi, rank]):.4f}")
+        return 0
+    finally:
+        eng.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fast-pplx",
@@ -610,9 +742,17 @@ def build_parser() -> argparse.ArgumentParser:
         p_embed,
         mode_choices=_MODES,
         default_mode="auto",
-        allow_doc_prefix=True,
+        allow_doc_prefix=False,
         allow_dimensions=True,
     )
+    p_embed.add_argument(
+        "--document-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Prepend [D] document prefix (default: enabled for document encoding)",
+    )
+    p_embed.add_argument("--prefix", default=None)
+    p_embed.add_argument("--prompt-name", default=None)
     p_embed.add_argument(
         "--dtype",
         choices=("float32", "float16", "int8"),
@@ -645,14 +785,27 @@ def build_parser() -> argparse.ArgumentParser:
         mode_choices=_MODES,
         default_mode="auto",
         default_max_body_tokens=508,
-        allow_doc_prefix=True,
+        allow_doc_prefix=False,
         allow_dimensions=True,
     )
-    # Extend shared --dtype choices locally to support signed int8 embeddings.
+    p_parquet.add_argument(
+        "--document-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Prepend [D] document prefix (default: enabled for document encoding)",
+    )
+    p_parquet.add_argument("--prefix", default=None)
+    p_parquet.add_argument("--prompt-name", default=None)
+    # Extend shared --dtype choices locally to support signed int8 embeddings and context-aware --overlap default.
     for act in p_parquet._actions:
         if "--dtype" in act.option_strings:
             act.choices = ("float32", "float16", "int8")
-            break
+        elif "--overlap" in act.option_strings:
+            act.default = None
+            act.help = (
+                "Overlap in original body tokens (default: 0 for --context-tokens, 51 for flat --chunk); "
+                "must be smaller than usable window"
+            )
     p_parquet.add_argument(
         "--context-tokens",
         type=int,
@@ -664,16 +817,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help="Target chunk size in tokens when --context-tokens is active (default: 256)",
-    )
-    p_parquet.add_argument(
-        "--header-text",
-        default=None,
-        help="Optional document header/title anchored across contextual windows (--context-tokens)",
-    )
-    p_parquet.add_argument(
-        "--header-col",
-        default=None,
-        help="Optional input Parquet column containing per-document header/title text",
     )
     p_parquet.add_argument(
         "--repeat-header-tokens",
@@ -697,6 +840,40 @@ def build_parser() -> argparse.ArgumentParser:
         allow_dimensions=True,
     )
 
+    p_img = sub.add_parser("embed-images", help="Encode page/document images (or PDF pages) directly via ViT")
+    _add_common_engine_args(p_img, include_ane_profile=False)
+    p_img.add_argument("paths", nargs="+", help="Image or PDF file paths")
+    p_img.add_argument("--mode", choices=("auto", "gpu"), default="auto", help="Execution mode (default: auto)")
+    p_img.add_argument("--chunks", type=int, default=8, help="Horizontal contextual chunk bands per page (default: 8)")
+    p_img.add_argument("--min-pixels", type=int, default=16384, help="Minimum resized pixel area (default: 16384)")
+    p_img.add_argument("--max-pixels", type=int, default=1_800_000, help="Maximum resized pixel area (default: 1800000)")
+    p_img.add_argument("--dpi", type=int, default=100, help="PDF rasterization DPI (default: 100)")
+    p_img.add_argument("--crop-margins", action="store_true", help="Trim whitespace margins before visual encoding")
+    p_img.add_argument(
+        "--rotate-cw",
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        help="Clockwise page rotation in degrees before encoding (0, 90, 180, 270)",
+    )
+    p_img.add_argument("--batch-size", type=int, default=4, help="Max same-shape wave batch size (default: 4)")
+    p_img.add_argument("--dimensions", type=int, default=None, help="Optional MRL truncation dimension")
+    p_img.add_argument("--dtype", choices=("float32", "float16", "int8"), default="float32")
+    p_img.add_argument("--no-normalize", action="store_true", help="Skip L2 normalization")
+    p_img.add_argument("--output", default=None, help="Optional output path (.npz or .json)")
+    p_img.add_argument(
+        "--build-index",
+        action="store_true",
+        help="Build a CompactRetrievalIndex over the encoded page bands",
+    )
+    p_img.add_argument(
+        "--query",
+        action="append",
+        default=None,
+        help="Optional query text to score against the built image index (implies --build-index)",
+    )
+    p_img.add_argument("--top-k", type=int, default=5, help="Top-k pages to print per --query (default: 5)")
+
     return parser
 
 
@@ -711,12 +888,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_setup_ane(args)
     if args.command == "embed":
         return _cmd_embed(args)
+    if args.command == "embed-images":
+        return _cmd_embed_images(args)
     if args.command == "verify":
         return _cmd_verify(args)
     if args.command == "bench":
         return _cmd_bench(args)
     if args.command == "parquet":
         if getattr(args, "context_tokens", None):
+            eff_ctx_overlap = 0 if getattr(args, "overlap", None) is None else int(args.overlap)
             eng = _make_engine(args)
             try:
                 summary = embed_contextual_parquet(
@@ -728,7 +908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     drop_text_col=args.drop_text_col,
                     chunk_tokens=args.chunk_tokens,
                     context_tokens=args.context_tokens,
-                    overlap=args.overlap,
+                    overlap=eff_ctx_overlap,
                     header_text=getattr(args, "header_text", None),
                     header_col=getattr(args, "header_col", None),
                     repeat_header_tokens=getattr(args, "repeat_header_tokens", None),
@@ -760,51 +940,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             finally:
                 eng.close()
-        if args.dtype == "int8":
-            eng = _make_engine(args)
-            try:
-                summary = embed_parquet(
-                    eng,
-                    args.input,
-                    args.output,
-                    text_col=args.text_col,
-                    keep_cols=args.keep_cols,
-                    drop_text_col=args.drop_text_col,
-                    mode=args.mode,
-                    dtype=args.dtype,
-                    batch_rows=args.batch_rows,
-                    encode_batch_rows=args.encode_batch_rows,
-                    shard_rows=args.shard_rows,
-                    filter_ocr=args.filter_ocr,
-                    ocr_pages_only=args.ocr_pages_only,
-                    per_ocr_page=args.per_ocr_page,
-                    chunk=args.chunk,
-                    max_body_tokens=args.max_body_tokens,
-                    overlap=args.overlap,
-                    max_length=args.max_length,
-                    max_chunk_tokens=args.max_chunk_tokens,
-                    skip_empty=args.skip_empty,
-                    include_chunk_text=args.include_chunk_text,
-                    prefix=getattr(args, "prefix", None),
-                    prompt_name=getattr(args, "prompt_name", None),
-                    add_query_prefix=args.query_prefix,
-                    add_document_prefix=bool(getattr(args, "document_prefix", False)),
-                    dimensions=getattr(args, "dimensions", None),
-                    compression=args.compression,
-                    resume=args.resume,
-                    limit=args.limit,
-                    progress_every=args.progress_every,
-                )
-                print(
-                    f"DONE: files={summary.input_files} rows_read={summary.rows_read:,} "
-                    f"rows_emitted={summary.rows_emitted:,} tokens={summary.total_tokens:,} "
-                    f"elapsed={summary.elapsed_seconds:.2f}s throughput={summary.tokens_per_sec:,.0f} tok/s "
-                    f"({summary.rows_per_sec:,.0f} rows/s) -> {summary.output_path}"
-                )
-                return 0
-            finally:
-                eng.close()
-        return run_parquet_command(args, _make_engine)
+        eff_flat_overlap = 51 if getattr(args, "overlap", None) is None else int(args.overlap)
+        eng = _make_engine(args)
+        try:
+            summary = embed_parquet(
+                eng,
+                args.input,
+                args.output,
+                text_col=args.text_col,
+                keep_cols=args.keep_cols,
+                drop_text_col=args.drop_text_col,
+                mode=args.mode,
+                dtype=args.dtype,
+                batch_rows=args.batch_rows,
+                encode_batch_rows=args.encode_batch_rows,
+                shard_rows=args.shard_rows,
+                filter_ocr=args.filter_ocr,
+                ocr_pages_only=args.ocr_pages_only,
+                per_ocr_page=args.per_ocr_page,
+                chunk=args.chunk,
+                max_body_tokens=args.max_body_tokens,
+                overlap=eff_flat_overlap,
+                max_length=args.max_length,
+                max_chunk_tokens=args.max_chunk_tokens,
+                skip_empty=args.skip_empty,
+                include_chunk_text=args.include_chunk_text,
+                prefix=getattr(args, "prefix", None),
+                prompt_name=getattr(args, "prompt_name", None),
+                add_query_prefix=args.query_prefix,
+                add_document_prefix=getattr(args, "document_prefix", None),
+                header_col=getattr(args, "header_col", None),
+                header_text=getattr(args, "header_text", None),
+                dimensions=getattr(args, "dimensions", None),
+                compression=args.compression,
+                resume=args.resume,
+                limit=args.limit,
+                progress_every=args.progress_every,
+            )
+            print(
+                f"DONE: files={summary.input_files} rows_read={summary.rows_read:,} "
+                f"rows_emitted={summary.rows_emitted:,} tokens={summary.total_tokens:,} "
+                f"elapsed={summary.elapsed_seconds:.2f}s throughput={summary.tokens_per_sec:,.0f} tok/s "
+                f"({summary.rows_per_sec:,.0f} rows/s) -> {summary.output_path}"
+            )
+            return 0
+        finally:
+            eng.close()
     if args.command == "serve":
         return run_serve_command(args, _make_engine, label="fast-pplx")
     parser.error(f"Unknown command: {args.command}")

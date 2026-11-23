@@ -86,6 +86,13 @@ def test_compact_retrieval_index_single_and_multivector_parity() -> None:
     np.testing.assert_allclose(sc_i8_np, sc_i8_neon, atol=1e-4)
     np.testing.assert_allclose(sc_i8_neon, sc_fp32, atol=1e-2)
 
+    # Default binary search rerank width is 256 (higher recall with negligible cost) and executes cleanly
+    import inspect
+    assert inspect.signature(CompactRetrievalIndex.search).parameters["rerank_top_r"].default == 256
+    top_bin_default, sc_bin_default = idx_bin_neon.search(queries, k=5)
+    assert np.array_equal(top_bin_default[:, 0], np.arange(8, dtype=np.int32))
+    assert sc_bin_default.shape == (8, 5)
+
     top_bin_np, sc_bin_np = idx_bin_np.search(queries, k=5, rerank_top_r=64)
     top_bin_neon, sc_bin_neon = idx_bin_neon.search(queries, k=5, rerank_top_r=64)
     assert np.array_equal(top_bin_np[:, 0], np.arange(8, dtype=np.int32))

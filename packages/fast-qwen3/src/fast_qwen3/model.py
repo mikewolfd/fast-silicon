@@ -23,6 +23,7 @@ from fast_shared.kv_quant import (
     normalize_kv_mode,
 )
 
+from ._mpp_linear import install_qwen_mpp_linears
 from .kernels import (
     RMSNormGated,
     SpecBucketedLinearGroup,
@@ -1070,6 +1071,7 @@ class FullAttentionLayer(nn.Module):
         *,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
+        rope_offset_delta: int = 0,
     ) -> mx.array:
         b_sz, s_len, _ = x.shape
         parts = self.qkvg_group(x)
@@ -1090,7 +1092,7 @@ class FullAttentionLayer(nn.Module):
         elif cache is not None:
             # Cached inference: fuse [Q, K] into 1 RoPE kernel launch (+ [Q, K, V] single-launch FWHT-64 under QuaRot)
             qk = mx.concatenate([q, k], axis=1)
-            qk = self.rope(qk, offset=cache.offset)
+            qk = self.rope(qk, offset=cache.offset + int(rope_offset_delta))
             if use_quarot:
                 bank = get_hadamard_bank(self.head_dim)
                 qkv = bank.transform(mx.concatenate([qk, v], axis=1), inverse=False)
@@ -1215,6 +1217,7 @@ class Qwen3DecoderBlock(nn.Module):
         valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
+        rope_offset_delta: int = 0,
     ) -> mx.array:
         if self.is_linear:
             h = x + self.linear_attn(
@@ -1229,6 +1232,7 @@ class Qwen3DecoderBlock(nn.Module):
                 cache,  # type: ignore[arg-type]
                 attn_mask=attn_mask,
                 rope_trig=rope_trig,
+                rope_offset_delta=rope_offset_delta,
             )
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -1247,6 +1251,9 @@ class FastQwen3Model(nn.Module):
         quantize_bf16_bits: int | None = None,
         quantize_group_size: int = 64,
         model_dir: Path | None = None,
+        enable_mpp_linear: bool | None = None,
+        mpp_w8a8: bool | None = None,
+        apple10_nax: bool | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -1351,6 +1358,34 @@ class FastQwen3Model(nn.Module):
             [1.0 / (cfg.rope_theta ** (float(i) / float(rot))) for i in range(0, rot, 2)],
             dtype=mx.float32,
         )
+        self._mpp_state = install_qwen_mpp_linears(
+            self,
+            enabled=enable_mpp_linear,
+            allow_w8a8=mpp_w8a8,
+            apple10_nax=apple10_nax,
+        )
+
+    def clear_mpp_packed_weights(self) -> int:
+        """Release cached Apple10 NAX packed weight buffers under memory pressure."""
+        st = getattr(self, "_mpp_state", None)
+        return int(st.clear()) if st is not None else 0
+
+    def mpp_linear_stats(self) -> dict[str, Any]:
+        """Return Apple10 NAX prefill MPP activation & lazy-pack telemetry."""
+        st = getattr(self, "_mpp_state", None)
+        if st is None:
+            return {"enabled": False, "packed_modules": 0, "packed_bytes": 0}
+        return {
+            "enabled": bool(st.enabled),
+            "allow_w8a8": bool(st.allow_w8a8),
+            "packed_modules": len(st.packed_weights),
+            "packed_bytes": int(st.packed_bytes),
+            "max_pack_bytes": int(st.max_pack_bytes),
+            "w4_calls": int(st.w4_calls),
+            "w8_calls": int(st.w8_calls),
+            "shared_quant_calls": int(st.shared_quant_calls),
+            "budget_skips": int(st.budget_skips),
+        }
 
     @property
     def vocab_n(self) -> int:
@@ -1370,15 +1405,22 @@ class FastQwen3Model(nn.Module):
 
     def forward_hidden(
         self,
-        input_ids: mx.array,
+        input_ids: mx.array | None = None,
         cache: Sequence[DeltaSlotCache | GrowingKVCache] | None = None,
         *,
+        inputs_embeds: mx.array | None = None,
         valid_token_scale: mx.array | None = None,
         valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
+        rope_offset_delta: int = 0,
     ) -> mx.array:
-        h = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        elif input_ids is not None:
+            h = self.embed_tokens(input_ids)
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
         if cache is None:
             for layer in self.layers:
                 h = layer(
@@ -1388,6 +1430,7 @@ class FastQwen3Model(nn.Module):
                     valid_lengths=valid_lengths,
                     attn_mask=attn_mask,
                     rope_trig=rope_trig,
+                    rope_offset_delta=rope_offset_delta,
                 )
         else:
             for layer, c in zip(self.layers, cache):
@@ -1398,6 +1441,7 @@ class FastQwen3Model(nn.Module):
                     valid_lengths=valid_lengths,
                     attn_mask=attn_mask,
                     rope_trig=rope_trig,
+                    rope_offset_delta=rope_offset_delta,
                 )
         return self.norm(h)
 
@@ -1421,21 +1465,25 @@ class FastQwen3Model(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        input_ids: mx.array | None = None,
         cache: Sequence[DeltaSlotCache | GrowingKVCache] | None = None,
         *,
+        inputs_embeds: mx.array | None = None,
         valid_token_scale: mx.array | None = None,
         valid_lengths: mx.array | None = None,
         attn_mask: str | mx.array = "causal",
         rope_trig: tuple[mx.array, mx.array] | None = None,
+        rope_offset_delta: int = 0,
     ) -> mx.array:
         h = self.forward_hidden(
             input_ids,
             cache,
+            inputs_embeds=inputs_embeds,
             valid_token_scale=valid_token_scale,
             valid_lengths=valid_lengths,
             attn_mask=attn_mask,
             rope_trig=rope_trig,
+            rope_offset_delta=rope_offset_delta,
         )
         return self.project_logits(h)
 
@@ -1595,6 +1643,9 @@ class FastQwen3Model(nn.Module):
         quantize_group_size: int = 64,
         load_mtp_tensors: bool = True,
         allow_oversubscribe: bool = False,
+        enable_mpp_linear: bool | None = None,
+        mpp_w8a8: bool | None = None,
+        apple10_nax: bool | None = None,
     ) -> tuple[FastQwen3Model, dict[str, mx.array]]:
         """Stream-load Qwen3.5/3.6 shards skipping `vision_tower`/`visual` shards via header inspection."""
         mdir = Path(model_dir).expanduser().resolve()
@@ -1678,6 +1729,9 @@ class FastQwen3Model(nn.Module):
             quantize_bf16_bits=quantize_bf16_bits,
             quantize_group_size=quantize_group_size,
             model_dir=mdir,
+            enable_mpp_linear=enable_mpp_linear,
+            mpp_w8a8=mpp_w8a8,
+            apple10_nax=apple10_nax,
         )
         del norm_weights
         gc.collect()

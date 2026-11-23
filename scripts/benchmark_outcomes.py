@@ -56,6 +56,8 @@ from fast_shared.outcome_eval import (
     compute_outcome_metrics,
     evaluate_bfcl_v3,
     evaluate_clinc_two_stage,
+    evaluate_cord_v2,
+    evaluate_fintabnet_otsl,
     evaluate_instruction_following,
     evaluate_jsonschemabench_compiler,
     evaluate_legalbench_spans,
@@ -65,6 +67,8 @@ from fast_shared.outcome_eval import (
     evaluate_mmlu_redux,
     evaluate_mrl_dtype_grid,
     evaluate_multiclass_choice,
+    evaluate_olmocr_bench,
+    evaluate_omnidocbench,
     evaluate_promotion_gates,
     evaluate_ragtruth_noul,
     evaluate_retrieval_rankings,
@@ -74,6 +78,8 @@ from fast_shared.outcome_eval import (
     load_banking77,
     load_bfcl_v3,
     load_clinc_oos,
+    load_cord_v2,
+    load_fintabnet_otsl,
     load_ifbench_test,
     load_ifeval,
     load_jsonschemabench,
@@ -85,6 +91,8 @@ from fast_shared.outcome_eval import (
     load_math_500,
     load_mmlu_redux,
     load_nanobeir_subset,
+    load_olmocr_bench,
+    load_omnidocbench_en,
     load_ragtruth,
     load_reward_bench_2,
     partition_banking77_clusters,
@@ -114,6 +122,7 @@ PACKAGE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("fast-gemma4", 4, "FAST_GEMMA4_HOME", "Gemma-4 chat/IF/reasoning & structured JSON (Cat 3+4)"),
     OutcomePackageSpec("fast-qwen3", 4, "FAST_QWEN3_HOME", "Qwen3.5/3.6 hybrid GDN+GQA chat & structured JSON (Cat 3+4)"),
     OutcomePackageSpec("fast-gpt-oss", 4, "FAST_GPT_OSS_HOME", "GPT-OSS-20B chat/reasoning & structured JSON (Cat 3+4)"),
+    OutcomePackageSpec("fast-ocr", 5, "FAST_OCR_HOME", "Apple Vision ANE + FastOvisOCREngine / NuExtract3 OCR (Cat 5)"),
 )
 PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("public-bge-small", 1, "FAST_BGE_SMALL_HOME", "Stock mlx-embeddings BGE-small 8-bit (Cat 1)"),
@@ -128,6 +137,19 @@ PUBLIC_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("public-gpt-oss", 4, "FAST_GPT_OSS_HOME", "Stock mlx-lm GPT-OSS-20B MXFP4 (Cat 3+4)"),
     OutcomePackageSpec("coreai-qwen3.5-4b", 4, "FAST_QWEN3_HOME", "Apple CoreAI Qwen3.5-4B 4bit/fp4_fp8 (Cat 3+4)"),
     OutcomePackageSpec("coreai-gemma4", 4, "FAST_GEMMA4_HOME", "Apple CoreAI Gemma-4 E2B QAT (Cat 3+4)"),
+    OutcomePackageSpec("public-ovis-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm OvisOCR2-8bit full-canvas AR (Cat 5)"),
+    OutcomePackageSpec("public-apple-vision", 5, "FAST_OCR_HOME", "Standalone Apple Vision ANE OCR (Cat 5)"),
+    OutcomePackageSpec("public-pypdfium2", 5, "FAST_OCR_HOME", "Native pypdfium2 PDF text extraction (Cat 5)"),
+    OutcomePackageSpec("public-glm-ocr-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm GLM-OCR BF16 (Cat 5)"),
+    OutcomePackageSpec("public-lightonocr2-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm LightOnOCR-2-1B BF16 (Cat 5)"),
+    OutcomePackageSpec("public-nuextract3-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm NuExtract3 visual JSON KIE (Cat 5)"),
+    OutcomePackageSpec("public-deepseek-ocr2-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm DeepSeek-OCR-2 4-bit (Cat 5)"),
+    OutcomePackageSpec("public-paddleocr-vl-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm PaddleOCR-VL 8-bit (Cat 5)"),
+    OutcomePackageSpec("public-nemotron-parse-mlx-vlm", 5, "FAST_OCR_HOME", "Stock mlx-vlm NVIDIA Nemotron-Parse 8-bit (Cat 5)"),
+    OutcomePackageSpec("public-rapidocr", 5, "FAST_OCR_HOME", "RapidOCR PP-OCRv4/v5 ONNX CPU pipeline (Cat 5)"),
+    OutcomePackageSpec("public-tesseract", 5, "FAST_OCR_HOME", "Tesseract CLI CPU OCR baseline (Cat 5)"),
+    OutcomePackageSpec("public-docling", 5, "FAST_OCR_HOME", "IBM Docling DocumentConverter pipeline (Cat 5)"),
+    OutcomePackageSpec("public-marker", 5, "FAST_OCR_HOME", "Marker + Surya PDF/image Markdown pipeline (Cat 5)"),
 )
 COREML_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("coreml-bge-small", 1, "FAST_BGE_SMALL_HOME", "Open HF CoreML FP16 BGE-small ANE (sidekickd, Cat 1)"),
@@ -135,6 +157,22 @@ COREML_BASELINE_SPECS: tuple[OutcomePackageSpec, ...] = (
     OutcomePackageSpec("coreml-embeddinggemma-2-int8", 1, "FAST_EMBEDDINGGEMMA2_HOME", "Open HF CoreML INT8 EmbeddingGemma-2 ANE + pack_256 (OpenInfinity, Cat 1)"),
     OutcomePackageSpec("coreml-laya", 2, "FAST_DECISION_MODELS_HOME", "Open HF CoreML ANE Laya-Typed-421M L192/L384/L512 (NMTZ, Cat 2)"),
     OutcomePackageSpec("coreml-kev-0.8b", 2, "FAST_DECISION_MODELS_HOME", "Open HF CoreML FP16 Kev-0.8B Fused+Row GPU (FluidInference, Cat 2)"),
+)
+OCR_FAMILY_PACKAGES: tuple[str, ...] = (
+    "fast-ocr",
+    "public-ovis-mlx-vlm",
+    "public-glm-ocr-mlx-vlm",
+    "public-lightonocr2-mlx-vlm",
+    "public-deepseek-ocr2-mlx-vlm",
+    "public-paddleocr-vl-mlx-vlm",
+    "public-nemotron-parse-mlx-vlm",
+    "public-nuextract3-mlx-vlm",
+    "public-apple-vision",
+    "public-rapidocr",
+    "public-tesseract",
+    "public-docling",
+    "public-marker",
+    "public-pypdfium2",
 )
 PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     "fast-bge-small": ("public-bge-small", "coreml-bge-small"),
@@ -147,6 +185,7 @@ PUBLIC_FOR_FAST_PACKAGE: dict[str, tuple[str, ...]] = {
     "fast-gemma4": ("public-gemma4", "coreai-gemma4"),
     "fast-qwen3": ("public-qwen3.5", "coreai-qwen3.5-4b"),
     "fast-gpt-oss": ("public-gpt-oss",),
+    "fast-ocr": ("public-ovis-mlx-vlm", "public-apple-vision", "public-pypdfium2"),
 }
 _SPEC_BY_NAME: dict[str, OutcomePackageSpec] = {
     s.name: s for s in (*PACKAGE_SPECS, *PUBLIC_BASELINE_SPECS, *COREML_BASELINE_SPECS)
@@ -169,6 +208,19 @@ _CANONICAL_HOME_PKG: dict[str, str] = {
     "public-gpt-oss": "fast-gpt-oss",
     "coreai-qwen3.5-4b": "fast-qwen3",
     "coreai-gemma4": "fast-gemma4",
+    "public-ovis-mlx-vlm": "fast-ocr",
+    "public-apple-vision": "fast-ocr",
+    "public-pypdfium2": "fast-ocr",
+    "public-glm-ocr-mlx-vlm": "fast-ocr",
+    "public-lightonocr2-mlx-vlm": "fast-ocr",
+    "public-nuextract3-mlx-vlm": "fast-ocr",
+    "public-deepseek-ocr2-mlx-vlm": "fast-ocr",
+    "public-paddleocr-vl-mlx-vlm": "fast-ocr",
+    "public-nemotron-parse-mlx-vlm": "fast-ocr",
+    "public-rapidocr": "fast-ocr",
+    "public-tesseract": "fast-ocr",
+    "public-docling": "fast-ocr",
+    "public-marker": "fast-ocr",
 }
 
 
@@ -456,6 +508,20 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--reasoning-effort", default=None)
     p.add_argument("--coreai-variant", choices=("4bit", "fp4_fp8", "both"), default="both")
     p.add_argument("--max-coarse-tokens", type=int, default=None)
+    # Category 5 (OCR) worker flags
+    p.add_argument("--ocr-backend", choices=("auto", "ovis", "apple-vision"), default="auto")
+    p.add_argument("--ocr-suites", default="default")
+    p.add_argument("--table-mode", choices=("gfm", "html"), default="gfm")
+    p.add_argument("--output-format", choices=("markdown", "raw", "text"), default="markdown")
+    p.add_argument("--ocr-model", default=None)
+    p.add_argument("--ocr-render-only", action="store_true", default=False)
+    p.add_argument("--ocr-dpi", type=int, default=200)
+    p.add_argument("--speculative", choices=("auto", "off", "self", "vision+self"), default="auto")
+    p.add_argument("--no-crop-margins", action="store_true", default=False)
+    p.add_argument("--no-auto-orient", action="store_true", default=False)
+    p.add_argument("--strict-markdown-grammar", action="store_true", default=False)
+    p.add_argument("--ocr-max-tokens", type=int, default=4096)
+    p.add_argument("--ocr-vocab-size", type=int, default=None)
     ns, _ = p.parse_known_args(list(extra_args))
     return ns
 
@@ -1937,6 +2003,655 @@ def _run_llm_worker(
     return records
 
 
+# ---------------------------------------------------------------------------
+# Category 5 Workers: fast-ocr + cross-family MLX VLMs / ANE / ONNX / CLI / PDF pipelines
+# ---------------------------------------------------------------------------
+
+_CAT5_PACKAGES: frozenset[str] = frozenset(OCR_FAMILY_PACKAGES)
+_CAT5_ALL_SUITES: tuple[str, ...] = ("olmocr_bench", "fintabnet_otsl", "omnidocbench_en", "cord_v2")
+
+
+def _resolve_cat5_suites(pkg_name: str, extra: argparse.Namespace) -> list[str]:
+    raw = str(getattr(extra, "ocr_suites", "default") or "default").strip().lower()
+    if raw == "all":
+        requested = list(_CAT5_ALL_SUITES)
+    elif raw == "default":
+        ocr_model_low = str(getattr(extra, "ocr_model", None) or "").strip().lower()
+        if pkg_name == "public-pypdfium2":
+            requested = ["olmocr_bench"]
+        elif pkg_name == "public-nuextract3-mlx-vlm" or "nuextract" in ocr_model_low:
+            requested = ["cord_v2", "olmocr_bench", "fintabnet_otsl"]
+        else:
+            # Default Markdown/Table/Formula OCR families (`OvisOCR2`, `GLM-OCR`, `LightOnOCR-2`,
+            # `DeepSeek-OCR-2`, `PaddleOCR-VL`, `Nemotron-Parse`, `Apple Vision`, `RapidOCR`,
+            # `Tesseract`, `Docling`, `Marker`). Pass `--ocr-suites all` or `cord_v2` for JSON KIE.
+            requested = ["olmocr_bench", "fintabnet_otsl", "omnidocbench_en"]
+    else:
+        requested = [tok.strip() for tok in raw.split(",") if tok.strip()]
+        for tok in requested:
+            if tok not in _CAT5_ALL_SUITES:
+                raise ValueError(f"Unknown --ocr-suites entry {tok!r}; expected subset of {_CAT5_ALL_SUITES}")
+    if pkg_name == "public-pypdfium2":
+        requested = [s for s in requested if s == "olmocr_bench"]
+    return requested
+
+
+def _render_pdf_first_page_pil(pdf_path: str | Path, *, dpi: int) -> Any:
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = doc[0]
+        bitmap = page.render(scale=float(dpi) / 72.0)
+        pil = bitmap.to_pil().convert("RGB")
+        page.close()
+        return pil
+    finally:
+        doc.close()
+
+
+def _bytes_to_pil(image_bytes: bytes) -> Any:
+    import io
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        return im.convert("RGB")
+
+
+def _build_cord_v2_prompt(schema: Mapping[str, Any]) -> str:
+    compact = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+    return (
+        "Extract the receipt fields from this image as a single valid JSON object conforming strictly to "
+        f"the following JSON Schema. Omit or set null for fields not visible on the receipt. Output ONLY JSON.\n"
+        f"Schema: {compact}"
+    )
+
+
+def _resolve_fast_ocr_model_arg(ocr_model: str | None) -> str | Path | None:
+    if not ocr_model:
+        return None
+    low = str(ocr_model).strip().lower()
+    if low in ("nuextract", "nuextract3"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from public_baselines import resolve_hf_snapshot
+
+        for cand in ("numind/NuExtract3-mlx-4bits", "mlx-community/NuExtract3-bf16"):
+            snap = resolve_hf_snapshot(cand)
+            if snap is not None and (snap / "config.json").is_file():
+                sfiles = list(snap.glob("*.safetensors"))
+                if sfiles and all(f.exists() and f.stat().st_size > 0 for f in sfiles):
+                    return snap
+    return ocr_model
+
+
+def _summarize_cat5_rates(
+    metas: Sequence[Mapping[str, Any]],
+    *,
+    n_pages: int,
+    wall_sec: float,
+    default_family: str,
+) -> dict[str, Any]:
+    """Aggregate page throughput and token generation rates for a Category 5 benchmark record."""
+    n = max(1, int(n_pages))
+    wall = max(float(wall_sec), 1e-6)
+    gen_toks = [int(m.get("generated_tokens", 0) or 0) for m in metas]
+    prompt_toks = [int(m.get("prompt_tokens", 0) or 0) for m in metas]
+    vis_toks = [int(m.get("visual_tokens", 0) or 0) for m in metas]
+    total_gen = int(sum(gen_toks))
+    tokens_per_page = round(float(total_gen) / float(n), 2)
+    decode_ms_sum = sum(float(m.get("decode_ms", 0.0) or 0.0) for m in metas)
+    pos_tps = [float(m.get("decode_tps", 0.0) or 0.0) for m in metas if float(m.get("decode_tps", 0.0) or 0.0) > 0.0]
+    if total_gen > 0 and decode_ms_sum > 0.0:
+        decode_tok_s = round(float(total_gen) / (decode_ms_sum / 1000.0), 2)
+    elif pos_tps:
+        decode_tok_s = round(float(np.mean(pos_tps)), 2)
+    else:
+        decode_tok_s = 0.0
+    e2e_tok_s = round(float(total_gen) / wall, 2) if total_gen > 0 else 0.0
+    family = next((str(m.get("model_family")) for m in metas if m.get("model_family")), default_family)
+    backends_used = sorted({str(m.get("backend_used") or "") for m in metas if m.get("backend_used")})
+    return {
+        "model_family": family,
+        "backends_used": backends_used,
+        "pages_per_sec": round(float(n_pages) / wall, 4),
+        "sec_per_page": round(wall / float(n), 4),
+        "total_generated_tokens": total_gen,
+        "tokens_per_page": tokens_per_page,
+        "avg_generated_tokens": tokens_per_page,
+        "prompt_tokens_per_page": round(float(sum(prompt_toks)) / float(n), 2),
+        "avg_visual_tokens": round(float(sum(vis_toks)) / float(n), 2),
+        "decode_tok_s": decode_tok_s,
+        "e2e_tok_s": e2e_tok_s,
+    }
+
+
+def _extract_cat5_rates(rec: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract normalized Category 5 page/token rates from a saved or live outcome record."""
+    diag = rec.get("diagnostics") or {}
+    n_items = int(rec.get("n_items", 0) or 0)
+    wall = float(rec.get("wall_sec", 0.0) or 0.0)
+    pps = diag.get("pages_per_sec")
+    if pps is None:
+        raw_ips = rec.get("raw_items_per_sec")
+        if raw_ips is not None:
+            pps = float(raw_ips)
+        elif n_items > 0 and wall > 0.0:
+            pps = float(n_items) / wall
+        else:
+            pps = 0.0
+    spp = diag.get("sec_per_page")
+    if spp is None:
+        spp = (wall / float(n_items)) if (n_items > 0 and wall > 0.0) else ((1.0 / float(pps)) if float(pps) > 0.0 else 0.0)
+    tpp = diag.get("tokens_per_page")
+    if tpp is None:
+        tpp = float(diag.get("avg_generated_tokens", 0.0) or 0.0)
+    tot_tok = diag.get("total_generated_tokens")
+    if tot_tok is None:
+        tot_tok = int(round(float(tpp) * n_items)) if (float(tpp) > 0.0 and n_items > 0) else 0
+    dec_tps = float(diag.get("decode_tok_s", 0.0) or 0.0)
+    e2e_tps = diag.get("e2e_tok_s")
+    if e2e_tps is None:
+        e2e_tps = (float(tot_tok) / wall) if (int(tot_tok) > 0 and wall > 0.0) else 0.0
+    mem_gb = float((rec.get("memory_4bucket_gb") or {}).get("combined_with_model_mapped_gb", 0.0) or 0.0)
+    return {
+        "model_family": str(diag.get("model_family") or diag.get("backend") or rec.get("package") or "-"),
+        "pages_per_sec": round(float(pps), 4),
+        "sec_per_page": round(float(spp), 4),
+        "total_generated_tokens": int(tot_tok),
+        "tokens_per_page": round(float(tpp), 2),
+        "decode_tok_s": round(float(dec_tps), 2),
+        "e2e_tok_s": round(float(e2e_tps), 2),
+        "mem_gb": round(mem_gb, 4),
+    }
+
+
+def _run_cat5_worker(
+    pkg_name: str,
+    *,
+    tier: str,
+    config_label: str,
+    extra: argparse.Namespace,
+    lock: Mapping[str, Any],
+    cache_dir: Path,
+    local_files_only: bool,
+    max_items: int | None,
+    smoke: bool,
+    home: Path,
+    host_mem_gb: float,
+) -> list[dict[str, Any]]:
+    from PIL import Image
+
+    model_dirs: list[Path] = [home / "artifacts"]
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _outcome_public_backends import build_public_cat5_adapter, stock_hf_model_files
+
+    if pkg_name == "fast-ocr":
+        from fast_ocr.ovis_engine import resolve_ocr_model_dir
+
+        if extra.ocr_backend != "apple-vision":
+            try:
+                mdir = resolve_ocr_model_dir(_resolve_fast_ocr_model_arg(extra.ocr_model), local_files_only=True)
+                model_dirs.extend([p.resolve() for p in mdir.rglob("*") if p.is_file()])
+            except Exception:
+                pass
+    else:
+        model_dirs.extend(stock_hf_model_files(pkg_name))
+
+    probe = FourBucketMemoryProbe(model_directories=model_dirs)
+    guard = DeviceMemoryGuard()
+    guard_tripped = False
+
+    suites = _resolve_cat5_suites(pkg_name, extra)
+    if not suites:
+        return []
+
+    olm_cap = 4 if smoke else max_items
+    ftn_cap = 2 if smoke else max_items
+    od_cap = 2 if smoke else max_items
+    cord_cap = 2 if smoke else max_items
+
+    loaded: dict[str, list[dict[str, Any]]] = {}
+    if "olmocr_bench" in suites:
+        loaded["olmocr_bench"] = load_olmocr_bench(
+            tier=tier,
+            max_pages=olm_cap,
+            download_pdfs=True,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+    if "fintabnet_otsl" in suites:
+        loaded["fintabnet_otsl"] = load_fintabnet_otsl(
+            tier=tier,
+            max_items=ftn_cap,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+    if "omnidocbench_en" in suites:
+        loaded["omnidocbench_en"] = load_omnidocbench_en(
+            tier=tier,
+            max_items=od_cap,
+            download_images=True,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+    if "cord_v2" in suites:
+        loaded["cord_v2"] = load_cord_v2(
+            tier=tier,
+            max_items=cord_cap,
+            lock=lock,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+
+    fast_eng: Any = None
+    pub_ad: Any = None
+    eff_backend: str
+    eff_label: str
+    default_family: str
+    allow_html_tables = (extra.table_mode == "html") or (extra.output_format != "markdown")
+
+    if pkg_name == "fast-ocr":
+        from fast_ocr import FastOCR
+
+        eff_backend = str(extra.ocr_backend)
+        model_arg = _resolve_fast_ocr_model_arg(extra.ocr_model)
+        fast_eng = FastOCR(
+            backend=eff_backend,  # type: ignore[arg-type]
+            output_format=extra.output_format,  # type: ignore[arg-type]
+            table_mode=extra.table_mode,  # type: ignore[arg-type]
+            strict_markdown_grammar=bool(extra.strict_markdown_grammar),
+            model_path=model_arg,
+            crop_margins=not bool(extra.no_crop_margins),
+            auto_orient=not bool(extra.no_auto_orient),
+            speculative=extra.speculative,  # type: ignore[arg-type]
+            vocab_size=extra.ocr_vocab_size,
+            max_tokens=int(extra.ocr_max_tokens),
+        )
+        mode_tag = f"{eff_backend}_{extra.table_mode}"
+        if extra.ocr_render_only:
+            mode_tag += "_render"
+        if extra.ocr_model:
+            mode_tag += f"_{Path(str(extra.ocr_model)).name}"
+        eff_label = config_label or mode_tag
+        if eff_backend == "apple-vision":
+            default_family = "apple-vision-ane"
+        elif "nuextract" in str(extra.ocr_model or "").lower():
+            default_family = "qwen3.5-nuextract3"
+        elif eff_backend == "auto":
+            default_family = "qwen3.5-ovis+ane"
+        else:
+            default_family = "qwen3.5-ovis"
+    else:
+        pub_ad = build_public_cat5_adapter(
+            pkg_name,
+            table_mode=extra.table_mode,
+            output_format=extra.output_format,
+            max_tokens=int(extra.ocr_max_tokens),
+        )
+        eff_backend = pkg_name
+        eff_label = config_label or pub_ad.default_label
+        default_family = pub_ad.model_family
+
+    def _fast_result_meta(res: Any) -> dict[str, Any]:
+        return {
+            "backend_used": res.backend_used,
+            "model_family": default_family,
+            "generated_tokens": int(res.timings.generated_tokens),
+            "prompt_tokens": int(res.timings.prompt_tokens),
+            "visual_tokens": int(res.timings.visual_tokens),
+            "decode_tps": float(res.timings.decode_tps),
+            "decode_ms": float(res.timings.decode_ms),
+            "vit_ms": float(res.timings.vit_ms),
+            "prefill_ms": float(res.timings.prefill_ms),
+        }
+
+    def _run_image_ocr(
+        pil_img: Any,
+        *,
+        prompt: str | None = None,
+        schema: Mapping[str, Any] | None = None,
+        max_tokens_override: int | None = None,
+        task_kind: str = "page",
+    ) -> tuple[str, str, dict[str, Any]]:
+        if fast_eng is not None:
+            if schema is not None or prompt is not None:
+                if eff_backend == "apple-vision":
+                    res = fast_eng.ocr_image(pil_img)
+                else:
+                    ovis = fast_eng._get_ovis_engine()
+                    res = ovis.ocr_image(
+                        pil_img,
+                        prompt=prompt,
+                        schema=schema,
+                        output_format="raw" if schema is not None else extra.output_format,
+                        table_mode=extra.table_mode,
+                        max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                    )
+            else:
+                res = fast_eng.ocr_image(pil_img)
+            return res.text, res.finish_reason, _fast_result_meta(res)
+        assert pub_ad is not None
+        return pub_ad.ocr_image_fn(
+            pil_img,
+            prompt=prompt,
+            schema=schema,
+            max_tokens_override=max_tokens_override,
+            task_kind=task_kind,
+        )
+
+    def _run_pdf_page_ocr(pdf_path: str | Path, *, task_kind: str = "page") -> tuple[str, str, dict[str, Any]]:
+        if fast_eng is not None:
+            use_native = (not bool(extra.ocr_render_only)) and (eff_backend == "auto")
+            if use_native:
+                outs = fast_eng.ocr_pdf(
+                    pdf_path,
+                    dpi=int(extra.ocr_dpi),
+                    page_indices=[0],
+                    use_native_text=True,
+                )
+                res = outs[0]
+                return res.text, res.finish_reason, _fast_result_meta(res)
+            pil_img = _render_pdf_first_page_pil(pdf_path, dpi=int(extra.ocr_dpi))
+            return _run_image_ocr(pil_img, task_kind=task_kind)
+        assert pub_ad is not None
+        if pub_ad.ocr_pdf_page_fn is not None and (not bool(extra.ocr_render_only) or not pub_ad.supports_images):
+            return pub_ad.ocr_pdf_page_fn(pdf_path, page_index=0)
+        pil_img = _render_pdf_first_page_pil(pdf_path, dpi=int(extra.ocr_dpi))
+        return pub_ad.ocr_image_fn(pil_img, task_kind=task_kind)
+
+    records: list[dict[str, Any]] = []
+    try:
+        guard.arm()
+        # Untimed tiny warmup for VLM/ANE paths so model compilation & weights load outside EOT timing.
+        if fast_eng is not None:
+            tiny = Image.new("RGB", (64, 64), (255, 255, 255))
+            if eff_backend == "ovis":
+                _ = fast_eng._get_ovis_engine().ocr_image(
+                    tiny, output_format="raw", crop_margins=False, auto_orient=False, speculative="off", max_tokens=2
+                )
+            elif eff_backend == "apple-vision":
+                _ = fast_eng.ocr_image(tiny)
+            else:
+                _ = fast_eng._get_vision_ocr().recognize_image(tiny, output_format="raw")
+                if any(s in suites for s in ("fintabnet_otsl", "omnidocbench_en", "cord_v2", "olmocr_bench")):
+                    _ = fast_eng._get_ovis_engine().ocr_image(
+                        tiny, output_format="raw", crop_margins=False, auto_orient=False, speculative="off", max_tokens=2
+                    )
+        elif pub_ad is not None and pub_ad.supports_images:
+            tiny = Image.new("RGB", (64, 64), (255, 255, 255))
+            _ = pub_ad.ocr_image_fn(tiny, max_tokens_override=2, task_kind="page")
+        _mx_sync()
+        _mx_reset_peak()
+
+        # Pre-decode/rasterize inputs outside timed inference strictly when --ocr-render-only is set
+        # or on image-only suites so PNG/Parquet decompression isn't conflated with inference latency.
+        for suite_name in suites:
+            items = loaded.get(suite_name) or []
+            if not items:
+                continue
+            _mx_reset_peak()
+
+            if suite_name == "olmocr_bench":
+                pre_imgs: list[Any] | None = None
+                if bool(extra.ocr_render_only) and (pub_ad is None or pub_ad.supports_images):
+                    pre_imgs = [_render_pdf_first_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi)) for it in items]
+                preds: list[str] = []
+                reasons: list[str] = []
+                metas: list[dict[str, Any]] = []
+                t0 = time.perf_counter()
+                for idx_p, it in enumerate(items):
+                    if pre_imgs is not None:
+                        tx, fr, md = _run_image_ocr(pre_imgs[idx_p], task_kind="page")
+                    else:
+                        tx, fr, md = _run_pdf_page_ocr(it["pdf_path"], task_kind="page")
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_olmocr_bench(
+                    items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "render_only": bool(extra.ocr_render_only),
+                    "dpi": int(extra.ocr_dpi),
+                    "speculative": extra.speculative if pkg_name == "fast-ocr" else "off",
+                    "crop_margins": (not bool(extra.no_crop_margins)) if pkg_name == "fast-ocr" else False,
+                    "auto_orient": (not bool(extra.no_auto_orient)) if pkg_name == "fast-ocr" else False,
+                    "overall_macro": ev["overall_macro"],
+                    "overall_no_hf": ev["overall_no_hf"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"olmOCR-bench({len(items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks=ev["per_category"],
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "fintabnet_otsl":
+                pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for pil_img in pils:
+                    tx, fr, md = _run_image_ocr(pil_img, task_kind="table")
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_fintabnet_otsl(
+                    items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "teds": ev["teds"],
+                    "teds_s": ev["teds_s"],
+                    "grits_top": ev["grits_top"],
+                    "grits_con": ev["grits_con"],
+                    "numeric_cell_f1": ev["numeric_cell_f1"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"FinTabNet-OTSL({len(items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "table_metrics": {
+                                "teds": ev["teds"],
+                                "teds_s": ev["teds_s"],
+                                "grits_top": ev["grits_top"],
+                                "grits_con": ev["grits_con"],
+                                "numeric_cell_f1": ev["numeric_cell_f1"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "omnidocbench_en":
+                pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for pil_img in pils:
+                    tx, fr, md = _run_image_ocr(pil_img, task_kind="page")
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_omnidocbench(
+                    items,
+                    preds,
+                    finish_reasons=reasons,
+                    allow_html_tables=allow_html_tables or (pkg_name != "fast-ocr"),
+                )
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "table_mode": extra.table_mode,
+                    "output_format": extra.output_format,
+                    "vocab_mode": (
+                        f"custom_{extra.ocr_vocab_size}" if extra.ocr_vocab_size else "ocr_latin_140k"
+                    )
+                    if (pkg_name == "fast-ocr" and eff_backend != "apple-vision")
+                    else "n/a",
+                    "omnidoc_overall": ev["omnidoc_overall"],
+                    "text_edit_distance": ev["text_edit_distance"],
+                    "reading_order_sim": ev["reading_order_sim"],
+                    "table_teds": ev["table_teds"],
+                    "formula_norm_sim": ev["formula_norm_sim"],
+                    "valid_markdown_rate": ev["valid_markdown_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"OmniDocBench-EN({len(items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "omnidoc_pillars": {
+                                "omnidoc_overall": ev["omnidoc_overall"],
+                                "text_similarity": ev["text_similarity"],
+                                "text_edit_distance": ev["text_edit_distance"],
+                                "reading_order_sim": ev["reading_order_sim"],
+                                "table_teds": ev["table_teds"],
+                                "formula_norm_sim": ev["formula_norm_sim"],
+                                "n_table_pages": ev["n_table_pages"],
+                                "n_formula_pages": ev["n_formula_pages"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+
+            elif suite_name == "cord_v2":
+                pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
+                prompts = [_build_cord_v2_prompt(it["schema"]) for it in items]
+                preds, reasons, metas = [], [], []
+                t0 = time.perf_counter()
+                for pil_img, pr, it in zip(pils, prompts, items):
+                    tx, fr, md = _run_image_ocr(
+                        pil_img,
+                        prompt=pr,
+                        schema=it["schema"],
+                        max_tokens_override=min(1024, int(extra.ocr_max_tokens)),
+                        task_kind="page",
+                    )
+                    preds.append(tx)
+                    reasons.append(fr)
+                    metas.append(md)
+                _mx_sync()
+                wall = time.perf_counter() - t0
+                _, ref = guard.check()
+                if ref is not None:
+                    guard_tripped = True
+                ev = evaluate_cord_v2(items, preds, finish_reasons=reasons)
+                mem4 = _memory_4bucket_dict(probe)
+                rate_diag = _summarize_cat5_rates(metas, n_pages=len(items), wall_sec=wall, default_family=default_family)
+                diag = {
+                    "backend": eff_backend,
+                    **rate_diag,
+                    "llguidance": bool(pkg_name == "fast-ocr" and eff_backend != "apple-vision"),
+                    "grounded_field_f1": ev["grounded_field_f1"],
+                    "anls": ev["anls"],
+                    "valid_json_rate": ev["valid_json_rate"],
+                    "valid_schema_rate": ev["valid_schema_rate"],
+                    "repeat_4gram_rate": ev["repeat_4gram_rate"],
+                    "repeat_loop_count": ev["repeat_loop_count"],
+                    "device_guard_tripped": guard_tripped,
+                }
+                records.append(
+                    _build_record(
+                        package=pkg_name,
+                        category=5,
+                        config_label=eff_label,
+                        benchmark=f"CORD-v2({len(items)})",
+                        valid_flags=ev["per_item_valid"],
+                        item_scores=ev["per_item_scores"],
+                        wall_sec=wall,
+                        diagnostics=diag,
+                        memory_4bucket_gb=mem4,
+                        sub_benchmarks={
+                            "cord_v2": {
+                                "grounded_field_f1": ev["grounded_field_f1"],
+                                "anls": ev["anls"],
+                                "valid_json_rate": ev["valid_json_rate"],
+                                "valid_schema_rate": ev["valid_schema_rate"],
+                            }
+                        },
+                        host_mem_gb=host_mem_gb,
+                    )
+                )
+    finally:
+        if pub_ad is not None:
+            pub_ad.close()
+        if fast_eng is not None and hasattr(fast_eng, "close"):
+            fast_eng.close()
+    return records
+
+
 def _run_worker_main(args: argparse.Namespace) -> int:
     """Isolated child subprocess entrypoint executing one package+config under wired_limit & 4-bucket probes."""
     lock, _ = load_lockfile(args.lockfile)
@@ -2056,6 +2771,36 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                             "gate_verdict": "SKIP",
                         }
                     )
+        elif pkg_name in _CAT5_PACKAGES:
+            try:
+                recs = _run_cat5_worker(
+                    pkg_name,
+                    tier=args.tier,
+                    config_label=args.worker_label or "",
+                    extra=extra,
+                    lock=lock,
+                    cache_dir=cache_dir,
+                    local_files_only=bool(args.local_files_only),
+                    max_items=args.max_items,
+                    smoke=bool(args.smoke),
+                    home=home,
+                    host_mem_gb=host_mem,
+                )
+            except FileNotFoundError as exc:
+                if pkg_name.startswith(("public-", "coreai-", "coreml-")):
+                    recs = [
+                        {
+                            "package": pkg_name,
+                            "category": 5,
+                            "config_label": args.worker_label or pkg_name,
+                            "benchmark": "olmOCR-bench+FinTabNet+OmniDocBench+CORD-v2",
+                            "status": "skipped",
+                            "error": str(exc),
+                            "gate_verdict": "SKIP",
+                        }
+                    ]
+                else:
+                    raise
         elif pkg_name == "coreai-qwen3.5-4b" and extra.coreai_variant == "both":
             recs = []
             for ca_var in ("4bit", "fp4_fp8"):
@@ -2197,6 +2942,7 @@ def _spawn_isolated_worker(
         str(_REPO_ROOT / "packages" / "fast-embeddinggemma-2" / "src"),
         str(_REPO_ROOT / "packages" / "fast-pplx" / "src"),
         str(_REPO_ROOT / "packages" / "fast-gpt-oss" / "src"),
+        str(_REPO_ROOT / "packages" / "fast-ocr" / "src"),
     ]
     if getattr(args, "pplx_mlx_path", None):
         py_paths.append(str(Path(args.pplx_mlx_path).expanduser()))
@@ -2283,6 +3029,15 @@ def _aggregate_abba_records(runs: Sequence[list[dict[str, Any]]]) -> list[dict[s
         )
         rep["abba_repeats"] = len(slot_runs)
         rep["wall_series_sec"] = [round(float(r["wall_sec"]), 4) for r in slot_runs]
+        if rep.get("category") == 5 and isinstance(rep.get("diagnostics"), Mapping):
+            diag5 = dict(rep["diagnostics"])
+            n_it = max(1, int(rep.get("n_items", 1) or 1))
+            diag5["pages_per_sec"] = round(float(rep["n_items"]) / max(med_wall, 1e-6), 4)
+            diag5["sec_per_page"] = round(med_wall / float(n_it), 4)
+            tot_tok = int(diag5.get("total_generated_tokens", 0) or 0)
+            if tot_tok > 0:
+                diag5["e2e_tok_s"] = round(float(tot_tok) / max(med_wall, 1e-6), 2)
+            rep["diagnostics"] = diag5
         if rep.get("category") == 1:
             incomplete = [i for i, r in enumerate(slot_records, 1) if r.get("status") != "ok" or retrieval_coverage_errors(r)]
             if incomplete:
@@ -2302,12 +3057,34 @@ def parse_abba_arm(raw: str) -> tuple[str, str]:
     return lbl.strip(), flags.strip()
 
 
+def _fmt_opt_rate(val: float | None, digits: int = 1) -> str:
+    if val is None or float(val) <= 0.0:
+        return "-"
+    return f"{float(val):.{digits}f}"
+
+
+def _fmt_opt_ratio(val: float | None) -> str:
+    if val is None or float(val) <= 0.0:
+        return "-"
+    return f"{float(val):.2f}x"
+
+
+def _short_chip_label(chip: str | None, fallback: str) -> str:
+    raw = str(chip or "").strip()
+    if not raw:
+        return fallback
+    if raw.lower().startswith("apple "):
+        return raw[6:].strip() or fallback
+    return raw
+
+
 def format_outcomes_markdown(results: Sequence[Mapping[str, Any]]) -> str:
     """Render concise Markdown summary table of External Objective Outcome Benchmark results."""
     lines = [
         "| Package | Cat | Config | Benchmark | Valid / intended | `S_obj,e2e` | `EOT` (u/s) | Wall (s) | 4-Bucket Mem (GB) | Gate |",
         "|---|---:|---|---|---:|---:|---:|---:|---:|---|",
     ]
+    cat5_ok: list[Mapping[str, Any]] = []
     for r in results:
         pkg = r.get("package", "-")
         cat = r.get("category", "-")
@@ -2323,6 +3100,104 @@ def format_outcomes_markdown(results: Sequence[Mapping[str, Any]]) -> str:
         mem = float((r.get("memory_4bucket_gb") or {}).get("combined_with_model_mapped_gb", 0.0))
         guard = "FAIL (retrieval coverage)" if retrieval_coverage_errors(r) else r.get("gate_verdict", "PASS")
         lines.append(f"| `{pkg}` | {cat} | `{cfg}` | {bench} | {n_str} | {s_val} | {eot_val} | {wall} | {mem:.3f} | `{guard}` |")
+        if cat == 5:
+            cat5_ok.append(r)
+
+    if cat5_ok:
+        lines.extend(
+            [
+                "",
+                "### Category 5 OCR Cross-Family Token & Page Rates",
+                "",
+                "| Package | Family | Config | Benchmark | `S_obj,e2e` | `pp/s` | `s/page` | `tok/page` | Decode `tok/s` | E2E `tok/s` | `EOT` (u/s) | Mem (GB) |",
+                "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for r in cat5_ok:
+            rates = _extract_cat5_rates(r)
+            lines.append(
+                f"| `{r.get('package', '-')}` | `{rates['model_family']}` | `{r.get('config_label', '-')}` "
+                f"| {r.get('benchmark', '-')} | {float(r['objective_score_e2e']):.4f} "
+                f"| {rates['pages_per_sec']:.3f} | {rates['sec_per_page']:.2f} "
+                f"| {_fmt_opt_rate(rates['tokens_per_page'], 1)} | {_fmt_opt_rate(rates['decode_tok_s'], 1)} "
+                f"| {_fmt_opt_rate(rates['e2e_tok_s'], 1)} | {float(r['effective_outcome_per_sec']):.3f} "
+                f"| {rates['mem_gb']:.3f} |"
+            )
+    return "\n".join(lines)
+
+
+def format_compare_markdown(
+    comparisons: Sequence[Mapping[str, Any]],
+    *,
+    baseline_chip: str = "Baseline",
+    candidate_chip: str = "Candidate",
+) -> str:
+    """Render side-by-side comparison Markdown, including cross-chip M4 vs M5 OCR token/page rates."""
+    b_lbl = _short_chip_label(baseline_chip, "Base")
+    c_lbl = _short_chip_label(candidate_chip, "Cand")
+    lines = [
+        f"### Outcome Comparison (`{baseline_chip}` vs `{candidate_chip}`)",
+        "",
+        f"| Package | Cat | Benchmark | {b_lbl} `S_obj` | {c_lbl} `S_obj` | `ΔS_obj` | {b_lbl} `EOT` | {c_lbl} `EOT` | `EOT` Ratio | {b_lbl} Mem | {c_lbl} Mem | Verdict |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    cat5_rows: list[Mapping[str, Any]] = []
+    for c in comparisons:
+        pkg = c.get("package", "-")
+        cat = c.get("category", "-")
+        bench = c.get("benchmark", "-")
+        b_sc = c.get("baseline_score_e2e")
+        c_sc = c.get("candidate_score_e2e")
+        d_sc = c.get("delta_objective_score_e2e")
+        b_eot = c.get("baseline_eot")
+        c_eot = c.get("candidate_eot")
+        eot_r = c.get("eot_ratio")
+        b_mem = c.get("baseline_mem_gb")
+        c_mem = c.get("candidate_mem_gb")
+        lines.append(
+            f"| `{pkg}` | {cat} | {bench} "
+            f"| {f'{float(b_sc):.4f}' if b_sc is not None else '-'} "
+            f"| {f'{float(c_sc):.4f}' if c_sc is not None else '-'} "
+            f"| {f'{float(d_sc):+.4f}' if d_sc is not None else '-'} "
+            f"| {f'{float(b_eot):.3f}' if b_eot is not None else '-'} "
+            f"| {f'{float(c_eot):.3f}' if c_eot is not None else '-'} "
+            f"| {_fmt_opt_ratio(eot_r)} "
+            f"| {f'{float(b_mem):.2f} GB' if b_mem is not None else '-'} "
+            f"| {f'{float(c_mem):.2f} GB' if c_mem is not None else '-'} "
+            f"| `{c.get('verdict', 'FAIL')}` |"
+        )
+        if cat == 5 and c.get("baseline_pages_per_sec") is not None:
+            cat5_rows.append(c)
+
+    if cat5_rows:
+        lines.extend(
+            [
+                "",
+                f"### Category 5 Cross-Silicon OCR Token & Page Rates (`{baseline_chip}` vs `{candidate_chip}`)",
+                "",
+                f"| Package | Family | Benchmark | {b_lbl} `S_obj` | {c_lbl} `S_obj` | {b_lbl} `pp/s` (`s/p`) | {c_lbl} `pp/s` (`s/p`) | `pp/s` Ratio | {b_lbl} `tok/p` | {c_lbl} `tok/p` | {b_lbl} Dec `tok/s` | {c_lbl} Dec `tok/s` | Dec Ratio | {b_lbl} E2E `tok/s` | {c_lbl} E2E `tok/s` | E2E Ratio | {b_lbl} Mem | {c_lbl} Mem | Verdict |",
+                "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            ]
+        )
+        for c in cat5_rows:
+            b_pps = float(c.get("baseline_pages_per_sec", 0.0) or 0.0)
+            c_pps = float(c.get("candidate_pages_per_sec", 0.0) or 0.0)
+            b_spp = float(c.get("baseline_sec_per_page", 0.0) or 0.0)
+            c_spp = float(c.get("candidate_sec_per_page", 0.0) or 0.0)
+            b_mem = c.get("baseline_mem_gb")
+            c_mem = c.get("candidate_mem_gb")
+            lines.append(
+                f"| `{c.get('package', '-')}` | `{c.get('model_family', '-')}` | {c.get('benchmark', '-')} "
+                f"| {float(c.get('baseline_score_e2e', 0.0) or 0.0):.4f} "
+                f"| {float(c.get('candidate_score_e2e', 0.0) or 0.0):.4f} "
+                f"| {b_pps:.3f} ({b_spp:.2f}s) | {c_pps:.3f} ({c_spp:.2f}s) | {_fmt_opt_ratio(c.get('pages_per_sec_ratio'))} "
+                f"| {_fmt_opt_rate(c.get('baseline_tokens_per_page'), 1)} | {_fmt_opt_rate(c.get('candidate_tokens_per_page'), 1)} "
+                f"| {_fmt_opt_rate(c.get('baseline_decode_tok_s'), 1)} | {_fmt_opt_rate(c.get('candidate_decode_tok_s'), 1)} | {_fmt_opt_ratio(c.get('decode_tok_s_ratio'))} "
+                f"| {_fmt_opt_rate(c.get('baseline_e2e_tok_s'), 1)} | {_fmt_opt_rate(c.get('candidate_e2e_tok_s'), 1)} | {_fmt_opt_ratio(c.get('e2e_tok_s_ratio'))} "
+                f"| {f'{float(b_mem):.2f} GB' if b_mem is not None else '-'} "
+                f"| {f'{float(c_mem):.2f} GB' if c_mem is not None else '-'} "
+                f"| `{c.get('verdict', 'FAIL')}` |"
+            )
     return "\n".join(lines)
 
 
@@ -2358,16 +3233,24 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             and base_doc["dataset_lock_sha256"] != cand_doc["dataset_lock_sha256"]):
         print(json.dumps({"comparisons": [], "verdict": "FAIL", "error": "Dataset lock fingerprints differ."}, indent=2))
         return 1
+    base_env = base_doc.get("environment") or {}
+    cand_env = cand_doc.get("environment") or {}
+    base_chip = str(base_env.get("chip") or "Baseline")
+    cand_chip = str(cand_env.get("chip") or "Candidate")
     host_mem = float(args.host_mem_gb) if args.host_mem_gb is not None else float(
-        (cand_doc.get("environment") or {}).get("mem_gb") or 0.0
+        cand_env.get("mem_gb") or 0.0
     )
 
     base_by_key: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for br in base_doc.get("results", []):
+        if br.get("status") == "skipped":
+            continue
         base_by_key.setdefault(_compare_record_key(br), []).append(br)
 
     comparisons: list[dict[str, Any]] = []
     for cr in cand_doc.get("results", []):
+        if cr.get("status") == "skipped":
+            continue
         key = _compare_record_key(cr)
         bucket = base_by_key.get(key)
         if not bucket:
@@ -2384,6 +3267,8 @@ def _cmd_compare(args: argparse.Namespace) -> int:
                         "benchmark": cr.get("benchmark"),
                         "baseline_label": None,
                         "candidate_label": cr.get("config_label"),
+                        "baseline_chip": base_chip,
+                        "candidate_chip": cand_chip,
                         "verdict": "FAIL",
                         "reasons": [f"Ambiguous baseline match ({len(bucket)} records) for key {key}"],
                     }
@@ -2398,16 +3283,54 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             min_eot_ratio=float(args.min_eot_ratio),
             host_mem_gb=host_mem if host_mem > 0 else None,
         )
-        comparisons.append(
-            {
-                "package": cr.get("package"),
-                "category": cr.get("category"),
-                "benchmark": cr.get("benchmark"),
-                "baseline_label": br.get("config_label"),
-                "candidate_label": cr.get("config_label"),
-                **ev.to_dict(),
-            }
-        )
+        b_mem = float((br.get("memory_4bucket_gb") or {}).get("combined_with_model_mapped_gb", 0.0) or 0.0)
+        c_mem = float((cr.get("memory_4bucket_gb") or {}).get("combined_with_model_mapped_gb", 0.0) or 0.0)
+        comp_row: dict[str, Any] = {
+            "package": cr.get("package"),
+            "category": cr.get("category"),
+            "benchmark": cr.get("benchmark"),
+            "baseline_label": br.get("config_label"),
+            "candidate_label": cr.get("config_label"),
+            "baseline_chip": base_chip,
+            "candidate_chip": cand_chip,
+            "baseline_score_e2e": round(float(br.get("objective_score_e2e", 0.0) or 0.0), 4),
+            "candidate_score_e2e": round(float(cr.get("objective_score_e2e", 0.0) or 0.0), 4),
+            "baseline_eot": round(float(br.get("effective_outcome_per_sec", 0.0) or 0.0), 3),
+            "candidate_eot": round(float(cr.get("effective_outcome_per_sec", 0.0) or 0.0), 3),
+            "baseline_wall_sec": round(float(br.get("wall_sec", 0.0) or 0.0), 4),
+            "candidate_wall_sec": round(float(cr.get("wall_sec", 0.0) or 0.0), 4),
+            "baseline_mem_gb": round(b_mem, 4),
+            "candidate_mem_gb": round(c_mem, 4),
+            **ev.to_dict(),
+        }
+        if cr.get("category") == 5:
+            b_rates = _extract_cat5_rates(br)
+            c_rates = _extract_cat5_rates(cr)
+            comp_row.update(
+                {
+                    "model_family": c_rates["model_family"] or b_rates["model_family"],
+                    "baseline_pages_per_sec": b_rates["pages_per_sec"],
+                    "candidate_pages_per_sec": c_rates["pages_per_sec"],
+                    "pages_per_sec_ratio": round(c_rates["pages_per_sec"] / max(b_rates["pages_per_sec"], 1e-6), 3)
+                    if b_rates["pages_per_sec"] > 0.0
+                    else None,
+                    "baseline_sec_per_page": b_rates["sec_per_page"],
+                    "candidate_sec_per_page": c_rates["sec_per_page"],
+                    "baseline_tokens_per_page": b_rates["tokens_per_page"],
+                    "candidate_tokens_per_page": c_rates["tokens_per_page"],
+                    "baseline_decode_tok_s": b_rates["decode_tok_s"],
+                    "candidate_decode_tok_s": c_rates["decode_tok_s"],
+                    "decode_tok_s_ratio": round(c_rates["decode_tok_s"] / max(b_rates["decode_tok_s"], 1e-6), 3)
+                    if (b_rates["decode_tok_s"] > 0.0 and c_rates["decode_tok_s"] > 0.0)
+                    else None,
+                    "baseline_e2e_tok_s": b_rates["e2e_tok_s"],
+                    "candidate_e2e_tok_s": c_rates["e2e_tok_s"],
+                    "e2e_tok_s_ratio": round(c_rates["e2e_tok_s"] / max(b_rates["e2e_tok_s"], 1e-6), 3)
+                    if (b_rates["e2e_tok_s"] > 0.0 and c_rates["e2e_tok_s"] > 0.0)
+                    else None,
+                }
+            )
+        comparisons.append(comp_row)
     if not comparisons:
         out_empty = {
             "comparisons": [],
@@ -2418,7 +3341,25 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         return 1
     verdicts = {r["verdict"] for r in comparisons}
     verdict = "FAIL" if "FAIL" in verdicts else "UNRESOLVED" if "UNRESOLVED" in verdicts else "PASS"
-    print(json.dumps({"comparisons": comparisons, "verdict": verdict}, indent=2))
+    md_out = format_compare_markdown(comparisons, baseline_chip=base_chip, candidate_chip=cand_chip)
+    if getattr(args, "markdown_out", None):
+        out_m = Path(args.markdown_out)
+        out_m.parent.mkdir(parents=True, exist_ok=True)
+        out_m.write_text(md_out + "\n", encoding="utf-8")
+    if getattr(args, "markdown", False):
+        print(md_out)
+    else:
+        print(
+            json.dumps(
+                {
+                    "baseline_environment": base_env,
+                    "candidate_environment": cand_env,
+                    "comparisons": comparisons,
+                    "verdict": verdict,
+                },
+                indent=2,
+            )
+        )
     return 0 if verdict == "PASS" else 1
 
 
@@ -2455,6 +3396,19 @@ def compute_public_comparisons(
         ("fast-qwen3", None, "public-qwen3.5"),
         ("fast-qwen3", None, "coreai-qwen3.5-4b"),
         ("fast-gpt-oss", None, "public-gpt-oss"),
+        ("fast-ocr", None, "public-ovis-mlx-vlm"),
+        ("fast-ocr", None, "public-apple-vision"),
+        ("fast-ocr", None, "public-pypdfium2"),
+        ("fast-ocr", None, "public-glm-ocr-mlx-vlm"),
+        ("fast-ocr", None, "public-lightonocr2-mlx-vlm"),
+        ("fast-ocr", None, "public-deepseek-ocr2-mlx-vlm"),
+        ("fast-ocr", None, "public-paddleocr-vl-mlx-vlm"),
+        ("fast-ocr", None, "public-nemotron-parse-mlx-vlm"),
+        ("fast-ocr", None, "public-nuextract3-mlx-vlm"),
+        ("fast-ocr", None, "public-rapidocr"),
+        ("fast-ocr", None, "public-tesseract"),
+        ("fast-ocr", None, "public-docling"),
+        ("fast-ocr", None, "public-marker"),
     )
     for fast_pkg, backend_filter, pub_pkg in pair_map:
         fast_cands = [
@@ -2502,6 +3456,42 @@ def compute_public_comparisons(
                     "stock_eot": round(p_eot, 3),
                     "eot_speedup_vs_stock": round(f_eot / max(p_eot, 1e-6), 3),
                 }
+                if fr.get("category") == 5:
+                    f_rates = _extract_cat5_rates(fr)
+                    p_rates = _extract_cat5_rates(pr)
+                    row.update(
+                        {
+                            "fast_family": f_rates["model_family"],
+                            "stock_family": p_rates["model_family"],
+                            "fast_pages_per_sec": f_rates["pages_per_sec"],
+                            "stock_pages_per_sec": p_rates["pages_per_sec"],
+                            "pages_per_sec_ratio": round(
+                                f_rates["pages_per_sec"] / max(p_rates["pages_per_sec"], 1e-6), 3
+                            )
+                            if p_rates["pages_per_sec"] > 0.0
+                            else None,
+                            "fast_sec_per_page": f_rates["sec_per_page"],
+                            "stock_sec_per_page": p_rates["sec_per_page"],
+                            "fast_tokens_per_page": f_rates["tokens_per_page"],
+                            "stock_tokens_per_page": p_rates["tokens_per_page"],
+                            "fast_decode_tok_s": f_rates["decode_tok_s"],
+                            "stock_decode_tok_s": p_rates["decode_tok_s"],
+                            "decode_tok_s_ratio": round(
+                                f_rates["decode_tok_s"] / max(p_rates["decode_tok_s"], 1e-6), 3
+                            )
+                            if (f_rates["decode_tok_s"] > 0.0 and p_rates["decode_tok_s"] > 0.0)
+                            else None,
+                            "fast_e2e_tok_s": f_rates["e2e_tok_s"],
+                            "stock_e2e_tok_s": p_rates["e2e_tok_s"],
+                            "e2e_tok_s_ratio": round(
+                                f_rates["e2e_tok_s"] / max(p_rates["e2e_tok_s"], 1e-6), 3
+                            )
+                            if (f_rates["e2e_tok_s"] > 0.0 and p_rates["e2e_tok_s"] > 0.0)
+                            else None,
+                            "fast_mem_gb": f_rates["mem_gb"],
+                            "stock_mem_gb": p_rates["mem_gb"],
+                        }
+                    )
                 if f_cap is not None and p_cap is not None:
                     row["fast_coarse_max_tokens"] = int(f_cap)
                     row["stock_coarse_max_tokens"] = int(p_cap)
@@ -2535,12 +3525,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             for s in COREML_BASELINE_SPECS:
                 if s.name not in pkg_names:
                     pkg_names.append(s.name)
+        elif tok_p == "ocr-families":
+            saw_group_token = True
+            for name in OCR_FAMILY_PACKAGES:
+                if name not in pkg_names:
+                    pkg_names.append(name)
         elif tok_p in _SPEC_BY_NAME or tok_p == "openai-chat":
             if tok_p not in pkg_names:
                 pkg_names.append(tok_p)
         else:
             raise ValueError(
-                f"Unknown package {tok_p!r}; choose from all, public, coreml, {', '.join(_SPEC_BY_NAME)}, openai-chat"
+                f"Unknown package {tok_p!r}; choose from all, public, coreml, ocr-families, {', '.join(_SPEC_BY_NAME)}, openai-chat"
             )
 
     if getattr(args, "include_public_baselines", False):
@@ -2590,7 +3585,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if idx > 1 and cooldown > 0.0:
                 time.sleep(cooldown)
             print(f"[{idx}/{len(pkg_names)}] Running outcome benchmarks for {pkg} ({args.tier})...", file=sys.stderr, flush=True)
-            worker_py = pub_py if pkg.startswith(("public-", "coreai-")) else args.python
+            worker_py = (
+                pub_py
+                if pkg.startswith(("public-", "coreai-"))
+                and pkg not in ("public-apple-vision", "public-pypdfium2", "public-tesseract")
+                else args.python
+            )
 
             if len(abba_arms) >= 2:
                 # Interleaved A-B-B-A execution in isolated child subprocesses.
@@ -2709,7 +3709,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     rn = sub.add_parser("run", help="Run isolated Tier-1 / Tier-2 objective outcome benchmarks under GPU lock")
     rn.add_argument("--tier", choices=("tier1", "tier2"), default="tier1")
-    rn.add_argument("--packages", default="all", help="Comma-separated package names or groups (all, public, coreml)")
+    rn.add_argument(
+        "--packages",
+        default="all",
+        help="Comma-separated package names or groups (all, public, coreml, ocr-families)",
+    )
     rn.add_argument("--abba-compare", nargs="+", default=None, help="Two 'label:flags' arms for interleaved ABBA")
     rn.add_argument("--abba-rounds", type=int, default=2, help="Interleaved ABBA rounds when --abba-compare is set")
     rn.add_argument("--gate-profile", choices=("lossless", "quantized"), default="lossless")
@@ -2754,6 +3758,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Fixed acceptable score loss for the paired 95%% interval (default: 0.003)")
     cp.add_argument("--min-eot-ratio", type=float, default=1.0)
     cp.add_argument("--host-mem-gb", type=float, default=None)
+    cp.add_argument("--markdown", action="store_true", help="Render cross-chip/cross-family Markdown tables instead of JSON")
+    cp.add_argument("--markdown-out", default=None, help="Optional path to write Markdown comparison tables")
     cp.set_defaults(func=_cmd_compare)
 
     wk = sub.add_parser("_worker", help=argparse.SUPPRESS)

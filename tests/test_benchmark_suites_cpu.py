@@ -1626,3 +1626,155 @@ def test_coreai_gemma4_llm_runner_bundle_preference_and_telemetry_parsing_cpu(tm
     assert "timeout=600" in opb_src
 
 
+def test_cat5_cross_family_and_m4_vs_m5_rates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = _load_script("test_cat5_cross_family_out", "benchmark_outcomes.py")
+    opb = _load_script("test_cat5_cross_family_opb", "_outcome_public_backends.py")
+
+    # 1. --packages ocr-families --dry-run expands all 14 cross-family packages
+    rc_dry = out.main(["run", "--dry-run", "--packages", "ocr-families"])
+    assert rc_dry == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["packages"] == list(out.OCR_FAMILY_PACKAGES)
+    assert len(plan["packages"]) == 14
+    for expected in (
+        "fast-ocr",
+        "public-ovis-mlx-vlm",
+        "public-glm-ocr-mlx-vlm",
+        "public-lightonocr2-mlx-vlm",
+        "public-deepseek-ocr2-mlx-vlm",
+        "public-paddleocr-vl-mlx-vlm",
+        "public-nemotron-parse-mlx-vlm",
+        "public-rapidocr",
+        "public-tesseract",
+        "public-docling",
+        "public-marker",
+    ):
+        assert expected in plan["packages"]
+
+    # 2. Family-native OCR prompt resolution (page vs table)
+    assert opb.resolve_cat5_native_prompt("public-glm-ocr-mlx-vlm", task_kind="page") == "Text Recognition:"
+    assert opb.resolve_cat5_native_prompt("public-glm-ocr-mlx-vlm", task_kind="table") == "Table Recognition:"
+    assert opb.resolve_cat5_native_prompt("public-lightonocr2-mlx-vlm", task_kind="page") == ""
+    assert opb.resolve_cat5_native_prompt("public-paddleocr-vl-mlx-vlm", task_kind="page") == "OCR:"
+    assert opb.resolve_cat5_native_prompt("public-paddleocr-vl-mlx-vlm", task_kind="table") == "Table Recognition:"
+    assert "<|grounding|>" in opb.resolve_cat5_native_prompt("public-deepseek-ocr2-mlx-vlm", task_kind="page")
+
+    # 3. _summarize_cat5_rates + compute_public_comparisons + format_outcomes_markdown
+    rates = out._summarize_cat5_rates(
+        [
+            {"backend_used": "ovis:8bit", "model_family": "qwen3.5-ovis", "generated_tokens": 300, "prompt_tokens": 600, "visual_tokens": 500, "decode_ms": 2000.0, "decode_tps": 150.0},
+            {"backend_used": "ovis:8bit", "model_family": "qwen3.5-ovis", "generated_tokens": 500, "prompt_tokens": 800, "visual_tokens": 700, "decode_ms": 2000.0, "decode_tps": 250.0},
+        ],
+        n_pages=2,
+        wall_sec=5.0,
+        default_family="qwen3.5-ovis",
+    )
+    assert rates["pages_per_sec"] == pytest.approx(0.4)
+    assert rates["sec_per_page"] == pytest.approx(2.5)
+    assert rates["total_generated_tokens"] == 800
+    assert rates["tokens_per_page"] == pytest.approx(400.0)
+    assert rates["decode_tok_s"] == pytest.approx(200.0)
+    assert rates["e2e_tok_s"] == pytest.approx(160.0)
+
+    def _cat5_rec(pkg: str, family: str, cfg: str, wall: float, gen_toks: int, dec_tps: float, score: float, mem: float) -> dict[str, object]:
+        n = 4
+        return {
+            "package": pkg,
+            "category": 5,
+            "config_label": cfg,
+            "benchmark": "FinTabNet-OTSL(4)",
+            "status": "ok",
+            "n_items": n,
+            "n_valid": n,
+            "wall_sec": wall,
+            "raw_items_per_sec": round(n / wall, 4),
+            "valid_outputs_per_sec": round(n / wall, 4),
+            "objective_score_e2e": score,
+            "effective_outcome_per_sec": round((n / wall) * score, 4),
+            "per_item_effective_scores": [score] * n,
+            "memory_4bucket_gb": {"combined_with_model_mapped_gb": mem},
+            "diagnostics": {
+                "backend": "ovis" if pkg == "fast-ocr" else pkg,
+                "model_family": family,
+                "pages_per_sec": round(n / wall, 4),
+                "sec_per_page": round(wall / n, 4),
+                "total_generated_tokens": gen_toks,
+                "tokens_per_page": round(gen_toks / n, 2),
+                "decode_tok_s": dec_tps,
+                "e2e_tok_s": round(gen_toks / wall, 2) if gen_toks > 0 else 0.0,
+            },
+            "gate_verdict": "PASS",
+        }
+
+    m4_rows = [
+        _cat5_rec("fast-ocr", "qwen3.5-ovis", "ovis_gfm_render", wall=4.0, gen_toks=1200, dec_tps=400.0, score=0.90, mem=1.8),
+        _cat5_rec("public-glm-ocr-mlx-vlm", "glm-ocr", "glm_ocr_mlx_vlm", wall=8.0, gen_toks=1000, dec_tps=200.0, score=0.88, mem=2.6),
+        _cat5_rec("public-rapidocr", "rapidocr-onnx", "rapidocr_onnx", wall=2.0, gen_toks=0, dec_tps=0.0, score=0.45, mem=0.4),
+        {"package": "public-deepseek-ocr2-mlx-vlm", "category": 5, "config_label": "deepseek", "benchmark": "all", "status": "skipped", "gate_verdict": "SKIP"},
+    ]
+    m5_rows = [
+        _cat5_rec("fast-ocr", "qwen3.5-ovis", "ovis_gfm_render", wall=5.0, gen_toks=1200, dec_tps=300.0, score=0.90, mem=1.75),
+        _cat5_rec("public-glm-ocr-mlx-vlm", "glm-ocr", "glm_ocr_mlx_vlm", wall=10.0, gen_toks=1000, dec_tps=150.0, score=0.88, mem=2.55),
+        _cat5_rec("public-rapidocr", "rapidocr-onnx", "rapidocr_onnx", wall=1.6, gen_toks=0, dec_tps=0.0, score=0.45, mem=0.38),
+        {"package": "public-deepseek-ocr2-mlx-vlm", "category": 5, "config_label": "deepseek", "benchmark": "all", "status": "skipped", "gate_verdict": "SKIP"},
+    ]
+
+    pub_comps = out.compute_public_comparisons(m4_rows)
+    assert len(pub_comps) == 2
+    glm_pair = next(c for c in pub_comps if c["stock_package"] == "public-glm-ocr-mlx-vlm")
+    assert glm_pair["fast_family"] == "qwen3.5-ovis"
+    assert glm_pair["stock_family"] == "glm-ocr"
+    assert glm_pair["pages_per_sec_ratio"] == pytest.approx(2.0)
+    assert glm_pair["decode_tok_s_ratio"] == pytest.approx(2.0)
+    assert glm_pair["e2e_tok_s_ratio"] == pytest.approx(2.4)
+    assert glm_pair["fast_tokens_per_page"] == pytest.approx(300.0)
+    assert glm_pair["stock_tokens_per_page"] == pytest.approx(250.0)
+
+    md_run = out.format_outcomes_markdown(m4_rows)
+    assert "### Category 5 OCR Cross-Family Token & Page Rates" in md_run
+    assert "`qwen3.5-ovis`" in md_run and "`glm-ocr`" in md_run and "`rapidocr-onnx`" in md_run
+
+    # 4. Cross-chip compare (Apple M4 Pro vs Apple M5) JSON & Markdown tables
+    m4_json = tmp_path / "m4_ocr.json"
+    m5_json = tmp_path / "m5_ocr.json"
+    md_file = tmp_path / "m4_vs_m5.md"
+    m4_json.write_text(
+        json.dumps({"environment": {"chip": "Apple M4 Pro", "mem_gb": 48.0}, "dataset_lock_sha256": "abc", "results": m4_rows}),
+        encoding="utf-8",
+    )
+    m5_json.write_text(
+        json.dumps({"environment": {"chip": "Apple M5", "mem_gb": 24.0}, "dataset_lock_sha256": "abc", "results": m5_rows}),
+        encoding="utf-8",
+    )
+
+    rc_json = out.main(["compare", str(m4_json), str(m5_json), "--min-eot-ratio", "0.0", "--markdown-out", str(md_file)])
+    assert rc_json == 0
+    cmp_payload = json.loads(capsys.readouterr().out)
+    assert cmp_payload["verdict"] == "PASS"
+    assert len(cmp_payload["comparisons"]) == 3  # skipped package cleanly ignored
+    fast_cmp = next(c for c in cmp_payload["comparisons"] if c["package"] == "fast-ocr")
+    assert fast_cmp["baseline_chip"] == "Apple M4 Pro"
+    assert fast_cmp["candidate_chip"] == "Apple M5"
+    assert fast_cmp["baseline_pages_per_sec"] == pytest.approx(1.0)
+    assert fast_cmp["candidate_pages_per_sec"] == pytest.approx(0.8)
+    assert fast_cmp["pages_per_sec_ratio"] == pytest.approx(0.8)
+    assert fast_cmp["baseline_tokens_per_page"] == pytest.approx(300.0)
+    assert fast_cmp["candidate_tokens_per_page"] == pytest.approx(300.0)
+    assert fast_cmp["baseline_decode_tok_s"] == pytest.approx(400.0)
+    assert fast_cmp["candidate_decode_tok_s"] == pytest.approx(300.0)
+    assert fast_cmp["decode_tok_s_ratio"] == pytest.approx(0.75)
+    assert fast_cmp["baseline_e2e_tok_s"] == pytest.approx(300.0)
+    assert fast_cmp["candidate_e2e_tok_s"] == pytest.approx(240.0)
+    assert fast_cmp["e2e_tok_s_ratio"] == pytest.approx(0.8)
+
+    rc_md = out.main(["compare", str(m4_json), str(m5_json), "--min-eot-ratio", "0.0", "--markdown"])
+    assert rc_md == 0
+    md_text = capsys.readouterr().out
+    assert "### Category 5 Cross-Silicon OCR Token & Page Rates (`Apple M4 Pro` vs `Apple M5`)" in md_text
+    assert "M4 Pro `pp/s`" in md_text and "M5 `pp/s`" in md_text
+    assert "M4 Pro Dec `tok/s`" in md_text and "M5 Dec `tok/s`" in md_text
+    assert "0.80x" in md_text and "0.75x" in md_text
+    assert md_file.read_text(encoding="utf-8").strip() == md_text.strip()
+
+
+

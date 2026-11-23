@@ -19,11 +19,11 @@ from fast_embeddinggemma_2 import FastEmbeddingGemma2
 
 eng = FastEmbeddingGemma2()
 q = eng.encode_texts("quarterly semiconductor capex", is_query=True, add_query_prefix=True, dimensions=512)
-docs = eng.encode_texts(["First long passage...", "Second passage..."], dimensions=512)
+docs = eng.encode_documents(["First long passage...", "Second passage..."], titles=["2025 Capex Note", "Summary"], dimensions=512)
 
-# Build a 6x-smaller 512d INT8 / binary+INT8 search index:
-index = eng.build_index(["First long passage...", "Second passage..."])
-top_ids, top_scores = index.search(q, top_k=5)
+# Build a 6x-smaller 512d INT8 / binary+INT8 search index (uses rerank_top_r=256 when binary):
+index = eng.build_index(["First long passage...", "Second passage..."], titles=["2025 Capex Note", "Summary"])
+top_ids, top_scores = index.search(q, k=5)
 ```
 
 ```bash
@@ -74,9 +74,9 @@ Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum c
 ## CLI, Parquet & HTTP server
 
 ```bash
-# Chunked Parquet ingestion (--mode hetero uses GPU + ANE; --max-chunk-tokens 512 keeps ANE buckets active)
+# Chunked Parquet ingestion (--mode hetero uses GPU + ANE; --header-col formats native "title: {header} | text: " prefixes)
 .venv/bin/embeddinggemma-2 parquet \
-  --input ocr-text.parquet --output embeddings/ --text-col body \
+  --input ocr-text.parquet --output embeddings/ --text-col body --header-col title \
   --mode hetero --dimensions 512 --document-prefix \
   --chunk --max-chunk-tokens 512 --overlap 64 \
   --batch-rows 32 --encode-batch-rows 4096 --shard-rows 65536 \

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-ocr"
+version = "0.1.0"
+description = "Zero-training Apple Silicon OCR stack combining independent Apple Vision (ANE), FastOvisOCREngine (Qwen3.5 ViT + GDN + Vision/Self PLD), and AutoOCRPipeline"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fast-shared>=0.1.0",
+    "fast-qwen3>=0.1.0",
+    "mlx>=0.32.4",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "pypdfium2>=4.30.0",
+    "pyobjc-framework-Vision>=11.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=11.0; sys_platform == 'darwin'",
+]
+
+[tool.uv.sources]
+fast-shared = { workspace = true }
+fast-qwen3 = { workspace = true }
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+fast-ocr = "fast_ocr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

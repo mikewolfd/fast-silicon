@@ -27,6 +27,16 @@ def add_embed_arguments(
     parser.add_argument("--stdin", action="store_true")
     parser.add_argument("--query", action="store_true")
     parser.add_argument("--query-prefix", action="store_true")
+    parser.add_argument(
+        "--header-col",
+        default=None,
+        help="Optional input Parquet column containing per-document header/title text prepended to each row or chunk",
+    )
+    parser.add_argument(
+        "--header-text",
+        default=None,
+        help="Optional static document header/title text prepended to each row or chunk",
+    )
     if allow_doc_prefix:
         parser.add_argument("--document-prefix", action="store_true")
         parser.add_argument("--prefix", default=None)
@@ -80,6 +90,16 @@ def add_parquet_arguments(
     parser.add_argument("--skip-empty", action="store_true")
     parser.add_argument("--include-chunk-text", action="store_true")
     parser.add_argument("--query-prefix", action="store_true")
+    parser.add_argument(
+        "--header-col",
+        default=None,
+        help="Optional input Parquet column containing per-document header/title text prepended to each row or chunk",
+    )
+    parser.add_argument(
+        "--header-text",
+        default=None,
+        help="Optional static document header/title text prepended to each row or chunk",
+    )
     if allow_doc_prefix:
         parser.add_argument("--document-prefix", action="store_true")
         parser.add_argument("--prefix", default=None)
@@ -189,6 +209,8 @@ def run_parquet_command(args: argparse.Namespace, make_engine: Callable[[argpars
         prompt_name=getattr(args, "prompt_name", None),
         add_query_prefix=args.query_prefix,
         add_document_prefix=bool(getattr(args, "document_prefix", False)),
+        header_col=getattr(args, "header_col", None),
+        header_text=getattr(args, "header_text", None),
         dimensions=getattr(args, "dimensions", None),
         compression=args.compression,
         resume=args.resume,

@@ -64,10 +64,37 @@ class ContextualTokenizer:
         self.chunk_sep_id = self.reserved_id(config.boundary_marker)
         self.query_prefix = config.query_prefix
         self.document_prefix = config.document_prefix
+        full_dp = (
+            list(self._tokenizer.encode(config.document_prefix, add_special_tokens=False).ids)
+            if config.document_prefix
+            else []
+        )
+        base_dp_str = config.document_prefix.rstrip()
+        base_dp = (
+            list(self._tokenizer.encode(base_dp_str, add_special_tokens=False).ids)
+            if base_dp_str
+            else list(full_dp)
+        )
+        self._doc_prefix_full_ids: list[int] = full_dp
+        self._doc_prefix_base_ids: list[int] = base_dp
         self.prompts = {
             "query": config.query_prefix,
             "document": config.document_prefix,
         }
+
+    def document_prefix_span(self, token_ids: Sequence[int]) -> tuple[int, int]:
+        """Return `(start, end)` excluding leading `document_prefix` tokens from pooling."""
+        n = len(token_ids)
+        if n == 0:
+            return (0, 0)
+        head = list(token_ids)
+        full = self._doc_prefix_full_ids
+        if full and len(full) <= n and head[: len(full)] == full:
+            return (0, 0) if len(full) >= n else (len(full), n)
+        base = self._doc_prefix_base_ids
+        if base and len(base) <= n and head[: len(base)] == base:
+            return (0, 0) if len(base) >= n else (len(base), n)
+        return (0, n)
 
     def reserved_id(self, token: str) -> int:
         value = self._tokenizer.token_to_id(token)
@@ -581,7 +608,7 @@ class ContextualTokenizer:
         chunk_tokens: int = 256,
         max_context_tokens: int = 2048,
         context_tokens: int | None = None,
-        overlap: int = 32,
+        overlap: int = 0,
         header_text: str | None = None,
         repeat_header_tokens: int | Sequence[int] | None = None,
         window_overlap_chunks: int = 0,
@@ -612,7 +639,7 @@ class ContextualTokenizer:
         chunk_tokens: int = 256,
         max_context_tokens: int = 2048,
         context_tokens: int | None = None,
-        overlap: int = 32,
+        overlap: int = 0,
         header_text: str | None = None,
         repeat_header_tokens: int | Sequence[int] | None = None,
         window_overlap_chunks: int = 0,

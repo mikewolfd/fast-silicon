@@ -2226,6 +2226,46 @@ def _quantize_pplx_linear_weights(model: PplxModel, *, bits: int = 8, group_size
     )
 
 
+def normalize_rotations_cw(
+    rotations_cw: int | Sequence[int] | None,
+    count: int,
+) -> list[int]:
+    """Normalize `rotations_cw` (None, scalar int, or per-image sequence) into `[0|90|180|270] * count`."""
+    if rotations_cw is None:
+        return [0] * count
+
+    def _validate_angle(val: Any) -> int:
+        if isinstance(val, bool) or not isinstance(val, (int, np.integer)):
+            raise ValueError(
+                f"rotations_cw values must be integer multiples of 90 degrees, got {val!r}"
+            )
+        deg = int(val)
+        if deg % 90 != 0:
+            raise ValueError(
+                f"rotations_cw values must be multiples of 90 degrees (0, 90, 180, 270), got {deg}"
+            )
+        return deg % 360
+
+    if isinstance(rotations_cw, (bool, str, bytes)):
+        raise ValueError(
+            f"rotations_cw must be None, an int multiple of 90, or a sequence of ints, got {rotations_cw!r}"
+        )
+    if isinstance(rotations_cw, (int, np.integer)):
+        deg = _validate_angle(rotations_cw)
+        return [deg] * count
+
+    if not isinstance(rotations_cw, Sequence) and not hasattr(rotations_cw, "__iter__"):
+        raise ValueError(
+            f"rotations_cw must be None, an int multiple of 90, or a sequence of ints, got {rotations_cw!r}"
+        )
+    seq = list(rotations_cw)
+    if len(seq) != count:
+        raise ValueError(
+            f"rotations_cw length ({len(seq)}) must match number of images ({count})"
+        )
+    return [_validate_angle(v) for v in seq]
+
+
 class FastPplxGPU:
     """High-throughput MLX Metal GPU backend for `pplx-embed-v2-context-0.6b`."""
 
@@ -2260,6 +2300,9 @@ class FastPplxGPU:
         self.cache_limit_mb = int(cache_limit_mb)
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
+        self.local_files_only = bool(local_files_only)
+        self._vision_dir: Path | None = None
+        self._vision_model: Any | None = None
         self.runtime_telemetry = {
             **get_mlx_runtime_telemetry(),
             "state_dtype": self.state_dtype_name,
@@ -2275,6 +2318,8 @@ class FastPplxGPU:
                 model_dir=model_dir,
                 local_files_only=local_files_only,
             )
+            if kind == "dir":
+                self._vision_dir = source_path
 
             # Resolve config & tokenizer
             cfg_candidates = [
@@ -2714,6 +2759,7 @@ class FastPplxGPU:
         dimensions: int | None,
         output_dtype: str,
         normalize: bool,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         if output_dtype not in ("float32", "float16", "int8"):
             raise ValueError(f"Unsupported output_dtype {output_dtype!r}")
@@ -2724,14 +2770,13 @@ class FastPplxGPU:
         sliced = projected[:, :target_dim]
         if output_dtype == "int8":
             return _quantize_int8_np(sliced)
-        if normalize:
-            vecs = truncate_and_normalize(projected, target_dim)
-            # truncate_and_normalize returns unnormalized vectors when target_dim == width.
-            if target_dim == projected.shape[-1]:
-                norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
-                vecs = np.ascontiguousarray(vecs / np.maximum(norms, 1e-12), dtype=np.float32)
+        if apply_tanh:
+            vecs = np.clip(np.rint(np.tanh(sliced) * 127.0), -128.0, 127.0).astype(np.float32)
         else:
             vecs = np.asarray(sliced, dtype=np.float32)
+        if normalize:
+            norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
+            vecs = np.ascontiguousarray(vecs / np.maximum(norms, 1e-12), dtype=np.float32)
         if output_dtype == "float16":
             return vecs.astype(np.float16)
         return vecs.astype(np.float32, copy=False)
@@ -2744,6 +2789,7 @@ class FastPplxGPU:
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         n = len(token_lists)
         target_dim = resolve_embedding_dim(dimensions, max_dim=self.dim)
@@ -2780,6 +2826,7 @@ class FastPplxGPU:
             dimensions=dimensions,
             output_dtype=output_dtype,
             normalize=normalize,
+            apply_tanh=apply_tanh,
         )
 
     def encode(
@@ -2792,22 +2839,39 @@ class FastPplxGPU:
         output_dtype: str = "float32",
         normalize: bool = True,
         is_query: bool = False,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         single = isinstance(texts, str)
         items = [texts] if single else list(texts)
         eff_max = _resolve_max_length(max_length, self.max_seq_len)
         if is_query:
             token_lists = [self.tokenizer.encode_query(t, max_length=eff_max) for t in items]
-        else:
-            token_lists = [self.tokenizer.encode_document(t, max_length=eff_max) for t in items]
-        out = self.encode_tokens(
-            token_lists,
+            return self.encode_tokens(
+                token_lists,
+                batch_size=batch_size,
+                dimensions=dimensions,
+                output_dtype=output_dtype,
+                normalize=normalize,
+                apply_tanh=apply_tanh,
+            )
+        if not items:
+            return self._format_output(
+                np.zeros((0, self.dim), dtype=np.float32),
+                dimensions=dimensions,
+                output_dtype=output_dtype,
+                normalize=normalize,
+                apply_tanh=apply_tanh,
+            )
+        encoded_docs = [self.tokenizer.encode_contextual_document([t], return_spans=True, max_length=eff_max) for t in items]
+        mats = self.encode_contextual_tokens(
+            encoded_docs,
             batch_size=batch_size,
             dimensions=dimensions,
             output_dtype=output_dtype,
             normalize=normalize,
+            apply_tanh=apply_tanh,
         )
-        return out
+        return np.vstack(mats)
 
     def encode_queries(
         self,
@@ -2818,6 +2882,7 @@ class FastPplxGPU:
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         return self.encode(
             queries,
@@ -2827,6 +2892,7 @@ class FastPplxGPU:
             output_dtype=output_dtype,
             normalize=normalize,
             is_query=True,
+            apply_tanh=apply_tanh,
         )
 
     def encode_documents(
@@ -2838,6 +2904,7 @@ class FastPplxGPU:
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
+        apply_tanh: bool = True,
     ) -> np.ndarray:
         return self.encode(
             texts,
@@ -2847,6 +2914,7 @@ class FastPplxGPU:
             output_dtype=output_dtype,
             normalize=normalize,
             is_query=False,
+            apply_tanh=apply_tanh,
         )
 
     def encode_contextual_chunks(
@@ -2858,6 +2926,7 @@ class FastPplxGPU:
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
+        apply_tanh: bool = True,
     ) -> list[np.ndarray]:
         eff_max = _resolve_max_length(max_length, self.max_seq_len)
         encoded_docs = [
@@ -2865,7 +2934,12 @@ class FastPplxGPU:
             for chunks in documents
         ]
         return self.encode_contextual_tokens(
-            encoded_docs, batch_size=batch_size, dimensions=dimensions, output_dtype=output_dtype, normalize=normalize
+            encoded_docs,
+            batch_size=batch_size,
+            dimensions=dimensions,
+            output_dtype=output_dtype,
+            normalize=normalize,
+            apply_tanh=apply_tanh,
         )
 
     def encode_contextual_tokens(
@@ -2876,6 +2950,7 @@ class FastPplxGPU:
         dimensions: int | None = None,
         output_dtype: str = "float32",
         normalize: bool = True,
+        apply_tanh: bool = True,
     ) -> list[np.ndarray]:
         """Pool one vector per supplied span, preserving document and chunk order."""
         if not encoded_docs:
@@ -2895,6 +2970,7 @@ class FastPplxGPU:
                         dimensions=dimensions,
                         output_dtype=output_dtype,
                         normalize=normalize,
+                        apply_tanh=apply_tanh,
                     )
             bins = self._pack_varlen_token_bins(tok_lists, spans_list=all_spans)
             for bin_spec, proj_bin in zip(bins, self._run_varlen_bins(bins), strict=True):
@@ -2907,6 +2983,7 @@ class FastPplxGPU:
                         dimensions=dimensions,
                         output_dtype=output_dtype,
                         normalize=normalize,
+                        apply_tanh=apply_tanh,
                     )
         else:
             uniform_pos_len = int(lengths[0]) if int(lengths.min()) == int(lengths.max()) > 0 else 0
@@ -2933,12 +3010,209 @@ class FastPplxGPU:
                         dimensions=dimensions,
                         output_dtype=output_dtype,
                         normalize=normalize,
+                        apply_tanh=apply_tanh,
                     )
 
         clear_mlx_arena(256)
         return [r for r in results if r is not None]
 
+    @staticmethod
+    def _has_vision_checkpoint(cand: Path | None) -> bool:
+        if cand is None or not cand.is_dir():
+            return False
+        cfg_p = cand / "config.json"
+        if not cfg_p.is_file():
+            return False
+        import json
+        import struct
+
+        raw_cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
+        if "vision_config" not in raw_cfg:
+            return False
+        for sf in sorted(cand.glob("*.safetensors")):
+            with open(sf, "rb") as fp:
+                hdr_len = struct.unpack("<Q", fp.read(8))[0]
+                hdr = json.loads(fp.read(hdr_len).decode("utf-8"))
+            if any(
+                k.startswith(("visual.", "model.visual.", "vision_tower."))
+                for k in hdr
+                if k != "__metadata__"
+            ):
+                return True
+        return False
+
+    def _resolve_vision_weights_dir(self) -> Path:
+        for cand in (
+            self._vision_dir,
+            self.paths.model_dir,
+            _find_local_hf_snapshot(DEFAULT_MODEL_NAME),
+        ):
+            if self._has_vision_checkpoint(cand):
+                assert cand is not None
+                return cand
+        resolved = resolve_hf_model_dir(None, DEFAULT_MODEL_NAME, local_files_only=self.local_files_only)
+        if not self._has_vision_checkpoint(resolved):
+            raise FileNotFoundError(
+                f"Resolved model directory {resolved} does not contain Qwen3.5 visual encoder weights"
+            )
+        return resolved
+
+    def _ensure_vision_model(self) -> Any:
+        if self._vision_model is None:
+            from fast_shared.qwen35_vision import FastQwen35VisionModel
+
+            vdir = self._resolve_vision_weights_dir()
+            self._vision_model = FastQwen35VisionModel.from_pretrained(vdir, dtype=self.act_dtype)
+        return self._vision_model
+
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        chunks: int = 8,
+        batch_size: int = 4,
+        min_pixels: int = 16384,
+        max_pixels: int = 1_800_000,
+        crop_margins: bool = False,
+        rotations_cw: int | Sequence[int] | None = None,
+        dimensions: int | None = None,
+        output_dtype: str = "float32",
+        normalize: bool = True,
+        apply_tanh: bool = True,
+    ) -> list[np.ndarray]:
+        """Encode document/page images directly into contextual `(num_chunks, dim)` embeddings via ViT + MRoPE."""
+        img_list = list(images)
+        norm_rotations = normalize_rotations_cw(rotations_cw, len(img_list))
+        if not img_list:
+            return []
+
+        from fast_shared.qwen35_vision import precompute_mrope_trig
+        from fast_shared.vision_preprocess import PplxImageItem, prepare_pplx_image_item
+
+        vis = self._ensure_vision_model()
+        items: list[PplxImageItem] = []
+        for img, rot_i in zip(img_list, norm_rotations):
+            if isinstance(img, PplxImageItem):
+                if rot_i != 0:
+                    applied = getattr(
+                        img,
+                        "rotation_applied_cw",
+                        getattr(img, "rotation_cw", None),
+                    )
+                    if applied != rot_i:
+                        raise ValueError(
+                            f"Cannot apply rotations_cw={rot_i} to prebuilt PplxImageItem"
+                        )
+                items.append(img)
+            else:
+                items.append(
+                    prepare_pplx_image_item(
+                        img,
+                        chunks=int(chunks),
+                        min_pixels=int(min_pixels),
+                        max_pixels=int(max_pixels),
+                        crop_margins=bool(crop_margins),
+                        rotation_cw=rot_i,
+                    )
+                )
+
+        n = len(items)
+        bs = max(1, min(int(batch_size), self.max_batch_size))
+        order = sorted(
+            range(n),
+            key=lambda i: (
+                items[i].vision_inputs.grid_thw[1],
+                items[i].vision_inputs.grid_thw[2],
+                len(items[i].input_ids),
+            ),
+        )
+        out: list[np.ndarray | None] = [None] * n
+
+        idx = 0
+        while idx < n:
+            g0 = items[order[idx]].vision_inputs.grid_thw
+            end = idx + 1
+            while end < n and items[order[end]].vision_inputs.grid_thw == g0 and (end - idx) < bs:
+                end += 1
+            grp_idxs = order[idx:end]
+            grp_items = [items[i] for i in grp_idxs]
+            b_w = len(grp_items)
+
+            px_all = np.concatenate([it.vision_inputs.pixel_values for it in grp_items], axis=0)
+            grids = [it.vision_inputs.grid_thw for it in grp_items]
+            vis_feats = vis(mx.array(px_all), grids)
+
+            ids_rows = [it.input_ids.tolist() for it in grp_items]
+            input_ids, attn_mask = self._prepare_batch_inputs_and_mask(ids_rows)
+            _b, S = input_ids.shape
+            hidden = self._embed_inputs(input_ids).astype(self.act_dtype)
+
+            vis_offset = 0
+            rows_list: list[mx.array] = []
+            for b_i, it in enumerate(grp_items):
+                n_vis_tok = it.vision_inputs.num_visual_tokens
+                vf = vis_feats[vis_offset : vis_offset + n_vis_tok].astype(self.act_dtype)
+                vis_offset += n_vis_tok
+
+                parts: list[mx.array] = []
+                vf_cur = 0
+                cur = 0
+                for s0, s1 in it.chunk_token_spans:
+                    if s0 > cur:
+                        parts.append(hidden[b_i, cur:s0, :])
+                    slen = s1 - s0
+                    parts.append(vf[vf_cur : vf_cur + slen, :])
+                    vf_cur += slen
+                    cur = s1
+                if cur < S:
+                    parts.append(hidden[b_i, cur:S, :])
+                if vf_cur != n_vis_tok:
+                    raise ValueError(f"Expected {n_vis_tok} visual span slots, filled {vf_cur}")
+                rows_list.append(mx.concatenate(parts, axis=0))
+            hidden_mm = mx.stack(rows_list, axis=0)
+
+            max_sp = max(1, *(len(it.chunk_token_spans) for it in grp_items))
+            pos_3d = np.zeros((3, b_w, S), dtype=np.float32)
+            span_arr = np.zeros((b_w, max_sp, 2), dtype=np.int32)
+            for b_i, it in enumerate(grp_items):
+                Li = len(it.input_ids)
+                pos_3d[:, b_i, :Li] = it.position_ids
+                for j, (s0, s1) in enumerate(it.chunk_token_spans):
+                    span_arr[b_i, j] = (s0, s1)
+
+            ssm_mask = mx.array(attn_mask, dtype=mx.bool_) if attn_mask is not None else None
+            sdpa_mask = _build_sdpa_mask(attn_mask, dtype_name=self.dtype_name) if attn_mask is not None else None
+            rope_cos, rope_sin = precompute_mrope_trig(
+                mx.array(pos_3d, dtype=mx.float32),
+                rot_dims=self.config.rope_dim,
+                rope_theta=self.config.rope_theta,
+                mrope_section=self.config.mrope_section,
+                dtype=self.act_dtype,
+            )
+            out_h = self.model.forward_hidden(
+                hidden_mm,
+                ssm_mask=ssm_mask,
+                sdpa_mask=sdpa_mask,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+            )
+            proj = self._project_span_pool(out_h, span_arr)
+            for b_i, orig_i in enumerate(grp_idxs):
+                n_sp = len(items[orig_i].chunk_token_spans)
+                out[orig_i] = self._format_output(
+                    proj[b_i, :n_sp],
+                    dimensions=dimensions,
+                    output_dtype=output_dtype,
+                    normalize=normalize,
+                    apply_tanh=apply_tanh,
+                )
+            idx = end
+
+        clear_mlx_arena(256)
+        return [r for r in out if r is not None]
+
     def close(self) -> None:
+        self._vision_model = None
         if getattr(self, "_mapped_embed", None) is not None:
             self._mapped_embed.close()
             self._mapped_embed = None

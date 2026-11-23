@@ -1470,6 +1470,7 @@ class FastEmbeddingGemma2:
         self,
         texts: Sequence[str],
         *,
+        titles: Sequence[str | None] | None = None,
         mode: str | None = None,
         dimensions: int | None = None,
         max_length: int | None = None,
@@ -1479,7 +1480,14 @@ class FastEmbeddingGemma2:
         items = list(texts)
         eff_dim = self._resolve_dim(dimensions)
         if not items:
+            if titles is not None and len(titles) != 0:
+                raise ValueError(f"titles length ({len(titles)}) must match texts length (0)")
             return np.empty((0, eff_dim), dtype=np.float32)
+        if titles is not None:
+            if len(titles) != len(items):
+                raise ValueError(f"titles length ({len(titles)}) must match texts length ({len(items)})")
+            items = [self.tokenizer.format_document_text(t, ttl) for t, ttl in zip(items, titles)]
+            add_document_prefix = False
         return self.encode_texts(
             items,
             is_query=False,
@@ -1493,6 +1501,7 @@ class FastEmbeddingGemma2:
         self,
         corpus: Sequence[str] | Sequence[Sequence[int]] | np.ndarray,
         *,
+        titles: Sequence[str | None] | None = None,
         doc_offsets: np.ndarray | Sequence[int] | None = None,
         mode: IndexMode = "auto",
         mrl_dim: int | None = None,
@@ -1510,6 +1519,7 @@ class FastEmbeddingGemma2:
         elif isinstance(corpus[0], str):
             vecs = self.encode_documents(
                 corpus,  # type: ignore[arg-type]
+                titles=titles,
                 mode=encode_mode,
                 dimensions=EMBED_DIM,
                 add_document_prefix=add_document_prefix,

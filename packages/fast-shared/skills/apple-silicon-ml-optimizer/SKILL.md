@@ -1,6 +1,6 @@
 ---
 name: apple-silicon-ml-optimizer
-description: Optimize local ML inference, quantization, custom Metal/MLX kernels, CoreML/ANE pipelines, and training/distillation/QAT/RLVR workloads across Apple Silicon M4 (Apple9) and M5+ (Apple10+ / NAX) Macs. Use when profiling hardware bottlenecks, reducing RAM/DRAM traffic, writing Metal 4 MPP or CoreML/CPU-SME kernels, accelerating LoRA/QLoRA, teacher distillation, encoder/head fine-tuning, or GRPO rollouts, debugging dtype regressions, or maximizing end-to-end throughput and schema/task accuracy on dense encoders, dense LLMs, and sparse MoE models.
+description: Optimize local ML inference, quantization, custom Metal/MLX kernels, CoreML/ANE & Apple Vision pipelines, ViT/VLM/OCR workflows, and training/distillation/QAT/RLVR workloads across Apple Silicon M4 (Apple9) and M5+ (Apple10+ / NAX) Macs. Use when profiling hardware bottlenecks, reducing RAM/DRAM traffic, writing Metal 4 MPP or CoreML/CPU-SME kernels, tuning multimodal ViT/M-RoPE or hybrid PDF-to-Markdown OCR pipelines, accelerating LoRA/QLoRA, teacher distillation, encoder/head fine-tuning, or GRPO rollouts, debugging dtype regressions, or maximizing end-to-end throughput and schema/task accuracy on dense encoders, dense LLMs, VLMs, and sparse MoE models.
 ---
 
 # Apple Silicon ML Roofline Optimizer (M4 & M5+)
@@ -103,3 +103,26 @@ Training flips the roofline from `M=1` DRAM-bandwidth-bound decode to **`3×`-GE
 1. **Autograd & memory hygiene:** Split frozen bottom trunks outside `nn.value_and_grad`, unwrap dead KV-shared `k_proj`/`v_proj` LoRAs, gather `lm_head` strictly on answer tokens with `256`-token sliced `FP32` CE (`5×–8×` fewer `262K`-head FLOPs), pre-cast frozen weights once at load, keep self-attention `BF16` (no `FP32` SDPA upcast), and stay below `75–80%` wired RAM to avoid `50×` swap cliffs.
 2. **Tile saturation & checkpoint elimination:** Pack variable-length examples into fixed `M=2048..4096` bins (`position_ids` reset + block-diagonal mask) instead of `B=1` or padded batches (`1.5×–2.6×`), and freeze base trunks in `8-bit g64` / `MXFP4` (`QLoRA`) so `nn.utils.checkpoint` (`+30–35%` 2nd-forward tax) stays off (`1.25×–1.4×`).
 3. **Silicon co-execution and kernel fusion.** Pipeline frozen prefixes on the ANE or cache their activations for repeated training. Reuse shared prompt keys and values within gradient accumulation, and use `@mx.compile` on the cross-entropy and optimizer steps. Compare teacher distillation and GRPO rollouts with the same candidates and measured scores. For export, four workers built nine BGE Core ML shapes about twice as fast as one worker on both test Macs. Larger Gemma builds had similar warm serial and parallel times.
+
+---
+
+## Vision, Multimodal Embeddings & OCR Playbook
+
+Follow [references/vision-and-ocr-playbook.md](references/vision-and-ocr-playbook.md) before touching ViT, VLM OCR, or document-image retrieval pipelines:
+
+- **Route PDFs & images across 3 tiers (`0` MLX for native/clean prose):**
+  1. *Tier 0 (`pypdfium2`, `0.008–0.023 s/p`):* Strip running stamps/headers/footers, reject any C0/C1/`\ufffd` control char (`== 0`), count `FPDF_PAGEOBJ_IMAGE`, route `is_clean and (eff_chars >= 80 or (eff_chars > 0 and image_count == 0))` natively (never bypass on `eff_chars == 0` alone — vector-outlined text has `0` images & `0` chars), and clamp raster DPI to `max_pixels=20M` (`min_dpi=36`).
+  2. *Tier 1 (Zero-MLX Apple Vision ANE):* Feed raw RGB via `NSData -> CGDataProviderCreateWithCFData` inside `objc.autorelease_pool()` (zero `CGDataProviderCreateWithData` leak), screen packets at `triage_dpi=100` (`word_jaccard 0.938–1.000`, `16.62×` faster) before selective full-DPI re-render, use `bands=3` + `language_correction=False` for table escalation detection vs `bands=1` + `True` standalone, upscale `<600 px` crops via `_prepare_vision_image` (fixes `macOS 27.2.1` tiny-crop line drops `0.0000 -> 0.5914 PASS`), infer exact `0/90/180/270` CW rotation from baseline vectors (`topLeft -> topRight`), synthesize `<1–13.5 ms` XY-Cut GFM Markdown, and log OS `SystemVersion.plist` + `VNRecognizeTextRequest.revision()` provenance.
+  3. *Tier 2 (Double-Buffered VLM + ViT):* Keep `BF16` ViT (`OvisOCR2-8bit` / `NuExtract3`), apply `crop_to_ink` (`4.47×–5.68×` ViT speedup, `-56%..61%` tokens) paired with `detect_catastrophic_token_loop()` + `auto_loop_recover=True` (uncropped fallback recovering `olmOCR-bench(4)` `4/4` `0.8438 PASS`, `2.05×` EOT vs stock on Base M5), uniform-frame SDPA + `16`-entry grid cache, `detect_apple10_d256_force_fused` (`M5 NAX`), `rope_offset_delta` 3D M-RoPE decode invariance, ByteLevel-decoded `140,307`-token OCR vocab (`1.10–1.12×`), grammar-checked `OCRPLDDrafter` via `DynamicTableRowGrammar.clone()` / `LLMatcher.deep_copy()` (`1.85×` M4 Pro / `1.144×` M5 GFM; `1.11×–1.80×` `CORD-v2` JSON), and opt-in Edit-Distance-1 pruned `zoom_recover` (`0.994 -> 1.000` numeric recall).
+- **Multimodal visual retrieval & Category 5 gates:** Lazy-load `FastQwen35VisionModel` (`0` RAM for text-only callers); keep bulk search on `AppleVisionOCR` + text (`fast-pplx` + BM25, `7.8×–27.8×` faster than MPS image embed) while using `crop_margins=True` `encode_images` (`cos >= 0.9997`, `109 ms/p` @ `100 DPI` M5 / `159 ms/p` M4P, `10/10` packet `MaxSim` R@1) strictly as a sparse supplement on charts/diagrams; validate OCR changes under `--ocr-render-only` on `olmOCR-Bench`, `FinTabNet-OTSL` (`TEDS`/`GriTS`/`Numeric F1`), `OmniDocBench-EN`, and `CORD-v2`.
+
+---
+
+## Reference Index
+
+- [references/m4-vs-m5-architecture.md](references/m4-vs-m5-architecture.md) — Empirical M4 vs M5+ rooflines, OS feature gates, Core AI vs custom engine promotion gates, and cross-silicon encoder/OCR measurements.
+- [references/m4-m5-capability-matrix.md](references/m4-m5-capability-matrix.md) — Six-chip M4/M5 hardware, SDK, Darwin key, and instruction capability reference (`query_capability_matrix.py`).
+- [references/kernel-and-dtype-playbook.md](references/kernel-and-dtype-playbook.md) — Metal 4 `MPP::matmul2d`, `MXFP4`, rolling KV caches, CoreML/ANE `conv1x1` & `2^-14` numerics, and MLX/Qwen3.5 traps.
+- [references/vision-and-ocr-playbook.md](references/vision-and-ocr-playbook.md) — 3-tier PDF/ANE/VLM routing, `FastQwen35VisionModel`, M-RoPE, grammar-checked PLD, `zoom_recover`, `encode_images`, and Category 5 OCR suites.
+- [references/training-and-distillation-playbook.md](references/training-and-distillation-playbook.md) — LoRA/QLoRA, sequence packing, `GRPO` + concurrent ANE critic, `MTP` drafting, and parallel CoreML export.
+- [references/dead-ends-registry.md](references/dead-ends-registry.md) — Empirically refuted optimizations and dead-end models across LLMs, encoders, Core AI, training, and Vision/OCR.
