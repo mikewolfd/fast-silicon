@@ -35,7 +35,7 @@ from fast_qwen3.multimodal_batch import (
 )
 from fast_qwen3.tokenizer import ENDOFTEXT, IM_END, IM_START, THINK_CLOSE, THINK_OPEN, FastQwen3Tokenizer, QwenVocabRemapper
 
-from .apple_vision import AppleVisionOCR, deskew_document_image
+from .apple_vision import AppleVisionOCR, deskew_document_image, normalize_deskew_mode
 from .markdown_struct import DynamicTableRowGrammar, canonicalize_markdown, validate_markdown
 from .mrope import compute_mrope_positions, precompute_mrope_trig
 from .numeric_recovery import (
@@ -533,7 +533,7 @@ class FastOvisOCREngine:
         crop_pad_px: int = 24,
         auto_orient: bool = True,
         adaptive_resolution: bool = True,
-        deskew: bool = False,
+        deskew: bool | str = "auto",
         speculative: SpeculativeMode = "auto",
         draft_k: int = 4,
         vocab_size: int | None = None,
@@ -580,7 +580,7 @@ class FastOvisOCREngine:
         self.crop_pad_px: int = max(0, int(crop_pad_px))
         self.auto_orient: bool = bool(auto_orient)
         self.adaptive_resolution: bool = bool(adaptive_resolution)
-        self.deskew: bool = bool(deskew)
+        self.deskew: str = normalize_deskew_mode(deskew)
         self.speculative: SpeculativeMode = speculative
         self.draft_k: int = max(1, int(draft_k))
         self.vit_quant_bits: int | None = vit_quant_bits
@@ -692,7 +692,7 @@ class FastOvisOCREngine:
         crop_margins: bool | None = None,
         auto_orient: bool | None = None,
         adaptive_resolution: bool | None = None,
-        deskew: bool | None = None,
+        deskew: bool | str | None = None,
         min_pixels: int | None = None,
         max_pixels: int | None = None,
         drop_white_patches: bool | None = None,
@@ -714,7 +714,7 @@ class FastOvisOCREngine:
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
-        do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
+        eff_deskew = normalize_deskew_mode(getattr(self, "deskew", "off") if deskew is None else deskew)
         eff_drop_white = (
             bool(getattr(self, "drop_white_patches", False))
             if drop_white_patches is None
@@ -745,13 +745,17 @@ class FastOvisOCREngine:
         img = load_image(source)
         vision_res = pre_analysis
         deskew_meta: dict[str, Any] | None = None
-        if do_deskew:
+        if eff_deskew != "off":
             try:
-                img, deskew_meta = deskew_document_image(img)
-                if deskew_meta.get("applied"):
+                img, d_meta = deskew_document_image(img, mode=eff_deskew)
+                if d_meta.get("applied"):
                     vision_res = None
+                    deskew_meta = d_meta
+                elif eff_deskew == "on":
+                    deskew_meta = d_meta
             except Exception:
-                deskew_meta = {"applied": False, "reason": "deskew_error"}
+                if eff_deskew == "on":
+                    deskew_meta = {"applied": False, "reason": "deskew_error"}
         vision_ms = float(vision_res.timings.apple_vision_ms) if vision_res is not None else 0.0
 
         # Run lightweight ANE Vision pre-pass when needed for orientation, zoom recovery, or vision+self speculative drafting
@@ -1562,7 +1566,7 @@ class FastOvisOCREngine:
         crop_margins: bool | None = None,
         auto_orient: bool | None = None,
         adaptive_resolution: bool | None = None,
-        deskew: bool | None = None,
+        deskew: bool | str | None = None,
         min_pixels: int | Sequence[int | None] | None = None,
         max_pixels: int | Sequence[int | None] | None = None,
         drop_white_patches: bool | None = None,
@@ -1614,7 +1618,7 @@ class FastOvisOCREngine:
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
-        do_deskew = bool(getattr(self, "deskew", False)) if deskew is None else bool(deskew)
+        eff_deskew = normalize_deskew_mode(getattr(self, "deskew", "off") if deskew is None else deskew)
         eff_drop_white = (
             bool(getattr(self, "drop_white_patches", False))
             if drop_white_patches is None
@@ -1642,7 +1646,7 @@ class FastOvisOCREngine:
         # Single image or explicit B=1 path keeps double-buffered ANE Vision + B=1 PLD fast path
         if n_sources == 1 or eff_bs <= 1:
             need_ane_prepass = do_orient or do_zoom or spec_req in ("auto", "vision+self")
-            if n_sources == 1 or do_deskew or not need_ane_prepass or all(p is not None for p in pre_seq):
+            if n_sources == 1 or eff_deskew == "on" or not need_ane_prepass or all(p is not None for p in pre_seq):
                 return [
                     self.ocr_image(
                         src,
@@ -1656,7 +1660,7 @@ class FastOvisOCREngine:
                         crop_margins=do_crop,
                         auto_orient=do_orient,
                         adaptive_resolution=do_adaptive,
-                        deskew=do_deskew,
+                        deskew=eff_deskew,
                         min_pixels=_item_min_px(pos_i),
                         max_pixels=_item_max_px(pos_i),
                         drop_white_patches=eff_drop_white,
@@ -1724,16 +1728,19 @@ class FastOvisOCREngine:
         t_load0 = time.perf_counter()
         raw_imgs = [load_image(src) for src in sources]
         deskew_metas: list[dict[str, Any] | None] = [None] * n_items
-        if do_deskew:
+        if eff_deskew != "off":
             for i in range(n_items):
                 try:
-                    warped_i, d_meta = deskew_document_image(raw_imgs[i])
-                    deskew_metas[i] = d_meta
+                    warped_i, d_meta = deskew_document_image(raw_imgs[i], mode=eff_deskew)
                     if d_meta.get("applied"):
+                        deskew_metas[i] = d_meta
                         raw_imgs[i] = warped_i
                         pre_seq[i] = None
+                    elif eff_deskew == "on":
+                        deskew_metas[i] = d_meta
                 except Exception:
-                    deskew_metas[i] = {"applied": False, "reason": "deskew_error"}
+                    if eff_deskew == "on":
+                        deskew_metas[i] = {"applied": False, "reason": "deskew_error"}
         load_ms_each = ((time.perf_counter() - t_load0) * 1000.0) / max(1, n_items)
 
         need_batch_ane = do_orient or do_zoom or (schema is not None)

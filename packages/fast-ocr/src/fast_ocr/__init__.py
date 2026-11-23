@@ -8,6 +8,8 @@ from .apple_vision import (
     AppleVisionOCR,
     deskew_document_image,
     detect_document_quad,
+    is_likely_camera_photo,
+    normalize_deskew_mode,
     perspective_deskew_image,
 )
 from .markdown_struct import (
@@ -84,7 +86,9 @@ __all__ = [
     "extract_escalation_regions",
     "extract_normalized_numbers",
     "find_filtered_missing_numbers",
+    "is_likely_camera_photo",
     "merge_region_markdown",
+    "normalize_deskew_mode",
     "ocr_parquet",
     "perspective_deskew_image",
     "resolve_ocr_mlx_limits",

@@ -653,7 +653,7 @@ def test_pipeline_passes_kv_gdn_whitepatch_args_to_ovis_engine(monkeypatch: pyte
         drop_white_patches=True,
     )
     assert p_explicit.adaptive_resolution is True
-    assert p_explicit.deskew is False
+    assert p_explicit.deskew == "auto"
     assert p_explicit.region_routing is False
     _ = p_explicit._get_ovis_engine()
     assert seen[-1]["kv_i8"] == "q4_quarot"

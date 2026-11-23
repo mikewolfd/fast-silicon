@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from PIL import Image
 
-from .apple_vision import AppleVisionOCR, _NativeVisionRunner, deskew_document_image
+from .apple_vision import AppleVisionOCR, _NativeVisionRunner, deskew_document_image, normalize_deskew_mode
 from .markdown_struct import canonicalize_markdown, validate_markdown
 from .preprocess import (
     DEFAULT_MAX_PDF_PIXELS,
@@ -301,7 +301,7 @@ class AutoOCRPipeline:
         crop_margins: bool = True,
         auto_orient: bool = True,
         adaptive_resolution: bool = True,
-        deskew: bool = False,
+        deskew: bool | str = "auto",
         region_routing: bool = False,
         speculative: SpeculativeMode = "auto",
         vocab_size: int | None = None,
@@ -347,7 +347,7 @@ class AutoOCRPipeline:
         self.crop_margins: bool = bool(crop_margins)
         self.auto_orient: bool = bool(auto_orient)
         self.adaptive_resolution: bool = bool(adaptive_resolution)
-        self.deskew: bool = bool(deskew)
+        self.deskew: str = normalize_deskew_mode(deskew)
         self.region_routing: bool = bool(region_routing)
         self.speculative: SpeculativeMode = speculative
         self.vocab_size: int | None = vocab_size
@@ -424,15 +424,15 @@ class AutoOCRPipeline:
         self,
         source: str | Path | Image.Image | np.ndarray,
     ) -> tuple[str | Path | Image.Image | np.ndarray, dict[str, Any] | None]:
-        if not self.deskew:
+        if self.deskew == "off":
             return source, None
         try:
-            warped, info = deskew_document_image(source)
+            warped, info = deskew_document_image(source, mode=self.deskew)
             if info.get("applied"):
                 return warped, info
-            return source, info
+            return (source, info) if self.deskew == "on" else (source, None)
         except Exception:
-            return source, {"applied": False, "reason": "deskew_error"}
+            return (source, {"applied": False, "reason": "deskew_error"}) if self.deskew == "on" else (source, None)
 
     def _run_vision_image(
         self,
@@ -510,24 +510,45 @@ class AutoOCRPipeline:
         output_format: OutputFormat,
         apply_deskew: bool = True,
     ) -> list[OCRResult]:
-        if apply_deskew and self.deskew:
-            return [
-                self._run_vision_image(src, page_index=int(idx), output_format=output_format, apply_deskew=True)
-                for src, idx in zip(sources, page_indices)
-            ]
+        eff_sources: Sequence[Any] = sources
+        deskew_metas: list[dict[str, Any] | None] | None = None
+        if apply_deskew and self.deskew != "off":
+            eff_list: list[Any] = []
+            meta_list: list[dict[str, Any] | None] = []
+            for src in sources:
+                ds, dinfo = self._maybe_deskew_source(src)
+                eff_list.append(ds)
+                meta_list.append(dinfo)
+            eff_sources = eff_list
+            if any(m is not None for m in meta_list):
+                deskew_metas = meta_list
         par = run_vision_batch_parallel(
             self._get_vision_ocr(),
-            sources,
+            eff_sources,
             page_indices,
             output_format=output_format,
             workers=4,
         )
         if par is not None:
-            return par
-        return [
-            self._run_vision_image(src, page_index=int(idx), output_format=output_format, apply_deskew=False)
-            for src, idx in zip(sources, page_indices)
-        ]
+            if deskew_metas is None:
+                return par
+            out_par: list[OCRResult] = []
+            for r, dm in zip(par, deskew_metas):
+                if dm is not None:
+                    meta = dict(r.metadata)
+                    meta["deskew"] = dm
+                    r = replace(r, metadata=meta)
+                out_par.append(r)
+            return out_par
+        out_seq: list[OCRResult] = []
+        for pos, (src, idx) in enumerate(zip(eff_sources, page_indices)):
+            r = self._run_vision_image(src, page_index=int(idx), output_format=output_format, apply_deskew=False)
+            if deskew_metas is not None and deskew_metas[pos] is not None:
+                meta = dict(r.metadata)
+                meta["deskew"] = deskew_metas[pos]
+                r = replace(r, metadata=meta)
+            out_seq.append(r)
+        return out_seq
 
     def _run_ovis_batch(
         self,
@@ -804,7 +825,7 @@ class AutoOCRPipeline:
                 output_format=fmt,
                 table_mode=tmode,
                 pre_analysis=vision_res,
-                deskew_override=False if deskew_info is not None else None,
+                deskew_override=False if (self.deskew != "off" and pre_analysis is None) else None,
             )
         return vision_res
 
@@ -843,9 +864,10 @@ class AutoOCRPipeline:
                 batch_size=bs,
             )
 
-        # If opt-in deskew is enabled in `auto` mode, deskew once upfront so ANE Vision and VLM share identical coordinates.
+        # If deskew is active (`auto` or `on`) in `auto` mode, run once upfront so ANE Vision and VLM share identical coordinates.
+        deskew_active = self.deskew != "off"
         eff_sources: Sequence[Any] = (
-            [self._maybe_deskew_source(src)[0] for src in sources] if self.deskew else sources
+            [self._maybe_deskew_source(src)[0] for src in sources] if deskew_active else sources
         )
 
         # `auto` mode: pipeline ANE Vision pre-analysis of batch `k + 1` while VLM runs escalated pages of batch `k`
@@ -869,8 +891,9 @@ class AutoOCRPipeline:
                 vis_batch,
                 output_format=fmt,
                 table_mode=tmode,
+                batch_size=bs,
                 native_pdf_texts=native_pdf_texts,
-                deskew_already_applied=self.deskew,
+                deskew_already_applied=deskew_active,
             )
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -889,7 +912,7 @@ class AutoOCRPipeline:
                         table_mode=tmode,
                         batch_size=bs,
                         native_pdf_texts=native_pdf_texts,
-                        deskew_already_applied=self.deskew,
+                        deskew_already_applied=deskew_active,
                     )
                 )
                 if next_future is not None:

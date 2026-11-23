@@ -15,7 +15,12 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from fast_ocr.apple_vision import deskew_document_image, perspective_deskew_image
+from fast_ocr.apple_vision import (
+    deskew_document_image,
+    is_likely_camera_photo,
+    normalize_deskew_mode,
+    perspective_deskew_image,
+)
 from fast_ocr.pld_drafter import OCRPLDDrafter
 from fast_ocr.region_router import (
     REGION_CROP_MIN_PIXELS,
@@ -54,6 +59,16 @@ def test_cursor_tracked_multi_corpus_pld_drafter() -> None:
     # Secondary corpus lookup works and NEVER bleeds across corpus boundary sentinel.
     assert drafter.draft([900, 901], mode="vision") == [902, 903, 904]
     assert drafter.draft([302, 303], mode="vision") == []
+
+    # Tight 56-token windowed 1-gram cursor re-lock recovers immediately across a formatting/punctuation break!
+    drafter.reset_cursor()
+    assert drafter.draft([10, 11], mode="vision") == [100, 101, 102, 103]
+    # Insert divergent formatting token 9999 before unique token 102 -> 2-gram fails, 1-gram window re-locks cleanly!
+    assert drafter.draft([10, 11, 100, 9999, 102], mode="vision") == [103, 50, 51, 52]
+    # Disabling window_relock turns off 1-gram fallback cleanly.
+    drafter_no_rl = OCRPLDDrafter(corpus, max_ngram=4, min_ngram=2, max_k=4, window_relock=False)
+    assert drafter_no_rl.draft([10, 11], mode="vision") == [100, 101, 102, 103]
+    assert drafter_no_rl.draft([10, 11, 100, 9999, 102], mode="vision") == []
 
     # Incremental O(1) self-history drafts repeated local structure cleanly.
     drafter.reset_cursor()
@@ -220,6 +235,39 @@ def test_perspective_deskew_homography_and_zero_mlx() -> None:
     out_low, info_low = deskew_document_image(img, min_confidence=0.80, quad_detector=lambda _im: (tilted_quad, 0.45))
     assert info_low["applied"] is False and info_low["reason"] == "low_confidence" and out_low.size == img.size
 
+    # Camera-photo auto gate: rejects white-margin scans/PDFs & solid saturated slides without calling quad_detector!
+    assert normalize_deskew_mode(False) == "off"
+    assert normalize_deskew_mode(True) == "on"
+    assert normalize_deskew_mode("auto") == "auto"
+
+    white_pdf = Image.new("RGB", (400, 500), (255, 255, 255))
+    assert is_likely_camera_photo(white_pdf) is False
+    called_det = []
+    _, info_skip = deskew_document_image(
+        white_pdf,
+        mode="auto",
+        quad_detector=lambda _im: called_det.append(1) or (tilted_quad, 0.99),  # type: ignore[func-returns-value]
+    )
+    assert info_skip["applied"] is False and info_skip["reason"] == "not_camera_photo" and called_det == []
+
+    solid_ppt = Image.new("RGB", (400, 300), (0, 0, 255))
+    assert is_likely_camera_photo(solid_ppt) is False
+
+    # Simulated camera receipt photo: warm wood/dark textured border + bright paper center -> auto gate triggers!
+    rng = np.random.default_rng(7)
+    photo_arr = rng.integers(55, 115, size=(400, 400, 3), dtype=np.uint8)
+    photo_arr[:, :, 0] = np.clip(photo_arr[:, :, 0].astype(np.int32) + 25, 0, 255).astype(np.uint8)
+    photo_arr[90:310, 80:320] = 235
+    photo_img = Image.fromarray(photo_arr, mode="RGB")
+    assert is_likely_camera_photo(photo_img) is True
+    # Tilted receipt quad (area ~0.33 <= 0.84) warps under mode="auto".
+    w_auto, info_auto = deskew_document_image(photo_img, mode="auto", quad_detector=lambda _im: (tilted_quad, 0.97))
+    assert info_auto["applied"] is True and info_auto["area_ratio"] <= 0.84 and w_auto.size != photo_img.size
+    # High-area full-frame scan quad (area ~0.92 > 0.84) is blocked under mode="auto"!
+    big_quad = ((0.02, 0.02), (0.98, 0.02), (0.98, 0.98), (0.02, 0.98))
+    _, info_big = deskew_document_image(photo_img, mode="auto", quad_detector=lambda _im: (big_quad, 0.99))
+    assert info_big["applied"] is False and info_big["reason"] == "full_frame_area"
+
     # Verify zero MLX imports when using deskew_document_image standalone.
     sub_code = (
         f"import sys; sys.path.insert(0, {str(SRC_DIR)!r})\n"
@@ -249,22 +297,24 @@ def test_phase_b_engine_pipeline_cli_wiring(tmp_path: Path, monkeypatch: pytest.
     from fast_ocr.pipeline import FastOCR
     from fast_ocr.types import OCRTimings
 
-    # 1. Verified Phase B defaults: adaptive_resolution=True, deskew=False, region_routing=False.
+    # 1. Verified optimal defaults: adaptive_resolution=True, deskew="auto", region_routing=False.
     assert inspect.signature(FastOvisOCREngine.__init__).parameters["adaptive_resolution"].default is True
-    assert inspect.signature(FastOvisOCREngine.__init__).parameters["deskew"].default is False
+    assert inspect.signature(FastOvisOCREngine.__init__).parameters["deskew"].default == "auto"
     assert inspect.signature(FastOCR.__init__).parameters["adaptive_resolution"].default is True
-    assert inspect.signature(FastOCR.__init__).parameters["deskew"].default is False
+    assert inspect.signature(FastOCR.__init__).parameters["deskew"].default == "auto"
     assert inspect.signature(FastOCR.__init__).parameters["region_routing"].default is False
 
     args_def = build_parser().parse_args(["run", "dummy.png"])
     assert args_def.batch_size == 16
     assert args_def.no_adaptive_resolution is False
-    assert args_def.deskew is False
+    assert args_def.deskew == "auto"
     assert args_def.region_routing is False
     args_opt = build_parser().parse_args(["run", "dummy.png", "--no-adaptive-resolution", "--deskew", "--region-routing"])
     assert args_opt.no_adaptive_resolution is True
-    assert args_opt.deskew is True
+    assert args_opt.deskew == "on"
     assert args_opt.region_routing is True
+    args_off = build_parser().parse_args(["run", "dummy.png", "--no-deskew"])
+    assert args_off.deskew == "off"
 
     # 2. FastOvisOCREngine.ocr_image & ocr_images: adaptive_24 cap, min_pixels hook, per-item prompts, ordered PLD + native_pdf_text.
     vocab: dict[str, int] = {ch: i for i, ch in enumerate(sorted(ByteLevel.alphabet()))}

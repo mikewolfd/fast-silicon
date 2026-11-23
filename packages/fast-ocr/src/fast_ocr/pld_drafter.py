@@ -26,12 +26,14 @@ class OCRPLDDrafter:
         max_k: int = 6,
         max_hits_per_ngram: int = 32,
         use_cursor: bool = True,
+        window_relock: bool = True,
     ) -> None:
         self.max_ngram = max(2, int(max_ngram))
         self.min_ngram = max(1, min(self.max_ngram, int(min_ngram)))
         self.max_k = max(1, int(max_k))
         self.max_hits_per_ngram = max(1, int(max_hits_per_ngram))
         self.use_cursor = bool(use_cursor)
+        self.window_relock = bool(window_relock)
 
         # Concatenate primary reading-order corpus + optional fallback corpora (e.g. raw Vision / PDF text)
         # separated by `_CORPUS_SENTINEL` so n-grams never span across corpus boundaries.
@@ -169,6 +171,20 @@ class OCRPLDDrafter:
                     chosen = self._pick_vision_hit(vis_hits, ng)
                     cand = self._slice_vision_draft(chosen + ng, k)
                     if cand:
+                        return cand
+
+        # Tight 56-token windowed 1-gram cursor re-lock recovers immediately across Markdown/punctuation breaks.
+        if self.window_relock and self.use_cursor and use_vision and g_len >= 1:
+            last_tok = int(generated_ids[-1])
+            lo = max(0, self._cursor - 8)
+            hi = min(len(self._vision_ids) - 1, self._cursor + 48)
+            relock_hits = [p for p in range(lo, hi) if self._vision_ids[p] == last_tok]
+            if len(relock_hits) == 1:
+                pos = relock_hits[0]
+                if self._vision_ids[pos + 1] != _CORPUS_SENTINEL:
+                    cand = self._slice_vision_draft(pos + 1, k)
+                    if cand:
+                        self._cursor = pos + 1
                         return cand
 
         return []

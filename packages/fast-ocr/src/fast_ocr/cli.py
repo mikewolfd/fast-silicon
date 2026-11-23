@@ -118,8 +118,18 @@ def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool 
     )
     p.add_argument(
         "--deskew",
-        action="store_true",
-        help="Enable opt-in ANE perspective deskew via VNDetectDocumentSegmentationRequest (best for receipt/camera photos)",
+        nargs="?",
+        const="on",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="ANE perspective deskew mode (`auto` camera-photo gate default, `on` force, `off` disable)",
+    )
+    p.add_argument(
+        "--no-deskew",
+        action="store_const",
+        dest="deskew",
+        const="off",
+        help="Disable automatic camera-photo perspective deskew",
     )
     p.add_argument(
         "--region-routing",
@@ -170,7 +180,7 @@ def _build_ocr_from_args(args: argparse.Namespace, *, backend_override: str | No
         crop_margins=not bool(args.no_crop),
         auto_orient=not bool(args.no_orient),
         adaptive_resolution=not bool(getattr(args, "no_adaptive_resolution", False)),
-        deskew=bool(getattr(args, "deskew", False)),
+        deskew=str(getattr(args, "deskew", "auto")),
         region_routing=bool(getattr(args, "region_routing", False)),
         speculative=args.speculative,
         vocab_size=args.vocab_size,
