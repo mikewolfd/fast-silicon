@@ -14,7 +14,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from PIL import Image
 
-from .apple_vision import AppleVisionOCR, _NativeVisionRunner, deskew_document_image, normalize_deskew_mode
+from .apple_vision import (
+    AppleVisionOCR,
+    _NativeVisionRunner,
+    analyze_page_from_lines,
+    deskew_document_image,
+    normalize_deskew_mode,
+)
 from .markdown_struct import canonicalize_markdown, validate_markdown
 from .preprocess import (
     DEFAULT_MAX_PDF_PIXELS,
@@ -36,6 +42,7 @@ from .types import (
     OCRResult,
     OCRTimings,
     OutputFormat,
+    PageAnalysis,
     SpeculativeMode,
 )
 
@@ -1037,6 +1044,7 @@ class AutoOCRPipeline:
         output_format: OutputFormat,
         table_mode: MarkdownTableMode,
         inspect_ms: float,
+        native_analysis: PageAnalysis | None = None,
     ) -> OCRResult:
         t0 = time.perf_counter()
         raw_text = page.native_text
@@ -1047,6 +1055,22 @@ class AutoOCRPipeline:
         else:
             rendered = raw_text
         post_ms = (time.perf_counter() - t0) * 1000.0
+        meta: dict[str, Any] = {
+            "native_char_count": page.native_char_count,
+            "native_body_char_count": (
+                page.native_body_char_count
+                if page.native_body_char_count is not None
+                else page.native_char_count
+            ),
+            "native_control_char_count": page.native_control_char_count,
+            "image_count": page.image_count,
+            "native_garbled_ratio": page.native_garbled_ratio,
+            "width_pt": page.width_pt,
+            "height_pt": page.height_pt,
+        }
+        if native_analysis is not None:
+            meta["native_estimated_columns"] = int(native_analysis.estimated_columns)
+            meta["native_table_score"] = float(native_analysis.table_score)
         return OCRResult(
             text=rendered,
             raw_text=raw_text,
@@ -1060,19 +1084,7 @@ class AutoOCRPipeline:
                 postprocess_ms=post_ms,
                 total_ms=inspect_ms + post_ms,
             ),
-            metadata={
-                "native_char_count": page.native_char_count,
-                "native_body_char_count": (
-                    page.native_body_char_count
-                    if page.native_body_char_count is not None
-                    else page.native_char_count
-                ),
-                "native_control_char_count": page.native_control_char_count,
-                "image_count": page.image_count,
-                "native_garbled_ratio": page.native_garbled_ratio,
-                "width_pt": page.width_pt,
-                "height_pt": page.height_pt,
-            },
+            metadata=meta,
         )
 
     def _render_pdf_subset(
@@ -1248,12 +1260,28 @@ class AutoOCRPipeline:
             for p in native_pages:
                 eff_chars = p.native_body_char_count if p.native_body_char_count is not None else p.native_char_count
                 is_clean = p.native_control_char_count == 0 and p.native_garbled_ratio < _NATIVE_MAX_GARBLED_RATIO
-                if is_clean and (eff_chars >= _NATIVE_MIN_CHARS or (eff_chars > 0 and p.image_count == 0)):
+                native_pa = (
+                    analyze_page_from_lines(
+                        p.lines,
+                        None,
+                        int(round(p.width_pt)),
+                        int(round(p.height_pt)),
+                    )
+                    if (is_clean and p.lines)
+                    else None
+                )
+                layout_needs_vlm = bool(native_pa is not None and native_pa.needs_vlm)
+                if (
+                    is_clean
+                    and (not layout_needs_vlm)
+                    and (eff_chars >= _NATIVE_MIN_CHARS or (eff_chars > 0 and p.image_count == 0))
+                ):
                     ordered_results[p.page_index] = self._build_native_result(
                         p,
                         output_format=fmt,
                         table_mode=tmode,
                         inspect_ms=per_page_inspect,
+                        native_analysis=native_pa,
                     )
                 else:
                     raster_indices.append(p.page_index)

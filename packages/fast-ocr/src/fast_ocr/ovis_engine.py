@@ -1559,6 +1559,7 @@ class FastOvisOCREngine:
         prompt: str | None = None,
         prompts: Sequence[str | None] | None = None,
         schema: str | Mapping[str, Any] | None = None,
+        schemas: Sequence[str | Mapping[str, Any] | None] | None = None,
         output_format: OutputFormat | None = None,
         table_mode: MarkdownTableMode | None = None,
         strict_markdown_grammar: bool | None = None,
@@ -1602,6 +1603,12 @@ class FastOvisOCREngine:
         if len(prompt_seq) != n_sources:
             raise ValueError(f"Expected {n_sources} prompts, got {len(prompt_seq)}")
 
+        schema_seq: list[str | Mapping[str, Any] | None] = (
+            list(schemas) if schemas is not None else [schema] * n_sources
+        )
+        if len(schema_seq) != n_sources:
+            raise ValueError(f"Expected {n_sources} schemas, got {len(schema_seq)}")
+
         native_seq: list[str | None] = (
             list(native_pdf_texts) if native_pdf_texts is not None else [None] * n_sources
         )
@@ -1614,7 +1621,7 @@ class FastOvisOCREngine:
         fmt: OutputFormat = output_format or self.output_format
         tmode: MarkdownTableMode = table_mode or self.table_mode
         strict_md = self.strict_markdown_grammar if strict_markdown_grammar is None else bool(strict_markdown_grammar)
-        do_zoom = (self.zoom_recover if zoom_recover is None else bool(zoom_recover)) and (schema is None)
+        do_zoom_req = self.zoom_recover if zoom_recover is None else bool(zoom_recover)
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
@@ -1645,18 +1652,18 @@ class FastOvisOCREngine:
 
         # Single image or explicit B=1 path keeps double-buffered ANE Vision + B=1 PLD fast path
         if n_sources == 1 or eff_bs <= 1:
-            need_ane_prepass = do_orient or do_zoom or spec_req in ("auto", "vision+self")
+            need_ane_prepass = do_orient or (do_zoom_req and any(sc is None for sc in schema_seq)) or spec_req in ("auto", "vision+self")
             if n_sources == 1 or eff_deskew == "on" or not need_ane_prepass or all(p is not None for p in pre_seq):
                 return [
                     self.ocr_image(
                         src,
                         page_index=idx,
                         prompt=pr_i,
-                        schema=schema,
+                        schema=sc_i,
                         output_format=fmt,
                         table_mode=tmode,
                         strict_markdown_grammar=strict_md,
-                        zoom_recover=do_zoom,
+                        zoom_recover=(do_zoom_req and sc_i is None),
                         crop_margins=do_crop,
                         auto_orient=do_orient,
                         adaptive_resolution=do_adaptive,
@@ -1672,7 +1679,9 @@ class FastOvisOCREngine:
                         pre_analysis=pre,
                         auto_loop_recover=do_loop_recover,
                     )
-                    for pos_i, (src, idx, pre, pr_i, nat_i) in enumerate(zip(sources, indices, pre_seq, prompt_seq, native_seq))
+                    for pos_i, (src, idx, pre, pr_i, sc_i, nat_i) in enumerate(
+                        zip(sources, indices, pre_seq, prompt_seq, schema_seq, native_seq)
+                    )
                 ]
 
             def _run_ane(src: Any, idx: int) -> OCRResult | None:
@@ -1688,16 +1697,17 @@ class FastOvisOCREngine:
                     nxt_fut: Future[OCRResult | None] | None = None
                     if pos + 1 < n_sources and pre_seq[pos + 1] is None:
                         nxt_fut = pool.submit(_run_ane, sources[pos + 1], indices[pos + 1])
+                    sc_pos = schema_seq[pos]
                     results_b1.append(
                         self.ocr_image(
                             sources[pos],
                             page_index=indices[pos],
                             prompt=prompt_seq[pos],
-                            schema=schema,
+                            schema=sc_pos,
                             output_format=fmt,
                             table_mode=tmode,
                             strict_markdown_grammar=strict_md,
-                            zoom_recover=do_zoom,
+                            zoom_recover=(do_zoom_req and sc_pos is None),
                             crop_margins=do_crop,
                             auto_orient=do_orient,
                             adaptive_resolution=do_adaptive,
@@ -1743,7 +1753,11 @@ class FastOvisOCREngine:
                         deskew_metas[i] = {"applied": False, "reason": "deskew_error"}
         load_ms_each = ((time.perf_counter() - t_load0) * 1000.0) / max(1, n_items)
 
-        need_batch_ane = do_orient or do_zoom or (schema is not None)
+        need_batch_ane = (
+            do_orient
+            or (do_zoom_req and any(sc is None for sc in schema_seq))
+            or any(sc is not None for sc in schema_seq)
+        )
         if need_batch_ane:
             missing_pos = [i for i, pre in enumerate(pre_seq) if pre is None]
             if missing_pos:
@@ -1846,14 +1860,30 @@ class FastOvisOCREngine:
             suf_i = suf_ids_per_item[item_idx]
             return pre_ids + ([self.image_token_id] * nv) + suf_i, ([(s0, s0 + nv)] if nv > 0 else [])
 
-        json_gram: GrammarHelper | None = None
-        if schema is not None:
-            schema_norm = normalize_json_schema(schema)
-            json_gram = GrammarHelper(self.tokenizer.llguidance_tokenizer(), schema_norm, new_to_old=self._new_to_old)
+        gram_cache: dict[str, GrammarHelper] = {}
+        json_grams: list[GrammarHelper | None] = []
+        for sc_i in schema_seq:
+            if sc_i is None:
+                json_grams.append(None)
+                continue
+            schema_norm = normalize_json_schema(sc_i)
+            cache_k = (
+                schema_norm
+                if isinstance(schema_norm, str)
+                else json.dumps(schema_norm, sort_keys=True, separators=(",", ":"))
+            )
+            gh = gram_cache.get(cache_k)
+            if gh is None:
+                gh = GrammarHelper(self.tokenizer.llguidance_tokenizer(), schema_norm, new_to_old=self._new_to_old)
+                gram_cache[cache_k] = gh
+            json_grams.append(gh)
 
         table_grammars = (
-            [DynamicTableRowGrammar(self.tokenizer.llguidance_tokenizer()) for _ in range(n_items)]
-            if (strict_md and json_gram is None)
+            [
+                DynamicTableRowGrammar(self.tokenizer.llguidance_tokenizer()) if g_i is None else None
+                for g_i in json_grams
+            ]
+            if (strict_md and any(g_i is None for g_i in json_grams))
             else None
         )
         mrope_sec = tuple(
@@ -1882,7 +1912,7 @@ class FastOvisOCREngine:
             image_token_id=self.image_token_id,
             new_to_old=self._new_to_old,
             old_to_new=self._old_to_new,
-            grammars=[json_gram] * n_items,
+            grammars=json_grams,
             table_grammars=table_grammars,
             max_tokens=tok_cap,
             temperature=temperature,
@@ -1931,11 +1961,11 @@ class FastOvisOCREngine:
                     oriented_imgs[i],
                     page_index=indices[i],
                     prompt=prompt_seq[i],
-                    schema=schema,
+                    schema=schema_seq[i],
                     output_format=fmt,
                     table_mode=tmode,
                     strict_markdown_grammar=strict_md,
-                    zoom_recover=do_zoom,
+                    zoom_recover=(do_zoom_req and schema_seq[i] is None),
                     crop_margins=retry_crop,
                     auto_orient=False,
                     adaptive_resolution=do_adaptive,
@@ -1987,7 +2017,7 @@ class FastOvisOCREngine:
             t_post0 = time.perf_counter()
             raw_text = decode_fn(gen_ids)
             validation = None
-            if fmt == "markdown" and schema is None:
+            if fmt == "markdown" and schema_seq[i] is None:
                 rendered = canonicalize_markdown(raw_text, table_mode=tmode)
                 validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
             else:
@@ -2006,7 +2036,7 @@ class FastOvisOCREngine:
             decode_tps = (total_gen / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
 
             zoom_meta: dict[str, Any] | None = None
-            if do_zoom and vision_res is not None and vision_res.lines:
+            if do_zoom_req and (schema_seq[i] is None) and vision_res is not None and vision_res.lines:
                 rendered, raw_text, z_res, zoom_meta = self._run_zoom_recovery(
                     oriented_imgs[i],
                     vision_res,
@@ -2036,7 +2066,7 @@ class FastOvisOCREngine:
                     peak_gb = max(peak_gb, float(z_res.timings.peak_memory_gb))
                     if dec_ms > 0.0:
                         decode_tps = total_gen / (dec_ms / 1000.0)
-                    if fmt == "markdown" and schema is None and zoom_meta and zoom_meta.get("appended"):
+                    if fmt == "markdown" and schema_seq[i] is None and zoom_meta and zoom_meta.get("appended"):
                         validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
 
             grid_thw = list(mm_res.image_grids[0]) if mm_res.image_grids else [1, 0, 0]
@@ -2054,7 +2084,7 @@ class FastOvisOCREngine:
                 metadata["adaptive_max_pixels"] = int(adaptive_caps[i])  # type: ignore[arg-type]
             if deskew_metas[i] is not None:
                 metadata["deskew"] = deskew_metas[i]
-            if schema is not None and vision_res is not None:
+            if schema_seq[i] is not None and vision_res is not None:
                 line_rot = (int(rot_cws[i]) - int(vision_res.rotation_applied_cw)) % 360
                 metadata["field_boxes"] = align_json_values_to_lines(
                     raw_text,

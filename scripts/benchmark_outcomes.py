@@ -515,6 +515,19 @@ def _build_record(
     }
 
 
+def _parse_ocr_batch_size(raw: str) -> int | str:
+    tok = str(raw).strip().lower()
+    if tok == "auto":
+        return "auto"
+    try:
+        val = int(tok)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--ocr-batch-size must be >= 1 or 'auto', got {raw!r}") from exc
+    if val < 1:
+        raise argparse.ArgumentTypeError(f"--ocr-batch-size must be >= 1 or 'auto', got {raw!r}")
+    return val
+
+
 def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--mode", default=None)
@@ -554,7 +567,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--ocr-render-only", action="store_true", default=False)
     p.add_argument("--ocr-dpi", type=int, default=200)
     p.add_argument("--triage-dpi", type=int, default=None)
-    p.add_argument("--ocr-batch-size", type=int, default=None)
+    p.add_argument("--ocr-batch-size", type=_parse_ocr_batch_size, default="auto")
     p.add_argument("--ocr-kv-i8", default=None)
     p.add_argument("--ocr-gdn-state-mode", choices=("auto", "fp32", "bf16", "int8_blk32"), default=None)
     p.add_argument("--drop-white-patches", action="store_true", default=False)
@@ -2083,6 +2096,24 @@ _CAT5_ALL_SUITES: tuple[str, ...] = (
     "us_gov_ocr",
 )
 _CAT5_PDF_NATIVE_SUITES: frozenset[str] = frozenset({"olmocr_bench", "doclaynet_gov", "us_gov_ocr"})
+_CAT5_AUTO_BATCH_SIZE: dict[str, int] = {
+    "fintabnet_otsl": 16,
+    "cord_v2": 16,
+    "vrdu_ad_buy": 16,
+    "vrdu_registration": 16,
+}
+
+
+def _resolve_cat5_suite_batch_size(suite_name: str, extra: argparse.Namespace) -> int:
+    """Resolve effective Category 5 batch size: explicit `--ocr-batch-size` / `--batch-size`, else suite policy."""
+    req = getattr(extra, "ocr_batch_size", "auto")
+    if isinstance(req, int):
+        return max(1, req)
+    if getattr(extra, "batch_size", None) is not None:
+        return max(1, int(extra.batch_size))
+    if req is None or str(req).strip().lower() == "auto":
+        return int(_CAT5_AUTO_BATCH_SIZE.get(suite_name, 1))
+    return max(1, int(req))
 
 _PUREDOCBENCH_EN_SUBDIR: dict[str, str] = {
     "clean": "clean",
@@ -2546,12 +2577,6 @@ def _run_cat5_worker(
     eff_label: str
     default_family: str
     allow_html_tables = (extra.table_mode == "html") or (extra.output_format != "markdown")
-
-    eff_ocr_batch_size = (
-        max(1, int(extra.ocr_batch_size))
-        if getattr(extra, "ocr_batch_size", None) is not None
-        else (max(1, int(extra.batch_size)) if getattr(extra, "batch_size", None) is not None else 1)
-    )
     if pkg_name == "fast-ocr":
         from fast_ocr import FastOCR
 
@@ -2731,20 +2756,53 @@ def _run_cat5_worker(
     def _run_image_list_ocr(
         pil_imgs: Sequence[Any],
         *,
+        suite_name: str = "",
+        prompts: Sequence[str | None] | None = None,
+        schemas: Sequence[Mapping[str, Any] | None] | None = None,
+        max_tokens_override: int | None = None,
         task_kind: str = "page",
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-        if fast_eng is not None and eff_ocr_batch_size > 1 and len(pil_imgs) > 1:
-            outs = fast_eng.ocr_images(pil_imgs, batch_size=eff_ocr_batch_size)
-            return (
-                [r.text for r in outs],
-                [r.finish_reason for r in outs],
-                [_fast_result_meta(r) for r in outs],
-            )
+        suite_bs = _resolve_cat5_suite_batch_size(suite_name, extra)
+        if fast_eng is not None and suite_bs > 1 and len(pil_imgs) > 1:
+            if schemas is not None:
+                if eff_backend != "apple-vision" and callable(getattr(fast_eng, "_get_ovis_engine", None)):
+                    ovis = fast_eng._get_ovis_engine()
+                    ovis_batch = getattr(ovis, "ocr_images", None)
+                    if callable(ovis_batch) and accepts_kwarg(ovis_batch, "schemas"):
+                        outs = ovis_batch(
+                            pil_imgs,
+                            prompts=list(prompts) if prompts is not None else None,
+                            schemas=list(schemas),
+                            output_format="raw",
+                            table_mode=extra.table_mode,
+                            max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                            batch_size=suite_bs,
+                        )
+                        return (
+                            [r.text for r in outs],
+                            [r.finish_reason for r in outs],
+                            [_fast_result_meta(r) for r in outs],
+                        )
+            else:
+                outs = fast_eng.ocr_images(pil_imgs, batch_size=suite_bs)
+                return (
+                    [r.text for r in outs],
+                    [r.finish_reason for r in outs],
+                    [_fast_result_meta(r) for r in outs],
+                )
         preds_l: list[str] = []
         reasons_l: list[str] = []
         metas_l: list[dict[str, Any]] = []
-        for pil_img in pil_imgs:
-            tx, fr, md = _run_image_ocr(pil_img, task_kind=task_kind)
+        prompt_seq = list(prompts) if prompts is not None else [None] * len(pil_imgs)
+        schema_seq = list(schemas) if schemas is not None else [None] * len(pil_imgs)
+        for pil_img, pr_i, sc_i in zip(pil_imgs, prompt_seq, schema_seq):
+            tx, fr, md = _run_image_ocr(
+                pil_img,
+                prompt=pr_i,
+                schema=sc_i,
+                max_tokens_override=max_tokens_override,
+                task_kind=task_kind,
+            )
             preds_l.append(tx)
             reasons_l.append(fr)
             metas_l.append(md)
@@ -2828,7 +2886,7 @@ def _run_cat5_worker(
                     pre_imgs = [_render_pdf_first_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi)) for it in items]
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
-                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
                 else:
                     preds, reasons, metas = [], [], []
                     for it in items:
@@ -2885,7 +2943,7 @@ def _run_cat5_worker(
             elif suite_name == "fintabnet_otsl":
                 pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
                 t0 = time.perf_counter()
-                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="table")
+                preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="table")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2941,7 +2999,7 @@ def _run_cat5_worker(
             elif suite_name == "omnidocbench_en":
                 pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
                 t0 = time.perf_counter()
-                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="page")
+                preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="page")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3006,19 +3064,16 @@ def _run_cat5_worker(
             elif suite_name == "cord_v2":
                 pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
                 prompts = [_build_cord_v2_prompt(it["schema"]) for it in items]
-                preds, reasons, metas = [], [], []
+                schemas = [it["schema"] for it in items]
                 t0 = time.perf_counter()
-                for pil_img, pr, it in zip(pils, prompts, items):
-                    tx, fr, md = _run_image_ocr(
-                        pil_img,
-                        prompt=pr,
-                        schema=it["schema"],
-                        max_tokens_override=min(1024, int(extra.ocr_max_tokens)),
-                        task_kind="page",
-                    )
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                preds, reasons, metas = _run_image_list_ocr(
+                    pils,
+                    suite_name=suite_name,
+                    prompts=prompts,
+                    schemas=schemas,
+                    max_tokens_override=min(1024, int(extra.ocr_max_tokens)),
+                    task_kind="page",
+                )
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3073,19 +3128,16 @@ def _run_cat5_worker(
                     for it in items
                 ]
                 prompts = [_build_vrdu_prompt(it["schema"], corpus_label) for it in items]
-                preds, reasons, metas = [], [], []
+                schemas = [it["schema"] for it in items]
                 t0 = time.perf_counter()
-                for pil_img, pr, it in zip(pils, prompts, items):
-                    tx, fr, md = _run_image_ocr(
-                        pil_img,
-                        prompt=pr,
-                        schema=it["schema"],
-                        max_tokens_override=min(1536, int(extra.ocr_max_tokens)),
-                        task_kind="page",
-                    )
-                    preds.append(tx)
-                    reasons.append(fr)
-                    metas.append(md)
+                preds, reasons, metas = _run_image_list_ocr(
+                    pils,
+                    suite_name=suite_name,
+                    prompts=prompts,
+                    schemas=schemas,
+                    max_tokens_override=min(1536, int(extra.ocr_max_tokens)),
+                    task_kind="page",
+                )
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3152,7 +3204,7 @@ def _run_cat5_worker(
                     ]
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
-                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
                 else:
                     preds, reasons, metas = [], [], []
                     with tempfile.TemporaryDirectory(prefix="doclaynet_gov_") as tmp_dir:
@@ -3220,7 +3272,7 @@ def _run_cat5_worker(
             elif suite_name in ("puredocbench_legal_gov", "puredocbench_en"):
                 pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
                 t0 = time.perf_counter()
-                preds, reasons, metas = _run_image_list_ocr(pils, task_kind="page")
+                preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="page")
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3293,7 +3345,7 @@ def _run_cat5_worker(
                     ]
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
-                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, task_kind="page")
+                    preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
                 else:
                     preds, reasons, metas = [], [], []
                     for it in suite_items:

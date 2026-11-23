@@ -18,10 +18,13 @@ from fast_shared.vision_preprocess import (
     smart_resize_qwen,
 )
 
+from .types import OCRBox, OCRLine
+
 if TYPE_CHECKING:
     from PIL import Image
 
 DEFAULT_MAX_PDF_PIXELS = 20_000_000
+DEFAULT_PDF_LINE_MERGE_GAP = 0.015
 
 _CONTROL_GARBLE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]")
 _STAMP_BOILERPLATE_RES = (
@@ -48,6 +51,7 @@ class RenderedPDFPage:
     effective_dpi: int | None = None
     native_control_char_count: int = 0
     native_body_char_count: int | None = None
+    lines: tuple[OCRLine, ...] = ()
 
 
 def rotate_box_normalized(
@@ -136,12 +140,90 @@ def _garbled_text_ratio(text: str) -> float:
     return bad / max(1, total)
 
 
+def extract_native_pdf_lines(
+    textpage: object,
+    width_pt: float,
+    height_pt: float,
+    *,
+    merge_gap: float = DEFAULT_PDF_LINE_MERGE_GAP,
+) -> tuple[OCRLine, ...]:
+    """Extract baseline-merged normalized `OCRLine` boxes from a `pypdfium2` text page."""
+    count_fn = getattr(textpage, "count_rects", None)
+    rect_fn = getattr(textpage, "get_rect", None)
+    bounded_fn = getattr(textpage, "get_text_bounded", None)
+    if not callable(count_fn) or not callable(rect_fn) or not callable(bounded_fn):
+        return ()
+    w_pt = max(float(width_pt), 1.0)
+    h_pt = max(float(height_pt), 1.0)
+    raw_lines: list[OCRLine] = []
+    n_rects = int(count_fn())
+    for i in range(n_rects):
+        l, b, r, t = rect_fn(i)
+        raw = bounded_fn(l, b, r, t) or ""
+        parts = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not parts:
+            continue
+        x0 = max(0.0, min(1.0, float(l) / w_pt))
+        x1 = max(x0, min(1.0, float(r) / w_pt))
+        y0 = max(0.0, min(1.0, 1.0 - float(t) / h_pt))
+        y1 = max(y0, min(1.0, 1.0 - float(b) / h_pt))
+        step = (y1 - y0) / float(len(parts))
+        for k, part in enumerate(parts):
+            ly0 = y0 + k * step
+            ly1 = min(1.0, max(ly0, y0 + (k + 1) * step))
+            raw_lines.append(OCRLine(text=part, box=OCRBox(x0, ly0, x1, ly1), confidence=1.0))
+
+    if len(raw_lines) <= 1:
+        return tuple(raw_lines)
+
+    # Group same-baseline lines (handling descender height differences) before sorting left-to-right by `x0`
+    # so taller text on the left is never sorted after shorter numbers on the right and merged backwards.
+    raw_lines.sort(key=lambda ln: (0.5 * (ln.box.y0 + ln.box.y1), ln.box.x0))
+    gap_tol = max(0.0, float(merge_gap))
+    bands: list[list[OCRLine]] = []
+    for ln in raw_lines:
+        cy = 0.5 * (ln.box.y0 + ln.box.y1)
+        if bands:
+            anchor = bands[-1][0]
+            acy = 0.5 * (anchor.box.y0 + anchor.box.y1)
+            y_tol = max(0.006, 0.5 * min(anchor.box.height, ln.box.height))
+            if abs(cy - acy) <= y_tol:
+                bands[-1].append(ln)
+                continue
+        bands.append([ln])
+
+    merged: list[OCRLine] = []
+    for band in bands:
+        band.sort(key=lambda ln: ln.box.x0)
+        band_merged: list[OCRLine] = []
+        for ln in band:
+            if band_merged:
+                prev = band_merged[-1]
+                dx = ln.box.x0 - prev.box.x1
+                if -0.015 <= dx <= gap_tol:
+                    band_merged[-1] = OCRLine(
+                        text=f"{prev.text} {ln.text}",
+                        box=OCRBox(
+                            min(prev.box.x0, ln.box.x0),
+                            min(prev.box.y0, ln.box.y0),
+                            max(prev.box.x1, ln.box.x1),
+                            max(prev.box.y1, ln.box.y1),
+                        ),
+                        confidence=1.0,
+                    )
+                    continue
+            band_merged.append(ln)
+        merged.extend(band_merged)
+    return tuple(merged)
+
+
 def extract_native_pdf_text(
     pdf_path: str | Path,
     *,
     page_indices: Sequence[int] | None = None,
+    include_lines: bool = True,
 ) -> list[RenderedPDFPage]:
-    """Extract per-page native text metadata from a PDF via `pypdfium2` without rasterizing."""
+    """Extract per-page native text metadata and optional merged `OCRLine` boxes from a PDF without rasterizing."""
     import pypdfium2 as pdfium
 
     doc = pdfium.PdfDocument(str(Path(pdf_path).expanduser()))
@@ -158,22 +240,32 @@ def extract_native_pdf_text(
                 tp = page.get_textpage()
                 try:
                     raw_txt = tp.get_text_bounded() or ""
+                    stripped = raw_txt.strip()
+                    body_stripped = strip_running_pdf_boilerplate(stripped)
+                    char_count = sum(1 for c in stripped if not c.isspace())
+                    garbled_ratio = _garbled_text_ratio(stripped)
+                    ctrl_count = count_control_garble_chars(stripped)
+                    body_count = sum(1 for c in body_stripped if not c.isspace())
+                    page_lines: tuple[OCRLine, ...] = (
+                        extract_native_pdf_lines(tp, float(w_pt), float(h_pt))
+                        if (include_lines and ctrl_count == 0 and garbled_ratio < 0.02 and body_count > 0)
+                        else ()
+                    )
                 finally:
                     tp.close()
-                stripped = raw_txt.strip()
-                body_stripped = strip_running_pdf_boilerplate(stripped)
                 out.append(
                     RenderedPDFPage(
                         page_index=idx,
                         width_pt=float(w_pt),
                         height_pt=float(h_pt),
                         native_text=stripped,
-                        native_char_count=sum(1 for c in stripped if not c.isspace()),
-                        native_garbled_ratio=_garbled_text_ratio(stripped),
+                        native_char_count=char_count,
+                        native_garbled_ratio=garbled_ratio,
                         image=None,
                         image_count=_count_pdf_page_images(page),
-                        native_control_char_count=count_control_garble_chars(stripped),
-                        native_body_char_count=sum(1 for c in body_stripped if not c.isspace()),
+                        native_control_char_count=ctrl_count,
+                        native_body_char_count=body_count,
+                        lines=page_lines,
                     )
                 )
             finally:

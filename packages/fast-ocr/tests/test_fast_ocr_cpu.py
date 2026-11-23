@@ -2120,3 +2120,250 @@ def test_b_gt_8_defaults_parallel_ane_gate_and_ovis_batch_wiring(
     assert all(r.metadata["speculative_mode"] == "batched" for r in bat_res)
 
 
+def test_native_pdf_layout_gate_merges_inline_runs_and_escalates_multicol_tables(tmp_path: Path) -> None:
+    from fast_ocr.apple_vision import analyze_page_from_lines
+    from fast_ocr.preprocess import extract_native_pdf_lines, extract_native_pdf_text
+
+    def _build_positioned_pdf(out_pdf: Path, pages_ops: list[list[str]]) -> None:
+        objs: list[bytes] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"",
+        ]
+        kids: list[str] = []
+        font_num = 3 + len(pages_ops) * 2
+        for idx, ops in enumerate(pages_ops):
+            pg_num = 3 + idx * 2
+            ct_num = pg_num + 1
+            kids.append(f"{pg_num} 0 R")
+            stream = "\n".join(ops).encode("latin1")
+            objs.append(
+                f"{pg_num} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 {font_num} 0 R >> >> /Contents {ct_num} 0 R >>\nendobj\n".encode("latin1")
+            )
+            objs.append(
+                f"{ct_num} 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode("latin1") + stream + b"\nendstream\nendobj\n"
+            )
+        objs[1] = f"2 0 obj\n<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(pages_ops)} >>\nendobj\n".encode("latin1")
+        objs.append(f"{font_num} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".encode("latin1"))
+        buf = bytearray(b"%PDF-1.4\n")
+        offsets: list[int] = []
+        for obj in objs:
+            offsets.append(len(buf))
+            buf.extend(obj)
+        xref_pos = len(buf)
+        buf.extend(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode("latin1"))
+        for off in offsets:
+            buf.extend(f"{off:010d} 00000 n \n".encode("latin1"))
+        buf.extend(f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode("latin1"))
+        out_pdf.write_bytes(bytes(buf))
+
+    # Page 0: single-column court opinion prose with split inline runs at the same baseline (must stay native)
+    p0_ops: list[str] = []
+    for row_i in range(10):
+        y = 720 - row_i * 20
+        p0_ops.extend(
+            [
+                f"BT /F1 11 Tf 72 {y} Td (Court opinion ) Tj ET",
+                f"BT /F1 11 Tf 143 {y} Td (section {row_i} continuing cleanly across column center.) Tj ET",
+            ]
+        )
+
+    # Page 1: clean 3-column table with >80 clean chars and 0 images (must NOT bypass to Tier-0)
+    p1_ops: list[str] = []
+    for row_i in range(8):
+        y = 720 - row_i * 22
+        p1_ops.extend(
+            [
+                f"BT /F1 10 Tf 40 {y} Td (Budget Row {row_i}) Tj ET",
+                f"BT /F1 10 Tf 230 {y} Td (FY26 {1000 + row_i}.00) Tj ET",
+                f"BT /F1 10 Tf 420 {y} Td (FY27 {2000 + row_i}.00) Tj ET",
+            ]
+        )
+
+    pdf_p = tmp_path / "native_layout_gate.pdf"
+    _build_positioned_pdf(pdf_p, [p0_ops, p1_ops])
+
+    pages = extract_native_pdf_text(pdf_p)
+    assert len(pages) == 2 and pages[0].lines and pages[1].lines
+    pa0 = analyze_page_from_lines(pages[0].lines, None, 612, 792)
+    pa1 = analyze_page_from_lines(pages[1].lines, None, 612, 792)
+    assert pa0.estimated_columns == 1 and pa0.needs_vlm is False
+    assert pa1.estimated_columns >= 3 and pa1.needs_vlm is True
+
+    # Also verify graceful empty return for stub textpages without count_rects
+    assert extract_native_pdf_lines(object(), 612.0, 792.0) == ()
+
+    class FakeVisionTablePrepass:
+        def recognize_image(self, _img: object, *, page_index: int = 0, output_format: str = "markdown") -> OCRResult:
+            from dataclasses import replace as _dc_replace
+
+            base = _make_prose_result(page_index=page_index)
+            assert base.analysis is not None
+            return _dc_replace(
+                base,
+                analysis=_dc_replace(base.analysis, estimated_columns=3, table_score=1.0, needs_vlm=True),
+            )
+
+    seen_hints: list[str | None] = []
+
+    class FakeOvisTableRouter:
+        def ocr_images(self, imgs: list[object], **kwargs: Any) -> list[OCRResult]:
+            hints = kwargs.get("native_pdf_texts") or []
+            seen_hints.extend(hints)
+            return [
+                OCRResult(
+                    text="| Line | FY26 | FY27 |\n| --- | --- | --- |\n| Item 0 | $1000.00 | $2000.00 |",
+                    raw_text="| Line |",
+                    backend_used="ovis:stub",
+                    page_index=int((kwargs.get("page_indices") or [0])[i]),
+                    finish_reason="stop",
+                    timings=OCRTimings(generated_tokens=16, decode_tps=200.0, decode_ms=80.0),
+                )
+                for i, _ in enumerate(imgs)
+            ]
+
+    with FastOCR(backend="auto", vision_ocr=FakeVisionTablePrepass(), ovis_engine=FakeOvisTableRouter()) as pipe:
+        outs = pipe.ocr_pdf(pdf_p, dpi=100)
+
+    assert [r.page_index for r in outs] == [0, 1]
+    assert outs[0].backend_used == "native"
+    assert outs[0].metadata["native_estimated_columns"] == 1
+    assert outs[1].backend_used == "ovis:stub"
+    assert len(seen_hints) == 1 and seen_hints[0] and "Budget Row 0" in seen_hints[0]
+
+
+def test_ovis_engine_ocr_images_per_item_schemas_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    import numpy as np
+    from tokenizers import AddedToken, Tokenizer as HfTokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_ocr.ovis_engine import FastOvisOCREngine
+    from fast_qwen3.multimodal_batch import BatchedMMItemResult
+    from fast_qwen3.tokenizer import FastQwen3Tokenizer
+    from fast_shared.grammar import normalize_json_schema
+
+    vocab: dict[str, int] = {ch: i for i, ch in enumerate(sorted(ByteLevel.alphabet()))}
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    bpe.add_special_tokens(
+        [
+            AddedToken("<|endoftext|>", special=True),
+            AddedToken("<|im_start|>", special=True),
+            AddedToken("<|im_end|>", special=True),
+            AddedToken("<think>", special=True),
+            AddedToken("</think>", special=True),
+            AddedToken("<|vision_start|>", special=True),
+            AddedToken("<|image_pad|>", special=True),
+            AddedToken("<|vision_end|>", special=True),
+        ]
+    )
+    tok_p = tmp_path / "tok_ovis_schemas.json"
+    bpe.save(str(tok_p))
+    ftok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+
+    built_schemas: list[str] = []
+
+    class _FakeGrammarHelper:
+        def __init__(self, _ltok: Any, schema_norm: str, new_to_old: Any = None) -> None:
+            self.schema = str(schema_norm)
+            built_schemas.append(self.schema)
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.GrammarHelper", _FakeGrammarHelper)
+    monkeypatch.setattr("fast_ocr.ovis_engine.normalize_json_schema", normalize_json_schema)
+
+    stub_eng = FastOvisOCREngine.__new__(FastOvisOCREngine)
+    stub_eng.model_dir = tmp_path
+    stub_eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [1, 1, 1]}}}
+    stub_eng.output_format = "markdown"
+    stub_eng.table_mode = "gfm"
+    stub_eng.strict_markdown_grammar = True
+    stub_eng.zoom_recover = False
+    stub_eng.crop_margins = False
+    stub_eng.crop_pad_px = 0
+    stub_eng.auto_orient = False
+    stub_eng.adaptive_resolution = False
+    stub_eng.deskew = "off"
+    stub_eng.speculative = "off"
+    stub_eng.draft_k = 4
+    stub_eng.prefill_chunk_size = 512
+    stub_eng.max_tokens = 256
+    stub_eng.loop_breaker = False
+    stub_eng.auto_loop_recover = False
+    stub_eng.kv_i8 = "bf16"
+    stub_eng.gdn_state_mode = "fp32"
+    stub_eng.drop_white_patches = False
+    stub_eng.image_token_id = int(ftok.backend_tokenizer.token_to_id("<|image_pad|>"))
+    stub_eng.vision_model = SimpleNamespace()
+    stub_eng.lm = SimpleNamespace(cfg=SimpleNamespace(head_dim=256), vocab_n=ftok.vocab_size)
+    stub_eng.tokenizer = ftok
+    stub_eng.vocab_remap = None
+    stub_eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    stub_eng._new_to_old_mx = None
+    stub_eng._old_to_new = None
+    stub_eng._vision_prepass = None
+
+    seen_mm: dict[str, Any] = {}
+    ans_a = ftok.encode('{"amount":"12.50"}', add_special_tokens=False)
+    ans_txt = ftok.encode("Table text", add_special_tokens=False)
+
+    def _fake_batched_mm(**kw: Any):
+        seen_mm["grammars"] = list(kw["grammars"])
+        seen_mm["table_grammars"] = list(kw["table_grammars"]) if kw["table_grammars"] is not None else None
+        return [
+            BatchedMMItemResult(
+                generated_ids=ans_a if seen_mm["grammars"][idx_m] is not None else ans_txt,
+                prompt_tokens=12,
+                hit_eos=True,
+                hit_max_tokens=False,
+                vit_ms=1.0,
+                prefill_ms=1.0,
+                decode_ms=1.0,
+                image_grids=[(1, 2, 2)],
+            )
+            for idx_m in range(len(kw["images_per_item"]))
+        ], {"waves": 1, "compactions": 0}
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.batched_multimodal_generate", _fake_batched_mm)
+
+    schema_a = {"type": "object", "properties": {"amount": {"type": "string"}}, "required": ["amount"]}
+    schema_b = {"type": "object", "properties": {"vendor": {"type": "string"}}, "required": ["vendor"]}
+    imgs = [Image.new("RGB", (32, 32), "white")] * 3
+    outs = stub_eng.ocr_images(
+        imgs,
+        prompts=["extract a", "extract b", "read page"],
+        schemas=[dict(schema_a), schema_a, None],
+        batch_size=4,
+    )
+    assert len(outs) == 3
+    # Identical normalized schemas share one compiled GrammarHelper; None leaves slot open for table_grammars
+    assert len(built_schemas) == 1
+    assert seen_mm["grammars"][0] is seen_mm["grammars"][1]
+    assert seen_mm["grammars"][2] is None
+    assert seen_mm["table_grammars"] is not None
+    assert seen_mm["table_grammars"][0] is None and seen_mm["table_grammars"][1] is None and seen_mm["table_grammars"][2] is not None
+
+    outs_diff = stub_eng.ocr_images(
+        imgs[:2],
+        prompts=["extract a", "extract b"],
+        schemas=[schema_a, schema_b],
+        batch_size=4,
+    )
+    assert len(outs_diff) == 2
+    assert seen_mm["grammars"][0] is not seen_mm["grammars"][1]
+    assert seen_mm["table_grammars"] is None
+
+    # B=1 fallback forwards per-item schema into ocr_image
+    seen_b1_schemas: list[Any] = []
+    monkeypatch.setattr(
+        stub_eng,
+        "ocr_image",
+        lambda _im, **kw: (seen_b1_schemas.append(kw.get("schema")) or _make_prose_result()),
+    )
+    _ = stub_eng.ocr_images(imgs[:2], schemas=[schema_a, schema_b], batch_size=1)
+    assert seen_b1_schemas == [schema_a, schema_b]
+
+
+

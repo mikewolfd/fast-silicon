@@ -2466,6 +2466,109 @@ def test_visual_retrieval_workers_embeddinggemma2_and_pplx_cpu(
     assert pplx_calls[1]["crop_margins"] is False and pplx_calls[1]["grid_bucket_step"] == 4
 
 
+def test_cat5_ocr_batch_policy_and_kie_batched_schemas_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from PIL import Image
+    import fast_ocr
+    from fast_ocr.types import OCRResult, OCRTimings
+
+    out = _load_script("test_cat5_kie_batch", "benchmark_outcomes.py")
+
+    # 1. Verify `--ocr-batch-size auto` policy resolves 16 for table/KIE suites and 1 for long prose
+    ns_auto = out._parse_extra_flags([])
+    assert ns_auto.ocr_batch_size == "auto"
+    assert out._resolve_cat5_suite_batch_size("fintabnet_otsl", ns_auto) == 16
+    assert out._resolve_cat5_suite_batch_size("cord_v2", ns_auto) == 16
+    assert out._resolve_cat5_suite_batch_size("vrdu_ad_buy", ns_auto) == 16
+    assert out._resolve_cat5_suite_batch_size("vrdu_registration", ns_auto) == 16
+    assert out._resolve_cat5_suite_batch_size("olmocr_bench", ns_auto) == 1
+    assert out._resolve_cat5_suite_batch_size("omnidocbench_en", ns_auto) == 1
+    assert out._resolve_cat5_suite_batch_size("us_gov_ocr", ns_auto) == 1
+
+    ns_explicit = out._parse_extra_flags(["--ocr-batch-size", "1"])
+    assert ns_explicit.ocr_batch_size == 1
+    assert out._resolve_cat5_suite_batch_size("cord_v2", ns_explicit) == 1
+
+    # 2. Verify CORD-v2 routes batched per-item schemas to ovis.ocr_images(..., schemas=..., batch_size=16) under auto policy
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    cord_items = [
+        {
+            "id": f"cord_{i}",
+            "image_bytes": png_bytes,
+            "schema": {"type": "object", "properties": {f"field_{i}": {"type": "string"}}, "required": [f"field_{i}"]},
+            "gt_parse": {f"field_{i}": f"val_{i}"},
+        }
+        for i in range(2)
+    ]
+    monkeypatch.setattr(out, "load_cord_v2", lambda **_kw: list(cord_items))
+
+    batch_calls: list[dict[str, Any]] = []
+
+    class _SpyKIEOvis:
+        def ocr_image(self, *_a: Any, **_kw: Any) -> OCRResult:
+            return OCRResult(text="{}", raw_text="{}", backend_used="ovis:stub", finish_reason="stop", timings=OCRTimings())
+
+        def ocr_images(
+            self,
+            imgs: list[Any],
+            *,
+            prompts: list[str] | None = None,
+            schemas: list[dict[str, Any]] | None = None,
+            batch_size: int = 16,
+            **_kw: Any,
+        ) -> list[OCRResult]:
+            batch_calls.append({"n": len(imgs), "prompts": prompts, "schemas": schemas, "batch_size": batch_size})
+            return [
+                OCRResult(
+                    text=json.dumps({f"field_{i}": f"val_{i}"}),
+                    raw_text=json.dumps({f"field_{i}": f"val_{i}"}),
+                    backend_used="ovis:stub",
+                    page_index=i,
+                    finish_reason="stop",
+                    timings=OCRTimings(generated_tokens=6, decode_tps=120.0, decode_ms=50.0),
+                )
+                for i in range(len(imgs))
+            ]
+
+    class _SpyKIEFastOCR:
+        def __init__(self, **_kw: Any) -> None:
+            self._ov = _SpyKIEOvis()
+
+        def _get_ovis_engine(self) -> _SpyKIEOvis:
+            return self._ov
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(fast_ocr, "FastOCR", _SpyKIEFastOCR)
+    extra = out._parse_extra_flags(["--ocr-backend", "ovis", "--ocr-suites", "cord_v2"])
+    recs = out._run_cat5_worker(
+        "fast-ocr",
+        tier="tier1",
+        config_label="cord_auto_batch",
+        extra=extra,
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=2,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=48.0,
+    )
+    assert len(recs) == 1 and recs[0]["benchmark"] == "CORD-v2(2)"
+    assert recs[0]["objective_score_e2e"] == 1.0
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["n"] == 2
+    assert batch_calls[0]["batch_size"] == 16
+    assert len(batch_calls[0]["schemas"]) == 2
+    assert batch_calls[0]["schemas"][0] != batch_calls[0]["schemas"][1]
+
+
 
 
 
