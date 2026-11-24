@@ -25,7 +25,7 @@ docs = eng.encode_documents(["First long passage...", "Second passage..."], titl
 index = eng.build_index(["First long passage...", "Second passage..."], titles=["2025 Capex Note", "Summary"])
 top_ids, top_scores = index.search(q, k=5)
 
-# Optional lazy image encoding (install extra: `uv pip install -e ".[vision]"`).
+# Optional lazy image encoding (defaults to max_soft_tokens=140; install extra: `uv pip install -e ".[vision]"`).
 # Text-only calls never import Pillow or load vision_tower weights (0 text overhead).
 img_index = eng.build_image_index(["page_1.png", "page_2.png"])
 page_hits, page_scores = img_index.search(eng.encode_texts("revenue table", is_query=True), k=1)
@@ -68,11 +68,12 @@ Prepending document headers when chunking Parquet windows raised 175-query legal
 
 Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum cosine similarity against the FP16 reference is `0.999998` on GPU, `0.999728` in `hetero2`, and `0.999887` on a single 24-token ANE query.
 
-### 3. Optional lazy image encoding & cross-modal retrieval (M4 Pro)
+### 3. Optional lazy image encoding, CPU prefetch & cross-modal retrieval
 
 With optional `[vision]` installed (`uv pip install -e ".[vision]"`), `encode_images()` and `build_image_index()` lazily load the shared `gemma4_vision` tower only when image inputs are passed (text-only workloads never import `PIL` or `fast_shared.gemma4_vision`):
-- **Stock `mlx-vlm` parity (8 Category-5 pages):** `min_cos = 0.999819` (`bf16`, `3.39 img/s` `B=1` / `2.91 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.24 GB`) and `min_cos = 0.999701` (`8bit`, `3.51 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.00 GB`).
-- **Cross-modal text-to-page retrieval (`16` Category-5 pages):** **`15/16` (`93.75%`) `Recall@1` and `0.950` `MRR` at `4.36 img/s`** (`1.59 GB` MLX / `2.98 GB` RSS) vs `FastPplx` (`14/16` `87.5%` `R@1`, `0.903` `MRR` at `2.17 img/s`, `1.85 GB` MLX / `3.51 GB` RSS) — `2.01×` faster image encoding with compact single-vector embeddings. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
+- **Default `140` soft tokens + bounded `depth=1` CPU image prefetch:** `DEFAULT_VISION_SOFT_TOKENS = 140` (`70/140/280/560/1120` selectable) cut Base M5 `48`-page ViT latency `100.69 -> 44.87 ms`, lifting pre-decoded GPU throughput **`2.18×` (`19.57 img/s`)** and disk E2E **`1.936×` (`15.14 img/s`)** at identical `R@1 = 0.8542`. Adding bounded `depth=1` background Pillow decode/resize prefetch lifted `48`-page disk E2E another **`1.276×` on Base M5 (`18.98 img/s`, `peak_phys -45.76 MB`)** and **`1.164×` on M4 Pro (`10.89 img/s`, `peak_phys -38.63 MB`)** with `min_cos >= 0.9999993` and exact `R@1 = 0.8542`. [v3.0 vision prefetch benchmarks](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
+- **Stock `mlx-vlm` parity (8 Category-5 pages, M4 Pro):** `min_cos = 0.999819` (`bf16`, `3.39 img/s` `B=1` / `2.91 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.24 GB`) and `min_cos = 0.999701` (`8bit`, `3.51 img/s` `B=8`, `1.59 GB` MLX peak vs stock `2.00 GB`).
+- **Cross-modal text-to-page retrieval (`16` Category-5 pages, M4 Pro):** **`15/16` (`93.75%`) `Recall@1` and `0.950` `MRR` at `4.36 img/s`** (`1.59 GB` MLX / `2.98 GB` RSS) vs `FastPplx` (`14/16` `87.5%` `R@1`, `0.903` `MRR` at `2.17 img/s`, `1.85 GB` MLX / `3.51 GB` RSS) — `2.01×` faster image encoding with compact single-vector embeddings. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
 
 ## What keeps it fast
 

@@ -1,0 +1,254 @@
+{
+  "schema_version": "3.0.0",
+  "date": "2026-11-23",
+  "title": "v3.0 Cross-Silicon Local Optimizations, Proxima Builds, Round-1/2 Winners & Negative Gates Receipt",
+  "hosts": {
+    "m4_pro": "Apple M4 Pro (Mac16,8, 48 GB, macOS 26.6 25G5057c, Apple9, MLX 0.32.4)",
+    "base_m5": "Base Apple M5 (Mac17,2, 24 GB, macOS 27.2.1 26B131, Apple10 NAX, MLX 0.32.4)"
+  },
+  "commits": {
+    "proxima_builds": "6826e34",
+    "round1_2_winners": "93e207c",
+    "v3_local_maxout": "1623e7b",
+    "fast_shared_local": "7330201",
+    "fast_embeddinggemma_2_local": "8c43a32"
+  },
+  "promoted": {
+    "L2_async_cpu_image_prefetch": {
+      "verdict": "PROMOTE",
+      "packages": ["fast-embeddinggemma-2", "fast-pplx"],
+      "base_m5": {
+        "emb2_48_140tok": {
+          "baseline_median_s": 3.2278,
+          "candidate_median_s": 2.5287,
+          "baseline_img_per_s": 14.87,
+          "candidate_img_per_s": 18.98,
+          "speedup_median_x": 1.2764,
+          "min_cos_vs_baseline": 0.9999999,
+          "recall_at_1": 0.8542,
+          "recall_at_5": 0.875,
+          "mrr_at_10": 0.8697,
+          "rss_delta_mb": 40.27,
+          "peak_phys_delta_mb": -45.76,
+          "peak_mlx_gb": 1.3509
+        },
+        "pplx_24_786k": {
+          "baseline_median_s": 3.0061,
+          "candidate_median_s": 2.6955,
+          "baseline_img_per_s": 7.98,
+          "candidate_img_per_s": 8.9,
+          "speedup_median_x": 1.1152,
+          "min_cos_vs_baseline": 0.9999998,
+          "rss_delta_mb": 88.37,
+          "peak_phys_delta_mb": 110.07,
+          "peak_mlx_gb": 1.7479
+        }
+      },
+      "m4_pro": {
+        "emb2_48_140tok": {
+          "baseline_median_s": 5.1297,
+          "candidate_median_s": 4.4061,
+          "baseline_img_per_s": 9.36,
+          "candidate_img_per_s": 10.89,
+          "speedup_median_x": 1.1642,
+          "min_cos_vs_baseline": 0.9999993,
+          "recall_at_1": 0.8542,
+          "recall_at_5": 0.9167,
+          "mrr_at_10": 0.883,
+          "rss_delta_mb": 43.86,
+          "peak_phys_delta_mb": -38.63,
+          "peak_mlx_gb": 1.5812
+        },
+        "pplx_24_786k": {
+          "baseline_median_s": 4.4176,
+          "candidate_median_s": 4.0023,
+          "baseline_img_per_s": 5.43,
+          "candidate_img_per_s": 6.0,
+          "speedup_median_x": 1.1038,
+          "min_cos_vs_baseline": 0.9999998,
+          "rss_delta_mb": 61.53,
+          "peak_phys_delta_mb": 65.78,
+          "peak_mlx_gb": 1.8668
+        }
+      }
+    },
+    "L5_5a_db_inline_xor_meta_only": {
+      "verdict": "PROMOTE",
+      "host": "Base Apple M5 (Mac17,2, 24 GB, macOS 27.2.1 26B131, MLX 0.32.4)",
+      "packs_meta_only": true,
+      "m_ge_128_vs_packed_ratio": {"count": 32, "min": 0.94, "median": 0.9955, "max": 1.055},
+      "m_ge_128_vs_mlx_qmm_ratio": {"count": 32, "min": 1.012, "median": 1.183, "max": 2.2},
+      "m_64_vs_packed_ratio": {"count": 8, "min": 0.93, "median": 0.959, "max": 0.986},
+      "m_64_vs_mlx_qmm_ratio": {"count": 8, "min": 1.023, "median": 1.1815, "max": 2.401},
+      "max_diff_vs_packed": 0.0,
+      "cos_vs_packed": 1.0,
+      "post_integration_m5_matrix_cases": 32,
+      "edge_parity_cases_passed": "12/12",
+      "shadow_weight_ram_eliminated_gb": {
+        "qwen35_4b_optiq_4bit": 2.341,
+        "ovisocr2_8bit": 0.403
+      }
+    },
+    "L8_part_a_logprob_confidence": {
+      "verdict": "PROMOTE_B1_AUTO_OPT_IN_BATCHED",
+      "host": "Apple M4 Pro (Mac16,8, 48 GB, macOS 26.6 25G5057c, MLX 0.32.4)",
+      "fintabnet_otsl_30_b1": {
+        "off_wall_sec": 46.8072,
+        "on_wall_sec": 45.8701,
+        "overhead_pct": -2.002,
+        "teds": 0.863877,
+        "exact_match_count": 30,
+        "off_mlx_peak_gb": 1.5825,
+        "on_mlx_peak_gb": 1.5825,
+        "auroc_lt1_min_window_logprob": 0.9135,
+        "auroc_lt1_mean_logprob": 0.9038,
+        "auroc_lt085_mean_prob": 0.8,
+        "auroc_lt085_p05_logprob": 0.792
+      },
+      "olmocr_12_b1": {
+        "off_wall_sec": 210.6843,
+        "on_wall_sec": 202.99,
+        "overhead_pct": -3.652,
+        "macro": 0.617308,
+        "exact_match_count": 12,
+        "mlx_peak_gb": 2.3909
+      },
+      "olmocr_cal3_18_lt1": {
+        "auroc_p05_logprob": 0.7792,
+        "auroc_mean_logprob": 0.7403,
+        "bot15_mean_score": 0.0833,
+        "top85_mean_score": 0.7715
+      },
+      "fintabnet_otsl_30_b16_batched_opt_in": {
+        "baseline_wall_sec": 33.2143,
+        "telemetry_wall_sec": 37.9788,
+        "overhead_pct": 14.34
+      }
+    },
+    "L8_part_b_region_routing_and_digital_pdf_splice": {
+      "verdict": "OPT_IN_REPAIRED",
+      "default_region_routing": false,
+      "host": "Apple M4 Pro (Mac16,8, 48 GB, macOS 26.6 25G5057c, MLX 0.32.4)",
+      "olmocr_mc_tbl_12": {
+        "baseline_rr_false": {"wall_sec": 100.007, "macro": 0.785178, "multi_column": 0.692308, "table_tests": 0.878049},
+        "prior_broken_rr_true": {"wall_sec": 89.577, "macro": 0.748593, "multi_column": 0.692308, "table_tests": 0.804878},
+        "repaired_rr_true": {"wall_sec": 101.1179, "macro": 0.785178, "multi_column": 0.692308, "table_tests": 0.878049}
+      },
+      "us_gov_ocr_27": {
+        "baseline_rr_false": {"wall_sec": 84.5999, "overall": 0.600825, "table_teds": 0.605369, "govinfo_uscourts": 0.894007},
+        "prior_broken_rr_true": {"wall_sec": 85.9482, "overall": 0.432855, "table_teds": 0.275742, "govinfo_uscourts": 0.894007},
+        "repaired_rr_true": {"wall_sec": 87.2344, "overall": 0.606508, "table_teds": 0.605369, "govinfo_uscourts": 0.970726}
+      },
+      "mixed_digital_pdf_splice_3pp": {
+        "off_wall_sec": 2.7492,
+        "on_wall_sec": 0.7926,
+        "speedup_x": 3.468
+      }
+    },
+    "round1_2_and_proxima_builds": {
+      "fast_gemma4_multimodal_mtp": {
+        "fintabnet_4": {"wall_before_s": 34.053, "wall_after_s": 16.04, "speedup_x": 2.123, "tok_s_before": 48.81, "tok_s_after": 103.62, "parity": "4/4"},
+        "cord_v2_4_json": {"wall_before_s": 26.02, "wall_after_s": 17.28, "speedup_x": 1.505, "parity": "4/4"}
+      },
+      "kev_2hit_prefix_admission": {
+        "cold_ratio_x": 1.0039,
+        "cold_held_bytes": 0,
+        "warm_speedup_x": 2.394,
+        "flips": 0
+      },
+      "emb2_default_140_soft_tokens": {
+        "gpu_img_per_s": 19.57,
+        "gpu_speedup_x": 2.18,
+        "disk_e2e_img_per_s": 15.14,
+        "disk_e2e_speedup_x": 1.936,
+        "recall_at_1": 0.8542,
+        "mrr_at_10": 0.8697
+      },
+      "fast_pplx_default_786k_max_pixels": {
+        "n_docs": 164,
+        "wall_before_s": 53.617,
+        "wall_after_s": 25.77,
+        "speedup_x": 2.081,
+        "recall_at_1": 0.9634,
+        "recall_at_5": 0.9817,
+        "mrr_at_10": 0.9726
+      },
+      "ovis_max_pad_ratio_and_tiny_table_upscale": {
+        "fintabnet_24_m5_wave_gate": {"before_s": 98.643, "after_s": 71.862, "speedup_x": 1.373, "teds": 0.7295},
+        "fintabnet_24_post_build_m4_pro": {"wall_s": 21.338, "teds": 0.7705, "numeric_cell_f1": 0.8141},
+        "fintabnet_24_post_build_m5": {"wall_s": 39.551, "teds": 0.7649, "numeric_cell_f1": 0.8114},
+        "fintabnet_16_tiny_table_post_build_m4_pro": {"wall_s": 16.059, "teds": 0.8512, "numeric_cell_f1": 0.893},
+        "fintabnet_16_tiny_table_post_build_m5": {"wall_s": 27.969, "teds": 0.8421, "numeric_cell_f1": 0.8915},
+        "triage_dpi_100_loop_recovery_s": {"before_s": 103.02, "after_s": 27.357, "speedup_x": 3.77}
+      }
+    }
+  },
+  "killed_or_opt_in_only": {
+    "L3_global_w8a8_auto_default": {
+      "verdict": "KILL",
+      "keep_opt_in_env": "FAST_SILICON_QWEN3_MPP_W8A8=1",
+      "4b_optiq_cat4_50": {"eot_ratio": 1.0414, "wall_s": "57.31 -> 55.02", "delta_score": 0.0, "valid": "50/50"},
+      "9b_optiq_cat4_50": {"eot_ratio": 1.0083, "wall_s": "99.49 -> 98.15", "delta_score": -0.004495, "ci95": [-0.009982, 0.000992]},
+      "ovisocr2_cat5_96": {"olmocr_42_eot_ratio": 1.0622, "fintabnet_30_eot_ratio": 0.9994, "omnidoc_24_eot_ratio": 1.0018}
+    },
+    "L4_fp8_e4m3_vit_m5": {
+      "verdict": "KILL",
+      "fp8_peak_tflops": 15.7,
+      "mlx_bf16_peak_tflops": 14.97,
+      "ceiling_ratio": 1.049,
+      "ovis_12l_vit": [
+        {"M": 1024, "speedup_fp8_fp8": 0.99, "cos_fp8_fp8": 0.981497, "speedup_f16_fp8": 1.058, "cos_f16_fp8": 0.992129},
+        {"M": 2024, "speedup_fp8_fp8": 0.981, "cos_fp8_fp8": 0.982208, "speedup_f16_fp8": 1.032, "cos_f16_fp8": 0.99228},
+        {"M": 3072, "speedup_fp8_fp8": 0.984, "cos_fp8_fp8": 0.982628, "speedup_f16_fp8": 1.035, "cos_f16_fp8": 0.992592}
+      ]
+    },
+    "L5b_fused_act_quant_prologue": {
+      "verdict": "KILL",
+      "m_ge_128_vs_packed_median_x": 0.3055
+    },
+    "L6_masked_bidir_d512_sdpa": {
+      "verdict": "KILL",
+      "unmasked_ceiling_m4_pro_x": {"min": 0.96, "max": 1.039},
+      "unmasked_ceiling_base_m5_x": {"min": 0.995, "max": 1.03},
+      "mpp_gqa32_x": {"m4_pro": [0.962, 1.008], "base_m5": [0.54, 0.578]},
+      "sg_opt_x": {"m4_pro": [0.212, 0.34], "base_m5": [0.052, 0.084]}
+    },
+    "L7_coreml_ane_vit_emb2": {
+      "verdict": "KILL",
+      "host": "Apple M4 Pro (Mac16,8, 48 GB, macOS 26.6 25G5057c)",
+      "gate0_emb2_max_abs": 23680.0,
+      "gate0_top2_grid_coverage": 0.6042,
+      "gate1_39x30": {
+        "ane_ops_cpu_and_ne": "1736/1736 (100.0%)",
+        "pipe4_img_per_sec": 10.539,
+        "vs_fp32_min_cos": 0.995326,
+        "vs_bf16_min_cos": 0.988555,
+        "gpu_bf16_vs_fp32_min_cos": 0.992586,
+        "final_768d_min_cos": 0.996673,
+        "r1_48": 0.9583
+      },
+      "gate2_concurrent_2grid": {
+        "speedup_pre_decoded_x": 1.608,
+        "speedup_pil_e2e_x": 1.518,
+        "extra_peak_phys_mb": 192.3,
+        "extra_peak_neural_mb": 498.5,
+        "extra_total_mb": 690.8,
+        "r1_drop": 0.0
+      },
+      "gate2_concurrent_3grid": {
+        "speedup_pre_decoded_x": 1.576,
+        "speedup_pil_e2e_x": 1.559,
+        "extra_peak_neural_mb": 766.5,
+        "extra_total_mb": 633.6,
+        "r1_drop": 0.0
+      }
+    },
+    "L8_confidence_auto_dpi_escalation": {
+      "verdict": "OPT_IN_HOOK_ONLY",
+      "default_confidence_escalate_dpi": null,
+      "flagged_old_scans": "4/30 (13.33%)",
+      "extra_wall_sec_range": [162.146, 202.086],
+      "overall_macro_delta": 0.0
+    }
+  }
+}
