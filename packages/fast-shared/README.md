@@ -2,7 +2,7 @@
 
 Shared runtime, hardware dispatch, compact vector indexing, KV compression, Parquet pipelines, HTTP serving, and benchmark tooling for [`fast-silicon`](https://github.com/mikewolfd/fast-silicon).
 
-`fast-shared` provides one tested foundation across all model packages in the workspace — so encoders, decision scorers, and generators share the same Apple Silicon policy engine (`DynamicSiliconPolicy`), memory measurement (`RUSAGE_INFO_V6`), Core ML / Core AI build helpers, `llguidance` grammar loops, `PrefixTree` caching, and compact retrieval indexes instead of re-implementing them per model. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
+`fast-shared` gives every model package one tested runtime foundation. Encoders, decision scorers, and generators share one Apple Silicon policy engine (`DynamicSiliconPolicy`), memory measurement (`RUSAGE_INFO_V6`), Core ML and Core AI build helpers, `llguidance` grammar loops, `PrefixTree` caching, and compact retrieval indexes rather than re-implementing them per model. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Quick start
 
@@ -55,7 +55,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
 | `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates`, `outcome_eval.ocr` |
 | `fast_shared.hw_check` / `ir_dtype_guard` / `roofline` | `fast-silicon-hw-check`, `fast-ir-guard`, `fast-silicon-probe`, `fast-silicon-audit` |
-| `fast_shared.metal_mpp` / `metal_mpp_int8` / `ane_ffn` / `include/*` | `HEADER_MPP`, `mpp_linear_bf16`, `PACKS_META_ONLY` inline XOR `mpp_quantized_linear` (`2.34–4.2+ GB` saved), `AneWave`, C++/ObjC++ Core ML & Accelerate headers |
+| `fast_shared.metal_mpp` / `metal_mpp_int8` / `ane_ffn` / `include/*` | `HEADER_MPP`, `mpp_linear_bf16`, inline XOR `mpp_quantized_linear` (saves `2.34–4.2+ GB` shadow RAM), `AneWave`, C++/ObjC++ Core ML & Accelerate headers |
 
 ## Shared Parquet controls
 
@@ -73,7 +73,7 @@ The shared CLI and `embed_parquet` separate source reading (`--batch-rows`), enc
 ```bash
 embeddinggemma-2 parquet \
   --input documents.parquet --output embeddings/ --text-col body \
-  --chunk --document-prefix --max-chunk-tokens 512 --chunk-overlap 51 \
+  --chunk --document-prefix --max-chunk-tokens 512 --overlap 51 \
   --batch-rows 32 --encode-batch-rows 4096 --shard-rows 65536 \
   --keep-cols document_id --include-chunk-text --resume
 ```
@@ -110,6 +110,6 @@ python3 skills/apple-silicon-ml-optimizer/scripts/query_capability_matrix.py --s
 
 Verified on **Apple M4 Pro (`48 GB`, `macOS 26.6`)** and **Base Apple M5 (`24 GB`, `macOS 27.2.1`)**.
 
-- **[`zm2231/pplx-context-mlx`](https://github.com/zm2231/pplx-context-mlx)** (Copyright © 2026 Merchantry LLC, MIT License): Inspired the `proc_pid_rusage` OS physical footprint helpers, memmap `.safetensors` embedding loader (`MappedEmbedding`), `tile_aligned_slices` boundary helper, MLX cache discipline, and scannable README layout.
+- **[`zm2231/pplx-context-mlx`](https://github.com/zm2231/pplx-context-mlx)** (Copyright © 2026 Merchantry LLC, MIT License) inspired the `proc_pid_rusage` OS physical footprint helpers, memmap `.safetensors` embedding loader (`MappedEmbedding`), `tile_aligned_slices` boundary helper, MLX cache discipline, and scannable README layout.
 
 **Michael Deeb** ([`@mikewolfd`](https://github.com/mikewolfd)) · **TealWolf Consulting LLC** · [MIT License](LICENSE).

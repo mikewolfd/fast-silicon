@@ -2,7 +2,9 @@
 
 Extract schema-constrained JSON or call tools locally on Apple Silicon with Qwen 3.5 and Qwen 3.6 models (`0.8B` to `27B` dense and `35B-A3B` MoE). On 50 public extraction and tool tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returned **50/50 valid responses and scored 0.902** on both the 24 GB M5 and the 48 GB M4 Pro. Unconstrained stock `mlx-lm` on the same checkpoint returned 37/50 valid responses on M5 (0.662 score) and 35/50 on M4 Pro (0.623 score), giving `fast-qwen3` 1.53× and 1.38× the score per second. [Outcome tables and methodology](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 
-The engine runs Qwen’s hybrid 3:1 `GatedDeltaNet` + GQA architecture on MLX with mixed-bit `OptiQ` weight fusion, Apple10+ NAX `W4A8`/`W8A8` prefill acceleration, compiled GDN/RoPE kernels, threadgroup-staged `GdnDecodeShared` Metal recurrent-state compression (`FP32`/`BF16`/`INT8` block-32), recurrent prefix caching, speculative multi-token prediction (`MTP`) on 9B+ models, rotated 4-bit KV compression (`QuaRot`) for long contexts, lazy Qwen3.5 vision (`generate` / `generate_batch(..., images=..., compact_active=True)`, delivering `1.11×` at `B=8` and `1.0` schema validity at `B=16` on `CORD-v2`), and hot-swappable LoRA adapters. Thinking mode defaults off (`<think>\n\n</think>\n\n`), which matches or beats thinking on structured JSON and tool calls at roughly one-third the latency. [Vision, OCR & NAX prefill validation](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23)
+The engine runs Qwen’s hybrid 3:1 `GatedDeltaNet` + GQA architecture on MLX with mixed-bit `OptiQ` weight fusion, Apple10+ NAX `W4A8` prefill acceleration, compiled GDN and RoPE kernels, and recurrent prefix caching (`PrefixTree`). Thinking mode defaults off (`<think>\n\n</think>\n\n`), which matches or beats thinking on structured JSON and tool calls at roughly one-third the latency.
+
+Optional subsystems cover large-batch GDN recurrent-state compression (`int8_blk32`), rotated 4-bit KV caches (`QuaRot`) for long contexts, speculative multi-token prediction (`MTP`) on 9B+ checkpoints, lazy Qwen3.5 vision (`generate(..., images=...)`), and hot-swappable LoRA adapters. [Vision, OCR & NAX prefill validation](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23)
 
 ## Quick start
 
@@ -10,7 +12,7 @@ From the `fast-silicon` workspace root, install the package and stage weights (`
 
 ```bash
 uv sync --python 3.13 --package fast-qwen3 --inexact
-.venv/bin/fast-qwen3 setup-weights --preset 4b --allow-download
+.venv/bin/fast-qwen3 setup-weights --model-dir 4b --allow-download
 ```
 
 Extract schema-constrained JSON in Python:
@@ -43,11 +45,11 @@ with FastQwen3Engine(model_dir="4b") as engine:
 
 ```bash
 # Schema-constrained CLI generation
-.venv/bin/fast-qwen3 generate --model 4b --prompt "Summarize silicon photonics in JSON" \
+.venv/bin/fast-qwen3 generate --model-dir 4b "Summarize silicon photonics in JSON" \
   --schema '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}'
 
 # OpenAI-compatible HTTP server
-.venv/bin/fast-qwen3 serve --model 4b --host 127.0.0.1 --port 8080
+.venv/bin/fast-qwen3 serve --model-dir 4b --host 127.0.0.1 --port 8080
 
 # Interleaved ABBA speed and footprint benchmark
 .venv/bin/python packages/fast-qwen3/scripts/benchmark.py --presets 4b,0.8b-bf16 --rounds 2
@@ -61,7 +63,7 @@ Measurements compare the 24 GB base M5 and the 48 GB M4 Pro under lock-serialize
 | :--- | :--- | ---: | ---: | ---: |
 | `4B-OptiQ` (`4b`, constrained) | 50 public extraction + tool tasks | 0.902 score, 50/50 valid (0.513 score/s) | 0.902 score, 50/50 valid (0.396 score/s) | 5.26 / 5.18 GB |
 | Stock `mlx-lm` (`4B-OptiQ`, unconstrained) | Same 50 public tasks | 0.662 score, 37/50 valid (0.336 score/s) | 0.623 score, 35/50 valid (0.286 score/s) | 3.79 / 8.02 GB |
-| `9B-OptiQ` (`--mtp-drafter`, constrained) | Same 50 public tasks | 0.886 score, 50/50 valid (0.402 score/s) | 0.887 score, 50/50 valid (0.277 score/s) | 8.39 / 8.79 GB |
+| `9B-OptiQ` (`mtp_drafter`, constrained) | Same 50 public tasks | 0.886 score, 50/50 valid (0.402 score/s) | 0.887 score, 50/50 valid (0.277 score/s) | 8.39 / 8.79 GB |
 | `4B-OptiQ` (`4b`) | Shared-prefix strict JSON, batch 1 / batch 8 | 57.5 / 171.5 tok/s | 82.7 / 191.0 tok/s | 4.46 / 4.49 GB |
 | `9B-OptiQ` (`9b-optiq`, 248K vocab) | Speculative MTP batch 1 / batch 8 | 32.4 / 101.2 tok/s | 41.4 / 112.9 tok/s | 8.29 / 8.31 GB (16.4 GB peak) |
 | `9B-OptiQ` (`9b-optiq`, 65K Latin vocab) | Speculative MTP batch 1 / batch 8 | 42.3 / 105.7 tok/s | 50.2 / 115.9 tok/s | 16.7 / 16.9 GB peak |
@@ -71,20 +73,22 @@ Measurements compare the 24 GB base M5 and the 48 GB M4 Pro under lock-serialize
 | `9B-OptiQ` (`Apple10` NAX `W4A8` / opt-in `W8A8`) | 50 public extraction + tool tasks (`B=8`) | 0.886 / 0.884 score, 50/50 valid (`+4.6%` / `+8.3%` EOT) | Native `qmm` (`Apple9`) | 12.57 / 14.59 GB peak (`10.07 GB` base) |
 | `4B` / `9B-OptiQ` (`L=512` prefill + 16 tok) | Single-pass prefill (`W4A8` default / `W8A8` opt-in) | **1.06–1.14×** (`4B`), **1.10–1.18×** (`9B`) | Native `qmm` (`Apple9`) | 5.82–6.98 GB (`4B`), 10.72–12.78 GB (`9B`) |
 
-On zero-shot reasoning and instruction benchmarks (`IFBench`, `MMLU-Redux`, `MATH-500`) with `enable_thinking=False`, weak `IFBench` formatting adherence (0.16–0.24) held overall Category-3 averages to 0.533–0.573 despite 0.76–0.80 MMLU and 0.64–0.72 MATH scores. Enable thinking with a token budget of at least 384 tokens for multi-step reasoning tasks. Compiled `@mx.compile` GDN/RoPE kernels (`RMSNormGated`, `normalize_gdn_qk`, `apply_partial_rope_trig`) provide a `1.053–1.303×` (M4 Pro) / `1.038–1.440×` (Base M5) bit-exact kernel speedup, and `generate(..., images=...)` lazily loads the shared Qwen3.5 ViT (`0` extra ViT RAM on text-only calls).
+- **Reasoning and instruction following.** On zero-shot reasoning benchmarks (`IFBench`, `MMLU-Redux`, `MATH-500`) with `enable_thinking=False`, weak `IFBench` formatting adherence (0.16–0.24) held overall Category-3 averages to 0.533–0.573 despite 0.76–0.80 MMLU and 0.64–0.72 MATH scores. Enable thinking with a budget of at least 384 tokens for multi-step reasoning tasks.
+- **Compiled Metal kernels.** Bit-exact `@mx.compile` GDN and RoPE kernels deliver `1.053–1.303×` (M4 Pro) and `1.038–1.440×` (Base M5) speedups.
+- **Optional lazy vision.** Passing `images=...` to `generate` or `generate_batch` loads the shared Qwen3.5 ViT on demand with zero extra RAM on text-only calls. On `CORD-v2` with `Qwen3.5-0.8B` BF16, `generate_batch(..., compact_active=True)` runs `1.11×` faster at `B=8` and maintains `1.0` schema validity at `B=16`.
 
 ## Key options & defaults
 
 | Option | Default | What it does |
 | :--- | :--- | :--- |
-| `kv_i8` | `"auto"` | Uses BF16 KV on short requests and automatically switches to rotated 4-bit KV (`"q4_quarot"`, 3.56× smaller) at `>= 16K` tokens (`>= 8K` on 24 GB Macs) or batch `>= 16` (`>= 8` or `>= 4K`/`8K` ctx in `fast-ocr`). Pass `"q8"` for 8-bit KV or `False`/`"bf16"` for BF16 everywhere. |
-| `gdn_state_mode` | `"auto"` | Controls `DeltaSlotCache` recurrent state storage in `GdnDecodeShared` (`gdn_kernels.py` with `FP32` decay `g`). `"auto"` keeps `fp32` via native `gated_delta_update` at `B < 8` (`< 4` on `<= 28 GB` hosts) so `B=1` PLD avoids Metal kernel launch tax, and switches to `int8_blk32` (`3.76×` DRAM cut, exact `mask` freeze) at `B >= 8` (`>= 4` on `<= 28 GB`). Override via arg or `FAST_QWEN3_GDN_STATE_MODE` (`FAST_QWEN3_USE_GDN_METAL`). |
-| `drop_white_patches` | `False` | Opt-in uniform bright-patch dropping in `batched_multimodal_generate` (default `False` because dropping interior white column gaps caused table hallucinations on compact financial tables). |
-| `enable_mpp_linear` / `mpp_w8a8` | `"auto"` / `False` | Enables Apple10 (`M5+`) NAX `64×64` `W4A8` prefill on large 4-bit projections (`M >= 128`, `k,n >= 1536`) behind `PACKS_META_ONLY=True` inline XOR weight unpacking (eliminates `2.341 GB` shadow RAM on `4B-OptiQ` and `> 4.2 GB` on `9B-OptiQ` at **`max_diff=0.0`, `cos=1.0`**, `1.183×` median vs `MLX qmm`) and a `28%` RAM pack cap (`should_use_qwen_mpp_linear`). Set `mpp_w8a8=True` or `FAST_SILICON_QWEN3_MPP_W8A8=1` to also enable large 8-bit projections (`4B-OptiQ` `+4.1%` EOT at `delta=0.0`, `OvisOCR2` `olmOCR` `+6.2%` EOT; stays opt-in since `9B-OptiQ` regressed `-0.0045` on `Cat-4`). Multimodal wave splitting (`max_pad_ratio`) in `batched_multimodal_generate` activates only above `1024` tokens (`1.373×` single-wave `FinTabNet-24` speedup on M5). |
-| `enable_thinking` | `False` | Skips `<think>` chains for fast, deterministic extraction and tool calling. When `True`, enforces a `>= 384`-token budget (1,024 default) so thoughts are not cut off mid-sentence. |
-| `mtp_drafter` | `"auto"` (`None` `< 9B`) | Loads the native 1-layer multi-token drafter (`draft_k=3`) on 9B+ checkpoints where speculative decoding speeds up single-stream generation (1.28–1.92×); stays off on smaller models where the 248K output head outweighs draft savings. |
+| `kv_i8` | `"auto"` | Uses BF16 KV on short requests and switches to rotated 4-bit KV (`"q4_quarot"`, 3.56× smaller) at `>= 16K` tokens (`>= 8K` on 24 GB Macs) or batch `>= 16`. Pass `"q8"` for 8-bit KV or `False`/`"bf16"` for BF16 everywhere. |
+| `gdn_state_mode` (cache / `FAST_QWEN3_GDN_STATE_MODE`) | `"auto"` | Stores recurrent GDN state in `fp32` below `B=8` (`< 4` on `<= 28 GB` hosts) to avoid kernel launch overhead, and switches to `int8_blk32` (`3.76×` DRAM cut with `FP32` decay `g`) at larger batches. |
+| `enable_mpp_linear` / `mpp_w8a8` (model / `FAST_SILICON_QWEN3_MPP_W8A8`) | `"auto"` / `False` | Uses Apple10+ NAX `64×64` `W4A8` prefill on large 4-bit projections (`M >= 128`, `k, n >= 1536`) with inline XOR unpacking, saving `2.341 GB` on `4B-OptiQ` and `> 4.2 GB` on `9B-OptiQ` at zero diff (`1.183×` vs. `MLX qmm`). Set `FAST_SILICON_QWEN3_MPP_W8A8=1` for 8-bit NAX prefill (`4B-OptiQ` `+4.1%` EOT; kept opt-in because `9B-OptiQ` lost `-0.0045` on Category 4). |
+| `drop_white_patches` (multimodal batch) | `False` | Keeps all bright background patches by default because dropping white column gaps caused hallucinations on compact financial tables; pass `True` only to opt in. (`max_pad_ratio` wave splitting also stays inactive up to `1,024` tokens, giving `1.373×` on `FinTabNet-24`.) |
+| `default_enable_thinking` / `enable_thinking` | `False` | Skips `<think>` chains for fast, deterministic extraction and tool calling. When `True`, enforces at least a `384`-token budget (`1,024` default) so reasoning does not truncate mid-thought. |
+| `mtp_drafter` | `None` | Automatically loads the bundled 1-layer multi-token drafter when checkpoint weights include MTP layers (such as `9B+`, `1.28–1.92×` faster single-stream decode) and leaves smaller checkpoints without MTP weights unchanged. Pass `False` to disable. |
 | `prefix_cache_mb` | `"auto"` | Shares 256-token prompt prefixes across calls in `PrefixTree`, compressing recurrent `GatedDeltaNet` states 3.76× in block-32 INT8 without breaking ragged batch parity. |
-| `lora_path` | `None` | Attaches PEFT/MLX LoRA adapters across attention, MLP, and safe `GatedDeltaNet` linear projections while guarding against destructive double quantization (`4-bit -> LoRA -> 4-bit`). |
+| `lora_adapter` (`load_lora_adapter`) | `None` | Attaches PEFT or MLX LoRA adapters across attention, MLP, and safe `GatedDeltaNet` linear projections while guarding against destructive double quantization (`4-bit` to `LoRA` to `4-bit`). |
 
 ## Scope & License
 

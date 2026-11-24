@@ -2,7 +2,7 @@
 
 Turn short English queries and passages into 384-number vectors with `BAAI/bge-small-en-v1.5`. One warm 24-token query took 0.49 ms on the M4 Pro and 0.79 ms on the base M5. Across 1,000 pretokenized documents the package processed 187,150 and 200,646 tokens/s on those machines.
 
-`fast-bge-small` runs short queries on the Apple Neural Engine (ANE) and can split bulk encoding between the GPU and ANE. It includes a Python API, an OpenAI-compatible `/v1/embeddings` server, a resumable Parquet CLI and the standalone `bge-ane-cli`. Inference uses neither `torch` nor `transformers`. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
+`fast-bge-small` runs short queries on the Apple Neural Engine (ANE) and can split bulk encoding between the GPU and ANE. It includes a Python API, an OpenAI-compatible `/v1/embeddings` server, a resumable Parquet CLI, and the standalone `bge-ane-cli`. Inference uses neither `torch` nor `transformers`. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Quick start
 
@@ -23,7 +23,7 @@ vecs = eng.encode_texts(["passage one...", "passage two..."], mode="hetero")    
 
 # Build a compact INT8 / binary+INT8 search index automatically sized to the corpus:
 index = eng.build_index(["passage one...", "passage two..."])
-top_ids, top_scores = index.search(q, top_k=5)
+top_ids, top_scores = index.search(q, k=5)
 ```
 
 ```bash

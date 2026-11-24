@@ -74,34 +74,32 @@ Optional lazy multimodal image support is available via the `[vision]` extra (`u
 
 | Capability | Base M5 (24 GB) | M4 Pro (48 GB) | Takeaway |
 |---|---|---|---|
-| **Speculative `MTP` (`B=1` / `B=4` AR parity)** | **1.65×–1.68×** vs AR at `B=1` (`2.15×` vs unrestricted `mlx-vlm` JSON), **`1.00×` `json_b4`**, **`10/10` exact** (`9.30 GB`) | **1.49×–1.62×** vs AR at `B=1`, **`1.13×` `free_b4`**, **`10/10` exact** (`9.53 GB`) | `forward_verify_mtp_slot` gates singleton verify kernels strictly to `B=1` while `B>=2` uses standard batched linears, and explicit-MTP engines stay on dense `run_decode_rolling` when `B > max_b`. See [capability reruns](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes). |
+| **Speculative `MTP` (`B=1` / `B=4` AR parity)** | **1.65×–1.68×** vs. AR at `B=1` (`2.15×` vs. unconstrained `mlx-vlm` JSON), **`1.00×` `json_b4`**, **`10/10` exact** (`9.30 GB`) | **1.49×–1.62×** vs. AR at `B=1`, **`1.13×` `free_b4`**, **`10/10` exact** (`9.53 GB`) | Keeps single-slot verify kernels on `B=1`, uses batched linears for `B >= 2`, and stays on dense rolling decode when MTP declines oversized batches. [Capability reruns](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes) |
 | **Shared-prefix `PrefixTree` reuse** | Zero system-KV cloning across batch slots | Up to **2.59×** faster across 4–8 shared-prefix candidates | Automatically reuses shared prompt prefixes (`>= 32` tokens). |
-| **Local 8-bit `QLoRA` adapter training** | **80.5–87.7 sup tok/s** in 4.85–6.76 GiB (`pack=1024, accum=2`) | **545.8 tok/s** packed 8-bit (`pack=2048`) | Sizing to `pack_tokens=1024, grad_accum=2, ckpt_tokens=512` eliminates 24 GB OOMs with matching loss and gradients. |
-| **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61–3.38 rollouts/s** (8.68 GB peak) | **1.81–3.15 rollouts/s** (7.11 GB vs 19.38 GB GPU critic) | Runs critic scoring on the Neural Engine concurrently with GPU rollouts and backward passes. |
+| **Local 8-bit `QLoRA` adapter training** | **80.5–87.7 sup tok/s** in 4.85–6.76 GiB (`pack=1024, accum=2`) | **545.8 tok/s** packed 8-bit (`pack=2048`) | Sizing to `pack_tokens=1024, grad_accum=2, ckpt_tokens=512` prevents 24 GB OOMs with matching loss and gradients. |
+| **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61–3.38 rollouts/s** (8.68 GB peak) | **1.81–3.15 rollouts/s** (7.11 GB vs. 19.38 GB GPU critic) | Runs critic scoring on the Neural Engine concurrently with GPU rollouts and backward passes. |
 
 #### Optional lazy multimodal vision & multimodal `MTP`
 
-On Base M5 (`24 GB`), wiring `_maybe_ensure_mtp_drafter` + `run_decode_mtp` onto `prefill_multimodal_b1` speeds `FinTabNet(4)` **`2.123×` E2E (`34.053s -> 16.04s`, `48.81 -> 103.62 tok/s`, `4/4` exact token & text parity)** and `CORD-v2(4)` JSON **`1.505×` E2E (`26.02s -> 17.28s`, `4/4` parity; `max_tokens=1024` yields `1.00` valid JSON)**. [v3.0 multimodal MTP receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
+On Base M5 (`24 GB`), multimodal speculative decoding (`MTP`) speeds `FinTabNet(4)` end to end by **2.123×** (`34.05 s` down to `16.04 s`, rising from `48.81` to `103.62 tok/s` with `4/4` exact token and text parity) and speeds `CORD-v2(4)` JSON by **1.505×** (`26.02 s` down to `17.28 s` with `4/4` parity; `max_tokens=1024` raises valid JSON to `1.00`). [Multimodal MTP receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
 
-On M4 Pro (`48 GB`), optional `generate(..., images=...)` leaves text-only latency and RAM unchanged (`63.09 tok/s`, `3.33 GB` MLX peak, `_vision_model=None`), while `Gemma-4 E2B-4bit` (`4.24–4.30 GB` MLX / `5.43 GB` RSS) scored `0.7665` TEDS (`@280` soft tokens, `0.170 pp/s`) → `0.8293` TEDS (`@1120`, `0.9053` NumF1) on `FinTabNet`, `1.000` schema validity (`0.2566` F1, `0.506 pp/s`, `95.9 tok/s`) on `CORD-v2`, `0.5128` (`0.364 pp/s`) on `OmniDocBench-EN(2)`, and `0.1667` on `olmOCR-bench(2)`. `E4B-bf16` (`14.9–15.1 GB` MLX / `17.05 GB` RSS, `16–29 tok/s`) lifted `olmOCR-bench(2)` to `0.500` (`3/3` `old_scans_math`) while trailing E2B on `FinTabNet` (`0.3932`) and `CORD-v2` (`0.1146`). Use `fast-ocr` (`OvisOCR2-8bit`) for dedicated document OCR and `fast-gemma4` vision for lightweight multimodal extraction/VQA. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
-
-*(Note: `fast_shared.metal_mpp_int8` now sets `PACKS_META_ONLY=True` for Apple10 NAX inline XOR weight unpacking, eliminating duplicate packed weight buffers in RAM at `max_diff=0.0`.)*
+On M4 Pro (`48 GB`), optional `generate(..., images=...)` leaves text-only latency and memory unchanged (`63.09 tok/s`, `3.33 GB` MLX peak, zero vision weights loaded). `Gemma-4 E2B-4bit` (`4.24–4.30 GB` MLX / `5.43 GB` RSS) scored `0.7665` TEDS (`0.170 pp/s`) at `280` soft tokens and `0.8293` TEDS (`0.9053` NumF1) at `1,120` on `FinTabNet`, `1.000` schema validity (`0.2566` F1, `0.506 pp/s`, `95.9 tok/s`) on `CORD-v2`, `0.5128` (`0.364 pp/s`) on `OmniDocBench-EN(2)`, and `0.1667` on `olmOCR-bench(2)`. `E4B-bf16` (`14.9–15.1 GB` MLX / `17.05 GB` RSS, `16–29 tok/s`) lifted `olmOCR-bench(2)` to `0.500` (`3/3` `old_scans_math`) while trailing `E2B` on `FinTabNet` (`0.3932`) and `CORD-v2` (`0.1146`). Use [`fast-ocr`](../fast-ocr) (`OvisOCR2-8bit`) for dedicated document OCR and `fast-gemma4` vision for lightweight multimodal extraction and VQA. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
 
 ## Automatic hardware dispatch (`"auto"` defaults)
 
-`FastGemma4Engine()` probes chip generation and RAM via `DynamicSiliconPolicy` so callers do not have to hand-tune flags per Mac:
+`FastGemma4Engine()` probes chip generation and RAM via `DynamicSiliconPolicy` so callers do not have to hand-tune options per Mac:
 
-| Parameter | `"auto"` behavior | Manual override |
+| Option | `"auto"` behavior | Manual override |
 |---|---|---|
 | `mtp_drafter` | Lazily loads the ~150 MiB draft assistant only on greedy single-stream GPU calls (`B=1` on M5, `B=1..2` on M4 Pro); costs 0 MB on batch ETL. | Pass `False` / `None` to disable, or `True` to load eagerly. |
-| `use_ane_ring` | Uses the `Early14` Pure-ANE prefill ring on `>= 32 GB` M4 Macs for batches `>= 16`; stays pure GPU on M5 `NAX` (where GPU reaches 10.46 docs/s) and on 24 GB hosts. | Pass `False` to force GPU or `True` to require the ANE ring. |
+| `use_ane_ring` (`generate_batch`) | Uses the `Early14` Pure-ANE prefill ring on `>= 32 GB` M4 Macs for batches `>= 16`; stays pure GPU on M5 `NAX` (where GPU reaches 10.46 docs/s) and on 24 GB hosts. | Pass `False` to force GPU or `True` to require the ANE ring. |
 | `ane_ring_variant` | Uses `fp16` (`1.0 GB`, safe for arbitrary base or LoRA weights) on `> 24 GB` Macs; uses calibrated Hadamard `w8` (`504 MB`, `7,815 tok/s` chunk prefill) on `<= 24 GB` Macs only when a verified calibration manifest is present. | Pass `"fp16"` or `"w8"`. |
 
 ## What keeps it fast
 
 | Component | How it works | Source |
 |---|---|---|
-| **Rolling Metal GPU + `kv_i8`** | Continuous 128-slot scheduler, INT8 KV cache compression, fused BF16 GeGLU, and FP32 logit softcapping (`0/1,024` greedy mismatches vs FP32) | [`model.py`](src/fast_gemma4/model.py), [`kernels.py`](src/fast_gemma4/kernels.py) |
+| **Rolling Metal GPU + `kv_i8`** | Continuous 128-slot scheduler, INT8 KV cache compression, fused BF16 GeGLU, Apple10 NAX inline XOR packing without duplicate weight buffers (`max_diff=0.0`), and FP32 logit softcapping (`0/1,024` greedy mismatches vs. FP32) | [`model.py`](src/fast_gemma4/model.py), [`kernels.py`](src/fast_gemma4/kernels.py) |
 | **Schema grammar & loop guard** | Zero-allocation `llguidance` bitmasking, multi-token forced-prefix jumps, deferred length-truncation retries, and a cycle/4-gram loop breaker | [`grammar.py`](src/fast_gemma4/grammar.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
 | **Pure-ANE `Early14` prefill ring** | Power-of-2 residual-scale folding keeps Layer 10–14 activations inside FP16 range (`1,326` ANE ops, `0` GPU/CPU) with zero-copy `IOSurface` handoff to Metal | [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py), [`native/gemma4_ane_prefix.mm`](native/gemma4_ane_prefix.mm) |
 | **Local `QLoRA` acceleration** | Compiled chunked softcap cross-entropy + AdamW, variable-length FFD sequence packing, and shared system-prompt KV backward passes | [`lora_accel.py`](src/fast_gemma4/lora_accel.py), [`scripts/train_lora.py`](scripts/train_lora.py) |

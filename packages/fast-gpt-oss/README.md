@@ -54,14 +54,14 @@ The project rows run eight extraction fixtures under a JSON schema with up to 51
 | **`fast-gpt-oss`, batched** | **128 (128)** | **128/128** | **46.14 s** | **39.87 s decode** | **454.1** | **1.483** | **14.79 GB** |
 | Stock `mlx-lm`, summary prompt | 8 (8) | — | — | — | 156.1 | 1.188 | 11.24 GB |
 
-By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (eliminating expert-selection drift on 8-bit checkpoints), uses hybrid FP16 intermediates with FP32 accumulators, and pairs `reasoning_effort="low"` with a compact chain-of-thought budget — scoring **0.726 on MMLU-Redux**, **0.54 on MATH-500**, and **0.847 on BFCL** in full-set ablations while running 3.3–4.4× faster than pure FP32. [Precision and CoT ablations](../../docs/BENCHMARKS.md#track-c--fast-gemma4--fast-gpt-oss-precision-loop-breakers--cot-budgets)
+By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (eliminating expert-selection drift on 8-bit checkpoints), uses hybrid FP16 intermediates with FP32 accumulators, and pairs `reasoning_effort="low"` with a compact chain-of-thought budget. In full-set ablations, those defaults scored **0.726 on MMLU-Redux**, **0.54 on MATH-500**, and **0.847 on BFCL**, while running 3.3–4.4× faster than pure FP32. [Precision and CoT ablations](../../docs/BENCHMARKS.md#track-c--fast-gemma4--fast-gpt-oss-precision-loop-breakers--cot-budgets)
 
 ## Hardware sizing
 
 | Unified memory | Policy ceiling | Recommended usage |
 |---|---|---|
-| **48 GB+ (`M4 Pro/Max`, `M5 Pro/Max`)** | 38.4 GB (80% UMA) | **Target host for `fast-gpt-oss` (`B=1..128`)** — resident MXFP4 weights (~11–12 GB) + Hydragen KV fit comfortably without swap. |
-| **24 GB (`Base M5`)** | 19.2 GB | **Use `fast-gemma4` or `fast-qwen3` (`4B` / `9B`) for batch extraction.** The benchmark skips 20B sweeps on 24 GB hosts; if invoked directly, the engine caps waves at 16 requests on 24 GB and 8 on 16 GB. |
+| **48 GB+ (`M4 Pro/Max`, `M5 Pro/Max`)** | 38.4 GB (80% UMA) | **Target host for `fast-gpt-oss` (`B=1..128`).** Resident MXFP4 weights (~11–12 GB) and Hydragen KV fit without swap. |
+| **24 GB (`Base M5`)** | 19.2 GB | **Prefer `fast-gemma4` or `fast-qwen3` (`4B` / `9B`) for batch extraction.** Benchmark suites skip 20B sweeps on 24 GB hosts; direct engine calls cap waves at 16 requests on 24 GB and 8 on 16 GB. |
 
 ## What keeps it fast
 

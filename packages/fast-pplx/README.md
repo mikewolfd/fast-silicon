@@ -8,7 +8,7 @@ Use `fast-pplx` to find a passage whose meaning depends on the surrounding text.
 
 ```bash
 make -C packages/fast-pplx native
-fast-pplx setup-weights --local-files-only
+fast-pplx setup-weights  # Pass --local-files-only for offline setup
 # Optional: compile Pure-ANE Core ML stages (`balanced` profile by default)
 fast-pplx setup-ane --precision w8a16
 ```
@@ -98,7 +98,9 @@ On official `LongEmbed` per-length splits (50 queries against 100 documents at o
 
 ### 4. Direct visual page embeddings (`encode_images`, `build_image_index`, Metal GPU)
 
-`encode_images(..., batch_size=16, max_pixels=786_432)`, `build_image_index(...)`, and `fast-pplx embed-images` reuse `fast_shared.qwen35_vision` (`FastQwen35VisionModel`, exact fractional `<|chunk_sep|>` 3D MRoPE, optional `crop_margins`, `rotations_cw` / `--rotate-cw`, and opt-in `grid_bucket_step` / `--grid-bucket-step`) lazily — text-only workloads allocate zero ViT memory (`B=16` holds `min_cos=1.00000` at `6.41 img/s` on mixed crops; keep `--grid-bucket-step` opt-in since padding tiny crops shifts cosine to `0.7572` min). Default `max_pixels=786_432` cuts `164`-page multi-domain wall time **`2.081×`** (`53.617s -> 25.770s`, `6.364 img/s`) with **`0.0000` `R@1`/`MRR@10` loss** (`R@1=0.9634`), while background CPU image decode/resize prefetch (`n <= 24` parallel pre-batch wave preserving exact `grid_thw` groups; `depth=1` wave streaming above `24`) speeds `24`-image disk E2E another **`1.115×` on Base M5 (`8.90 img/s`)** and **`1.104×` on M4 Pro (`6.00 img/s`)** at `min_cos=0.9999998`. `build_image_index(..., crop_margins=True, agg="maxsim")` flattens multi-band page embeddings into a `CompactRetrievalIndex` for cross-modal text-to-page search (`--build-index` / `--query` on CLI). [Cross-silicon vision & OCR receipts](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23) · [v3.0 prefetch receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
+`encode_images(..., batch_size=16, max_pixels=786_432)`, `build_image_index(...)`, and `fast-pplx embed-images` reuse `fast_shared.qwen35_vision` (`FastQwen35VisionModel`, fractional `<|chunk_sep|>` 3D MRoPE, `crop_margins`, `rotations_cw` / `--rotate-cw`, and opt-in `grid_bucket_step` / `--grid-bucket-step`) lazily so text-only workloads allocate zero ViT memory. Default `max_pixels=786_432` cuts 164-page multi-domain encoding wall time **2.081×** (from `53.62 s` to `25.77 s`, `6.364 img/s`) with **zero `R@1` or `MRR@10` loss** (`R@1=0.9634`). Adding background CPU image decode and resize prefetch speeds 24-image end-to-end disk throughput by **1.115× on Base M5 (`8.90 img/s`)** and **1.104× on M4 Pro (`6.00 img/s`)** at `min_cos=0.9999998`.
+
+`build_image_index(..., crop_margins=True, agg="maxsim")` flattens multi-band page embeddings into a `CompactRetrievalIndex` for cross-modal text-to-page search (`--build-index` and `--query` on the CLI). At `batch_size=16`, mixed crops keep `min_cos=1.00000` at `6.41 img/s`; keep `--grid-bucket-step` opt-in because padding small crops can lower minimum cosine similarity to `0.7572`. [Cross-silicon vision & OCR receipts](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23) · [v3.0 prefetch receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
 
 | Mode (`float16`, `batch_size=4`) | PyTorch MPS (M4 Pro `bf16`) | `fast-pplx` M4 Pro (`Apple9`) | `fast-pplx` Base M5 (`Apple10 NAX`) | Fidelity vs. PyTorch Ref |
 | :--- | ---: | ---: | ---: | :--- |
