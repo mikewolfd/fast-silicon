@@ -164,3 +164,134 @@ def test_cli_embed_images_parser() -> None:
     assert args.mode == "gpu"
     assert args.no_warmup is True
     assert args.json is True
+
+
+def test_encode_images_async_prefetch_order_and_parity_across_waves(monkeypatch, tmp_path) -> None:
+    """Multi-wave async prefetch must preserve exact output parity and strict input order even under out-of-order decode."""
+    import threading
+    import time
+    from PIL import Image
+    import fast_shared.gemma4_vision as gv
+
+    class _OrderTokenTable:
+        def gather_scaled_f16(self, ids: np.ndarray) -> np.ndarray:
+            arr = np.asarray(ids, dtype=np.int32)
+            out = np.zeros((arr.size, HIDDEN_SIZE), dtype=np.float16)
+            out[:, 0] = np.where(arr >= 0, 0.01, 0.0).astype(np.float16)
+            return out
+
+    class _OrderGPU:
+        def __init__(self) -> None:
+            self.token_table = _OrderTokenTable()
+
+        def encode_embedded_batch(self, h_mx: mx.array, msk_mx: mx.array, *, dimensions: int | None = None) -> np.ndarray:
+            b_sz, l_pad = int(msk_mx.shape[0]), int(msk_mx.shape[1])
+            eff_dim = EMBED_DIM if dimensions is None else int(dimensions)
+            h_np = np.asarray(h_mx, dtype=np.float32).reshape(b_sz, l_pad, HIDDEN_SIZE)
+            m_np = np.asarray(msk_mx, dtype=bool)
+            out = np.zeros((b_sz, eff_dim), dtype=np.float32)
+            for bi in range(b_sz):
+                valid_rows = h_np[bi, m_np[bi]]
+                # Encode deterministic signature from the scattered visual tokens
+                sig = valid_rows[2:-2, : min(eff_dim, HIDDEN_SIZE)].mean(axis=0)
+                out[bi, : sig.size] = sig
+                out[bi, -1] = float(valid_rows.shape[0])
+                norm = float(np.linalg.norm(out[bi]))
+                if norm > 0.0:
+                    out[bi] /= norm
+            return out
+
+    class _OrderVisionModel:
+        def __init__(self) -> None:
+            self.cfg = Gemma4VisionConfig(
+                hidden_size=768,
+                text_hidden_size=HIDDEN_SIZE,
+                patch_size=16,
+                pooling_kernel_size=3,
+                default_output_length=140,
+                boi_token_id=255999,
+                image_token_id=258880,
+                eoi_token_id=258882,
+            )
+
+        def encode_images(self, inputs, *, batch_size: int = 8):
+            outs = []
+            for item in inputs:
+                # Deterministic mean per channel directly from preprocessed pixel values
+                ch_mean = item.pixel_values.reshape(3, -1).mean(axis=1)
+                arr = np.zeros((int(item.num_soft_tokens), HIDDEN_SIZE), dtype=np.float32)
+                arr[:, 0] = float(ch_mean[0])
+                arr[:, 1] = float(ch_mean[1])
+                arr[:, 2] = float(ch_mean[2])
+                arr[:, 3] = float(item.resized_width) * 1e-3
+                arr[:, 4] = float(item.resized_height) * 1e-3
+                outs.append(mx.array(arr, dtype=mx.bfloat16))
+            return outs
+
+    class _OrderTokenizer:
+        bos_id = 2
+        eos_id = 1
+        pad_id = 0
+
+        def encode_batch(self, texts):
+            return [[2, 500 + len(t), 1] for t in texts]
+
+    eng = object.__new__(FastEmbeddingGemma2)
+    eng.dim = EMBED_DIM
+    eng.tokenizer = _OrderTokenizer()
+    eng._vision_model_dir = tmp_path
+    eng._vision_model = _OrderVisionModel()
+    eng._vision_init_lock = threading.Lock()
+    eng._gpu_lock = threading.Lock()
+    eng._gpu = _OrderGPU()
+
+    # Build 10 distinct images (mix of sizes & RGB values) saved as disk paths AND in-memory PILs
+    paths: list[str] = []
+    pils: list[Image.Image] = []
+    texts: list[str | None] = []
+    for i in range(10):
+        w = 48 * (1 + (i % 3))
+        h = 48 * (1 + ((i + 1) % 2))
+        im = Image.new("RGB", (w, h), ((23 * i + 17) % 255, (53 * i + 41) % 255, (97 * i + 83) % 255))
+        p = tmp_path / f"img_{i}.png"
+        im.save(p)
+        paths.append(str(p))
+        pils.append(im)
+        texts.append(f"caption {i}" if i % 2 == 0 else None)
+
+    # Serial reference via single-item calls
+    ref_paths = np.concatenate(
+        [eng.encode_images([p], texts=[t], batch_size=1, dimensions=256) for p, t in zip(paths, texts)],
+        axis=0,
+    )
+    ref_pils = np.concatenate(
+        [eng.encode_images([im], texts=[t], batch_size=1, dimensions=256) for im, t in zip(pils, texts)],
+        axis=0,
+    )
+
+    # Force out-of-order completion inside ThreadPoolExecutor (delay first image in each wave)
+    real_prep = gv.preprocess_gemma4_image
+    seen_threads: set[int] = set()
+    seen_lock = threading.Lock()
+
+    def _delayed_prep(src, **kwargs):
+        with seen_lock:
+            seen_threads.add(threading.get_ident())
+        if isinstance(src, str) and src.endswith(("img_0.png", "img_3.png", "img_6.png")):
+            time.sleep(0.025)
+        return real_prep(src, **kwargs)
+
+    monkeypatch.setattr(gv, "preprocess_gemma4_image", _delayed_prep)
+
+    got_paths = eng.encode_images(paths, texts=texts, batch_size=3, dimensions=256)
+    got_pils = eng.encode_images(pils, texts=texts, batch_size=3, dimensions=256)
+
+    assert len(seen_threads) >= 2
+    assert got_paths.shape == (10, 256)
+    assert got_pils.shape == (10, 256)
+    np.testing.assert_array_equal(got_paths, ref_paths)
+    np.testing.assert_array_equal(got_pils, ref_pils)
+
+    # Verify strict 1-to-1 ordering (no adjacent items swapped or mixed)
+    sim = got_paths @ ref_paths.T
+    assert list(np.argmax(sim, axis=1)) == list(range(10))

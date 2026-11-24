@@ -10,6 +10,7 @@ import mlx.nn as nn
 
 from fast_shared.hw_check import supports_apple10_nax
 from fast_shared.kv_quant import SpecBucketedLinearGroup
+import fast_shared.metal_mpp_int8 as _metal_mpp_int8
 from fast_shared.metal_mpp_int8 import (
     mpp_quantized_linear,
     pack_affine_weights_for_mpp_i8,
@@ -184,6 +185,8 @@ class QwenMppPackState:
 
     @staticmethod
     def estimate_pack_bytes(k: int, n: int, *, bits: int = 8) -> int:
+        if bool(getattr(_metal_mpp_int8, "PACKS_META_ONLY", False)):
+            return 4 * int(n) * (int(k) // 64)
         return (int(k) * int(n) * int(bits)) // 8 + 2 * int(n) * (int(k) // 64)
 
     def can_pack_estimate(self, k: int, n: int, *, bits: int = 8) -> bool:

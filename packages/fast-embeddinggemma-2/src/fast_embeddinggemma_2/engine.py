@@ -1624,7 +1624,9 @@ class FastEmbeddingGemma2:
         if not items:
             return np.empty((0, eff_dim), dtype=np.float32)
 
-        from fast_shared.gemma4_vision import preprocess_gemma4_image
+        from concurrent.futures import ThreadPoolExecutor
+
+        from fast_shared.gemma4_vision import Gemma4ImageInputs, preprocess_gemma4_image
 
         vis = self._ensure_vision_model(vision_model_dir)
         v_cfg = getattr(vis, "cfg", None)
@@ -1641,22 +1643,30 @@ class FastEmbeddingGemma2:
         eos_id = int(getattr(self.tokenizer, "eos_id", 1))
         pad_id = int(getattr(self.tokenizer, "pad_id", 0))
 
-        vinputs = [
-            preprocess_gemma4_image(
+        bs_cap = max(1, int(batch_size))
+        n_items = len(items)
+        # Bound decoded wave lookahead (~64 MiB per wave) to keep < +100 MB RSS across large corpora.
+        est_bytes_per_item = max(1, eff_soft * (pool_k * pool_k) * (patch_sz * patch_sz) * 3 * 4)
+        wave_cap = max(1, min(bs_cap, (64 * 1024 * 1024) // est_bytes_per_item))
+        waves = [(w0, min(n_items, w0 + wave_cap)) for w0 in range(0, n_items, wave_cap)]
+
+        def _prep_one(im: Any) -> Gemma4ImageInputs:
+            if isinstance(im, Gemma4ImageInputs):
+                return im
+            return preprocess_gemma4_image(
                 im,
                 patch_size=patch_sz,
                 pooling_kernel_size=pool_k,
                 max_soft_tokens=eff_soft,
             )
-            for im in items
-        ]
 
-        bs_cap = max(1, int(batch_size))
-        n_items = len(items)
-        tok_lists: list[list[int]] = []
         raw_texts = [t for t in texts] if texts is not None else []
         encoded_texts: list[list[int] | None] = [None] * n_items
-        if raw_texts and any(t for t in raw_texts):
+        has_texts = bool(raw_texts and any(t for t in raw_texts))
+
+        def _encode_texts() -> None:
+            if not has_texts:
+                return
             non_empty_idxs = [idx for idx, t in enumerate(raw_texts) if t]
             enc_batch = self.tokenizer.encode_batch([str(raw_texts[idx]) for idx in non_empty_idxs])
             for idx, tids in zip(non_empty_idxs, enc_batch):
@@ -1667,24 +1677,26 @@ class FastEmbeddingGemma2:
                     seq = seq[:-1]
                 encoded_texts[idx] = seq
 
-        for i, vi in enumerate(vinputs):
-            n_vis = int(vi.num_soft_tokens)
-            seq = [bos_id, boi_id] + ([pad_id] * n_vis) + [eoi_id]
-            txt_toks = encoded_texts[i]
-            if txt_toks:
-                room = max(0, MAX_SEQ_LEN - len(seq) - 1)
-                seq.extend(txt_toks[:room])
-            seq.append(eos_id)
-            tok_lists.append(seq)
+        outs = np.empty((n_items, eff_dim), dtype=np.float32)
 
-        with self._gpu_lock:
-            gpu = self.gpu
-            vis_feats = vis.encode_images(vinputs, batch_size=bs_cap)
-            outs = np.empty((n_items, eff_dim), dtype=np.float32)
-            for c0 in range(0, n_items, bs_cap):
-                c1 = min(n_items, c0 + bs_cap)
+        def _run_wave_gpu(gpu: Any, w0: int, w_vinputs: list[Gemma4ImageInputs]) -> None:
+            w_n = len(w_vinputs)
+            w_tok_lists: list[list[int]] = []
+            for i, vi in enumerate(w_vinputs):
+                n_vis = int(vi.num_soft_tokens)
+                seq = [bos_id, boi_id] + ([pad_id] * n_vis) + [eoi_id]
+                txt_toks = encoded_texts[w0 + i]
+                if txt_toks:
+                    room = max(0, MAX_SEQ_LEN - len(seq) - 1)
+                    seq.extend(txt_toks[:room])
+                seq.append(eos_id)
+                w_tok_lists.append(seq)
+
+            vis_feats = vis.encode_images(w_vinputs, batch_size=bs_cap)
+            for c0 in range(0, w_n, bs_cap):
+                c1 = min(w_n, c0 + bs_cap)
                 b_cur = c1 - c0
-                chunk_seqs = tok_lists[c0:c1]
+                chunk_seqs = w_tok_lists[c0:c1]
                 max_sl = max(len(s) for s in chunk_seqs)
                 l_pad = max(64, ((max_sl + 63) // 64) * 64)
                 ids_np = np.full((b_cur, l_pad), -1, dtype=np.int32)
@@ -1697,16 +1709,41 @@ class FastEmbeddingGemma2:
                     b_cur, l_pad, HIDDEN_SIZE
                 )
                 for b_idx in range(b_cur):
-                    n_vis = int(vinputs[c0 + b_idx].num_soft_tokens)
+                    n_vis = int(w_vinputs[c0 + b_idx].num_soft_tokens)
                     vf = vis_feats[c0 + b_idx]
                     vf_np = np.asarray(vf.astype(mx.float16) if isinstance(vf, mx.array) else vf, dtype=np.float16)
                     h_np[b_idx, 2 : 2 + n_vis, :] = vf_np[:n_vis]
-                outs[c0:c1] = gpu.encode_embedded_batch(
+                outs[w0 + c0 : w0 + c1] = gpu.encode_embedded_batch(
                     mx.array(h_np.reshape(b_cur * l_pad, HIDDEN_SIZE)),
                     mx.array(msk_np),
                     dimensions=eff_dim,
                 )
+
+        if n_items == 1:
+            _encode_texts()
+            w_vinputs = [_prep_one(items[0])]
+            with self._gpu_lock:
+                _run_wave_gpu(self.gpu, 0, w_vinputs)
             return outs
+
+        max_workers = min(4, n_items)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="emb2-img-prep") as pool:
+            cur_futs = [pool.submit(_prep_one, items[idx]) for idx in range(waves[0][0], waves[0][1])]
+            _encode_texts()
+            cur_vinputs = [fut.result() for fut in cur_futs]
+            with self._gpu_lock:
+                gpu = self.gpu
+                for w_idx, (w0, _w1) in enumerate(waves):
+                    next_futs = (
+                        [pool.submit(_prep_one, items[idx]) for idx in range(waves[w_idx + 1][0], waves[w_idx + 1][1])]
+                        if (w_idx + 1) < len(waves)
+                        else None
+                    )
+                    _run_wave_gpu(gpu, w0, cur_vinputs)
+                    del cur_vinputs
+                    if next_futs is not None:
+                        cur_vinputs = [fut.result() for fut in next_futs]
+        return outs
 
     def build_image_index(
         self,

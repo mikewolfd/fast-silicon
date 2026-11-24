@@ -3087,12 +3087,19 @@ class FastPplxGPU:
         if not img_list:
             return []
 
+        from concurrent.futures import ThreadPoolExecutor
+
         from fast_shared.qwen35_vision import precompute_mrope_trig
         from fast_shared.vision_preprocess import PplxImageItem, prepare_pplx_image_item
 
         vis = self._ensure_vision_model()
-        items: list[PplxImageItem] = []
-        for img, rot_i in zip(img_list, norm_rotations):
+        n = len(img_list)
+        bs = max(1, min(int(batch_size), self.max_batch_size))
+        out: list[np.ndarray | None] = [None] * n
+
+        def _prep_one(orig_idx: int) -> PplxImageItem:
+            img = img_list[orig_idx]
+            rot_i = norm_rotations[orig_idx]
             if isinstance(img, PplxImageItem):
                 if rot_i != 0:
                     applied = getattr(
@@ -3104,111 +3111,138 @@ class FastPplxGPU:
                         raise ValueError(
                             f"Cannot apply rotations_cw={rot_i} to prebuilt PplxImageItem"
                         )
-                items.append(img)
-            else:
-                items.append(
-                    prepare_pplx_image_item(
-                        img,
-                        chunks=int(chunks),
-                        min_pixels=int(min_pixels),
-                        max_pixels=int(max_pixels),
-                        crop_margins=bool(crop_margins),
-                        rotation_cw=rot_i,
-                        grid_bucket_step=grid_bucket_step,
+                return img
+            return prepare_pplx_image_item(
+                img,
+                chunks=int(chunks),
+                min_pixels=int(min_pixels),
+                max_pixels=int(max_pixels),
+                crop_margins=bool(crop_margins),
+                rotation_cw=rot_i,
+                grid_bucket_step=grid_bucket_step,
+            )
+
+        def _run_wave_gpu(w0: int, w_items: list[PplxImageItem]) -> None:
+            w_n = len(w_items)
+            order = sorted(
+                range(w_n),
+                key=lambda i: (
+                    w_items[i].vision_inputs.grid_thw[1],
+                    w_items[i].vision_inputs.grid_thw[2],
+                    len(w_items[i].input_ids),
+                ),
+            )
+            idx = 0
+            while idx < w_n:
+                g0 = w_items[order[idx]].vision_inputs.grid_thw
+                end = idx + 1
+                while end < w_n and w_items[order[end]].vision_inputs.grid_thw == g0 and (end - idx) < bs:
+                    end += 1
+                grp_idxs = order[idx:end]
+                grp_items = [w_items[i] for i in grp_idxs]
+                b_w = len(grp_items)
+
+                px_all = np.concatenate([it.vision_inputs.pixel_values for it in grp_items], axis=0)
+                grids = [it.vision_inputs.grid_thw for it in grp_items]
+                vis_feats = vis(mx.array(px_all), grids)
+
+                ids_rows = [it.input_ids.tolist() for it in grp_items]
+                input_ids, attn_mask = self._prepare_batch_inputs_and_mask(ids_rows)
+                _b, S = input_ids.shape
+                hidden = self._embed_inputs(input_ids).astype(self.act_dtype)
+
+                vis_offset = 0
+                rows_list: list[mx.array] = []
+                for b_i, it in enumerate(grp_items):
+                    n_vis_tok = it.vision_inputs.num_visual_tokens
+                    vf = vis_feats[vis_offset : vis_offset + n_vis_tok].astype(self.act_dtype)
+                    vis_offset += n_vis_tok
+
+                    parts: list[mx.array] = []
+                    vf_cur = 0
+                    cur = 0
+                    for s0, s1 in it.chunk_token_spans:
+                        if s0 > cur:
+                            parts.append(hidden[b_i, cur:s0, :])
+                        slen = s1 - s0
+                        parts.append(vf[vf_cur : vf_cur + slen, :])
+                        vf_cur += slen
+                        cur = s1
+                    if cur < S:
+                        parts.append(hidden[b_i, cur:S, :])
+                    if vf_cur != n_vis_tok:
+                        raise ValueError(f"Expected {n_vis_tok} visual span slots, filled {vf_cur}")
+                    rows_list.append(mx.concatenate(parts, axis=0))
+                hidden_mm = mx.stack(rows_list, axis=0)
+
+                max_sp = max(1, *(len(it.chunk_token_spans) for it in grp_items))
+                pos_3d = np.zeros((3, b_w, S), dtype=np.float32)
+                span_arr = np.zeros((b_w, max_sp, 2), dtype=np.int32)
+                for b_i, it in enumerate(grp_items):
+                    Li = len(it.input_ids)
+                    pos_3d[:, b_i, :Li] = it.position_ids
+                    for j, (s0, s1) in enumerate(it.chunk_token_spans):
+                        span_arr[b_i, j] = (s0, s1)
+
+                ssm_mask = mx.array(attn_mask, dtype=mx.bool_) if attn_mask is not None else None
+                sdpa_mask = _build_sdpa_mask(attn_mask, dtype_name=self.dtype_name) if attn_mask is not None else None
+                rope_cos, rope_sin = precompute_mrope_trig(
+                    mx.array(pos_3d, dtype=mx.float32),
+                    rot_dims=self.config.rope_dim,
+                    rope_theta=self.config.rope_theta,
+                    mrope_section=self.config.mrope_section,
+                    dtype=self.act_dtype,
+                )
+                out_h = self.model.forward_hidden(
+                    hidden_mm,
+                    ssm_mask=ssm_mask,
+                    sdpa_mask=sdpa_mask,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                )
+                proj = self._project_span_pool(out_h, span_arr)
+                for b_i, local_i in enumerate(grp_idxs):
+                    n_sp = len(w_items[local_i].chunk_token_spans)
+                    out[w0 + local_i] = self._format_output(
+                        proj[b_i, :n_sp],
+                        dimensions=dimensions,
+                        output_dtype=output_dtype,
+                        normalize=normalize,
+                        apply_tanh=apply_tanh,
                     )
+                idx = end
+
+        all_prebuilt = all(isinstance(img, PplxImageItem) for img in img_list)
+        if n == 1 or all_prebuilt:
+            w_items = [_prep_one(i) for i in range(n)]
+            _run_wave_gpu(0, w_items)
+            clear_mlx_arena(256)
+            return [r for r in out if r is not None]
+
+        # Parallelize moderate batches (<=24 within memory budget) as one wave to preserve exact
+        # grid_thw batching (`min_cos = 1.0`), and stream larger runs via depth-1 wave prefetch.
+        est_bytes_per_item = max(1, int(max_pixels) * 24)
+        mem_cap = max(2, (480 * 1024 * 1024) // est_bytes_per_item)
+        if n <= min(24, mem_cap):
+            waves = [(0, n)]
+        else:
+            wave_cap = max(1, min(bs, 16, mem_cap))
+            waves = [(w0, min(n, w0 + wave_cap)) for w0 in range(0, n, wave_cap)]
+
+        max_workers = min(4, n)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pplx-img-prep") as pool:
+            cur_futs = [pool.submit(_prep_one, idx) for idx in range(waves[0][0], waves[0][1])]
+            cur_items = [fut.result() for fut in cur_futs]
+            for w_idx, (w0, _w1) in enumerate(waves):
+                next_futs = (
+                    [pool.submit(_prep_one, idx) for idx in range(waves[w_idx + 1][0], waves[w_idx + 1][1])]
+                    if (w_idx + 1) < len(waves)
+                    else None
                 )
-
-        n = len(items)
-        bs = max(1, min(int(batch_size), self.max_batch_size))
-        order = sorted(
-            range(n),
-            key=lambda i: (
-                items[i].vision_inputs.grid_thw[1],
-                items[i].vision_inputs.grid_thw[2],
-                len(items[i].input_ids),
-            ),
-        )
-        out: list[np.ndarray | None] = [None] * n
-
-        idx = 0
-        while idx < n:
-            g0 = items[order[idx]].vision_inputs.grid_thw
-            end = idx + 1
-            while end < n and items[order[end]].vision_inputs.grid_thw == g0 and (end - idx) < bs:
-                end += 1
-            grp_idxs = order[idx:end]
-            grp_items = [items[i] for i in grp_idxs]
-            b_w = len(grp_items)
-
-            px_all = np.concatenate([it.vision_inputs.pixel_values for it in grp_items], axis=0)
-            grids = [it.vision_inputs.grid_thw for it in grp_items]
-            vis_feats = vis(mx.array(px_all), grids)
-
-            ids_rows = [it.input_ids.tolist() for it in grp_items]
-            input_ids, attn_mask = self._prepare_batch_inputs_and_mask(ids_rows)
-            _b, S = input_ids.shape
-            hidden = self._embed_inputs(input_ids).astype(self.act_dtype)
-
-            vis_offset = 0
-            rows_list: list[mx.array] = []
-            for b_i, it in enumerate(grp_items):
-                n_vis_tok = it.vision_inputs.num_visual_tokens
-                vf = vis_feats[vis_offset : vis_offset + n_vis_tok].astype(self.act_dtype)
-                vis_offset += n_vis_tok
-
-                parts: list[mx.array] = []
-                vf_cur = 0
-                cur = 0
-                for s0, s1 in it.chunk_token_spans:
-                    if s0 > cur:
-                        parts.append(hidden[b_i, cur:s0, :])
-                    slen = s1 - s0
-                    parts.append(vf[vf_cur : vf_cur + slen, :])
-                    vf_cur += slen
-                    cur = s1
-                if cur < S:
-                    parts.append(hidden[b_i, cur:S, :])
-                if vf_cur != n_vis_tok:
-                    raise ValueError(f"Expected {n_vis_tok} visual span slots, filled {vf_cur}")
-                rows_list.append(mx.concatenate(parts, axis=0))
-            hidden_mm = mx.stack(rows_list, axis=0)
-
-            max_sp = max(1, *(len(it.chunk_token_spans) for it in grp_items))
-            pos_3d = np.zeros((3, b_w, S), dtype=np.float32)
-            span_arr = np.zeros((b_w, max_sp, 2), dtype=np.int32)
-            for b_i, it in enumerate(grp_items):
-                Li = len(it.input_ids)
-                pos_3d[:, b_i, :Li] = it.position_ids
-                for j, (s0, s1) in enumerate(it.chunk_token_spans):
-                    span_arr[b_i, j] = (s0, s1)
-
-            ssm_mask = mx.array(attn_mask, dtype=mx.bool_) if attn_mask is not None else None
-            sdpa_mask = _build_sdpa_mask(attn_mask, dtype_name=self.dtype_name) if attn_mask is not None else None
-            rope_cos, rope_sin = precompute_mrope_trig(
-                mx.array(pos_3d, dtype=mx.float32),
-                rot_dims=self.config.rope_dim,
-                rope_theta=self.config.rope_theta,
-                mrope_section=self.config.mrope_section,
-                dtype=self.act_dtype,
-            )
-            out_h = self.model.forward_hidden(
-                hidden_mm,
-                ssm_mask=ssm_mask,
-                sdpa_mask=sdpa_mask,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-            )
-            proj = self._project_span_pool(out_h, span_arr)
-            for b_i, orig_i in enumerate(grp_idxs):
-                n_sp = len(items[orig_i].chunk_token_spans)
-                out[orig_i] = self._format_output(
-                    proj[b_i, :n_sp],
-                    dimensions=dimensions,
-                    output_dtype=output_dtype,
-                    normalize=normalize,
-                    apply_tanh=apply_tanh,
-                )
-            idx = end
+                _run_wave_gpu(w0, cur_items)
+                del cur_items
+                if next_futs is not None:
+                    cur_items = [fut.result() for fut in next_futs]
 
         clear_mlx_arena(256)
         return [r for r in out if r is not None]

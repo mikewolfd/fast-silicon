@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+import math
+from typing import Any, Literal, Sequence
 
 OCRBackend = Literal["apple-vision", "ovis", "auto"]
 OutputFormat = Literal["markdown", "raw", "text"]
@@ -118,3 +119,138 @@ class OCRResult:
     timings: OCRTimings = field(default_factory=OCRTimings)
     finish_reason: str = "stop"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+DEFAULT_CONFIDENCE_WINDOW: int = 16
+DEFAULT_LOW_LOGPROB_THRESHOLD: float = -0.7
+DEFAULT_LOW_MARGIN_THRESHOLD: float = 1.0
+
+
+@dataclass(frozen=True)
+class LogprobConfidence:
+    """Aggregated per-page token log-probability and greedy logit-margin statistics."""
+
+    n_tokens: int
+    mean_logprob: float
+    mean_prob: float
+    min_window_logprob: float
+    p05_logprob: float
+    low_conf_frac: float
+    window_size: int = DEFAULT_CONFIDENCE_WINDOW
+    low_logprob_threshold: float = DEFAULT_LOW_LOGPROB_THRESHOLD
+    mean_margin: float | None = None
+    min_window_margin: float | None = None
+    low_margin_frac: float | None = None
+    low_margin_threshold: float = DEFAULT_LOW_MARGIN_THRESHOLD
+    mean_entropy: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "n_tokens": int(self.n_tokens),
+            "mean_logprob": round(float(self.mean_logprob), 6),
+            "mean_prob": round(float(self.mean_prob), 6),
+            "min_window_logprob": round(float(self.min_window_logprob), 6),
+            "p05_logprob": round(float(self.p05_logprob), 6),
+            "low_conf_frac": round(float(self.low_conf_frac), 6),
+            "window_size": int(self.window_size),
+            "low_logprob_threshold": float(self.low_logprob_threshold),
+        }
+        if self.mean_margin is not None:
+            out["mean_margin"] = round(float(self.mean_margin), 6)
+        if self.min_window_margin is not None:
+            out["min_window_margin"] = round(float(self.min_window_margin), 6)
+        if self.low_margin_frac is not None:
+            out["low_margin_frac"] = round(float(self.low_margin_frac), 6)
+            out["low_margin_threshold"] = float(self.low_margin_threshold)
+        if self.mean_entropy is not None:
+            out["mean_entropy"] = round(float(self.mean_entropy), 6)
+        return out
+
+
+def _min_sliding_window_mean(values: Sequence[float], window: int) -> float:
+    n = len(values)
+    if n == 0:
+        return 0.0
+    w = min(max(1, int(window)), n)
+    cur_sum = sum(float(v) for v in values[:w])
+    min_sum = cur_sum
+    for i in range(w, n):
+        cur_sum += float(values[i]) - float(values[i - w])
+        if cur_sum < min_sum:
+            min_sum = cur_sum
+    return min_sum / float(w)
+
+
+def summarize_logprob_confidence(
+    logprobs: Sequence[float],
+    *,
+    probs: Sequence[float] | None = None,
+    margins: Sequence[float] | None = None,
+    entropies: Sequence[float] | None = None,
+    window_size: int = DEFAULT_CONFIDENCE_WINDOW,
+    low_logprob_threshold: float = DEFAULT_LOW_LOGPROB_THRESHOLD,
+    low_margin_threshold: float = DEFAULT_LOW_MARGIN_THRESHOLD,
+) -> LogprobConfidence:
+    """Compute per-page token confidence summary without requiring heavy numeric imports."""
+    n = len(logprobs)
+    w_eff = min(max(1, int(window_size)), max(1, n))
+    if n == 0:
+        return LogprobConfidence(
+            n_tokens=0,
+            mean_logprob=0.0,
+            mean_prob=1.0,
+            min_window_logprob=0.0,
+            p05_logprob=0.0,
+            low_conf_frac=0.0,
+            window_size=int(window_size),
+            low_logprob_threshold=float(low_logprob_threshold),
+            mean_margin=0.0 if margins is not None else None,
+            min_window_margin=0.0 if margins is not None else None,
+            low_margin_frac=0.0 if margins is not None else None,
+            low_margin_threshold=float(low_margin_threshold),
+            mean_entropy=0.0 if entropies is not None else None,
+        )
+
+    lps = [float(x) for x in logprobs]
+    mean_lp = sum(lps) / float(n)
+    if probs is not None and len(probs) == n:
+        mean_p = sum(float(p) for p in probs) / float(n)
+    else:
+        mean_p = sum(math.exp(max(-60.0, min(0.0, lp))) for lp in lps) / float(n)
+
+    min_win_lp = _min_sliding_window_mean(lps, w_eff)
+    sorted_lps = sorted(lps)
+    p05_idx = min(n - 1, max(0, int(0.05 * (n - 1))))
+    p05_lp = sorted_lps[p05_idx]
+    low_lp_thresh = float(low_logprob_threshold)
+    low_conf_frac = sum(1 for lp in lps if lp < low_lp_thresh) / float(n)
+
+    mean_m: float | None = None
+    min_win_m: float | None = None
+    low_m_frac: float | None = None
+    low_m_thresh = float(low_margin_threshold)
+    if margins is not None and len(margins) == n:
+        m_vals = [float(m) for m in margins]
+        mean_m = sum(m_vals) / float(n)
+        min_win_m = _min_sliding_window_mean(m_vals, w_eff)
+        low_m_frac = sum(1 for m in m_vals if m < low_m_thresh) / float(n)
+
+    mean_ent: float | None = None
+    if entropies is not None and len(entropies) == n:
+        mean_ent = sum(float(e) for e in entropies) / float(n)
+
+    return LogprobConfidence(
+        n_tokens=n,
+        mean_logprob=mean_lp,
+        mean_prob=mean_p,
+        min_window_logprob=min_win_lp,
+        p05_logprob=p05_lp,
+        low_conf_frac=low_conf_frac,
+        window_size=int(window_size),
+        low_logprob_threshold=low_lp_thresh,
+        mean_margin=mean_m,
+        min_window_margin=min_win_m,
+        low_margin_frac=low_m_frac,
+        low_margin_threshold=low_m_thresh,
+        mean_entropy=mean_ent,
+    )

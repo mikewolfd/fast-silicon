@@ -8,12 +8,14 @@ for Apple10+ GPUs with Metal 4 Hardware TensorOps (`MPP::matmul2d` `16x32x16`/`T
   - Bitwise `bfloat16` non-finite exponent guard (`(bits & 0x7f80u) == 0x7f80u`) propagating quiet NaN
     bits (`0x7fc00000u`) into `x_meta` even when Metal fast-math is active.
   - Outputs `[M, K] int8` codes and `[K//64, M, 2] float32` metadata (`sc`, `sc * sum(q)`).
-- Offline/lazy weight repacking (`pack_affine_weights_for_mpp_i8`):
-  - `bits == 8` (`W8A8`): `w_i8 = (wq ^ 0x80808080).view(int8)`.
-  - `bits == 4` (`W4A8`): `w_i4 = (wq ^ 0x88888888)` (consumed as `metal::int4b_format`).
+- Offline/lazy metadata packing (`pack_affine_weights_for_mpp_i8`) + inline XOR unpack (`5a`):
+  - Default `include_packed=False` stores only compact `[K//64, N] uint32` metadata (`w_meta`),
+    eliminating shadow `w_packed` weight copies while keeping zero-byte sentinel compatibility.
+  - Double-buffered threadgroup load unpacks `wq` inline via `^ 0x80808080` (`W8A8`) or
+    `^ 0x88888888` (`W4A8` consumed as `metal::int4b_format`).
   - Compact `uint32` metadata `[K//64, N]` packing `(bfloat(sq), bfloat(bq))` per `(group, col)`,
     reconstructing exact `FP32` `wb = fma(128|8, ws, bq)` inside the kernel without BF16 re-rounding.
-- Single-barrier double-buffered 64-tile (`TM=32` for `M < 64`, `TM=64` for `M >= 64`, `TN=64`) kernels
+- Single-barrier/double-buffered 64-tile (`TM=32` for `M < 64`, `TM=64` for `M >= 64`, `TN=64`) kernels
   with 16-column-band tile walk (`prefill_int8_walk`) and optional fused epilogue vector bias.
 
 Strictly gated OFF on Apple9 (`supports_apple10_nax() == False`) and gated on Apple10+ only for
@@ -37,7 +39,8 @@ using namespace mpp::tensor_ops;
 
 _APPLE10_NAX_CACHE: bool | None = None
 _QX_KERNELS: dict[tuple[int, str], tuple[Any, int]] = {}
-_GEMM_KERNELS: dict[tuple[int, int, int, int, int, int, bool, str], Any] = {}
+_GEMM_KERNELS: dict[tuple[int, int, int, int, int, int, bool, str, bool], Any] = {}
+PACKS_META_ONLY: bool = True
 
 
 def _apple10_nax_supported(apple10_nax: bool | None = None) -> bool:
@@ -247,15 +250,23 @@ def pack_affine_weights_for_mpp_i8(
     *,
     bits: int,
     group_size: int = 64,
+    include_packed: bool = False,
 ) -> tuple[mx.array, mx.array]:
-    """Repack MLX unsigned affine `(wq, sq, bq)` into signed `(w_packed, w_meta [ng, N] uint32)` on GPU."""
+    """Pack compact `[K//64, N] uint32` metadata (`w_meta`) and optional signed `w_packed` for Apple10 MPP.
+
+    By default (`include_packed=False`), returns `(empty_u32, w_meta)` so the GEMM kernel unpacks
+    `wq` inline via threadgroup XOR without duplicating weight buffers in RAM.
+    """
     b_i = int(bits)
     if int(group_size) != 64 or b_i not in (4, 8):
         raise ValueError(f"Expected group_size=64 and bits in (4, 8), got group_size={group_size}, bits={bits}")
-    if b_i == 8:
-        w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x80808080, dtype=mx.uint32)).view(mx.int8))
+    if include_packed:
+        if b_i == 8:
+            w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x80808080, dtype=mx.uint32)).view(mx.int8))
+        else:
+            w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x88888888, dtype=mx.uint32)))
     else:
-        w_packed = mx.contiguous(mx.bitwise_xor(wq, mx.array(0x88888888, dtype=mx.uint32)))
+        w_packed = mx.zeros((0,), dtype=mx.uint32)
     sq_bf = sq.astype(mx.bfloat16)
     bq_bf = bq.astype(mx.bfloat16)
     sq_u32 = sq_bf.view(mx.uint16).astype(mx.uint32)
@@ -274,13 +285,192 @@ def _get_gemm_kernel(
     sgs: int,
     has_bias: bool,
     out_dtype_name: str = "bf16",
+    inline_weight_unpack: bool = True,
 ) -> Any:
-    key = (bits, k, n, tm, tn, sgs, has_bias, out_dtype_name)
+    key = (bits, k, n, tm, tn, sgs, has_bias, out_dtype_name, bool(inline_weight_unpack))
     cached = _GEMM_KERNELS.get(key)
     if cached is not None:
         return cached
     ng = k // 64
     w_offset_f = "128.0f" if bits == 8 else "8.0f"
+    bias_tg = "threadgroup float tg_bias[TN];" if has_bias else ""
+    bias_load = (
+        """
+    if (tid < (uint)TN) {
+        uint gn = n0 + tid;
+        tg_bias[tid] = ((int)gn < N) ? float(bias[gn]) : 0.0f;
+    }"""
+        if has_bias
+        else ""
+    )
+    bias_add = " + tg_bias[nl[i]]" if has_bias else ""
+    out_metal_t = "half" if out_dtype_name == "f16" else "bfloat"
+    out_nan_bits = "0x7e00u" if out_dtype_name == "f16" else "0x7fc0u"
+
+    if inline_weight_unpack:
+        if bits == 8:
+            w_tg_decl = "threadgroup uint4 tg_w[2][64 * 4];"
+            load_w = """
+        {{
+            uint r0 = tid >> 2, c0 = tid & 3u;
+            uint r1 = (tid + 128u) >> 2, c1 = (tid + 128u) & 3u;
+            uint gn0 = n0 + r0, gn1 = n0 + r1;
+            uint4 v0 = ((int)gn0 < N) ? reinterpret_cast<const device uint4*>(wq + (size_t)gn0 * (size_t)(K >> 2) + (size_t)({g_idx} * 16u))[c0] : uint4(0u);
+            uint4 v1 = ((int)gn1 < N) ? reinterpret_cast<const device uint4*>(wq + (size_t)gn1 * (size_t)(K >> 2) + (size_t)({g_idx} * 16u))[c1] : uint4(0u);
+            {buf_ptr}[tid] = v0 ^ uint4(0x80808080u);
+            {buf_ptr}[tid + 128u] = v1 ^ uint4(0x80808080u);
+        }}"""
+            tg_ten = "auto ws = tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>(reinterpret_cast<threadgroup int8_t*>(cur_w), dextents<int, 2>{64, TN}, array<int, 2>{1, 64});"
+            ws0_expr = "tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>(reinterpret_cast<threadgroup int8_t*>(tg_w[0]), dextents<int, 2>{64, TN}, array<int, 2>{1, 64})"
+        else:
+            w_tg_decl = "threadgroup uint4 tg_w[2][64 * 2];"
+            load_w = """
+        {{
+            uint r0 = tid >> 1, c0 = tid & 1u;
+            uint gn0 = n0 + r0;
+            uint4 v0 = ((int)gn0 < N) ? reinterpret_cast<const device uint4*>(wq + (size_t)gn0 * (size_t)(K >> 3) + (size_t)({g_idx} * 8u))[c0] : uint4(0u);
+            {buf_ptr}[tid] = v0 ^ uint4(0x88888888u);
+        }}"""
+            tg_ten = "auto ws = tensor<threadgroup metal::int4b_format, dextents<int, 2>, tensor_inline>(reinterpret_cast<threadgroup uchar*>(cur_w), dextents<int, 2>{64, TN}, array<int, 2>{1, 64});"
+            ws0_expr = "tensor<threadgroup metal::int4b_format, dextents<int, 2>, tensor_inline>(reinterpret_cast<threadgroup uchar*>(tg_w[0]), dextents<int, 2>{64, TN}, array<int, 2>{1, 64})"
+        input_names = ["x_q", "x_meta", "wq", "w_meta"] + (["bias"] if has_bias else [])
+        src = f"""
+    constexpr int K = {k}, N = {n}, NG = {ng}, TM = {tm}, TN = {tn};
+    int M = (int)x_q_shape[0];
+    uint n_tiles = (uint)((N + TN - 1) / TN);
+    uint m_tiles = (uint)((M + TM - 1) / TM);
+    uint tg_x = threadgroup_position_in_grid.x;
+    uint tg_y = threadgroup_position_in_grid.y;
+    uint band = tg_x / 16u;
+    uint band_w = min(16u, n_tiles - band * 16u);
+    uint lin_in_band = (tg_x % 16u) * m_tiles + tg_y;
+    uint n0 = (band * 16u + (lin_in_band % band_w)) * TN;
+    uint m0 = (lin_in_band / band_w) * TM;
+    if ((int)m0 >= M || (int)n0 >= N) return;
+
+    threadgroup float2 tg_xm[2][TM];
+    threadgroup uint tg_wm[2][TN];
+    {w_tg_decl}
+    threadgroup uint tg_nf[TM];
+    {bias_tg}
+    uint tid = thread_index_in_threadgroup;
+    if (tid < (uint)TM) {{
+        tg_nf[tid] = 0u;
+    }}
+    {bias_load}
+    device int8_t* xp = const_cast<device int8_t*>(x_q);
+    auto X_t = tensor(xp, dextents<int, 2>{{K, M}}, array<int, 2>{{1, K}});
+    auto Y_t = tensor(out, dextents<int, 2>{{N, M}}, array<int, 2>{{1, N}});
+    constexpr auto d0 = matmul2d_descriptor(TM, TN, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<d0, execution_simdgroups<{sgs}>> op0;
+    auto xs0 = X_t.slice<64, TM>(0, (int)m0);
+    auto ws0 = {ws0_expr};
+    auto c = op0.get_destination_cooperative_tensor<decltype(xs0), decltype(ws0), int>();
+    uint16_t cap = c.get_capacity();
+    short ml[32], nl[32];
+    float acc[32];
+    for (uint16_t i = 0; i < cap; ++i) {{
+        acc[i] = 0.0f;
+        if (c.is_valid_element(i)) {{
+            auto coord = c.get_multidimensional_index(i);
+            ml[i] = (short)coord[1];
+            nl[i] = (short)coord[0];
+        }} else {{
+            ml[i] = -1;
+            nl[i] = -1;
+        }}
+    }}
+    const device float2* x_meta2 = reinterpret_cast<const device float2*>(x_meta);
+    int buf = 0;
+    {load_w.format(g_idx='0u', buf_ptr='tg_w[0]')}
+    if (tid < (uint)TM) {{
+        int gm = (int)m0 + (int)tid;
+        float2 xm_t = (gm < M) ? x_meta2[(size_t)gm] : float2(0.0f, 0.0f);
+        tg_xm[0][tid] = xm_t;
+        if ((as_type<uint>(xm_t.x) & 0x7f800000u) == 0x7f800000u) {{
+            tg_nf[tid] = 1u;
+        }}
+    }}
+    if (tid >= (uint)TM && tid < (uint)(TM + TN)) {{
+        uint r = tid - (uint)TM;
+        uint gn = n0 + r;
+        tg_wm[0][r] = ((int)gn < N) ? w_meta[(size_t)gn] : 0u;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int g = 0; g < NG; ++g) {{
+        int next_g = g + 1;
+        int nbuf = buf ^ 1;
+        if (next_g < NG) {{
+            {load_w.format(g_idx='(uint)next_g', buf_ptr='tg_w[nbuf]')}
+            if (tid < (uint)TM) {{
+                int gm = (int)m0 + (int)tid;
+                float2 xm_t = (gm < M) ? x_meta2[(size_t)next_g * (size_t)M + gm] : float2(0.0f, 0.0f);
+                tg_xm[nbuf][tid] = xm_t;
+                if ((as_type<uint>(xm_t.x) & 0x7f800000u) == 0x7f800000u) {{
+                    tg_nf[tid] = 1u;
+                }}
+            }}
+            if (tid >= (uint)TM && tid < (uint)(TM + TN)) {{
+                uint r = tid - (uint)TM;
+                uint gn = n0 + r;
+                tg_wm[nbuf][r] = ((int)gn < N) ? w_meta[(size_t)next_g * (size_t)N + gn] : 0u;
+            }}
+        }}
+        threadgroup uint4* cur_w = tg_w[buf];
+        auto xs = X_t.slice<64, TM>(g * 64, (int)m0);
+        {tg_ten}
+        op0.run(xs, ws, c);
+        for (uint16_t i = 0; i < cap; ++i) {{
+            short rm = ml[i];
+            if (rm >= 0) {{
+                float2 xm = tg_xm[buf][rm];
+                uint wu = tg_wm[buf][nl[i]];
+                float ws_v = float(as_type<bfloat>(ushort(wu & 0xFFFFu)));
+                float bq_v = float(as_type<bfloat>(ushort(wu >> 16)));
+                float wb_v = fma({w_offset_f}, ws_v, bq_v);
+                acc[i] = fma(float(c[i]), xm.x * ws_v, fma(xm.y, wb_v, acc[i]));
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf = nbuf;
+    }}
+    if ((int)m0 + TM <= M && (int)n0 + TN <= N) {{
+        auto yo = op0.get_destination_cooperative_tensor<decltype(xs0), decltype(ws0), {out_metal_t}>();
+        for (uint16_t i = 0; i < cap; ++i) {{
+            short rm = ml[i];
+            if (rm >= 0) {{
+                yo[i] = (tg_nf[rm] != 0u)
+                    ? as_type<{out_metal_t}>(ushort({out_nan_bits}))
+                    : {out_metal_t}(acc[i]{bias_add});
+            }} else {{
+                yo[i] = {out_metal_t}(0.0f);
+            }}
+        }}
+        auto ys = Y_t.slice<TN, TM>((int)n0, (int)m0);
+        yo.store(ys);
+    }} else {{
+        for (uint16_t i = 0; i < cap; ++i) {{
+            short rm = ml[i];
+            if (rm >= 0 && ((int)m0 + (int)rm) < M && nl[i] >= 0 && ((int)n0 + (int)nl[i]) < N) {{
+                size_t gm = (size_t)m0 + (size_t)rm;
+                size_t gn = (size_t)n0 + (size_t)nl[i];
+                out[gm * (size_t)N + gn] = (tg_nf[rm] != 0u)
+                    ? as_type<{out_metal_t}>(ushort({out_nan_bits}))
+                    : {out_metal_t}(acc[i]{bias_add});
+            }}
+        }}
+    }}
+    """
+        kern = mx.fast.metal_kernel(
+            f"mpp_w{bits}a8_i5a_gemm_{out_dtype_name}_{k}_{n}_{tm}x{tn}_{sgs}{'_b' if has_bias else ''}",
+            input_names,
+            ["out"],
+            header=HEADER_MPP_INT8,
+            source=src,
+        )
+        _GEMM_KERNELS[key] = kern
+        return kern
+
     if bits == 8:
         w_arg = "w_i8"
         right_decl = "device int8_t* wp = const_cast<device int8_t*>(w_i8);"
@@ -292,19 +482,6 @@ def _get_gemm_kernel(
             "auto W_t = tensor<device metal::int4b_format, dextents<int, 2>, tensor_inline>"
             "(wp, dextents<int, 2>{K, N}, array<int, 2>{1, K});"
         )
-    bias_tg = "threadgroup float tg_bias[TN];" if has_bias else ""
-    bias_load = (
-        f"""
-    if (tid < (uint)TN) {{
-        uint gn = n0 + tid;
-        tg_bias[tid] = ((int)gn < N) ? float(bias[gn]) : 0.0f;
-    }}"""
-        if has_bias
-        else ""
-    )
-    bias_add = " + tg_bias[nl[i]]" if has_bias else ""
-    out_metal_t = "half" if out_dtype_name == "f16" else "bfloat"
-    out_nan_bits = "0x7e00u" if out_dtype_name == "f16" else "0x7fc0u"
     input_names = ["x_q", "x_meta", w_arg, "w_meta"] + (["bias"] if has_bias else [])
     src = f"""
     constexpr int K = {k}, N = {n}, NG = {ng}, TM = {tm}, TN = {tn};
@@ -452,6 +629,7 @@ def mpp_quantized_linear(
         w_packed, w_meta = pack_affine_weights_for_mpp_i8(wq, sq, bq, bits=int(bits), group_size=int(group_size))
     else:
         w_packed, w_meta = packed_weights
+    use_inline_unpack = w_packed is None or int(w_packed.size) == 0
     if prequantized_x is None:
         x_q, x_meta = quantize_activations_i8_k64(x_2d)
     else:
@@ -471,10 +649,12 @@ def mpp_quantized_linear(
         sgs=sgs,
         has_bias=has_bias,
         out_dtype_name=out_dtype_name,
+        inline_weight_unpack=use_inline_unpack,
     )
     nt = (n + tn - 1) // tn
     mt = (m + tm - 1) // tm
-    inputs: list[mx.array] = [x_q, x_meta, w_packed, w_meta]
+    weight_arg = mx.contiguous(wq) if use_inline_unpack else w_packed
+    inputs: list[mx.array] = [x_q, x_meta, weight_arg, w_meta]
     if has_bias:
         bias_in = mx.contiguous(bias if bias.dtype == eff_out_dtype else bias.astype(eff_out_dtype))
         inputs.append(bias_in)
@@ -514,6 +694,7 @@ def get_or_pack_affine_module_weights(
 
 
 __all__ = [
+    "PACKS_META_ONLY",
     "get_or_pack_affine_module_weights",
     "mpp_quantized_linear",
     "pack_affine_weights_for_mpp_i8",

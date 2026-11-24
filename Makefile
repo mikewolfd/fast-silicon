@@ -57,6 +57,7 @@ test-cpu: hw-check
 		packages/fast-shared/tests/test_v23_track_b_cpu.py \
 		packages/fast-shared/tests/test_rd_winners_cpu.py \
 		packages/fast-shared/tests/test_bench_memory.py \
+		packages/fast-shared/tests/test_metal_mpp_int8_cpu.py \
 		packages/fast-decision-models/tests/test_decision_models_cpu.py \
 		packages/fast-decision-models/tests/test_prefix_tree_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \
@@ -68,6 +69,7 @@ test-cpu: hw-check
 		packages/fast-ocr/tests/test_fast_ocr_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_regions_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_whitepatch_vocab_cpu.py \
+		packages/fast-ocr/tests/test_fast_ocr_confidence_splice_cpu.py \
 		packages/fast-gemma4/tests/test_per_doc_grammar.py \
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \

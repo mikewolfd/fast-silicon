@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import ctypes
 from dataclasses import asdict, replace
 import json
+import math
 import os
 from pathlib import Path
+import queue
 import re
+import sys
+import threading
 import time
 from typing import AbstractSet, Any, Callable, Mapping, Sequence
 
@@ -59,11 +64,13 @@ from .region_router import (
     compute_adaptive_max_pixels,
 )
 from .types import (
+    LogprobConfidence,
     MarkdownTableMode,
     OCRResult,
     OCRTimings,
     OutputFormat,
     SpeculativeMode,
+    summarize_logprob_confidence,
 )
 from .vision import FastQwen35VisionModel
 
@@ -565,6 +572,200 @@ def _normalize_per_item_int(
     return None, seq
 
 
+def _normalize_confidence_mode(mode: bool | str | None, *, default: str = "auto") -> str:
+    if mode is None:
+        return default
+    if isinstance(mode, bool):
+        return "on" if mode else "off"
+    norm = str(mode).strip().lower()
+    if norm in {"auto", "on", "true", "1", "yes"}:
+        return "auto" if norm == "auto" else "on"
+    if norm in {"off", "false", "0", "no", "none"}:
+        return "off"
+    raise ValueError(f"Invalid collect_logprob_confidence mode {mode!r}; expected 'auto', True, or False")
+
+
+def _load_accelerate_vdsp() -> Any | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        acc = ctypes.CDLL("/System/Library/Frameworks/Accelerate.framework/Accelerate")
+        acc.vDSP_maxv.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.POINTER(ctypes.c_float), ctypes.c_ulong]
+        acc.vDSP_vsadd.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_ulong,
+        ]
+        acc.vvexpf.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        acc.vDSP_sve.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.POINTER(ctypes.c_float), ctypes.c_ulong]
+        return acc
+    except Exception:
+        return None
+
+
+_VDSP_LIB: Any | None = _load_accelerate_vdsp()
+
+
+class _StepConfidenceState:
+    """Reusable per-thread scratch & Accelerate vDSP kernels for zero-copy step logprob + margin."""
+
+    def __init__(self) -> None:
+        self._vdsp = _VDSP_LIB
+        self._scratch = np.empty(160_000, dtype=np.float32)
+        self._c_max = ctypes.c_float()
+        self._c_shift = ctypes.c_float()
+        self._c_sum = ctypes.c_float()
+        self._c_m_l = ctypes.c_float()
+        self._c_m_r = ctypes.c_float()
+        self._c_n = ctypes.c_int()
+
+    def compute(self, logits_1d: np.ndarray, chosen_idx: int) -> tuple[float, float]:
+        n = int(logits_1d.shape[0]) if getattr(logits_1d, "ndim", 0) == 1 else 0
+        if n <= 0 or chosen_idx < 0 or chosen_idx >= n:
+            return 0.0, 0.0
+        arr = (
+            logits_1d
+            if (logits_1d.dtype == np.float32 and logits_1d.flags.c_contiguous)
+            else np.ascontiguousarray(logits_1d, dtype=np.float32)
+        )
+        chosen = float(arr[chosen_idx])
+        if not math.isfinite(chosen):
+            return -60.0, 0.0
+
+        vdsp = self._vdsp
+        if vdsp is not None and n >= 64:
+            if n > int(self._scratch.shape[0]):
+                self._scratch = np.empty(n, dtype=np.float32)
+            ptr = arr.ctypes.data
+            sptr = self._scratch.ctypes.data
+            vdsp.vDSP_maxv(ptr, 1, ctypes.byref(self._c_max), n)
+            m = float(self._c_max.value)
+            if not math.isfinite(m):
+                m = chosen
+            self._c_shift.value = -m
+            vdsp.vDSP_vsadd(ptr, 1, ctypes.byref(self._c_shift), sptr, 1, n)
+            self._c_n.value = n
+            vdsp.vvexpf(sptr, sptr, ctypes.byref(self._c_n))
+            vdsp.vDSP_sve(sptr, 1, ctypes.byref(self._c_sum), n)
+            z = float(self._c_sum.value)
+            lse = m + math.log(max(z, 1e-30))
+            lp = min(0.0, chosen - lse)
+
+            other_max = -1e30
+            if chosen_idx > 0:
+                vdsp.vDSP_maxv(ptr, 1, ctypes.byref(self._c_m_l), chosen_idx)
+                v_l = float(self._c_m_l.value)
+                if v_l > other_max:
+                    other_max = v_l
+            if chosen_idx + 1 < n:
+                vdsp.vDSP_maxv(ptr + (chosen_idx + 1) * 4, 1, ctypes.byref(self._c_m_r), n - chosen_idx - 1)
+                v_r = float(self._c_m_r.value)
+                if v_r > other_max:
+                    other_max = v_r
+            margin = (chosen - other_max) if other_max > -1e29 else 0.0
+            return lp, margin
+
+        m = float(np.max(arr))
+        z = float(np.sum(np.exp(arr - m)))
+        lse = m + math.log(max(z, 1e-30))
+        lp = min(0.0, chosen - lse)
+        other_max = -1e30
+        if chosen_idx > 0:
+            other_max = max(other_max, float(np.max(arr[:chosen_idx])))
+        if chosen_idx + 1 < n:
+            other_max = max(other_max, float(np.max(arr[chosen_idx + 1 :])))
+        margin = (chosen - other_max) if other_max > -1e29 else 0.0
+        return lp, margin
+
+
+def compute_step_logprob_margin(logits_1d: np.ndarray, chosen_idx: int) -> tuple[float, float]:
+    """Compute `(logprob, logit_margin)` for a single step without full-softmax float64 copies."""
+    return _StepConfidenceState().compute(logits_1d, chosen_idx)
+
+
+class _StepConfidenceWorker:
+    """Persistent single background thread computing step logprobs/margins overlapped with GPU steps."""
+
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue[tuple[Any, ...]] = queue.SimpleQueue()
+        self._state = _StepConfidenceState()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="fast-ocr-logprob-worker", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            kind = item[0]
+            if kind == "stop":
+                return
+            if kind == "flush":
+                item[1].set()
+                continue
+            _, arr, chosen_idx, out_lps, out_margins = item
+            lp, margin = self._state.compute(arr, chosen_idx)
+            out_lps.append(lp)
+            out_margins.append(margin)
+
+    def submit(
+        self,
+        logits_1d: np.ndarray,
+        chosen_idx: int,
+        out_lps: list[float],
+        out_margins: list[float],
+    ) -> None:
+        if self._closed:
+            lp, margin = self._state.compute(logits_1d, chosen_idx)
+            out_lps.append(lp)
+            out_margins.append(margin)
+            return
+        self._queue.put(("step", logits_1d, int(chosen_idx), out_lps, out_margins))
+
+    def flush(self) -> None:
+        if self._closed:
+            return
+        done = threading.Event()
+        self._queue.put(("flush", done))
+        done.wait()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(("stop",))
+        self._thread.join(timeout=1.0)
+
+
+class _StepConfidenceSession:
+    """Per-page accumulator backed by `_StepConfidenceWorker` or synchronous evaluation."""
+
+    def __init__(self, worker: _StepConfidenceWorker | None) -> None:
+        self._worker = worker
+        self._sync_state = _StepConfidenceState() if worker is None else None
+        self.logprobs: list[float] = []
+        self.margins: list[float] = []
+
+    def submit(self, logits_1d: np.ndarray, chosen_idx: int) -> None:
+        n = int(logits_1d.shape[0]) if getattr(logits_1d, "ndim", 0) == 1 else 0
+        if n <= 0 or chosen_idx < 0 or chosen_idx >= n:
+            return
+        if self._worker is not None:
+            self._worker.submit(logits_1d, chosen_idx, self.logprobs, self.margins)
+        else:
+            assert self._sync_state is not None
+            lp, margin = self._sync_state.compute(logits_1d, chosen_idx)
+            self.logprobs.append(lp)
+            self.margins.append(margin)
+
+    def finish(self) -> LogprobConfidence:
+        if self._worker is not None:
+            self._worker.flush()
+        return summarize_logprob_confidence(self.logprobs, margins=self.margins)
+
+
 class FastOvisOCREngine:
     """Zero-training high-speed Qwen3.5 VLM OCR engine built on `fast-qwen3` + `FastQwen35VisionModel`."""
 
@@ -599,6 +800,7 @@ class FastOvisOCREngine:
         memory_limit_gb: float | None = None,
         cache_limit_gb: float | None = None,
         apply_memory_limits: bool = True,
+        collect_logprob_confidence: bool | str = "auto",
     ) -> None:
         self._prev_mlx_memory_limit: int | None = None
         self._prev_mlx_cache_limit: int | None = None
@@ -640,6 +842,8 @@ class FastOvisOCREngine:
         self.drop_white_patches: bool = bool(drop_white_patches)
         self.latin_only: bool = bool(latin_only)
         self.languages: tuple[str, ...] | None = tuple(languages) if languages is not None else None
+        self.collect_logprob_confidence: str = _normalize_confidence_mode(collect_logprob_confidence)
+        self._confidence_worker: _StepConfidenceWorker | None = None
 
         self.image_token_id: int = int(self.raw_config.get("image_token_id", 248056))
         self.vision_start_token_id: int = int(self.raw_config.get("vision_start_token_id", 248053))
@@ -691,6 +895,13 @@ class FastOvisOCREngine:
         self._vision_prepass: AppleVisionOCR | None = None
         if warmup:
             self._warmup()
+
+    def _get_confidence_worker(self) -> _StepConfidenceWorker:
+        worker = getattr(self, "_confidence_worker", None)
+        if worker is None:
+            worker = _StepConfidenceWorker()
+            self._confidence_worker = worker
+        return worker
 
     def _get_vision_prepass(self) -> AppleVisionOCR:
         if self._vision_prepass is None:
@@ -750,6 +961,7 @@ class FastOvisOCREngine:
         temperature: float = 0.0,
         pre_analysis: OCRResult | None = None,
         auto_loop_recover: bool | None = None,
+        collect_logprob_confidence: bool | str | None = None,
         _force_loop_breaker: bool = False,
         _loop_retry_depth: int = 0,
     ) -> OCRResult:
@@ -776,6 +988,16 @@ class FastOvisOCREngine:
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
         eff_loop_breaker = bool(getattr(self, "loop_breaker", False) or _force_loop_breaker)
+        eff_conf_mode = _normalize_confidence_mode(
+            getattr(self, "collect_logprob_confidence", "auto")
+            if collect_logprob_confidence is None
+            else collect_logprob_confidence
+        )
+        conf_session = (
+            _StepConfidenceSession(self._get_confidence_worker())
+            if eff_conf_mode in ("auto", "on")
+            else None
+        )
 
         if prompt is not None:
             instruction = str(prompt)
@@ -1051,6 +1273,7 @@ class FastOvisOCREngine:
                     work, argmax_idx = apply_loop_breaker_penalties_1d(work, pen, self._old_to_new)
 
             active_json_matcher = json_matcher_override if json_matcher_override is not None else json_matcher
+            chosen_tok: int | None = None
             if active_json_matcher is not None and json_gram is not None:
                 def _lazy_full() -> np.ndarray:
                     assert hidden_1d is not None
@@ -1068,28 +1291,36 @@ class FastOvisOCREngine:
                     fallback_to_full_vocab=can_fb,
                     full_logits_1d=_lazy_full if can_fb else None,
                 )
-                return int(tok_i)
+                chosen_tok = int(tok_i)
+            else:
+                active_table_gram = table_gram_override if table_gram_override is not None else table_gram
+                if active_table_gram is not None and active_table_gram.is_active:
+                    full_mask = active_table_gram.prepare_mask(vocab_size=self.tokenizer.vocab_size)
+                    if full_mask is not None:
+                        active_mask = full_mask[self._new_to_old] if self.vocab_remap is not None else full_mask[: len(work)]
+                        if np.any(active_mask):
+                            masked = np.where(active_mask, work, -1e9)
+                            chosen_tok = int(self._new_to_old[safe_argmax_1d(masked)])
 
-            active_table_gram = table_gram_override if table_gram_override is not None else table_gram
-            if active_table_gram is not None and active_table_gram.is_active:
-                full_mask = active_table_gram.prepare_mask(vocab_size=self.tokenizer.vocab_size)
-                if full_mask is not None:
-                    active_mask = full_mask[self._new_to_old] if self.vocab_remap is not None else full_mask[: len(work)]
-                    if np.any(active_mask):
-                        masked = np.where(active_mask, work, -1e9)
-                        return int(self._new_to_old[safe_argmax_1d(masked)])
+            if chosen_tok is None:
+                if float(temperature) <= 0.0:
+                    chosen_tok = int(self._new_to_old[argmax_idx])
+                else:
+                    chosen_tok = int(
+                        sample_unconstrained(
+                            work,
+                            self._new_to_old,
+                            argmax_idx,
+                            temperature=temperature,
+                            top_p=1.0,
+                        )
+                    )
 
-            if float(temperature) <= 0.0:
-                return int(self._new_to_old[argmax_idx])
-            return int(
-                sample_unconstrained(
-                    work,
-                    self._new_to_old,
-                    argmax_idx,
-                    temperature=temperature,
-                    top_p=1.0,
-                )
-            )
+            if conf_session is not None and chosen_tok not in stop_ids:
+                old_to_new = self._old_to_new
+                c_idx = int(old_to_new[chosen_tok]) if old_to_new is not None else int(chosen_tok)
+                conf_session.submit(work, c_idx)
+            return chosen_tok
 
         gen_ids: list[int] = []
         drafted_tokens = 0
@@ -1313,6 +1544,8 @@ class FastOvisOCREngine:
             aborted_loop = (0, len(gen_ids))
 
         if aborted_loop is not None and can_loop_recover:
+            if conf_session is not None:
+                conf_session.finish()
             aborted_tokens = len(gen_ids)
             del cache
             mx.clear_cache()
@@ -1347,6 +1580,7 @@ class FastOvisOCREngine:
                 temperature=temperature,
                 pre_analysis=vision_res,
                 auto_loop_recover=do_loop_recover,
+                collect_logprob_confidence=collect_logprob_confidence,
                 _force_loop_breaker=retry_lb,
                 _loop_retry_depth=int(_loop_retry_depth) + 1,
             )
@@ -1390,6 +1624,7 @@ class FastOvisOCREngine:
             validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
         else:
             rendered = raw_text
+        conf_summary = conf_session.finish() if conf_session is not None else None
         post_ms = (time.perf_counter() - t_post0) * 1000.0
 
         zoom_meta: dict[str, Any] | None = None
@@ -1449,6 +1684,8 @@ class FastOvisOCREngine:
             )
         if zoom_meta is not None:
             metadata["zoom_recovery"] = zoom_meta
+        if conf_summary is not None:
+            metadata["logprob_confidence"] = conf_summary.to_dict()
 
         finish_reason = "stop" if (hit_eos or (json_matcher is not None and json_matcher.is_stopped())) else "length"
         return OCRResult(
@@ -1635,6 +1872,7 @@ class FastOvisOCREngine:
         max_pad_ratio: float | None = 1.8,
         max_wave_tokens: int | None = None,
         auto_loop_recover: bool | None = None,
+        collect_logprob_confidence: bool | str | None = None,
     ) -> list[OCRResult]:
         """Process multiple images: true `B >= 2` batched VLM waves or double-buffered ANE+PLD when `B=1`."""
         if not sources:
@@ -1688,6 +1926,11 @@ class FastOvisOCREngine:
         k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
+        eff_conf_mode = _normalize_confidence_mode(
+            getattr(self, "collect_logprob_confidence", "auto")
+            if collect_logprob_confidence is None
+            else collect_logprob_confidence
+        )
         eff_loop_breaker = bool(getattr(self, "loop_breaker", False))
         eff_bs = 1 if batch_size is None else max(1, int(batch_size))
         eff_min_pixels = 65_536 if min_px_scalar is None else max(1024, int(min_px_scalar))
@@ -1731,6 +1974,7 @@ class FastOvisOCREngine:
                         temperature=temperature,
                         pre_analysis=pre,
                         auto_loop_recover=do_loop_recover,
+                        collect_logprob_confidence=collect_logprob_confidence,
                     )
                     for pos_i, (src, idx, pre, pr_i, sc_i, nat_i) in enumerate(
                         zip(sources, indices, pre_seq, prompt_seq, schema_seq, native_seq)
@@ -1775,6 +2019,7 @@ class FastOvisOCREngine:
                             temperature=temperature,
                             pre_analysis=cur_pre,
                             auto_loop_recover=do_loop_recover,
+                            collect_logprob_confidence=collect_logprob_confidence,
                         )
                     )
                     if nxt_fut is not None:
@@ -1991,6 +2236,7 @@ class FastOvisOCREngine:
             max_tokens=tok_cap,
             temperature=temperature,
             repeat_penalty=eff_loop_breaker,
+            collect_telemetry=(eff_conf_mode == "on"),
             batch_size=eff_bs,
             kv_step=512,
             kv_i8_resolver=_ovis_kv_i8,
@@ -2061,6 +2307,7 @@ class FastOvisOCREngine:
                     temperature=temperature,
                     pre_analysis=(None if retry_rot_reset else vision_res),
                     auto_loop_recover=True,
+                    collect_logprob_confidence=collect_logprob_confidence,
                     _force_loop_breaker=retry_lb,
                     _loop_retry_depth=1,
                 )
@@ -2176,6 +2423,13 @@ class FastOvisOCREngine:
                 )
             if zoom_meta is not None:
                 metadata["zoom_recovery"] = zoom_meta
+            mm_tel = getattr(mm_res, "telemetry", None)
+            if mm_tel:
+                metadata["logprob_confidence"] = summarize_logprob_confidence(
+                    [float(step["logprob"]) for step in mm_tel],
+                    probs=[float(step["prob"]) for step in mm_tel],
+                    entropies=[float(step["entropy"]) for step in mm_tel],
+                ).to_dict()
 
             item_total_ms = prep_ms + vision_ms_arr[i] + vit_ms + prefill_ms + dec_ms + post_ms
             results.append(
@@ -2257,6 +2511,10 @@ class FastOvisOCREngine:
 
     def close(self) -> None:
         """Clear MLX caches and restore any host memory/cache limits applied at init."""
+        worker = getattr(self, "_confidence_worker", None)
+        if worker is not None:
+            worker.close()
+            self._confidence_worker = None
         prev_mem = getattr(self, "_prev_mlx_memory_limit", None)
         if prev_mem is not None and callable(getattr(mx, "set_memory_limit", None)):
             mx.set_memory_limit(int(prev_mem))

@@ -394,8 +394,9 @@ def test_encode_images_forwards_rotations_cw_and_rejects_mismatches(monkeypatch:
     assert captured_items[0].chunk_token_spans == captured_items[1].chunk_token_spans
 
     # Conflicting prebuilt PplxImageItem with non-zero rotation raises cleanly.
+    upright_item = next(it for it in captured_items if it.rotation_applied_cw == 0)
     with pytest.raises(ValueError, match="PplxImageItem"):
-        gpu.encode_images([captured_items[0]], rotations_cw=90)
+        gpu.encode_images([upright_item], rotations_cw=90)
 
     # FastPplx wrapper forwards normalized rotations_cw and rejects invalid length/angles.
     seen_rots: list[Any] = []
@@ -609,4 +610,70 @@ def test_encode_images_batch_size_16_default_and_grid_bucket_step_forwarding(
     assert rc == 0
     assert captured["kwargs"]["batch_size"] == 16
     assert captured["kwargs"]["grid_bucket_step"] == 4
+
+
+def test_encode_images_async_prefetch_multiwave_order_and_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Multi-wave async prefetch (>24 items) must match serial encoding identically and preserve strict input order."""
+    import threading
+    import time
+    import fast_shared.vision_preprocess as vp
+
+    gpu, _spy_vis, _fake_model = _make_stub_gpu(dim=64)
+
+    # Use 28 varied-aspect images (crosses >24 macro-wave threshold) on disk and as PILs
+    n_test = 28
+    paths: list[str] = []
+    pils: list[Image.Image] = []
+    for i in range(n_test):
+        w = 160 + (i % 4) * 32
+        h = 192 + ((i + 1) % 3) * 32
+        im = _make_doc_img(w, h, margin=8 + (i % 5) * 4)
+        p = tmp_path / f"doc_{i}.png"
+        im.save(p)
+        paths.append(str(p))
+        pils.append(im)
+
+    # Prebuilt serial reference (single-item calls)
+    ref_paths = [
+        gpu.encode_images([p], chunks=4, batch_size=1, min_pixels=16384, max_pixels=120_000)[0]
+        for p in paths
+    ]
+    ref_pils = [
+        gpu.encode_images([im], chunks=4, batch_size=1, min_pixels=16384, max_pixels=120_000)[0]
+        for im in pils
+    ]
+    prebuilt_items = [
+        vp.prepare_pplx_image_item(p, chunks=4, min_pixels=16384, max_pixels=120_000)
+        for p in paths
+    ]
+
+    # Force out-of-order thread completion across macro-waves
+    real_prepare = vp.prepare_pplx_image_item
+    worker_tids: set[int] = set()
+    tid_lock = threading.Lock()
+
+    def _delayed_prepare(src, **kwargs):
+        with tid_lock:
+            worker_tids.add(threading.get_ident())
+        if isinstance(src, str) and src.endswith(("doc_0.png", "doc_4.png", "doc_8.png", "doc_24.png")):
+            time.sleep(0.025)
+        return real_prepare(src, **kwargs)
+
+    monkeypatch.setattr(vp, "prepare_pplx_image_item", _delayed_prepare)
+
+    got_paths = gpu.encode_images(paths, chunks=4, batch_size=4, min_pixels=16384, max_pixels=120_000)
+    got_pils = gpu.encode_images(pils, chunks=4, batch_size=4, min_pixels=16384, max_pixels=120_000)
+    got_prebuilt = gpu.encode_images(prebuilt_items, chunks=4, batch_size=4, min_pixels=16384, max_pixels=120_000)
+
+    assert len(worker_tids) >= 2
+    assert len(got_paths) == n_test
+    assert len(got_pils) == n_test
+    assert len(got_prebuilt) == n_test
+    for i in range(n_test):
+        np.testing.assert_allclose(got_paths[i], ref_paths[i], atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(got_pils[i], ref_pils[i], atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(got_prebuilt[i], ref_paths[i], atol=1e-5, rtol=1e-5)
 

@@ -1130,6 +1130,20 @@ def test_qwen3_apple10_mpp_gating_and_env_overrides(monkeypatch: pytest.MonkeyPa
     assert not should_use_qwen_mpp_linear(512, 4096, 12288, bits=4, apple10_nax=True)
 
 
+def test_qwen3_mpp_estimate_pack_bytes_respects_packs_meta_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fast_qwen3._mpp_linear as mpp_mod
+    from fast_qwen3._mpp_linear import QwenMppPackState
+
+    k, n = 4096, 12288
+    expected_meta = 4 * n * (k // 64)
+    monkeypatch.setattr(mpp_mod._metal_mpp_int8, "PACKS_META_ONLY", True, raising=False)
+    assert QwenMppPackState.estimate_pack_bytes(k, n, bits=8) == expected_meta
+    assert QwenMppPackState.estimate_pack_bytes(k, n, bits=4) == expected_meta
+
+    monkeypatch.setattr(mpp_mod._metal_mpp_int8, "PACKS_META_ONLY", False, raising=False)
+    assert QwenMppPackState.estimate_pack_bytes(k, n, bits=8) == (k * n) + 2 * n * (k // 64)
+
+
 def test_qwen3_mpp_shared_group_budget_shed_and_lora_grad(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

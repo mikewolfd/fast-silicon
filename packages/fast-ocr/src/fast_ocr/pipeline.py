@@ -33,6 +33,8 @@ from .preprocess import (
 from .region_router import (
     REGION_CROP_MIN_PIXELS,
     PageSegment,
+    RegionKind,
+    analyze_digital_pdf_splice,
     extract_escalation_regions,
     merge_region_markdown,
 )
@@ -326,6 +328,8 @@ class AutoOCRPipeline:
         gdn_state_mode: str | None = None,
         drop_white_patches: bool | None = None,
         latin_only: bool | None = None,
+        confidence_escalate_dpi: int | None = None,
+        confidence_escalate_threshold: float = -0.15,
     ) -> None:
         if backend not in _VALID_BACKENDS:
             raise ValueError(f"Unsupported backend {backend!r}; expected one of {sorted(_VALID_BACKENDS)}")
@@ -371,6 +375,12 @@ class AutoOCRPipeline:
         self.gdn_state_mode: str | None = gdn_state_mode
         self.drop_white_patches: bool | None = drop_white_patches
         self.latin_only: bool | None = latin_only
+        self.confidence_escalate_dpi: int | None = (
+            int(confidence_escalate_dpi)
+            if (confidence_escalate_dpi is not None and int(confidence_escalate_dpi) > 0)
+            else None
+        )
+        self.confidence_escalate_threshold: float = float(confidence_escalate_threshold)
 
         self._vision: Any | None = vision_ocr
         self._ovis: Any | None = ovis_engine
@@ -483,6 +493,8 @@ class AutoOCRPipeline:
         pre_analysis: OCRResult | None = None,
         native_pdf_text: str | None = None,
         deskew_override: bool | None = None,
+        crop_margins_override: bool | None = None,
+        adaptive_resolution_override: bool | None = None,
     ) -> OCRResult:
         ovis = self._get_ovis_engine()
         fn = getattr(ovis, "ocr_image", None)
@@ -496,9 +508,13 @@ class AutoOCRPipeline:
             "table_mode": table_mode,
             "strict_markdown_grammar": self.strict_markdown_grammar,
             "zoom_recover": self.zoom_recover,
-            "crop_margins": self.crop_margins,
+            "crop_margins": self.crop_margins if crop_margins_override is None else bool(crop_margins_override),
             "auto_orient": self.auto_orient,
-            "adaptive_resolution": self.adaptive_resolution,
+            "adaptive_resolution": (
+                self.adaptive_resolution
+                if adaptive_resolution_override is None
+                else bool(adaptive_resolution_override)
+            ),
             "deskew": self.deskew if deskew_override is None else bool(deskew_override),
             "speculative": self.speculative,
             "draft_k": self.draft_k,
@@ -571,6 +587,8 @@ class AutoOCRPipeline:
         native_pdf_texts: Sequence[str | None] | None = None,
         batch_size: int | None = None,
         deskew_override: bool | None = None,
+        crop_margins_override: bool | None = None,
+        adaptive_resolution_override: bool | None = None,
     ) -> list[OCRResult]:
         if not sources:
             return []
@@ -584,14 +602,20 @@ class AutoOCRPipeline:
                 "table_mode": table_mode,
                 "strict_markdown_grammar": self.strict_markdown_grammar,
                 "zoom_recover": self.zoom_recover,
-                "crop_margins": self.crop_margins,
+                "crop_margins": self.crop_margins if crop_margins_override is None else bool(crop_margins_override),
                 "auto_orient": self.auto_orient,
-                "adaptive_resolution": self.adaptive_resolution,
+                "adaptive_resolution": (
+                    self.adaptive_resolution
+                    if adaptive_resolution_override is None
+                    else bool(adaptive_resolution_override)
+                ),
                 "deskew": self.deskew if deskew_override is None else bool(deskew_override),
                 "speculative": self.speculative,
                 "draft_k": self.draft_k,
                 "max_tokens": self.max_tokens,
             }
+            if self.confidence_escalate_dpi is not None:
+                candidates["collect_logprob_confidence"] = True
             if batch_size is not None:
                 candidates["batch_size"] = int(batch_size)
             if pre_analyses is not None:
@@ -617,9 +641,76 @@ class AutoOCRPipeline:
                     pre_analysis=pre,
                     native_pdf_text=nat,
                     deskew_override=deskew_override,
+                    crop_margins_override=crop_margins_override,
+                    adaptive_resolution_override=adaptive_resolution_override,
                 )
             )
         return out
+
+    def _run_ovis_region_crops(
+        self,
+        all_crops: Sequence[Image.Image],
+        all_prompts: Sequence[str | None],
+        *,
+        table_mode: MarkdownTableMode,
+        batch_size: int | None = None,
+    ) -> list[OCRResult]:
+        if not all_crops:
+            return []
+        ovis = self._get_ovis_engine()
+        crop_tok_cap = min(1024, self.max_tokens)
+        crop_spec: SpeculativeMode = "off" if self.speculative == "off" else "self"
+        batch_fn = getattr(ovis, "ocr_images", None)
+        if len(all_crops) >= 2 and callable(batch_fn) and _supports_kwarg(batch_fn, "prompts"):
+            batch_kw = _filter_accepted_kwargs(
+                batch_fn,
+                {
+                    "prompts": list(all_prompts),
+                    "output_format": "raw",
+                    "table_mode": table_mode,
+                    "strict_markdown_grammar": False,
+                    "zoom_recover": False,
+                    "crop_margins": False,
+                    "auto_orient": False,
+                    "adaptive_resolution": False,
+                    "deskew": False,
+                    "min_pixels": REGION_CROP_MIN_PIXELS,
+                    "speculative": crop_spec,
+                    "draft_k": self.draft_k,
+                    "max_tokens": crop_tok_cap,
+                    "batch_size": (
+                        max(2, len(all_crops))
+                        if batch_size is None
+                        else max(1, min(int(batch_size), len(all_crops)))
+                    ),
+                },
+            )
+            return list(batch_fn(list(all_crops), **batch_kw))
+        img_fn = getattr(ovis, "ocr_image", None) or getattr(ovis, "recognize_image", None)
+        if img_fn is None:
+            return []
+        crop_results: list[OCRResult] = []
+        for crop_im, crop_pr in zip(all_crops, all_prompts):
+            kw = _filter_accepted_kwargs(
+                img_fn,
+                {
+                    "prompt": crop_pr,
+                    "output_format": "raw",
+                    "table_mode": table_mode,
+                    "strict_markdown_grammar": False,
+                    "zoom_recover": False,
+                    "crop_margins": False,
+                    "auto_orient": False,
+                    "adaptive_resolution": False,
+                    "deskew": False,
+                    "min_pixels": REGION_CROP_MIN_PIXELS,
+                    "speculative": crop_spec,
+                    "draft_k": self.draft_k,
+                    "max_tokens": crop_tok_cap,
+                },
+            )
+            crop_results.append(img_fn(crop_im, **kw))
+        return crop_results
 
     def _try_region_route_pages(
         self,
@@ -672,60 +763,14 @@ class AutoOCRPipeline:
         if not page_plans:
             return {}
 
-        ovis = self._get_ovis_engine()
-        crop_tok_cap = min(1024, self.max_tokens)
-        crop_spec: SpeculativeMode = "off" if self.speculative == "off" else "self"
-        batch_fn = getattr(ovis, "ocr_images", None)
-        if len(all_crops) >= 2 and callable(batch_fn) and _supports_kwarg(batch_fn, "prompts"):
-            batch_kw = _filter_accepted_kwargs(
-                batch_fn,
-                {
-                    "prompts": all_prompts,
-                    "output_format": "raw",
-                    "table_mode": table_mode,
-                    "strict_markdown_grammar": False,
-                    "zoom_recover": False,
-                    "crop_margins": False,
-                    "auto_orient": False,
-                    "adaptive_resolution": False,
-                    "deskew": False,
-                    "min_pixels": REGION_CROP_MIN_PIXELS,
-                    "speculative": crop_spec,
-                    "draft_k": self.draft_k,
-                    "max_tokens": crop_tok_cap,
-                    "batch_size": (
-                        max(2, len(all_crops))
-                        if batch_size is None
-                        else max(1, min(int(batch_size), len(all_crops)))
-                    ),
-                },
-            )
-            crop_results = list(batch_fn(all_crops, **batch_kw))
-        else:
-            img_fn = getattr(ovis, "ocr_image", None) or getattr(ovis, "recognize_image", None)
-            if img_fn is None:
-                return {}
-            crop_results = []
-            for crop_im, crop_pr in zip(all_crops, all_prompts):
-                kw = _filter_accepted_kwargs(
-                    img_fn,
-                    {
-                        "prompt": crop_pr,
-                        "output_format": "raw",
-                        "table_mode": table_mode,
-                        "strict_markdown_grammar": False,
-                        "zoom_recover": False,
-                        "crop_margins": False,
-                        "auto_orient": False,
-                        "adaptive_resolution": False,
-                        "deskew": False,
-                        "min_pixels": REGION_CROP_MIN_PIXELS,
-                        "speculative": crop_spec,
-                        "draft_k": self.draft_k,
-                        "max_tokens": crop_tok_cap,
-                    },
-                )
-                crop_results.append(img_fn(crop_im, **kw))
+        crop_results = self._run_ovis_region_crops(
+            all_crops,
+            all_prompts,
+            table_mode=table_mode,
+            batch_size=batch_size,
+        )
+        if not crop_results:
+            return {}
 
         routed: dict[int, OCRResult] = {}
         for pos, page_idx, v_res, rot_cw, segs, start_c, end_c in page_plans:
@@ -777,6 +822,150 @@ class AutoOCRPipeline:
                 metadata=meta,
             )
         return routed
+
+    def _try_hybrid_native_pdf_pages(
+        self,
+        pdf_path: str | Path,
+        hybrid_entries: Sequence[
+            tuple[
+                RenderedPDFPage,
+                PageAnalysis | None,
+                list[tuple[RegionKind, str | None, tuple[float, float, float, float] | None, str | None, int]],
+            ]
+        ],
+        *,
+        dpi: int,
+        output_format: OutputFormat,
+        table_mode: MarkdownTableMode,
+        batch_size: int | None,
+        max_pixels: int | None,
+        inspect_ms_per_page: float,
+    ) -> dict[int, OCRResult]:
+        """Keep verified clean native prose and splice `min_pixels=4096` VLM table crops on digital PDFs."""
+        if not self.region_routing or output_format != "markdown" or not hybrid_entries:
+            return {}
+
+        page_indices = [p.page_index for p, _pa, _specs in hybrid_entries]
+        imgs, idxs, per_page_render = self._render_pdf_subset(
+            pdf_path,
+            dpi=int(dpi),
+            page_indices=page_indices,
+            max_pixels=max_pixels,
+        )
+        img_by_idx = {int(idx): im for idx, im in zip(idxs, imgs)}
+
+        page_plans: list[tuple[RenderedPDFPage, PageAnalysis | None, list[PageSegment], int, int]] = []
+        all_crops: list[Image.Image] = []
+        all_prompts: list[str | None] = []
+        for page, native_pa, specs in hybrid_entries:
+            im = img_by_idx.get(page.page_index)
+            if im is None:
+                continue
+            w, h = im.size
+            if w <= 0 or h <= 0:
+                continue
+            segs: list[PageSegment] = []
+            start_c = len(all_crops)
+            valid_page = True
+            for kind, md, nbox, prompt, lc in specs:
+                if kind == "prose":
+                    segs.append(PageSegment(kind="prose", markdown=md, line_count=lc))
+                else:
+                    assert nbox is not None
+                    x0 = max(0, int(round(nbox[0] * w)))
+                    y0 = max(0, int(round(nbox[1] * h)))
+                    x1 = min(w, int(round(nbox[2] * w)))
+                    y1 = min(h, int(round(nbox[3] * h)))
+                    if x1 - x0 < 24 or y1 - y0 < 16:
+                        valid_page = False
+                        break
+                    px_box = (x0, y0, x1, y1)
+                    segs.append(PageSegment(kind=kind, crop_box_px=px_box, prompt=prompt, line_count=lc))
+                    all_crops.append(im.crop(px_box))
+                    all_prompts.append(prompt)
+            end_c = len(all_crops)
+            if valid_page and end_c > start_c:
+                page_plans.append((page, native_pa, segs, start_c, end_c))
+            elif end_c > start_c:
+                del all_crops[start_c:]
+                del all_prompts[start_c:]
+
+        if not page_plans:
+            return {}
+
+        crop_results = self._run_ovis_region_crops(
+            all_crops,
+            all_prompts,
+            table_mode=table_mode,
+            batch_size=batch_size,
+        )
+        if not crop_results:
+            return {}
+
+        spliced: dict[int, OCRResult] = {}
+        for page, native_pa, segs, start_c, end_c in page_plans:
+            sub = crop_results[start_c:end_c]
+            t_post0 = time.perf_counter()
+            merged = merge_region_markdown(segs, [r.text for r in sub], table_mode=table_mode)
+            validation = validate_markdown(merged, allow_html_tables=(table_mode == "html"))
+            post_ms = (time.perf_counter() - t_post0) * 1000.0 + sum(float(r.timings.postprocess_ms) for r in sub)
+            prep_ms = inspect_ms_per_page + per_page_render + sum(float(r.timings.preprocess_ms) for r in sub)
+            vit_ms = sum(float(r.timings.vit_ms) for r in sub)
+            prefill_ms = sum(float(r.timings.prefill_ms) for r in sub)
+            dec_ms = sum(float(r.timings.decode_ms) for r in sub)
+            gen_toks = sum(int(r.timings.generated_tokens) for r in sub)
+            tot_ms = inspect_ms_per_page + per_page_render + sum(float(r.timings.total_ms) for r in sub)
+            dec_tps = (gen_toks / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
+            meta: dict[str, Any] = {
+                "native_char_count": page.native_char_count,
+                "native_body_char_count": (
+                    page.native_body_char_count
+                    if page.native_body_char_count is not None
+                    else page.native_char_count
+                ),
+                "native_control_char_count": page.native_control_char_count,
+                "image_count": page.image_count,
+                "native_garbled_ratio": page.native_garbled_ratio,
+                "width_pt": page.width_pt,
+                "height_pt": page.height_pt,
+                "region_routing": {
+                    "enabled": True,
+                    "mode": "digital_pdf_splice",
+                    "crops": len(sub),
+                    "min_pixels": REGION_CROP_MIN_PIXELS,
+                    "segment_kinds": [s.kind for s in segs],
+                },
+            }
+            if native_pa is not None:
+                meta["native_estimated_columns"] = int(native_pa.estimated_columns)
+                meta["native_table_score"] = float(native_pa.table_score)
+            spliced[page.page_index] = OCRResult(
+                text=merged,
+                raw_text=merged,
+                backend_used=f"{sub[0].backend_used}+native-splice",
+                page_index=page.page_index,
+                output_format=output_format,
+                table_mode=table_mode,
+                lines=page.lines,
+                analysis=native_pa,
+                markdown_validation=validation,
+                timings=OCRTimings(
+                    preprocess_ms=round(prep_ms, 3),
+                    vit_ms=round(vit_ms, 3),
+                    prefill_ms=round(prefill_ms, 3),
+                    decode_ms=round(dec_ms, 3),
+                    postprocess_ms=round(post_ms, 3),
+                    total_ms=round(tot_ms, 3),
+                    decode_tps=round(dec_tps, 2),
+                    prompt_tokens=sum(int(r.timings.prompt_tokens) for r in sub),
+                    visual_tokens=sum(int(r.timings.visual_tokens) for r in sub),
+                    generated_tokens=gen_toks,
+                    peak_memory_gb=max((float(r.timings.peak_memory_gb) for r in sub), default=0.0),
+                ),
+                finish_reason="stop",
+                metadata=meta,
+            )
+        return spliced
 
     def ocr_image(
         self,
@@ -1141,6 +1330,86 @@ class AutoOCRPipeline:
         updated_meta["triage_dpi"] = int(triage_dpi)
         return replace(result, timings=updated_timings, metadata=updated_meta)
 
+    def _maybe_escalate_low_confidence_pdf_pages(
+        self,
+        pdf_path: str | Path,
+        results: Sequence[OCRResult],
+        *,
+        base_dpi: int,
+        output_format: OutputFormat,
+        table_mode: MarkdownTableMode,
+        batch_size: int,
+        max_pixels: int | None,
+        native_pdf_texts: Mapping[int, str] | None = None,
+    ) -> list[OCRResult]:
+        """Opt-in (`confidence_escalate_dpi` set): re-render flagged low-logprob VLM pages at higher DPI."""
+        esc_dpi = getattr(self, "confidence_escalate_dpi", None)
+        if esc_dpi is None or int(esc_dpi) <= int(base_dpi) or not results:
+            return list(results)
+        thresh = float(getattr(self, "confidence_escalate_threshold", -0.15))
+
+        flagged_pos: list[int] = []
+        flagged_idxs: list[int] = []
+        prior_lps: dict[int, float] = {}
+        for pos, r in enumerate(results):
+            conf = r.metadata.get("logprob_confidence")
+            if (
+                str(r.backend_used).startswith("ovis:")
+                and isinstance(conf, Mapping)
+                and int(conf.get("n_tokens", 0)) > 0
+                and float(conf.get("mean_logprob", 0.0)) < thresh
+            ):
+                flagged_pos.append(pos)
+                flagged_idxs.append(int(r.page_index))
+                prior_lps[pos] = float(conf["mean_logprob"])
+        if not flagged_pos:
+            return list(results)
+
+        hi_imgs, hi_idxs, per_page_hi = self._render_pdf_subset(
+            pdf_path,
+            dpi=int(esc_dpi),
+            page_indices=flagged_idxs,
+            max_pixels=max_pixels,
+        )
+        nat_seq = [native_pdf_texts.get(idx) for idx in hi_idxs] if native_pdf_texts is not None else None
+        retried = self._run_ovis_batch(
+            hi_imgs,
+            page_indices=hi_idxs,
+            output_format=output_format,
+            table_mode=table_mode,
+            native_pdf_texts=nat_seq,
+            batch_size=max(1, int(batch_size)),
+            crop_margins_override=False,
+            adaptive_resolution_override=False,
+        )
+        out = list(results)
+        retry_by_idx = {int(r.page_index): r for r in retried}
+        for pos, idx in zip(flagged_pos, flagged_idxs):
+            new_r = retry_by_idx.get(idx)
+            if new_r is None:
+                continue
+            prev_r = out[pos]
+            merged_timings = replace(
+                new_r.timings,
+                preprocess_ms=round(float(prev_r.timings.preprocess_ms) + float(new_r.timings.preprocess_ms) + per_page_hi, 3),
+                apple_vision_ms=round(float(prev_r.timings.apple_vision_ms), 3),
+                vit_ms=round(float(prev_r.timings.vit_ms) + float(new_r.timings.vit_ms), 3),
+                prefill_ms=round(float(prev_r.timings.prefill_ms) + float(new_r.timings.prefill_ms), 3),
+                decode_ms=round(float(prev_r.timings.decode_ms) + float(new_r.timings.decode_ms), 3),
+                total_ms=round(float(prev_r.timings.total_ms) + float(new_r.timings.total_ms) + per_page_hi, 3),
+                peak_memory_gb=round(max(float(prev_r.timings.peak_memory_gb), float(new_r.timings.peak_memory_gb)), 4),
+            )
+            meta = dict(new_r.metadata)
+            meta["confidence_escalation"] = {
+                "triggered": True,
+                "base_dpi": int(base_dpi),
+                "escalate_dpi": int(esc_dpi),
+                "threshold_mean_logprob": thresh,
+                "prior_mean_logprob": prior_lps[pos],
+            }
+            out[pos] = replace(new_r, timings=merged_timings, metadata=meta)
+        return out
+
     def _run_raster_pdf_pages(
         self,
         pdf_path: str | Path,
@@ -1174,6 +1443,16 @@ class AutoOCRPipeline:
                 output_format=output_format,
                 table_mode=table_mode,
                 batch_size=batch_size,
+                native_pdf_texts=native_pdf_texts,
+            )
+            ocr_outs = self._maybe_escalate_low_confidence_pdf_pages(
+                pdf_path,
+                ocr_outs,
+                base_dpi=int(dpi),
+                output_format=output_format,
+                table_mode=table_mode,
+                batch_size=batch_size,
+                max_pixels=max_pixels,
                 native_pdf_texts=native_pdf_texts,
             )
             return [self._fold_pdf_overhead(r, preprocess_extra_ms=per_page_ren) for r in ocr_outs]
@@ -1245,6 +1524,16 @@ class AutoOCRPipeline:
                 batch_size=bs,
                 native_pdf_texts=native_pdf_texts,
             )
+            chunk_outs = self._maybe_escalate_low_confidence_pdf_pages(
+                pdf_path,
+                chunk_outs,
+                base_dpi=int(dpi),
+                output_format=output_format,
+                table_mode=table_mode,
+                batch_size=bs,
+                max_pixels=max_pixels,
+                native_pdf_texts=native_pdf_texts,
+            )
             for res in chunk_outs:
                 by_page[res.page_index] = self._fold_pdf_overhead(
                     res,
@@ -1282,6 +1571,13 @@ class AutoOCRPipeline:
             ordered_indices = [p.page_index for p in native_pages]
             raster_indices: list[int] = []
             raster_native_hints: dict[int, str] = {}
+            hybrid_entries: list[
+                tuple[
+                    RenderedPDFPage,
+                    PageAnalysis | None,
+                    list[tuple[RegionKind, str | None, tuple[float, float, float, float] | None, str | None, int]],
+                ]
+            ] = []
             for p in native_pages:
                 eff_chars = p.native_body_char_count if p.native_body_char_count is not None else p.native_char_count
                 is_clean = p.native_control_char_count == 0 and p.native_garbled_ratio < _NATIVE_MAX_GARBLED_RATIO
@@ -1296,11 +1592,25 @@ class AutoOCRPipeline:
                     else None
                 )
                 layout_needs_vlm = bool(native_pa is not None and native_pa.needs_vlm)
+                can_native_eligible = is_clean and (eff_chars >= _NATIVE_MIN_CHARS or (eff_chars > 0 and p.image_count == 0))
+                splice_handled = False
                 if (
-                    is_clean
-                    and (not layout_needs_vlm)
-                    and (eff_chars >= _NATIVE_MIN_CHARS or (eff_chars > 0 and p.image_count == 0))
+                    self.region_routing
+                    and fmt == "markdown"
+                    and can_native_eligible
+                    and p.lines
+                    and p.image_count == 0
                 ):
+                    specs, disp = analyze_digital_pdf_splice(p)
+                    if disp == "single_column_clean":
+                        layout_needs_vlm = False
+                    elif disp == "splice_tables" and specs:
+                        hybrid_entries.append((p, native_pa, specs))
+                        splice_handled = True
+
+                if splice_handled:
+                    continue
+                if can_native_eligible and (not layout_needs_vlm):
                     ordered_results[p.page_index] = self._build_native_result(
                         p,
                         output_format=fmt,
@@ -1312,6 +1622,25 @@ class AutoOCRPipeline:
                     raster_indices.append(p.page_index)
                     if is_clean and p.native_text and len(p.native_text.strip()) >= 20:
                         raster_native_hints[p.page_index] = p.native_text.strip()
+
+            if hybrid_entries:
+                spliced = self._try_hybrid_native_pdf_pages(
+                    pdf_path,
+                    hybrid_entries,
+                    dpi=int(dpi),
+                    output_format=fmt,
+                    table_mode=tmode,
+                    batch_size=batch_size,
+                    max_pixels=max_pixels,
+                    inspect_ms_per_page=per_page_inspect,
+                )
+                for p_h, _pa_h, _sp_h in hybrid_entries:
+                    if p_h.page_index in spliced:
+                        ordered_results[p_h.page_index] = spliced[p_h.page_index]
+                    else:
+                        raster_indices.append(p_h.page_index)
+                        if p_h.native_text and len(p_h.native_text.strip()) >= 20:
+                            raster_native_hints[p_h.page_index] = p_h.native_text.strip()
 
             if raster_indices:
                 for res in self._run_raster_pdf_pages(
