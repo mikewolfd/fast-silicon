@@ -65,7 +65,8 @@ Optional lazy multimodal image support is available via the `[vision]` extra (`u
 
 | Workload | Base M5 (24 GB) | M4 Pro (48 GB) | Comparison & notes |
 |---|---|---|---|
-| **Strict JSON + tool calls (M5, 300 tasks)** | **1.835 score/s** (300/300 valid, 0.946 field F1, 144.4 s) | — | **1.22×** unconstrained stock `mlx-vlm` (1.501 score/s, 286/300 valid, 0.923 F1, 172.2 s) on the same checkpoint. |
+| **Tier-1 Cat-4 JSON + tool calls (300 tasks, `llg_on`)** | **4.179 score/s** (300/300 valid, 0.8836 `S_obj,e2e`, 4.98 GB) | **3.639 score/s** (300/300 valid, 0.8802 `S_obj,e2e`, 8.15 GB) | Batched 2026-11-24 Tier-1 run (`PASS` on both Macs). [Tier-1 suite](../../docs/BENCHMARKS.md#152-dual-mac-tier-1--vision-outcome-suite-results-with-m4-fast-embeddinggemma-2-reruns) |
+| **Strict JSON + tool calls (`B=8`, 300 tasks)** | **1.835 score/s** (300/300 valid, 0.946 field F1, 144.4 s) | — | **1.22×** unconstrained stock `mlx-vlm` (1.501 score/s, 286/300 valid, 0.923 F1, 172.2 s) on the same checkpoint. |
 | **Historical minified 150K profile (300 tasks)** | 2.717 score/s (299/300 valid, 82.7 s) | 2.412 score/s (299/300 valid, 92.9 s) | Faster output head, lower multilingual field F1 (0.749 combined score vs 0.883 repaired strict). |
 | **Reasoning & instruction following (435 tasks)** | **0.843 score/s** (0.352 score, 181.5 s) | 0.892 score/s (0.359 score, 174.8 s) | 1.03× (M5) and 0.94× (M4 Pro) vs stock `mlx-vlm` (0.366 score). |
 | **Batch-128 extraction fixtures (`kv_i8`)** | **10.46 valid docs/s** (GPU, 6.13 GB MLX) | **8.78 valid docs/s** (ANE+GPU) · 6.87 (GPU) | Holds 128 rolling slots inside 6.1–6.9 GB active MLX RAM, whereas unchunked batch 64 in stock `mlx-vlm` OOMs at 34.4 GB. |

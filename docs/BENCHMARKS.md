@@ -35,7 +35,8 @@ Model format and input limits can differ within a model family. For example, Flu
 14. [v3.0 Vision Prefetch, NAX Meta-Only Packing, Multimodal MTP, and OCR Confidence (2026-11-23)](#14-v30-vision-prefetch-nax-meta-only-packing-multimodal-mtp-and-ocr-confidence-2026-11-23)
 15. [Dual-Mac Full 4-Suite Verification and Post-Fix Reruns (2026-11-24)](#15-dual-mac-full-4-suite-verification-and-post-fix-reruns-2026-11-24)
 16. [Validated Engine, Default & Laya FP16 LayerNorm Fixes (2026-11-24)](#16-validated-engine-default--laya-fp16-layernorm-fixes-2026-11-24)
-17. [Saved Benchmark Receipts Index](#17-saved-benchmark-receipts-index)
+17. [Wave-5 DRY Optimizations & Dual-Mac ABBA Gates (`fast-qwen3` & `fast-pplx`, 2026-11-24)](#17-wave-5-dry-optimizations--dual-mac-abba-gates-fast-qwen3--fast-pplx-2026-11-24)
+18. [Saved Benchmark Receipts Index](#18-saved-benchmark-receipts-index)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -1029,7 +1030,19 @@ Restoring explicit two-pass centered `LayerNorm` (`reduce_mean -> sub -> mul(ln_
 | `fast-embeddinggemma-2` Vision `VisualRetrieval(18)` | `18/18`, `0.9722`, **`9.909` EOT**, `1.77 s` (`11.63 img/s`), `3.532 GB` (`neural=0.0`), **`PASS`** | **`18/18`**, **`1.0000`**, **`11.207` EOT**, `1.61 s` (`15.06 img/s`), `3.558 GB` (`neural=0.0`), **`PASS`** | `enable_ane=None` avoids loading ANE text buckets on vision runs (`0.0 GB` ANE footprint; `1.77 s` vs `5.01 s` M4 Pro contended) |
 | `fast-pplx` `hetero2` vs `gpu` (`benchmark.py`) | `B=1` `6.50 ms` (`0.89×`), `B=32` `9,249 tok/s` (`1.34×`), `S=256` `21,345` (`1.81×`), `S=512` `19,060` (`1.62×`), `mixed` `15,212` (`1.47×`) | `B=1` **`5.80 ms` (`1.22×`)**, `B=32` `9,098` (`0.85×`), `S=256` **`27,234` (`1.41×`)**, `S=512` **`28,415` (`1.46×`)**, `mixed` **`22,273` (`1.34×`)** | Apple9 (`B=1` GPU default) + Base M5 `hetero2` (`5.80 ms` `B=1` / `55.5 docs/s` `S=512` / `545 ms` `mixed`) |
 
-## 17. Saved Benchmark Receipts Index
+## 17. Wave-5 DRY Optimizations & Dual-Mac ABBA Gates (`fast-qwen3` & `fast-pplx`, 2026-11-24)
+
+Shared DRY primitives extracted into `fast-shared`: `detect_catastrophic_token_loop` (`fast_shared/grammar.py`), cursor-tracked `PromptLookupDrafter` + `filter_drafts_with_grammar` (`fast_shared/pld_drafter.py`), and generic Apple10 NAX `W4A8`/`W8A8` wrappers (`fast_shared/mpp_linear.py`). (`fast-embeddinggemma-2` was audited and kept closed — already at hardware ceiling at `4.33–4.80×` vs. stock MLX.)
+
+| Track & Package | Default Disposition | Base M5 (`24 GB`, `Apple10 NAX`) ABBA | M4 Pro (`48 GB`, `Apple9`) ABBA | Notes & Guardrails |
+| :--- | :--- | :--- | :--- | :--- |
+| **`P1` (`fast-pplx`)**: Apple10 inline GPU tiny query batching | **Promoted default** on Apple10 `hetero2` | `B=32, S=15`: **`0.0383 s`** (`gpu=32`) vs. `0.0876 s` ANE (**`2.289×`**, `min_cos = 0.999623`) | Stays `hetero2`: `0.0518 s` (`ane=15, gpu=17`, `min_cos = 0.999619`) | Routes non-contextual tiny batches (`max_len <= 32`, `total_tokens <= 1024`) inline on Metal GPU on Apple10 (`M5+`). |
+| **`P2` (`fast-pplx`)**: Apple10 NAX `W8A8` (`metal_mpp_int8`) | **Opt-in under `quantize_weights="w8"`** (`"none"` default) | Beats `w8_nompp` **`1.067–1.078×`** (`S256_B8`: `0.1218` vs. `0.1313 s`; `S512_B8`: `0.2432` vs. `0.2620 s`; `S2048_B4`: `0.3208` vs. `0.3423 s`) and edges `fp16` (`0.1232 / 0.2466 / 0.3243 s`); `min_cos = 0.9984–0.9993` | Native `qmm` (`Apple9`) | `M >= 128`, `min >= 1024`, `max >= 3584` (`9.75 MB` packed metadata); `FAST_SILICON_PPLX_MPP=0` kill-switch. |
+| **`Q1` (`fast-qwen3`)**: Hygiene bundle | **Promoted default** | `admission_min_hits=2` (`0` cold snapshots, `circuit_breaker_open=False`), Apple10 KV cutoffs `16384 / 32768`, early loop abort, `mx.async_eval` on pure-FF steps | Identical 2-hit admission (`8192 / 16384` KV cutoffs), early loop abort, `mx.async_eval` | Eliminates cold `PrefixTree` thrash and sync overhead on forced tokens. |
+| **`Q2` (`fast-qwen3`)**: Grammar-checked `PromptLookupDrafter` | **Opt-in `speculative=True`** under `json_schema` | `100%` token-for-token parity; short JSON ran `0.843×` on `4B` (`5.88 s` vs. `4.95 s`) | `100%` parity; `0.588×` on `4B` (`7.64 s` vs. `4.49 s`), `0.781×` on `9B` `MTP` (`7.72 s` vs. `6.03 s`) | `upfront_ff` already jumps JSON keys; `speculative=None` (`"auto"`) retains the `matcher is None` guard. |
+| **`Q3` (`fast-qwen3`)**: Rolling continuous batching (`HybridCache`) | **Opt-in `rolling=True`** (`_ENABLE_ROLLING_AUTO=False`) | `100%` parity (`32/32`); `N=32, B=16` vs. static `B=8` ran `0.809×` (`11.34 s` vs. `9.18 s`, `6.83` vs. `5.17 GB` MLX peak) | `100%` parity (`48/48`); `B=32` sweep peaks at `592.70 tok/s` (`1.751 docs/s`, `11.36 GB` peak phys vs. `B=64` `495.51 tok/s`, `18.11 GB`); `N=48, B=32` hits **`1.021×`** (`24.15 s` vs. `26.04/23.51 s`, **`-2.4 GB` MLX peak** `9.8` vs. `12.2 GB`) | `RollingHybridCache` + `refill_min = B_slots // 4` scheduler (`rolling.py`). |
+
+## 18. Saved Benchmark Receipts Index
 
 | Artifact | Scope |
 |---|---|
