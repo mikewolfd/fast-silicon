@@ -285,3 +285,228 @@ def test_multimodal_generate_mtp_dispatch_and_fallbacks(monkeypatch) -> None:
     provide_last_x = False
     _ = eng.generate("Extract", images=[np.zeros((48, 48, 3), dtype=np.uint8)])
     assert calls == ["batch"]
+
+
+def test_multimodal_and_batch_preserve_caller_peak_memory_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `FastGemma4Engine._generate_multimodal` and `generate_batch` never erase caller peak memory."""
+    import threading
+    from types import SimpleNamespace
+    import fast_gemma4.engine as eng_mod
+
+    reset_calls = 0
+
+    def _spy_reset() -> None:
+        nonlocal reset_calls
+        reset_calls += 1
+
+    monkeypatch.setattr(eng_mod.mx, "reset_peak_memory", _spy_reset)
+
+    eng = object.__new__(FastGemma4Engine)
+    eng._gpu_lock = threading.Lock()
+    eng.default_mode = "gpu"
+    eng.profile = "auto"
+    eng.ane_available = False
+    eng.default_max_b_slots = 8
+    eng.mtp_drafter = None
+    eng._engine_apple10_nax = lambda: False  # type: ignore[method-assign]
+    eng._has_mtp_drafter_candidate = lambda: False  # type: ignore[method-assign]
+    eng._maybe_ensure_mtp_drafter = lambda **_kw: None  # type: ignore[method-assign]
+    eng._maybe_get_ane_ring = lambda *_a, **_kw: None  # type: ignore[method-assign]
+    eng._effective_ane_ring_variant = lambda: "fp16"  # type: ignore[method-assign]
+    eng.resolve_call_kv_i8 = lambda **_kw: False  # type: ignore[method-assign]
+    eng.get_prefix_kv = lambda _sys_ids: {"l_sys": 0}  # type: ignore[method-assign]
+    eng.encode_prompts = lambda prompts, **_kw: [[2, 10] for _ in prompts]  # type: ignore[method-assign]
+    eng._prepare_multimodal_prefill = lambda *_a, **_kw: (  # type: ignore[method-assign]
+        [2, 10, 11],
+        mx.zeros((1, 3, 8), dtype=mx.bfloat16),
+        0.0,
+        1,
+    )
+
+    class _TinyModel:
+        window_size = 512
+        embed_scale = mx.array(1.0, dtype=mx.bfloat16)
+
+        @staticmethod
+        def embed_tokens(arr: mx.array) -> mx.array:
+            return mx.zeros((int(arr.shape[0]), int(arr.shape[1]), 8), dtype=mx.bfloat16)
+
+        @staticmethod
+        def prefill_prefix(_xs: Any) -> dict[str, Any]:
+            return {}
+
+        @staticmethod
+        def make_batch_cache(_pkv: Any, **_kw: Any) -> dict[str, Any]:
+            return {}
+
+        @staticmethod
+        def prefill_multimodal_b1(_pids: Any, _embeds: Any, _cache: Any, apply_softcap: bool = True):
+            return mx.zeros((1, 1, 8)), mx.array([3], dtype=mx.int32)
+
+    eng.model = _TinyModel()  # type: ignore[assignment]
+    eng.tokenizer = SimpleNamespace(
+        bos_token_id=2,
+        stop_token_ids=frozenset({1}),
+        decode=lambda ids, skip_special_tokens=True: "ok",
+    )  # type: ignore[assignment]
+
+    monkeypatch.setattr(
+        eng_mod,
+        "run_decode_batch",
+        lambda *_a, **_kw: {"decode_sec": 0.01, "gen_toks": [[5]], "used_speculative": False},
+    )
+    monkeypatch.setattr(
+        eng_mod,
+        "run_decode_rolling",
+        lambda *_a, **_kw: {
+            "gen_toks": [[5]],
+            "prefill_sec": 0.0,
+            "decode_sec": 0.01,
+            "tot_out_tok": 1,
+            "ff_tokens": 0,
+            "llm_steps": 1,
+            "ff_early14_steps": 0,
+            "mask_fallbacks": 0,
+            "used_speculative": False,
+        },
+    )
+
+    _ = eng.generate("hi", images=[np.zeros((8, 8, 3), dtype=np.uint8)], speculative=False)
+    _ = eng.generate_batch(["hi"], mode="gpu", speculative=False)
+    assert reset_calls == 0
+
+
+def test_multimodal_online_catastrophic_loop_abort_cpu() -> None:
+    """Verify `_generate_multimodal` aborts runaway `p=1` & `p>8` loops online instead of spinning to `max_tokens=4096`."""
+    import threading
+    from types import SimpleNamespace
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        vocab_n = 64
+        eng = object.__new__(FastGemma4Engine)
+        eng._gpu_lock = threading.Lock()
+        eng.mtp_draft_k = 3
+        eng._engine_apple10_nax = lambda: False  # type: ignore[method-assign]
+        eng._prepare_multimodal_prefill = lambda *_a, **_kw: (  # type: ignore[method-assign]
+            [2, 3, 4],
+            mx.zeros((1, 3, 8), dtype=mx.bfloat16),
+            0.0,
+            1,
+        )
+
+        # Tokens: 1=EOS, 10..21=p12 cycle, 30=<td>, 31=</td>, 32=<tr>, 33=</tr>, 34=0.00, 40..59=row labels
+        tok_map = {30: "<td>", 31: "</td>", 32: "<tr>", 33: "</tr>", 34: "0.00"}
+        eng.tokenizer = SimpleNamespace(
+            stop_token_ids=frozenset({1}),
+            decode=lambda ids, skip_special_tokens=True: "".join(tok_map.get(int(t), f"w{int(t)}") for t in ids),
+        )  # type: ignore[assignment]
+
+        dense_table_seq = [
+            tok
+            for row_i in range(16)
+            for tok in (32, 30, 40 + (row_i % 20), 31, 30, 31, 30, 34, 31, 30, 31, 30, 34, 31, 33)
+        ]  # 240 tokens of real dense HTML table markup followed by EOS
+        p12_cycle = list(range(10, 22))
+        mode_box = {"mode": "p12", "step": 0}
+
+        def _next_logits_np() -> np.ndarray:
+            arr = np.full((1, 1, vocab_n), -20.0, dtype=np.float32)
+            idx = mode_box["step"]
+            mode_box["step"] += 1
+            if mode_box["mode"] == "p12":
+                tid = p12_cycle[idx % len(p12_cycle)]
+            elif mode_box["mode"] == "p1":
+                tid = 13
+            else:
+                tid = dense_table_seq[idx] if idx < len(dense_table_seq) else 1
+            # Huge margin ensures penalty alone does not break loop, exercising online abort!
+            arr[0, 0, tid] = 40.0
+            return arr
+
+        class _LoopModel:
+            window_size = 512
+            swa_layers = [0]
+            full_layers = [1]
+            new_to_old = np.arange(vocab_n, dtype=np.int32)
+            old_to_new = np.arange(vocab_n, dtype=np.int32)
+            embed_scale = mx.array(1.0, dtype=mx.bfloat16)
+
+            @staticmethod
+            def embed_tokens(arr: mx.array) -> mx.array:
+                return mx.zeros((int(arr.shape[0]), int(arr.shape[1]), 8), dtype=mx.bfloat16)
+
+            @staticmethod
+            def prefill_prefix(_xs: Any) -> dict[str, Any]:
+                return {}
+
+            @staticmethod
+            def make_batch_cache(_pkv: Any, **_kw: Any) -> dict[str, Any]:
+                return {"swa_cap": 512, "l_sys": 0, "_last_x_in": mx.zeros((1, 1, 8), dtype=mx.bfloat16)}
+
+            @staticmethod
+            def compact_cache(cache: dict[str, Any], _keep: Any) -> dict[str, Any]:
+                return cache
+
+            @staticmethod
+            def prefill_multimodal_b1(_pids: Any, _embeds: Any, cache: dict[str, Any], apply_softcap: bool = True):
+                return mx.array(_next_logits_np()), mx.array([3], dtype=mx.int32)
+
+            @staticmethod
+            def forward_step_ragged(toks: mx.array, cache: dict[str, Any], off_b: mx.array, apply_softcap: bool = True, **_kw: Any):
+                _ = (cache, off_b, apply_softcap)
+                return mx.array(_next_logits_np())
+
+            @staticmethod
+            def forward_verify_mtp_slot(verify_toks: mx.array, cache: dict[str, Any], off_cur: mx.array, slot_idx: Any = None, return_logits: bool = False):
+                _ = (cache, off_cur, slot_idx, return_logits)
+                b_cur, l_q = int(verify_toks.shape[0]), int(verify_toks.shape[1])
+                x_step = mx.zeros((b_cur, l_q, 8), dtype=mx.bfloat16)
+                cols = []
+                for _j in range(l_q):
+                    cols.append(int(np.argmax(_next_logits_np()[0, 0])))
+                am_mx = mx.array([cols], dtype=mx.int32)
+                return x_step, am_mx
+
+            @staticmethod
+            def _apply_lm_head(_x: Any, apply_softcap: bool = True) -> mx.array:
+                arr = np.full((1, 1, vocab_n), -20.0, dtype=np.float32)
+                arr[0, 0, 13] = 40.0
+                return mx.array(arr)
+
+        class _LoopDrafter:
+            @staticmethod
+            def draft_k(anchor_mx: mx.array, _seed: Any, _cache: Any, _off: Any, cur_k: int, slot_idx: Any = None):
+                return mx.full((int(anchor_mx.shape[0]), int(cur_k)), 13, dtype=mx.int32)
+
+        eng.model = _LoopModel()  # type: ignore[assignment]
+
+        # 1. run_decode_batch path: p=12 cycle aborts early well below max_tokens=4096
+        eng._maybe_ensure_mtp_drafter = lambda **_kw: None  # type: ignore[method-assign]
+        mode_box["mode"] = "p12"
+        mode_box["step"] = 0
+        it_p12 = eng.generate("OCR", images=[np.zeros((16, 16, 3), dtype=np.uint8)], max_tokens=4096, speculative=False)
+        assert it_p12.finish_reason == "length"
+        assert eng.last_multimodal_stats["loop_aborted"] is True
+        assert 144 <= it_p12.completion_tokens < 256
+
+        # 2. run_decode_batch path: normal 240-token dense <td>/<tr> table is NOT falsely aborted
+        mode_box["mode"] = "table"
+        mode_box["step"] = 0
+        it_tbl = eng.generate("OCR", images=[np.zeros((16, 16, 3), dtype=np.uint8)], max_tokens=4096, speculative=False)
+        assert it_tbl.finish_reason == "stop"
+        assert eng.last_multimodal_stats["loop_aborted"] is False
+        assert it_tbl.completion_tokens == len(dense_table_seq)
+
+        # 3. run_decode_mtp path: p=1 runaway cycle aborts early well below max_tokens=4096
+        eng._maybe_ensure_mtp_drafter = lambda **_kw: _LoopDrafter()  # type: ignore[method-assign]
+        mode_box["mode"] = "p1"
+        mode_box["step"] = 0
+        it_mtp_loop = eng.generate("OCR", images=[np.zeros((16, 16, 3), dtype=np.uint8)], max_tokens=4096)
+        assert it_mtp_loop.finish_reason == "length"
+        assert eng.last_multimodal_stats["loop_aborted"] is True
+        assert it_mtp_loop.completion_tokens < 64
+    finally:
+        mx.set_default_device(prev_dev)
+

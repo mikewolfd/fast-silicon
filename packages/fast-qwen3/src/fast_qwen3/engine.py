@@ -124,6 +124,20 @@ def _compute_step_telemetry(logits_1d: np.ndarray, chosen_idx: int) -> dict[str,
     }
 
 
+def _safe_argmax_with_nan_guard(logits_2d: mx.array) -> mx.array:
+    """Compute `int32` argmax along `axis=-1`, returning `-1` for any row containing `NaN`."""
+    am = mx.argmax(logits_2d, axis=-1).astype(mx.int32)
+    isnan_fn = getattr(mx, "isnan", None)
+    any_fn = getattr(mx, "any", None)
+    where_fn = getattr(mx, "where", None)
+    full_fn = getattr(mx, "full", None)
+    if callable(isnan_fn) and callable(any_fn) and callable(where_fn) and callable(full_fn):
+        has_nan = any_fn(isnan_fn(logits_2d), axis=-1)
+        neg1 = full_fn(am.shape, -1, dtype=mx.int32)
+        am = where_fn(has_nan, neg1, am)
+    return am
+
+
 class FastQwen3Engine:
     """Unified Qwen3.5 / Qwen3.6 inference & structured-extraction engine (`M4` / `M5`)."""
 
@@ -168,6 +182,12 @@ class FastQwen3Engine:
         except Exception:
             host_ram_bytes = 24 * (1 << 30)
         self._is_low_ram: bool = 0 < host_ram_bytes <= (32 * (1 << 30))
+        try:
+            from fast_shared.hw_check import supports_apple10_nax
+
+            self._is_apple10: bool = bool(supports_apple10_nax())
+        except Exception:
+            self._is_apple10 = False
         self.default_max_b_slots: int = (
             max(1, int(max_b_slots)) if max_b_slots is not None else (8 if self._is_low_ram else 64)
         )
@@ -309,13 +329,16 @@ class FastQwen3Engine:
         self.close()
 
     def _resolve_kv_i8(self, batch_size: int, kv_alloc: int) -> KVMode:
-        """Resolve lossless KV precision (`'bf16'` short, `'q4_quarot'` long/batch `3.56x` KV & `2.13x` faster than `q8`)."""
+        """Resolve lossless KV precision (`'bf16'` short, `'q4_quarot'` long/heavy batch `3.56x` KV & `2.13x` faster than `q8`)."""
         if isinstance(self.kv_i8_mode, bool):
             return "q8" if self.kv_i8_mode else "bf16"
         mode_s = str(self.kv_i8_mode).strip().lower()
         if mode_s == "auto":
             q_ctx_cutoff = 8192 if self._is_low_ram else 16384
-            if int(batch_size) >= 16 or int(kv_alloc) >= q_ctx_cutoff:
+            pressure_cutoff = 262_144 if self._is_low_ram else 524_288
+            bs = max(1, int(batch_size))
+            ctx = max(1, int(kv_alloc))
+            if ctx >= q_ctx_cutoff or (bs * ctx) >= pressure_cutoff:
                 return "q4_quarot" if (int(self.model.cfg.head_dim) % 64 == 0) else "q8"
             return "bf16"
         return normalize_kv_mode(mode_s)
@@ -493,7 +516,7 @@ class FastQwen3Engine:
                 self._prefix_cache.popitem(last=False)
         return snap
 
-    def _select_next_token(
+    def _select_next_token_with_meta(
         self,
         logits_1d: np.ndarray,
         *,
@@ -506,7 +529,7 @@ class FastQwen3Engine:
         rng: np.random.Generator | None = None,
         repeat_penalty: bool,
         collect_telemetry: bool,
-    ) -> tuple[int, dict[str, float] | None]:
+    ) -> tuple[int, dict[str, float] | None, bool]:
         work = logits_1d[: len(self._new_to_old)] if (self.model.vocab_remap is None and len(logits_1d) > len(self._new_to_old)) else logits_1d
         argmax_idx = safe_argmax_1d(work)
         if repeat_penalty:
@@ -522,6 +545,7 @@ class FastQwen3Engine:
                 old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
                 work, argmax_idx = apply_loop_breaker_penalties_1d(work, pen, old_to_new)
 
+        was_masked = False
         if matcher is not None and gram is not None:
             def _lazy_full() -> np.ndarray:
                 assert full_hidden_1d is not None
@@ -530,7 +554,7 @@ class FastQwen3Engine:
                 return np.asarray(fl[0, 0].astype(mx.float32))
 
             can_fallback = bool(self.model.has_full_vocab_fallback and full_hidden_1d is not None)
-            tok_id, _ = gram.pick_valid_token(
+            tok_id, was_masked = gram.pick_valid_token(
                 matcher,
                 work,
                 argmax_idx,
@@ -559,7 +583,158 @@ class FastQwen3Engine:
                 if 0 <= c_idx < len(work)
                 else {"logprob": 0.0, "prob": 0.0, "entropy": 0.0}
             )
-        return int(tok_id), tel
+        return int(tok_id), tel, bool(was_masked)
+
+    def _select_next_token(
+        self,
+        logits_1d: np.ndarray,
+        *,
+        full_hidden_1d: mx.array | None,
+        matcher: Any | None,
+        gram: GrammarHelper | None,
+        recent_tokens: Sequence[int],
+        temperature: float,
+        top_p: float = 1.0,
+        rng: np.random.Generator | None = None,
+        repeat_penalty: bool,
+        collect_telemetry: bool,
+    ) -> tuple[int, dict[str, float] | None]:
+        tok_id, tel, _ = self._select_next_token_with_meta(
+            logits_1d,
+            full_hidden_1d=full_hidden_1d,
+            matcher=matcher,
+            gram=gram,
+            recent_tokens=recent_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            rng=rng,
+            repeat_penalty=repeat_penalty,
+            collect_telemetry=collect_telemetry,
+        )
+        return tok_id, tel
+
+    def _project_needed_rows(
+        self,
+        h_2d: mx.array,
+        need_rows: list[int],
+        row_count: int,
+        *,
+        eager_fp32: bool = False,
+    ) -> tuple[mx.array | None, dict[int, int], dict[int, np.ndarray]]:
+        """Project active rows; evaluate `[M]` GPU argmax only when `eager_fp32=False`."""
+        if not need_rows:
+            mx.eval(h_2d)  # guard: allow-eval
+            return None, {}, {}
+        if len(need_rows) == row_count:
+            sl_raw = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
+        else:
+            idx_mx = mx.array(need_rows, dtype=mx.int32)
+            sub_h = mx.take(h_2d, idx_mx, axis=0)[:, None, :]
+            sl_raw = self.model.project_logits(sub_h)[:, 0, :]
+
+        v_limit = len(self._new_to_old)
+        sl_eff = (
+            sl_raw[:, :v_limit]
+            if (self.model.vocab_remap is None and int(sl_raw.shape[-1]) > v_limit)
+            else sl_raw
+        )
+        if eager_fp32:
+            sl_f32 = sl_eff.astype(mx.float32)
+            mx.eval(h_2d, sl_f32)  # guard: allow-eval
+            arr = np.asarray(sl_f32)
+            return None, {}, {r: arr[pos] for pos, r in enumerate(need_rows)}
+
+        am_mx = _safe_argmax_with_nan_guard(sl_eff)
+        mx.eval(h_2d, am_mx)  # guard: allow-eval
+        am_list = [int(x) for x in am_mx.tolist()]
+        return sl_eff, {r: am_list[pos] for pos, r in enumerate(need_rows)}, {}
+
+    def _select_tokens_from_hidden(
+        self,
+        h_2d: mx.array,
+        need_rows: list[int],
+        row_count: int,
+        *,
+        matchers: Sequence[Any | None],
+        grammars: Sequence[GrammarHelper | None],
+        recent_tokens_by_row: Sequence[Sequence[int]],
+        rngs: Sequence[np.random.Generator | None],
+        temperature: float,
+        top_p: float,
+        repeat_penalty: bool,
+        collect_telemetry: bool,
+    ) -> tuple[dict[int, int], dict[int, dict[str, float] | None], int]:
+        """Select next tokens via lazy GPU argmax, copying FP32 logits only for fallback rows."""
+        eager_fp32 = bool(float(temperature) > 0.0 or collect_telemetry)
+        sl_eff, greedy_map, logits_map = self._project_needed_rows(
+            h_2d,
+            need_rows,
+            row_count,
+            eager_fp32=eager_fp32,
+        )
+        if not need_rows:
+            return {}, {}, 0
+
+        picked_tid: dict[int, int] = {}
+        picked_tel: dict[int, dict[str, float] | None] = {}
+        mask_fallbacks = 0
+
+        if not eager_fp32:
+            n_vocab = len(self._new_to_old)
+            fb_rows: list[tuple[int, int]] = []
+            for pos, r in enumerate(need_rows):
+                argmax_idx = greedy_map[r]
+                m = matchers[r]
+                if 0 <= argmax_idx < n_vocab:
+                    cand_tid = int(self._new_to_old[argmax_idx])
+                    is_penalized = False
+                    if repeat_penalty:
+                        min_hits = 5 if m is not None else 4
+                        pen = compute_loop_breaker_penalties(
+                            recent_tokens_by_row[r],
+                            window=96,
+                            min_prior_hits=min_hits,
+                            base_penalty=8.0,
+                            stop_token_ids=self.tokenizer.stop_token_ids,
+                        )
+                        is_penalized = bool(pen and cand_tid in pen)
+                    if not is_penalized and (m is None or bool(m.validate_tokens([cand_tid]))):
+                        picked_tid[r] = cand_tid
+                        picked_tel[r] = None
+                        continue
+                fb_rows.append((pos, r))
+
+            if fb_rows:
+                assert sl_eff is not None
+                fb_pos_mx = mx.array([pos for pos, _ in fb_rows], dtype=mx.int32)
+                fb_f32 = mx.take(sl_eff, fb_pos_mx, axis=0).astype(mx.float32)
+                mx.eval(fb_f32)  # guard: allow-eval
+                fb_arr = np.asarray(fb_f32)
+                for k_idx, (_, r) in enumerate(fb_rows):
+                    logits_map[r] = fb_arr[k_idx]
+            del sl_eff
+
+        for r in need_rows:
+            if r in picked_tid:
+                continue
+            tid, tel, was_masked = self._select_next_token_with_meta(
+                logits_map[r],
+                full_hidden_1d=h_2d[r],
+                matcher=matchers[r],
+                gram=grammars[r],
+                recent_tokens=recent_tokens_by_row[r],
+                temperature=temperature,
+                top_p=top_p,
+                rng=rngs[r],
+                repeat_penalty=repeat_penalty,
+                collect_telemetry=collect_telemetry,
+            )
+            picked_tid[r] = tid
+            picked_tel[r] = tel
+            if was_masked:
+                mask_fallbacks += 1
+
+        return picked_tid, picked_tel, mask_fallbacks
 
     def _finalize_item(
         self,
@@ -657,10 +832,12 @@ class FastQwen3Engine:
         inputs_embeds: mx.array | None = None,
         rope_trig: tuple[mx.array, mx.array] | None = None,
         rope_offset_delta: int = 0,
+        fallback_counter: list[int] | None = None,
     ) -> GenerationItem:
         rng = np.random.default_rng(int(seed)) if seed is not None else None
         matcher = gram.new_matcher() if gram is not None else None
         telemetry: list[dict[str, float]] | None = [] if collect_telemetry else None
+        single_mask_fallbacks = 0
         folded_ff: list[int] = []
         if thinking_budget <= 0 and matcher is not None and gram is not None and gram.upfront_ff:
             hit_stop_up = False
@@ -724,12 +901,12 @@ class FastQwen3Engine:
                 extra_tail_ids=folded_ff,
             )
         last_h = hidden[:, -1:, :]
-        logits = self.model.project_logits(last_h)
-        mx.eval(last_h, logits)
-
+        logits: mx.array | None = None
         reasoning_text: str | None = None
         # Optional Phase 1: Two-phase budgeted thinking (`thinking_budget >= 384`)
         if thinking_budget > 0:
+            logits = self.model.project_logits(last_h)
+            mx.eval(last_h, logits)
             think_ids: list[int] = []
             closed_naturally = False
             cur_logits = np.asarray(logits[0, 0].astype(mx.float32))
@@ -828,37 +1005,45 @@ class FastQwen3Engine:
         )
 
         mtp_cache = self.mtp_drafter.make_cache() if (use_spec and self.mtp_drafter is not None) else None
-        if (
-            mtp_cache is not None
-            and self.mtp_drafter is not None
-            and thinking_budget <= 0
-            and len(prefill_in) >= 2
-            and int(hidden.shape[1]) >= 2
-        ):
-            # Seed 1-layer MTP cache over prompt tail (capped to 128 tokens and bounded by chunked hidden buffer)
-            tail_n = min(len(prefill_in) - 1, int(hidden.shape[1]) - 1, 128)
-            seed_next = mx.array([prefill_in[-tail_n:]], dtype=mx.int32)
-            seed_prev_h = hidden[:, -(tail_n + 1) : -1, :]
-            _ = self.mtp_drafter.forward_hidden(seed_next, seed_prev_h, self.model, mtp_cache)
-
-        cur_logits_1d = np.asarray(logits[0, 0].astype(mx.float32))
-        cur_h_1d = last_h[0, 0]
         history_ids = list(prompt_ids) + list(answer_ids)
 
-        # Sample first non-FF token from prefill logits
+        # Sample first non-FF token from prefill logits (lazy GPU argmax when thinking_budget <= 0)
         if len(answer_ids) < max_tokens and (matcher is None or not matcher.is_stopped()):
-            first_tok, first_tel = self._select_next_token(
-                cur_logits_1d,
-                full_hidden_1d=cur_h_1d,
-                matcher=matcher,
-                gram=gram,
-                recent_tokens=answer_ids,
-                temperature=temperature,
-                top_p=top_p,
-                rng=rng,
-                repeat_penalty=True,
-                collect_telemetry=collect_telemetry,
-            )
+            if logits is not None:
+                cur_h_1d = last_h[0, 0]
+                cur_logits_1d = np.asarray(logits[0, 0].astype(mx.float32))
+                first_tok, first_tel, first_masked = self._select_next_token_with_meta(
+                    cur_logits_1d,
+                    full_hidden_1d=cur_h_1d,
+                    matcher=matcher,
+                    gram=gram,
+                    recent_tokens=answer_ids,
+                    temperature=temperature,
+                    top_p=top_p,
+                    rng=rng,
+                    repeat_penalty=True,
+                    collect_telemetry=collect_telemetry,
+                )
+                if first_masked:
+                    single_mask_fallbacks += 1
+            else:
+                h_2d_0 = last_h[:, 0, :]
+                tids0, tels0, fb0 = self._select_tokens_from_hidden(
+                    h_2d_0,
+                    [0],
+                    1,
+                    matchers=[matcher],
+                    grammars=[gram],
+                    recent_tokens_by_row=[answer_ids],
+                    rngs=[rng],
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=True,
+                    collect_telemetry=collect_telemetry,
+                )
+                single_mask_fallbacks += fb0
+                cur_h_1d = h_2d_0[0]
+                first_tok, first_tel = tids0[0], tels0[0]
             if first_tel is not None and telemetry is not None:
                 telemetry.append(first_tel)
             if first_tok not in self.tokenizer.stop_token_ids:
@@ -884,7 +1069,23 @@ class FastQwen3Engine:
             else:
                 pending_tokens = []
         else:
+            if logits is None:
+                mx.eval(last_h)
+            cur_h_1d = last_h[0, 0]
             pending_tokens = []
+
+        if (
+            mtp_cache is not None
+            and self.mtp_drafter is not None
+            and thinking_budget <= 0
+            and len(prefill_in) >= 2
+            and int(hidden.shape[1]) >= 2
+        ):
+            # Seed 1-layer MTP cache over prompt tail (capped to 128 tokens and bounded by chunked hidden buffer)
+            tail_n = min(len(prefill_in) - 1, int(hidden.shape[1]) - 1, 128)
+            seed_next = mx.array([prefill_in[-tail_n:]], dtype=mx.int32)
+            seed_prev_h = hidden[:, -(tail_n + 1) : -1, :]
+            _ = self.mtp_drafter.forward_hidden(seed_next, seed_prev_h, self.model, mtp_cache)
 
         draft_k = recommended_draft_k(1, has_grammar=gram is not None) if use_spec else 0
 
@@ -1032,23 +1233,23 @@ class FastQwen3Engine:
             step_arr = mx.array([pending_tokens], dtype=mx.int32)
             sh = self.model.forward_hidden(step_arr, cache, rope_offset_delta=rope_offset_delta)
             last_h = sh[:, -1:, :]
-            sl = self.model.project_logits(last_h)
-            mx.eval(last_h, sl)  # guard: allow-eval
-            cur_h_1d = last_h[0, 0]
-            cur_logits_1d = np.asarray(sl[0, 0].astype(mx.float32))
-
-            nxt_tok, nxt_tel = self._select_next_token(
-                cur_logits_1d,
-                full_hidden_1d=cur_h_1d,
-                matcher=matcher,
-                gram=gram,
-                recent_tokens=answer_ids,
+            h_2d = last_h[:, 0, :]
+            tids_step, tels_step, step_fb = self._select_tokens_from_hidden(
+                h_2d,
+                [0],
+                1,
+                matchers=[matcher],
+                grammars=[gram],
+                recent_tokens_by_row=[answer_ids],
+                rngs=[rng],
                 temperature=temperature,
                 top_p=top_p,
-                rng=rng,
                 repeat_penalty=True,
                 collect_telemetry=collect_telemetry,
             )
+            single_mask_fallbacks += step_fb
+            cur_h_1d = h_2d[0]
+            nxt_tok, nxt_tel = tids_step[0], tels_step[0]
             if nxt_tel is not None and telemetry is not None:
                 telemetry.append(nxt_tel)
             if nxt_tok in self.tokenizer.stop_token_ids:
@@ -1080,6 +1281,9 @@ class FastQwen3Engine:
         ):
             hit_max_tokens = True
 
+        if fallback_counter is not None:
+            fallback_counter[0] += single_mask_fallbacks
+
         return self._finalize_item(
             prompt_tokens=len(prompt_ids),
             answer_ids=answer_ids,
@@ -1103,6 +1307,7 @@ class FastQwen3Engine:
         slot_seeds: Sequence[int | None] | None = None,
         collect_telemetry: bool,
         compact_active: bool = True,
+        fallback_counter: list[int] | None = None,
     ) -> list[GenerationItem]:
         """Right-padded batched prefill + multi-token FF + active-row `lm_head` decode wave (`B >= 2`, zero pad leakage)."""
         b_sz = len(wave_prompt_ids)
@@ -1175,7 +1380,7 @@ class FastQwen3Engine:
         if prefix_snap is not None:
             cache = restore_hybrid_cache(prefix_snap, batch_size=b_sz, kv_step=kv_alloc, kv_i8=use_kvi8)
         else:
-            cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
+            cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8, batch_size=b_sz)
 
         # Right-padded suffixes stay contiguous with `LCP[-3:]` (`0` conv1d boundary corruption, `"causal"` SDPA!)
         if any_ragged:
@@ -1231,23 +1436,6 @@ class FastQwen3Engine:
                         slot_cur_h[i] = ch_h[i, pos_i - c0, :]
             cur_h = mx.stack([slot_cur_h[i] for i in range(b_sz)], axis=0)  # type: ignore[misc]
 
-        def _project_needed_rows(h_2d: mx.array, need_rows: list[int], row_count: int) -> dict[int, np.ndarray]:
-            if not need_rows:
-                mx.eval(h_2d)  # guard: allow-eval
-                return {}
-            if len(need_rows) == row_count:
-                sl_all = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
-                mx.eval(h_2d, sl_all)  # guard: allow-eval
-                arr_all = np.asarray(sl_all.astype(mx.float32))
-                return {r: arr_all[r] for r in range(row_count)}
-            idx_mx = mx.array(need_rows, dtype=mx.int32)
-            sub_h = mx.take(h_2d, idx_mx, axis=0)[:, None, :]
-            sl_sub = self.model.project_logits(sub_h)[:, 0, :]
-            mx.eval(h_2d, sl_sub)  # guard: allow-eval
-            arr_sub = np.asarray(sl_sub.astype(mx.float32))
-            return {r: arr_sub[pos] for pos, r in enumerate(need_rows)}
-
-        cur_logits_map = _project_needed_rows(cur_h, [i for i in range(b_sz) if not done[i]], b_sz)
         true_pos = [lcp_len + sl for sl in suf_lens]
         kv_cursor = lcp_len + max_suf
         live_rows = list(range(b_sz))
@@ -1258,15 +1446,16 @@ class FastQwen3Engine:
             else None
         )
         pending_q: list[list[int]] = [[] for _ in range(b_sz)]
+        wave_mask_fallbacks = 0
 
         for _step in range(max_tokens + 1):
             cur_b = len(live_rows)
+            need_rows: list[int] = []
             for r in range(cur_b):
                 w_i = live_rows[r]
                 if done[w_i] or pending_q[w_i]:
                     continue
                 m = matchers[w_i]
-                g = grammars[w_i]
                 if len(ans_ids[w_i]) >= max_tokens:
                     done[w_i] = True
                     hit_max[w_i] = not (m is not None and m.is_stopped() and m.is_accepting())
@@ -1274,19 +1463,28 @@ class FastQwen3Engine:
                 if m is not None and m.is_stopped():
                     done[w_i] = True
                     continue
+                need_rows.append(r)
 
-                tid, tel = self._select_next_token(
-                    cur_logits_map[r],
-                    full_hidden_1d=cur_h[r],
-                    matcher=m,
-                    gram=g,
-                    recent_tokens=ans_ids[w_i],
-                    temperature=temperature,
-                    top_p=top_p,
-                    rng=rngs[w_i],
-                    repeat_penalty=True,
-                    collect_telemetry=collect_telemetry,
-                )
+            picked_tid, picked_tel, step_fb = self._select_tokens_from_hidden(
+                cur_h,
+                need_rows,
+                cur_b,
+                matchers=[matchers[w_i] for w_i in live_rows],
+                grammars=[grammars[w_i] for w_i in live_rows],
+                recent_tokens_by_row=[ans_ids[w_i] for w_i in live_rows],
+                rngs=[rngs[w_i] for w_i in live_rows],
+                temperature=temperature,
+                top_p=top_p,
+                repeat_penalty=True,
+                collect_telemetry=collect_telemetry,
+            )
+            wave_mask_fallbacks += step_fb
+
+            for r in need_rows:
+                w_i = live_rows[r]
+                m = matchers[w_i]
+                tid = picked_tid[r]
+                tel = picked_tel[r]
                 if tel is not None and tels[w_i] is not None:
                     tels[w_i].append(tel)  # type: ignore[union-attr]
                 if tid in self.tokenizer.stop_token_ids:
@@ -1395,11 +1593,12 @@ class FastQwen3Engine:
                 rope_trig=r_trig_s,
             )
             cur_h = sh[:, -1, :]
-            need_rows = [r for r, w_i in enumerate(live_rows) if not done[w_i] and not pending_q[w_i]]
-            cur_logits_map = _project_needed_rows(cur_h, need_rows, cur_b)
             for w_i in live_rows:
                 if not done[w_i]:
                     true_pos[w_i] += step_w
+
+        if fallback_counter is not None:
+            fallback_counter[0] += wave_mask_fallbacks
 
         return [
             self._finalize_item(
@@ -1442,7 +1641,10 @@ class FastQwen3Engine:
     ) -> GenerationBatchResult:
         """Generate structured or free-text completions over a batch of prompts with LCP hybrid caching."""
         if not prompts:
-            return GenerationBatchResult(items=[], stats={"docs": 0, "elapsed_sec": 0.0})
+            return GenerationBatchResult(
+                items=[],
+                stats={"docs": 0, "prompt_tokens": 0, "completion_tokens": 0, "mask_fallbacks": 0, "elapsed_sec": 0.0},
+            )
 
         t0 = time.perf_counter()
         eff_think = self.default_enable_thinking if enable_thinking is None else bool(enable_thinking)
@@ -1518,6 +1720,7 @@ class FastQwen3Engine:
             ).b_slots
             results: list[GenerationItem | None] = [None] * n_docs
             max_lcp_seen = 0
+            fb_counter = [0]
 
             if norm_images is not None:
                 if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
@@ -1546,6 +1749,7 @@ class FastQwen3Engine:
                                 inputs_embeds=inp_emb,
                                 rope_trig=r_trig,
                                 rope_offset_delta=r_delta,
+                                fallback_counter=fb_counter,
                             )
                         else:
                             enc_i = self.tokenizer.encode_chat(
@@ -1566,6 +1770,7 @@ class FastQwen3Engine:
                                 thinking_budget=eff_budget,
                                 speculative=speculative,
                                 collect_telemetry=collect_telemetry,
+                                fallback_counter=fb_counter,
                             )
                 else:
                     has_any_images = any(bool(xs) for xs in norm_images)
@@ -1666,6 +1871,7 @@ class FastQwen3Engine:
                             thinking_budget=eff_budget,
                             speculative=speculative,
                             collect_telemetry=collect_telemetry,
+                            fallback_counter=fb_counter,
                         )
                 else:
                     # Bucket by prompt length (`128`-tok buckets) first to bound ragged pad waste across mixed-schema batches,
@@ -1722,6 +1928,7 @@ class FastQwen3Engine:
                                 thinking_budget=0,
                                 speculative=speculative,
                                 collect_telemetry=collect_telemetry,
+                                fallback_counter=fb_counter,
                             )
                         else:
                             wave_encs = [encoded[i] for i in chunk_idx]
@@ -1747,6 +1954,7 @@ class FastQwen3Engine:
                                 slot_seeds=[(int(seed) + i) if seed is not None else None for i in chunk_idx],
                                 collect_telemetry=collect_telemetry,
                                 compact_active=compact_active,
+                                fallback_counter=fb_counter,
                             )
                             for i, it in zip(chunk_idx, wave_items):
                                 results[i] = it
@@ -1755,11 +1963,16 @@ class FastQwen3Engine:
 
         elapsed = time.perf_counter() - t0
         final_items = [r for r in results if r is not None]
+        total_prompt = sum(it.prompt_tokens for it in final_items)
         total_comp = sum(it.completion_tokens for it in final_items)
+        total_mask_fallbacks = fb_counter[0] + int(extra_stats.get("mask_fallbacks", 0) or 0)
         stats: dict[str, Any] = {
             "docs": n_docs,
             "lcp_tokens": max_lcp_seen,
             "prefix_tree_reused_tokens": int(self.prefix_tree.reused_tokens) if self.prefix_tree is not None else 0,
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_comp,
+            "mask_fallbacks": total_mask_fallbacks,
             "elapsed_sec": round(elapsed, 4),
             "docs_per_sec": round(n_docs / max(elapsed, 1e-9), 3),
             "decode_tok_s": round(total_comp / max(elapsed, 1e-9), 2),

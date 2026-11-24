@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 import ctypes
 import json
 import math
@@ -52,8 +53,8 @@ def _laya_ln_gain_and_eps(
     cum_r: float,
     *,
     base_inv_scale: float = 0.25,
-    s_eff_floor: float = 1.0 / 256.0,
-    max_ln_gain: float = 16.0,
+    s_eff_floor: float = 1.0 / 128.0,
+    max_ln_gain: float = 4.0,
     eps: float = 1e-5,
 ) -> tuple[np.float16, np.float16]:
     """Compute scale-invariant FP16 LayerNorm `(ln_gain, eps_u)` compensating for `cum_r`."""
@@ -176,6 +177,53 @@ def _precompute_sliding_window_bias_bkhq(seq_len: int, local_attention: int = 12
     return bias[None, :, None, :]
 
 
+_COREML_DISABLED_BN_FP16_PASSES: tuple[str, ...] = (
+    "common::fuse_elementwise_to_batchnorm",
+    "common::add_fp16_cast",
+    "common::fuse_layernorm_or_instancenorm",
+)
+
+
+@contextmanager
+def _without_coreml_bn_fp16_passes(pass_pipeline_module: Any = None) -> Any:
+    """Temporarily strip `fuse_elementwise_to_batchnorm`/`add_fp16_cast` from coremltools global defaults.
+
+    coremltools 9.0's `cto.linear_quantize_weights` calls `_apply_graph_pass -> _mil_convert` with
+    `main_pipeline=None`, resetting `_COMMON_PASSES` and re-enabling BN fusion that fails on FP16/FP32
+    LayerNorm weights (`hl0_n1_bm` `gamma fp16 vs mean fp32`).
+    """
+    pp_mod = pass_pipeline_module
+    if pp_mod is None:
+        try:
+            from coremltools.converters.mil.mil.passes import pass_pipeline as imported_pp_mod
+
+            pp_mod = imported_pp_mod
+        except Exception:
+            yield
+            return
+
+    common_passes = getattr(pp_mod, "_COMMON_PASSES", None)
+    orig_common = list(common_passes) if isinstance(common_passes, list) else None
+    pp_cls = getattr(pp_mod, "PassPipeline", None)
+    default_map = getattr(pp_cls, "_PIPELINE_NAME_TO_PASSES", None) if pp_cls is not None else None
+    orig_default = (
+        list(default_map["default"])
+        if isinstance(default_map, dict) and isinstance(default_map.get("default"), list)
+        else None
+    )
+    try:
+        if orig_common is not None:
+            common_passes[:] = [p for p in orig_common if p not in _COREML_DISABLED_BN_FP16_PASSES]
+        if orig_default is not None:
+            default_map["default"] = [p for p in orig_default if p not in _COREML_DISABLED_BN_FP16_PASSES]
+        yield
+    finally:
+        if orig_common is not None:
+            common_passes[:] = orig_common
+        if orig_default is not None:
+            default_map["default"] = orig_default
+
+
 def _build_laya_seq_mlpackage(
     seq_len: int,
     w: Mapping[str, np.ndarray],
@@ -189,7 +237,8 @@ def _build_laya_seq_mlpackage(
 
     Architecture optimizations:
       - Exact `erf` GELU (`mode="EXACT"`) on ModernBERT GeGLU and Laya scorer
-      - Native `mb.layer_norm` (`axes=[1]`) with `_laya_ln_gain_and_eps` `>= 2^-14` FTZ floor
+      - Explicit two-pass centered FP16 LayerNorm (`reduce_mean`/`rsqrt`) with `_laya_ln_gain_and_eps`
+        `>= 2^-14` FTZ floor & `common::fuse_layernorm_or_instancenorm` stripped to avoid FP16 INF/cancel
       - Split-head `[1, hd, 1, S]` `mb.einsum` (`0` 4D reshape+matmul ops; `100%` Pure-ANE)
       - Pre-scorer `marker_map` `[1, S, 1, 32]` gather (`16x` less scorer compute at `S=512`)
     """
@@ -230,14 +279,24 @@ def _build_laya_seq_mlpackage(
             base_inv_scale=base_inv_scale,
             eps=layer_norm_eps,
         )
-        u = x if float(ln_gain) == 1.0 else mb.mul(x=x, y=ln_gain, name=prefix + "_u")
-        xn = mb.layer_norm(x=u, axes=[1], epsilon=eps_u, name=prefix + "_ln")
+        mean = mb.reduce_mean(x=x, axes=[1], keep_dims=True, name=prefix + "_mn")
+        xc = mb.sub(x=x, y=mean, name=prefix + "_xc")
+        u = xc if float(ln_gain) == 1.0 else mb.mul(x=xc, y=ln_gain, name=prefix + "_u")
+        var_u = mb.reduce_mean(
+            x=mb.mul(x=u, y=u, name=prefix + "_sq"),
+            axes=[1],
+            keep_dims=True,
+            name=prefix + "_vu",
+        )
+        rsq = mb.rsqrt(x=mb.add(x=var_u, y=eps_u, name=prefix + "_ae"), name=prefix + "_rsq")
         gam4 = np.asarray(gamma_1d, dtype=np.float16).reshape(1, H, 1, 1)
-        out = mb.mul(x=xn, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_gm")
         if beta_1d is None:
-            return out
+            xn = mb.mul(x=u, y=rsq, name=prefix + "_xn")
+            return mb.mul(x=xn, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_gm")
+        ug = mb.mul(x=u, y=mb.const(val=gam4, name=prefix + "_gw"), name=prefix + "_ug")
+        xn = mb.mul(x=ug, y=rsq, name=prefix + "_xn")
         bet4 = np.asarray(beta_1d, dtype=np.float16).reshape(1, H, 1, 1)
-        return mb.add(x=out, y=mb.const(val=bet4, name=prefix + "_bw"), name=prefix + "_bm")
+        return mb.add(x=xn, y=mb.const(val=bet4, name=prefix + "_bw"), name=prefix + "_bm")
 
     def _rope_head(xh: Any, cos_c: Any, sin_c: Any, prefix: str) -> Any:
         x0, x1 = mb.split(x=xh, num_splits=2, axis=1, name=prefix + "_sp")
@@ -311,7 +370,7 @@ def _build_laya_seq_mlpackage(
         swa_mask = mb.add(x=swa_c, y=ext_mask, name="swa_mask")
 
         cur = _layernorm_ch(
-            tok_emb_in, w["encoder.embeddings.norm.weight"], None, "emb_ln", cum_r=1.0, base_inv_scale=1.0
+            tok_emb_in, w["encoder.embeddings.norm.weight"], None, "emb_ln", cum_r=1.0, base_inv_scale=4.0
         )
 
         for i in range(n_layers):
@@ -361,7 +420,7 @@ def _build_laya_seq_mlpackage(
         for hi in range(2):
             hp = f"head.layers.{hi}."
             hn1 = _layernorm_ch(
-                h, w[hp + "norm1.weight"], w[hp + "norm1.bias"], f"hl{hi}_n1", cum_r=1.0, base_inv_scale=0.25
+                h, w[hp + "norm1.weight"], w[hp + "norm1.bias"], f"hl{hi}_n1", cum_r=1.0, base_inv_scale=0.0625
             )
             in_w = np.asarray(w[hp + "self_attn.in_proj_weight"], dtype=np.float32).copy()
             in_b = np.asarray(w[hp + "self_attn.in_proj_bias"], dtype=np.float32).copy()
@@ -388,7 +447,7 @@ def _build_laya_seq_mlpackage(
             h = mb.add(x=h, y=hao, name=f"hl{hi}_res1")
 
             hn2 = _layernorm_ch(
-                h, w[hp + "norm2.weight"], w[hp + "norm2.bias"], f"hl{hi}_n2", cum_r=1.0, base_inv_scale=0.25
+                h, w[hp + "norm2.weight"], w[hp + "norm2.bias"], f"hl{hi}_n2", cum_r=1.0, base_inv_scale=0.0625
             )
             hl1 = mb.conv(
                 x=hn2,
@@ -418,7 +477,7 @@ def _build_laya_seq_mlpackage(
             name="gather_markers",
         )
         sn = _layernorm_ch(
-            h_markers, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", cum_r=1.0, base_inv_scale=0.25
+            h_markers, w["scorer.0.weight"], w["scorer.0.bias"], "sc_ln", cum_r=1.0, base_inv_scale=0.0625
         )
         s1 = mb.conv(
             x=sn,
@@ -435,7 +494,7 @@ def _build_laya_seq_mlpackage(
         )
 
     pp = ct.PassPipeline.DEFAULT
-    pp.remove_passes(["common::fuse_elementwise_to_batchnorm", "common::add_fp16_cast"])
+    pp.remove_passes(list(_COREML_DISABLED_BN_FP16_PASSES))
     ml = ct.convert(
         prog,
         inputs=[
@@ -453,10 +512,11 @@ def _build_laya_seq_mlpackage(
     disallowed = validate_export_quant_dtypes(["int8"], export_backend="coreml")
     if disallowed:
         raise ValueError(f"Disallowed export quantization dtypes for coreml: {disallowed}")
-    ml = cto.linear_quantize_weights(
-        ml,
-        config=_build_laya_quant_config(cto),
-    )
+    with _without_coreml_bn_fp16_passes():
+        ml = cto.linear_quantize_weights(
+            ml,
+            config=_build_laya_quant_config(cto),
+        )
     tag = f"laya_typed_s{seq_len}_w8"
     if guard_ir:
         rep = check_coreml_model(

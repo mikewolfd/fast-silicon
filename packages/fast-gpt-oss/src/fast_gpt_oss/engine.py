@@ -29,6 +29,7 @@ import warnings
 import numpy as np
 
 from fast_shared.grammar import (
+    compute_loop_breaker_penalties,
     normalize_json_schema,
     sample_unconstrained,
     validate_json_against_schema,
@@ -84,27 +85,16 @@ def _find_repeated_4gram_penalties(
     window: int = _REPEAT_4GRAM_WINDOW,
     min_prior_hits: int = _REPEAT_4GRAM_MIN_HITS,
     base_penalty: float = _REPEAT_4GRAM_PENALTY,
+    stop_token_ids: frozenset[int] = frozenset(),
 ) -> dict[int, float]:
-    """Return `{continuation_tok_id: penalty}` when trailing 3-gram has repeated `>= min_prior_hits` times."""
-    if not recent_ids or len(recent_ids) < (3 + min_prior_hits):
-        return {}
-    tail = recent_ids[-window:] if len(recent_ids) > window else recent_ids
-    n_tail = len(tail)
-    if n_tail < (3 + min_prior_hits):
-        return {}
-    a, b, c = int(tail[-3]), int(tail[-2]), int(tail[-1])
-    hits: dict[int, int] = {}
-    for i in range(n_tail - 3):
-        if int(tail[i]) == a and int(tail[i + 1]) == b and int(tail[i + 2]) == c:
-            d = int(tail[i + 3])
-            hits[d] = hits.get(d, 0) + 1
-    if not hits:
-        return {}
-    return {
-        d: float(base_penalty) * float(min(cnt - min_prior_hits + 1, 4))
-        for d, cnt in hits.items()
-        if cnt >= min_prior_hits
-    }
+    """Delegate to shared `compute_loop_breaker_penalties` (periodic `p=1..8` + trailing 4-gram check)."""
+    return compute_loop_breaker_penalties(
+        recent_ids,
+        window=window,
+        min_prior_hits=min_prior_hits,
+        base_penalty=base_penalty,
+        stop_token_ids=stop_token_ids,
+    )
 
 
 def split_lcp_ids(prompt_ids_list: Sequence[Sequence[int]]) -> tuple[list[int], list[list[int]]]:
@@ -555,7 +545,20 @@ class FastGptOssEngine:
 
         lg_2d = eval_pack["lg_2d"]
         step_was_masked = [False]
-        penalties = _find_repeated_4gram_penalties(recent_ids)
+        tok = getattr(self, "tokenizer", None)
+        raw_stops = getattr(tok, "final_stop_token_ids", None) if tok is not None else None
+        stop_ids = (
+            raw_stops
+            if isinstance(raw_stops, frozenset)
+            else (frozenset(raw_stops) if raw_stops is not None else frozenset())
+        )
+        penalties = compute_loop_breaker_penalties(
+            recent_ids,
+            window=_REPEAT_4GRAM_WINDOW,
+            min_prior_hits=_REPEAT_4GRAM_MIN_HITS,
+            base_penalty=_REPEAT_4GRAM_PENALTY,
+            stop_token_ids=stop_ids,
+        )
         n2o = getattr(grammar, "new_to_old", self.model.new_to_old) if grammar is not None else self.model.new_to_old
         cached_row: list[np.ndarray | None] = [None]
 

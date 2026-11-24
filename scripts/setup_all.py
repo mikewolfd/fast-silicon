@@ -30,6 +30,7 @@ PACKAGE_ORDER: tuple[str, ...] = (
     "gemma4",
     "gpt-oss",
     "qwen3",
+    "ocr",
 )
 
 _PACKAGE_ALIASES: dict[str, str] = {
@@ -48,6 +49,8 @@ _PACKAGE_ALIASES: dict[str, str] = {
     "gpt-oss": "gpt-oss",
     "fast-qwen3": "qwen3",
     "qwen3": "qwen3",
+    "fast-ocr": "ocr",
+    "ocr": "ocr",
 }
 
 _BGE_REQUIRED_BUCKETS: tuple[tuple[int, int], ...] = (
@@ -76,6 +79,7 @@ _GEMMA4_TEST_HF_REPOS: tuple[str, ...] = (
 _GPT_OSS_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
 _GPT_OSS_PREBUILT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q8"
 _QWEN3_HF_REPO = "mlx-community/Qwen3.5-4B-OptiQ-4bit"
+_OCR_HF_REPO = "mlx-community/OvisOCR2-8bit"
 _LAYA_HF_REPO = "convaiinnovations/laya-typed-decisions"
 _KEV_ADAPTER_HF_REPO = "jaredpalmer/kev-0.8b"
 _KEV_BASE_HF_REPO = "Qwen/Qwen3.5-0.8B-Base"
@@ -107,6 +111,9 @@ VETTED_PREBUILT_HF_REPOS: dict[str, tuple[str, ...]] = {
         "mlx-community/Qwen3.5-4B-OptiQ-4bit",
         "mlx-community/Qwen3.5-0.8B-4bit",
     ),
+    "ocr": (
+        _OCR_HF_REPO,
+    ),
 }
 
 _PREBUILT_APPROX_GB: dict[str, float] = {
@@ -117,6 +124,7 @@ _PREBUILT_APPROX_GB: dict[str, float] = {
     "gemma4": 10.40,
     "gpt-oss": 12.10,
     "qwen3": 3.10,
+    "ocr": 2.60,
 }
 
 
@@ -201,6 +209,8 @@ def _resolve_target_home(
     if target_mode != "auto":
         raise ValueError(f"Unsupported target mode {target_mode!r}; expected auto|in-repo|cache")
 
+    if pkg_key == "ocr":
+        return (REPO_ROOT / "packages" / pkg_dir_name).resolve()
     mod = importlib.import_module(paths_module)
     if pkg_key in ("bge-small", "embeddinggemma-2", "pplx", "decision-models"):
         return Path(mod.resolve_home()).resolve()
@@ -387,6 +397,18 @@ def _plan_pplx(
     )
 
 
+def _is_valid_mlmodelc(bundle_dir: Path) -> bool:
+    """Return True if `bundle_dir` (or symlink target) is a non-empty compiled `.mlmodelc`."""
+    if not bundle_dir.is_dir():
+        return False
+    if (bundle_dir / "coremldata.bin").is_file() or (bundle_dir / "model.mil").is_file():
+        return True
+    try:
+        return any(bundle_dir.iterdir())
+    except OSError:
+        return False
+
+
 def _plan_decision_models(
     home: Path,
     *,
@@ -398,9 +420,14 @@ def _plan_decision_models(
     pkg_dir = REPO_ROOT / "packages" / "fast-decision-models"
     art = home / "artifacts"
     laya_dir = art / "laya_typed"
+    mf_bundle_ok = _is_valid_mlmodelc(laya_dir / "laya_typed_w8.mlmodelc") and all(
+        _is_valid_mlmodelc(laya_dir / f"laya_typed_s{s}_w8.mlmodelc") for s in (64, 128, 256, 512)
+    )
+    standalone_ok = _is_valid_mlmodelc(laya_dir / "laya_typed_s256_w8.mlmodelc") and _is_valid_mlmodelc(
+        laya_dir / "laya_typed_s512_w8.mlmodelc"
+    )
     laya_ok = (
-        (laya_dir / "laya_typed_s256_w8.mlmodelc").is_dir()
-        and (laya_dir / "laya_typed_s512_w8.mlmodelc").is_dir()
+        (mf_bundle_ok or standalone_ok)
         and (laya_dir / "laya_typed_emb_f16.npz").is_file()
         and (laya_dir / "tokenizer" / "tokenizer.json").is_file()
     )
@@ -415,7 +442,7 @@ def _plan_decision_models(
         actions.append(
             StepAction(
                 kind="subprocess",
-                label="decision-models: download Laya-Typed & compile ANE s256/s512 W8 bundles",
+                label="decision-models: download Laya-Typed & compile ANE s64..s512 W8 multifunction bundle",
                 needed=force or not laya_ok,
                 reason="forced" if force else ("present" if laya_ok else "missing laya_typed bundles"),
                 repo_id=_LAYA_HF_REPO,
@@ -658,6 +685,43 @@ def _plan_qwen3(
     )
 
 
+def _is_ocr_snapshot_cached() -> bool:
+    try:
+        from fast_ocr.ovis_engine import resolve_ocr_model_dir
+
+        resolve_ocr_model_dir(_OCR_HF_REPO, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def _plan_ocr(
+    home: Path,
+    *,
+    force: bool,
+    hf_checker: Callable[[str], bool],
+) -> PackagePlan:
+    hf_cached = bool(hf_checker(_OCR_HF_REPO)) or (
+        hf_checker is _is_hf_snapshot_cached and _is_ocr_snapshot_cached()
+    )
+    actions = (
+        StepAction(
+            kind="hf_snapshot",
+            label=f"ocr: cache OvisOCR2 VLM snapshot ({_OCR_HF_REPO})",
+            needed=force or not hf_cached,
+            reason="forced" if force else ("cached" if hf_cached else "missing OvisOCR2-8bit HF snapshot"),
+            repo_id=_OCR_HF_REPO,
+        ),
+    )
+    return PackagePlan(
+        package="ocr",
+        target_home=home,
+        approx_size_gb=2.6,
+        hf_repos=(_OCR_HF_REPO,),
+        actions=actions,
+    )
+
+
 def _plan_prebuilt_package(
     pkg: str,
     home: Path,
@@ -736,6 +800,7 @@ def build_setup_plan(
         "gemma4": ("fast-gemma4", "fast_gemma4.paths"),
         "gpt-oss": ("fast-gpt-oss", "fast_gpt_oss.paths"),
         "qwen3": ("fast-qwen3", "fast_qwen3.paths"),
+        "ocr": ("fast-ocr", "fast_ocr.ovis_engine"),
     }
 
     plans: list[PackagePlan] = []
@@ -777,6 +842,8 @@ def build_setup_plan(
             plans.append(_plan_gpt_oss(home, force=force, hf_checker=hf_checker, python_exe=python_exe))
         elif pkg == "qwen3":
             plans.append(_plan_qwen3(home, force=force, hf_checker=hf_checker, python_exe=python_exe))
+        elif pkg == "ocr":
+            plans.append(_plan_ocr(home, force=force, hf_checker=hf_checker))
 
     return native_actions, plans
 
@@ -849,7 +916,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--packages",
         default="all",
-        help="Comma-separated package list (all or subset of: bge-small,embeddinggemma-2,pplx,decision-models,gemma4,gpt-oss)",
+        help="Comma-separated package list (all or subset of: bge-small,embeddinggemma-2,pplx,decision-models,gemma4,gpt-oss,qwen3,ocr)",
     )
     parser.add_argument(
         "--target",

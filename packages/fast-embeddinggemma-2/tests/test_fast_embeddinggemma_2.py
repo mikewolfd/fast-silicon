@@ -1286,5 +1286,111 @@ def test_document_title_formatting_and_parquet_header_col_cpu(tmp_path: Path) ->
     assert any(title_id not in ids for ids in stub.seen_tok_lists)
 
 
+def test_lazy_neural_init_skipped_for_metal_default_mode_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`enable_ane=None` skips CoreML ANE init for `default_mode='gpu'` while honoring explicit overrides."""
+    import inspect
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    import fast_embeddinggemma_2.engine as emb2_eng
+
+    sig = inspect.signature(FastEmbeddingGemma2.__init__)
+    assert sig.parameters["enable_ane"].default is None
+
+    home = tmp_path / "emb2_home"
+    (home / "artifacts" / "weights").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "ane_models").mkdir(parents=True)
+    (home / "build").mkdir(parents=True)
+    (home / "artifacts" / "weights" / "embeddinggemma_2_f16.npz").write_bytes(b"stub")
+    (home / "build" / "libemb2_coreml_runner.dylib").write_bytes(b"stub")
+    (home / "build" / "libemb2_fast_io.dylib").write_bytes(b"stub")
+
+    raw_tok = Tokenizer(WordLevel(vocab={"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "hello": 4}, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", 2), ("<eos>", 1)],
+    )
+    raw_tok.save(str(home / "artifacts" / "tokenizer" / "tokenizer.json"))
+
+    class _StubGPU:
+        def __init__(self, weights_path: Path, *, token_table: object = None) -> None:
+            del weights_path, token_table
+
+        def encode_single(self, token_ids: object, dimensions: int | None = None) -> np.ndarray:
+            del token_ids
+            d = int(dimensions or 768)
+            v = np.ones((d,), dtype=np.float32)
+            v /= np.linalg.norm(v)
+            return v
+
+        def exec_packed(self, L_l: int, lanes: list, *, dimensions: int | None = None):
+            del L_l
+            di = [doc_i for ln in lanes for doc_i, _ in ln]
+            d = int(dimensions or 768)
+            out = np.ones((len(di), d), dtype=np.float32)
+            out /= np.linalg.norm(out, axis=-1, keepdims=True)
+            return sum(len(tok) for ln in lanes for _, tok in ln), 0, di, out
+
+    coreml_calls: list[dict[str, object]] = []
+
+    def _spy_init_coreml(self: FastEmbeddingGemma2, *, enable_ane: bool, enable_cpu_sme: bool, verify_plan: bool = True) -> None:
+        coreml_calls.append({"enable_ane": enable_ane, "enable_cpu_sme": enable_cpu_sme, "verify_plan": verify_plan})
+        if enable_ane:
+            self.ane_handles[32] = 1
+            self.ane_available = True
+
+    monkeypatch.setattr(emb2_eng, "load_or_mmap_token_table", lambda *_a, **_kw: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(emb2_eng, "FastEmbeddingGemma2GPU", _StubGPU)
+    monkeypatch.setattr(emb2_eng, "set_mlx_cache_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng, "_apply_mlx_wired_limit", lambda: None)
+    monkeypatch.setattr(emb2_eng, "_restore_mlx_wired_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng, "_maybe_clear_mlx_arena", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng.mx, "async_eval", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng.mx, "synchronize", lambda: None)
+    monkeypatch.setattr(FastEmbeddingGemma2, "_init_coreml", _spy_init_coreml)
+
+    # 1. default_mode="gpu" skips _init_coreml completely
+    with FastEmbeddingGemma2(home=home, default_mode="gpu", warmup=False) as eng_gpu:
+        assert coreml_calls == []
+        assert eng_gpu.ane_available is False
+        assert eng_gpu.default_mode == "gpu"
+        with pytest.raises(RuntimeError, match="not initialized"):
+            eng_gpu.encode_texts("hello", mode="ane")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            eng_gpu.encode_corpus([[2, 4, 1]], mode="ane")
+        assert eng_gpu.encode_texts("hello", mode="hetero").shape == (768,)
+        assert eng_gpu.encode_corpus([[2, 4, 1], [2, 4, 4, 1]], mode="hetero2").shape == (2, 768)
+
+    # 2. Explicit enable_ane=True still initializes ANE even when default_mode="gpu"
+    coreml_calls.clear()
+    with FastEmbeddingGemma2(home=home, default_mode="gpu", enable_ane=True, warmup=False) as eng_gpu_ane:
+        assert coreml_calls == [{"enable_ane": True, "enable_cpu_sme": False, "verify_plan": True}]
+        assert eng_gpu_ane.ane_available is True
+        assert eng_gpu_ane.default_mode == "gpu"
+
+    # 3. Non-GPU default modes initialize ANE normally by default
+    for non_gpu_mode, expected_resolved in (("ane", "ane"), ("hetero", "hetero"), ("hetero2", "hetero")):
+        coreml_calls.clear()
+        with FastEmbeddingGemma2(home=home, default_mode=non_gpu_mode, warmup=False) as eng_m:
+            assert coreml_calls == [{"enable_ane": True, "enable_cpu_sme": False, "verify_plan": True}]
+            assert eng_m.ane_available is True
+            assert eng_m.default_mode == expected_resolved
+
+    # 4. Explicit enable_ane=False skips ANE in hetero and errors clearly in ane mode
+    coreml_calls.clear()
+    with FastEmbeddingGemma2(home=home, default_mode="hetero", enable_ane=False, warmup=False) as eng_no_ane:
+        assert coreml_calls == []
+        assert eng_no_ane.ane_available is False
+        assert eng_no_ane.default_mode == "gpu"
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        FastEmbeddingGemma2(home=home, default_mode="ane", enable_ane=False, warmup=False)
+
+
+
 
 

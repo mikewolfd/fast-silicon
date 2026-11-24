@@ -177,8 +177,19 @@ def split_sentences(text: str) -> list[str]:
     return [s for s in sentences if s]
 
 
-def repeat_4gram_rate(tokens_or_text: Sequence[int] | str) -> float:
-    """Fraction of 4-gram positions appearing >=4 times consecutively (stride 1..4) or >=8 times total."""
+def repeat_4gram_rate(
+    tokens_or_text: Sequence[int] | str,
+    *,
+    finish_reason: str | None = None,
+    valid_schema: bool | None = None,
+) -> float:
+    """Fraction of 4-gram positions involved in degenerative repetition.
+
+    Always catches contiguous runs at stride 1..4 (``run_len >= 4``). When not a
+    schema-valid ``stop`` output, also catches contiguous multi-token cycles
+    (period 5..64, ``>= 4`` copies), low-diversity repetition in the trailing
+    128-token window, and elevated repetition under ``finish_reason == "length"``.
+    """
     if isinstance(tokens_or_text, str):
         seq: Sequence[Any] = tokenize_words(tokens_or_text.lower())
     else:
@@ -192,7 +203,7 @@ def repeat_4gram_rate(tokens_or_text: Sequence[int] | str) -> float:
     for g in grams:
         counts[g] = counts.get(g, 0) + 1
 
-    flagged = [counts[g] >= 8 for g in grams]
+    flagged = [False] * m
     # Detect >=4 consecutive repetitions at period 1, 2, 3, or 4 (e.g. AAAA... or ABCD ABCD ABCD ABCD).
     for stride in (1, 2, 3, 4):
         for offset in range(stride):
@@ -208,7 +219,68 @@ def repeat_4gram_rate(tokens_or_text: Sequence[int] | str) -> float:
                     for pos in range(run_start, run_end, stride):
                         flagged[pos] = True
                 run_start = run_end
-    return float(sum(1 for f in flagged if f)) / float(m)
+
+    is_length_stop = str(finish_reason) == "length" if finish_reason is not None else False
+    is_valid_stop_schema = valid_schema is True and (finish_reason is None or str(finish_reason) != "length")
+
+    tail_window = 128
+    tail_gram_count = tail_window - 3
+    tail_start = max(0, m - tail_gram_count)
+    tail_grams = grams[tail_start:]
+    wm = len(tail_grams)
+
+    if not is_valid_stop_schema:
+        # Multi-token contiguous cycles (period 5..64 repeated >= 4 times back-to-back).
+        pos_by_gram: dict[tuple[Any, ...], list[int]] = {}
+        for idx, g in enumerate(grams):
+            if counts[g] >= 4:
+                pos_by_gram.setdefault(g, []).append(idx)
+        for positions in pos_by_gram.values():
+            p_len = len(positions)
+            for idx_a in range(p_len):
+                start = positions[idx_a]
+                if flagged[start]:
+                    continue
+                for idx_b in range(idx_a + 1, p_len):
+                    period = positions[idx_b] - start
+                    if period < 5:
+                        continue
+                    if period > 64:
+                        break
+                    block = seq[start : start + period]
+                    cycles = 1
+                    cursor = start + period
+                    while cursor + period <= n and seq[cursor : cursor + period] == block:
+                        cycles += 1
+                        cursor += period
+                    if cycles >= 4:
+                        end_gram = min(m, start + cycles * period - 3)
+                        for pos in range(start, end_gram):
+                            flagged[pos] = True
+                        break
+
+        w_counts: dict[tuple[Any, ...], int] = {}
+        for g in tail_grams:
+            w_counts[g] = w_counts.get(g, 0) + 1
+
+        if is_length_stop:
+            # Truncated outputs hitting max_tokens remain strict on both global and tail repetition.
+            for idx, g in enumerate(grams):
+                if counts[g] >= 8:
+                    flagged[idx] = True
+            for j, g in enumerate(tail_grams):
+                if w_counts[g] >= 4:
+                    flagged[tail_start + j] = True
+        elif wm >= 16 and (float(len(w_counts)) / float(wm)) <= 0.28:
+            # Non-contiguous boilerplate in long valid solutions keeps high 4-gram diversity;
+            # tail-window collapse has both low diversity and repeated tail 4-grams.
+            for j, g in enumerate(tail_grams):
+                if w_counts[g] >= 4:
+                    flagged[tail_start + j] = True
+
+    global_rate = float(sum(1 for f in flagged if f)) / float(m)
+    tail_rate = float(sum(1 for f in flagged[tail_start:] if f)) / float(wm) if wm > 0 else 0.0
+    return max(global_rate, tail_rate)
 
 
 def check_chat_validity(
@@ -217,9 +289,14 @@ def check_chat_validity(
     finish_reason: str = "stop",
     token_ids: Sequence[int] | None = None,
     repeat_threshold: float = 0.15,
+    valid_schema: bool | None = None,
 ) -> tuple[bool, float]:
     """Cat 3 item validity: non-empty, ``finish_reason != 'length'``, and ``repeat_4gram_rate < 0.15``."""
-    rep = repeat_4gram_rate(token_ids if token_ids is not None else text)
+    rep = repeat_4gram_rate(
+        token_ids if token_ids is not None else text,
+        finish_reason=finish_reason,
+        valid_schema=valid_schema,
+    )
     ok = bool((text or "").strip()) and str(finish_reason) != "length" and rep < float(repeat_threshold)
     return ok, rep
 

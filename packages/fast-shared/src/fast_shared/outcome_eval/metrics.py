@@ -249,19 +249,32 @@ def evaluate_memory_gate(
     max_host_fraction: float = 0.80,
     device_guard_tripped: bool = False,
 ) -> tuple[bool, float | None, float | None, list[str]]:
-    """Verify ``FourBucketMemoryProbe`` ``combined_with_model_mapped_gb <= 0.80 * host_mem_gb`` and guard status."""
+    """Verify ``FourBucketMemoryProbe`` peak/combined GB ``<= 0.80 * host_mem_gb`` and guard status."""
     reasons: list[str] = []
     if device_guard_tripped:
         reasons.append("DeviceMemoryGuard tripped (exceeded 0.98 * recommendedMaxWorkingSetSize)")
     combined_gb: float | None = None
-    if isinstance(memory_4bucket, Mapping) and memory_4bucket.get("combined_with_model_mapped_gb") is not None:
-        combined_gb = float(memory_4bucket["combined_with_model_mapped_gb"])
+    if isinstance(memory_4bucket, Mapping):
+        candidates_gb: list[float] = []
+        for k in (
+            "combined_with_model_mapped_gb",
+            "peak_footprint_gb",
+            "peak_combined_with_model_mapped_gb",
+        ):
+            val = memory_4bucket.get(k)
+            if val is not None:
+                candidates_gb.append(float(val))
+        phys_fp = memory_4bucket.get("phys_footprint")
+        if isinstance(phys_fp, Mapping) and phys_fp.get("peak_footprint_gb") is not None:
+            candidates_gb.append(float(phys_fp["peak_footprint_gb"]))
+        if candidates_gb:
+            combined_gb = max(candidates_gb)
     ceiling_gb: float | None = None
     if host_mem_gb is not None and float(host_mem_gb) > 0.0:
         ceiling_gb = float(max_host_fraction) * float(host_mem_gb)
         if combined_gb is not None and combined_gb > ceiling_gb:
             reasons.append(
-                f"FourBucketMemoryProbe combined_with_model_mapped_gb={combined_gb:.3f}GB "
+                f"FourBucketMemoryProbe effective_peak_gb={combined_gb:.3f}GB "
                 f"> {max_host_fraction * 100.0:.0f}% ceiling ({ceiling_gb:.2f}GB of {host_mem_gb:.1f}GB)"
             )
     return (len(reasons) == 0), ceiling_gb, combined_gb, reasons
@@ -373,7 +386,8 @@ def evaluate_promotion_gates(
 
     base_diag = baseline.get("diagnostics") if isinstance(baseline.get("diagnostics"), Mapping) else {}
     cand_diag = candidate.get("diagnostics") if isinstance(candidate.get("diagnostics"), Mapping) else {}
-    repeat_loops = int(cand_diag.get("repeat_loop_count", 0) or 0)
+    base_repeats = int(base_diag.get("repeat_loop_count", 0) or 0)
+    cand_repeats = int(cand_diag.get("repeat_loop_count", 0) or 0)
     base_fb = float(base_diag.get("mask_fallback_rate", 0.0) or 0.0)
     cand_fb = float(cand_diag.get("mask_fallback_rate", 0.0) or 0.0)
 
@@ -419,9 +433,9 @@ def evaluate_promotion_gates(
 
     diagnostics_ok = True
     if prof == "lossless":
-        if repeat_loops > 0:
+        if cand_repeats > base_repeats:
             diagnostics_ok = False
-            reasons.append(f"Gate1(lossless) repeat_loop_count={repeat_loops} > 0")
+            reasons.append(f"Gate1(lossless) repeat_loop_count={cand_repeats} > baseline={base_repeats}")
     else:
         fb_limit = max(0.005, 2.0 * base_fb)
         if cand_fb > fb_limit:

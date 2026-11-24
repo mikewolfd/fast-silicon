@@ -33,6 +33,9 @@ Model format and input limits can differ within a model family. For example, Flu
 12. [v2.5 Cross-Model R&D Winners & Negative Gates (2026-11-22)](#12-v25-cross-model-rd-winners--negative-gates-2026-11-22)
 13. [Vision, OCR (`Category 5`) & Apple10 NAX Prefill Validation (2026-11-23)](#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23)
 14. [v3.0 Vision Prefetch, NAX Meta-Only Packing, Multimodal MTP, and OCR Confidence (2026-11-23)](#14-v30-vision-prefetch-nax-meta-only-packing-multimodal-mtp-and-ocr-confidence-2026-11-23)
+15. [Dual-Mac Full 4-Suite Verification and Post-Fix Reruns (2026-11-24)](#15-dual-mac-full-4-suite-verification-and-post-fix-reruns-2026-11-24)
+16. [Validated Engine, Default & Laya FP16 LayerNorm Fixes (2026-11-24)](#16-validated-engine-default--laya-fp16-layernorm-fixes-2026-11-24)
+17. [Saved Benchmark Receipts Index](#17-saved-benchmark-receipts-index)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -343,7 +346,7 @@ The BGE and EmbeddingGemma project probes start with token IDs. Historical stock
 | EmbeddingGemma, stock `mlx-vlm`, text inputs | 46.05 documents/s, 8.39 ms for one query | 64.91 documents/s, 8.48 ms for one query |
 | `fast-pplx`, 24 short and four long inputs | 12,624 tokens/s | 16,796 tokens/s (1.33× the M4 Pro rate) |
 | Kev, 64 short fixtures in batches of eight, project / stock `mlx-lm` | 54.52 / 62.13 questions/s | 86.84 questions/s project (scored stock short-fixture probe not rerun on M5; 1,400-item decision suite: 4.395 vs 5.039 score units/s in [Decision scoring](#decision-models)) |
-| Laya, `fast-decision-models` Neural Engine scorer | 41.91 questions/s | 44.38 questions/s |
+| Laya, `fast-decision-models` 6-bucket ANE / `laya-hetero` (`1x_s64..64x_mixed`) | `195.7` q/s (`1x_s64`), `62.2` / `51.4` q/s (`64x_mixed`) *(vs GPU `33.0` q/s, contended)* | `153.1` q/s (`1x_s64`), `63.5` / `110.6` q/s (`64x_mixed`) *(vs GPU `81.6` q/s, quiescent)* |
 
 The PPLX package also reports fixed-length runs. For public Kev performance when eight questions share one short passage, use the shared-passage results. [PPLX workloads](../packages/fast-pplx/README.md) · [Public Kev warm timings](#warm-query-corpus-and-packing)
 
@@ -981,7 +984,51 @@ Machine-readable receipt combining all 4 baseline suites (`monorepo`, `outcomes_
    - **Base M5 (2-round contended rerun with stock `mlx-vlm`):** `free_b1` **`1.677×`** vs AR, `free_b4` **`0.560× -> 0.967×`** vs AR, `json_b1` **`1.648×`** vs AR (`33.5 vs 15.6 tok/s` unrestricted `mlx-vlm` = **`2.15×`**), `json_b4` **`0.861× -> 1.002×`** vs AR (`59.7 vs 45.5 tok/s` unrestricted `mlx-vlm`), `9.300 GB` peak, **`10/10` exact AR/MTP token matches** (up from `5/10`).
 4. **`setup_all.py` offline `qwen3` readiness & Category 3/4 repeat-loop probe:** Updating `_plan_qwen3` in `scripts/setup_all.py` to check `Qwen3Paths.is_complete_snapshot` made `setup_all.py --dry-run` report **`[READY]` across all 7 packages (`0.00 GB` pending)** on both Macs. Probing the `fast-gemma4` `math_500` first 16 items found the flagged item (`rep4=0.194`) finished cleanly with `finish_reason="stop"` and `exact_3x_periods=[]` (algebraic phrase reuse over 1,330 valid tokens rather than a cyclic loop), and a batched `fast-qwen3` `bfcl_v3` probe (`150` items) had `0` `length` truncations and `0` `rep4 >= 0.15` flags, so `compute_loop_breaker_penalties` remains unchanged.
 
-## 16. Saved Benchmark Receipts Index
+## 16. Validated Engine, Default & Laya FP16 LayerNorm Fixes (2026-11-24)
+
+Machine-readable receipt covering the dual-Mac Wave 3 post-fix verification runs, 6-shape Laya matrix, and Laya Core ML FP16 LayerNorm root-cause repair: [`benchmarks/rca-and-laya-fixes-20261124.json`](benchmarks/rca-and-laya-fixes-20261124.json).
+
+- **Quiescence & contention disclosures:**
+  - All Wave 3 **Base Apple M5 (`24 GB`, `macOS 27.2.1`)** runs executed **quiescent** (zero system quiescence warnings).
+  - All Wave 3 **Apple M4 Pro (`48 GB`, `macOS 26.6`)** runs executed with `--allow-contended` alongside active desktop/compositor/VM background load; compare internal backend/baseline deltas rather than raw wall-clock speeds across contended vs quiescent hosts.
+
+### 16.1 Laya-Typed-421M 6-Bucket Multifunction Core ML & Two-Pass FP16 LayerNorm Repair
+
+Restoring explicit two-pass centered `LayerNorm` (`reduce_mean -> sub -> mul(ln_gain) -> sq -> reduce_mean -> add(eps_u) -> rsqrt -> mul`) across all 6 multifunction buckets (`s64, s128, s192, s256, s384, s512`) while fixing four live-activation numerical failure modes achieved **`[10538, 0, 0]` (`100%` `CPU_AND_NE`)** placement and **`711/1400` (`0.5079` `S_obj,e2e`, `PASS`)** on **both** Macs (up from `707/1400` / `0.5050` baseline, and recovering from the `697/1400` regression):
+
+- **`tok_emb` (`base_inv_scale 1.0 -> 4.0`):** `var_min=0.0007` suffered `+8.7%` `FP16_MIN_NORMAL` (`6.1e-5`) variance inflation; scaling by `4.0` lifts `var(u) >= 0.0112` (`u^2 <= 58`).
+- **`l14..l18` (`s_eff_floor 1/256 -> 1/128`, `ln_gain=2.0`):** Real `RewardBench-2` activations (`max|xc|=11,255.2`, `var_min=7.11..14.39`) dropped to `var(u)=1.08e-4` next to `eps_u=6.1e-5` (`+56%` variance inflation across 10 consecutive LNs, dropping `RB2` `75/250 -> 63/250`); `1/128` keeps `var(u) >= 4.34e-4` with `max u^2 = 7,733 << 65,504`.
+- **`l19..l27` (`max_ln_gain=4.0`):** Caps `s_eff=1/256` on late layers (`max|xc|=31,851`, `u^2 <= 15,480 << 65,504`).
+- **Head/scorer LNs (`hl0_n1`, `hl0_n2`, `hl1_n1`, `hl1_n2`, `sc_ln`: `base_inv_scale 0.25 -> 0.0625`):** Eliminated `u^2 = 67,379..113,232 > 65,504` FP16 `INF` overflow (`max u^2 = 7,077`).
+- **Pass removal after `cto.linear_quantize_weights` + split-head `mb.einsum`:** Removed `common::fuse_elementwise_to_batchnorm`, `common::add_fp16_cast`, and `common::fuse_layernorm_or_instancenorm` after weight quantization so `0` `mb.layer_norm` ops remain in `model.mil`, and retained split-head `mb.einsum` (`1.44×` faster than `mb.matmul` on Base M5 `RB2`: `37.33 s` vs `53.41 s`, `75/250` `0.3000`, `max_diff=0.07494` vs `gpu_bf16`).
+
+| Model & Backend (`Tier-1`, `1,400` items) | M4 Pro (`--allow-contended`) `S_obj,e2e` / `EOT` / Wall / Mem | Base M5 (quiescent) `S_obj,e2e` / `EOT` / Wall / Mem | Notes |
+|---|---|---|---|
+| `fast-decision-models` (`laya-ane`, 6-bucket pre-warmed) | **`0.5079` (`711/1400`)**, `5.341`, `133.12 s`, `1.516 GB`, `PASS` | **`0.5079` (`711/1400`)**, **`9.266`**, **`76.73 s`**, `1.593 GB`, `PASS` | `1.50×` faster than Nov 20 M5 `laya-ane` (`114.8 s`) and **`1.15×` faster than NMTZ Core ML (`88.4 s`)** |
+| `fast-decision-models` (`laya-hetero`, ANE + compiled MLX GPU) | **`0.5050` (`707/1400`)**, **`11.932`**, **`59.25 s`**, `3.295 GB`, `PASS` | `0.5029` (`704/1400`), **`18.586`**, **`37.88 s`**, `3.722 GB`, `PASS` | `compile_encode=True`, makespan split, `n=1` zero-thread fast path; **`3.03×` faster than Nov 20 M5 `laya-ane`** |
+| `fast-decision-models` (`kev-0.8b`, `kev_mlx` NAX `bf16` guard) | *— (baseline `0.5257`)* | **`0.5257`**, **`4.885`**, `150.67 s`, `2.227 GB`, `PASS` | `ragtruth 0.645` (`0.610` AUROC), `clinc 0.498`, `rb2 0.300`, `0` loops |
+
+| Laya 6-Shape Matrix (`ms` / `q/s`) | M4 Pro ANE | M4 Pro GPU | M4 Pro Hetero | Base M5 ANE | Base M5 GPU | Base M5 Hetero |
+|---|---:|---:|---:|---:|---:|---:|
+| `1x_s64` | **`5.11` (`195.7`)** | `8.87` (`112.7`) | `5.33` (`187.7`) | **`6.53` (`153.1`)** | `10.30` (`97.1`) | `6.54` (`152.9`) |
+| `1x_short` | **`5.09` (`196.6`)** | `12.80` (`78.2`) | `5.39` (`185.5`) | **`6.53` (`153.1`)** | `11.97` (`83.5`) | `6.53` (`153.2`) |
+| `8x_512` | `377.09` (`21.2`) | `679.27` (`11.8`) | **`284.21` (`28.2`)** | `342.53` (`23.4`) | `263.37` (`30.4`) | **`172.71` (`46.3`)** |
+| `64x_short` | **`325.34` (`196.7`)** | `487.51` (`131.3`) | `331.27` (`193.2`) | `411.94` (`155.4`) | `210.78` (`303.6`) | **`200.98` (`318.4`)** |
+| `64x_mixed` | **`1028.97` (`62.2`)** | `1939.23` (`33.0`) | `1244.54` (`51.4`) | `1008.38` (`63.5`) | `783.95` (`81.6`) | **`578.90` (`110.6`)** |
+
+### 16.2 Post-Fix `fast-qwen3`, `fast-ocr`, `fast-embeddinggemma-2` Vision & `fast-pplx` Results
+
+| Package & Workload | M4 Pro (`--allow-contended`) | Base M5 (quiescent) | Validation Delta / Notes |
+|---|---|---|---|
+| `fast-qwen3` Cat 4 (`LiquidAI 150 + BFCL v3 150`) | `299/300`, `0.8930` (`F1=0.9526`, `BFCL=0.8333`), `0.676` EOT, `396.52 s`, `4.990 GB`, `2` loops | **`300/300`**, **`0.8955`** (`F1=0.9510`, `BFCL=0.8400`), **`0.881` EOT**, `305.08 s`, `4.760 GB`, **`0` loops (`PASS`)** | Removing blind `bs >= 32` `q4_quarot` eliminated `BFCL[116]` looping and flipped Base M5 Cat 4 from `FAIL` to `300/300 PASS` |
+| `fast-qwen3` Cat 3 (`MMLU 285 + IFBench 100 + MATH-500 50`) | `396/435`, `0.6368`, `0.715` EOT, `387.28 s`, `4.262 GB`, `12` loops (`MMLU 285/285 0.7860 0 loops`, `IFBench 72/100 7 loops`, `MATH 39/50 5 loops`) | `394/435`, `0.6598`, **`0.562` EOT** (**`1.44×`** vs `0.391`), `510.44 s`, `4.206 GB`, `6` loops (`MMLU 285/285 0.7895 0 loops`, `MATH 40/50 0.7200 0 loops`, `IFBench 69/100 6 loops`) | Lazy GPU argmax + `make_cache(batch_size)` lifted Base M5 Cat 3 EOT `1.44×` and cleared `MATH-500` loops (`5 -> 0`) |
+| `fast-ocr` `olmOCR-bench(42)` | **`42/42`**, **`0.6155`**, `0.0689` EOT, `375.43 s`, `5.624 GB`, **`PASS` (`0` loops)** | `41/42`, **`0.6128`**, `0.0626` EOT, `411.09 s`, `5.445 GB`, `1` loop | Triage + `_resolve_ovis_min_pixels` lifted `olmOCR` **`+13.65 pp`** (M4 Pro `0.4790 -> 0.6155`) and **`+21.34 pp`** (Base M5 `0.3994 -> 0.6128`) |
+| `fast-ocr` `FinTabNet-OTSL(30)` | **`30/30`**, **`0.8935`** (`NumF1=0.8829`), **`1.0189` EOT**, `26.31 s`, `5.313 GB`, **`PASS`** | **`30/30`**, **`0.8867`** (`NumF1=0.8808`), `0.9303` EOT, `28.60 s`, `4.002 GB`, **`PASS`** | **`+5.57 pp`** M4 Pro (`0.8378 -> 0.8935`) and **`+2.68 pp`** Base M5 (`0.8599 -> 0.8867`) |
+| `fast-ocr` `OmniDocBench-EN(24)` | **`22/24`**, **`0.6574`**, `0.0895` EOT, `176.35 s`, `5.735 GB`, **`PASS` (`0` loops)** | **`22/24`**, **`0.6872`**, `0.0899` EOT, `183.52 s`, `5.825 GB`, **`PASS` (`0` loops)** | Flipped **both** Macs from `FAIL` (`0.5805` / `0.5820`) to **`PASS`** (**`+7.69 pp`** M4 Pro / **`+10.52 pp`** Base M5); all 3 OCR suites `PASS` on M4 Pro |
+| `fast-embeddinggemma-2` Vision `VisualRetrieval(18)` | `18/18`, `0.9722`, **`9.909` EOT**, `1.77 s` (`11.63 img/s`), `3.532 GB` (`neural=0.0`), **`PASS`** | **`18/18`**, **`1.0000`**, **`11.207` EOT**, `1.61 s` (`15.06 img/s`), `3.558 GB` (`neural=0.0`), **`PASS`** | `enable_ane=None` avoids loading ANE text buckets on vision runs (`0.0 GB` ANE footprint; `1.77 s` vs `5.01 s` M4 Pro contended) |
+| `fast-pplx` `hetero2` vs `gpu` (`benchmark.py`) | `B=1` `6.50 ms` (`0.89×`), `B=32` `9,249 tok/s` (`1.34×`), `S=256` `21,345` (`1.81×`), `S=512` `19,060` (`1.62×`), `mixed` `15,212` (`1.47×`) | `B=1` **`5.80 ms` (`1.22×`)**, `B=32` `9,098` (`0.85×`), `S=256` **`27,234` (`1.41×`)**, `S=512` **`28,415` (`1.46×`)**, `mixed` **`22,273` (`1.34×`)** | Apple9 (`B=1` GPU default) + Base M5 `hetero2` (`5.80 ms` `B=1` / `55.5 docs/s` `S=512` / `545 ms` `mixed`) |
+
+## 17. Saved Benchmark Receipts Index
 
 | Artifact | Scope |
 |---|---|
@@ -999,3 +1046,4 @@ Machine-readable receipt combining all 4 baseline suites (`monorepo`, `outcomes_
 | [`benchmarks/v25-rd-winners-20261122.json`](benchmarks/v25-rd-winners-20261122.json) | `v2.5` `MaxSim` `32K`, `MRL + INT8`, `QuaRot` KV & CoreAI gates (`Section 12`) |
 | [`benchmarks/v30-validation-20261123.json`](benchmarks/v30-validation-20261123.json) | `v3.0` vision prefetch, NAX meta-only XOR, multimodal `MTP`, OCR confidence & negative gates (`Section 14`) |
 | [`benchmarks/dual-mac-suite-20261124.json`](benchmarks/dual-mac-suite-20261124.json) | 2026-11-24 dual-Mac 4-suite baseline & targeted post-fix rerun receipts (`Section 15`) |
+| [`benchmarks/rca-and-laya-fixes-20261124.json`](benchmarks/rca-and-laya-fixes-20261124.json) | 2026-11-24 Wave 3 dual-Mac post-fix outcomes, 6-shape Laya matrix & Laya FP16 LayerNorm RCA (`Section 16`) |

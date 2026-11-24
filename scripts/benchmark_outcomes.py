@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import gc
 import hashlib
 import html
 import json
@@ -34,10 +35,13 @@ import numpy as np
 
 from fast_shared.bench import (
     DeviceMemoryGuard,
+    EXIT_SKIP,
     FourBucketMemoryProbe,
     check_system_quiescence,
     collect_env_telemetry,
+    run_isolated_json_worker,
     wired_limit,
+    write_worker_json,
 )
 from fast_shared.embeddings import accepts_kwarg
 from fast_shared.outcome_eval import (
@@ -547,7 +551,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
     p.add_argument("--mtp-drafter", action="store_true")
     p.add_argument("--mtp-drafter-path", default=None)
-    p.add_argument("--backend", choices=("all", "laya-ane", "kev-0.8b"), default="all")
+    p.add_argument("--backend", choices=("all", "laya-ane", "laya-hetero", "kev-0.8b"), default="all")
     p.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="w8")
     p.add_argument("--batch-docs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=None)
@@ -847,10 +851,11 @@ def _run_cat1_worker(
         all_scores: list[float] = []
         sub_reports: dict[str, Any] = {}
         mrl_deltas: list[float] = []
+        nb_vec_cache: dict[str, tuple[list[str], Any, list[str], Any, dict[str, Any]]] = {}
 
         t0 = time.perf_counter()
 
-        # 1A: NanoBEIR-en + zero-recompute MRL x dtype sweep
+        # 1A: NanoBEIR-en primary retrieval encoding & scoring
         nb_ndcgs: list[float] = []
         for sub in subsets:
             pack = nb_loaded[sub]
@@ -868,21 +873,7 @@ def _run_cat1_worker(
             r_main = evaluate_retrieval_rankings(
                 q_ids, q_vecs, d_ids, d_vecs, pack["qrels"], k=10, expect_unit_norm=nb_pre_normalized
             )
-            grid = evaluate_mrl_dtype_grid(
-                q_ids,
-                q_vecs,
-                d_ids,
-                d_vecs,
-                pack["qrels"],
-                dims=mrl_dims,
-                dtypes=("f32", "f16", "int8"),
-                int8_mode=int8_mode,
-                pre_normalized=nb_pre_normalized,
-                k=10,
-            )
             nb_ndcgs.append(float(r_main["ndcg@10"]))
-            if grid.get("mrl_128_int8_delta_ndcg@10") is not None:
-                mrl_deltas.append(float(grid["mrl_128_int8_delta_ndcg@10"]))
             valid, scores, coverage = _retrieval_query_outcomes(q_ids, r_main, "per_query_ndcg")
             all_valid.extend(valid)
             all_scores.extend(scores)
@@ -892,15 +883,15 @@ def _run_cat1_worker(
                 "ndcg@10": round(float(r_main["ndcg@10"]), 6),
                 "mrr@10": round(float(r_main["mrr@10"]), 6),
                 "recall@10": round(float(r_main["recall@10"]), 6),
-                "mrl_grid": grid,
             }
             if sub in skipped_unjudged_by_sub:
                 sub_entry["skipped_unjudged_query_ids"] = skipped_unjudged_by_sub[sub]
             sub_reports[sub] = sub_entry
+            nb_vec_cache[sub] = (q_ids, q_vecs, d_ids, d_vecs, pack)
 
-        # 1B: LegalBench-RAG isolated (plus ~2K coarse chunks for fast-embeddinggemma-2 and contextual lift for fast-pplx)
-        contextual_lift = None
-        coarse_2k_lift = None
+        # 1B: LegalBench-RAG isolated primary encoding & scoring (325 core queries total on Tier-1)
+        r_iso: dict[str, Any] | None = None
+        lb_q_vecs: Any = None
         if lb_queries and lb_flat_chunks:
             lb_q_vecs = _enc_q(lb_q_texts)
             lb_iso_vecs = _enc_d([ch.text for ch in lb_flat_chunks])
@@ -914,52 +905,8 @@ def _run_cat1_worker(
                 "span_ndcg@10": round(float(r_iso["span_ndcg@10"]), 6),
                 "char_recall@10": round(float(r_iso["char_recall@10"]), 6),
             }
-            if _enc_ctx is not None:
-                doc_chunk_texts = [[ch.text for ch in lb_chunks_by_doc[did]] for did in lb_doc_ids]
-                ctx_mats = _enc_ctx(doc_chunk_texts)
-                _mx_sync()
-                if [len(mat) for mat in ctx_mats] != [len(doc) for doc in doc_chunk_texts]:
-                    raise ValueError("Contextual embedding count differs from the intended chunks per document")
-                lb_ctx_vecs = np.vstack(ctx_mats) if ctx_mats else np.zeros((0, lb_q_vecs.shape[1]), dtype=np.float32)
-                r_ctx = evaluate_legalbench_spans(lb_queries, lb_flat_chunks, lb_q_vecs, lb_ctx_vecs, k=10)
-                contextual_lift = compute_contextual_lift(r_iso, r_ctx, k=10)
-                valid, scores, coverage = _retrieval_query_outcomes(lb_q_ids, r_ctx, "per_query_span_ndcg")
-                sub_reports["legalbench_rag_contextual"] = {
-                    **coverage,
-                    "span_ndcg@10": round(float(r_ctx["span_ndcg@10"]), 6),
-                    "char_recall@10": round(float(r_ctx["char_recall@10"]), 6),
-                    **contextual_lift,
-                }
-                all_valid.extend(valid)
-                all_scores.extend(scores)
-            elif _enc_coarse_2k is not None:
-                lb_coarse_chunks = [
-                    ch
-                    for did in lb_doc_ids
-                    for ch in chunk_document_char_spans(did, lb_pack["corpus_texts"][did], chunk_chars=6144, overlap_chars=0)
-                ]
-                lb_coarse_vecs = _enc_coarse_2k([ch.text for ch in lb_coarse_chunks])
-                _mx_sync()
-                r_coarse = evaluate_legalbench_spans(lb_queries, lb_coarse_chunks, lb_q_vecs, lb_coarse_vecs, k=10)
-                coarse_2k_lift = compute_contextual_lift(r_iso, r_coarse, k=10)
-                valid, scores, coverage = _retrieval_query_outcomes(lb_q_ids, r_coarse, "per_query_span_ndcg")
-                sub_reports["legalbench_rag_coarse_2k"] = {
-                    **coverage,
-                    "n_chunks": len(lb_coarse_chunks),
-                    "chunk_chars": 6144,
-                    "max_tokens": coarse_max_tokens,
-                    "span_ndcg@10": round(float(r_coarse["span_ndcg@10"]), 6),
-                    "char_recall@10": round(float(r_coarse["char_recall@10"]), 6),
-                    "coarse_2k_delta_ndcg@10": coarse_2k_lift["contextual_delta_ndcg@10"],
-                    "se_paired": coarse_2k_lift["se_paired"],
-                }
-                all_valid.extend(iso_valid)
-                all_scores.extend(iso_scores)
-                all_valid.extend(valid)
-                all_scores.extend(scores)
-            else:
-                all_valid.extend(iso_valid)
-                all_scores.extend(iso_scores)
+            all_valid.extend(iso_valid)
+            all_scores.extend(iso_scores)
 
         # 1C: Tier-2 LongEmbed (fast-pplx / public-pplx 4K-32K)
         if tier == "tier2" and pkg_name in ("fast-pplx", "public-pplx") and not smoke:
@@ -1055,6 +1002,69 @@ def _run_cat1_worker(
 
         _mx_sync()
         wall_sec = time.perf_counter() - t0
+
+        # Auxiliary ablations (MRL/dtype sweep, contextual lift, coarse 2K lift) excluded from primary wall_sec & 325-item n_items
+        t_abl0 = time.perf_counter()
+        for sub, (q_ids, q_vecs, d_ids, d_vecs, pack) in nb_vec_cache.items():
+            grid = evaluate_mrl_dtype_grid(
+                q_ids,
+                q_vecs,
+                d_ids,
+                d_vecs,
+                pack["qrels"],
+                dims=mrl_dims,
+                dtypes=("f32", "f16", "int8"),
+                int8_mode=int8_mode,
+                pre_normalized=nb_pre_normalized,
+                k=10,
+            )
+            if grid.get("mrl_128_int8_delta_ndcg@10") is not None:
+                mrl_deltas.append(float(grid["mrl_128_int8_delta_ndcg@10"]))
+            sub_reports[sub]["mrl_grid"] = grid
+
+        contextual_lift = None
+        coarse_2k_lift = None
+        if r_iso is not None and lb_q_vecs is not None:
+            if _enc_ctx is not None:
+                doc_chunk_texts = [[ch.text for ch in lb_chunks_by_doc[did]] for did in lb_doc_ids]
+                ctx_mats = _enc_ctx(doc_chunk_texts)
+                _mx_sync()
+                if [len(mat) for mat in ctx_mats] != [len(doc) for doc in doc_chunk_texts]:
+                    raise ValueError("Contextual embedding count differs from the intended chunks per document")
+                lb_ctx_vecs = np.vstack(ctx_mats) if ctx_mats else np.zeros((0, lb_q_vecs.shape[1]), dtype=np.float32)
+                r_ctx = evaluate_legalbench_spans(lb_queries, lb_flat_chunks, lb_q_vecs, lb_ctx_vecs, k=10)
+                contextual_lift = compute_contextual_lift(r_iso, r_ctx, k=10)
+                _, _, coverage = _retrieval_query_outcomes(lb_q_ids, r_ctx, "per_query_span_ndcg")
+                sub_reports["legalbench_rag_contextual"] = {
+                    **coverage,
+                    "span_ndcg@10": round(float(r_ctx["span_ndcg@10"]), 6),
+                    "char_recall@10": round(float(r_ctx["char_recall@10"]), 6),
+                    **contextual_lift,
+                }
+            elif _enc_coarse_2k is not None:
+                lb_coarse_chunks = [
+                    ch
+                    for did in lb_doc_ids
+                    for ch in chunk_document_char_spans(did, lb_pack["corpus_texts"][did], chunk_chars=6144, overlap_chars=0)
+                ]
+                lb_coarse_vecs = _enc_coarse_2k([ch.text for ch in lb_coarse_chunks])
+                _mx_sync()
+                r_coarse = evaluate_legalbench_spans(lb_queries, lb_coarse_chunks, lb_q_vecs, lb_coarse_vecs, k=10)
+                coarse_2k_lift = compute_contextual_lift(r_iso, r_coarse, k=10)
+                _, _, coverage = _retrieval_query_outcomes(lb_q_ids, r_coarse, "per_query_span_ndcg")
+                sub_reports["legalbench_rag_coarse_2k"] = {
+                    **coverage,
+                    "n_chunks": len(lb_coarse_chunks),
+                    "chunk_chars": 6144,
+                    "max_tokens": coarse_max_tokens,
+                    "span_ndcg@10": round(float(r_coarse["span_ndcg@10"]), 6),
+                    "char_recall@10": round(float(r_coarse["char_recall@10"]), 6),
+                    "coarse_2k_delta_ndcg@10": coarse_2k_lift["contextual_delta_ndcg@10"],
+                    "se_paired": coarse_2k_lift["se_paired"],
+                }
+        _mx_sync()
+        ablation_wall_sec = time.perf_counter() - t_abl0
+
         _, ref_end = guard.check()
         if ref_end is not None:
             guard_tripped = True
@@ -1069,6 +1079,7 @@ def _run_cat1_worker(
             "contextual_delta_ndcg10": contextual_lift["contextual_delta_ndcg@10"] if contextual_lift else None,
             "coarse_2k_delta_ndcg10": coarse_2k_lift["contextual_delta_ndcg@10"] if coarse_2k_lift else None,
             "coarse_max_tokens": coarse_max_tokens,
+            "ablation_wall_sec": round(ablation_wall_sec, 4),
             "skipped_unjudged_query_ids": skipped_unjudged_by_sub,
             "device_guard_tripped": guard_tripped,
             "repeat_loop_count": 0,
@@ -1176,11 +1187,17 @@ def _run_cat2_single_backend(
     cl_s2_qdefs = {dom: build_clinc_stage2_qdef(dom) for dom in CLINC150_DOMAINS}
     rb_qdef = build_rewardbench2_score_qdef()
 
-    is_laya = backend_name in ("laya-ane", "public-laya", "coreai-laya", "coreml-laya")
+    is_laya = backend_name in ("laya-ane", "laya-hetero", "public-laya", "coreai-laya", "coreml-laya")
     if backend_name == "laya-ane":
         laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
         eng: Any = LayaAneBackend(laya_dir, ensure_laya_dylib(), pipe_depth=4)
         eff_label = config_label or "laya_ane"
+    elif backend_name == "laya-hetero":
+        from fast_decision_models.laya_hetero import LayaHeteroEngine
+
+        laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
+        eng = LayaHeteroEngine(laya_dir, ensure_laya_dylib(), mode="hetero", pipe_depth=4)
+        eff_label = config_label or "laya_hetero"
     elif backend_name == "public-laya":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import PublicLayaMlxBackend
@@ -1574,11 +1591,13 @@ def _run_llm_worker(
         batch_sz = int(extra.batch_size)
     elif pkg_name in ("fast-gemma4", "public-gemma4"):
         batch_sz = 64 if host_mem_gb >= 36.0 else 32
-    elif pkg_name in ("fast-gpt-oss", "public-gpt-oss", "fast-qwen3", "public-qwen3.5", "coreai-qwen3.5-4b"):
+    elif pkg_name in ("fast-qwen3", "public-qwen3.5", "coreai-qwen3.5-4b"):
+        batch_sz = 16 if 0 < host_mem_gb < 36.0 else 32
+    elif pkg_name in ("fast-gpt-oss", "public-gpt-oss"):
         batch_sz = 8 if 0 < host_mem_gb < 36.0 else 16
     else:
         batch_sz = 16
-    if pkg_name in ("fast-gpt-oss", "public-gpt-oss", "fast-qwen3", "public-qwen3.5", "coreai-qwen3.5-4b") and 0 < host_mem_gb < 36.0:
+    if pkg_name in ("fast-gpt-oss", "public-gpt-oss") and 0 < host_mem_gb < 36.0:
         batch_sz = min(batch_sz, 8)
     use_mtp = bool(extra.mtp_drafter or extra.mtp_drafter_path)
 
@@ -2685,6 +2704,8 @@ def _run_cat5_worker(
             "generated_tokens": int(st.get("completion_tokens", getattr(item, "completion_tokens", 0)) or 0),
             "prompt_tokens": int(st.get("prompt_tokens", getattr(item, "prompt_tokens", 0)) or 0),
             "visual_tokens": int(st.get("vision_tokens", 0) or 0),
+            "used_speculative": bool(st.get("used_speculative", False)),
+            "speculative_backend": st.get("speculative_backend"),
             "decode_tps": float(st.get("decode_tok_s", 0.0) or 0.0),
             "decode_ms": float(st.get("decode_sec", 0.0) or 0.0) * 1000.0,
             "vit_ms": float(st.get("vision_sec", 0.0) or 0.0) * 1000.0,
@@ -2888,6 +2909,8 @@ def _run_cat5_worker(
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
                     preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
+                    del pre_imgs
+                    gc.collect()
                 else:
                     preds, reasons, metas = [], [], []
                     for it in items:
@@ -2915,7 +2938,13 @@ def _run_cat5_worker(
                     "output_format": extra.output_format,
                     "render_only": bool(extra.ocr_render_only),
                     "dpi": int(extra.ocr_dpi),
-                    "speculative": extra.speculative if pkg_name == "fast-ocr" else "off",
+                    "speculative": (
+                        next((str(m["speculative_backend"]) for m in metas if m.get("speculative_backend")), "mtp")
+                        if any(m.get("used_speculative") for m in metas)
+                        else "off"
+                    )
+                    if pkg_name == "fast-gemma4-vision"
+                    else (extra.speculative if pkg_name == "fast-ocr" else "off"),
                     "crop_margins": (not bool(extra.no_crop_margins)) if pkg_name == "fast-ocr" else False,
                     "auto_orient": (not bool(extra.no_auto_orient)) if pkg_name == "fast-ocr" else False,
                     "overall_macro": ev["overall_macro"],
@@ -2945,6 +2974,8 @@ def _run_cat5_worker(
                 pils = [_bytes_to_pil(it["image_bytes"]) for it in items]
                 t0 = time.perf_counter()
                 preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="table")
+                del pils
+                gc.collect()
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -2998,9 +3029,14 @@ def _run_cat5_worker(
                 )
 
             elif suite_name == "omnidocbench_en":
-                pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
+                pils = []
+                for it in items:
+                    with Image.open(it["image_path"]) as im:
+                        pils.append(im.convert("RGB"))
                 t0 = time.perf_counter()
                 preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="page")
+                del pils
+                gc.collect()
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3075,6 +3111,8 @@ def _run_cat5_worker(
                     max_tokens_override=min(1024, int(extra.ocr_max_tokens)),
                     task_kind="page",
                 )
+                del pils
+                gc.collect()
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3139,6 +3177,8 @@ def _run_cat5_worker(
                     max_tokens_override=min(1536, int(extra.ocr_max_tokens)),
                     task_kind="page",
                 )
+                del pils
+                gc.collect()
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3206,6 +3246,8 @@ def _run_cat5_worker(
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
                     preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
+                    del pre_imgs
+                    gc.collect()
                 else:
                     preds, reasons, metas = [], [], []
                     with tempfile.TemporaryDirectory(prefix="doclaynet_gov_") as tmp_dir:
@@ -3271,9 +3313,14 @@ def _run_cat5_worker(
                 )
 
             elif suite_name in ("puredocbench_legal_gov", "puredocbench_en"):
-                pils = [Image.open(it["image_path"]).convert("RGB") for it in items]
+                pils = []
+                for it in items:
+                    with Image.open(it["image_path"]) as im:
+                        pils.append(im.convert("RGB"))
                 t0 = time.perf_counter()
                 preds, reasons, metas = _run_image_list_ocr(pils, suite_name=suite_name, task_kind="page")
+                del pils
+                gc.collect()
                 _mx_sync()
                 wall = time.perf_counter() - t0
                 _, ref = guard.check()
@@ -3338,15 +3385,17 @@ def _run_cat5_worker(
                     continue
                 pre_imgs = None
                 if bool(extra.ocr_render_only) and (pub_ad is None or pub_ad.supports_images):
-                    pre_imgs = [
-                        _render_pdf_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi), page_index=int(it.get("page_index", 0)))
-                        if it.get("pdf_path")
-                        else Image.open(it["image_path"]).convert("RGB")
-                        for it in suite_items
-                    ]
+                    pre_imgs = []
+                    for it in suite_items:
+                        if it.get("pdf_path"):
+                            pre_imgs.append(_render_pdf_page_pil(it["pdf_path"], dpi=int(extra.ocr_dpi), page_index=int(it.get("page_index", 0))))
+                        else:
+                            with Image.open(it["image_path"]) as im:
+                                pre_imgs.append(im.convert("RGB"))
                 t0 = time.perf_counter()
                 if pre_imgs is not None:
                     preds, reasons, metas = _run_image_list_ocr(pre_imgs, suite_name=suite_name, task_kind="page")
+                    del pre_imgs
                 else:
                     preds, reasons, metas = [], [], []
                     for it in suite_items:
@@ -3357,7 +3406,8 @@ def _run_cat5_worker(
                                 task_kind="page",
                             )
                         else:
-                            tx, fr, md = _run_image_ocr(Image.open(it["image_path"]).convert("RGB"), task_kind="page")
+                            with Image.open(it["image_path"]) as im:
+                                tx, fr, md = _run_image_ocr(im.convert("RGB"), task_kind="page")
                         preds.append(tx)
                         reasons.append(fr)
                         metas.append(md)
@@ -3696,7 +3746,12 @@ def _run_visual_retrieval_worker(
         from fast_embeddinggemma_2.engine import FastEmbeddingGemma2
 
         eff_mode = extra.mode or "gpu"
-        eng = FastEmbeddingGemma2(home=home, default_mode=eff_mode, warmup=False)
+        eng = FastEmbeddingGemma2(
+            home=home,
+            default_mode=eff_mode,
+            enable_ane=(eff_mode != "gpu"),
+            warmup=False,
+        )
         try:
             vdir = eng._resolve_vision_model_dir(getattr(extra, "vision_model_dir", None))
             model_dirs.append(vdir)
@@ -4067,15 +4122,10 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                 else:
                     raise
 
-    payload = json.dumps({"records": recs}, ensure_ascii=False)
     out_file = getattr(args, "worker_out_file", None)
-    if out_file:
-        out_path = Path(str(out_file))
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(out_path)
-    print(_WORKER_MARKER + payload, flush=True)
+    write_worker_json({"records": recs}, worker_out_file=out_file, marker=_WORKER_MARKER)
+    if recs and all(r.get("status") == "skipped" for r in recs):
+        return EXIT_SKIP
     return 0
 
 
@@ -4158,53 +4208,41 @@ def _spawn_isolated_worker(
         spec = _SPEC_BY_NAME[pkg_name]
         env.setdefault(spec.home_env_var, str(resolve_package_home(spec)))
 
-    import signal
+    res = run_isolated_json_worker(
+        cmd,
+        worker_out_arg="--worker-out-file",
+        marker=_WORKER_MARKER,
+        timeout_sec=int(args.timeout_sec),
+        cwd=_REPO_ROOT,
+        env=env,
+        skip_exit_codes=(EXIT_SKIP,),
+        stderr_tail_lines=20,
+    )
+    if res["timed_out"]:
+        return [
+            {
+                "package": pkg_name,
+                "category": _SPEC_BY_NAME[pkg_name].category if pkg_name in _SPEC_BY_NAME else 3,
+                "config_label": label or "default",
+                "status": "failed",
+                "error": f"timeout after {args.timeout_sec}s",
+                "stderr_tail": res["stderr_tail"],
+                "gate_verdict": "FAIL",
+            }
+        ]
+    payload = res.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        return list(payload["records"])
 
-    with tempfile.TemporaryDirectory(prefix="fs_worker_") as td:
-        worker_out_file = Path(td) / "worker_records.json"
-        worker_cmd = list(cmd) + ["--worker-out-file", str(worker_out_file)]
-        proc = subprocess.Popen(
-            worker_cmd,
-            cwd=str(_REPO_ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        try:
-            out_s, err_s = proc.communicate(timeout=int(args.timeout_sec))
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                proc.kill()
-            proc.communicate()
-            return [
-                {
-                    "package": pkg_name,
-                    "category": _SPEC_BY_NAME[pkg_name].category if pkg_name in _SPEC_BY_NAME else 3,
-                    "config_label": label or "default",
-                    "status": "failed",
-                    "error": f"timeout after {args.timeout_sec}s",
-                    "gate_verdict": "FAIL",
-                }
-            ]
-
-        if proc.returncode == 0 and worker_out_file.is_file():
-            payload = json.loads(worker_out_file.read_text(encoding="utf-8"))
-            return list(payload.get("records", []))
-
-    for line in reversed(out_s.splitlines()):
-        idx = line.find(_WORKER_MARKER)
-        if idx >= 0:
-            payload = json.loads(line[idx + len(_WORKER_MARKER) :])
-            return list(payload.get("records", []))
-
-    err_tail = (err_s or out_s or f"exit={proc.returncode}").strip().splitlines()
-    reason = err_tail[-1] if err_tail else f"exit={proc.returncode}"
+    rc = int(res.get("returncode") or 0)
+    err_s = str(res.get("stderr") or "")
+    out_s = str(res.get("stdout") or "")
+    err_tail = str(res.get("stderr_tail") or out_s or f"exit={rc}").strip().splitlines()
+    reason = err_tail[-1] if err_tail else f"exit={rc}"
     low = (err_s + "\n" + out_s).lower()
-    is_skip = any(tok in low for tok in ("filenotfounderror", "not found", "missing", "not staged"))
+    is_skip = (res["status"] == "skipped") or any(
+        tok in low for tok in ("filenotfounderror", "not found", "missing", "not staged")
+    )
     return [
         {
             "package": pkg_name,
@@ -4212,6 +4250,7 @@ def _spawn_isolated_worker(
             "config_label": label or "default",
             "status": "skipped" if is_skip else "failed",
             "error": reason[:200],
+            "stderr_tail": res["stderr_tail"],
             "gate_verdict": "SKIP" if is_skip else "FAIL",
         }
     ]
@@ -4919,14 +4958,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
         out_m.write_text(md + "\n", encoding="utf-8")
 
     print(md)
-    failed = [r for r in results if r.get("status") == "failed" or
-              (r.get("category") == 1 and r.get("status") == "ok" and retrieval_coverage_errors(r))]
+    failed = [
+        r for r in results
+        if r.get("status") == "failed"
+        or (r.get("category") == 1 and r.get("status") == "ok" and retrieval_coverage_errors(r))
+    ]
+    advisory = bool(getattr(args, "advisory_gates", False))
+    gate_failed = [] if advisory else [r for r in results if r.get("gate_verdict") == "FAIL"]
     is_subset = bool(args.smoke or args.max_items is not None)
-    comp_failed = [
+    comp_failed = [] if advisory else [
         c for c in comparisons
         if (c.get("verdict") == "FAIL" if is_subset else c.get("verdict") != "PASS")
     ]
-    return 1 if (failed or comp_failed) else 0
+    return 1 if (failed or gate_failed or comp_failed) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4992,6 +5036,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--allow-contended", action="store_true")
     rn.add_argument("--skip-gpt-oss", action="store_true")
     rn.add_argument("--omit-item-scores", action="store_true")
+    rn.add_argument("--advisory-gates", action="store_true", help="Exit 0 even when gate_verdict == FAIL")
     rn.add_argument("--dry-run", action="store_true")
     rn.add_argument("--json-out", default=None)
     rn.add_argument("--markdown-out", default=None)

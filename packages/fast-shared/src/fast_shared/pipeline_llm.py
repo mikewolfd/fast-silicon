@@ -1263,6 +1263,75 @@ def _enter_mlx_limits(
         stack.enter_context(wired_limit())
 
 
+_EXTRACT_MANIFEST_FILENAME = ".extract_manifest.json"
+
+
+def _extract_engine_model_fingerprint(engine: Any) -> dict[str, str]:
+    fp: dict[str, str] = {}
+    for attr in ("model_name", "model_id", "model_dir", "ckpt_dir", "checkpoint_dir", "path"):
+        val = getattr(engine, attr, None)
+        if val is not None and str(val).strip():
+            fp[attr] = str(val)
+    return fp
+
+
+def _load_extract_manifest(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Corrupt extract resume manifest at {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Corrupt extract resume manifest at {path}: expected JSON object")
+    return data
+
+
+def _save_extract_manifest(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _deduplicate_prior_shards(
+    prior_shards: Sequence[Path],
+    *,
+    key_col: str,
+    superseded_keys: set[Any],
+) -> None:
+    """Remove superseded/retried primary keys atomically from earlier shards so IDs remain unique."""
+    if not prior_shards or not superseded_keys:
+        return
+
+    for shard in prior_shards:
+        if not shard.is_file():
+            continue
+        pf_s = pq.ParquetFile(shard)
+        if key_col not in pf_s.schema_arrow.names:
+            continue
+        col_tbl = pq.read_table(shard, columns=[key_col])
+        key_vals = col_tbl.column(key_col).to_pylist()
+        if not any(k in superseded_keys for k in key_vals):
+            continue
+        full_tbl = pq.read_table(shard)
+        keep_flags = [k not in superseded_keys for k in key_vals]
+        filtered = full_tbl.filter(pa.array(keep_flags, type=pa.bool_()))
+        if filtered.num_rows == 0:
+            shard.unlink(missing_ok=True)
+            continue
+        tmp_path = shard.with_name(f".{shard.name}.dedup.tmp.{os.getpid()}")
+        try:
+            pq.write_table(filtered, tmp_path, compression="zstd")
+            os.replace(tmp_path, shard)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+
 def _iter_filtered_batches(
     pf: pq.ParquetFile,
     *,
@@ -1271,8 +1340,9 @@ def _iter_filtered_batches(
     done_ids: set[Any],
     resume_key_col: str | None,
     filter_ocr: bool,
-) -> Iterator[pa.RecordBatch]:
-    """Yield filtered `RecordBatch` slices, pre-checking ID/OCR columns per row group before decompressing text."""
+    file_row_offset: int = 0,
+) -> Iterator[tuple[pa.RecordBatch, list[int]]]:
+    """Yield `(RecordBatch, orig_row_indices)` slices, pre-checking ID/OCR columns per row group before decompressing text."""
     avail = set(pf.schema_arrow.names)
     kcol: str | None = None
     if done_ids:
@@ -1286,8 +1356,13 @@ def _iter_filtered_batches(
     has_iso = filter_ocr and ("is_ocr" in avail)
     has_op = filter_ocr and ("ocr_pages" in avail)
 
+    global_row = int(file_row_offset)
     if kcol is None and not (has_iso or has_op):
-        yield from pf.iter_batches(batch_size=batch_size, columns=read_cols)
+        for rb in pf.iter_batches(batch_size=batch_size, columns=read_cols):
+            n_rb = rb.num_rows
+            orig_idxs = list(range(global_row, global_row + n_rb))
+            global_row += n_rb
+            yield rb, orig_idxs
         return
 
     pre_cols: list[str] = []
@@ -1303,6 +1378,8 @@ def _iter_filtered_batches(
         n_rg = pre_tbl.num_rows
         if n_rg == 0:
             continue
+        rg_start = global_row
+        global_row += n_rg
 
         keep_flags = [True] * n_rg
         if kcol is not None:
@@ -1328,11 +1405,13 @@ def _iter_filtered_batches(
         offset = 0
         for rb in pf.iter_batches(batch_size=batch_size, row_groups=[rg_idx], columns=read_cols):
             sub_flags = keep_flags[offset : offset + rb.num_rows]
+            batch_start = rg_start + offset
             offset += rb.num_rows
             if all(sub_flags):
-                yield rb
+                yield rb, list(range(batch_start, batch_start + rb.num_rows))
             elif any(sub_flags):
-                yield rb.filter(pa.array(sub_flags, type=pa.bool_()))
+                kept_orig = [batch_start + j for j, keep in enumerate(sub_flags) if keep]
+                yield rb.filter(pa.array(sub_flags, type=pa.bool_())), kept_orig
 
 
 def extract_parquet(
@@ -1403,9 +1482,13 @@ def extract_parquet(
 
     done_ids: set[Any] = set()
     resume_key_col: str | None = None
+    prior_shards: list[Path] = []
+    manifest_path = out / _EXTRACT_MANIFEST_FILENAME
+    loaded_manifest = _load_extract_manifest(manifest_path) if (resume and sharded) else {}
     if resume and sharded:
         status_by_id: dict[Any, bool] = {}
         for shard in sorted(out.glob("part-*.parquet")):
+            prior_shards.append(shard)
             pf_s = pq.ParquetFile(shard)
             names = pf_s.schema_arrow.names
             kcol = "id" if "id" in names else ("body_sha" if "body_sha" in names else None)
@@ -1441,6 +1524,22 @@ def extract_parquet(
     )
     eff_schema = schema_resolver.default_spec
     eff_schema_dict = schema_resolver.default_dict
+    eff_mode = str(mode or getattr(engine, "default_mode", "auto") or "auto").lower()
+    extract_fingerprint: dict[str, Any] = {
+        "system_prompt": str(system_prompt),
+        "schema_key": schema_resolver.default_key,
+        "schema_col": schema_col,
+        "compact_optional_schema": bool(compact_optional_schema),
+        "text_col": text_col,
+        "mode": eff_mode,
+        "model": _extract_engine_model_fingerprint(engine),
+        "input_files": [[f.name, int(f.stat().st_size), int(f.stat().st_mtime_ns)] for f in in_files],
+    }
+    if resume and sharded and loaded_manifest:
+        if loaded_manifest.get("fingerprint") != extract_fingerprint:
+            raise ValueError(
+                f"Extract resume manifest mismatch at {manifest_path}: prompt, schema, model, or inputs changed"
+            )
     clean_extra = {k: v for k, v in extra_gen_kwargs.items() if v is not None}
     if max_whitespace_run is not None:
         clean_extra.setdefault("max_whitespace_run", int(max_whitespace_run))
@@ -1482,10 +1581,9 @@ def extract_parquet(
     eff_cache_mb = DEFAULT_MLX_CACHE_LIMIT_MB if mlx_cache_limit_mb is None else int(mlx_cache_limit_mb)
     engine_can_roll = _engine_supports_rolling(engine)
     eff_use_chat = bool(clean_extra.get("use_chat_template", True))
-    eff_mode = str(mode or getattr(engine, "default_mode", "auto") or "auto").lower()
     accepts_per_doc = _engine_accepts_explicit_kwarg(engine, "per_doc_grammars")
 
-    prep_queue: queue.Queue[tuple[pa.Table, list[str | None], list[Any] | None] | None | BaseException] = queue.Queue(maxsize=2)
+    prep_queue: queue.Queue[tuple[pa.Table, list[str | None], list[Any] | None, list[int]] | None | BaseException] = queue.Queue(maxsize=2)
     ready_queue: queue.Queue[dict[str, Any] | None | BaseException] = queue.Queue(maxsize=2)
     write_queue: queue.Queue[pa.Table | None] = queue.Queue(maxsize=2)
     reader_stop = threading.Event()
@@ -1493,7 +1591,7 @@ def extract_parquet(
     writer_abort = threading.Event()
     writer_err: list[BaseException] = []
 
-    def _put_prep(item: tuple[pa.Table, list[str | None], list[Any] | None] | None | BaseException) -> bool:
+    def _put_prep(item: tuple[pa.Table, list[str | None], list[Any] | None, list[int]] | None | BaseException) -> bool:
         while not reader_stop.is_set():
             try:
                 prep_queue.put(item, timeout=0.05)
@@ -1507,22 +1605,26 @@ def extract_parquet(
             acc_tables: list[pa.Table] = []
             acc_prompts: list[str | None] = []
             acc_schemas: list[Any] | None = [] if schema_col is not None else None
+            acc_orig_indices: list[int] = []
             acc_rows = 0
 
             def _flush_window() -> bool:
-                nonlocal acc_tables, acc_prompts, acc_schemas, acc_rows
+                nonlocal acc_tables, acc_prompts, acc_schemas, acc_orig_indices, acc_rows
                 if not acc_tables:
                     return True
                 merged = acc_tables[0] if len(acc_tables) == 1 else pa.concat_tables(acc_tables)
                 prompts_out = acc_prompts
                 schemas_out = acc_schemas
+                orig_indices_out = acc_orig_indices
                 acc_tables = []
                 acc_prompts = []
                 acc_schemas = [] if schema_col is not None else None
+                acc_orig_indices = []
                 acc_rows = 0
-                return _put_prep((merged, prompts_out, schemas_out))
+                return _put_prep((merged, prompts_out, schemas_out, orig_indices_out))
 
             read_batch_sz = int(batch_rows) if batch_rows is not None else eff_window_rows
+            file_row_cursor = 0
             for fpath in in_files:
                 if reader_stop.is_set():
                     return
@@ -1548,13 +1650,14 @@ def extract_parquet(
                         if extra in avail and extra not in read_cols:
                             read_cols.append(extra)
 
-                    for rb in _iter_filtered_batches(
+                    for rb, rb_orig_indices in _iter_filtered_batches(
                         pf,
                         read_cols=read_cols,
                         batch_size=read_batch_sz,
                         done_ids=done_ids,
                         resume_key_col=resume_key_col,
                         filter_ocr=filter_ocr,
+                        file_row_offset=file_row_cursor,
                     ):
                         if reader_stop.is_set():
                             return
@@ -1565,6 +1668,7 @@ def extract_parquet(
                         ocr_pages_col = rb.column("ocr_pages").to_pylist() if "ocr_pages" in rb.schema.names else None
 
                         kept_indices: list[int] = []
+                        kept_orig_indices: list[int] = []
                         prompts: list[str | None] = []
                         kept_schemas: list[Any] | None = [] if sch_col_vals is not None else None
                         for i in range(rb.num_rows):
@@ -1579,11 +1683,13 @@ def extract_parquet(
                                 if skip_empty:
                                     continue
                                 kept_indices.append(i)
+                                kept_orig_indices.append(rb_orig_indices[i])
                                 prompts.append(None)
                                 if kept_schemas is not None and sch_col_vals is not None:
                                     kept_schemas.append(sch_col_vals[i])
                             else:
                                 kept_indices.append(i)
+                                kept_orig_indices.append(rb_orig_indices[i])
                                 prompts.append(t)
                                 if kept_schemas is not None and sch_col_vals is not None:
                                     kept_schemas.append(sch_col_vals[i])
@@ -1599,6 +1705,7 @@ def extract_parquet(
                             take_n = min(space, total_rb - cursor)
                             acc_tables.append(meta_tbl.slice(cursor, take_n))
                             acc_prompts.extend(prompts[cursor : cursor + take_n])
+                            acc_orig_indices.extend(kept_orig_indices[cursor : cursor + take_n])
                             if acc_schemas is not None and kept_schemas is not None:
                                 acc_schemas.extend(kept_schemas[cursor : cursor + take_n])
                             acc_rows += take_n
@@ -1606,6 +1713,7 @@ def extract_parquet(
                             if acc_rows >= eff_window_rows:
                                 if not _flush_window():
                                     return
+                    file_row_cursor += int(pf.metadata.num_rows)
 
             if acc_rows > 0:
                 _flush_window()
@@ -1615,9 +1723,12 @@ def extract_parquet(
             _put_prep(None)
 
     shard_idx = next_shard_index(out) if sharded else 0
+    written_keys: set[Any] = set()
+    written_key_col: str | None = resume_key_col
+    manifest_saved = False
 
     def _writer_worker() -> None:
-        nonlocal shard_idx
+        nonlocal shard_idx, written_key_col, manifest_saved
         writer: pq.ParquetWriter | None = None
         tmp_dst: Path | None = None
         final_dst: Path | None = None
@@ -1638,6 +1749,15 @@ def extract_parquet(
                     writer = pq.ParquetWriter(tmp_dst, out_table.schema, compression="zstd")
                     shard_acc = 0
 
+                if written_key_col is None:
+                    t_names = out_table.schema.names
+                    if "id" in t_names:
+                        written_key_col = "id"
+                    elif "body_sha" in t_names:
+                        written_key_col = "body_sha"
+                if written_key_col is not None and written_key_col in out_table.schema.names:
+                    written_keys.update(out_table.column(written_key_col).to_pylist())
+
                 writer.write_table(out_table)
                 shard_acc += out_table.num_rows
                 if sharded and shard_acc >= shard_rows:
@@ -1645,6 +1765,8 @@ def extract_parquet(
                     writer = None
                     assert tmp_dst is not None and final_dst is not None
                     os.replace(tmp_dst, final_dst)
+                    _save_extract_manifest(manifest_path, {"version": 1, "fingerprint": extract_fingerprint})
+                    manifest_saved = True
                     tmp_dst = None
                     final_dst = None
                     shard_idx += 1
@@ -1663,6 +1785,9 @@ def extract_parquet(
                     writer = None
                     assert tmp_dst is not None and final_dst is not None
                     os.replace(tmp_dst, final_dst)
+                    if sharded:
+                        _save_extract_manifest(manifest_path, {"version": 1, "fingerprint": extract_fingerprint})
+                        manifest_saved = True
                     tmp_dst = None
                     final_dst = None
         except BaseException as exc:
@@ -1700,7 +1825,7 @@ def extract_parquet(
         meta_tbl: pa.Table,
         raw_schemas: list[Any] | None,
         active_indices: list[int],
-        win_row_offset: int,
+        orig_row_indices: list[int],
     ) -> tuple[list[str | dict[str, Any] | None], list[Mapping[str, Any] | None], list[str | None], bool]:
         specs: list[str | dict[str, Any] | None] = []
         dicts: list[Mapping[str, Any] | None] = []
@@ -1713,7 +1838,7 @@ def extract_parquet(
             col_cache = {name: meta_tbl.column(name).to_pylist() for name in meta_tbl.schema.names}
 
         for idx in active_indices:
-            g_idx = win_row_offset + idx
+            g_idx = orig_row_indices[idx]
             raw_spec: Any = None
             raw_col_val = raw_schemas[idx] if raw_schemas is not None else None
             if is_callable_g:
@@ -1744,7 +1869,6 @@ def extract_parquet(
 
     def _tok_worker() -> None:
         try:
-            win_row_offset = 0
             while not tok_stop.is_set():
                 try:
                     raw_item = prep_queue.get(timeout=0.05)
@@ -1756,12 +1880,13 @@ def extract_parquet(
                     _put_ready(raw_item)
                     return
 
-                meta_tbl, raw_prompts, raw_schemas = raw_item
+                meta_tbl, raw_prompts, raw_schemas, orig_row_indices = raw_item
                 n_win = len(raw_prompts)
                 active_indices = [idx for idx, p in enumerate(raw_prompts) if p is not None]
                 prepared: dict[str, Any] = {
                     "meta_tbl": meta_tbl,
                     "raw_prompts": raw_prompts,
+                    "orig_row_indices": orig_row_indices,
                     "active_indices": active_indices,
                     "unique_entries": [],
                     "entry_schemas": [],
@@ -1772,7 +1897,7 @@ def extract_parquet(
                 }
                 if active_indices:
                     act_specs, act_dicts, act_keys, has_mixed_schemas = _resolve_active_schemas(
-                        meta_tbl, raw_schemas, active_indices, win_row_offset
+                        meta_tbl, raw_schemas, active_indices, orig_row_indices
                     )
                     can_dedup = (
                         bool(dedup_within_window)
@@ -1856,7 +1981,6 @@ def extract_parquet(
                     prepared["eff_thinking"] = eff_thinking
                     prepared["has_mixed_schemas"] = has_mixed_schemas
 
-                win_row_offset += n_win
                 if not _put_ready(prepared):
                     return
         except BaseException as exc:
@@ -1907,6 +2031,7 @@ def extract_parquet(
 
                 meta_tbl = item["meta_tbl"]
                 raw_prompts = item["raw_prompts"]
+                orig_row_indices = item["orig_row_indices"]
                 active_indices = item["active_indices"]
                 n_win = len(raw_prompts)
                 resp_texts: list[str] = [""] * n_win
@@ -2070,7 +2195,7 @@ def extract_parquet(
                                 for orig_idx in st["orig_positions"]:
                                     deferred_reqs.append(
                                         ExtractRetryRequest(
-                                            row_index=docs_processed + orig_idx,
+                                            row_index=orig_row_indices[orig_idx],
                                             prompt=st["prompt"],
                                             system_prompt=system_prompt,
                                             json_schema=st["schema_spec"],
@@ -2115,7 +2240,7 @@ def extract_parquet(
                                     retry_state_indices.append(s_idx)
                                     round_reqs.append(
                                         ExtractRetryRequest(
-                                            row_index=docs_processed + st["orig_positions"][0],
+                                            row_index=orig_row_indices[st["orig_positions"][0]],
                                             prompt=st["prompt"],
                                             system_prompt=system_prompt,
                                             json_schema=st["schema_spec"],
@@ -2203,6 +2328,14 @@ def extract_parquet(
             writer_thread.join()
             if writer_err:
                 raise writer_err[0]
+            if resume and sharded and prior_shards and written_keys and (written_key_col is not None):
+                _deduplicate_prior_shards(
+                    prior_shards,
+                    key_col=written_key_col,
+                    superseded_keys=written_keys,
+                )
+            if sharded and manifest_saved:
+                _save_extract_manifest(manifest_path, {"version": 1, "fingerprint": extract_fingerprint})
         except BaseException:
             reader_stop.set()
             tok_stop.set()

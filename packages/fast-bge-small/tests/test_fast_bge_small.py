@@ -616,3 +616,101 @@ def test_single_layers_dropped_and_borrowed_tables(engine: FastBgeSmall) -> None
         q_after = engine.encode_query([101, 2054, 2003, 102], prefer_ane=True)
         assert q_after.shape == (384,) and np.all(np.isfinite(q_after))
 
+
+def test_lazy_neural_init_skipped_for_metal_default_mode_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`enable_ane=None` skips CoreML ANE bundle init for `default_mode='gpu'` unless `enable_ane=True`."""
+    import inspect
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    import fast_bge_small.engine as bge_eng
+
+    sig = inspect.signature(FastBgeSmall.__init__)
+    assert sig.parameters["enable_ane"].default is None
+
+    home = tmp_path / "bge_home"
+    (home / "artifacts" / "weights").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "ane_models").mkdir(parents=True)
+    (home / "build").mkdir(parents=True)
+    (home / "artifacts" / "weights" / "bge_small_f16.npz").write_bytes(b"stub")
+    (home / "build" / "libbge_ane_runner.dylib").write_bytes(b"stub")
+
+    raw_tok = Tokenizer(WordLevel(vocab={"[PAD]": 0, "[UNK]": 100, "[CLS]": 101, "[SEP]": 102, "hello": 200}, unk_token="[UNK]"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        special_tokens=[("[CLS]", 101), ("[SEP]", 102)],
+    )
+    raw_tok.save(str(home / "artifacts" / "tokenizer" / "tokenizer.json"))
+
+    class _StubGPU:
+        def __init__(self, weights_path: Path, *, wt0_f16: object = None, pos_f16: object = None) -> None:
+            del weights_path, wt0_f16, pos_f16
+
+        def encode_single(self, token_ids: object) -> np.ndarray:
+            del token_ids
+            v = np.ones((384,), dtype=np.float32)
+            v /= np.linalg.norm(v)
+            return v
+
+        def encode_corpus(self, token_lists: list, *, max_tokens: int = 8192) -> np.ndarray:
+            del max_tokens
+            out = np.ones((len(token_lists), 384), dtype=np.float32)
+            out /= np.linalg.norm(out, axis=-1, keepdims=True)
+            return out
+
+    ane_calls: list[bool] = []
+
+    def _spy_init_ane(self: FastBgeSmall, *, verify_plan: bool = True) -> None:
+        ane_calls.append(verify_plan)
+        self.ane = object()  # type: ignore[assignment]
+        self.ane_available = True
+
+    monkeypatch.setattr(bge_eng, "load_or_mmap_host_tables", lambda *_a, **_kw: (np.zeros((1, 384), dtype=np.float16), np.zeros((1, 384), dtype=np.float16)))
+    monkeypatch.setattr(bge_eng, "FastBgeSmallGPU", _StubGPU)
+    monkeypatch.setattr(bge_eng, "set_mlx_cache_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bge_eng, "_apply_mlx_wired_limit", lambda: None)
+    monkeypatch.setattr(bge_eng, "_restore_mlx_wired_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bge_eng, "_maybe_clear_mlx_arena", lambda *_a, **_kw: None)
+    monkeypatch.setattr(FastBgeSmall, "_init_ane", _spy_init_ane)
+
+    # 1. default_mode="gpu" skips _init_ane completely
+    with FastBgeSmall(home=home, default_mode="gpu", warmup=False) as eng_gpu:
+        assert ane_calls == []
+        assert eng_gpu.ane_available is False
+        assert eng_gpu.default_mode == "gpu"
+        with pytest.raises(RuntimeError, match="not initialized"):
+            eng_gpu.encode_texts("hello", mode="ane")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            eng_gpu.encode_corpus([[101, 200, 102]], mode="ane")
+        assert eng_gpu.encode_texts("hello", mode="hetero").shape == (384,)
+        assert eng_gpu.encode_corpus([[101, 200, 102], [101, 200, 200, 102]], mode="hetero2").shape == (2, 384)
+
+    # 2. Explicit enable_ane=True initializes ANE even when default_mode="gpu"
+    ane_calls.clear()
+    with FastBgeSmall(home=home, default_mode="gpu", enable_ane=True, warmup=False) as eng_gpu_ane:
+        assert ane_calls == [True]
+        assert eng_gpu_ane.ane_available is True
+        assert eng_gpu_ane.default_mode == "gpu"
+
+    # 3. Non-GPU default modes initialize ANE normally by default
+    for non_gpu_mode, expected_resolved in (("ane", "ane"), ("hetero", "hetero"), ("hetero2", "hetero")):
+        ane_calls.clear()
+        with FastBgeSmall(home=home, default_mode=non_gpu_mode, warmup=False) as eng_m:
+            assert ane_calls == [True]
+            assert eng_m.ane_available is True
+            assert eng_m.default_mode == expected_resolved
+
+    # 4. Explicit enable_ane=False skips ANE in hetero and errors clearly in ane mode
+    ane_calls.clear()
+    with FastBgeSmall(home=home, default_mode="hetero", enable_ane=False, warmup=False) as eng_no_ane:
+        assert ane_calls == []
+        assert eng_no_ane.ane_available is False
+        assert eng_no_ane.default_mode == "gpu"
+
+    with pytest.raises(RuntimeError, match="enable_ane=False"):
+        FastBgeSmall(home=home, default_mode="ane", enable_ane=False, warmup=False)
+
+

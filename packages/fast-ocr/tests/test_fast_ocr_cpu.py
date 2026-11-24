@@ -487,6 +487,45 @@ def test_apple_vision_banded_dedup_escalation_and_zero_mlx() -> None:
     assert "financial_table" in table_analysis.escalation_reasons
     assert table_analysis.estimated_columns >= 3
 
+    # 2-column table without currency (e.g. olmOCR / OmniDoc 2-col table or balanced split with high table_score)
+    twocol_lines: list[OCRLine] = []
+    for r in range(6):
+        y0 = 0.1 + r * 0.06
+        twocol_lines.append(OCRLine(text=f"ColA item {r} explanation", confidence=0.96, box=OCRBox(0.06, y0, 0.42, y0 + 0.02)))
+        twocol_lines.append(OCRLine(text=f"ColB item {r} description", confidence=0.96, box=OCRBox(0.55, y0, 0.90, y0 + 0.02)))
+    twocol_analysis = analyze_page_from_lines(twocol_lines, None, 1000, 1200)
+    assert twocol_analysis.estimated_columns == 2
+    assert twocol_analysis.needs_vlm is True
+    assert "two_column_layout" in twocol_analysis.escalation_reasons
+
+    # Low Vision confidence at 0.22 ratio (>= 0.20)
+    lowconf_lines = [
+        OCRLine(text=f"Line {i}", confidence=(0.55 if i < 2 else 0.98), box=OCRBox(0.1, 0.1 + i * 0.06, 0.7, 0.12 + i * 0.06))
+        for i in range(9)
+    ]
+    lowconf_analysis = analyze_page_from_lines(lowconf_lines, None, 1000, 1200)
+    assert lowconf_analysis.needs_vlm is True
+    assert "low_vision_confidence" in lowconf_analysis.escalation_reasons
+
+    # Formula / math bands (2+ bands with dense math symbols or low-conf math symbols)
+    math_lines = [
+        OCRLine(text="Given x_1 + y_2 = α + β for all n", confidence=0.65, box=OCRBox(0.1, 0.2, 0.8, 0.23)),
+        OCRLine(text="Then ∑ f(x_i) ≤ ∫ g(t) dt = ∞", confidence=0.90, box=OCRBox(0.1, 0.3, 0.8, 0.33)),
+        OCRLine(text="Normal prose follows in paragraph one.", confidence=0.98, box=OCRBox(0.1, 0.45, 0.8, 0.48)),
+    ]
+    math_analysis = analyze_page_from_lines(math_lines, None, 1000, 1200)
+    assert math_analysis.needs_vlm is True
+    assert "formula_or_math" in math_analysis.escalation_reasons
+
+    # Compact table crop (<160K px with moderate numeric ratio, like FinTabNet[8] 506x111)
+    compact_lines = [
+        OCRLine(text=f"Row {i} val 12.{i}", confidence=0.95, box=OCRBox(0.05, 0.08 + i * 0.12, 0.90, 0.16 + i * 0.12))
+        for i in range(6)
+    ]
+    compact_analysis = analyze_page_from_lines(compact_lines, None, 506, 111)
+    assert compact_analysis.needs_vlm is True
+    assert "compact_table_crop" in compact_analysis.escalation_reasons
+
     # Verify AppleVisionOCR standalone import & execution never imports mlx or VLM modules
     code = (
         "import sys\n"
@@ -1176,6 +1215,8 @@ def test_adaptive_pdf_dpi_boilerplate_control_garble_and_routing(
     raw_sample = "\n".join(
         [
             "VerDate Mar 15 2016 14:22 Jkt 000001 PO 00000 Frm 00001 Fmt 6601 Sfmt 6601",
+            "RULES-408278 with DISTILLER",
+            "Insert offset folio 13 here 38674.013",
             "Page 3 of 12",
             "42",
             "---",
@@ -1268,6 +1309,107 @@ def test_adaptive_pdf_dpi_boilerplate_control_garble_and_routing(
         ctrl_outs = pipe.ocr_pdf(single_pdf, dpi=100)
     assert len(ctrl_outs) == 1
     assert ctrl_outs[0].backend_used.startswith("apple-vision")
+
+    # 5. Vector-outlined Distiller page (<80 body chars, 0 images, >=200 vector paths) routes to raster OCR,
+    #    while genuinely sparse digital page (<80 body chars, 0 images, <200 paths) stays native.
+    two_page_pdf = tmp_path / "outlined_vs_sparse.pdf"
+    _write_custom_pdf(
+        two_page_pdf,
+        [
+            {"lines": ["Vector outlined p0"], "with_image": False},
+            {"lines": ["Sparse digital p1"], "with_image": False},
+        ],
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "extract_native_pdf_text",
+        lambda _p, page_indices=None: [
+            RenderedPDFPage(
+                page_index=0,
+                width_pt=612.0,
+                height_pt=792.0,
+                native_text="GPO-DISTILLER-SLUG-25CHAR",
+                native_char_count=25,
+                native_garbled_ratio=0.0,
+                image=None,
+                image_count=0,
+                path_count=340,
+                native_control_char_count=0,
+                native_body_char_count=25,
+            ),
+            RenderedPDFPage(
+                page_index=1,
+                width_pt=612.0,
+                height_pt=792.0,
+                native_text="PART II - BRIEF NOTE HERE",
+                native_char_count=25,
+                native_garbled_ratio=0.0,
+                image=None,
+                image_count=0,
+                path_count=6,
+                native_control_char_count=0,
+                native_body_char_count=21,
+            ),
+        ],
+    )
+    with FastOCR(backend="auto", vision_ocr=FakeVisionRouter(), ovis_engine=FakeOvisNever()) as pipe:
+        path_outs = pipe.ocr_pdf(two_page_pdf, dpi=100)
+    assert [r.page_index for r in path_outs] == [0, 1]
+    assert path_outs[0].backend_used.startswith("apple-vision")
+    assert path_outs[1].backend_used == "native"
+    assert path_outs[1].metadata["path_count"] == 6
+
+    # 6. Dense vector-outlined Distiller page (>=80 body chars from running headers, 0 images,
+    #    >=500 paths and path_count > eff_chars * 4) routes to raster OCR, while digital
+    #    tables with lots of body text (e.g. 2000 chars, 400 paths) stay native.
+    dense_pdf = tmp_path / "dense_outlined_vs_digital_table.pdf"
+    _write_custom_pdf(
+        dense_pdf,
+        [
+            {"lines": ["Dense outlined p0"], "with_image": False},
+            {"lines": ["Digital table p1"], "with_image": False},
+        ],
+    )
+    hdr_120 = ("RUNNING HEADER LABEL " * 6)[:120]
+    tbl_2000 = ("CLEAN DIGITAL TABLE CELL VALUE ROW " * 60)[:2000]
+    monkeypatch.setattr(
+        pipeline_mod,
+        "extract_native_pdf_text",
+        lambda _p, page_indices=None: [
+            RenderedPDFPage(
+                page_index=0,
+                width_pt=612.0,
+                height_pt=792.0,
+                native_text=hdr_120,
+                native_char_count=len(hdr_120),
+                native_garbled_ratio=0.0,
+                image=None,
+                image_count=0,
+                path_count=1000,
+                native_control_char_count=0,
+                native_body_char_count=120,
+            ),
+            RenderedPDFPage(
+                page_index=1,
+                width_pt=612.0,
+                height_pt=792.0,
+                native_text=tbl_2000,
+                native_char_count=len(tbl_2000),
+                native_garbled_ratio=0.0,
+                image=None,
+                image_count=0,
+                path_count=400,
+                native_control_char_count=0,
+                native_body_char_count=2000,
+            ),
+        ],
+    )
+    with FastOCR(backend="auto", vision_ocr=FakeVisionRouter(), ovis_engine=FakeOvisNever()) as pipe:
+        dense_outs = pipe.ocr_pdf(dense_pdf, dpi=100)
+    assert [r.page_index for r in dense_outs] == [0, 1]
+    assert dense_outs[0].backend_used.startswith("apple-vision")
+    assert dense_outs[1].backend_used == "native"
+    assert dense_outs[1].metadata["path_count"] == 400
 
 
 def test_apple_vision_provenance_and_cli_vision_pdf_flags(
@@ -2432,5 +2574,476 @@ def test_triage_dpi_refreshes_only_rotated_or_low_conf_escalations(tmp_path: Pat
     # Page 0 stays at single low-DPI pass; Page 1 gets refreshed at 180 DPI so Ovis receives rot=0 for both.
     assert [idx for idx, _sz in vision_calls] == [0, 1, 1]
     assert seen_pre == [(0, 0), (1, 0)]
+
+
+def test_ovis_preserves_caller_peak_memory_and_long_period_loop_recovery_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Ovis never resets caller peak memory, catches `p>8` tail loops, and recovers on `length` at `rep4>=0.35`."""
+    from tokenizers import AddedToken, Tokenizer as HfTokenizer
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel
+    from fast_ocr.ovis_engine import (
+        FastOvisOCREngine,
+        _token_tail_repeat_4gram_rate,
+        detect_catastrophic_token_loop,
+    )
+    from fast_qwen3.multimodal_batch import BatchedMMItemResult
+    from fast_qwen3.tokenizer import FastQwen3Tokenizer
+    from fast_shared.vision_preprocess import QwenVisionInputs
+
+    # 1. detect_catastrophic_token_loop catches p > 8 & tail-4gram collapse while sparing normal dense tables
+    assert detect_catastrophic_token_loop(list(range(10, 22)) * 16) == (12, 16)
+    assert detect_catastrophic_token_loop(list(range(10, 30)) * 10) == (20, 10)
+    drifting_p16 = [tok for k in range(12) for tok in ([500 + k] + list(range(10, 25)))]
+    assert len(drifting_p16) == 192
+    assert detect_catastrophic_token_loop(drifting_p16) == (0, 192)
+
+    tbl_tok_map = {100: "<td>", 101: "</td>", 102: "<tr>", 103: "</tr>", 104: "0.00", 105: "|"}
+    dec_tbl = lambda ids: "".join(tbl_tok_map.get(int(t), f"v{int(t)}") for t in ids)
+    dense_html_table = [
+        tok
+        for row_i in range(16)
+        for tok in (102, 100, 300 + row_i, 101, 100, 101, 100, 104, 101, 100, 101, 100, 104, 101, 103)
+    ]  # 240 tokens of dense real table markup with repeated empty/0.00 cells and varying row labels
+    assert detect_catastrophic_token_loop(dense_html_table, decode_fn=dec_tbl) is None
+
+    dense_gfm_table = [
+        tok
+        for row_i in range(20)
+        for tok in (105, 300 + row_i, 105, 104, 105, 104, 105, 104, 105, 400 + row_i)
+    ]
+    assert detect_catastrophic_token_loop(dense_gfm_table, decode_fn=dec_tbl) is None
+
+    stuck_table_loop = [102, 100, 200, 101, 100, 104, 101, 100, 104, 101, 100, 104, 101, 100, 104, 103] * 12
+    assert detect_catastrophic_token_loop(stuck_table_loop, decode_fn=dec_tbl) == (16, 12)
+
+    # 2. Construct lightweight stub FastOvisOCREngine on CPU
+    vocab: dict[str, int] = {ch: i for i, ch in enumerate(sorted(ByteLevel.alphabet()))}
+    bpe = HfTokenizer(BPE(vocab=vocab, merges=[]))
+    bpe.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    bpe.decoder = ByteLevelDecoder(add_prefix_space=False)
+    bpe.add_special_tokens(
+        [
+            AddedToken("<|endoftext|>", special=True),
+            AddedToken("<|im_start|>", special=True),
+            AddedToken("<|im_end|>", special=True),
+            AddedToken("<think>", special=True),
+            AddedToken("</think>", special=True),
+            AddedToken("<|vision_start|>", special=True),
+            AddedToken("<|image_pad|>", special=True),
+            AddedToken("<|vision_end|>", special=True),
+        ]
+    )
+    tok_p = tmp_path / "tok_loop_test.json"
+    bpe.save(str(tok_p))
+    ftok = FastQwen3Tokenizer(tok_p, full_vocab_size=bpe.get_vocab_size(with_added_tokens=True))
+
+    mode_holder = {"mode": "p12", "step": 0}
+    p12_cycle = list(range(10, 22))
+    tail_seq = list(range(30, 140)) + (list(range(10, 25)) * 6)
+    tail_rate = _token_tail_repeat_4gram_rate(tail_seq)
+    assert 0.35 <= tail_rate < 0.65
+
+    class _StubLM:
+        vocab_n = ftok.vocab_size
+        has_full_vocab_fallback = False
+
+        class cfg:
+            rot_dims = 64
+            rope_theta = 1000000.0
+            head_dim = 256
+            mrope_section = (11, 11, 10)
+
+        def make_cache(self, **_kw: object) -> list[object]:
+            return []
+
+        def embed_tokens(self, x: mx.array) -> mx.array:
+            return mx.zeros((int(x.shape[0]), int(x.shape[1]), 16), dtype=mx.bfloat16)
+
+        def forward_hidden(self, _ids: object = None, _cache: object = None, *, inputs_embeds: mx.array | None = None, **_kw: object) -> mx.array:
+            b = int(inputs_embeds.shape[0]) if inputs_embeds is not None else 1
+            s = int(inputs_embeds.shape[1]) if inputs_embeds is not None else 1
+            return mx.zeros((b, s, 16), dtype=mx.bfloat16)
+
+        def project_logits(self, h: mx.array, **_kw: object) -> mx.array:
+            out = np.full((int(h.shape[0]), int(h.shape[1]), ftok.vocab_size), -20.0, dtype=np.float32)
+            idx = mode_holder["step"]
+            mode_holder["step"] += 1
+            if mode_holder["mode"] == "eos":
+                tok_id = ftok.eos_token_id
+            elif mode_holder["mode"] == "p12":
+                tok_id = p12_cycle[idx % len(p12_cycle)]
+            elif mode_holder["mode"] == "tail_len":
+                tok_id = tail_seq[idx] if idx < len(tail_seq) else ftok.eos_token_id
+            else:
+                tok_id = ftok.eos_token_id
+            out[:, :, tok_id] = 10.0
+            if tok_id != ftok.eos_token_id:
+                out[:, :, ftok.eos_token_id] = 4.0  # Loop breaker -8.0 flips top token to EOS on retry!
+            return mx.array(out)
+
+    class _StubVision:
+        spatial_merge_size = 2
+
+        class cfg:
+            patch_size = 16
+            temporal_patch_size = 2
+            spatial_merge_size = 2
+
+        def __call__(self, _px: mx.array, grids: list[tuple[int, int, int]]) -> mx.array:
+            n_vis = sum((t * h * w) // 4 for t, h, w in grids)
+            return mx.zeros((n_vis, 16), dtype=mx.bfloat16)
+
+    eng = object.__new__(FastOvisOCREngine)
+    eng.model_dir = tmp_path
+    eng.raw_config = {"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}
+    eng.output_format = "raw"
+    eng.table_mode = "gfm"
+    eng.strict_markdown_grammar = False
+    eng.zoom_recover = False
+    eng.crop_margins = False
+    eng.crop_pad_px = 0
+    eng.auto_orient = False
+    eng.adaptive_resolution = False
+    eng.deskew = "off"
+    eng.speculative = "off"
+    eng.draft_k = 4
+    eng.prefill_chunk_size = 512
+    eng.max_tokens = 4096
+    eng.loop_breaker = False
+    eng.auto_loop_recover = True
+    eng.kv_i8 = "auto"
+    eng.gdn_state_mode = "auto"
+    eng.drop_white_patches = False
+    eng.collect_logprob_confidence = "off"
+    eng._confidence_worker = None
+    eng.image_token_id = ftok.backend_tokenizer.token_to_id("<|image_pad|>")
+    eng.tokenizer = ftok
+    eng.vocab_remap = None
+    eng.vision_model = _StubVision()  # type: ignore[assignment]
+    eng.lm = _StubLM()  # type: ignore[assignment]
+    eng._new_to_old = np.arange(ftok.vocab_size, dtype=np.int32)
+    eng._new_to_old_mx = None
+    eng._old_to_new = None
+    eng._vision_prepass = None
+
+    monkeypatch.setattr(
+        "fast_ocr.ovis_engine.build_qwen_vision_inputs",
+        lambda _im, **_kw: QwenVisionInputs(
+            pixel_values=np.zeros((1, 4, 4, 3), dtype=np.float32),
+            grid_thw=(1, 4, 4),
+            resized_height=56,
+            resized_width=56,
+            num_visual_tokens=4,
+        ),
+    )
+
+    reset_calls = 0
+
+    def _spy_reset() -> None:
+        nonlocal reset_calls
+        reset_calls += 1
+
+    monkeypatch.setattr("fast_ocr.ovis_engine.mx.reset_peak_memory", _spy_reset)
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        # 2a. Verify ocr_image preserves caller peak memory and aborts p=12 runaway well below max_tokens=4096
+        mode_holder["mode"] = "p12"
+        mode_holder["step"] = 0
+        im = Image.new("RGB", (64, 64), "white")
+        res_p12 = eng.ocr_image(im, max_tokens=4096, auto_loop_recover=True)
+        assert reset_calls == 0
+        assert res_p12.metadata["loop_recovery"]["action"] == "retry_loop_breaker"
+        assert res_p12.metadata["loop_recovery"]["aborted_at_tokens"] < 256
+
+        # 2b. Verify ocr_image triggers auto_loop_recover on finish_reason="length" with 0.35 <= rep4 < 0.65
+        mode_holder["mode"] = "tail_len"
+        mode_holder["step"] = 0
+        res_len = eng.ocr_image(im, max_tokens=len(tail_seq), auto_loop_recover=True)
+        assert reset_calls == 0
+        assert "loop_recovery" in res_len.metadata
+        assert res_len.metadata["loop_recovery"]["aborted_at_tokens"] == len(tail_seq)
+    finally:
+        mx.set_default_device(prev_dev)
+
+    # 3. Verify ocr_images (batched path) never resets peak memory and recovers on length when 0.35 <= rep4 < 0.65
+    monkeypatch.setattr(
+        "fast_ocr.ovis_engine.batched_multimodal_generate",
+        lambda **_kw: (
+            [
+                BatchedMMItemResult(
+                    generated_ids=list(tail_seq),
+                    prompt_tokens=16,
+                    hit_eos=False,
+                    hit_max_tokens=True,
+                    vit_ms=1.0,
+                    prefill_ms=1.0,
+                    decode_ms=5.0,
+                    image_grids=[(1, 4, 4)],
+                )
+            ]
+            * 2,
+            {"waves": 1, "compactions": 0},
+        ),
+    )
+    retry_calls: list[dict[str, object]] = []
+
+    def _spy_retry(_src: object, **kw: object) -> OCRResult:
+        retry_calls.append(dict(kw))
+        return OCRResult(
+            text="recovered",
+            raw_text="recovered",
+            backend_used="ovis:stub",
+            finish_reason="stop",
+            timings=OCRTimings(decode_ms=2.0, total_ms=3.0, generated_tokens=4),
+        )
+
+    monkeypatch.setattr(eng, "ocr_image", _spy_retry)
+    outs = eng.ocr_images([Image.new("RGB", (64, 64), "white")] * 2, batch_size=2, max_tokens=len(tail_seq))
+    assert reset_calls == 0
+    assert len(retry_calls) == 2
+    assert all(r.text == "recovered" and "loop_recovery" in r.metadata for r in outs)
+
+
+def test_ocr_parquet_streaming_resume_invalidation_batching_and_cleanup_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `ocr_parquet` streams via `iter_batches`, invalidates on config change, batches images, closes PIL, and cleans shards."""
+    import io
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image as _PILImage
+
+    from fast_ocr.pipeline import ocr_parquet
+
+    blobs: list[bytes] = []
+    for idx in range(6):
+        buf = io.BytesIO()
+        _PILImage.new("RGB", (64, 32), (255 - idx, 255, 255)).save(buf, format="PNG")
+        blobs.append(buf.getvalue())
+
+    in_pq = tmp_path / "multi_rg.parquet"
+    # Write 3 row groups of 2 rows each so resume skips completed row groups cleanly.
+    tbl = pa.table({"doc_id": [f"d{i}" for i in range(6)], "image_bytes": blobs})
+    pq.write_table(tbl, str(in_pq), row_group_size=2)
+    assert pq.ParquetFile(in_pq).num_row_groups == 3
+
+    def _forbid_read(self, *_a: object, **_kw: object) -> object:
+        raise AssertionError("pq.ParquetFile.read() must not be called; use iter_batches()")
+
+    iter_rg_log: list[object] = []
+    orig_iter = pq.ParquetFile.iter_batches
+
+    def _spy_iter(self, *args: object, **kwargs: object):
+        iter_rg_log.append(kwargs.get("row_groups"))
+        return orig_iter(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read", _forbid_read)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", _spy_iter)
+
+    calls = {"count": 0}
+    fail_on = {"at": 3}
+
+    def fake_engine(_buf: bytes, _w: int, _h: int) -> list[tuple[str, float, list[float]]]:
+        calls["count"] += 1
+        if fail_on["at"] > 0 and calls["count"] == fail_on["at"]:
+            raise RuntimeError("mid-run failure")
+        return [(f"Row {calls['count']}", 0.99, [0.1, 0.8, 0.5, 0.05])]
+
+    pipe = AutoOCRPipeline(
+        backend="apple-vision",
+        vision_ocr=AppleVisionOCR(engine=fake_engine, bands=1),
+    )
+
+    out_dir = tmp_path / "shards_out"
+    with pytest.raises(RuntimeError, match="mid-run failure"):
+        ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=2, resume=True, pipeline=pipe)
+
+    # Resume with same config must NEVER pass row_group [0] to iter_batches!
+    iter_rg_log.clear()
+    fail_on["at"] = 0
+    s_res = ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=2, resume=True, pipeline=pipe)
+    assert s_res["skipped_shards"] == 1
+    assert s_res["completed_shards"] == 2
+    assert s_res["total_rows"] == 6
+    assert [0] not in iter_rg_log
+    assert iter_rg_log == [[1], [2]]
+
+    # Changing config (table_mode, dpi, backend, prompt, schema) invalidates completed shards!
+    iter_rg_log.clear()
+    s_inv = ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=2, table_mode="html", resume=True, pipeline=pipe)
+    assert s_inv["skipped_shards"] == 0
+    assert s_inv["completed_shards"] == 3
+    assert iter_rg_log == [[0], [1], [2]]
+
+    iter_rg_log.clear()
+    s_dpi = ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=2, table_mode="html", dpi=240, resume=True, pipeline=pipe)
+    assert s_dpi["skipped_shards"] == 0 and s_dpi["completed_shards"] == 3
+
+    class _StubOvisParquet:
+        def ocr_images(self, srcs, **_kw):
+            return [
+                OCRResult(
+                    text='{"ok": true}',
+                    raw_text='{"ok": true}',
+                    backend_used="ovis:stub",
+                    page_index=i,
+                    output_format="raw",
+                    timings=OCRTimings(total_ms=1.0),
+                )
+                for i, _ in enumerate(srcs)
+            ]
+
+    ovis_pipe = AutoOCRPipeline(backend="ovis", ovis_engine=_StubOvisParquet())
+    s_be = ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=3, table_mode="html", dpi=240, resume=True, pipeline=ovis_pipe)
+    assert s_be["skipped_shards"] == 0 and s_be["completed_shards"] == 3
+    s_pr = ocr_parquet(in_pq, out_dir, shard_rows=2, batch_size=3, table_mode="html", dpi=240, prompt="Extract JSON", resume=True, pipeline=ovis_pipe)
+    assert s_pr["skipped_shards"] == 0 and s_pr["completed_shards"] == 3
+    s_sc = ocr_parquet(
+        in_pq,
+        out_dir,
+        shard_rows=2,
+        batch_size=3,
+        table_mode="html",
+        dpi=240,
+        prompt="Extract JSON",
+        schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        resume=True,
+        pipeline=ovis_pipe,
+    )
+    assert s_sc["skipped_shards"] == 0 and s_sc["completed_shards"] == 3 and s_sc["valid_rows"] == 6
+
+    # Batching through ocr_images(batch_size=3), closing PIL handles, and deleting .{stem}_shards on .parquet output
+    seen_batches: list[tuple[int, int]] = []
+    orig_ocr_images = pipe.ocr_images
+
+    def _spy_ocr_images(srcs, **kw):
+        seen_batches.append((len(srcs), int(kw.get("batch_size", 0))))
+        return orig_ocr_images(srcs, **kw)
+
+    monkeypatch.setattr(pipe, "ocr_images", _spy_ocr_images)
+
+    close_count = 0
+    orig_close = _PILImage.Image.close
+
+    def _spy_close(self_im: _PILImage.Image) -> None:
+        nonlocal close_count
+        close_count += 1
+        orig_close(self_im)
+
+    monkeypatch.setattr(_PILImage.Image, "close", _spy_close)
+
+    final_pq = tmp_path / "consolidated.parquet"
+    s_single = ocr_parquet(in_pq, final_pq, shard_rows=6, batch_size=3, resume=False, pipeline=pipe)
+    assert seen_batches == [(3, 3), (3, 3)]
+    assert close_count >= 6
+    assert final_pq.is_file()
+    assert not (tmp_path / ".consolidated_shards").exists()
+    assert s_single["valid_rows"] == 6
+    assert pq.read_table(str(final_pq)).num_rows == 6
+
+
+def test_run_vision_batch_parallel_zero_disk_and_pool_reuse_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `run_vision_batch_parallel` avoids temp PNG writes, handles bytes/RGB, and reuses default pool."""
+    import io
+    import fast_ocr.pipeline as pipe_mod
+    from fast_ocr.apple_vision import _NativeVisionRunner
+
+    buf = io.BytesIO()
+    Image.new("RGB", (1000, 800), "white").save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    def _forbid_tempdir(*_a: object, **_kw: object) -> object:
+        raise AssertionError("TemporaryDirectory must not be used")
+
+    def _forbid_save(*_a: object, **_kw: object) -> object:
+        raise AssertionError("Image.save() must not write temp PNGs")
+
+    monkeypatch.setattr("tempfile.TemporaryDirectory", _forbid_tempdir)
+    monkeypatch.setattr(Image.Image, "save", _forbid_save)
+
+    vis_nat = AppleVisionOCR(bands=1)
+    vis_nat._engine = object.__new__(_NativeVisionRunner)  # type: ignore[assignment]
+
+    pool_creations = 0
+    shutdown_calls = 0
+
+    class _ReusablePool:
+        def __init__(self, max_workers: int = 1) -> None:
+            nonlocal pool_creations
+            pool_creations += 1
+            self.max_workers = int(max_workers)
+            self._broken = False
+            self._shutdown_thread = False
+
+        def map(self, _fn: object, tasks: list[tuple[object, ...]]) -> list[list[OCRResult]]:
+            return [
+                [
+                    OCRResult(
+                        text=f"P {idx}",
+                        raw_text=f"P {idx}",
+                        backend_used="apple-vision:par",
+                        page_index=int(idx),
+                    )
+                    for idx, _payload in task[-1]
+                ]
+                for task in tasks
+            ]
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            nonlocal shutdown_calls
+            _ = (wait, cancel_futures)
+            shutdown_calls += 1
+            self._shutdown_thread = True
+
+    pipe_mod._shutdown_vision_pool()
+    monkeypatch.setattr(pipe_mod, "_DEFAULT_PROCESS_POOL_EXECUTOR", _ReusablePool)
+    monkeypatch.setattr(pipe_mod, "ProcessPoolExecutor", _ReusablePool)
+
+    sources = [
+        Image.new("RGB", (1000, 800), "white"),
+        np.full((800, 1000, 3), 255, dtype=np.uint8),
+        png_bytes,
+        Image.new("L", (1000, 800), 255),
+    ]
+    res1 = pipe_mod.run_vision_batch_parallel(vis_nat, sources, [0, 1, 2, 3], output_format="markdown")
+    res2 = pipe_mod.run_vision_batch_parallel(vis_nat, sources, [0, 1, 2, 3], output_format="markdown")
+    assert res1 is not None and [r.text for r in res1] == ["P 0", "P 1", "P 2", "P 3"]
+    assert res2 is not None and [r.text for r in res2] == ["P 0", "P 1", "P 2", "P 3"]
+    assert pool_creations == 1  # Default pool reused across both calls!
+
+    pipe_mod._shutdown_vision_pool()
+    assert shutdown_calls == 1
+
+    # Also verify _recognize_vision_worker_chunk decodes ("rgb", ...) and raw PNG bytes payloads cleanly
+    seen_sizes: list[tuple[int, int]] = []
+
+    class _MockWorkerOCR:
+        def __init__(self, **_kw: object) -> None:
+            pass
+
+        def recognize_image(self, src: Image.Image, *, page_index: int = 0, output_format: str = "markdown") -> OCRResult:
+            _ = output_format
+            seen_sizes.append(src.size)
+            return OCRResult(text=f"W {page_index}", raw_text=f"W {page_index}", backend_used="mock", page_index=page_index)
+
+    pipe_mod._WORKER_OCR_CACHE.clear()
+    monkeypatch.setattr(pipe_mod, "AppleVisionOCR", _MockWorkerOCR)
+    rgb_payload = ("rgb", b"\xff" * (24 * 16 * 3), 24, 16)
+    w_res = pipe_mod._recognize_vision_worker_chunk(
+        ("accurate", 1, True, ("en-US",), False, 960, "raw", [(0, rgb_payload), (1, png_bytes)])
+    )
+    assert [r.text for r in w_res] == ["W 0", "W 1"]
+    assert seen_sizes == [(24, 16), (1000, 800)]
+    pipe_mod._WORKER_OCR_CACHE.clear()
+
 
 

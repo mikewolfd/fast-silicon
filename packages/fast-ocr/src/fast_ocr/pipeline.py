@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import atexit
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 import inspect
+import io
 from pathlib import Path
 import re
-import tempfile
+import shutil
+import threading
 import time
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .apple_vision import (
     AppleVisionOCR,
@@ -55,6 +58,9 @@ _VALID_SPECULATIVE_MODES = frozenset({"auto", "off", "self", "vision+self"})
 _VALID_LEVELS = frozenset({"accurate", "fast"})
 
 _NATIVE_MIN_CHARS = 80
+_NATIVE_OUTLINED_TEXT_MAX_PATHS = 200
+_NATIVE_OUTLINED_DENSE_MIN_PATHS = 500
+_NATIVE_OUTLINED_DENSE_PATH_PER_CHAR = 4
 _NATIVE_MAX_GARBLED_RATIO = 0.02
 
 _NATIVE_BULLET_RE = re.compile(r"^(?:[-*•·]|(?:\d{1,3}|[a-zA-Z])[.)])\s+")
@@ -84,12 +90,64 @@ def _supports_kwarg(fn: Any, name: str) -> bool:
     return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+_DEFAULT_PROCESS_POOL_EXECUTOR = ProcessPoolExecutor
+_VISION_POOL_LOCK = threading.Lock()
+_VISION_POOL: ProcessPoolExecutor | None = None
+_VISION_POOL_WORKERS: int = 0
+_WORKER_OCR_CACHE: dict[tuple[str, int, bool, tuple[str, ...], bool, int], AppleVisionOCR] = {}
+
+
+def _shutdown_vision_pool() -> None:
+    global _VISION_POOL, _VISION_POOL_WORKERS
+    with _VISION_POOL_LOCK:
+        pool = _VISION_POOL
+        _VISION_POOL = None
+        _VISION_POOL_WORKERS = 0
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_vision_pool)
+
+
+def _get_or_create_vision_pool(max_workers: int) -> ProcessPoolExecutor:
+    global _VISION_POOL, _VISION_POOL_WORKERS
+    req = max(1, int(max_workers))
+    with _VISION_POOL_LOCK:
+        pool = _VISION_POOL
+        if (
+            pool is not None
+            and _VISION_POOL_WORKERS >= req
+            and not bool(getattr(pool, "_broken", False))
+            and not bool(getattr(pool, "_shutdown_thread", False))
+        ):
+            return pool
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        pool = _DEFAULT_PROCESS_POOL_EXECUTOR(max_workers=req)
+        _VISION_POOL = pool
+        _VISION_POOL_WORKERS = req
+        return pool
+
+
 def _estimate_source_pixels(src: Any) -> int:
     """Cheaply estimate pixel count (`W * H`) for parallel ANE triage routing."""
     if isinstance(src, Image.Image):
         return int(src.width) * int(src.height)
     if isinstance(src, np.ndarray):
         return (int(src.shape[0]) * int(src.shape[1])) if src.ndim >= 2 else 0
+    if isinstance(src, (bytes, bytearray, memoryview)):
+        try:
+            with io.BytesIO(bytes(src)) as bio, Image.open(bio) as im:
+                return int(im.width) * int(im.height)
+        except Exception:
+            return 0
     if isinstance(src, (str, Path)):
         try:
             with Image.open(Path(src).expanduser()) as im:
@@ -100,24 +158,50 @@ def _estimate_source_pixels(src: Any) -> int:
 
 
 def _recognize_vision_worker_chunk(
-    args: tuple[str, int, bool, tuple[str, ...], bool, int, OutputFormat, list[tuple[int, str]]],
+    args: tuple[str, int, bool, tuple[str, ...], bool, int, OutputFormat, list[tuple[int, Any]]],
 ) -> list[OCRResult]:
     """Top-level picklable worker running full `AppleVisionOCR.recognize_image` (no MLX import)."""
     level, bands, language_correction, languages, auto_orient, min_long_edge, output_format, chunk = args
-    ocr = AppleVisionOCR(
-        level=level,
-        bands=bands,
-        language_correction=language_correction,
-        languages=languages,
-        auto_orient=auto_orient,
-        min_long_edge=min_long_edge,
-    )
-    return [ocr.recognize_image(path, page_index=page_idx, output_format=output_format) for page_idx, path in chunk]
+    key = (str(level), int(bands), bool(language_correction), tuple(languages), bool(auto_orient), int(min_long_edge))
+    ocr = _WORKER_OCR_CACHE.get(key)
+    if ocr is None:
+        ocr = AppleVisionOCR(
+            level=level,
+            bands=bands,
+            language_correction=language_correction,
+            languages=languages,
+            auto_orient=auto_orient,
+            min_long_edge=min_long_edge,
+        )
+        _WORKER_OCR_CACHE[key] = ocr
+    results: list[OCRResult] = []
+    for page_idx, item in chunk:
+        if isinstance(item, tuple) and len(item) == 4 and item[0] == "rgb":
+            _, raw_rgb, w, h = item
+            pil_im = Image.frombytes("RGB", (int(w), int(h)), raw_rgb)
+            try:
+                results.append(ocr.recognize_image(pil_im, page_index=page_idx, output_format=output_format))
+            finally:
+                pil_im.close()
+        elif isinstance(item, (bytes, bytearray, memoryview)):
+            with io.BytesIO(bytes(item)) as bio, Image.open(bio) as opened:
+                transposed = ImageOps.exif_transpose(opened)
+                pil_im = transposed.convert("RGB") if transposed.mode != "RGB" else transposed
+                try:
+                    results.append(ocr.recognize_image(pil_im, page_index=page_idx, output_format=output_format))
+                finally:
+                    if pil_im is not transposed:
+                        pil_im.close()
+                    if transposed is not opened:
+                        transposed.close()
+        else:
+            results.append(ocr.recognize_image(item, page_index=page_idx, output_format=output_format))
+    return results
 
 
 def run_vision_batch_parallel(
     vision: Any,
-    sources: Sequence[str | Path | Image.Image | np.ndarray],
+    sources: Sequence[str | Path | Image.Image | np.ndarray | bytes | bytearray | memoryview],
     page_indices: Sequence[int],
     *,
     output_format: OutputFormat,
@@ -125,7 +209,7 @@ def run_vision_batch_parallel(
     min_batch: int = 4,
     min_total_pixels: int = 2_000_000,
 ) -> list[OCRResult] | None:
-    """Dispatch `>= min_batch` full-page Apple Vision requests across `ProcessPoolExecutor`, else `None`."""
+    """Dispatch `>= min_batch` full-page Apple Vision requests across a reusable `ProcessPoolExecutor`, else `None`."""
     if len(sources) < min_batch:
         return None
     if not isinstance(vision, AppleVisionOCR):
@@ -136,59 +220,73 @@ def run_vision_batch_parallel(
     if sum(_estimate_source_pixels(src) for src in sources) < min_total_pixels:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="fast_ocr_ane_") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        paths: list[str] = []
-        for pos, src in enumerate(sources):
-            if isinstance(src, (str, Path)):
-                paths.append(str(Path(src).expanduser()))
-            else:
-                if isinstance(src, np.ndarray):
-                    arr = np.asarray(src)
-                    if arr.dtype != np.uint8:
-                        arr = np.clip(arr, 0, 255).astype(np.uint8)
-                    pil_im = Image.fromarray(arr)
-                elif isinstance(src, Image.Image):
-                    pil_im = src
-                else:
-                    return None
-                if pil_im.mode != "RGB":
-                    pil_im = pil_im.convert("RGB")
-                tmp_path = tmp_root / f"page_{pos}.png"
-                pil_im.save(tmp_path, format="PNG", compress_level=1)
-                paths.append(str(tmp_path))
-
-        n_workers = max(1, min(int(workers), len(paths)))
-        if n_workers <= 1:
+    payloads: list[Any] = []
+    for src in sources:
+        if isinstance(src, (str, Path)):
+            payloads.append(str(Path(src).expanduser()))
+        elif isinstance(src, (bytes, bytearray, memoryview)):
+            payloads.append(bytes(src))
+        elif isinstance(src, np.ndarray):
+            arr = np.asarray(src)
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            pil_im = Image.fromarray(arr)
+            rgb_im = pil_im.convert("RGB") if pil_im.mode != "RGB" else pil_im
+            try:
+                payloads.append(("rgb", rgb_im.tobytes(), int(rgb_im.width), int(rgb_im.height)))
+            finally:
+                if rgb_im is not pil_im:
+                    rgb_im.close()
+                pil_im.close()
+        elif isinstance(src, Image.Image):
+            transposed = ImageOps.exif_transpose(src)
+            rgb_im = transposed.convert("RGB") if transposed.mode != "RGB" else transposed
+            try:
+                payloads.append(("rgb", rgb_im.tobytes(), int(rgb_im.width), int(rgb_im.height)))
+            finally:
+                if rgb_im is not transposed:
+                    rgb_im.close()
+                if transposed is not src:
+                    transposed.close()
+        else:
             return None
-        indexed = list(zip((int(i) for i in page_indices), paths))
-        chunks = [indexed[w::n_workers] for w in range(n_workers)]
-        tasks = [
-            (
-                str(vision.level),
-                int(vision.bands),
-                bool(vision.language_correction),
-                tuple(vision.languages),
-                bool(vision.auto_orient),
-                int(vision.min_long_edge),
-                output_format,
-                chunk,
-            )
-            for chunk in chunks
-            if chunk
-        ]
-        try:
+
+    n_workers = max(1, min(int(workers), len(payloads)))
+    if n_workers <= 1:
+        return None
+    indexed = list(zip((int(i) for i in page_indices), payloads))
+    chunks = [indexed[w::n_workers] for w in range(n_workers)]
+    tasks = [
+        (
+            str(vision.level),
+            int(vision.bands),
+            bool(vision.language_correction),
+            tuple(vision.languages),
+            bool(vision.auto_orient),
+            int(vision.min_long_edge),
+            output_format,
+            chunk,
+        )
+        for chunk in chunks
+        if chunk
+    ]
+    try:
+        if ProcessPoolExecutor is not _DEFAULT_PROCESS_POOL_EXECUTOR:
             with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
                 chunk_results = list(pool.map(_recognize_vision_worker_chunk, tasks))
-        except (OSError, PermissionError):
-            return None
+        else:
+            pool = _get_or_create_vision_pool(len(tasks))
+            chunk_results = list(pool.map(_recognize_vision_worker_chunk, tasks))
+    except (OSError, PermissionError, RuntimeError):
+        _shutdown_vision_pool()
+        return None
 
-        ordered: list[OCRResult | None] = [None] * len(paths)
-        for worker_idx, res_list in enumerate(chunk_results):
-            for local_i, res in enumerate(res_list):
-                orig_pos = worker_idx + local_i * n_workers
-                ordered[orig_pos] = res
-        return [r for r in ordered if r is not None]
+    ordered: list[OCRResult | None] = [None] * len(payloads)
+    for worker_idx, res_list in enumerate(chunk_results):
+        for local_i, res in enumerate(res_list):
+            orig_pos = worker_idx + local_i * n_workers
+            ordered[orig_pos] = res
+    return [r for r in ordered if r is not None]
 
 
 def _is_likely_native_heading(line: str, *, prev_blank: bool, next_blank: bool) -> bool:
@@ -925,6 +1023,7 @@ class AutoOCRPipeline:
                 ),
                 "native_control_char_count": page.native_control_char_count,
                 "image_count": page.image_count,
+                "path_count": page.path_count,
                 "native_garbled_ratio": page.native_garbled_ratio,
                 "width_pt": page.width_pt,
                 "height_pt": page.height_pt,
@@ -1253,6 +1352,7 @@ class AutoOCRPipeline:
             ),
             "native_control_char_count": page.native_control_char_count,
             "image_count": page.image_count,
+            "path_count": page.path_count,
             "native_garbled_ratio": page.native_garbled_ratio,
             "width_pt": page.width_pt,
             "height_pt": page.height_pt,
@@ -1592,7 +1692,19 @@ class AutoOCRPipeline:
                     else None
                 )
                 layout_needs_vlm = bool(native_pa is not None and native_pa.needs_vlm)
-                can_native_eligible = is_clean and (eff_chars >= _NATIVE_MIN_CHARS or (eff_chars > 0 and p.image_count == 0))
+                is_dense_outlined_vector = (
+                    p.image_count == 0
+                    and p.path_count >= _NATIVE_OUTLINED_DENSE_MIN_PATHS
+                    and p.path_count > eff_chars * _NATIVE_OUTLINED_DENSE_PATH_PER_CHAR
+                )
+                can_native_eligible = (
+                    is_clean
+                    and not is_dense_outlined_vector
+                    and (
+                        eff_chars >= _NATIVE_MIN_CHARS
+                        or (eff_chars > 0 and p.image_count == 0 and p.path_count < _NATIVE_OUTLINED_TEXT_MAX_PATHS)
+                    )
+                )
                 splice_handled = False
                 if (
                     self.region_routing
@@ -1705,7 +1817,7 @@ class AutoOCRPipeline:
 
         files = resolve_input_files(input_path)
         out_raw = str(output_path).strip()
-        single_file_target = out_raw.endswith(".parquet")
+        single_file_target = out_raw.lower().endswith(".parquet")
         out_target = Path(out_raw).expanduser().resolve()
         shard_dir = (
             out_target.parent / f".{out_target.stem}_shards"
@@ -1718,22 +1830,53 @@ class AutoOCRPipeline:
             out_target.parent.mkdir(parents=True, exist_ok=True)
 
         step = max(1, int(shard_rows))
+        eff_bs = max(1, int(batch_size))
         row_budget = None if limit is None else max(0, int(limit))
         fmt: OutputFormat = output_format or self.output_format
         tmode: MarkdownTableMode = table_mode or self.table_mode
-
-        manifest: dict[str, Any] = _load_manifest(manifest_path) if resume else {}
-        completed_raw = manifest.get("completed_shards")
-        completed_shards: dict[str, dict[str, Any]] = (
-            dict(completed_raw) if isinstance(completed_raw, dict) else {}
+        schema_cfg = (
+            None
+            if schema is None
+            else (schema if isinstance(schema, str) else json.dumps(schema, sort_keys=True, ensure_ascii=False))
         )
-        manifest = {
-            "version": 1,
+        run_config: dict[str, Any] = {
+            "backend": self.backend,
+            "output_format": fmt,
+            "table_mode": tmode,
+            "strict_markdown_grammar": bool(self.strict_markdown_grammar),
+            "dpi": int(dpi),
+            "triage_dpi": int(triage_dpi),
+            "max_pixels": None if max_pixels is None else int(max_pixels),
+            "prompt": prompt,
+            "schema": schema_cfg,
+            "input_col": input_col,
+            "shard_rows": step,
+            "input_files": [[f.name, int(f.stat().st_size)] for f in files],
+        }
+
+        prev_manifest: dict[str, Any] = _load_manifest(manifest_path) if resume else {}
+        config_matches = (
+            bool(prev_manifest)
+            and isinstance(prev_manifest.get("config"), dict)
+            and prev_manifest.get("config") == run_config
+        )
+        if not resume or (prev_manifest and not config_matches):
+            completed_shards: dict[str, dict[str, Any]] = {}
+            for stale in shard_dir.glob("part-*.parquet"):
+                stale.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
+        else:
+            completed_raw = prev_manifest.get("completed_shards")
+            completed_shards = dict(completed_raw) if isinstance(completed_raw, dict) else {}
+
+        manifest: dict[str, Any] = {
+            "version": 2,
             "input_path": str(input_path),
             "backend": self.backend,
             "output_format": fmt,
             "table_mode": tmode,
             "shard_rows": step,
+            "config": run_config,
             "completed_shards": completed_shards,
         }
 
@@ -1762,116 +1905,7 @@ class AutoOCRPipeline:
                     return rel
             return p
 
-        def _ocr_single_row(
-            cols: dict[str, list[Any]],
-            idx: int,
-            src_file: Path,
-        ) -> tuple[str, str, bool, float, dict[str, Any]]:
-            cand_cols = (
-                [input_col]
-                if input_col is not None
-                else [c for c in ("pdf_path", "image_path", "image_bytes", "image") if c in cols]
-            )
-            chosen_col: str | None = None
-            raw_val: Any = None
-            for col_name in cand_cols:
-                if col_name not in cols:
-                    raise KeyError(f"Column {col_name!r} not found in {src_file.name}; available={list(cols)}")
-                val = cols[col_name][idx]
-                if val is not None:
-                    chosen_col = col_name
-                    raw_val = val
-                    break
-            if chosen_col is None:
-                raise ValueError(f"No non-null OCR source found at row {idx} of {src_file.name}")
-
-            if chosen_col == "pdf_path" or (
-                isinstance(raw_val, (str, Path)) and str(raw_val).lower().endswith(".pdf")
-            ):
-                pdf_p = _resolve_rel_path(str(raw_val), src_file)
-                page_idxs: list[int] | None = None
-                if "page_index" in cols and cols["page_index"][idx] is not None:
-                    page_idxs = [int(cols["page_index"][idx])]
-                if schema is not None or prompt is not None:
-                    if self.backend == "apple-vision":
-                        raise ValueError("Parquet `schema`/`prompt` extraction requires backend 'ovis' or 'auto'.")
-                    rendered_pages = render_pdf_pages(
-                        pdf_p,
-                        dpi=int(dpi),
-                        page_indices=page_idxs,
-                        include_native_text=False,
-                        max_pixels=max_pixels,
-                    )
-                    ovis = self._get_ovis_engine()
-                    pages = ovis.ocr_images(
-                        [rp.image for rp in rendered_pages if rp.image is not None],
-                        page_indices=[rp.page_index for rp in rendered_pages if rp.image is not None],
-                        prompt=prompt,
-                        schema=schema,
-                        output_format=fmt,
-                        table_mode=tmode,
-                    )
-                else:
-                    pages = self.ocr_pdf(
-                        pdf_p,
-                        dpi=int(dpi),
-                        triage_dpi=int(triage_dpi),
-                        page_indices=page_idxs,
-                        output_format=fmt,
-                        table_mode=tmode,
-                        batch_size=int(batch_size),
-                        max_pixels=max_pixels,
-                    )
-                ocr_txt = "\n\n".join(r.text for r in pages)
-                backends = ",".join(dict.fromkeys(r.backend_used for r in pages)) if pages else self.backend
-                if schema is not None:
-                    is_valid = bool(pages) and all(_is_valid_json_text(r.text) for r in pages)
-                else:
-                    is_valid = bool(pages) and all(
-                        (r.markdown_validation.valid if r.markdown_validation is not None else bool(r.text.strip()))
-                        for r in pages
-                    )
-                row_ms = sum(float(r.timings.total_ms) for r in pages)
-                meta = {
-                    "page_count": len(pages),
-                    "page_indices": [int(r.page_index) for r in pages],
-                    "output_format": pages[0].output_format if pages else fmt,
-                    "table_mode": pages[0].table_mode if pages else tmode,
-                    "finish_reasons": [r.finish_reason for r in pages],
-                    "generated_tokens": sum(int(r.timings.generated_tokens) for r in pages),
-                    "metadata": pages[0].metadata if len(pages) == 1 else [r.metadata for r in pages],
-                }
-                return ocr_txt, backends, is_valid, row_ms, meta
-
-            img_src: Image.Image | Path
-            if isinstance(raw_val, dict):
-                if raw_val.get("bytes") is not None:
-                    img_src = Image.open(io.BytesIO(bytes(raw_val["bytes"]))).convert("RGB")
-                elif raw_val.get("path"):
-                    img_src = _resolve_rel_path(str(raw_val["path"]), src_file)
-                else:
-                    raise ValueError(f"Unsupported image dict at row {idx}: keys={list(raw_val)}")
-            elif isinstance(raw_val, (bytes, bytearray, memoryview)):
-                img_src = Image.open(io.BytesIO(bytes(raw_val))).convert("RGB")
-            else:
-                img_src = _resolve_rel_path(str(raw_val), src_file)
-
-            if schema is not None or prompt is not None:
-                if self.backend == "apple-vision":
-                    raise ValueError("Parquet `schema`/`prompt` extraction requires backend 'ovis' or 'auto'.")
-                res = self._get_ovis_engine().ocr_image(
-                    img_src,
-                    prompt=prompt,
-                    schema=schema,
-                    output_format=fmt,
-                    table_mode=tmode,
-                )
-            else:
-                res = self.ocr_image(
-                    img_src,
-                    output_format=fmt,
-                    table_mode=tmode,
-                )
+        def _format_image_outcome(res: OCRResult) -> tuple[str, str, bool, float, dict[str, Any]]:
             if schema is not None:
                 is_valid = _is_valid_json_text(res.text)
             elif res.markdown_validation is not None:
@@ -1891,6 +1925,305 @@ class AutoOCRPipeline:
             }
             return res.text, res.backend_used, is_valid, float(res.timings.total_ms), meta
 
+        def _ocr_pdf_row(
+            pdf_p: Path,
+            page_idxs: list[int] | None,
+        ) -> tuple[str, str, bool, float, dict[str, Any]]:
+            if schema is not None or prompt is not None:
+                if self.backend == "apple-vision":
+                    raise ValueError("Parquet `schema`/`prompt` extraction requires backend 'ovis' or 'auto'.")
+                rendered_pages = render_pdf_pages(
+                    pdf_p,
+                    dpi=int(dpi),
+                    page_indices=page_idxs,
+                    include_native_text=False,
+                    max_pixels=max_pixels,
+                )
+                ovis = self._get_ovis_engine()
+                valid_rp = [rp for rp in rendered_pages if rp.image is not None]
+                imgs_rp = [rp.image for rp in valid_rp if rp.image is not None]
+                idxs_rp = [rp.page_index for rp in valid_rp]
+                try:
+                    pages = ovis.ocr_images(
+                        imgs_rp,
+                        page_indices=idxs_rp,
+                        prompt=prompt,
+                        schema=schema,
+                        output_format=fmt,
+                        table_mode=tmode,
+                        batch_size=eff_bs,
+                    )
+                finally:
+                    for im_rp in imgs_rp:
+                        im_rp.close()
+            else:
+                pages = self.ocr_pdf(
+                    pdf_p,
+                    dpi=int(dpi),
+                    triage_dpi=int(triage_dpi),
+                    page_indices=page_idxs,
+                    output_format=fmt,
+                    table_mode=tmode,
+                    batch_size=eff_bs,
+                    max_pixels=max_pixels,
+                )
+            ocr_txt = "\n\n".join(r.text for r in pages)
+            backends = ",".join(dict.fromkeys(r.backend_used for r in pages)) if pages else self.backend
+            if schema is not None:
+                is_valid = bool(pages) and all(_is_valid_json_text(r.text) for r in pages)
+            else:
+                is_valid = bool(pages) and all(
+                    (r.markdown_validation.valid if r.markdown_validation is not None else bool(r.text.strip()))
+                    for r in pages
+                )
+            row_ms = sum(float(r.timings.total_ms) for r in pages)
+            meta = {
+                "page_count": len(pages),
+                "page_indices": [int(r.page_index) for r in pages],
+                "output_format": pages[0].output_format if pages else fmt,
+                "table_mode": pages[0].table_mode if pages else tmode,
+                "finish_reasons": [r.finish_reason for r in pages],
+                "generated_tokens": sum(int(r.timings.generated_tokens) for r in pages),
+                "metadata": pages[0].metadata if len(pages) == 1 else [r.metadata for r in pages],
+            }
+            return ocr_txt, backends, is_valid, row_ms, meta
+
+        def _process_shard_table(
+            slice_table: pa.Table,
+            src_file: Path,
+            shard_path: Path,
+            shard_key: str,
+            row_start: int,
+            row_end: int,
+        ) -> None:
+            nonlocal completed_count, processed_rows, total_rows, valid_rows, total_ms
+            shard_len = int(slice_table.num_rows)
+            cols = slice_table.to_pydict()
+            row_outcomes: list[tuple[str, str, bool, float, dict[str, Any]] | None] = [None] * shard_len
+            pending_image_rows: list[tuple[int, Any]] = []
+
+            for r_idx in range(shard_len):
+                try:
+                    cand_cols = (
+                        [input_col]
+                        if input_col is not None
+                        else [c for c in ("pdf_path", "image_path", "image_bytes", "image") if c in cols]
+                    )
+                    chosen_col: str | None = None
+                    raw_val: Any = None
+                    for col_name in cand_cols:
+                        if col_name not in cols:
+                            raise KeyError(
+                                f"Column {col_name!r} not found in {src_file.name}; available={list(cols)}"
+                            )
+                        val = cols[col_name][r_idx]
+                        if val is not None:
+                            chosen_col = col_name
+                            raw_val = val
+                            break
+                    if chosen_col is None:
+                        raise ValueError(f"No non-null OCR source found at row {r_idx} of {src_file.name}")
+
+                    if chosen_col == "pdf_path" or (
+                        isinstance(raw_val, (str, Path)) and str(raw_val).lower().endswith(".pdf")
+                    ):
+                        pdf_p = _resolve_rel_path(str(raw_val), src_file)
+                        page_idxs: list[int] | None = None
+                        if "page_index" in cols and cols["page_index"][r_idx] is not None:
+                            page_idxs = [int(cols["page_index"][r_idx])]
+                        row_outcomes[r_idx] = _ocr_pdf_row(pdf_p, page_idxs)
+                    else:
+                        pending_image_rows.append((r_idx, raw_val))
+                except Exception as exc:
+                    if not skip_errors:
+                        raise
+                    row_outcomes[r_idx] = (
+                        "",
+                        f"error:{self.backend}",
+                        False,
+                        0.0,
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
+
+            for c0 in range(0, len(pending_image_rows), eff_bs):
+                chunk = pending_image_rows[c0 : c0 + eff_bs]
+                opened_images: list[Image.Image] = []
+                batch_items: list[tuple[int, Image.Image | Path]] = []
+                try:
+                    for r_idx, raw_val in chunk:
+                        try:
+                            if isinstance(raw_val, dict):
+                                if raw_val.get("bytes") is not None:
+                                    with io.BytesIO(bytes(raw_val["bytes"])) as bio, Image.open(bio) as im:
+                                        rgb = ImageOps.exif_transpose(im).convert("RGB")
+                                    opened_images.append(rgb)
+                                    img_src: Image.Image | Path = rgb
+                                elif raw_val.get("path"):
+                                    img_src = _resolve_rel_path(str(raw_val["path"]), src_file)
+                                else:
+                                    raise ValueError(f"Unsupported image dict at row {r_idx}: keys={list(raw_val)}")
+                            elif isinstance(raw_val, (bytes, bytearray, memoryview)):
+                                with io.BytesIO(bytes(raw_val)) as bio, Image.open(bio) as im:
+                                    rgb = ImageOps.exif_transpose(im).convert("RGB")
+                                opened_images.append(rgb)
+                                img_src = rgb
+                            else:
+                                img_src = _resolve_rel_path(str(raw_val), src_file)
+                            batch_items.append((r_idx, img_src))
+                        except Exception as exc:
+                            if not skip_errors:
+                                raise
+                            row_outcomes[r_idx] = (
+                                "",
+                                f"error:{self.backend}",
+                                False,
+                                0.0,
+                                {"error": f"{type(exc).__name__}: {exc}"},
+                            )
+
+                    if batch_items:
+                        batch_srcs = [src for _, src in batch_items]
+                        try:
+                            if schema is not None or prompt is not None:
+                                if self.backend == "apple-vision":
+                                    raise ValueError(
+                                        "Parquet `schema`/`prompt` extraction requires backend 'ovis' or 'auto'."
+                                    )
+                                ovis = self._get_ovis_engine()
+                                ovis_batch_fn = getattr(ovis, "ocr_images", None)
+                                if callable(ovis_batch_fn):
+                                    kw = _filter_accepted_kwargs(
+                                        ovis_batch_fn,
+                                        {
+                                            "prompt": prompt,
+                                            "schema": schema,
+                                            "output_format": fmt,
+                                            "table_mode": tmode,
+                                            "batch_size": eff_bs,
+                                        },
+                                    )
+                                    batch_res = list(ovis_batch_fn(batch_srcs, **kw))
+                                else:
+                                    batch_res = [
+                                        ovis.ocr_image(
+                                            src,
+                                            prompt=prompt,
+                                            schema=schema,
+                                            output_format=fmt,
+                                            table_mode=tmode,
+                                        )
+                                        for src in batch_srcs
+                                    ]
+                            else:
+                                batch_res = self.ocr_images(
+                                    batch_srcs,
+                                    output_format=fmt,
+                                    table_mode=tmode,
+                                    batch_size=eff_bs,
+                                )
+                            if len(batch_res) != len(batch_items):
+                                raise RuntimeError(
+                                    f"ocr_images returned {len(batch_res)} results for {len(batch_items)} rows"
+                                )
+                            for (r_idx, _), res in zip(batch_items, batch_res):
+                                row_outcomes[r_idx] = _format_image_outcome(res)
+                        except Exception:
+                            if not skip_errors:
+                                raise
+                            for r_idx, src in batch_items:
+                                try:
+                                    if schema is not None or prompt is not None:
+                                        if self.backend == "apple-vision":
+                                            raise ValueError(
+                                                "Parquet `schema`/`prompt` extraction requires backend 'ovis' or 'auto'."
+                                            )
+                                        res = self._get_ovis_engine().ocr_image(
+                                            src,
+                                            prompt=prompt,
+                                            schema=schema,
+                                            output_format=fmt,
+                                            table_mode=tmode,
+                                        )
+                                    else:
+                                        res = self.ocr_image(
+                                            src,
+                                            output_format=fmt,
+                                            table_mode=tmode,
+                                        )
+                                    row_outcomes[r_idx] = _format_image_outcome(res)
+                                except Exception as row_exc:
+                                    row_outcomes[r_idx] = (
+                                        "",
+                                        f"error:{self.backend}",
+                                        False,
+                                        0.0,
+                                        {"error": f"{type(row_exc).__name__}: {row_exc}"},
+                                    )
+                finally:
+                    for opened_rgb in opened_images:
+                        opened_rgb.close()
+
+            ocr_texts: list[str] = []
+            backends: list[str] = []
+            valids: list[bool] = []
+            row_times: list[float] = []
+            meta_jsons: list[str] = []
+            shard_valid = 0
+            shard_ms = 0.0
+            for outcome in row_outcomes:
+                assert outcome is not None
+                txt, b_used, ok, r_ms, meta = outcome
+                ocr_texts.append(txt)
+                backends.append(b_used)
+                valids.append(bool(ok))
+                row_times.append(round(float(r_ms), 3))
+                meta_jsons.append(json.dumps(meta, ensure_ascii=False))
+                if ok:
+                    shard_valid += 1
+                shard_ms += float(r_ms)
+
+            out_cols = {
+                name: slice_table.column(name)
+                for name in slice_table.column_names
+                if name not in ("ocr_text", "backend_used", "ocr_valid", "total_ms", "metadata_json")
+            }
+            out_cols["ocr_text"] = pa.array(ocr_texts, type=pa.string())
+            out_cols["backend_used"] = pa.array(backends, type=pa.string())
+            out_cols["ocr_valid"] = pa.array(valids, type=pa.bool_())
+            out_cols["total_ms"] = pa.array(row_times, type=pa.float64())
+            out_cols["metadata_json"] = pa.array(meta_jsons, type=pa.string())
+            out_table = pa.table(out_cols)
+
+            tmp_shard = shard_path.with_name(f".{shard_path.name}.tmp.{os.getpid()}")
+            try:
+                pq.write_table(
+                    out_table,
+                    str(tmp_shard),
+                    compression=_resolve_parquet_compression(out_table.schema, compression),
+                )
+                os.replace(tmp_shard, shard_path)
+            except BaseException:
+                tmp_shard.unlink(missing_ok=True)
+                raise
+
+            completed_shards[shard_key] = {
+                "file": shard_path.name,
+                "source_file": str(src_file),
+                "row_start": int(row_start),
+                "row_end": int(row_end),
+                "rows": int(shard_len),
+                "valid_rows": int(shard_valid),
+                "total_ms": round(shard_ms, 3),
+            }
+            _save_manifest(manifest_path, manifest)
+
+            shard_files.append(shard_path)
+            completed_count += 1
+            processed_rows += shard_len
+            total_rows += shard_len
+            valid_rows += shard_valid
+            total_ms += shard_ms
+
         for file_idx, src_file in enumerate(files):
             pf = pq.ParquetFile(src_file)
             file_rows = int(pf.metadata.num_rows) if pf.metadata is not None else 0
@@ -1900,7 +2233,7 @@ class AutoOCRPipeline:
             if remaining_for_file <= 0:
                 break
 
-            file_table = pf.read()
+            pending_shards: list[tuple[int, int, str, Path]] = []
             for row_start in range(0, remaining_for_file, step):
                 row_end = min(remaining_for_file, row_start + step)
                 shard_len = row_end - row_start
@@ -1912,7 +2245,11 @@ class AutoOCRPipeline:
                 prev_entry = completed_shards.get(shard_key) if resume else None
                 if prev_entry is not None:
                     prev_file = shard_dir / str(prev_entry.get("file", shard_name))
-                    if prev_file.is_file() and prev_file.stat().st_size > 0:
+                    if (
+                        prev_file.is_file()
+                        and prev_file.stat().st_size > 0
+                        and int(prev_entry.get("rows", shard_len)) == shard_len
+                    ):
                         shard_files.append(prev_file)
                         skipped_count += 1
                         skipped_rows += shard_len
@@ -1921,77 +2258,55 @@ class AutoOCRPipeline:
                         total_ms += float(prev_entry.get("total_ms", 0.0))
                         continue
 
-                slice_table = file_table.slice(row_start, shard_len)
-                cols = slice_table.to_pydict()
-                ocr_texts: list[str] = []
-                backends: list[str] = []
-                valids: list[bool] = []
-                row_times: list[float] = []
-                meta_jsons: list[str] = []
-                shard_valid = 0
-                shard_ms = 0.0
+                pending_shards.append((row_start, row_end, shard_key, shard_path))
 
-                for r_idx in range(shard_len):
-                    try:
-                        txt, b_used, ok, r_ms, meta = _ocr_single_row(cols, r_idx, src_file)
-                    except Exception as exc:
-                        if not skip_errors:
-                            raise
-                        txt = ""
-                        b_used = f"error:{self.backend}"
-                        ok = False
-                        r_ms = 0.0
-                        meta = {"error": f"{type(exc).__name__}: {exc}"}
-                    ocr_texts.append(txt)
-                    backends.append(b_used)
-                    valids.append(bool(ok))
-                    row_times.append(round(float(r_ms), 3))
-                    meta_jsons.append(json.dumps(meta, ensure_ascii=False))
-                    if ok:
-                        shard_valid += 1
-                    shard_ms += float(r_ms)
+            if not pending_shards:
+                continue
 
-                out_cols = {
-                    name: slice_table.column(name)
-                    for name in slice_table.column_names
-                    if name not in ("ocr_text", "backend_used", "ocr_valid", "total_ms", "metadata_json")
-                }
-                out_cols["ocr_text"] = pa.array(ocr_texts, type=pa.string())
-                out_cols["backend_used"] = pa.array(backends, type=pa.string())
-                out_cols["ocr_valid"] = pa.array(valids, type=pa.bool_())
-                out_cols["total_ms"] = pa.array(row_times, type=pa.float64())
-                out_cols["metadata_json"] = pa.array(meta_jsons, type=pa.string())
-                out_table = pa.table(out_cols)
+            rg_bounds: list[tuple[int, int, int]] = []
+            cur_rg_row = 0
+            for rg_idx in range(pf.num_row_groups):
+                rg_rows = int(pf.metadata.row_group(rg_idx).num_rows)
+                rg_bounds.append((rg_idx, cur_rg_row, cur_rg_row + rg_rows))
+                cur_rg_row += rg_rows
 
-                tmp_shard = shard_path.with_name(f".{shard_path.name}.tmp.{os.getpid()}")
-                try:
-                    pq.write_table(
-                        out_table,
-                        str(tmp_shard),
-                        compression=_resolve_parquet_compression(out_table.schema, compression),
-                    )
-                    os.replace(tmp_shard, shard_path)
-                except BaseException:
-                    tmp_shard.unlink(missing_ok=True)
-                    raise
-
-                completed_shards[shard_key] = {
-                    "file": shard_name,
-                    "source_file": str(src_file),
-                    "row_start": int(row_start),
-                    "row_end": int(row_end),
-                    "rows": int(shard_len),
-                    "valid_rows": int(shard_valid),
-                    "total_ms": round(shard_ms, 3),
-                }
-                _save_manifest(manifest_path, manifest)
-
-                shard_files.append(shard_path)
-                completed_count += 1
-                processed_rows += shard_len
-                total_rows += shard_len
-                valid_rows += shard_valid
-                total_ms += shard_ms
+            p_idx = 0
+            accum_batches: list[pa.RecordBatch] = []
+            accum_rows = 0
+            for rg_idx, rg_start, rg_end in rg_bounds:
+                if p_idx >= len(pending_shards):
+                    break
+                if not any(s0 < rg_end and s1 > rg_start for s0, s1, _, _ in pending_shards[p_idx:]):
+                    continue
+                cur_rb_row = rg_start
+                for rb in pf.iter_batches(batch_size=step, row_groups=[rg_idx]):
+                    rb_start = cur_rb_row
+                    rb_end = rb_start + int(rb.num_rows)
+                    cur_rb_row = rb_end
+                    while p_idx < len(pending_shards):
+                        s0, s1, shard_key, shard_path = pending_shards[p_idx]
+                        if s0 >= rb_end:
+                            break
+                        if s1 <= rb_start:
+                            p_idx += 1
+                            continue
+                        ov_start = max(s0, rb_start)
+                        ov_end = min(s1, rb_end)
+                        need_start = s0 + accum_rows
+                        if ov_end > need_start:
+                            slice_start = max(0, max(ov_start, need_start) - rb_start)
+                            slice_len = ov_end - max(ov_start, need_start)
+                            if slice_len > 0:
+                                accum_batches.append(rb.slice(slice_start, slice_len))
+                                accum_rows += slice_len
+                        if accum_rows == (s1 - s0):
+                            slice_table = pa.Table.from_batches(accum_batches, schema=rb.schema)
+                            accum_batches.clear()
+                            accum_rows = 0
+                            _process_shard_table(slice_table, src_file, shard_path, shard_key, s0, s1)
+                            p_idx += 1
+                        else:
+                            break
 
         final_output: Path = out_target if single_file_target else shard_dir
         if single_file_target:
@@ -2028,6 +2343,7 @@ class AutoOCRPipeline:
                     writer.close()
                 tmp_final.unlink(missing_ok=True)
                 raise
+            shutil.rmtree(shard_dir, ignore_errors=True)
 
         return {
             "input_files": [str(f) for f in files],
@@ -2041,7 +2357,7 @@ class AutoOCRPipeline:
             "skipped_shards": int(skipped_count),
             "valid_rows": int(valid_rows),
             "total_ms": round(total_ms, 3),
-            "shard_files": [str(p) for p in shard_files],
+            "shard_files": [] if single_file_target else [str(p) for p in shard_files],
         }
 
     def close(self) -> None:

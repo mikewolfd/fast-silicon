@@ -57,6 +57,41 @@ def resolve_hetero_schedule(
     return ane_take, steal_min, bs, 1, 2
 
 
+def resolve_hetero_initial_seed(
+    *,
+    is_apple10: bool,
+    n_short: int,
+    batch_size: int,
+    pipe_depth: int,
+) -> tuple[int, int]:
+    """Return `(gpu_seed, ane_seed)` pre-seeded before worker threads start when `not long_items`.
+
+    Avoids `t_ane` draining small/medium batches below `steal_min_chunk` before `t_gpu` starts,
+    preventing GPU starvation on Base M5 (`Apple10`) and small M4 Pro batches.
+    """
+    n = max(0, int(n_short))
+    if n == 0:
+        return 0, 0
+    ane_chunk_take, _steal_min, steal_cap, steal_num, steal_den = resolve_hetero_schedule(
+        is_apple10=is_apple10,
+        batch_size=batch_size,
+        pipe_depth=pipe_depth,
+    )
+    bs = max(1, int(batch_size))
+    if is_apple10:
+        if n <= 16:
+            gpu_seed = min(n, (n * 3 + 4) // 5)
+        else:
+            gpu_seed = min(n, steal_cap, max(10, min(max(bs, 16), (n * steal_num) // steal_den)))
+    else:
+        if n <= 16:
+            gpu_seed = min(n, max(1, (n + 1) // 3))
+        else:
+            gpu_seed = min(n, steal_cap, max(4, min(max(bs, 8), (n * steal_num) // (steal_den + 1))))
+    ane_seed = min(n - gpu_seed, ane_chunk_take)
+    return gpu_seed, ane_seed
+
+
 class _PplxSlotBuffers(ctypes.Structure):
     _fields_ = [
         ("slot_idx", ctypes.c_int),
@@ -1358,11 +1393,11 @@ class FastPplx:
             return ctx_out if contextual else flat_out
 
         # Zero-thread inline fast path for single-item short inputs:
-        # - Base M5+ (Apple10 NAX) `hetero2`: Metal GPU is ~1.5x faster (~6.1ms vs ~9.0ms ANE) at exact FP16 parity.
-        # - M4 Pro (Apple9) or deterministic `hetero`: single ANE slot beats Metal GPU without thread-spawn overhead.
+        # - Apple9 (M4 Pro: 6.57ms GPU vs 7.71ms ANE) and Apple10+ (M5 NAX: ~6.1ms GPU vs ~9.0ms ANE)
+        #   `hetero2`: single-item Metal GPU beats ANE without thread-spawn overhead at exact FP16 parity.
+        # - Deterministic `hetero` / `ane`: single ANE slot handles <= max_ane_cap deterministically.
         if n_items == 1 and not contextual and len(short_items) == 1:
-            is_apple10_q = bool(self.runtime_telemetry.get("is_apple10", False))
-            if eff_mode == "hetero2" and self.gpu is not None and is_apple10_q:
+            if eff_mode == "hetero2" and self.gpu is not None:
                 res = _encode_gpu(items)
                 self._set_call_stats(
                     {
@@ -1399,7 +1434,8 @@ class FastPplx:
 
         # Concurrent hetero (deterministic static split) vs hetero2 (dynamic work-stealing):
         # - `hetero`: ANE owns all short <= max_ane_cap items deterministically; GPU owns > max_ane_cap items.
-        # - `hetero2`: ANE drains from head of short_dq while GPU finishes long items and steals from tail of short_dq.
+        # - `hetero2`: When `not long_items`, pre-seed GPU + ANE before launching threads to eliminate
+        #   GPU starvation on small/medium batches (e.g. Base M5 `n=8`); both workers then drain/steal remaining work.
         allow_stealing = eff_mode == "hetero2"
         short_dq = deque(sorted(short_items, key=lambda it: len(it[1])))
         mu = threading.Lock()
@@ -1412,13 +1448,45 @@ class FastPplx:
             pipe_depth=self.pipe_depth,
         )
 
+        init_gpu: list[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]] = []
+        init_ane: list[tuple[int, Sequence[int], Sequence[tuple[int, int]] | None]] = []
+        if allow_stealing and not long_items and short_dq:
+            gpu_seed, ane_seed = resolve_hetero_initial_seed(
+                is_apple10=is_apple10,
+                n_short=len(short_dq),
+                batch_size=batch_size,
+                pipe_depth=self.pipe_depth,
+            )
+            init_gpu = [short_dq.pop() for _ in range(gpu_seed)]
+            init_ane = [short_dq.popleft() for _ in range(ane_seed)]
+
+        if init_gpu and not long_items and not init_ane and not short_dq:
+            _run_gpu_subset(init_gpu)
+            self._set_call_stats(
+                {
+                    "mode": eff_mode,
+                    "ane_items": 0,
+                    "ane_buckets": 0,
+                    "gpu_items": len(init_gpu),
+                    "gpu_stolen_items": len(init_gpu),
+                    "deterministic": False,
+                    "elapsed_s": round(time.perf_counter() - t0, 4),
+                }
+            )
+            return ctx_out if contextual else flat_out
+
         def ane_worker() -> None:
             try:
+                pending = init_ane
                 while True:
-                    with mu:
-                        if not short_dq:
-                            break
-                        taken = [short_dq.popleft() for _ in range(min(len(short_dq), ane_chunk_take))]
+                    if pending:
+                        taken = pending
+                        pending = []
+                    else:
+                        with mu:
+                            if not short_dq:
+                                break
+                            taken = [short_dq.popleft() for _ in range(min(len(short_dq), ane_chunk_take))]
                     bkts = pack_ane_buckets(taken, supported_caps=ane_caps)
                     done = self.ane.run_buckets(
                         bkts,
@@ -1439,11 +1507,17 @@ class FastPplx:
                     _run_gpu_subset(long_items)
                     with mu:
                         counts["gpu_items"] += len(long_items)
+                if init_gpu:
+                    _run_gpu_subset(init_gpu)
+                    with mu:
+                        counts["gpu_items"] += len(init_gpu)
+                        counts["gpu_stolen_items"] += len(init_gpu)
                 if allow_stealing:
+                    min_steal = 1 if not long_items else steal_min_chunk
                     while True:
                         with mu:
-                            # Leave small tail items when almost empty so ANE finishes cleanly without racing.
-                            if len(short_dq) < steal_min_chunk:
+                            # Leave small tail items when GPU had long_items so ANE finishes cleanly without racing.
+                            if len(short_dq) < min_steal:
                                 break
                             take_n = min(len(short_dq), steal_cap, max(1, (len(short_dq) * steal_num) // steal_den))
                             stolen = [short_dq.pop() for _ in range(take_n)]

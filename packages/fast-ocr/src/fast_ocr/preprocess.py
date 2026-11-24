@@ -29,6 +29,8 @@ DEFAULT_PDF_LINE_MERGE_GAP = 0.015
 _CONTROL_GARBLE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]")
 _STAMP_BOILERPLATE_RES = (
     re.compile(r"^\s*VerDate\s+\S+.*?\bFrm\s+\S+.*?\bFmt\s+\S+.*$", re.IGNORECASE),
+    re.compile(r"^\s*[A-Z]{2,12}[-_]\d{4,10}\s+with\s+(?:DISTILLER|PROD\S*)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Insert\s+offset\s+folio\s+\d+\s+here\b.*$", re.IGNORECASE),
     re.compile(r"^\s*(?:page\s+)?\d{1,5}(?:\s*(?:of|/)\s*\d{1,5})?\s*$", re.IGNORECASE),
     re.compile(r"^[\s\-_=–—·•*]+$"),
     re.compile(r"^\s*[A-Z]{2,8}[-_]\d{4,10}\s*$"),
@@ -48,6 +50,7 @@ class RenderedPDFPage:
     native_garbled_ratio: float
     image: Image.Image | None
     image_count: int = 0
+    path_count: int = 0
     effective_dpi: int | None = None
     native_control_char_count: int = 0
     native_body_char_count: int | None = None
@@ -120,6 +123,17 @@ def _count_pdf_page_images(page: object) -> int:
         import pypdfium2.raw as pdfium_raw
 
         objs = page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE])  # type: ignore[attr-defined]
+        return sum(1 for _ in objs)
+    except Exception:
+        return 0
+
+
+def _count_pdf_page_paths(page: object) -> int:
+    """Count vector path objects on a `pypdfium2` page (detects vector-outlined glyph streams)."""
+    try:
+        import pypdfium2.raw as pdfium_raw
+
+        objs = page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_PATH])  # type: ignore[attr-defined]
         return sum(1 for _ in objs)
     except Exception:
         return 0
@@ -263,6 +277,7 @@ def extract_native_pdf_text(
                         native_garbled_ratio=garbled_ratio,
                         image=None,
                         image_count=_count_pdf_page_images(page),
+                        path_count=_count_pdf_page_paths(page),
                         native_control_char_count=ctrl_count,
                         native_body_char_count=body_count,
                         lines=page_lines,
@@ -299,6 +314,7 @@ def render_pdf_pages(
                 w_pt, h_pt = page.get_size()
                 stripped = ""
                 img_count = 0
+                path_count = 0
                 ctrl_count = 0
                 body_count: int | None = None
                 if include_native_text:
@@ -308,6 +324,7 @@ def render_pdf_pages(
                     finally:
                         tp.close()
                     img_count = _count_pdf_page_images(page)
+                    path_count = _count_pdf_page_paths(page)
                     ctrl_count = count_control_garble_chars(stripped)
                     body_count = sum(1 for c in strip_running_pdf_boilerplate(stripped) if not c.isspace())
                 eff_dpi = compute_adaptive_render_dpi(
@@ -331,6 +348,7 @@ def render_pdf_pages(
                         native_garbled_ratio=_garbled_text_ratio(stripped),
                         image=pil_img,
                         image_count=img_count,
+                        path_count=path_count,
                         effective_dpi=eff_dpi,
                         native_control_char_count=ctrl_count,
                         native_body_char_count=body_count,

@@ -204,14 +204,14 @@ def _resolve_ovis_min_pixels(
     output_format: OutputFormat = "markdown",
     schema: Any = None,
 ) -> int:
-    """Resolve `min_pixels` for ViT preprocessing, auto-upscaling small Markdown tables (<150K px) when unpinned."""
+    """Resolve `min_pixels` for ViT preprocessing, auto-upscaling compact Markdown tables (<150K px) when unpinned."""
     if min_pixels is not None:
         return max(1024, int(min_pixels))
     if max_pixels is None and output_format == "markdown" and schema is None:
         w, h = int(image_size[0]), int(image_size[1])
         area = w * h
         min_side = min(w, h)
-        if 0 < area < 150_000 and min_side >= 80 and (float(max(w, h)) / float(min_side)) <= 6.0:
+        if 50_000 <= area < 150_000 and min_side >= 100 and (float(max(w, h)) / float(min_side)) <= 4.0:
             return 262_144
     return 65_536
 
@@ -497,12 +497,16 @@ def detect_catastrophic_token_loop(
     max_period: int = 8,
     decode_fn: Callable[[Sequence[int]], str] | None = None,
     table_min_repeats: int = 40,
+    tail_window: int = 128,
+    min_tail_tokens: int = 192,
+    tail_repeat_rate_threshold: float = 0.60,
+    table_tail_repeat_rate_threshold: float = 0.82,
+    long_max_period: int = 64,
 ) -> tuple[int, int] | None:
-    """Detect extreme consecutive periodic collapse (`p=1..max_period`) without tripping on normal tables.
+    """Detect extreme consecutive periodic collapse (`p=1..max_period`) or long-period tail collapse.
 
-    Returns `(period, consecutive_repeats)` when the tail of `token_ids` consists of at least
-    `min_repeats` identical consecutive copies of a short cycle (or `table_min_repeats` if the cycle
-    contains HTML/GFM table delimiters), else `None`.
+    Returns `(period, consecutive_repeats)` (or `(0, len(token_ids))` for aperiodic/tail-4gram collapse)
+    without false-flagging normal dense HTML/GFM table markup, else `None`.
     """
     n = len(token_ids)
     req_base = max(4, int(min_repeats))
@@ -533,6 +537,46 @@ def detect_catastrophic_token_loop(
                 if any(m in txt for m in _TABLE_MARKUP_MARKERS):
                     continue
             return (p, reps)
+
+    eff_min_tail = max(int(min_tail_tokens), int(tail_window), 16)
+    if n >= eff_min_tail:
+        win = max(16, int(tail_window))
+        rep4 = _token_tail_repeat_4gram_rate(token_ids, tail_len=win)
+        long_match: tuple[int, int] | None = None
+        last_tok = int(token_ids[n - 1])
+        for p in range(max(1, int(max_period)) + 1, int(long_max_period) + 1):
+            if n < 3 * p:
+                break
+            if int(token_ids[n - 1 - p]) != last_tok:
+                continue
+            pat = [int(t) for t in token_ids[n - p : n]]
+            reps = 1
+            pos = n - 2 * p
+            while pos >= 0:
+                ok = True
+                for j in range(p):
+                    if int(token_ids[pos + j]) != pat[j]:
+                        ok = False
+                        break
+                if not ok:
+                    break
+                reps += 1
+                pos -= p
+            if reps >= 3 and (p * reps) >= 144:
+                long_match = (p, reps)
+                break
+
+        if long_match is not None or rep4 >= float(tail_repeat_rate_threshold):
+            has_table_markup = False
+            if decode_fn is not None:
+                tail_txt = decode_fn(token_ids[-win:]).lower()
+                has_table_markup = any(m in tail_txt for m in _TABLE_MARKUP_MARKERS)
+            if not has_table_markup:
+                return long_match if long_match is not None else (0, n)
+            if long_match is not None and long_match[1] >= 6 and (long_match[0] * long_match[1]) >= eff_min_tail:
+                return long_match
+            if rep4 >= float(table_tail_repeat_rate_threshold):
+                return (0, n)
     return None
 
 
@@ -1007,7 +1051,6 @@ class FastOvisOCREngine:
             instruction = DEFAULT_OVIS_PROMPT
 
         mx.clear_cache()
-        mx.reset_peak_memory()
         t_total0 = time.perf_counter()
 
         t_prep0 = time.perf_counter()
@@ -1534,12 +1577,17 @@ class FastOvisOCREngine:
 
         decode_ms = (time.perf_counter() - t_dec0) * 1000.0
         peak_gb = float(mx.get_peak_memory() / 1e9)
+        hit_length = (not hit_eos) and not (json_matcher is not None and json_matcher.is_stopped())
+        tail_rep4 = max(
+            _token_tail_repeat_4gram_rate(gen_ids, tail_len=256),
+            _token_tail_repeat_4gram_rate(gen_ids, tail_len=128),
+        )
         if (
             aborted_loop is None
             and can_loop_recover
-            and not hit_eos
-            and len(gen_ids) >= max(128, tok_cap)
-            and _token_tail_repeat_4gram_rate(gen_ids) >= 0.65
+            and hit_length
+            and len(gen_ids) >= tok_cap
+            and tail_rep4 >= 0.35
         ):
             aborted_loop = (0, len(gen_ids))
 
@@ -2030,7 +2078,6 @@ class FastOvisOCREngine:
 
         # Batched `B >= 2` path: parallel ANE prepass + shared `batched_multimodal_generate` + per-page recovery
         mx.clear_cache()
-        mx.reset_peak_memory()
         n_items = len(sources)
 
         t_load0 = time.perf_counter()
@@ -2255,22 +2302,29 @@ class FastOvisOCREngine:
             mrope_section=(int(mrope_sec[0]), int(mrope_sec[1]), int(mrope_sec[2])),
         )
         batch_peak_gb = float(mx.get_peak_memory() / 1e9)
-        can_loop_recover = do_loop_recover and (not eff_loop_breaker)
         vocab_n = int(getattr(self.lm, "vocab_n", len(self._new_to_old)))
         decode_fn = lambda tids: self.tokenizer.decode(tids, skip_special_tokens=True)
 
         results: list[OCRResult] = []
         for i, mm_res in enumerate(mm_results):
             gen_ids = mm_res.generated_ids
+            can_loop_recover = bool(
+                do_loop_recover
+                and tok_cap >= 32
+                and float(temperature) <= 0.0
+                and (not eff_loop_breaker or crop_boxes[i] is not None or rot_cws[i] != 0)
+            )
             aborted_loop = detect_catastrophic_token_loop(gen_ids, decode_fn=decode_fn) if can_loop_recover else None
-            if (
-                aborted_loop is None
-                and can_loop_recover
-                and not mm_res.hit_eos
-                and len(gen_ids) >= max(128, tok_cap)
-                and _token_tail_repeat_4gram_rate(gen_ids) >= 0.65
-            ):
-                aborted_loop = (0, len(gen_ids))
+            hit_length = bool(mm_res.hit_max_tokens) or (
+                (not mm_res.hit_eos) and len(gen_ids) >= tok_cap and schema_seq[i] is None
+            )
+            if aborted_loop is None and can_loop_recover and hit_length:
+                tail_rep4 = max(
+                    _token_tail_repeat_4gram_rate(gen_ids, tail_len=256),
+                    _token_tail_repeat_4gram_rate(gen_ids, tail_len=128),
+                )
+                if tail_rep4 >= 0.35:
+                    aborted_loop = (0, len(gen_ids))
 
             vision_res = pre_seq[i]
             if aborted_loop is not None and can_loop_recover:

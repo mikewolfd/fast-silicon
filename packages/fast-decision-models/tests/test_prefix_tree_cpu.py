@@ -204,11 +204,31 @@ def test_prefix_tree_helpers_and_payload_nbytes_cpu() -> None:
     assert payload_nbytes((arr_k, arr_r)) == arr_k.nbytes + arr_r.nbytes
     assert payload_nbytes({"a": b"1234", "b": bytearray(6)}) == 10
     assert payload_nbytes(None) == 0
+    assert payload_nbytes((arr_k, arr_r, np.dtype("float32"))) == arr_k.nbytes + arr_r.nbytes
+    try:
+        from fast_shared.prefix_tree import payload_nbytes as shared_payload_nbytes
+
+        assert shared_payload_nbytes((arr_k, arr_r, np.dtype("float32"))) == arr_k.nbytes + arr_r.nbytes
+    except ImportError:
+        shared_payload_nbytes = None
+    try:
+        import mlx.core as mx
+
+        assert payload_nbytes((arr_k, arr_r, mx.float32)) == arr_k.nbytes + arr_r.nbytes
+        if shared_payload_nbytes is not None:
+            assert shared_payload_nbytes((arr_k, arr_r, mx.float32)) == arr_k.nbytes + arr_r.nbytes
+    except ImportError:
+        pass
 
     tree = PrefixTree(chunk_tokens=4, byte_budget=1024)
     with pytest.raises(ValueError, match="byte_size mismatch"):
         tree.insert(parent=None, tokens=[1, 2, 3, 4], depth=1, chunk=b"1234", byte_size=8)
     assert "0 node(s)" in tree.summary()
+    small_chunk = np.zeros((4,), dtype=np.float16)
+    small_snap = np.zeros((4,), dtype=np.float32)
+    snap_key = tree.insert(parent=None, tokens=[1, 2, 3, 4], depth=1, chunk=small_chunk)
+    assert snap_key is not None
+    assert tree.attach_snapshot(snap_key, (small_snap, np.dtype("float32"))) is True
 
 
 class _NumpyMx:

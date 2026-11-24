@@ -29,30 +29,33 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:  # prefix_cache_m
 
 ## Benchmark highlights
 
-### 1. `Laya-Typed-421M` Pure-ANE (`RAGTruth + CLINC150 + RewardBench-2`, 1,400 items)
+### 1. `Laya-Typed-421M` 6-Bucket ANE & `laya-hetero` (`RAGTruth + CLINC150 + RewardBench-2`, 1,400 items)
 
 Both Laya and Kev score the same 600 RAGTruth examples, 550 CLINC150 utterances, and 250 RewardBench-2 comparisons. Effective outcome throughput (EOT) divides total score by elapsed seconds after warmup.
 
-| Host | Implementation | Correct / 1,400 | Time after warmup | Score units/s | Measured memory |
-| --- | --- | ---: | ---: | ---: | ---: |
-| M5 | Stock MLX ModernBERT 8-bit | 702 | 73.9 s | 9.496 | 1.88 GB |
-| M5 | NMTZ Core ML | 699 | 88.4 s | 7.909 | 2.73 GB |
-| **M5** | **Project Laya, Neural Engine** | **707** | **114.8 s** | **6.158** | **1.00 GB** |
-| M5 | `ahmedandaloes` in Apple CoreAI | 699 | 940.7 s | 0.743 | 0.33 GB + 1.68 GB mapped |
-| M4 Pro | NMTZ Core ML | 699 | 92.0 s | 7.598 | 2.94 GB |
-| **M4 Pro** | **Project Laya, Neural Engine** | **707** | **121.3 s** | **5.827** | **0.98 GB** |
-| M4 Pro | Stock MLX ModernBERT 8-bit | 703 | 130.7 s | 5.380 | 2.00 GB |
+| Host | Implementation | Correct / 1,400 | `S_obj,e2e` | Time after warmup | Score units/s | Measured memory |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **M5 (quiescent)** | **Project `laya-hetero` (ANE + compiled GPU)** | **704** | **0.5029** | **37.9 s** | **18.586** | **3.72 GB** |
+| M5 | Stock MLX ModernBERT 8-bit | 702 | 0.5014 | 73.9 s | 9.496 | 1.88 GB |
+| **M5 (quiescent)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **76.7 s** | **9.266** | **1.59 GB** |
+| M5 | NMTZ Core ML | 699 | 0.4993 | 88.4 s | 7.909 | 2.73 GB |
+| M5 | `ahmedandaloes` in Apple CoreAI | 699 | 0.4993 | 940.7 s | 0.743 | 0.33 GB + 1.68 GB mapped |
+| **M4 Pro (contended)** | **Project `laya-hetero` (ANE + compiled GPU)** | **707** | **0.5050** | **59.3 s** | **11.932** | **3.30 GB** |
+| M4 Pro | NMTZ Core ML | 699 | 0.4993 | 92.0 s | 7.598 | 2.94 GB |
+| M4 Pro | Stock MLX ModernBERT 8-bit | 703 | 0.5021 | 130.7 s | 5.380 | 2.00 GB |
+| **M4 Pro (contended)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **133.1 s** | **5.341** | **1.52 GB** |
 
-On both Macs, NMTZ’s Core ML export finished the standalone 1,400-item sweep faster, whereas `LayaAneBackend` scored 0.0057 higher, used ~1.0 GB instead of 2.73–2.94 GB, and kept **100% of its 1,585 operations on the Neural Engine** (`0` GPU ops) so it can run concurrently beside GPU generation or training. Optional `CoreAI-Opt` 8-bit export reduces `RAGTruth` calibration error (`ECE-15`) by 14.3%, and casting macOS 27.2.1 `.aimodel` exports to FP16 unlocks 1,652 ANE operations (`23.0 ms` at `S=256`, 15.4× faster than stock CoreAI). [CoreAI audit](../../docs/BENCHMARKS.md#7-coreai-audit-of-22-decisions)
+All six multifunction Core ML buckets (`s64, s128, s192, s256, s384, s512`) in `laya_typed_w8.mlmodelc` place **100% of their `10,538` operations on the Neural Engine** (`[10538, 0, 0]`, `0` GPU/CPU ops). Explicit two-pass centered FP16 `LayerNorm` scaling (`tok_emb` `base_inv_scale=4.0`, `l14..l18` `s_eff_floor=1/128`, `l19..l27` `max_ln_gain=4.0`, head/scorer `base_inv_scale=0.0625`, post-quantization pass removal including `common::fuse_layernorm_or_instancenorm`, and split-head `mb.einsum`) lifts ANE accuracy to **`711/1400` (`0.5079`)** on both Macs while beating NMTZ Core ML on quiescent M5 wall time (`76.7 s` vs `88.4 s`) at `1.59 GB` memory (`2.73 GB` NMTZ). `laya-hetero` adds compiled MLX GPU execution with makespan splitting and a zero-thread `n=1` fast path (`37.9 s` / `18.586` EOT on M5; `59.3 s` / `11.932` EOT on contended M4 Pro). Optional `CoreAI-Opt` 8-bit export reduces `RAGTruth` calibration error (`ECE-15`) by 14.3%, and casting macOS 27.2.1 `.aimodel` exports to FP16 unlocks 1,652 ANE operations (`23.0 ms` at `S=256`, 15.4× faster than stock CoreAI). [CoreAI audit](../../docs/BENCHMARKS.md#7-coreai-audit-of-22-decisions) · [Wave 3 Laya & FP16 LN fixes](../../docs/benchmarks/rca-and-laya-fixes-20261124.json)
 
 ### 2. `Kev-0.8B` / `Kev-4B` GPU scoring & shared-passage prefix cache (1,400 items)
 
 | Host | Engine | Mean score | EOT (score/s) | Time after warmup | Measured memory |
 |---|---|---:|---:|---:|---:|
-| Base M5 | `fast-decision-models` W8, automatic cache | **0.5250** | 4.395 | 167.2 s | 1.78 GB |
+| Base M5 (Wave 3) | `fast-decision-models` W8, NAX `bf16` guard + cache | **0.5257** | **4.885** | 150.7 s | 2.23 GB |
+| Base M5 | `fast-decision-models` W8, automatic cache (baseline) | 0.5250 | 4.395 | 167.2 s | 1.78 GB |
 | Base M5 | FluidInference public Core ML FP16 | 0.5214 | 2.269 | 321.7 s | 1.29 GB |
 | Base M5 | Stock `mlx-lm` 8-bit | 0.5236 | **5.039** | 145.5 s | 2.28 GB |
-| M4 Pro | `fast-decision-models` W8, automatic cache | **0.5250** | **3.415** | 215.2 s | 2.29 GB |
+| M4 Pro | `fast-decision-models` W8, automatic cache | **0.5257** | **3.415** | 215.2 s | 2.29 GB |
 | M4 Pro | FluidInference public Core ML FP16 | 0.5207 | 1.674 | 435.4 s | 9.04 GB |
 | M4 Pro | Stock `mlx-lm` 8-bit | 0.5229 | 3.249 | 225.3 s | 2.10 GB |
 
@@ -69,8 +72,8 @@ When eight questions share two 432–1,015-token passages, automatic 256-token `
 
 | Component | How it works | Source |
 |---|---|---|
-| **Laya-Typed-421M ANE** | Piecewise residual re-centering (`1 -> 1/1024`) to stay within FP16 range, `IOSurface`-backed `CVPixelBuffer` I/O, 4-slot async Core ML ring (`1,585` ANE ops, `0` GPU/CPU), and parallel bucket compilation | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
-| **Kev-0.8B & Kev-4B MLX** | Lossless 8-bit (`g64`) and mixed-bit `SpecBucketedLinearGroup` projection fusion, `@mx.compile` forward, left-padded batching, and hit-aware 256-token `PrefixTree` reuse (`prefix_cache_mb="auto"`) without PyTorch at runtime | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
+| **Laya-Typed-421M ANE & Hetero** | 6-bucket multifunction Core ML (`s64..s512`, `10,538` ANE ops, `0` GPU/CPU) with two-pass FP16 `LayerNorm` scaling, split-head `einsum`, `encode_state`, `lazy_load`, and `laya-hetero` (`compile_encode=True`, makespan split, `n=1` zero-thread) | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`laya_hetero.py`](src/fast_decision_models/laya_hetero.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
+| **Kev-0.8B & Kev-4B MLX** | Lossless 8-bit (`g64`) with M5 NAX `bf16` guard, mixed-bit `SpecBucketedLinearGroup` projection fusion, `@mx.compile` forward, left-padded batching, and hit-aware 256-token `PrefixTree` reuse (`prefix_cache_mb="auto"`) without PyTorch | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
 
 ## CLI & verification
 

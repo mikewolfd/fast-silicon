@@ -408,7 +408,7 @@ class FastEmbeddingGemma2:
         openinfinity_dir: str | Path | None = None,
         default_mode: str = "hetero",
         warmup: bool = True,
-        enable_ane: bool = True,
+        enable_ane: bool | None = None,
         enable_cpu_sme: bool = False,
         dimensions: int | None = None,
         verify_ane_plan: bool = True,
@@ -473,8 +473,13 @@ class FastEmbeddingGemma2:
         self._corpus_lock = threading.Lock()
         self.last_stats: dict[str, int] | None = None
 
+        if default_mode not in ("gpu", "ane", "cpu", "hetero", "hetero2", "hetero3"):
+            raise ValueError(f"Unsupported mode: {default_mode!r}")
+
         # Retire hetero3 CPU-SME 3rd leg; only enable CPU bundles for explicit standalone mode="cpu".
         eff_enable_cpu = bool(enable_cpu_sme) and (default_mode == "cpu")
+        eff_enable_ane = (default_mode != "gpu") if enable_ane is None else bool(enable_ane)
+        self._ane_enabled = eff_enable_ane
         if eff_enable_cpu:
             cur_blas = os.environ.get("VECLIB_MAXIMUM_THREADS")
             if not cur_blas or (cur_blas.isdigit() and int(cur_blas) > MAX_CPU_SME_THREADS):
@@ -490,13 +495,13 @@ class FastEmbeddingGemma2:
                 _ = self.gpu
 
             if (
-                (enable_ane or eff_enable_cpu)
+                (eff_enable_ane or eff_enable_cpu)
                 and self.paths.coreml_dylib.exists()
                 and self.paths.io_dylib.exists()
                 and self.paths.ane_models_dir.exists()
             ):
                 self._init_coreml(
-                    enable_ane=enable_ane,
+                    enable_ane=eff_enable_ane,
                     enable_cpu_sme=eff_enable_cpu,
                     verify_plan=verify_ane_plan,
                 )
@@ -563,6 +568,10 @@ class FastEmbeddingGemma2:
                 return "ane"
             return "hetero" if self.ane_available else "gpu"
         if mode == "ane" and not self.ane_available:
+            if not getattr(self, "_ane_enabled", True):
+                raise RuntimeError(
+                    "ANE requested but ANE was not initialized (pass enable_ane=True or use default_mode!='gpu')"
+                )
             raise RuntimeError(
                 f"ANE requested but CoreML runner dylibs or .mlmodelc bundles are missing under {self.paths.home}"
             )
@@ -1061,6 +1070,14 @@ class FastEmbeddingGemma2:
                     return out[0]
 
         if strict_ane:
+            if not self.ane_available:
+                if not getattr(self, "_ane_enabled", True):
+                    raise RuntimeError(
+                        "ANE requested but ANE was not initialized (pass enable_ane=True or use default_mode!='gpu')"
+                    )
+                raise RuntimeError(
+                    f"ANE requested but CoreML runner dylibs or .mlmodelc bundles are missing under {self.paths.home}"
+                )
             raise ValueError(
                 f"Strict ANE mode cannot encode query of length {sl} (max ANE length is {self.ane_query_max_len}); "
                 "use mode='hetero'/'gpu' or truncate to <=512 tokens."

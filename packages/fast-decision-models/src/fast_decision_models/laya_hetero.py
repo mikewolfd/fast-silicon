@@ -286,6 +286,7 @@ class LayaMlxGpuBackend(LayaTokenizerHelper):
         max_len: int = 512,
         quant_bits: int = 8,
         group_size: int = 64,
+        compile_encode: bool = True,
         local_files_only: bool = False,
     ) -> None:
         import os
@@ -296,6 +297,8 @@ class LayaMlxGpuBackend(LayaTokenizerHelper):
         self._np = np
         self.batch_size = max(1, int(batch_size))
         self.pack_seq_len = max(64, int(pack_seq_len))
+        self.compile_encode = bool(compile_encode)
+        self._encode_hidden: Any = None
         self._prev_cache_limit: int | None = None
         self._limits_restored = False
         eff_offline = bool(local_files_only) or (
@@ -353,6 +356,13 @@ class LayaMlxGpuBackend(LayaTokenizerHelper):
             self._restore_limits()
             raise
 
+        self._encode_hidden = self.model.encode_hidden
+        if self.compile_encode and callable(getattr(mx, "compile", None)):
+            try:
+                self._encode_hidden = mx.compile(self.model.encode_hidden)
+            except Exception:
+                self._encode_hidden = self.model.encode_hidden
+
     def _restore_limits(self) -> None:
         if getattr(self, "_limits_restored", True):
             return
@@ -400,7 +410,8 @@ class LayaMlxGpuBackend(LayaTokenizerHelper):
                 local_half_win=self.local_half_win,
                 qtype_override=qtype_override,
             )
-            h = self.model.encode_hidden(ids_mx, pos_mx, qt_mx, full_m, swa_m)
+            encode_fn = getattr(self, "_encode_hidden", None) or self.model.encode_hidden
+            h = encode_fn(ids_mx, pos_mx, qt_mx, full_m, swa_m)
 
             m_count = len(m_meta)
             k_max = max((len(x[2]) for x in m_meta), default=0)
@@ -462,9 +473,83 @@ class LayaMlxGpuBackend(LayaTokenizerHelper):
         return self.score_choice_batch(encoded_items, temperature_override=temperature_override)
 
     def close(self) -> None:
+        self._encode_hidden = None
         self.model = None
         self._restore_limits()
         self._mx.clear_cache()
+
+
+def _choose_hetero_initial_split(
+    lengths_desc: Sequence[int],
+    gpu_batch_size: int,
+    ane_batch_size: int,
+    ane_buckets: Sequence[int] = (64, 128, 192, 256, 384, 512),
+) -> tuple[int, int]:
+    """Choose `(gpu_seed, ane_seed)` minimizing dual-engine makespan for small batches or large-batch wave seed."""
+    n_total = len(lengths_desc)
+    if n_total <= 0:
+        return (0, 0)
+    if n_total == 1:
+        return (0, 1) if int(lengths_desc[0]) <= 256 else (1, 0)
+
+    eff_gpu_bs = max(1, int(gpu_batch_size))
+    eff_ane_bs = max(1, int(ane_batch_size))
+    if n_total > eff_gpu_bs + eff_ane_bs:
+        ane_seed = min(eff_ane_bs, max(2, n_total // 4), n_total - 1)
+        gpu_seed = min(eff_gpu_bs, n_total - ane_seed)
+        return (gpu_seed, ane_seed)
+
+    buckets = sorted(int(b) for b in ane_buckets) if ane_buckets else [64, 128, 192, 256, 384, 512]
+    lane_cap = 512
+
+    def _est_ane_ms(tail_lens: Sequence[int]) -> float:
+        by_b: dict[int, int] = {}
+        for ln in tail_lens:
+            sel = next((b for b in buckets if ln <= b), buckets[-1])
+            by_b[sel] = by_b.get(sel, 0) + 1
+        total_ms = 0.0
+        for b, cnt in by_b.items():
+            item_ms = 0.068 * b + 1.0e-5 * (b * b)
+            total_ms += 2.0 + item_ms + max(0, cnt - 1) * item_ms * 0.88
+        return total_ms
+
+    def _est_gpu_ms(head_lens: Sequence[int]) -> float:
+        lane_loads: list[int] = []
+        for ln in head_lens:
+            if ln > lane_cap:
+                lane_loads.append(ln)
+                continue
+            best_i = -1
+            best_rem = lane_cap + 1
+            for li, used in enumerate(lane_loads):
+                rem = lane_cap - used
+                if ln <= rem < best_rem:
+                    best_rem = rem
+                    best_i = li
+            if best_i >= 0:
+                lane_loads[best_i] += ln
+            else:
+                lane_loads.append(ln)
+        lane_loads.sort()
+        total_ms = 0.0
+        for w0 in range(0, len(lane_loads), eff_gpu_bs):
+            wave = lane_loads[w0 : w0 + eff_gpu_bs]
+            s_w = max(32, ((max(wave) + 31) // 32) * 32)
+            s_ratio = s_w / 512.0
+            total_ms += 12.0 + len(wave) * (24.0 * s_ratio + 4.0 * (s_ratio * s_ratio))
+        return total_ms
+
+    max_k = min(eff_ane_bs, n_total - 1)
+    best_k = 1
+    best_score: tuple[float, float] | None = None
+    for k in range(1, max_k + 1):
+        ane_ms = _est_ane_ms(lengths_desc[n_total - k :])
+        gpu_ms = _est_gpu_ms(lengths_desc[: n_total - k])
+        score = (max(ane_ms, gpu_ms), abs(ane_ms - gpu_ms))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_k = k
+    return (min(eff_gpu_bs, n_total - best_k), best_k)
 
 
 class LayaHeteroEngine:
@@ -475,8 +560,8 @@ class LayaHeteroEngine:
         runs 100% on CoreML ANE (`pipe_depth=4`), ideal for non-blocking LLM sidecar triage and `B=1` queries.
       - `mode='gpu'`: runs 100% on `LayaMlxGpuBackend` (`Packed-512` + marker-gathered scorer).
       - `mode='hetero'` (or `mode='auto'` with `profile='backfill'`): double-ended work-stealing queue sorted
-        descending by token length — GPU steals longest `>= 256` batches from the head while ANE `pipe_depth=4`
-        steals shortest `<= 256` items from the tail concurrently.
+        descending by token length — makespan-balanced GPU head (`popleft`) and ANE tail (`pop`) seeds with
+        non-starving dynamic work-stealing across all bucket lengths.
     """
 
     def __init__(
@@ -569,6 +654,9 @@ class LayaHeteroEngine:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    def encode_state(self, state: Any) -> list[int]:
+        return self._tok_delegate.encode_state(state)
+
     def encode_item(
         self,
         state: Any,
@@ -576,8 +664,25 @@ class LayaHeteroEngine:
         *,
         max_len: int | None = None,
         on_truncate: Literal["warn", "error", "ignore"] = "warn",
+        state_ids: Sequence[int] | None = None,
     ) -> dict[str, Any]:
+        if state_ids is not None:
+            return self._tok_delegate.encode_item(
+                state, qdef, max_len=max_len, on_truncate=on_truncate, state_ids=state_ids
+            )
         return self._tok_delegate.encode_item(state, qdef, max_len=max_len, on_truncate=on_truncate)
+
+    def encode_items_for_state(
+        self,
+        state: Any,
+        qdefs: Sequence[Mapping[str, Any]],
+        *,
+        max_len: int | None = None,
+        on_truncate: Literal["warn", "error", "ignore"] = "warn",
+    ) -> list[dict[str, Any]]:
+        return self._tok_delegate.encode_items_for_state(
+            state, qdefs, max_len=max_len, on_truncate=on_truncate
+        )
 
     def _dispatch(
         self,
@@ -602,32 +707,42 @@ class LayaHeteroEngine:
                 return self.gpu_backend.score_noul_batch(encoded_items)
             return self.gpu_backend.score_choice_batch(encoded_items, temperature_override=temperature_override)
 
-        # Tiny interactive batch shortcut (<= 2 short items -> ANE directly without thread spawn)
-        if n_total <= 2 and all(len(it["ids"]) <= 256 for it in encoded_items):
+        # Tiny batch fast-paths (0 threads):
+        #   - n == 1: <= 256 tokens -> ANE directly; > 256 -> GPU directly
+        #   - n == 2 with all items <= 192 -> ANE directly
+        if n_total == 1:
+            items_l = list(encoded_items)
+            if len(items_l[0]["ids"]) <= 256:
+                if is_noul:
+                    return self.ane_backend.score_noul_batch(items_l)
+                return self.ane_backend.score_choice_batch(items_l, temperature_override=temperature_override)
+            if is_noul:
+                return self.gpu_backend.score_noul_batch(items_l)
+            return self.gpu_backend.score_choice_batch(items_l, temperature_override=temperature_override)
+
+        if n_total == 2 and all(len(it["ids"]) <= 192 for it in encoded_items):
             items_l = list(encoded_items)
             if is_noul:
                 return self.ane_backend.score_noul_batch(items_l)
             return self.ane_backend.score_choice_batch(items_l, temperature_override=temperature_override)
 
         # Double-ended work-stealing queue sorted descending by sequence length:
-        #   - HEAD (`popleft`): longest items (`>= 256` first) -> GPU NAX tensor-core waves
-        #   - TAIL (`pop`): shortest items (`<= 256` first) -> ANE multi-bucket `pipe_depth=4`
-        # Pre-assign the initial head (GPU) and tail (ANE) waves before thread start so both engines
+        #   - HEAD (`popleft`): longest items -> GPU NAX tensor-core waves
+        #   - TAIL (`pop`): shortest items -> ANE multi-bucket `pipe_depth=4`
+        # Pre-assign balanced head (GPU) and tail (ANE) waves before thread start so both engines
         # launch immediately with zero OS thread-spawn race.
         desc_indices = sorted(range(n_total), key=lambda i: len(encoded_items[i]["ids"]), reverse=True)
+        lengths_desc = [len(encoded_items[i]["ids"]) for i in desc_indices]
+        ane_buckets = getattr(self.ane_backend, "seq_buckets", None) or (64, 128, 192, 256, 384, 512)
+        gpu_seed, ane_seed = _choose_hetero_initial_split(
+            lengths_desc,
+            self.gpu_batch_size,
+            self.ane_batch_size,
+            ane_buckets,
+        )
         work_dq: deque[int] = deque(desc_indices)
-        init_gpu: list[int] = []
-        init_ane: list[int] = []
-        if len(work_dq) >= 2 and len(encoded_items[work_dq[-1]]["ids"]) <= 256:
-            ane_seed = min(self.ane_batch_size, max(1, len(work_dq) // 3))
-            for _ in range(ane_seed):
-                if work_dq and len(encoded_items[work_dq[-1]]["ids"]) <= 256:
-                    init_ane.append(work_dq.pop())
-                else:
-                    break
-        if work_dq:
-            gpu_seed = min(self.gpu_batch_size, len(work_dq))
-            init_gpu = [work_dq.popleft() for _ in range(gpu_seed)]
+        init_ane = [work_dq.pop() for _ in range(ane_seed)]
+        init_gpu = [work_dq.popleft() for _ in range(gpu_seed)]
 
         qlock = threading.Lock()
         results: list[Any] = [0.5 if is_noul else [] for _ in range(n_total)]
@@ -686,11 +801,9 @@ class LayaHeteroEngine:
                         rem = len(work_dq)
                         tail_len = len(encoded_items[work_dq[-1]]["ids"])
                         if tail_len > 256 and rem <= self.gpu_batch_size:
-                            n_take = max(1, min(4, rem // 3)) if rem >= 3 else 0
+                            n_take = min(self.ane_batch_size, max(1, rem // 2))
                         else:
                             n_take = min(self.ane_batch_size, rem)
-                        if n_take <= 0:
-                            break
                         batch_idx = [work_dq.pop() for _ in range(n_take)]
                     _run_ane_batch(batch_idx)
             except BaseException as exc:
@@ -738,5 +851,6 @@ __all__ = [
     "LayaHeteroEngine",
     "LayaMlxGpuBackend",
     "_build_laya_packed_batch_tensors",
+    "_choose_hetero_initial_split",
     "_pack_laya_segments",
 ]

@@ -25,6 +25,10 @@ _BAND_EDGE = 0.005
 _CURRENCY_RE = re.compile(
     r"(?:\$|USD)\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b|\b\d{1,3}(?:,\d{3})+\.\d{2}\b|\b\d+\.\d{2}\b"
 )
+_MATH_SYMBOL_RE = re.compile(
+    r"[=±×÷≤≥≠≈∞∑∏∫∂∇√∈∉⊂⊃∪∩→←⇒⇔∀∃αβγδεζηθλμνξπρστφχψωΓΔΘΛΞΠΣΦΨΩ^_\\]|"
+    r"\b(?:sin|cos|tan|log|ln|exp|lim|sup|inf|min|max|arg|det|dim|ker)\b"
+)
 
 
 def _same_line(box_a: list[float], box_b: list[float]) -> bool:
@@ -526,11 +530,24 @@ def analyze_page_from_lines(
     # Estimate horizontal band alignment & column structure
     x_starts = sorted(ln.box.x0 for ln in lines)
     estimated_columns = 1
+    multi_cell_bands = 0
+    formula_bands = 0
+    total_math_hits = 0
+
+    def _accumulate_band(band: Sequence[OCRLine]) -> tuple[bool, int]:
+        band_txt = " ".join(c.text.strip() for c in band if c.text.strip())
+        m_hits = len(_MATH_SYMBOL_RE.findall(band_txt))
+        is_formula = False
+        if band_txt:
+            b_conf = float(np.mean([float(c.confidence) for c in band]))
+            if m_hits >= 3 or (m_hits >= 1 and b_conf < 0.72):
+                is_formula = True
+        return is_formula, m_hits
+
     if len(lines) >= 6:
         # Count distinct horizontal bands that contain multiple horizontally separated detections
         sorted_y = sorted(lines, key=lambda ln: ln.box.y0)
         band_tol = max(0.008, med_h * 0.7)
-        multi_cell_bands = 0
         max_cells_in_band = 1
         cur_band: list[OCRLine] = []
         for ln in sorted_y:
@@ -538,6 +555,10 @@ def analyze_page_from_lines(
             if not cur_band or abs(cy - 0.5 * (cur_band[0].box.y0 + cur_band[0].box.y1)) <= band_tol:
                 cur_band.append(ln)
             else:
+                is_f, m_hits = _accumulate_band(cur_band)
+                total_math_hits += m_hits
+                if is_f:
+                    formula_bands += 1
                 if len(cur_band) >= 2:
                     # Check distinct non-overlapping x intervals
                     cur_sorted = sorted(cur_band, key=lambda c: c.box.x0)
@@ -550,6 +571,11 @@ def analyze_page_from_lines(
                         multi_cell_bands += 1
                         max_cells_in_band = max(max_cells_in_band, sep)
                 cur_band = [ln]
+        if cur_band:
+            is_f, m_hits = _accumulate_band(cur_band)
+            total_math_hits += m_hits
+            if is_f:
+                formula_bands += 1
         if len(cur_band) >= 2:
             cur_sorted = sorted(cur_band, key=lambda c: c.box.x0)
             sep = sum(
@@ -563,6 +589,11 @@ def analyze_page_from_lines(
         estimated_columns = max_cells_in_band if multi_cell_bands >= 3 else (2 if len(x_starts) >= 12 and (sum(1 for l in lines if l.box.x0 > 0.48) >= 4 and sum(1 for l in lines if l.box.x1 < 0.48) >= 4) else 1)
         table_score = min(1.0, (multi_cell_bands / 6.0) * 0.6 + min(1.0, currency_hits / 8.0) * 0.4)
     else:
+        for ln in lines:
+            is_f, m_hits = _accumulate_band((ln,))
+            total_math_hits += m_hits
+            if is_f:
+                formula_bands += 1
         table_score = 0.0
 
     crop_box = detect_ink_bbox(image) if image is not None else None
@@ -580,10 +611,22 @@ def analyze_page_from_lines(
         reasons.append("financial_table")
     elif estimated_columns >= 3 and table_score >= 0.4:
         reasons.append("multi_column_table")
+    elif estimated_columns == 2 and table_score >= 0.55:
+        reasons.append("two_column_layout")
     if digit_ratio >= 0.28 and n_lines >= 10:
         reasons.append("high_digit_density")
-    if low_conf_ratio >= 0.25 and n_lines >= 5:
+    if low_conf_ratio >= 0.20 and n_lines >= 5:
         reasons.append("low_vision_confidence")
+    if formula_bands >= 2 or (formula_bands >= 1 and total_math_hits >= 4):
+        reasons.append("formula_or_math")
+    if (
+        width > 0
+        and height > 0
+        and (width * height) < 160_000
+        and n_lines >= 6
+        and (digit_ratio >= 0.12 or currency_hits >= 2 or multi_cell_bands >= 2)
+    ):
+        reasons.append("compact_table_crop")
     if med_h > 0.0 and med_h < 0.0085 and n_lines >= 20:
         reasons.append("tiny_font_scan")
     if inferred_rot != 0:

@@ -582,8 +582,10 @@ def test_ovis_auto_upscales_small_markdown_tables_only(
     from fast_qwen3.tokenizer import FastQwen3Tokenizer
     from fast_ocr.ovis_engine import FastOvisOCREngine, _resolve_ovis_min_pixels
 
-    # Pure resolver contract: upscale tiny unpinned Markdown tables (<150K px, min_side>=80), preserve overrides/raw/JSON.
+    # Pure resolver contract: upscale compact unpinned Markdown tables (<150K px, >=50K px, min_side>=100, aspect<=4),
+    # while skipping tiny/narrow table strips (like FinTabNet[11] 376x87) and preserving overrides/raw/JSON.
     assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=None, output_format="markdown", schema=None) == 262_144
+    assert _resolve_ovis_min_pixels((376, 87), min_pixels=None, max_pixels=None, output_format="markdown", schema=None) == 65_536
     assert _resolve_ovis_min_pixels((320, 200), min_pixels=REGION_CROP_MIN_PIXELS, max_pixels=None, output_format="markdown", schema=None) == REGION_CROP_MIN_PIXELS
     assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=786_432, output_format="markdown", schema=None) == 65_536
     assert _resolve_ovis_min_pixels((320, 200), min_pixels=None, max_pixels=None, output_format="raw", schema=None) == 65_536

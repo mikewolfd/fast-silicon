@@ -172,6 +172,15 @@ DEFAULT_PACKAGE_SPECS: tuple[PackageSpec, ...] = (
         ),
     ),
     PackageSpec(
+        name="fast-qwen3",
+        role="Qwen3.5-4B hybrid GDN+GQA structured JSON & chat (Metal GPU + W4A8)",
+        home_env_var="FAST_QWEN3_HOME",
+        runner_kind="module",
+        runner_target="fast_qwen3.cli",
+        bench_args=("bench", "--batch-size", "16", "--max-tokens", "128", "--structured"),
+        verify_args=("bench", "--batch-size", "1", "--max-tokens", "16", "--structured"),
+    ),
+    PackageSpec(
         name="fast-gpt-oss",
         role="20B MXFP4 MoE (Metal 4 MPP + Hydragen v2)",
         home_env_var="FAST_GPT_OSS_HOME",
@@ -179,6 +188,15 @@ DEFAULT_PACKAGE_SPECS: tuple[PackageSpec, ...] = (
         runner_target="fast_gpt_oss.cli",
         bench_args=("bench", "--batches", "8,64,128", "--local-files-only"),
         verify_args=("verify", "--local-files-only"),
+    ),
+    PackageSpec(
+        name="fast-ocr",
+        role="Apple Vision ANE + OvisOCR2 VLM document/table OCR",
+        home_env_var="FAST_OCR_HOME",
+        runner_kind="module",
+        runner_target="fast_ocr.cli",
+        bench_args=("verify", "--json"),
+        verify_args=("verify", "--json"),
     ),
     PackageSpec(
         name="fast-decision-models",
@@ -353,6 +371,20 @@ def summarize_throughput(pkg_name: str, clean_stdout: str) -> str:
         if parts:
             return "; ".join(parts)
 
+    if pkg_name == "fast-qwen3" and parsed is not None:
+        st = parsed.get("stats") if isinstance(parsed.get("stats"), dict) else {}
+        bs = parsed.get("batch_size")
+        dec = st.get("decode_tok_s") or st.get("completion_tok_s")
+        if dec is not None:
+            return f"B={bs} structured: {float(dec):.1f} tok/s ({parsed.get('elapsed_sec', 0)}s)"
+        return f"B={bs} completed in {parsed.get('elapsed_sec', 0)}s"
+
+    if pkg_name == "fast-ocr" and parsed is not None:
+        checks = parsed.get("checks") or []
+        if isinstance(checks, list):
+            passed = sum(1 for c in checks if isinstance(c, dict) and c.get("ok"))
+            return f"verify {passed}/{len(checks)} checks ok"
+
     if pkg_name == "fast-gpt-oss" and parsed is not None:
         parts = []
         for k, v in parsed.items():
@@ -481,6 +513,8 @@ def _run_isolated_step(
     timeout_sec: int,
     wired_limit: bool = True,
 ) -> dict[str, Any]:
+    from fast_shared.bench import EXIT_SKIP, run_isolated_json_worker
+
     resolved_home = resolve_package_home(spec)
     cmd = [
         python_exe,
@@ -494,16 +528,17 @@ def _run_isolated_step(
     env["M4_GPU_LOCK_HELD"] = "1"
     env["FAST_SILICON_WIRED_LIMIT"] = "1" if wired_limit else "0"
     env.setdefault(spec.home_env_var, str(resolved_home))
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(_REPO_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-        )
-    except subprocess.TimeoutExpired:
+    wres = run_isolated_json_worker(
+        cmd,
+        worker_out_arg=None,
+        marker="__MONOREPO_METRICS__=",
+        timeout_sec=float(timeout_sec),
+        cwd=_REPO_ROOT,
+        env=env,
+        skip_exit_codes=(EXIT_SKIP,),
+        stderr_tail_lines=20,
+    )
+    if wres["timed_out"]:
         return {
             "rc": 124,
             "status": "failed",
@@ -513,17 +548,25 @@ def _run_isolated_step(
             "peak_footprint_gb": 0.0,
             "rss_gb": 0.0,
             "highlight": f"timed out after {timeout_sec}s",
+            "stderr_tail": wres["stderr_tail"],
             "error": "timeout",
         }
 
-    metrics, clean_out = parse_child_metrics(proc.stdout)
-    rc = proc.returncode if metrics is None else int(metrics["rc"])
+    metrics, clean_out = parse_child_metrics(str(wres.get("stdout") or ""))
+    if metrics is None and isinstance(wres.get("payload"), dict):
+        metrics = wres["payload"]
+    err_str = str(wres.get("stderr") or "")
+    rc = int(metrics["rc"]) if (metrics and "rc" in metrics) else int(wres.get("returncode") or 0)
     err = metrics.get("error") if metrics else None
-    status = "ok" if rc == 0 else classify_failure(clean_out, proc.stderr, err)
+    if rc == EXIT_SKIP:
+        status = "skipped"
+    else:
+        status = "ok" if rc == 0 else classify_failure(clean_out, err_str, err)
     if rc == 0:
         highlight = summarize_throughput(spec.name, clean_out)
     else:
-        reason = err or (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit={rc}")
+        tail = str(wres.get("stderr_tail") or "").strip().splitlines()
+        reason = err or (tail[-1] if tail else f"exit={rc}")
         highlight = reason[:96]
     parsed = _try_parse_json_tail(clean_out) if rc == 0 else None
     mlx_peak_gb = metrics["mlx_peak_gb"] if metrics else 0.0
@@ -554,7 +597,7 @@ def _run_isolated_step(
         "parsed_json": parsed,
         "error": err,
         "stdout_tail": "\n".join(clean_out.splitlines()[-12:]),
-        "stderr_tail": "\n".join(proc.stderr.splitlines()[-8:]),
+        "stderr_tail": str(wres.get("stderr_tail") or ""),
         "stdout_full": clean_out if rc == 0 else "",
     }
 
@@ -897,6 +940,11 @@ def _effective_bench_args(
             b_idx = cmd_args.index("--batches") + 1
             if b_idx < len(cmd_args):
                 cmd_args[b_idx] = "1,8,16"
+    elif spec.name == "fast-qwen3":
+        if host_mem_gb is not None and float(host_mem_gb) >= 36.0 and "--batch-size" in cmd_args:
+            b_idx = cmd_args.index("--batch-size") + 1
+            if b_idx < len(cmd_args):
+                cmd_args[b_idx] = "32"
     return cmd_args
 
 

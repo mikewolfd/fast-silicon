@@ -184,13 +184,25 @@ class JsonHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(status, {"error": {"message": message, "type": err_type}})
 
     def _send_sse(self, events: Iterable[dict[str, Any]]) -> None:
+        it = iter(events)
+        first_chunk: bytes | None = None
+        try:
+            first_ev = next(it)
+        except StopIteration:
+            first_ev = None
+        if first_ev is not None:
+            first_chunk = f"data: {json.dumps(first_ev, ensure_ascii=False)}\n\n".encode("utf-8")
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        for ev in events:
+        if first_chunk is not None:
+            self.wfile.write(first_chunk)
+            self.wfile.flush()
+        for ev in it:
             chunk = f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8")
             self.wfile.write(chunk)
             self.wfile.flush()
@@ -602,7 +614,7 @@ def iter_chat_sse_events(
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
-    yield {
+    role_event = {
         "id": cmpl_id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -612,6 +624,7 @@ def iter_chat_sse_events(
 
     is_completed_item = hasattr(item, "text") and not isinstance(item, Iterator)
     if is_completed_item:
+        yield role_event
         raw_ttft = getattr(item, "ttft_ms", None)
         ttft_ms = round(float(raw_ttft), 3) if raw_ttft is not None else round((time.perf_counter() - t0) * 1000.0, 3)
         total_ms = round((time.perf_counter() - t0) * 1000.0, 3)
@@ -673,7 +686,23 @@ def iter_chat_sse_events(
     streamed_chunks = 0
     finish_reason = "stop"
 
-    for raw_chunk in item:
+    # Peek the first chunk BEFORE emitting the assistant role header so prefill /
+    # first-token generation failures surface cleanly before HTTP 200 SSE commit.
+    it_stream = iter(item)
+    first_chunks: tuple[Any, ...]
+    try:
+        first_raw = next(it_stream)
+        first_chunks = (first_raw,)
+    except StopIteration:
+        first_chunks = ()
+
+    yield role_event
+
+    def _iter_peeked_stream() -> Iterator[Any]:
+        yield from first_chunks
+        yield from it_stream
+
+    for raw_chunk in _iter_peeked_stream():
         delta_text: str | None = None
         reasoning_text: str | None = None
         if isinstance(raw_chunk, str):
@@ -801,12 +830,33 @@ def iter_completion_sse_events(
     return events
 
 
+def _canonicalize_schema_for_key(node: Any, *, preserve_dict_order: bool = False) -> Any:
+    """Canonicalize JSON Schema nodes while preserving property key order for ``llguidance``."""
+    if isinstance(node, Mapping):
+        items = (
+            list(node.items())
+            if preserve_dict_order
+            else sorted(node.items(), key=lambda kv: str(kv[0]))
+        )
+        return {
+            k: _canonicalize_schema_for_key(
+                v,
+                preserve_dict_order=(k in ("properties", "patternProperties")),
+            )
+            for k, v in items
+        }
+    if isinstance(node, list):
+        return [_canonicalize_schema_for_key(v, preserve_dict_order=False) for v in node]
+    return node
+
+
 def schema_cache_key(schema: Any) -> str | None:
     if schema is None:
         return None
     if isinstance(schema, str):
         return schema
-    return json.dumps(schema, ensure_ascii=False)
+    canonical = _canonicalize_schema_for_key(schema)
+    return json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
 
 
 def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: Any = _UNSET) -> dict[str, Any]:
@@ -861,8 +911,9 @@ class _PendingChatRequest:
 class ChatMicroBatcher:
     """Leader-follower micro-batcher coalescing concurrent chat/completion requests without background threads.
 
-    Coalesces compatible requests using `max(max_tokens)` across the batch rather than requiring
-    exact `max_tokens` equality, and serializes `engine.generate_batch` calls under a per-engine lock.
+    Partition compatible requests by exact ``max_tokens`` bucket rather than forcing
+    shorter callers to wait behind or receive excess tokens from longer callers, while
+    serializing ``engine.generate_batch`` calls under a per-engine lock.
     """
 
     def __init__(
@@ -904,10 +955,12 @@ class ChatMicroBatcher:
     ) -> _PendingChatRequest:
         eff_seed = 0 if float(temperature) == 0.0 else int(seed)
         clean_extra = {k: v for k, v in extra_kwargs.items() if v is not None}
-        # Note: `max_tokens` is deliberately excluded from the coalescing key and merged via `max(max_tokens)`.
+        # Partition buckets by `max_tokens` so shorter requests never stall behind
+        # or receive excess generated tokens from longer callers.
         key = (
             kind,
             schema_cache_key(json_schema),
+            int(max_tokens),
             float(temperature),
             float(top_p),
             eff_seed,
@@ -1076,7 +1129,7 @@ class ChatMicroBatcher:
             flat_prompts: list[Any] = []
             for req in batch:
                 flat_prompts.extend(req.prompts)
-            batch_max_tokens = max(req.max_tokens for req in batch)
+            batch_max_tokens = int(head.max_tokens)
             run_kwargs = dict(head.kwargs)
             run_kwargs["max_tokens"] = batch_max_tokens
 

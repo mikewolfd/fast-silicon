@@ -352,6 +352,9 @@ def test_laya_residual_layernorm_fp16_precision_and_ftz_cpu() -> None:
         elif cum_r == 1.0 / 32.0:
             x_in[0, 17, 0, 0] = 4000.0
             x_in[0, 511, 0, 1] = -4000.0
+        elif cum_r == 1.0 / 256.0:
+            x_in[0, 17, 0, 0] = 16000.0
+            x_in[0, 511, 0, 1] = -16000.0
 
         x_scaled_f16 = (x_in * cum_r).astype(np.float16)
         got = _laya_layernorm_ch_np(x_scaled_f16, gamma, beta, cum_r=cum_r, flush_subnormals=True)
@@ -1090,7 +1093,7 @@ def test_v2_exports_paths_and_stdlib_isolation_cpu() -> None:
 
 
 def test_laya_default_buckets_and_multifunction_builder_cpu(tmp_path: Path) -> None:
-    """Verify 6-bucket `S=(64,128,192,256,384,512)` defaults + split-head `einsum`, `layer_norm`, `marker_map` & multifunction."""
+    """Verify 6-bucket `S=(64,128,192,256,384,512)` defaults + two-pass LN, split-head `einsum`, `marker_map` & multifunction."""
     from fast_decision_models import builder as fdm_builder
 
     assert fdm_builder.DEFAULT_LAYA_SEQ_LENS == (64, 128, 192, 256, 384, 512)
@@ -1155,7 +1158,9 @@ def test_laya_default_buckets_and_multifunction_builder_cpu(tmp_path: Path) -> N
     blk = fn.block_specializations[fn.opset]
     op_types = [op.type for op in blk.operations]
     assert "einsum" in op_types
-    assert "layer_norm" in op_types
+    assert "reduce_mean" in op_types
+    assert "rsqrt" in op_types
+    assert "layer_norm" not in op_types  # Strips CoreML fuse_layernorm_or_instancenorm so two-pass FP16 LN stays intact!
     assert "matmul" not in op_types  # Split-head einsum eliminates all 4D reshape+matmul ops!
     for op in blk.operations:
         if op.type == "gelu":
@@ -1739,5 +1744,801 @@ def test_kev_mixed_prefix_length_cold_warm_zero_diff_gpu(tmp_path: Path) -> None
             )
             assert max_prob_diff == 0.0
             assert max_logit_diff == 0.0
+
+
+def test_kev_d256_nax_force_fused_bfloat16_guard_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `kev_mlx` M5 NAX `D=256` `force_fused=True` fires for both `mx.bfloat16` and `mx.float16` on CPU."""
+    import types
+    from fast_decision_models.kev_mlx import _build_qwen35_backbone
+
+    sdpa_calls: list[dict[str, Any]] = []
+
+    class _FakeArr:
+        def __init__(self, shape: tuple[int, ...], dtype: str = "bfloat16") -> None:
+            self.shape = tuple(int(d) for d in shape)
+            self.dtype = dtype
+
+        def astype(self, dtype: str) -> "_FakeArr":
+            return _FakeArr(self.shape, dtype)
+
+        def reshape(self, *shape: Any) -> "_FakeArr":
+            dims = shape[0] if len(shape) == 1 and isinstance(shape[0], (tuple, list)) else shape
+            known = 1
+            neg_idx = -1
+            out: list[int] = []
+            for idx, d in enumerate(dims):
+                di = int(d)
+                if di == -1:
+                    neg_idx = idx
+                    out.append(1)
+                else:
+                    known *= di
+                    out.append(di)
+            if neg_idx >= 0:
+                total = 1
+                for s in self.shape:
+                    total *= s
+                out[neg_idx] = total // known
+            return _FakeArr(tuple(out), self.dtype)
+
+        def transpose(self, *axes: int) -> "_FakeArr":
+            return _FakeArr(tuple(self.shape[a] for a in axes), self.dtype)
+
+        def __mul__(self, other: Any) -> "_FakeArr":
+            return _FakeArr(self.shape, self.dtype)
+
+        def __add__(self, other: Any) -> "_FakeArr":
+            return _FakeArr(self.shape, self.dtype)
+
+        def __sub__(self, other: Any) -> "_FakeArr":
+            return _FakeArr(self.shape, self.dtype)
+
+    class _FakeFast:
+        @staticmethod
+        def metal_kernel(**_kw: Any) -> object:
+            return object()
+
+        @staticmethod
+        def scaled_dot_product_attention(
+            q: _FakeArr, k: _FakeArr, v: _FakeArr, *, scale: float, mask: Any = None, **kwargs: Any
+        ) -> _FakeArr:
+            sdpa_calls.append({"dtype": q.dtype, "shape": q.shape, "force_fused": kwargs.get("force_fused")})
+            return _FakeArr(q.shape, q.dtype)
+
+    fake_mx = types.SimpleNamespace(
+        float16="float16",
+        bfloat16="bfloat16",
+        float32="float32",
+        int32="int32",
+        fast=_FakeFast(),
+        compile=lambda fn, **_kw: fn,
+        array=lambda data, dtype="float32": _FakeArr((len(data),), dtype) if isinstance(data, list) else _FakeArr((1,), dtype),
+        cos=lambda x: _FakeArr(x.shape, x.dtype),
+        sin=lambda x: _FakeArr(x.shape, x.dtype),
+        split=lambda x, stops_or_n, axis=-1: (
+            [
+                _FakeArr(
+                    (*x.shape[:axis], x.shape[axis] // int(stops_or_n), *x.shape[axis + 1 :])
+                    if axis != -1
+                    else (*x.shape[:-1], x.shape[-1] // int(stops_or_n)),
+                    x.dtype,
+                )
+                for _ in range(int(stops_or_n))
+            ]
+            if isinstance(stops_or_n, int)
+            else [
+                _FakeArr(
+                    (
+                        *x.shape[: (axis if axis >= 0 else len(x.shape) + axis)],
+                        hi - lo,
+                        *x.shape[(axis if axis >= 0 else len(x.shape) + axis) + 1 :],
+                    ),
+                    x.dtype,
+                )
+                for lo, hi in zip([0, *stops_or_n], [*stops_or_n, x.shape[axis]])
+            ]
+        ),
+        concatenate=lambda arrs, axis=0: _FakeArr(
+            tuple(
+                sum(a.shape[i] for a in arrs) if i == (axis if axis >= 0 else len(arrs[0].shape) + axis) else arrs[0].shape[i]
+                for i in range(len(arrs[0].shape))
+            ),
+            arrs[0].dtype,
+        ),
+        sigmoid=lambda x: _FakeArr(x.shape, x.dtype),
+        eval=lambda *_args: None,
+    )
+
+    class _FakeModule:
+        def eval(self) -> None:
+            pass
+
+        def parameters(self) -> dict[str, Any]:
+            return {}
+
+    class _FakeLinear(_FakeModule):
+        def __init__(self, in_d: int, out_d: int, bias: bool = False) -> None:
+            self.out_d = out_d
+            self.weight = _FakeArr((out_d, in_d), "bfloat16")
+
+        def __call__(self, x: _FakeArr) -> _FakeArr:
+            return _FakeArr((*x.shape[:-1], self.out_d), x.dtype)
+
+    class _FakeNorm(_FakeModule):
+        def __init__(self, dims: int, eps: float = 1e-6) -> None:
+            self.weight = _FakeArr((dims,), "bfloat16")
+
+        def __call__(self, x: _FakeArr) -> _FakeArr:
+            return _FakeArr(x.shape, x.dtype)
+
+    class _FakeRoPE(_FakeModule):
+        def __init__(self, dims: int, **_kw: Any) -> None:
+            self.dims = dims
+
+        def __call__(self, x: _FakeArr, offset: int = 0) -> _FakeArr:
+            return _FakeArr(x.shape, x.dtype)
+
+    class _FakeEmbedding(_FakeModule):
+        def __init__(self, vocab: int, dims: int) -> None:
+            self.dims = dims
+            self.weight = _FakeArr((vocab, dims), "bfloat16")
+
+        def __call__(self, ids: _FakeArr) -> _FakeArr:
+            return _FakeArr((*ids.shape, self.dims), "bfloat16")
+
+    fake_nn = types.SimpleNamespace(
+        Module=_FakeModule,
+        Linear=_FakeLinear,
+        RMSNorm=_FakeNorm,
+        RoPE=_FakeRoPE,
+        Embedding=_FakeEmbedding,
+        silu=lambda x: _FakeArr(x.shape, x.dtype),
+    )
+    fake_mlx_pkg = types.SimpleNamespace(core=fake_mx, nn=fake_nn)
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx_pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
+    monkeypatch.setitem(sys.modules, "mlx.nn", fake_nn)
+
+    hidden_size, inter_size, head_dim = 256, 256, 256
+    text_cfg = {
+        "hidden_size": hidden_size,
+        "intermediate_size": inter_size,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": head_dim,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 16,
+        "full_attention_interval": 1,
+        "linear_num_value_heads": 2,
+        "linear_num_key_heads": 1,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "rope_parameters": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+    }
+    weights = {
+        "model.embed_tokens.weight": _FakeArr((16, hidden_size), "bfloat16"),
+        "model.norm.weight": _FakeArr((hidden_size,), "bfloat16"),
+        "model.layers.0.input_layernorm.weight": _FakeArr((hidden_size,), "bfloat16"),
+        "model.layers.0.post_attention_layernorm.weight": _FakeArr((hidden_size,), "bfloat16"),
+        "model.layers.0.self_attn.q_proj.weight": _FakeArr((2 * head_dim, hidden_size), "bfloat16"),
+        "model.layers.0.self_attn.k_proj.weight": _FakeArr((head_dim, hidden_size), "bfloat16"),
+        "model.layers.0.self_attn.v_proj.weight": _FakeArr((head_dim, hidden_size), "bfloat16"),
+        "model.layers.0.self_attn.o_proj.weight": _FakeArr((hidden_size, head_dim), "bfloat16"),
+        "model.layers.0.self_attn.q_norm.weight": _FakeArr((head_dim,), "bfloat16"),
+        "model.layers.0.self_attn.k_norm.weight": _FakeArr((head_dim,), "bfloat16"),
+        "model.layers.0.mlp.gate_proj.weight": _FakeArr((inter_size, hidden_size), "bfloat16"),
+        "model.layers.0.mlp.up_proj.weight": _FakeArr((inter_size, hidden_size), "bfloat16"),
+        "model.layers.0.mlp.down_proj.weight": _FakeArr((hidden_size, inter_size), "bfloat16"),
+    }
+
+    backbone = _build_qwen35_backbone(text_cfg, weights, quant_cfg=None, use_d256_force_fused=True)
+    attn = backbone.layers[0].self_attn
+
+    attn(_FakeArr((1, 256, hidden_size), "bfloat16"), None)
+    attn(_FakeArr((1, 512, hidden_size), "float16"), None)
+    attn(_FakeArr((1, 256, hidden_size), "float32"), None)
+    attn(_FakeArr((1, 128, hidden_size), "bfloat16"), None)
+    attn(_FakeArr((1, 1024, hidden_size), "bfloat16"), None)
+
+    assert [c["force_fused"] for c in sdpa_calls] == [True, True, None, None, None]
+
+
+def test_laya_shared_state_pretokenization_cpu() -> None:
+    """Verify `encode_state`, `state_ids` reuse, and `encode_items_for_state` produce bit-identical encodings."""
+    helper = LayaAneBackend.__new__(LayaAneBackend)
+    helper.max_len = 512
+    helper.head_max_len = 192
+    helper.cls_id = 1
+    helper.sep_id = 2
+    helper.pad_id = 3
+    helper.mask_id = 4
+    helper.mask_tok = "[MASK]"
+
+    encode_calls: list[str] = []
+
+    def _tok_ids(text: str) -> list[int]:
+        encode_calls.append(text)
+        return [100 + (sum(ord(ch) for ch in tok) % 900) for tok in text.split()]
+
+    helper._encode_ids = _tok_ids  # type: ignore[method-assign]
+
+    state_dict = {"status": "alert [MASK] critical", "node": "edge-01", "retries": 3}
+    qdefs = [
+        {"type": "noul", "instructions": "Check if critical", "criteria": {"false": "no", "true": "yes"}},
+        {"type": "choice", "instructions": "Select subsystem", "criteria": ["auth", "net", "disk"]},
+        {"type": "score", "instructions": "Severity level", "criteria": ["low", "med", "high"]},
+    ]
+
+    # Empty qdefs returns [] with zero tokenization calls
+    assert helper.encode_items_for_state(state_dict, []) == []
+    assert encode_calls == []
+
+    # Direct encode_state neutralizes [MASK] and matches reference encode_item state tokenization
+    st_ids = helper.encode_state(state_dict)
+    assert len(encode_calls) == 1
+    assert "[MASK]" not in encode_calls[0]
+    st_ids_snapshot = list(st_ids)
+
+    ref_items = [helper.encode_item(state_dict, qd) for qd in qdefs]
+    encode_calls.clear()
+
+    # Shared-state encode_items_for_state tokenizes state ONLY ONCE across all 3 qdefs
+    shared_items = helper.encode_items_for_state(state_dict, qdefs)
+    # 1 state encode + per-question head + options encodes (3*(1+2) + 3*(1+3) + 3*(1+3) = 1 + 11 = 12)
+    state_encode_hits = sum(1 for s in encode_calls if "edge-01" in s)
+    assert state_encode_hits == 1
+    assert shared_items == ref_items
+    assert st_ids == st_ids_snapshot  # caller list is never mutated
+
+    # Truncation parity at max_len=256 with state_ids passed explicitly
+    long_state = " ".join(f"tok{i % 20}" for i in range(400))
+    long_st_ids = helper.encode_state(long_state)
+    ref_trunc = helper.encode_item(long_state, qdefs[1], max_len=256, on_truncate="ignore")
+    reuse_trunc = helper.encode_item(long_state, qdefs[1], max_len=256, on_truncate="ignore", state_ids=long_st_ids)
+    assert reuse_trunc == ref_trunc
+
+
+def test_laya_lazy_multifunction_discovery_and_loading_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify symlink -> `metadata.json` -> `inspect_plan` discovery, lazy bucket loading, and `_h256`/`_h512` properties."""
+    import ctypes
+    import json
+    import threading
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    def _make_local_laya_dir(root: Path, *, with_mf: bool = True) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "tokenizer").mkdir(exist_ok=True)
+        vocab = {"[UNK]": 0, "[CLS]": 1, "[SEP]": 2, "[PAD]": 3, "[MASK]": 4, "w": 5}
+        tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.save(str(root / "tokenizer" / "tokenizer.json"))
+        (root / "rl_agent_config.json").write_text(
+            json.dumps({"head_max_len": 192, "temperature": [1.0, 1.0, 1.0]}), encoding="utf-8"
+        )
+        (root / "encoder_config.json").write_text(json.dumps({"local_attention": 128}), encoding="utf-8")
+        np.savez(
+            root / "laya_typed_emb_f16.npz",
+            word_f16=np.zeros((32, 16), dtype=np.float16),
+            type_f16=np.zeros((3, 16), dtype=np.float16),
+        )
+        if with_mf:
+            (root / "laya_typed_w8.mlmodelc").mkdir(exist_ok=True)
+        return root
+
+    fake_dylib = tmp_path / "libfake.dylib"
+    fake_dylib.write_bytes(b"stub")
+
+    class _FakeLib:
+        def __init__(self, *, load_fail_for: set[int] | None = None, plan_buckets: set[int] | None = None) -> None:
+            self.inspect_calls: list[tuple[str, str]] = []
+            self.load_calls: list[tuple[str, str, int]] = []
+            self.freed: list[int] = []
+            self.load_fail_for = load_fail_for or set()
+            self.plan_buckets = plan_buckets if plan_buckets is not None else {64, 256, 512}
+            self._next_ptr = 100
+
+        def laya_ane_inspect_plan_fn(self, mc_b: bytes, fn_b: bytes, _mode: int, counts_ptr: Any) -> None:
+            fn_s = fn_b.decode("utf-8")
+            self.inspect_calls.append((mc_b.decode("utf-8"), fn_s))
+            s_num = int(fn_s[1:]) if fn_s.startswith("s") and fn_s[1:].isdigit() else -1
+            if s_num in self.plan_buckets or fn_s == "main":
+                counts_ptr[0] = 1585
+                counts_ptr[1] = 0
+                counts_ptr[2] = 0
+            else:
+                counts_ptr[0] = 0
+                counts_ptr[1] = 0
+                counts_ptr[2] = 0
+
+        def laya_ane_load_fn(
+            self, mc_b: bytes, fn_b: bytes, _h: int, s_len: int, *_rest: Any
+        ) -> int:
+            self.load_calls.append((mc_b.decode("utf-8"), fn_b.decode("utf-8"), int(s_len)))
+            if int(s_len) in self.load_fail_for:
+                return 0
+            self._next_ptr += 1
+            return self._next_ptr
+
+        def laya_ane_max_markers(self, _h: int) -> int:
+            return 32
+
+        def laya_ane_exec_markers_batch(
+            self, _h: int, n_items: int, _ids: int, _vl: int, _qt: int, _mp: int, _mc: int, stride: int, out_ptr: int, _async: int
+        ) -> float:
+            out_arr = (ctypes.c_float * (n_items * stride)).from_address(out_ptr)
+            for i in range(n_items):
+                out_arr[i * stride + 0] = -0.2
+                out_arr[i * stride + 1] = 0.8
+            return 0.001
+
+        def laya_ane_free(self, h_ptr: int) -> None:
+            self.freed.append(h_ptr)
+
+    active_lib: list[_FakeLib] = []
+
+    def _bind_stub(self_obj: LayaAneBackend) -> None:
+        self_obj._has_last_error = False
+        self_obj._lib = active_lib[0]
+
+    monkeypatch.setattr(LayaAneBackend, "_bind_native_lib", _bind_stub)
+
+    # 1. Tier 1: symlinks discover buckets with ZERO inspect_plan_fn and ZERO load_fn on lazy_load=True
+    dir_sym = _make_local_laya_dir(tmp_path / "mf_symlink", with_mf=True)
+    for s_len in (64, 256, 512):
+        os.symlink("laya_typed_w8.mlmodelc", dir_sym / f"laya_typed_s{s_len}_w8.mlmodelc")
+    os.symlink("missing_target.mlmodelc", dir_sym / "laya_typed_s128_w8.mlmodelc")  # broken symlink skipped
+
+    lib1 = _FakeLib()
+    active_lib[:] = [lib1]
+    be = LayaAneBackend(dir_sym, fake_dylib, lazy_load=True)
+    assert lib1.inspect_calls == []
+    assert lib1.load_calls == []
+    assert be.seq_buckets == (64, 256, 512)
+    assert be._handles == {}
+    assert be._h256 is None and be._h512 is None
+    assert be._load_dims == (16, 64, 32)
+    assert be._bucket_sources[256] == ((dir_sym / "laya_typed_w8.mlmodelc").resolve(), "s256")
+
+    # inspect_compute_plans still inspects all discovered buckets via _bucket_sources without loading handles
+    plans = be.inspect_compute_plans()
+    assert set(plans.keys()) == {"s64", "s256", "s512"}
+    assert len(lib1.inspect_calls) == 3
+    assert be._handles == {}
+
+    # Scoring a 100-token item loads ONLY bucket 256
+    out_256 = be.score_choice_batch([{"ids": [5] * 100, "markers": [1, 2], "qtype": 0}])
+    assert len(out_256) == 1 and len(out_256[0]) == 2
+    assert len(lib1.load_calls) == 1 and lib1.load_calls[0][1:] == ("s256", 256)
+    assert be._h256 is not None and be._h512 is None
+
+    # Repeat 100-token call reuses cached handle; 400-token call lazily loads 512
+    be.score_choice_batch([{"ids": [5] * 120, "markers": [1, 2], "qtype": 0}])
+    assert len(lib1.load_calls) == 1
+    out_512 = be.score_noul_batch([{"ids": [5] * 400, "markers": [1, 2], "qtype": 2}])
+    assert len(out_512) == 1 and out_512[0] > 0.5
+    assert len(lib1.load_calls) == 2 and lib1.load_calls[1][1:] == ("s512", 512)
+    assert be._h512 is not None
+
+    # Concurrent _ensure_bucket_handle on unloaded bucket 64 invokes laya_ane_load_fn exactly once
+    results_64: list[int] = []
+    barrier = threading.Barrier(4)
+
+    def _worker_64() -> None:
+        barrier.wait()
+        results_64.append(be._ensure_bucket_handle(64))
+
+    threads = [threading.Thread(target=_worker_64) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(results_64)) == 1
+    assert sum(1 for _mc, fn_s, _s in lib1.load_calls if fn_s == "s64") == 1
+
+    # close() frees all 3 handles without AttributeError on read-only properties
+    be.close()
+    assert len(lib1.freed) == 3
+    assert be._h256 is None and be._h512 is None
+
+    # 2. Tier 2: metadata.json discovery (no symlinks, zero inspect_plan_fn calls)
+    dir_meta = _make_local_laya_dir(tmp_path / "mf_meta", with_mf=True)
+    (dir_meta / "laya_typed_w8.mlmodelc" / "metadata.json").write_text(
+        json.dumps([{"name": "s128"}, {"functionName": "s384"}]),
+        encoding="utf-8",
+    )
+    lib2 = _FakeLib()
+    active_lib[:] = [lib2]
+    be_meta = LayaAneBackend(dir_meta, fake_dylib, lazy_load=True)
+    assert lib2.inspect_calls == [] and lib2.load_calls == []
+    assert be_meta.seq_buckets == (128, 384)
+    be_meta.close()
+
+    (dir_meta / "laya_typed_w8.mlmodelc" / "metadata.json").write_text(
+        json.dumps({"functions": ["main", "s64", "s512"]}),
+        encoding="utf-8",
+    )
+    lib2b = _FakeLib()
+    active_lib[:] = [lib2b]
+    be_meta2 = LayaAneBackend(dir_meta, fake_dylib, lazy_load=True)
+    assert lib2b.inspect_calls == [] and lib2b.load_calls == []
+    assert be_meta2.seq_buckets == (64, 512)
+    be_meta2.close()
+
+    # 3. Tier 3: fallback to inspect_plan_fn when neither symlinks nor metadata.json exist
+    dir_fb = _make_local_laya_dir(tmp_path / "mf_fallback", with_mf=True)
+    lib3 = _FakeLib(plan_buckets={192, 512})
+    active_lib[:] = [lib3]
+    be_fb = LayaAneBackend(dir_fb, fake_dylib, lazy_load=True)
+    assert len(lib3.inspect_calls) == 8 and lib3.load_calls == []
+    assert be_fb.seq_buckets == (192, 512)
+    be_fb.close()
+
+    # 4. Eager load (lazy_load=False) + error paths
+    lib4 = _FakeLib()
+    active_lib[:] = [lib4]
+    be_eager = LayaAneBackend(dir_sym, fake_dylib, lazy_load=False)
+    assert len(lib4.load_calls) == 3 and set(be_eager._handles.keys()) == {64, 256, 512}
+    be_eager.close()
+
+    lib_partial = _FakeLib(load_fail_for={64})
+    active_lib[:] = [lib_partial]
+    be_partial = LayaAneBackend(dir_sym, fake_dylib, lazy_load=False)
+    assert be_partial.seq_buckets == (256, 512)
+    assert set(be_partial._bucket_sources.keys()) == {256, 512}
+    be_partial.close()
+
+    lib_fail_all = _FakeLib(load_fail_for={64, 256, 512})
+    active_lib[:] = [lib_fail_all]
+    with pytest.raises(RuntimeError, match="Failed to load any"):
+        LayaAneBackend(dir_sym, fake_dylib, lazy_load=False)
+
+    lib_no_buckets = _FakeLib(plan_buckets=set())
+    active_lib[:] = [lib_no_buckets]
+    with pytest.raises(RuntimeError, match="Failed to load any"):
+        LayaAneBackend(dir_fb, fake_dylib, lazy_load=True)
+
+    # Per-bucket standalone dir with lazy_load=True
+    dir_pb = _make_local_laya_dir(tmp_path / "per_bucket", with_mf=False)
+    (dir_pb / "laya_typed_s512_w8.mlmodelc").mkdir()
+    lib_pb = _FakeLib()
+    active_lib[:] = [lib_pb]
+    be_pb = LayaAneBackend(dir_pb, fake_dylib, lazy_load=True)
+    assert be_pb.seq_buckets == (512,) and be_pb._bucket_sources[512][1] == "main"
+    assert lib_pb.load_calls == []
+    be_pb.score_noul_batch([{"ids": [5] * 300, "markers": [1, 2], "qtype": 2}])
+    assert len(lib_pb.load_calls) == 1 and lib_pb.load_calls[0][1:] == ("main", 512)
+    be_pb.close()
+
+
+def test_laya_hetero_routing_shared_state_and_makespan_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `LayaHeteroEngine` shared-state forwarding, `n=1` fast-paths, and makespan-balanced dual split."""
+    import threading
+    import time
+    from fast_decision_models.laya_hetero import LayaHeteroEngine, _choose_hetero_initial_split
+
+    # 1. _choose_hetero_initial_split invariants across 8x512, 8xshort, 8xmixed, and 64xmixed
+    g_512, a_512 = _choose_hetero_initial_split([512] * 8, 16, 8, (64, 128, 192, 256, 384, 512))
+    assert (g_512, a_512) == (4, 4)
+
+    g_short, a_short = _choose_hetero_initial_split([96] * 8, 16, 8, (64, 128, 192, 256, 384, 512))
+    assert g_short >= 1 and a_short >= 1 and (g_short + a_short) == 8
+
+    g_64, a_64 = _choose_hetero_initial_split([512, 256, 128, 64] * 16, 16, 8, (64, 128, 192, 256, 384, 512))
+    assert (g_64, a_64) == (16, 8)
+
+    # 2. Dispatch fast-paths, dual-engine split (8x512, 8xshort, 64x512 non-starving), and shared-state forwarding
+    tok_helper = LayaAneBackend.__new__(LayaAneBackend)
+    tok_helper.max_len = 512
+    tok_helper.head_max_len = 192
+    tok_helper.cls_id = 1
+    tok_helper.sep_id = 2
+    tok_helper.pad_id = 3
+    tok_helper.mask_id = 4
+    tok_helper.mask_tok = "[MASK]"
+    state_tok_calls: list[str] = []
+
+    def _enc_ids(text: str) -> list[int]:
+        state_tok_calls.append(text)
+        return [10 + (i % 40) for i in range(len(text.split()))]
+
+    tok_helper._encode_ids = _enc_ids  # type: ignore[method-assign]
+
+    dual_calls: list[tuple[str, list[int]]] = []
+    gpu_delay_s = [0.0]
+
+    class _MockNeural:
+        max_len = 512
+        head_max_len = 192
+        pad_id = 3
+        seq_buckets = (64, 128, 192, 256, 384, 512)
+
+        def encode_state(self, state: Any) -> list[int]:
+            return tok_helper.encode_state(state)
+
+        def encode_item(self, state: Any, qdef: Any, **kwargs: Any) -> dict[str, Any]:
+            return tok_helper.encode_item(state, qdef, **kwargs)
+
+        def encode_items_for_state(self, state: Any, qdefs: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return tok_helper.encode_items_for_state(state, qdefs, **kwargs)
+
+        def score_noul_batch(self, items: list[dict[str, Any]]) -> list[float]:
+            dual_calls.append(("neural", [len(it["ids"]) for it in items]))
+            return [0.1 + 0.001 * it["ids"][0] for it in items]
+
+        def score_choice_batch(self, items: list[dict[str, Any]], *, temperature_override: float | None = None) -> list[list[float]]:
+            dual_calls.append(("neural", [len(it["ids"]) for it in items]))
+            return [[float(it["ids"][0]), float(len(it["ids"]))] for it in items]
+
+        def close(self) -> None:
+            pass
+
+    class _MockMetal:
+        def score_noul_batch(self, items: list[dict[str, Any]]) -> list[float]:
+            if gpu_delay_s[0] > 0:
+                time.sleep(gpu_delay_s[0])
+            dual_calls.append(("metal", [len(it["ids"]) for it in items]))
+            return [0.1 + 0.001 * it["ids"][0] for it in items]
+
+        def score_choice_batch(self, items: list[dict[str, Any]], *, temperature_override: float | None = None) -> list[list[float]]:
+            if gpu_delay_s[0] > 0:
+                time.sleep(gpu_delay_s[0])
+            dual_calls.append(("metal", [len(it["ids"]) for it in items]))
+            return [[float(it["ids"][0]), float(len(it["ids"]))] for it in items]
+
+        def close(self) -> None:
+            pass
+
+    het = LayaHeteroEngine(
+        mode="hetero",
+        ane_backend=_MockNeural(),
+        gpu_backend=_MockMetal(),
+        gpu_batch_size=16,
+        ane_batch_size=8,
+    )
+
+    # Shared-state forwarding
+    st_ids = het.encode_state("alpha beta gamma")
+    assert len(state_tok_calls) == 1
+    qdefs = [
+        {"type": "noul", "instructions": "q1", "criteria": {"false": "no", "true": "yes"}},
+        {"type": "noul", "instructions": "q2", "criteria": {"false": "no", "true": "yes"}},
+    ]
+    assert het.encode_item("alpha beta gamma", qdefs[0], state_ids=st_ids) == tok_helper.encode_item(
+        "alpha beta gamma", qdefs[0]
+    )
+    assert len(het.encode_items_for_state("alpha beta gamma", qdefs)) == 2
+
+    # n=1 short (<=256), n=1 long (>256), and n=2 <=192 use zero threads
+    orig_thread = threading.Thread
+
+    def _forbid_thread(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("Tiny batch fast-path must not spawn threads")
+
+    monkeypatch.setattr(threading, "Thread", _forbid_thread)
+
+    dual_calls.clear()
+    assert het.score_noul_batch([{"ids": [7] * 256, "markers": [1, 2], "qtype": 2}]) == pytest.approx([0.107])
+    assert dual_calls == [("neural", [256])]
+
+    dual_calls.clear()
+    assert het.score_noul_batch([{"ids": [8] * 257, "markers": [1, 2], "qtype": 2}]) == pytest.approx([0.108])
+    assert dual_calls == [("metal", [257])]
+
+    dual_calls.clear()
+    assert het.score_choice_batch(
+        [{"ids": [3] * 128, "markers": [1, 2], "qtype": 0}, {"ids": [4] * 192, "markers": [1, 2], "qtype": 0}]
+    ) == [[3.0, 128.0], [4.0, 192.0]]
+    assert dual_calls == [("neural", [128, 192])]
+
+    monkeypatch.setattr(threading, "Thread", orig_thread)
+
+    # 8x512 splits 4/4 across both engines
+    dual_calls.clear()
+    items_8x512 = [{"ids": [i + 1] * 512, "markers": [1, 2], "qtype": 0} for i in range(8)]
+    res_8x512 = het.score_choice_batch(items_8x512)
+    assert res_8x512 == [[float(i + 1), 512.0] for i in range(8)]
+    by_engine = {eng: sum(len(lens) for e, lens in dual_calls if e == eng) for eng in ("metal", "neural")}
+    assert by_engine == {"metal": 4, "neural": 4}
+
+    # 8xshort exercises both engines cleanly
+    dual_calls.clear()
+    items_8xshort = [{"ids": [i + 1] * 96, "markers": [1, 2], "qtype": 2} for i in range(8)]
+    res_8xshort = het.score_noul_batch(items_8xshort)
+    assert res_8xshort == pytest.approx([0.1 + 0.001 * (i + 1) for i in range(8)])
+    assert any(e == "metal" for e, _ in dual_calls) and any(e == "neural" for e, _ in dual_calls)
+
+    # 64x512 with slow GPU verifies neural worker steals >256 items down to empty queue (zero starvation!)
+    dual_calls.clear()
+    gpu_delay_s[0] = 0.015
+    items_64x512 = [{"ids": [i + 1] * 512, "markers": [1, 2], "qtype": 0} for i in range(64)]
+    res_64 = het.score_choice_batch(items_64x512)
+    assert res_64 == [[float(i + 1), 512.0] for i in range(64)]
+    neural_batches = [lens for e, lens in dual_calls if e == "neural"]
+    assert len(neural_batches) >= 2 and sum(len(b) for b in neural_batches) > 8
+
+    # Legacy delegate without state_ids parameter stays compatible when state_ids is omitted
+    class _LegacyTok:
+        max_len = 512
+        head_max_len = 192
+        pad_id = 0
+
+        def encode_item(self, state: Any, qdef: Any, *, max_len: int | None = None, on_truncate: str = "warn"):
+            return {"ids": [1, 2, 3], "markers": [1, 2], "qtype": 2}
+
+    legacy_het = LayaHeteroEngine(mode="ane", ane_backend=_LegacyTok(), gpu_backend=None)
+    assert legacy_het.encode_item("s", {"type": "noul"})["ids"] == [1, 2, 3]
+    het.close()
+
+
+def test_builder_pass_pipeline_ctx_and_laya_gpu_compile_encode_cpu() -> None:
+    from types import SimpleNamespace
+    import fast_decision_models.builder as bmod
+    from fast_decision_models.laya_hetero import _LAYA_GPU_CACHE_LIMIT_BYTES, LayaMlxGpuBackend
+
+    fake_common = [
+        "common::dead_code_elimination",
+        "common::fuse_elementwise_to_batchnorm",
+        "common::add_fp16_cast",
+        "common::const_elimination",
+    ]
+    fake_default = list(fake_common) + ["common::noop"]
+    fake_pp_mod = SimpleNamespace(
+        _COMMON_PASSES=fake_common,
+        PassPipeline=SimpleNamespace(_PIPELINE_NAME_TO_PASSES={"default": list(fake_default)}),
+    )
+
+    with bmod._without_coreml_bn_fp16_passes(pass_pipeline_module=fake_pp_mod):
+        assert "common::fuse_elementwise_to_batchnorm" not in fake_pp_mod._COMMON_PASSES
+        assert "common::add_fp16_cast" not in fake_pp_mod._COMMON_PASSES
+        assert "common::fuse_elementwise_to_batchnorm" not in fake_pp_mod.PassPipeline._PIPELINE_NAME_TO_PASSES["default"]
+        assert "common::add_fp16_cast" not in fake_pp_mod.PassPipeline._PIPELINE_NAME_TO_PASSES["default"]
+        assert "common::const_elimination" in fake_pp_mod._COMMON_PASSES
+
+    assert fake_pp_mod._COMMON_PASSES == fake_common
+    assert fake_pp_mod.PassPipeline._PIPELINE_NAME_TO_PASSES["default"] == fake_default
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with bmod._without_coreml_bn_fp16_passes(pass_pipeline_module=fake_pp_mod):
+            assert "common::fuse_elementwise_to_batchnorm" not in fake_pp_mod._COMMON_PASSES
+            raise RuntimeError("boom")
+    assert fake_pp_mod._COMMON_PASSES == fake_common
+    assert fake_pp_mod.PassPipeline._PIPELINE_NAME_TO_PASSES["default"] == fake_default
+
+    assert _LAYA_GPU_CACHE_LIMIT_BYTES == (512 << 20)
+
+    # Verify compile_encode routing on LayaMlxGpuBackend._score_generic
+    import numpy as np
+
+    class _FakeArray:
+        def __init__(self, arr):
+            self._arr = np.asarray(arr)
+
+        @property
+        def shape(self):
+            return self._arr.shape
+
+    class _FakeMx:
+        int32 = np.int32
+        bfloat16 = np.float32
+
+        @staticmethod
+        def array(x, dtype=None):
+            return np.asarray(x, dtype=dtype)
+
+        @staticmethod
+        def abs(x):
+            return np.abs(x)
+
+        @staticmethod
+        def where(cond, a, b):
+            return np.where(cond, a, b)
+
+        @staticmethod
+        def eval(*_args):
+            pass
+
+        @staticmethod
+        def clear_cache():
+            pass
+
+    calls: list[str] = []
+    fake_backend = object.__new__(LayaMlxGpuBackend)
+    fake_backend._mx = _FakeMx
+    fake_backend._np = np
+    fake_backend.batch_size = 4
+    fake_backend.pack_seq_len = 512
+    fake_backend.pad_id = 0
+    fake_backend.local_half_win = 64
+    fake_backend._prev_cache_limit = None
+    fake_backend._limits_restored = True
+    fake_backend.resolve_temperature = lambda _qt, _k, ov: ov or 1.0  # type: ignore[method-assign]
+    fake_backend.model = SimpleNamespace(
+        encode_hidden=lambda *args: calls.append("eager") or np.zeros((1, 32, 4), dtype=np.float32),
+        _score_laya_markers_fp32=lambda h, lane, pos: np.array([[0.2, 0.8]], dtype=np.float32),
+    )
+    fake_backend._encode_hidden = lambda *args: calls.append("compiled") or np.zeros((1, 32, 4), dtype=np.float32)
+
+    probs = fake_backend.score_noul_batch([{"ids": [1, 2, 3, 4], "markers": [1, 2], "qtype": 2}])
+    assert len(probs) == 1
+    assert calls == ["compiled"]
+
+    calls.clear()
+    fake_backend._encode_hidden = None
+    probs2 = fake_backend.score_noul_batch([{"ids": [1, 2, 3, 4], "markers": [1, 2], "qtype": 2}])
+    assert len(probs2) == 1 and probs2 == pytest.approx(probs)
+    assert calls == ["eager"]
+    fake_backend.close()
+
+
+def test_build_decision_models_unwraps_bucket_compile_result_cpu(monkeypatch: Any, tmp_path: Path) -> None:
+    """Verify `build_laya_ane_artifacts_parallel` unwraps `BucketCompileResult.value` when multifunction=True."""
+    import importlib.util
+    import sys
+    from types import SimpleNamespace
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "build_decision_models.py"
+    spec = importlib.util.spec_from_file_location("test_build_decision_models_script", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+        src_dir = tmp_path / "src_laya"
+        (src_dir / "encoder").mkdir(parents=True)
+        (src_dir / "tokenizer").mkdir(parents=True)
+        (src_dir / "rl_agent_config.json").write_text("{}", encoding="utf-8")
+        (src_dir / "encoder" / "config.json").write_text('{"hidden_size": 16}', encoding="utf-8")
+        (src_dir / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (src_dir / "model.safetensors").write_bytes(b"stub")
+
+        art_dir = tmp_path / "artifacts"
+        dylib_p = tmp_path / "liblaya_ane_runner.dylib"
+        dylib_p.write_bytes(b"")
+
+        monkeypatch.setattr(mod, "_resolve_dir_or_hf", lambda *_a, **_kw: src_dir)
+        monkeypatch.setattr(mod, "ensure_laya_dylib", lambda *_a, **_kw: dylib_p)
+        monkeypatch.setattr(
+            mod,
+            "_load_safetensors_as_float32_np",
+            lambda _p: {
+                "encoder.embeddings.tok_embeddings.weight": np.zeros((4, 16), dtype=np.float32),
+                "type_emb.weight": np.zeros((3, 16), dtype=np.float32),
+            },
+        )
+        fake_res_cls = type("BucketCompileResult", (), {})
+
+        def _fake_compile(tasks, _fn, **_kw):
+            out = []
+            for idx, (s_len, _src, stage_root) in enumerate(tasks):
+                pkg_p = Path(stage_root) / f"_laya_typed_s{s_len}_w8.mlpackage"
+                pkg_p.mkdir(parents=True, exist_ok=True)
+                rec = fake_res_cls()
+                rec.index = idx
+                rec.label = f"laya_typed_s{s_len}_w8"
+                rec.value = str(pkg_p)
+                out.append(rec)
+            return out
+
+        captured: dict[int, Path] = {}
+        monkeypatch.setattr(mod, "compile_buckets_parallel", _fake_compile)
+        monkeypatch.setattr(
+            mod,
+            "_save_laya_multifunction_mlpackage",
+            lambda seq_pkgs, dst, **_kw: captured.update(seq_pkgs) or dst,
+        )
+        monkeypatch.setattr(mod, "_publish_multifunction_and_symlinks", lambda mf, out_d, _lens: out_d / "laya_typed_w8.mlmodelc")
+        monkeypatch.setattr(mod.ctypes, "CDLL", lambda _p: SimpleNamespace(laya_ane_inspect_plan_fn=lambda _p, _fn, _m, c: (c.__setitem__(0, 1500), c.__setitem__(1, 0), c.__setitem__(2, 0))))
+
+        out = mod.build_laya_ane_artifacts_parallel(tmp_path, artifacts_dir=art_dir, seq_lens=(64, 128), multifunction=True)
+        assert out == art_dir / "laya_typed"
+        assert set(captured.keys()) == {64, 128}
+        assert all(isinstance(p, Path) and p.name.endswith(".mlpackage") for p in captured.values())
+    finally:
+        sys.modules.pop(spec.name, None)
+
 
 

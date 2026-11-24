@@ -2082,7 +2082,9 @@ def test_single_item_inline_routing_and_parquet_header_col_cpu(tmp_path: Path) -
         (True, "hetero2", 1, 0),
         (True, "hetero", 0, 1),
         (True, "ane", 0, 1),
-        (False, "hetero2", 0, 1),
+        (False, "hetero2", 1, 0),
+        (False, "hetero", 0, 1),
+        (False, "ane", 0, 1),
     ):
         g = _StubGPU()
         a = _StubANE()
@@ -2271,5 +2273,154 @@ def test_upstream_alignment_doc_prefix_spans_tanh_and_ctx_overlap_cpu(
         embed_parquet(eng, in_pq, out_nopfx_f32, text_col="text", add_document_prefix=False, dtype="float32")
         vec_nopfx_pq = np.asarray(pq.read_table(out_nopfx_f32)["vector"].to_pylist(), dtype=np.float32)
         np.testing.assert_allclose(vec_nopfx_pq, v_txt_nopfx, rtol=1e-6, atol=1e-6)
+
+
+def test_hetero2_apple10_preseed_no_starvation_cpu(tmp_path: Path) -> None:
+    """Verify Base M5 (Apple10) `hetero2` pre-seeds GPU + ANE before threads start and never strands tails."""
+    import math
+    from fast_pplx.engine import FastPplx, resolve_hetero_initial_seed
+
+    # 1. Pure pre-seed math across Apple10 vs Apple9 and n=1..64
+    for n in range(1, 17):
+        g_m5, a_m5 = resolve_hetero_initial_seed(is_apple10=True, n_short=n, batch_size=16, pipe_depth=4)
+        assert g_m5 >= math.ceil(n * 0.6)
+        assert g_m5 + a_m5 <= n
+        if n >= 3:
+            assert a_m5 >= 1
+    assert resolve_hetero_initial_seed(is_apple10=True, n_short=8, batch_size=16, pipe_depth=4) == (5, 3)
+
+    g_64, a_64 = resolve_hetero_initial_seed(is_apple10=True, n_short=64, batch_size=16, pipe_depth=4)
+    assert g_64 >= 16 and a_64 == 6 and g_64 + a_64 < 64
+
+    for n in range(2, 17):
+        g_m4, a_m4 = resolve_hetero_initial_seed(is_apple10=False, n_short=n, batch_size=16, pipe_depth=4)
+        assert g_m4 >= 1 and a_m4 >= 1 and g_m4 + a_m4 <= n
+
+    tok = ContextualTokenizer(_write_synthetic_tokenizer(tmp_path), DEFAULT_PPLX_CONFIG)
+
+    class _IdentityGPU:
+        max_seq_len = 32768
+
+        def __init__(self, on_batch: Any = None) -> None:
+            self.on_batch = on_batch
+
+        def encode_tokens(
+            self,
+            token_lists: list[list[int]],
+            *,
+            batch_size: int = 16,
+            dimensions: int | None = None,
+            output_dtype: str = "float32",
+            normalize: bool = True,
+            apply_tanh: bool = True,
+        ) -> np.ndarray:
+            del batch_size, output_dtype, normalize, apply_tanh
+            d = int(dimensions or 8)
+            out = np.zeros((len(token_lists), d), dtype=np.float32)
+            for row_i, toks in enumerate(token_lists):
+                out[row_i, 0] = float(toks[0])
+                out[row_i, 1] = float(len(toks))
+            if self.on_batch is not None:
+                self.on_batch(token_lists)
+            return out
+
+        def close(self) -> None:
+            pass
+
+    class _IdentityANE:
+        caps = (64, 128, 256, 512)
+        max_cap = 512
+
+        def __init__(self, hold_first: threading.Event | None = None) -> None:
+            self.hold_first = hold_first
+            self._seen_first = False
+            self._lock = threading.Lock()
+
+        def run_buckets(self, buckets, *, out_dim, apply_tanh_int8, apply_l2_norm):
+            del apply_tanh_int8, apply_l2_norm
+            if self.hold_first is not None:
+                with self._lock:
+                    first = not self._seen_first
+                    self._seen_first = True
+                if first:
+                    self.hold_first.wait(timeout=5.0)
+            done = []
+            for bkt in buckets:
+                live = [t for t in bkt.targets if t.end > t.start]
+                mat = np.zeros((len(live), out_dim), dtype=np.float32)
+                for row_i, tgt in enumerate(live):
+                    mat[row_i, 0] = float(bkt.token_ids[tgt.start])
+                    mat[row_i, 1] = float(tgt.end - tgt.start)
+                done.append((bkt, mat))
+            return done
+
+        def close(self) -> None:
+            pass
+
+    def _make_short_batch(n_docs: int) -> list[list[int]]:
+        return [[100 + i] + [4] * ((i % 6) + 1) for i in range(n_docs)]
+
+    def _assert_exact_rows(vecs: np.ndarray, toks: list[list[int]]) -> None:
+        assert vecs.shape == (len(toks), 8)
+        expected = np.zeros((len(toks), 8), dtype=np.float32)
+        for i, row in enumerate(toks):
+            expected[i, 0] = float(row[0])
+            expected[i, 1] = float(len(row))
+        np.testing.assert_allclose(vecs, expected, rtol=0.0, atol=0.0)
+
+    # 2. Base M5 (Apple10) n=8 & n=16 short-only batches: zero GPU starvation even with instant ANE
+    for is_a10, n_docs, min_gpu in ((True, 8, 5), (True, 16, 10), (False, 8, 1)):
+        batch = _make_short_batch(n_docs)
+        with FastPplx(
+            home=tmp_path,
+            mode="hetero2",
+            dimensions=8,
+            _gpu_backend=_IdentityGPU(),
+            _ane_backend=_IdentityANE(),
+            _tokenizer=tok,
+        ) as eng:
+            eng.runtime_telemetry["is_apple10"] = is_a10
+            out = eng.encode_tokens(batch, batch_size=16, dimensions=8, normalize=False, apply_tanh=False)
+            _assert_exact_rows(out, batch)
+            st = eng.last_stats
+            assert st["mode"] == "hetero2"
+            assert st["deterministic"] is False
+            assert st["gpu_items"] >= min_gpu
+            assert st["ane_items"] >= 1
+            assert st["gpu_items"] + st["ane_items"] == n_docs
+
+            # Mode="hetero" remains strictly deterministic (ANE owns all short_items, GPU=0)
+            out_h = eng.encode_tokens(batch, batch_size=16, dimensions=8, mode="hetero", normalize=False, apply_tanh=False)
+            _assert_exact_rows(out_h, batch)
+            st_h = eng.last_stats
+            assert st_h["deterministic"] is True
+            assert st_h["gpu_items"] == 0 and st_h["gpu_stolen_items"] == 0 and st_h["ane_items"] == n_docs
+
+    # 3. Leftover tail < steal_min_chunk (n=20 on M5: gpu_seed=13, ane_seed=6, leftover=1) is NOT stranded when GPU finishes first
+    release_ane = threading.Event()
+    gpu_total = {"n": 0}
+
+    def _on_gpu_batch(sub_toks: list[list[int]]) -> None:
+        gpu_total["n"] += len(sub_toks)
+        if gpu_total["n"] >= 14:
+            release_ane.set()
+
+    batch_20 = _make_short_batch(20)
+    with FastPplx(
+        home=tmp_path,
+        mode="hetero2",
+        dimensions=8,
+        _gpu_backend=_IdentityGPU(on_batch=_on_gpu_batch),
+        _ane_backend=_IdentityANE(hold_first=release_ane),
+        _tokenizer=tok,
+    ) as eng20:
+        eng20.runtime_telemetry["is_apple10"] = True
+        out_20 = eng20.encode_tokens(batch_20, batch_size=16, dimensions=8, normalize=False, apply_tanh=False)
+        _assert_exact_rows(out_20, batch_20)
+        st_20 = eng20.last_stats
+        assert st_20["gpu_items"] >= 14
+        assert st_20["ane_items"] == 6
+        assert st_20["gpu_items"] + st_20["ane_items"] == 20
+
 
 

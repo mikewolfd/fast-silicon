@@ -1233,18 +1233,58 @@ def stage_us_gov_ocr(
         if _want("scotus_opinions"):
             items.extend(_stage_scotus_items(root, per_source=per_source))
 
-    manifest = {"schema_version": 1, "year": int(year), "items": items}
     manifest_p = root / "manifest.json"
+    existing_items: list[dict[str, Any]] = []
+    if manifest_p.is_file():
+        try:
+            old_manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Corrupt U.S. Gov OCR manifest at {manifest_p}: {exc}") from exc
+        if not isinstance(old_manifest, dict):
+            raise ValueError(f"Corrupt U.S. Gov OCR manifest at {manifest_p}: expected JSON object")
+        raw_old_items = old_manifest.get("items") or []
+        if not isinstance(raw_old_items, list):
+            raise ValueError(f"Corrupt U.S. Gov OCR manifest at {manifest_p}: expected 'items' list")
+        existing_items = [dict(it) for it in raw_old_items if isinstance(it, dict)]
+
+    targeted_sources: set[str] = {str(it.get("source") or "unknown") for it in items}
+    if "legislative" in eff_branches:
+        for src in ("govinfo_plaw", "govinfo_bills", "govinfo_uscode"):
+            if _want(src):
+                targeted_sources.add(src)
+    if "executive" in eff_branches:
+        for src in ("govinfo_fr", "govinfo_budget"):
+            if _want(src):
+                targeted_sources.add(src)
+        if want_btp:
+            targeted_sources.add("loc_btp")
+    if "judicial" in eff_branches:
+        for src in ("govinfo_uscourts", "scotus_opinions"):
+            if _want(src):
+                targeted_sources.add(src)
+
+    new_ids = {(str(it.get("source") or "unknown"), str(it.get("id") or "")) for it in items if it.get("id")}
+    merged_items: list[dict[str, Any]] = []
+    for old_it in existing_items:
+        old_src = str(old_it.get("source") or "unknown")
+        old_id = str(old_it.get("id") or "")
+        if old_src in targeted_sources or (old_id and (old_src, old_id) in new_ids):
+            continue
+        merged_items.append(old_it)
+    merged_items.extend(items)
+
+    manifest = {"schema_version": 1, "year": int(year), "items": merged_items}
     manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
     manifest_sha = _write_cached_bytes(manifest_p, manifest_bytes)
-    sources_out = sorted({str(it.get("source") or "unknown") for it in items})
+    sources_out = sorted({str(it.get("source") or "unknown") for it in merged_items})
+    all_branches = tuple(dict.fromkeys([*eff_branches, *(str(it.get("branch") or "") for it in merged_items if it.get("branch"))]))
     return {
         "cache_dir": str(root),
         "manifest_path": str(manifest_p),
         "manifest_sha256": manifest_sha,
-        "n_items": len(items),
-        "by_branch": {b: sum(1 for it in items if it["branch"] == b) for b in eff_branches},
-        "by_source": {s: sum(1 for it in items if it.get("source") == s) for s in sources_out},
+        "n_items": len(merged_items),
+        "by_branch": {b: sum(1 for it in merged_items if it.get("branch") == b) for b in all_branches},
+        "by_source": {s: sum(1 for it in merged_items if it.get("source") == s) for s in sources_out},
     }
 
 

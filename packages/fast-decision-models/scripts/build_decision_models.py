@@ -217,14 +217,17 @@ def build_laya_ane_artifacts_parallel(
         try:
             tasks = [(int(s_len), str(src_dir.resolve()), str(stage_root.resolve())) for s_len in eff_seq_lens]
             with acquire_hw_lock("build_laya_ane_models"):
-                pkg_paths = compile_buckets_parallel(
+                compile_results = compile_buckets_parallel(
                     tasks,
                     _build_laya_mlpackage_task,
                     max_workers=eff_jobs,
                     label_fn=lambda t: f"laya_typed_s{t[0]}_w8",
                     extra_sys_paths=(Path(__file__).resolve().parent, SRC_DIR),
                 )
-                seq_pkgs = {int(s_len): Path(p_str) for s_len, p_str in zip(eff_seq_lens, pkg_paths)}
+                seq_pkgs = {
+                    int(s_len): Path(res.value if hasattr(res, "value") else res)
+                    for s_len, res in zip(eff_seq_lens, compile_results)
+                }
                 mf_pkg = _save_laya_multifunction_mlpackage(
                     seq_pkgs, stage_root / "laya_typed_w8.mlpackage", default_seq_len=512
                 )

@@ -1918,7 +1918,7 @@ def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
         resp2.read()
         conn2.close()
 
-    # 2. ChatMicroBatcher coalesces heterogeneous max_tokens using max(max_tokens) AND handles /v1/completions
+    # 2. ChatMicroBatcher partitions heterogeneous max_tokens buckets, coalesces identical max_tokens, AND handles /v1/completions
     class _MaxTokEngine:
         model_name = "dummy-llm"
         default_mode = "gpu"
@@ -1952,9 +1952,9 @@ def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
     llm = _MaxTokEngine()
     batcher = ChatMicroBatcher(llm, coalesce_ms=25.0, max_batch_size=16)
 
-    def _sub(max_tok: int) -> tuple[Any, dict[str, Any]]:
+    def _sub(max_tok: int, tag: str = "") -> tuple[Any, dict[str, Any]]:
         return batcher.submit(
-            [{"role": "user", "content": f"t-{max_tok}"}],
+            [{"role": "user", "content": f"t-{max_tok}{tag}"}],
             json_schema=None,
             max_tokens=max_tok,
             temperature=0.0,
@@ -1966,7 +1966,26 @@ def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
         res_pair = list(pool.map(_sub, [32, 128]))
     assert len(res_pair) == 2
     assert llm.max_concurrent == 1
-    assert llm.calls == [(2, 128)]  # Coalesced into 1 batch with max(32, 128) == 128!
+    assert sorted(llm.calls) == [(1, 32), (1, 128)]  # Isolated by exact max_tokens!
+
+    llm_same = _MaxTokEngine()
+    batcher_same = ChatMicroBatcher(llm_same, coalesce_ms=25.0, max_batch_size=16)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        res_same = list(
+            pool.map(
+                lambda tag: batcher_same.submit(
+                    [{"role": "user", "content": tag}],
+                    json_schema=None,
+                    max_tokens=64,
+                    temperature=0.0,
+                    top_p=1.0,
+                    seed=42,
+                ),
+                ["a", "b"],
+            )
+        )
+    assert len(res_same) == 2
+    assert llm_same.calls == [(2, 64)]
 
     # /v1/completions routes through ChatMicroBatcher too
     llm2 = _MaxTokEngine()
@@ -1988,7 +2007,7 @@ def test_server_locking_coalescing_chunked_and_mode_forwarding_cpu() -> None:
             cmpl_outs = list(pool.map(_hit_cmpl, [16, 96]))
         assert len(cmpl_outs) == 2
         assert llm2.max_concurrent == 1
-        assert len(llm2.calls) == 1 and llm2.calls[0] == (2, 96)
+        assert sorted(llm2.calls) == [(1, 16), (1, 96)]
 
 
 def test_grammar_bounds_was_masked_and_thread_safety_cpu() -> None:

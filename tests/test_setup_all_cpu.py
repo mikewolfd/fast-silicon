@@ -115,6 +115,7 @@ def test_setup_all_marks_staged_artifacts_ready_and_validates_flags_cpu(tmp_path
         "decision-models",
         "gemma4",
         "qwen3",
+        "ocr",
     )
     with pytest.raises(ValueError, match="Unknown package"):
         mod.parse_packages_arg("bge-small,nonexistent")
@@ -284,5 +285,56 @@ def test_setup_all_qwen3_uses_complete_snapshot_check_for_partial_hf_cache_cpu(
         python_exe=sys.executable,
     )
     assert plan_missing.has_pending is True
+
+
+def test_setup_all_decision_models_multifunction_and_ocr_plan_cpu(tmp_path: Path) -> None:
+    mod = _load_setup_all()
+
+    # Empty .mlmodelc directory must NOT mark decision-models ready
+    dm_home = tmp_path / "fast-decision-models"
+    laya_dir = dm_home / "artifacts" / "laya_typed"
+    kev_dir = dm_home / "artifacts" / "kev_08b"
+    (laya_dir / "tokenizer").mkdir(parents=True)
+    (laya_dir / "laya_typed_emb_f16.npz").write_bytes(b"npz")
+    (laya_dir / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (laya_dir / "laya_typed_s256_w8.mlmodelc").mkdir()
+    (laya_dir / "laya_typed_s512_w8.mlmodelc").mkdir()
+    kev_dir.mkdir(parents=True)
+    (kev_dir / "model_w8.safetensors").write_bytes(b"st")
+    (kev_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    plan_empty = mod._plan_decision_models(
+        dm_home,
+        force=False,
+        skip_ane=False,
+        hf_checker=lambda _r: True,
+        python_exe=sys.executable,
+    )
+    assert plan_empty.has_pending is True
+
+    # Valid multifunction laya_typed_w8.mlmodelc + symlinks marks decision-models ready
+    mf_bundle = laya_dir / "laya_typed_w8.mlmodelc"
+    mf_bundle.mkdir()
+    (mf_bundle / "coremldata.bin").write_bytes(b"bin")
+    for s in (64, 128, 256, 512):
+        link = laya_dir / f"laya_typed_s{s}_w8.mlmodelc"
+        if link.is_dir() and not link.is_symlink():
+            link.rmdir()
+        link.symlink_to(mf_bundle, target_is_directory=True)
+
+    plan_mf = mod._plan_decision_models(
+        dm_home,
+        force=False,
+        skip_ane=False,
+        hf_checker=lambda _r: True,
+        python_exe=sys.executable,
+    )
+    assert plan_mf.has_pending is False
+
+    # OCR package plan tracks HF cache
+    ocr_plan_miss = mod._plan_ocr(tmp_path / "fast-ocr", force=False, hf_checker=lambda _r: False)
+    ocr_plan_hit = mod._plan_ocr(tmp_path / "fast-ocr", force=False, hf_checker=lambda r: r == mod._OCR_HF_REPO)
+    assert ocr_plan_miss.has_pending is True
+    assert ocr_plan_hit.has_pending is False
 
 

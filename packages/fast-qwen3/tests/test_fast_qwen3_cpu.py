@@ -1465,6 +1465,723 @@ def test_compact_hybrid_cache_pack_waves_and_generate_batch_images(
         eng.close()
 
 
+def test_engine_non_lcp_make_cache_batch_size_and_kv_mode_cutoff_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pure-CPU test (mocked model/`mx`) for Fix 1 (`make_cache(..., batch_size=b_sz)`) & Fix 2 (`_resolve_kv_i8`)."""
+    import types
+    import fast_qwen3.engine as engine_mod
+    import fast_shared.hw_check as hw_check_mod
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    hidden_sz = 16
+    vocab_sz = tok.vocab_size
+
+    class _PureArray:
+        def __init__(self, data: np.ndarray, dtype: str = "float32") -> None:
+            self.data = np.asarray(data)
+            self._dtype = dtype
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            return self.data.shape
+
+        @property
+        def size(self) -> int:
+            return int(self.data.size)
+
+        @property
+        def ndim(self) -> int:
+            return int(self.data.ndim)
+
+        @property
+        def dtype(self) -> str:
+            return self._dtype
+
+        def astype(self, dtype: str) -> "_PureArray":
+            np_dt = np.int32 if dtype == "int32" else np.float32
+            return _PureArray(self.data.astype(np_dt), dtype=dtype)
+
+        def tolist(self) -> Any:
+            return self.data.tolist()
+
+        def item(self) -> Any:
+            return self.data.item()
+
+        def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
+            arr = np.asarray(self.data, dtype=dtype)
+            return arr.copy() if copy else arr
+
+        def __getitem__(self, key: Any) -> "_PureArray":
+            def _u(k: Any) -> Any:
+                if isinstance(k, _PureArray):
+                    return k.data
+                if isinstance(k, tuple):
+                    return tuple(_u(x) for x in k)
+                return k
+
+            return _PureArray(self.data[_u(key)], dtype=self._dtype)
+
+        def __invert__(self) -> "_PureArray":
+            return _PureArray(~self.data, dtype="bool")
+
+        def __and__(self, other: Any) -> "_PureArray":
+            rhs = other.data if isinstance(other, _PureArray) else other
+            return _PureArray(self.data & rhs, dtype="bool")
+
+        def __ge__(self, other: Any) -> "_PureArray":
+            rhs = other.data if isinstance(other, _PureArray) else other
+            return _PureArray(self.data >= rhs, dtype="bool")
+
+        def __lt__(self, other: Any) -> "_PureArray":
+            rhs = other.data if isinstance(other, _PureArray) else other
+            return _PureArray(self.data < rhs, dtype="bool")
+
+        def __le__(self, other: Any) -> "_PureArray":
+            rhs = other.data if isinstance(other, _PureArray) else other
+            return _PureArray(self.data <= rhs, dtype="bool")
+
+    class _PureMx:
+        bfloat16 = "bfloat16"
+        float32 = "float32"
+        int32 = "int32"
+
+        def array(self, data: Any, dtype: str | None = None) -> _PureArray:
+            arr = data.data if isinstance(data, _PureArray) else data
+            np_dt = np.int32 if dtype == self.int32 else np.float32
+            return _PureArray(np.array(arr, dtype=np_dt), dtype=dtype or self.float32)
+
+        def full(self, shape: tuple[int, ...], val: Any, dtype: str | None = None) -> _PureArray:
+            np_dt = np.int32 if dtype == self.int32 else np.float32
+            return _PureArray(np.full(shape, val, dtype=np_dt), dtype=dtype or self.int32)
+
+        def arange(self, n: int, dtype: str | None = None) -> _PureArray:
+            return _PureArray(np.arange(n, dtype=np.int32), dtype=dtype or self.int32)
+
+        def take(self, arr: _PureArray, idx: _PureArray, axis: int = 0) -> _PureArray:
+            return _PureArray(np.take(arr.data, idx.data, axis=axis), dtype=arr.dtype)
+
+        def take_along_axis(self, arr: _PureArray, idx: _PureArray, axis: int = 1) -> _PureArray:
+            return _PureArray(np.take_along_axis(arr.data, idx.data, axis=axis), dtype=arr.dtype)
+
+        def argmax(self, arr: _PureArray, axis: int = -1) -> _PureArray:
+            return _PureArray(np.argmax(arr.data, axis=axis).astype(np.int32), dtype=self.int32)
+
+        def isnan(self, arr: _PureArray) -> _PureArray:
+            return _PureArray(np.isnan(arr.data), dtype="bool")
+
+        def any(self, arr: _PureArray, axis: int | None = None) -> _PureArray:
+            return _PureArray(np.asarray(np.any(arr.data, axis=axis)), dtype="bool")
+
+        def where(self, cond: _PureArray, x: Any, y: Any) -> _PureArray:
+            xv = x.data if isinstance(x, _PureArray) else x
+            yv = y.data if isinstance(y, _PureArray) else y
+            dt = x.dtype if isinstance(x, _PureArray) else (y.dtype if isinstance(y, _PureArray) else self.float32)
+            return _PureArray(np.where(cond.data, xv, yv), dtype=dt)
+
+        def eval(self, *args: Any) -> None:
+            return None
+
+        def clear_cache(self) -> None:
+            return None
+
+    fake_mx = _PureMx()
+    monkeypatch.setattr(engine_mod, "mx", fake_mx)
+
+    make_cache_calls: list[dict[str, Any]] = []
+    eos_id = tok.eos_token_id
+
+    class _StubModel:
+        def __init__(self, *, head_dim: int = 128) -> None:
+            self.cfg = types.SimpleNamespace(head_dim=head_dim, hidden_size=hidden_sz, is_moe=False)
+            self.model_dir = None
+            self.vocab_remap = None
+            self.vocab_n = vocab_sz
+            self.has_full_vocab_fallback = False
+
+        def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False, batch_size: int = 1) -> list[dict[str, Any]]:
+            make_cache_calls.append({"kv_step": kv_step, "kv_i8": kv_i8, "batch_size": batch_size})
+            return [{"batch_size": batch_size, "kv_i8": kv_i8}]
+
+        def precompute_rope_trig(self, pos_mx: _PureArray) -> tuple[_PureArray, _PureArray]:
+            sh = (pos_mx.shape[0], 1, pos_mx.shape[1], 4)
+            return _PureArray(np.zeros(sh, dtype=np.float32), "bfloat16"), _PureArray(np.zeros(sh, dtype=np.float32), "bfloat16")
+
+        def forward_hidden(self, input_ids: _PureArray, cache: Any, **_kw: Any) -> _PureArray:
+            b, s = input_ids.shape
+            return _PureArray(np.zeros((b, s, hidden_sz), dtype=np.float32), dtype="bfloat16")
+
+        def project_logits(self, h: _PureArray, full_vocab: bool = False) -> _PureArray:
+            b, s, _ = h.shape
+            lg = np.full((b, s, vocab_sz), -10.0, dtype=np.float32)
+            lg[:, :, eos_id] = 10.0
+            return _PureArray(lg, dtype="bfloat16")
+
+    # 1. Verify Fix 2: _resolve_kv_i8 across Apple9 vs Apple10 and low RAM (24 GB) vs high RAM (48 GB)
+    monkeypatch.setattr(hw_check_mod, "supports_apple10_nax", lambda: False)
+    eng = FastQwen3Engine(model=_StubModel(head_dim=128), tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        assert eng._is_apple10 is False
+        # Apple9, high RAM (48 GB)
+        eng._is_low_ram = False
+        assert eng._resolve_kv_i8(1, 512) == "bf16"
+        assert eng._resolve_kv_i8(16, 512) == "bf16"
+        assert eng._resolve_kv_i8(16, 4096) == "bf16"
+        assert eng._resolve_kv_i8(32, 512) == "bf16"
+        assert eng._resolve_kv_i8(64, 4096) == "bf16"
+        assert eng._resolve_kv_i8(64, 8192) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 16384) == "q4_quarot"
+        assert eng._resolve_kv_i8(16, 32768) == "q4_quarot"
+
+        # Apple9, low RAM (24 GB)
+        eng._is_low_ram = True
+        assert eng._resolve_kv_i8(16, 512) == "bf16"
+        assert eng._resolve_kv_i8(32, 512) == "bf16"
+        assert eng._resolve_kv_i8(64, 4096) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 8192) == "q4_quarot"
+
+        # Apple10 NAX, low RAM (24 GB Base M5)
+        eng._is_apple10 = True
+        eng._is_low_ram = True
+        assert eng._resolve_kv_i8(16, 512) == "bf16"
+        assert eng._resolve_kv_i8(32, 512) == "bf16"
+        assert eng._resolve_kv_i8(64, 2048) == "bf16"
+        assert eng._resolve_kv_i8(64, 4096) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 8192) == "q4_quarot"
+
+        # Apple10 NAX, high RAM (48 GB M5 Pro)
+        eng._is_low_ram = False
+        assert eng._resolve_kv_i8(32, 512) == "bf16"
+        assert eng._resolve_kv_i8(64, 4096) == "bf16"
+        assert eng._resolve_kv_i8(64, 8192) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 16384) == "q4_quarot"
+
+        # Non-64-divisible head_dim falls back to q8 when pressure/ctx cutoff triggers
+        eng.model.cfg.head_dim = 96
+        assert eng._resolve_kv_i8(64, 8192) == "q8"
+        assert eng._resolve_kv_i8(16, 512) == "bf16"
+
+        # Explicit overrides remain intact
+        eng.kv_i8_mode = False
+        assert eng._resolve_kv_i8(64, 16384) == "bf16"
+        eng.kv_i8_mode = True
+        assert eng._resolve_kv_i8(1, 256) == "q8"
+        eng.kv_i8_mode = "q4_quarot"
+        assert eng._resolve_kv_i8(1, 256) == "q4_quarot"
+        eng.kv_i8_mode = "auto"
+
+        # 2. Verify Fix 1: non-LCP wave calls make_cache(..., batch_size=b_sz)
+        eng.model.cfg.head_dim = 128
+        eng._is_apple10 = False
+        eng._is_low_ram = False
+        res = eng.generate_batch(
+            ["Alpha prompt one", "Beta prompt two", "Gamma prompt three", "Delta prompt four"],
+            max_tokens=2,
+            batch_size=4,
+            temperature=0.0,
+        )
+        assert len(res.items) == 4
+        assert make_cache_calls[-1]["batch_size"] == 4
+        assert make_cache_calls[-1]["kv_i8"] == "bf16"
+    finally:
+        eng.close()
+
+    # Verify supports_apple10_nax=True propagates into Engine.__init__
+    monkeypatch.setattr(hw_check_mod, "supports_apple10_nax", lambda: True)
+    eng_a10 = FastQwen3Engine(model=_StubModel(head_dim=128), tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        assert eng_a10._is_apple10 is True
+    finally:
+        eng_a10.close()
+
+
+def test_engine_lazy_gpu_argmax_fallback_and_batch_stats_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pure-CPU test (mocked model/`mx`) for Fix 3 (lazy GPU argmax + selective FP32 fallback) & Fix 4 (stats)."""
+    import types
+    import fast_qwen3.engine as engine_mod
+    import fast_shared.hw_check as hw_check_mod
+
+    monkeypatch.setattr(hw_check_mod, "supports_apple10_nax", lambda: False)
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    hidden_sz = 16
+    real_vocab_sz = tok.vocab_size
+    padded_vocab_sz = real_vocab_sz + 16  # Padded lm_head columns beyond tokenizer vocab
+
+    f32_casts: list[tuple[tuple[int, ...], str]] = []
+    argmax_shapes: list[tuple[int, ...]] = []
+    eval_shapes: list[list[tuple[int, ...]]] = []
+    take_calls: list[tuple[tuple[int, ...], list[int]]] = []
+
+    class _SpyArray:
+        def __init__(self, data: np.ndarray, dtype: str = "float32") -> None:
+            self.data = np.asarray(data)
+            self._dtype = dtype
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            return self.data.shape
+
+        @property
+        def size(self) -> int:
+            return int(self.data.size)
+
+        @property
+        def ndim(self) -> int:
+            return int(self.data.ndim)
+
+        @property
+        def dtype(self) -> str:
+            return self._dtype
+
+        def astype(self, dtype: str) -> "_SpyArray":
+            if dtype == "float32" and self._dtype != "float32":
+                f32_casts.append((self.data.shape, self._dtype))
+            np_dt = np.int32 if dtype == "int32" else np.float32
+            return _SpyArray(self.data.astype(np_dt), dtype=dtype)
+
+        def tolist(self) -> Any:
+            return self.data.tolist()
+
+        def item(self) -> Any:
+            return self.data.item()
+
+        def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
+            arr = np.asarray(self.data, dtype=dtype)
+            return arr.copy() if copy else arr
+
+        def __getitem__(self, key: Any) -> "_SpyArray":
+            def _u(k: Any) -> Any:
+                if isinstance(k, _SpyArray):
+                    return k.data
+                if isinstance(k, tuple):
+                    return tuple(_u(x) for x in k)
+                return k
+
+            return _SpyArray(self.data[_u(key)], dtype=self._dtype)
+
+        def __invert__(self) -> "_SpyArray":
+            return _SpyArray(~self.data, dtype="bool")
+
+        def __and__(self, other: Any) -> "_SpyArray":
+            rhs = other.data if isinstance(other, _SpyArray) else other
+            return _SpyArray(self.data & rhs, dtype="bool")
+
+        def __ge__(self, other: Any) -> "_SpyArray":
+            rhs = other.data if isinstance(other, _SpyArray) else other
+            return _SpyArray(self.data >= rhs, dtype="bool")
+
+        def __lt__(self, other: Any) -> "_SpyArray":
+            rhs = other.data if isinstance(other, _SpyArray) else other
+            return _SpyArray(self.data < rhs, dtype="bool")
+
+        def __le__(self, other: Any) -> "_SpyArray":
+            rhs = other.data if isinstance(other, _SpyArray) else other
+            return _SpyArray(self.data <= rhs, dtype="bool")
+
+    class _SpyMx:
+        bfloat16 = "bfloat16"
+        float32 = "float32"
+        int32 = "int32"
+
+        def array(self, data: Any, dtype: str | None = None) -> _SpyArray:
+            arr = data.data if isinstance(data, _SpyArray) else data
+            np_dt = np.int32 if dtype == self.int32 else np.float32
+            return _SpyArray(np.array(arr, dtype=np_dt), dtype=dtype or self.float32)
+
+        def full(self, shape: tuple[int, ...], val: Any, dtype: str | None = None) -> _SpyArray:
+            np_dt = np.int32 if dtype == self.int32 else np.float32
+            return _SpyArray(np.full(shape, val, dtype=np_dt), dtype=dtype or self.int32)
+
+        def arange(self, n: int, dtype: str | None = None) -> _SpyArray:
+            return _SpyArray(np.arange(n, dtype=np.int32), dtype=dtype or self.int32)
+
+        def take(self, arr: _SpyArray, idx: _SpyArray, axis: int = 0) -> _SpyArray:
+            take_calls.append((arr.shape, [int(x) for x in idx.data.tolist()]))
+            return _SpyArray(np.take(arr.data, idx.data, axis=axis), dtype=arr.dtype)
+
+        def take_along_axis(self, arr: _SpyArray, idx: _SpyArray, axis: int = 1) -> _SpyArray:
+            return _SpyArray(np.take_along_axis(arr.data, idx.data, axis=axis), dtype=arr.dtype)
+
+        def argmax(self, arr: _SpyArray, axis: int = -1) -> _SpyArray:
+            argmax_shapes.append(arr.shape)
+            return _SpyArray(np.argmax(arr.data, axis=axis).astype(np.int32), dtype=self.int32)
+
+        def isnan(self, arr: _SpyArray) -> _SpyArray:
+            return _SpyArray(np.isnan(arr.data), dtype="bool")
+
+        def any(self, arr: _SpyArray, axis: int | None = None) -> _SpyArray:
+            return _SpyArray(np.asarray(np.any(arr.data, axis=axis)), dtype="bool")
+
+        def where(self, cond: _SpyArray, x: Any, y: Any) -> _SpyArray:
+            xv = x.data if isinstance(x, _SpyArray) else x
+            yv = y.data if isinstance(y, _SpyArray) else y
+            dt = x.dtype if isinstance(x, _SpyArray) else (y.dtype if isinstance(y, _SpyArray) else self.float32)
+            return _SpyArray(np.where(cond.data, xv, yv), dtype=dt)
+
+        def eval(self, *args: Any) -> None:
+            eval_shapes.append([a.shape for a in args if hasattr(a, "shape")])
+
+        def clear_cache(self) -> None:
+            return None
+
+    fake_mx = _SpyMx()
+    monkeypatch.setattr(engine_mod, "mx", fake_mx)
+
+    def _reset_spies() -> None:
+        f32_casts.clear()
+        argmax_shapes.clear()
+        eval_shapes.clear()
+        take_calls.clear()
+
+    # Token IDs for boolean schema: {"ok": true|false}
+    t_tok = tok.encode("true", add_special_tokens=False)[0]
+    f_tok = tok.encode("false", add_special_tokens=False)[0]
+    bad_tok = tok.encode("Z", add_special_tokens=False)[0]
+    tok_a = tok.encode("a", add_special_tokens=False)[0]
+    tok_b = tok.encode("b", add_special_tokens=False)[0]
+    tok_c = tok.encode("c", add_special_tokens=False)[0]
+    eos_id = tok.eos_token_id
+    bool_schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    class _ScriptedModel:
+        def __init__(self, *, vocab_n: int = real_vocab_sz) -> None:
+            self.cfg = types.SimpleNamespace(head_dim=128, hidden_size=hidden_sz, is_moe=False)
+            self.model_dir = None
+            self.vocab_remap = None
+            self.vocab_n = vocab_n
+            self.has_full_vocab_fallback = False
+            self.step_logits_fn: Any = None
+            self.project_calls = 0
+
+        def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False, batch_size: int = 1) -> list[dict[str, Any]]:
+            return [{"step": 0, "b": batch_size}]
+
+        def precompute_rope_trig(self, pos_mx: _SpyArray) -> tuple[_SpyArray, _SpyArray]:
+            sh = (pos_mx.shape[0], 1, pos_mx.shape[1], 4)
+            return _SpyArray(np.zeros(sh, dtype=np.float32), "bfloat16"), _SpyArray(np.zeros(sh, dtype=np.float32), "bfloat16")
+
+        def forward_hidden(self, input_ids: _SpyArray, cache: list[dict[str, Any]], **_kw: Any) -> _SpyArray:
+            b, s = input_ids.shape
+            step_idx = int(cache[0]["step"])
+            cache[0]["step"] = step_idx + 1
+            h_arr = np.zeros((b, s, hidden_sz), dtype=np.float32)
+            for row in range(b):
+                h_arr[row, :, 0] = float(row)
+                h_arr[row, :, 1] = float(step_idx)
+            return _SpyArray(h_arr, dtype="bfloat16")
+
+        def project_logits(self, h: _SpyArray, full_vocab: bool = False) -> _SpyArray:
+            self.project_calls += 1
+            b, s, _ = h.shape
+            out = np.full((b, s, self.vocab_n), -20.0, dtype=np.float32)
+            for row in range(b):
+                slot_id = int(round(float(h.data[row, 0, 0])))
+                step_idx = int(round(float(h.data[row, 0, 1])))
+                out[row, 0] = self.step_logits_fn(slot_id, step_idx, self.vocab_n)
+            return _SpyArray(out, dtype="bfloat16")
+
+    model = _ScriptedModel(vocab_n=padded_vocab_sz)
+    eng = FastQwen3Engine(model=model, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        # 1. Empty batch stats
+        empty_res = eng.generate_batch([])
+        assert empty_res.items == []
+        assert empty_res.stats["docs"] == 0
+        assert empty_res.stats["prompt_tokens"] == 0
+        assert empty_res.stats["completion_tokens"] == 0
+        assert empty_res.stats["mask_fallbacks"] == 0
+
+        # 2. Unconstrained greedy batch + padded vocab column (> real_vocab_sz) with huge/NaN logit:
+        #    _project_needed_rows must slice to len(_new_to_old) BEFORE mx.argmax, and perform 0 float32 casts!
+        def _logits_padded_unconstrained(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            row[real_vocab_sz + 3] = float("nan")  # Must be sliced away before argmax/NaN check!
+            row[real_vocab_sz + 5] = 999.0
+            if step_idx == 0:
+                row[tok_a if slot_id == 0 else tok_b] = 5.0
+            else:
+                row[eos_id] = 6.0
+            return row
+
+        model.step_logits_fn = _logits_padded_unconstrained
+        _reset_spies()
+        res_uncon = eng.generate_batch(["Prompt zero", "Prompt one here"], max_tokens=4, batch_size=2, temperature=0.0)
+        assert [it.token_ids for it in res_uncon.items] == [[tok_a], [tok_b]]
+        assert f32_casts == [], f"Expected zero FP32 casts on greedy unconstrained wave, got {f32_casts}"
+        assert all(sh[-1] == real_vocab_sz for sh in argmax_shapes)
+        assert res_uncon.stats["mask_fallbacks"] == 0
+        assert res_uncon.stats["prompt_tokens"] == sum(it.prompt_tokens for it in res_uncon.items)
+        assert res_uncon.stats["completion_tokens"] == sum(it.completion_tokens for it in res_uncon.items)
+
+        # 3. Grammar-constrained B=2 wave where ALL rows pass matcher.validate_tokens -> 0 FP32 casts & 0 fallbacks
+        def _logits_grammar_hit(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            row[t_tok if slot_id == 0 else f_tok] = 7.0
+            return row
+
+        model.step_logits_fn = _logits_grammar_hit
+        _reset_spies()
+        res_ghit = eng.generate_batch(
+            ["Doc zero", "Doc one with extra text"],
+            json_schema=bool_schema,
+            max_tokens=32,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert [it.parsed for it in res_ghit.items] == [{"ok": True}, {"ok": False}]
+        assert all(it.valid_schema for it in res_ghit.items)
+        assert f32_casts == [], f"Expected zero FP32 casts when GPU argmax passes matcher, got {f32_casts}"
+        assert res_ghit.stats["mask_fallbacks"] == 0
+
+        # 4. Grammar-constrained B=2 wave with MASK MISS on row 1 only:
+        #    Row 0 greedy argmax (t_tok) passes validate_tokens; Row 1 greedy argmax (bad_tok) misses ->
+        #    validate_tokens MUST NOT mutate matcher state, and ONLY row 1 is cast to float32!
+        def _logits_one_row_miss(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            if slot_id == 0:
+                row[t_tok] = 9.0
+            else:
+                row[bad_tok] = 12.0  # Disallowed after '{"ok":'
+                row[f_tok] = 6.0     # Highest valid token after mask fallback
+            return row
+
+        model.step_logits_fn = _logits_one_row_miss
+        _reset_spies()
+        res_miss = eng.generate_batch(
+            ["Prompt A", "Prompt B slightly longer"],
+            json_schema=bool_schema,
+            max_tokens=32,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert [it.parsed for it in res_miss.items] == [{"ok": True}, {"ok": False}]
+        assert all(it.valid_schema for it in res_miss.items)
+        assert res_miss.stats["mask_fallbacks"] == 1
+        assert len(f32_casts) == 1 and f32_casts[0][0] == (1, real_vocab_sz)
+        assert len(take_calls) == 1 and take_calls[0] == ((2, real_vocab_sz), [1])
+
+        # Verify exact greedy parity with _select_next_token for row 1's missed step
+        row1_logits = _logits_one_row_miss(1, 0, padded_vocab_sz)
+        gh = eng._get_grammar_helper(bool_schema, None)
+        ref_tid, _ = eng._select_next_token(
+            row1_logits,
+            full_hidden_1d=None,
+            matcher=gh.new_matcher(),
+            gram=gh,
+            recent_tokens=[],
+            temperature=0.0,
+            repeat_penalty=True,
+            collect_telemetry=False,
+        )
+        assert ref_tid == f_tok
+
+        # 5. NaN in valid vocab on row 0 in B=2 grammar batch -> NaN guard (-1) triggers fallback for row 0 only
+        def _logits_row0_nan(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            if slot_id == 0:
+                row[tok_c] = float("nan")
+                row[t_tok] = 5.0
+            else:
+                row[f_tok] = 8.0
+            return row
+
+        model.step_logits_fn = _logits_row0_nan
+        _reset_spies()
+        res_nan = eng.generate_batch(
+            ["Doc NaN", "Doc OK longer"],
+            json_schema=bool_schema,
+            max_tokens=32,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert res_nan.items[0].valid_schema and res_nan.items[1].valid_schema
+        assert res_nan.items[1].parsed == {"ok": False}
+        assert res_nan.stats["mask_fallbacks"] == 1
+        assert len(f32_casts) == 1 and f32_casts[0][0] == (1, real_vocab_sz)
+
+        # 6. Repeat-penalty override in greedy B=2 wave (cycle p=2 repeated 4x triggers penalty at step 8)
+        #    Keep "Short stop" shorter than "Cycle prompt longer payload" so sorted wave places Cycle at slot 1.
+        def _logits_repeat_cycle(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            if slot_id == 0:
+                row[eos_id] = 10.0
+                return row
+            if step_idx >= 9:
+                row[eos_id] = 10.0
+                return row
+            # Slot 1 emits [tok_a, tok_b] * 4 (8 tokens) -> at step 8, tok_a is penalized (-16.0), so tok_c (2.0) wins!
+            if step_idx % 2 == 0:
+                row[tok_a] = 10.0
+                row[tok_c] = 2.0
+            else:
+                row[tok_b] = 10.0
+            return row
+
+        model.step_logits_fn = _logits_repeat_cycle
+        _reset_spies()
+        res_rep = eng.generate_batch(
+            ["Short stop", "Cycle prompt longer payload"],
+            max_tokens=12,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert res_rep.items[0].token_ids == []
+        assert res_rep.items[1].token_ids == [tok_a, tok_b, tok_a, tok_b, tok_a, tok_b, tok_a, tok_b, tok_c]
+        assert res_rep.stats["mask_fallbacks"] == 0
+        # Only the single step where repeat penalty hit tok_a materialized a [1, V] float32 row!
+        assert len(f32_casts) == 1 and f32_casts[0][0] == (1, real_vocab_sz)
+
+        # 7. Non-greedy (temperature > 0) & telemetry (collect_telemetry=True) + B=1 mask_fallbacks aggregation
+        model.step_logits_fn = _logits_one_row_miss
+        _reset_spies()
+        res_temp = eng.generate_batch(
+            ["Temp doc A", "Temp doc B"],
+            json_schema=bool_schema,
+            max_tokens=32,
+            batch_size=2,
+            temperature=0.5,
+            seed=7,
+            collect_telemetry=True,
+        )
+        assert all(it.valid_schema and it.telemetry is not None for it in res_temp.items)
+        assert res_temp.stats["mask_fallbacks"] >= 1
+        assert len(f32_casts) >= 1 and argmax_shapes == []
+
+        # 8. Mixed wave (3 docs, batch_size=2 -> wave of 2 + B=1 _decode_single):
+        #    Verify lazy argmax + mask_fallbacks sums cleanly across both _decode_wave_batched and _decode_single!
+        def _logits_3docs(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            row[bad_tok] = 12.0
+            row[t_tok] = 6.0
+            return row
+
+        model.step_logits_fn = _logits_3docs
+        _reset_spies()
+        res_3 = eng.generate_batch(
+            ["Short 1", "Medium two", "Longest three payload"],
+            json_schema=bool_schema,
+            max_tokens=32,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert all(it.parsed == {"ok": True} for it in res_3.items)
+        assert res_3.stats["mask_fallbacks"] == 3
+        assert res_3.stats["prompt_tokens"] == sum(it.prompt_tokens for it in res_3.items)
+        assert res_3.stats["completion_tokens"] == sum(it.completion_tokens for it in res_3.items)
+
+        # 9. Batch compaction (B=4 -> 2 alive rows) preserves live_rows matcher/row alignment in lazy argmax + fallback
+        compact_calls: list[list[int]] = []
+        monkeypatch.setattr(
+            engine_mod,
+            "compact_hybrid_cache",
+            lambda _cache, alive_r: compact_calls.append(list(alive_r)) or list(alive_r),
+        )
+
+        class _CompactStubModel(_ScriptedModel):
+            def forward_hidden(self, input_ids: _SpyArray, cache: list[dict[str, Any]], **_kw: Any) -> _SpyArray:
+                b, s = input_ids.shape
+                step_idx = int(cache[0]["step"])
+                cache[0]["step"] = step_idx + 1
+                if step_idx == 0:
+                    rows = list(range(b))
+                elif b == 2:
+                    # After compaction of [0, 1, 2, 3] -> [1, 3], rows track original slots 1 and 3!
+                    rows = [1, 3]
+                else:
+                    rows = list(range(b))
+                h_arr = np.zeros((b, s, hidden_sz), dtype=np.float32)
+                for r_i, orig_slot in enumerate(rows):
+                    h_arr[r_i, :, 0] = float(orig_slot)
+                    h_arr[r_i, :, 1] = float(step_idx)
+                return _SpyArray(h_arr, dtype="bfloat16")
+
+        def _logits_compact(slot_id: int, step_idx: int, v_n: int) -> np.ndarray:
+            row = np.full((v_n,), -20.0, dtype=np.float32)
+            if slot_id in (0, 2):
+                row[eos_id] = 10.0  # Finish immediately at step 0 -> triggers compaction of [1, 3]!
+            elif step_idx == 0:
+                row[tok_a if slot_id == 1 else tok_b] = 9.0
+            elif step_idx == 1:
+                row[tok_c if slot_id == 1 else bad_tok] = 9.0
+            else:
+                row[eos_id] = 9.0
+            return row
+
+        c_model = _CompactStubModel(vocab_n=real_vocab_sz)
+        c_model.step_logits_fn = _logits_compact
+        c_eng = FastQwen3Engine(model=c_model, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+        try:
+            _reset_spies()
+            res_cmp = c_eng.generate_batch(
+                ["A0", "B1aa", "C2bbbb", "D3cccccc"],
+                max_tokens=4,
+                batch_size=4,
+                temperature=0.0,
+                compact_active=True,
+            )
+            assert compact_calls == [[1, 3]]
+            assert [it.token_ids for it in res_cmp.items] == [[], [tok_a, tok_c], [], [tok_b, bad_tok]]
+            assert f32_casts == []
+            assert res_cmp.stats["mask_fallbacks"] == 0
+        finally:
+            c_eng.close()
+
+        # 10. Pruned vocab_remap + full_vocab fallback triggers cleanly when lazy argmax misses grammar
+        from fast_qwen3 import QwenVocabRemapper
+
+        kept_ids = np.array([i for i in range(real_vocab_sz) if i not in (t_tok, f_tok)], dtype=np.int32)
+        remap = QwenVocabRemapper(kept_ids, full_vocab_size=real_vocab_sz)
+        pruned_bad_idx = int(remap.old_to_new[bad_tok])
+
+        class _RemapStubModel(_ScriptedModel):
+            def __init__(self) -> None:
+                super().__init__(vocab_n=len(kept_ids))
+                self.vocab_remap = remap
+                self.has_full_vocab_fallback = True
+                self.full_vocab_calls = 0
+
+            def project_logits(self, h: _SpyArray, full_vocab: bool = False) -> _SpyArray:
+                if full_vocab:
+                    self.full_vocab_calls += 1
+                    b, s, _ = h.shape
+                    out = np.full((b, s, real_vocab_sz), -20.0, dtype=np.float32)
+                    out[:, :, f_tok] = 15.0
+                    return _SpyArray(out, dtype="bfloat16")
+                b, s, _ = h.shape
+                out = np.full((b, s, len(kept_ids)), -20.0, dtype=np.float32)
+                out[:, :, pruned_bad_idx] = 10.0
+                return _SpyArray(out, dtype="bfloat16")
+
+        r_model = _RemapStubModel()
+        r_eng = FastQwen3Engine(model=r_model, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+        try:
+            _reset_spies()
+            res_rm = r_eng.generate_batch(
+                ["Remap doc 1", "Remap doc 2 longer"],
+                json_schema=bool_schema,
+                max_tokens=32,
+                batch_size=2,
+                temperature=0.0,
+            )
+            assert [it.parsed for it in res_rm.items] == [{"ok": False}, {"ok": False}]
+            assert r_model.full_vocab_calls == 2
+            assert res_rm.stats["mask_fallbacks"] == 2
+        finally:
+            r_eng.close()
+    finally:
+        eng.close()
+
+
+
 
 
 

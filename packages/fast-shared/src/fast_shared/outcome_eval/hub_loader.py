@@ -461,6 +461,13 @@ def download_pinned_file(
                     if not chunk:
                         break
                     out_fp.write(chunk)
+            if verify_checksum and expected_sha:
+                actual = compute_file_sha256(tmp_path)
+                if actual != expected_sha:
+                    tmp_path.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"Checksum mismatch for downloaded {dataset_key}/{filename}: got {actual}, expected {expected_sha}"
+                    )
             tmp_path.replace(local_candidate)
         finally:
             if tmp_path.exists():
@@ -480,12 +487,13 @@ def download_pinned_file(
                 local_files_only=local_files_only,
             )
         )
-    if verify_checksum and expected_sha:
-        actual = compute_file_sha256(downloaded)
-        if actual != expected_sha:
-            raise ValueError(
-                f"Checksum mismatch for downloaded {dataset_key}/{filename}: got {actual}, expected {expected_sha}"
-            )
+        if verify_checksum and expected_sha:
+            actual = compute_file_sha256(downloaded)
+            if actual != expected_sha:
+                downloaded.unlink(missing_ok=True)
+                raise ValueError(
+                    f"Checksum mismatch for downloaded {dataset_key}/{filename}: got {actual}, expected {expected_sha}"
+                )
     return downloaded
 
 

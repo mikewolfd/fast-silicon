@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 import warnings
 
 import mlx.core as mx
@@ -70,6 +70,179 @@ class GenerationBatchResult:
 
 
 PromptInput = str | Sequence[dict[str, Any]]
+
+_MM_TABLE_MARKUP_MARKERS: tuple[str, ...] = ("<td", "</td", "<tr", "</tr", "<th", "</th", "|")
+
+
+class _MultimodalLoopAbort(Exception):
+    """Internal control-flow signal raised by `_MultimodalLoopGuardModel` on runaway cycles."""
+
+    def __init__(self, committed_tokens: list[int], *, period: int, repeats: int) -> None:
+        super().__init__(f"multimodal catastrophic loop detected (period={period}, repeats={repeats})")
+        self.committed_tokens = committed_tokens
+        self.period = int(period)
+        self.repeats = int(repeats)
+
+
+def _tail_repeat_4gram_rate(token_ids: Sequence[int], *, tail_len: int = 128) -> float:
+    n = len(token_ids)
+    if n < 16:
+        return 0.0
+    sub = token_ids[max(0, n - int(tail_len)) :]
+    m = len(sub) - 3
+    if m <= 0:
+        return 0.0
+    seen: set[tuple[int, int, int, int]] = set()
+    dups = 0
+    for i in range(m):
+        gram = (int(sub[i]), int(sub[i + 1]), int(sub[i + 2]), int(sub[i + 3]))
+        if gram in seen:
+            dups += 1
+        else:
+            seen.add(gram)
+    return float(dups) / float(m)
+
+
+def _detect_multimodal_catastrophic_loop(
+    token_ids: Sequence[int],
+    *,
+    decode_fn: Callable[[Sequence[int]], str] | None = None,
+    min_repeats: int = 16,
+    max_period: int = 8,
+    table_min_repeats: int = 40,
+    tail_window: int = 128,
+    min_tail_tokens: int = 192,
+    tail_repeat_rate_threshold: float = 0.60,
+    table_tail_repeat_rate_threshold: float = 0.82,
+    long_max_period: int = 64,
+) -> tuple[int, int] | None:
+    """Detect consecutive periodic (`p=1..8`) or long-period (`p > 8`) tail collapse in multimodal decode."""
+    n = len(token_ids)
+    req_base = max(4, int(min_repeats))
+    if n < req_base:
+        return None
+    req_tbl = max(req_base, int(table_min_repeats))
+    for p in range(1, max(1, int(max_period)) + 1):
+        if n < p * req_base:
+            continue
+        pat = [int(t) for t in token_ids[n - p : n]]
+        reps = 1
+        pos = n - 2 * p
+        while pos >= 0:
+            if all(int(token_ids[pos + j]) == pat[j] for j in range(p)):
+                reps += 1
+                if reps >= req_tbl:
+                    break
+                pos -= p
+            else:
+                break
+        if reps >= req_base:
+            if decode_fn is not None and reps < req_tbl:
+                txt = decode_fn(pat).lower()
+                if any(m in txt for m in _MM_TABLE_MARKUP_MARKERS):
+                    continue
+            return (p, reps)
+
+    eff_min_tail = max(int(min_tail_tokens), int(tail_window), 16)
+    if n >= eff_min_tail:
+        win = max(16, int(tail_window))
+        rep4 = _tail_repeat_4gram_rate(token_ids, tail_len=win)
+        long_match: tuple[int, int] | None = None
+        last_tok = int(token_ids[n - 1])
+        for p in range(max(1, int(max_period)) + 1, int(long_max_period) + 1):
+            if n < 3 * p:
+                break
+            if int(token_ids[n - 1 - p]) != last_tok:
+                continue
+            pat = [int(t) for t in token_ids[n - p : n]]
+            reps = 1
+            pos = n - 2 * p
+            while pos >= 0:
+                if all(int(token_ids[pos + j]) == pat[j] for j in range(p)):
+                    reps += 1
+                    pos -= p
+                else:
+                    break
+            if reps >= 3 and (p * reps) >= 144:
+                long_match = (p, reps)
+                break
+
+        if long_match is not None or rep4 >= float(tail_repeat_rate_threshold):
+            has_table_markup = False
+            if decode_fn is not None:
+                tail_txt = decode_fn(token_ids[-win:]).lower()
+                has_table_markup = any(m in tail_txt for m in _MM_TABLE_MARKUP_MARKERS)
+            if not has_table_markup:
+                return long_match if long_match is not None else (0, n)
+            if long_match is not None and long_match[1] >= 6 and (long_match[0] * long_match[1]) >= eff_min_tail:
+                return long_match
+            if rep4 >= float(table_tail_repeat_rate_threshold):
+                return (0, n)
+    return None
+
+
+class _MultimodalLoopGuardModel:
+    """Transparent `B=1` model proxy that tracks committed tokens online and aborts catastrophic loops."""
+
+    _OWN_ATTRS = frozenset(
+        {"_inner", "_decode_fn", "_committed", "_pending_tokens", "_prev_off", "_next_loop_check"}
+    )
+    _STEP_METHODS = frozenset(
+        {"forward_step_ragged", "forward_step_slot", "forward_verify_mtp_slot", "forward_ff_jump_slot"}
+    )
+
+    def __init__(self, inner: Any, *, decode_fn: Callable[[Sequence[int]], str] | None = None) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_decode_fn", decode_fn)
+        object.__setattr__(self, "_committed", [])
+        object.__setattr__(self, "_pending_tokens", None)
+        object.__setattr__(self, "_prev_off", None)
+        object.__setattr__(self, "_next_loop_check", 16)
+
+    def _track_and_guard(self, toks_mx: Any, off_cur: Any) -> None:
+        cur_toks_raw = toks_mx.tolist() if hasattr(toks_mx, "tolist") else np.asarray(toks_mx).tolist()
+        cur_toks = [
+            int(t)
+            for t in (cur_toks_raw[0] if cur_toks_raw and isinstance(cur_toks_raw[0], list) else cur_toks_raw)
+        ]
+        cur_off_raw = off_cur.tolist() if hasattr(off_cur, "tolist") else np.asarray(off_cur).tolist()
+        cur_off = int(cur_off_raw[0] if isinstance(cur_off_raw, list) else cur_off_raw)
+
+        if self._pending_tokens is not None and self._prev_off is not None:
+            n_acc = max(0, min(len(self._pending_tokens), cur_off - self._prev_off))
+            if n_acc > 0:
+                self._committed.extend(self._pending_tokens[:n_acc])
+
+        object.__setattr__(self, "_pending_tokens", cur_toks)
+        object.__setattr__(self, "_prev_off", cur_off)
+
+        if cur_toks:
+            snapshot = self._committed + [cur_toks[0]]
+            if len(snapshot) >= self._next_loop_check:
+                hit = _detect_multimodal_catastrophic_loop(snapshot, decode_fn=self._decode_fn)
+                if hit is not None:
+                    raise _MultimodalLoopAbort(snapshot, period=hit[0], repeats=hit[1])
+                object.__setattr__(self, "_next_loop_check", len(snapshot) + 8)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        if name in self._STEP_METHODS and callable(attr):
+
+            def _guarded(*args: Any, **kwargs: Any) -> Any:
+                toks_mx = args[0] if len(args) >= 1 else kwargs.get("toks", kwargs.get("toks_mx", kwargs.get("input_ids")))
+                off_cur = args[2] if len(args) >= 3 else kwargs.get("off_b", kwargs.get("offsets", kwargs.get("off_cur")))
+                if toks_mx is not None and off_cur is not None:
+                    self._track_and_guard(toks_mx, off_cur)
+                return attr(*args, **kwargs)
+
+            return _guarded
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._OWN_ATTRS:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._inner, name, value)
 
 
 def _normalize_schema_key(
@@ -1031,7 +1204,6 @@ class FastGemma4Engine:
                 eff_thinking = True
 
         with self._gpu_lock:
-            mx.reset_peak_memory()
             t_all0 = time.perf_counter()
             prompt_ids, inputs_embeds, vision_sec, vis_toks = self._prepare_multimodal_prefill(
                 prompt,
@@ -1080,40 +1252,59 @@ class FastGemma4Engine:
                     speculative=speculative,
                     has_grammar=(grammar is not None),
                 )
-                if mtp_drafter is not None and cache.get("_last_x_in") is not None:
-                    dec_res = run_decode_mtp(
-                        self.model,
-                        mtp_drafter,
-                        self.tokenizer.stop_token_ids,
-                        grammar,
-                        lg0,
-                        ob0,
-                        cache,
-                        1,
-                        max_tokens=int(max_tokens),
-                        draft_k=getattr(self, "mtp_draft_k", None),
-                        enable_ff_jump=True,
-                        doc_prompts=[prefill_ids],
-                        doc_indices=[0],
-                        apple10_nax=self._engine_apple10_nax(),
-                    )
-                else:
-                    dec_res = run_decode_batch(
-                        self.model,
-                        self.tokenizer.stop_token_ids,
-                        grammar,
-                        lg0,
-                        ob0,
-                        cache,
-                        1,
-                        max_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        top_p=float(top_p),
-                        seed=int(seed),
-                        compact=False,
-                        tail_handoff_b=0,
-                        enable_ff_jump=True,
-                    )
+                decode_fn = (
+                    (lambda tids: self.tokenizer.decode(list(tids), skip_special_tokens=True))
+                    if callable(getattr(self.tokenizer, "decode", None))
+                    else None
+                )
+                guarded_model = _MultimodalLoopGuardModel(self.model, decode_fn=decode_fn)
+                t_dec_guard0 = time.perf_counter()
+                try:
+                    if mtp_drafter is not None and cache.get("_last_x_in") is not None:
+                        dec_res = run_decode_mtp(
+                            guarded_model,
+                            mtp_drafter,
+                            self.tokenizer.stop_token_ids,
+                            grammar,
+                            lg0,
+                            ob0,
+                            cache,
+                            1,
+                            max_tokens=int(max_tokens),
+                            draft_k=getattr(self, "mtp_draft_k", None),
+                            enable_ff_jump=True,
+                            doc_prompts=[prefill_ids],
+                            doc_indices=[0],
+                            apple10_nax=self._engine_apple10_nax(),
+                        )
+                    else:
+                        dec_res = run_decode_batch(
+                            guarded_model,
+                            self.tokenizer.stop_token_ids,
+                            grammar,
+                            lg0,
+                            ob0,
+                            cache,
+                            1,
+                            max_tokens=int(max_tokens),
+                            temperature=float(temperature),
+                            top_p=float(top_p),
+                            seed=int(seed),
+                            compact=False,
+                            tail_handoff_b=0,
+                            enable_ff_jump=True,
+                        )
+                except _MultimodalLoopAbort as abort:
+                    used_mtp = bool(mtp_drafter is not None and cache.get("_last_x_in") is not None)
+                    dec_res = {
+                        "decode_sec": time.perf_counter() - t_dec_guard0,
+                        "gen_toks": [list(abort.committed_tokens)],
+                        "used_speculative": used_mtp,
+                        "speculative_backend": ("mtp" if used_mtp else None),
+                        "loop_aborted": True,
+                        "loop_period": abort.period,
+                        "loop_repeats": abort.repeats,
+                    }
             finally:
                 del cache
                 gc.collect()
@@ -1133,7 +1324,12 @@ class FastGemma4Engine:
                 pass
             if grammar is not None:
                 is_schema = bool(grammar.validate_token_sequence(full_out_ids))
-            finish_reason = "length" if len(g_toks) >= int(max_tokens) and not (grammar is not None and is_schema) else "stop"
+            finish_reason = (
+                "length"
+                if (bool(dec_res.get("loop_aborted")) or len(g_toks) >= int(max_tokens))
+                and not (grammar is not None and is_schema)
+                else "stop"
+            )
             elapsed = time.perf_counter() - t_all0
             dec_sec = float(dec_res.get("decode_sec", 0.0))
             self.last_multimodal_stats = {
@@ -1149,8 +1345,12 @@ class FastGemma4Engine:
                 "used_speculative": bool(dec_res.get("used_speculative", False)),
                 "speculative_backend": dec_res.get("speculative_backend"),
                 "mtp_accept_rate": float(dec_res.get("mtp_accept_rate", 0.0) or 0.0),
+                "loop_aborted": bool(dec_res.get("loop_aborted", False)),
                 "peak_gb": mx.get_peak_memory() / (1024**3),
             }
+            if dec_res.get("loop_aborted"):
+                self.last_multimodal_stats["loop_period"] = int(dec_res.get("loop_period", 0))
+                self.last_multimodal_stats["loop_repeats"] = int(dec_res.get("loop_repeats", 0))
             return GenerationItem(
                 text=txt,
                 parsed=parsed,
@@ -1366,7 +1566,6 @@ class FastGemma4Engine:
                 eff_thinking = True
 
         with self._gpu_lock:
-            mx.reset_peak_memory()
             t_all0 = time.perf_counter()
 
             prompt_ids_list = self.encode_prompts(

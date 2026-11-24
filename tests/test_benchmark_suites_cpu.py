@@ -2646,6 +2646,104 @@ def test_spawn_isolated_worker_handles_nonnewline_prefix_and_worker_out_file_cpu
     assert recs_stdout == [{"package": "fast-bge-small", "status": "ok"}]
 
 
+def test_wave2_root_runner_updates_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify Qwen3/GPT-OSS batch split, laya-hetero flag, gate exit code vs --advisory-gates, emb2 enable_ane, and monorepo specs."""
+    out = _load_script("test_wave2_outcomes", "benchmark_outcomes.py")
+    mono = _load_script("test_wave2_mono", "benchmark_monorepo.py")
+
+    # 1. Extra flags accept --backend laya-hetero
+    ns_lh = out._parse_extra_flags(["--backend", "laya-hetero"])
+    assert ns_lh.backend == "laya-hetero"
+
+    # 2. gate_verdict=FAIL returns exit 1 by default and exit 0 with --advisory-gates
+    monkeypatch.setattr(out, "_hw_lock", out._null_ctx)
+    fail_rec = out._build_record(
+        package="fast-pplx",
+        category=1,
+        config_label="gpu",
+        benchmark="retrieval",
+        valid_flags=[True, True],
+        item_scores=[0.8, 0.8],
+        wall_sec=1.0,
+        diagnostics={},
+        memory_4bucket_gb={"combined_with_model_mapped_gb": 99.0},
+        sub_benchmarks={},
+        host_mem_gb=24.0,
+    )
+    assert fail_rec["gate_verdict"] == "FAIL"
+    monkeypatch.setattr(out, "_spawn_isolated_worker", lambda **_kw: [fail_rec])
+    assert out.main(["run", "--packages", "fast-pplx", "--allow-contended"]) == 1
+    _ = capsys.readouterr()
+    assert out.main(["run", "--packages", "fast-pplx", "--allow-contended", "--advisory-gates"]) == 0
+    _ = capsys.readouterr()
+
+    # 3. _run_visual_retrieval_worker passes enable_ane=False when eff_mode == 'gpu'
+    seen_emb2_kw: list[dict[str, Any]] = []
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    class _FakeEmb2:
+        def __init__(self, **kw: Any) -> None:
+            seen_emb2_kw.append(dict(kw))
+
+        def _resolve_vision_model_dir(self, _vdir: Any = None) -> Path:
+            return tmp_path
+
+        def encode_images(self, images: list[Any], **_kw: Any):
+            import numpy as np
+
+            return np.eye(len(images), 4, dtype=np.float32)
+
+        def build_image_index(self, images: list[Any], **_kw: Any):
+            import numpy as np
+
+            return SimpleNamespace(score_all=lambda qv: np.eye(len(qv), len(images), dtype=np.float32))
+
+        def encode_texts(self, texts: list[str], **_kw: Any):
+            import numpy as np
+
+            return np.eye(len(texts), 4, dtype=np.float32)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setitem(sys.modules, "fast_embeddinggemma_2.engine", SimpleNamespace(FastEmbeddingGemma2=_FakeEmb2))
+    monkeypatch.setattr(
+        out,
+        "load_fintabnet_otsl",
+        lambda **_kw: [{"id": "ft0", "image_bytes": png_bytes, "gold_html": "<table><td>Revenue 100</td></table>"}],
+    )
+    monkeypatch.setattr(out, "load_omnidocbench_en", lambda **_kw: [])
+    monkeypatch.setattr(out, "load_cord_v2", lambda **_kw: [])
+    out._run_visual_retrieval_worker(
+        "fast-embeddinggemma-2-vision",
+        tier="tier1",
+        config_label="gpu_test",
+        extra=out._parse_extra_flags([]),
+        lock={"datasets": {}},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=True,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    assert seen_emb2_kw and seen_emb2_kw[0]["enable_ane"] is False
+
+    # 4. benchmark_monorepo.py includes fast-qwen3 & fast-ocr with expected args
+    assert "fast-qwen3" in mono._SPEC_BY_NAME and "fast-ocr" in mono._SPEC_BY_NAME
+    mono_args = mono.build_parser().parse_args([])
+    assert "--batch-size" in mono._effective_bench_args(mono._SPEC_BY_NAME["fast-qwen3"], mono_args, host_mem_gb=48.0)
+    assert "32" in mono._effective_bench_args(mono._SPEC_BY_NAME["fast-qwen3"], mono_args, host_mem_gb=48.0)
+    assert "16" in mono._effective_bench_args(mono._SPEC_BY_NAME["fast-qwen3"], mono_args, host_mem_gb=24.0)
+
+
 
 
 

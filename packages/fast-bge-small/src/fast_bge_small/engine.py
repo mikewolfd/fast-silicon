@@ -174,7 +174,7 @@ class FastBgeSmall:
         home: str | Path | None = None,
         default_mode: str = "hetero",
         warmup: bool = True,
-        enable_ane: bool = True,
+        enable_ane: bool | None = None,
         verify_ane_plan: bool = True,
         mlx_cache_limit_mb: int | None = 512,
         set_wired_limit: bool = True,
@@ -205,18 +205,23 @@ class FastBgeSmall:
         self.cpu_sme_available = self.paths.cpu_dylib.exists()
 
         norm_default = "hetero" if default_mode == "hetero2" else default_mode
+        if norm_default not in ("hetero", "gpu", "ane"):
+            raise ValueError(f"Unknown default_mode {default_mode!r}; expected 'hetero', 'hetero2', 'gpu', or 'ane'")
 
-        if enable_ane and self.paths.ane_dylib.exists() and self.paths.ane_models_dir.exists():
+        eff_enable_ane = (norm_default != "gpu") if enable_ane is None else bool(enable_ane)
+        self._ane_enabled = eff_enable_ane
+
+        if eff_enable_ane and self.paths.ane_dylib.exists() and self.paths.ane_models_dir.exists():
             self._init_ane(verify_plan=verify_ane_plan)
 
         if norm_default == "hetero" and not self.ane_available:
             self.default_mode = "gpu"
         elif norm_default == "ane" and not self.ane_available:
+            if not eff_enable_ane:
+                raise RuntimeError("ANE requested (default_mode='ane') but enable_ane=False")
             raise RuntimeError(
                 f"ANE requested but native dylib or .mlmodelc bundles are missing under {self.paths.home}"
             )
-        elif norm_default not in ("hetero", "gpu", "ane"):
-            raise ValueError(f"Unknown default_mode {default_mode!r}; expected 'hetero', 'hetero2', 'gpu', or 'ane'")
         else:
             self.default_mode = norm_default
 
@@ -462,6 +467,17 @@ class FastBgeSmall:
                         return self._q_buf.copy()
             return self.gpu.encode_single(arr)
 
+    def _ensure_ane_ready(self) -> None:
+        if self.ane_available and self.ane is not None:
+            return
+        if not getattr(self, "_ane_enabled", True):
+            raise RuntimeError(
+                "ANE requested but ANE was not initialized (pass enable_ane=True or use default_mode!='gpu')"
+            )
+        raise RuntimeError(
+            f"ANE requested but native dylib or .mlmodelc bundles are missing under {self.paths.home}"
+        )
+
     def encode_texts(
         self,
         texts: str | Sequence[str],
@@ -474,6 +490,10 @@ class FastBgeSmall:
         eff_mode = mode or self.default_mode
         if eff_mode == "hetero2":
             eff_mode = "hetero"
+        if eff_mode not in ("hetero", "gpu", "ane"):
+            raise ValueError(f"Unknown mode {eff_mode!r}; expected 'hetero', 'hetero2', 'gpu', or 'ane'")
+        if eff_mode == "ane":
+            self._ensure_ane_ready()
         prefer_ane = eff_mode != "gpu"
 
         if isinstance(texts, str):
@@ -494,8 +514,8 @@ class FastBgeSmall:
         return self.encode_corpus(tok_lists, mode=eff_mode)
 
     def _run_ane_subdocs(self, doc_lists: Sequence[Sequence[int]], doc_indices: list[int], out_vecs: np.ndarray) -> None:
-        if not self.ane_available or self.ane is None:
-            raise RuntimeError("ANE runner not initialized")
+        self._ensure_ane_ready()
+        assert self.ane is not None
         self._bind_ane_tables()
         avail_caps = [c for c in _CORPUS_CAPS if c in self.buckets]
         if not avail_caps:

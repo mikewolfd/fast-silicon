@@ -191,8 +191,14 @@ def _iter_source_batches(
     filter_ocr: bool,
     limit: int | None,
     use_nocache: bool = False,
+    skip_rows: int = 0,
 ) -> Iterable[pa.RecordBatch]:
-    emitted = 0
+    eff_skip = max(0, int(skip_rows))
+    if limit is not None and eff_skip >= int(limit):
+        return
+    skipped = 0
+    emitted = eff_skip
+
     for fpath in files:
         with ExitStack() as fstack:
             if use_nocache:
@@ -202,6 +208,71 @@ def _iter_source_batches(
                 pf = pq.ParquetFile(fpath)
             names = set(pf.schema_arrow.names)
             read_cols = [c for c in columns if c in names]
+
+            if not filter_ocr and skipped < eff_skip:
+                file_rows = int(pf.metadata.num_rows)
+                if skipped + file_rows <= eff_skip:
+                    skipped += file_rows
+                    continue
+
+            if not filter_ocr and skipped < eff_skip:
+                for rg_idx in range(pf.num_row_groups):
+                    n_rg = int(pf.metadata.row_group(rg_idx).num_rows)
+                    if skipped + n_rg <= eff_skip:
+                        skipped += n_rg
+                        continue
+                    for rb in pf.iter_batches(batch_size=batch_rows, row_groups=[rg_idx], columns=read_cols):
+                        if skipped < eff_skip:
+                            drop_n = min(eff_skip - skipped, rb.num_rows)
+                            skipped += drop_n
+                            if drop_n >= rb.num_rows:
+                                continue
+                            rb = rb.slice(drop_n, rb.num_rows - drop_n)
+                        if limit is not None and emitted + rb.num_rows > limit:
+                            rb = rb.slice(0, max(0, limit - emitted))
+                        if rb.num_rows > 0:
+                            emitted += rb.num_rows
+                            yield rb
+                        if limit is not None and emitted >= limit:
+                            return
+                continue
+
+            if filter_ocr and skipped < eff_skip:
+                pre_col = "is_ocr" if "is_ocr" in names else ("ocr_pages" if "ocr_pages" in names else None)
+                if pre_col is not None:
+                    for rg_idx in range(pf.num_row_groups):
+                        pre_tbl = pf.read_row_group(rg_idx, columns=[pre_col])
+                        if pre_col == "is_ocr":
+                            mask = pc.equal(pre_tbl.column("is_ocr"), True)
+                        else:
+                            mask = pc.greater(pc.list_value_length(pre_tbl.column("ocr_pages")), 0)
+                        flags = [bool(x) for x in mask.to_pylist()]
+                        n_match = sum(1 for f in flags if f)
+                        if skipped + n_match <= eff_skip:
+                            skipped += n_match
+                            continue
+                        for rb in pf.iter_batches(batch_size=batch_rows, row_groups=[rg_idx], columns=read_cols):
+                            if "is_ocr" in names:
+                                rb = rb.filter(pc.equal(rb.column("is_ocr"), True))
+                            elif "ocr_pages" in names:
+                                rb = rb.filter(pc.greater(pc.list_value_length(rb.column("ocr_pages")), 0))
+                            if rb.num_rows == 0:
+                                continue
+                            if skipped < eff_skip:
+                                drop_n = min(eff_skip - skipped, rb.num_rows)
+                                skipped += drop_n
+                                if drop_n >= rb.num_rows:
+                                    continue
+                                rb = rb.slice(drop_n, rb.num_rows - drop_n)
+                            if limit is not None and emitted + rb.num_rows > limit:
+                                rb = rb.slice(0, max(0, limit - emitted))
+                            if rb.num_rows > 0:
+                                emitted += rb.num_rows
+                                yield rb
+                            if limit is not None and emitted >= limit:
+                                return
+                    continue
+
             for rb in pf.iter_batches(batch_size=batch_rows, columns=read_cols):
                 if filter_ocr:
                     if "is_ocr" in names:
@@ -212,6 +283,12 @@ def _iter_source_batches(
                         rb = rb.filter(mask)
                 if rb.num_rows == 0:
                     continue
+                if skipped < eff_skip:
+                    drop_n = min(eff_skip - skipped, rb.num_rows)
+                    skipped += drop_n
+                    if drop_n >= rb.num_rows:
+                        continue
+                    rb = rb.slice(drop_n, rb.num_rows - drop_n)
                 if limit is not None and emitted + rb.num_rows > limit:
                     rb = rb.slice(0, max(0, limit - emitted))
                 if rb.num_rows > 0:
@@ -1113,14 +1190,29 @@ def _enter_mlx_limits(
         stack.enter_context(wired_limit())
 
 
+def _embed_model_fingerprint(engine: Any) -> dict[str, str]:
+    fp: dict[str, str] = {}
+    for attr in ("model_name", "model_id", "model_dir", "ckpt_dir", "checkpoint_dir", "path"):
+        val = getattr(engine, attr, None)
+        if val is not None and str(val).strip():
+            fp[attr] = str(val)
+    tok = getattr(engine, "tokenizer", None)
+    tok_name = getattr(tok, "name_or_path", None) if tok is not None else None
+    if tok_name is not None and str(tok_name).strip():
+        fp["tokenizer"] = str(tok_name)
+    return fp
+
+
 def _load_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise ValueError(f"Corrupt parquet embed manifest at {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Corrupt parquet embed manifest at {path}: expected JSON object")
+    return data
 
 
 def _save_manifest(path: Path, data: dict[str, Any]) -> None:
@@ -1145,7 +1237,7 @@ def _shard_matches_expected(
     shard_path: Path,
     *,
     expected_rows: int,
-    expected_meta_cols: list[str],
+    expected_meta_cols: list[str] | None,
     expected_dim: int,
     expected_dtype: str,
     manifest: dict[str, Any],
@@ -1153,10 +1245,12 @@ def _shard_matches_expected(
 ) -> bool:
     if not shard_path.is_file():
         return False
-    if manifest and isinstance(manifest.get("config"), dict) and manifest["config"] != run_config:
-        return False
-    manifest_shards = manifest.get("shards") if isinstance(manifest.get("shards"), dict) else {}
-    if manifest_shards and shard_path.name in manifest_shards:
+    if manifest:
+        if manifest.get("config") != run_config:
+            return False
+        manifest_shards = manifest.get("shards")
+        if not isinstance(manifest_shards, dict) or shard_path.name not in manifest_shards:
+            return False
         entry = manifest_shards[shard_path.name]
         if (
             not isinstance(entry, dict)
@@ -1180,9 +1274,10 @@ def _shard_matches_expected(
             return False
         if vec_type.list_size != expected_dim or vec_type.value_type != exp_val_type:
             return False
-        actual_meta_cols = [n for n in sch.names if n not in ("vector", "embedding_scale")]
-        if actual_meta_cols != expected_meta_cols:
-            return False
+        if expected_meta_cols is not None:
+            actual_meta_cols = [n for n in sch.names if n not in ("vector", "embedding_scale")]
+            if actual_meta_cols != expected_meta_cols:
+                return False
         return True
     except Exception:
         return False
@@ -1381,6 +1476,7 @@ def embed_parquet(
         "max_body_tokens": max_body_tokens,
         "overlap": overlap,
         "snap_sentences": snap_sentences,
+        "snap_sentences": snap_sentences,
         "header_anchored": header_anchored,
         "anchor_max_chars": anchor_max_chars if header_anchored else None,
         "max_encode_length": max_encode_length,
@@ -1393,7 +1489,8 @@ def embed_parquet(
         "add_document_prefix": add_document_prefix,
         "header_col": header_col,
         "header_text": header_text,
-        "input_files": [[f.name, f.stat().st_size] for f in files],
+        "model": _embed_model_fingerprint(engine),
+        "input_files": [[f.name, int(f.stat().st_size), int(f.stat().st_mtime_ns)] for f in files],
     }
     manifest_path = out_p / _MANIFEST_FILENAME
     manifest = _load_manifest(manifest_path) if (not single_file_mode and not lance_mode and resume) else {}
@@ -1403,6 +1500,45 @@ def embed_parquet(
         else {}
     )
     manifest_lock = threading.Lock()
+
+    prefix_shards = 0
+    early_skip_src_rows = 0
+    initial_cum_emit_offset = 0
+    early_drop_emitted_rows = 0
+    completed_emit_total = 0
+    if not single_file_mode and not lance_mode and resume and manifest_shards:
+        while True:
+            cand_name = f"part-{prefix_shards:05d}.parquet"
+            cand_entry = manifest_shards.get(cand_name)
+            if not isinstance(cand_entry, dict) or not isinstance(cand_entry.get("num_rows"), int):
+                break
+            exp_meta = cand_entry.get("meta_cols") if isinstance(cand_entry.get("meta_cols"), list) else None
+            if not _shard_matches_expected(
+                out_p / cand_name,
+                expected_rows=int(cand_entry["num_rows"]),
+                expected_meta_cols=list(exp_meta) if exp_meta is not None else None,
+                expected_dim=dim,
+                expected_dtype=dtype,
+                manifest=manifest,
+                run_config=run_config,
+            ):
+                break
+            completed_emit_total += int(cand_entry["num_rows"])
+            prefix_shards += 1
+
+        if prefix_shards > 0:
+            last_entry = manifest_shards[f"part-{prefix_shards - 1:05d}.parquet"]
+            if not chunk and not per_ocr_page and not skip_empty:
+                early_skip_src_rows = completed_emit_total
+                initial_cum_emit_offset = completed_emit_total
+                early_drop_emitted_rows = 0
+            else:
+                rec_src = last_entry.get("safe_skip_src_rows")
+                rec_emit = last_entry.get("safe_skip_emitted_offset")
+                if isinstance(rec_src, int) and isinstance(rec_emit, int) and rec_emit <= completed_emit_total:
+                    early_skip_src_rows = rec_src
+                    initial_cum_emit_offset = rec_emit
+                    early_drop_emitted_rows = completed_emit_total - rec_emit
 
     if keep_cols is not None:
         needed_raw = [*keep_cols, eff_text_col]
@@ -1460,6 +1596,7 @@ def embed_parquet(
         return False
 
     def producer() -> None:
+        pending_empty_src = 0
         try:
             for rb in _iter_source_batches(
                 files,
@@ -1468,6 +1605,7 @@ def embed_parquet(
                 filter_ocr=filter_ocr,
                 limit=limit,
                 use_nocache=use_nocache,
+                skip_rows=early_skip_src_rows,
             ):
                 if prod_stop.is_set():
                     break
@@ -1499,7 +1637,12 @@ def embed_parquet(
                     header_col=header_col,
                     header_text=header_text,
                 )
-                if len(tok_lists) > 0 and not _put_prep((rb.num_rows, meta_tbl, tok_lists)):
+                if len(tok_lists) == 0:
+                    pending_empty_src += int(rb.num_rows)
+                    continue
+                eff_raw_src = int(rb.num_rows) + pending_empty_src
+                pending_empty_src = 0
+                if not _put_prep((eff_raw_src, meta_tbl, tok_lists)):
                     break
         except BaseException as exc:
             _put_prep(exc)
@@ -1512,7 +1655,7 @@ def embed_parquet(
     single_writer: pq.ParquetWriter | None = None
     tmp_single_path = out_p.with_suffix(".parquet.tmp") if single_file_mode else None
     lance_created = False
-    shard_idx = 0
+    shard_idx = prefix_shards
     pending_meta_parts: list[pa.Table] = []
     pending_meta_rows = 0
     pending_toks: list[list[int]] = []
@@ -1520,6 +1663,12 @@ def embed_parquet(
     sl_meta_parts: list[pa.Table] = []
     sl_toks: list[list[int]] = []
     sl_tok_sum = 0
+
+    cum_src_rows = early_skip_src_rows
+    cum_emit_rows = initial_cum_emit_offset
+    remaining_drop = early_drop_emitted_rows
+    next_shard_emit_cursor = completed_emit_total
+    batch_bounds: list[tuple[int, int]] = [(cum_src_rows, cum_emit_rows)]
 
     rows_emitted = 0
     total_tokens = 0
@@ -1555,7 +1704,7 @@ def embed_parquet(
                         single_writer = pq.ParquetWriter(tmp_single_path, out_tbl.schema, compression=col_comp)
                     single_writer.write_table(out_tbl)
                 else:
-                    _, m_slice, vecs, shard_path, tmp_shard, n_shard_toks = w_item
+                    _, m_slice, vecs, shard_path, tmp_shard, n_shard_toks, meta_col_names, safe_src, safe_emit = w_item
                     out_tbl = _append_vector_columns(_decode_temp_dict_columns(m_slice), vecs, dim=dim, dtype=dtype)
                     col_comp = _resolve_parquet_compression(out_tbl.schema, compression)
                     try:
@@ -1567,6 +1716,9 @@ def embed_parquet(
                                 "tokens": int(n_shard_toks),
                                 "dim": dim,
                                 "dtype": dtype,
+                                "meta_cols": list(meta_col_names),
+                                "safe_skip_src_rows": int(safe_src),
+                                "safe_skip_emitted_offset": int(safe_emit),
                             }
                             _save_manifest(manifest_path, {"config": run_config, "shards": manifest_shards})
                     except BaseException:
@@ -1663,8 +1815,15 @@ def embed_parquet(
         total_tokens += tok_cnt
         _enqueue_write(("lance" if lance_mode else "single", combined_meta, vecs))
 
+    def _safe_cursor_for_emit_end(shard_emit_end: int) -> tuple[int, int]:
+        if not chunk and not per_ocr_page and not skip_empty:
+            return shard_emit_end, shard_emit_end
+        while len(batch_bounds) > 1 and batch_bounds[1][1] <= shard_emit_end:
+            batch_bounds.pop(0)
+        return batch_bounds[0]
+
     def drain_shards(final: bool = False) -> None:
-        nonlocal pending_meta_parts, pending_meta_rows, pending_toks, pending_tok_sum, shard_idx, rows_emitted, total_tokens
+        nonlocal pending_meta_parts, pending_meta_rows, pending_toks, pending_tok_sum, shard_idx, rows_emitted, total_tokens, next_shard_emit_cursor
         if not pending_meta_parts:
             return
         cur_mult, cur_toks_cap = _govern_lookahead(eff_shard_mult)
@@ -1704,11 +1863,13 @@ def embed_parquet(
             pending_toks = []
             pending_tok_sum = 0
 
-        undone_slices: list[tuple[pa.Table, list[list[int]], Path, Path, int]] = []
+        undone_slices: list[tuple[pa.Table, list[list[int]], Path, Path, int, list[str], int, int]] = []
         for meta_slice, tok_slice in slices_to_process:
             shard_path = out_p / f"part-{shard_idx:05d}.parquet"
             tmp_shard = out_p / f".part-{shard_idx:05d}.parquet.tmp"
             shard_idx += 1
+            next_shard_emit_cursor += len(tok_slice)
+            safe_src, safe_emit = _safe_cursor_for_emit_end(next_shard_emit_cursor)
             if resume and _shard_matches_expected(
                 shard_path,
                 expected_rows=len(tok_slice),
@@ -1719,29 +1880,40 @@ def embed_parquet(
                 run_config=run_config,
             ):
                 continue
-            undone_slices.append((meta_slice, tok_slice, shard_path, tmp_shard, sum(len(x) for x in tok_slice)))
+            undone_slices.append(
+                (
+                    meta_slice,
+                    tok_slice,
+                    shard_path,
+                    tmp_shard,
+                    sum(len(x) for x in tok_slice),
+                    list(meta_slice.schema.names),
+                    safe_src,
+                    safe_emit,
+                )
+            )
 
         if not undone_slices:
             return
         if cur_mult <= 1 or len(undone_slices) == 1 or not sort_macro_window:
-            for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks in undone_slices:
+            for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks, meta_cols, safe_src, safe_emit in undone_slices:
                 vecs = encode_rows(tok_slice)
                 rows_emitted += len(tok_slice)
                 total_tokens += n_shard_toks
-                _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard, n_shard_toks))
+                _enqueue_write(("shard", meta_slice, vecs, shard_path, tmp_shard, n_shard_toks, meta_cols, safe_src, safe_emit))
             return
 
         # Cross-shard lookahead length sort: pack and sort across all undone slices once, then slice exact shards
         combined_toks = [t for _, tok_slice, *_ in undone_slices for t in tok_slice]
         vecs_all = encode_rows(combined_toks)
         vec_pos = 0
-        for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks in undone_slices:
+        for meta_slice, tok_slice, shard_path, tmp_shard, n_shard_toks, meta_cols, safe_src, safe_emit in undone_slices:
             n_slice = len(tok_slice)
             vecs_i = vecs_all[vec_pos : vec_pos + n_slice]
             vec_pos += n_slice
             rows_emitted += n_slice
             total_tokens += n_shard_toks
-            _enqueue_write(("shard", meta_slice, vecs_i, shard_path, tmp_shard, n_shard_toks))
+            _enqueue_write(("shard", meta_slice, vecs_i, shard_path, tmp_shard, n_shard_toks, meta_cols, safe_src, safe_emit))
 
     with ExitStack() as stack:
         _enter_mlx_limits(
@@ -1761,8 +1933,18 @@ def embed_parquet(
                 if isinstance(item, BaseException):
                     raise item
 
-                _, meta_tbl, tok_lists = item
+                raw_src_n, meta_tbl, tok_lists = item
                 batch_num += 1
+                cum_src_rows += int(raw_src_n)
+                cum_emit_rows += len(tok_lists)
+                batch_bounds.append((cum_src_rows, cum_emit_rows))
+                if remaining_drop > 0:
+                    drop_n = min(remaining_drop, len(tok_lists))
+                    remaining_drop -= drop_n
+                    if drop_n == len(tok_lists):
+                        continue
+                    meta_tbl = meta_tbl.slice(drop_n, len(tok_lists) - drop_n)
+                    tok_lists = tok_lists[drop_n:]
 
                 if lance_mode or single_file_mode:
                     sl_meta_parts.append(meta_tbl)

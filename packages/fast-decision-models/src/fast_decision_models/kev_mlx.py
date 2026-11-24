@@ -850,7 +850,7 @@ def _build_qwen35_backbone(
                 )
 
             eff_mask = (None if L == 1 else "causal") if attn_mask == "causal" else attn_mask
-            if allow_d256_force_fused and queries.dtype == mx.float16 and head_dim == 256 and 256 <= L < 1024:
+            if allow_d256_force_fused and queries.dtype in (mx.float16, mx.bfloat16) and head_dim == 256 and 256 <= L < 1024:
                 try:
                     out = mx.fast.scaled_dot_product_attention(
                         queries,

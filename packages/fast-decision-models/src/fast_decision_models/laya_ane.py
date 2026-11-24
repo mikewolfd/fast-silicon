@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import struct
 import threading
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 import warnings
 
 from ._common import softmax_2, softmax_vec
@@ -31,6 +31,55 @@ COMPUTE_MODE_ALL = 2
 def _tok_id_or_default(tok: Any, piece: str, default: int) -> int:
     tid = tok.token_to_id(piece)
     return default if tid is None else int(tid)
+
+
+def _discover_mf_metadata_buckets(mf_mc: Path) -> dict[int, tuple[Path, str]]:
+    """Discover multifunction `s{seq}` entrypoints from `mf_mc/metadata.json` without CoreML plan probing."""
+    meta_p = mf_mc / "metadata.json"
+    if not meta_p.is_file():
+        return {}
+    try:
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    cand_by_fn = {f"s{s_len}": s_len for s_len in _CANDIDATE_SEQ_LENS}
+    found_fns: set[str] = set()
+
+    def _walk(obj: Any, *, in_fn_scope: bool = False) -> None:
+        if isinstance(obj, str):
+            if obj in cand_by_fn and in_fn_scope:
+                found_fns.add(obj)
+            return
+        if isinstance(obj, list):
+            for elem in obj:
+                _walk(elem, in_fn_scope=in_fn_scope)
+            return
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if isinstance(key, str) and key in cand_by_fn and in_fn_scope:
+                    found_fns.add(key)
+                if key in ("functions", "function_names", "functionNames"):
+                    _walk(val, in_fn_scope=True)
+                elif key in ("name", "functionName", "function_name") and isinstance(val, str):
+                    if val in cand_by_fn:
+                        found_fns.add(val)
+                elif isinstance(val, (dict, list)):
+                    _walk(val, in_fn_scope=in_fn_scope)
+
+    if isinstance(meta, (list, dict)):
+        top_in_fn = isinstance(meta, list) and all(isinstance(x, str) for x in meta)
+        _walk(meta, in_fn_scope=top_in_fn)
+        if isinstance(meta, dict):
+            for k in meta:
+                if k in cand_by_fn:
+                    found_fns.add(k)
+
+    return {
+        s_len: (mf_mc, f"s{s_len}")
+        for s_len in _CANDIDATE_SEQ_LENS
+        if f"s{s_len}" in found_fns
+    }
 
 
 def _read_safetensors_fp16_pair_cpu(sf_path: Path) -> tuple[Any, Any]:
@@ -153,6 +202,11 @@ class LayaTokenizerHelper:
     def _encode_ids(self, text: str) -> list[int]:
         return list(self.tok.encode(text, add_special_tokens=False).ids)
 
+    def encode_state(self, state: Any) -> list[int]:
+        """Serialize and tokenize a state once for reuse across questions via `state_ids`."""
+        state_str = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        return self._encode_ids(state_str.replace(self.mask_tok, " "))
+
     def resolve_temperature(self, qtype: int, k: int, temperature_override: float | None = None) -> float:
         if temperature_override is not None:
             return float(temperature_override)
@@ -188,6 +242,7 @@ class LayaTokenizerHelper:
         *,
         max_len: int | None = None,
         on_truncate: Literal["warn", "error", "ignore"] = "warn",
+        state_ids: Sequence[int] | None = None,
     ) -> dict[str, Any]:
         """Encode one typed question (`noul`, `choice`, `score`) + state into token ids & option markers."""
         if on_truncate not in ("warn", "error", "ignore"):
@@ -238,8 +293,7 @@ class LayaTokenizerHelper:
             ids.extend(o)
         ids.append(self.sep_id)
         room = max(0, eff_max - len(ids) - 1)
-        state_str = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
-        st_ids_raw = self._encode_ids(state_str.replace(self.mask_tok, " "))
+        st_ids_raw = list(state_ids) if state_ids is not None else self.encode_state(state)
         if len(st_ids_raw) > room:
             truncated_parts.append(f"state({len(st_ids_raw)}>{room})")
         st_ids = st_ids_raw[:room]
@@ -263,6 +317,29 @@ class LayaTokenizerHelper:
             "truncated": truncated,
             "original_state_tokens": len(st_ids_raw),
         }
+
+    def encode_items_for_state(
+        self,
+        state: Any,
+        qdefs: Sequence[Mapping[str, Any]],
+        *,
+        max_len: int | None = None,
+        on_truncate: Literal["warn", "error", "ignore"] = "warn",
+    ) -> list[dict[str, Any]]:
+        """Encode multiple questions against a shared `state` while tokenizing `state` only once."""
+        if not qdefs:
+            return []
+        st_ids = self.encode_state(state)
+        return [
+            self.encode_item(
+                state,
+                qd,
+                max_len=max_len,
+                on_truncate=on_truncate,
+                state_ids=st_ids,
+            )
+            for qd in qdefs
+        ]
 
 
 class LayaAneBackend(LayaTokenizerHelper):
@@ -358,6 +435,7 @@ class LayaAneBackend(LayaTokenizerHelper):
         nmtz_repo_id: str = DEFAULT_LAYA_NMTZ_COREML_REPO,
         laya_src_repo_id: str = DEFAULT_LAYA_REPO,
         max_len: int = 512,
+        lazy_load: bool = True,
     ) -> None:
         import os
         import numpy as np
@@ -444,6 +522,7 @@ class LayaAneBackend(LayaTokenizerHelper):
 
         H = int(self._word_f16.shape[1])
         vocab_sz = int(self._word_f16.shape[0])
+        self._load_dims: tuple[int, int, int] = (H, local_half, vocab_sz)
 
         try:
             if use_nmtz:
@@ -494,49 +573,25 @@ class LayaAneBackend(LayaTokenizerHelper):
                             shutil.rmtree(mat_pkg, ignore_errors=True)
                         if rc != 0:
                             raise RuntimeError(f"Failed to compile NMTZ CoreML package {pkg_p}")
-                    h_ptr = self._lib.laya_ane_load_fn(
-                        str(dst_mc).encode("utf-8"),
-                        b"main",
-                        H,
-                        s_len,
-                        local_half,
-                        self.pipe_depth,
-                        self.compute_mode,
-                        self._word_f16.ctypes.data,
-                        vocab_sz,
-                        self._type_f16.ctypes.data,
-                        int(self.pad_id),
-                    )
-                    if h_ptr:
-                        self._handles[s_len] = h_ptr
-                        self._bucket_sources[s_len] = (dst_mc, "main")
+                    self._bucket_sources[s_len] = (dst_mc, "main")
             elif has_local_mf:
                 mf_mc = (resolved_dir / "laya_typed_w8.mlmodelc").resolve()
+                # Discover buckets lazily via symlinks first, then metadata.json, probing MLComputePlan only as fallback.
                 for s_len in _CANDIDATE_SEQ_LENS:
-                    fn_str = f"s{s_len}"
-                    # Check if multifunction bundle exposes `s{s_len}` cleanly
-                    counts = (ctypes.c_int * 3)()
-                    self._lib.laya_ane_inspect_plan_fn(
-                        str(mf_mc).encode("utf-8"), fn_str.encode("utf-8"), self.compute_mode, counts
-                    )
-                    if int(counts[0]) + int(counts[1]) + int(counts[2]) <= 0:
-                        continue
-                    h_ptr = self._lib.laya_ane_load_fn(
-                        str(mf_mc).encode("utf-8"),
-                        fn_str.encode("utf-8"),
-                        H,
-                        s_len,
-                        local_half,
-                        self.pipe_depth,
-                        self.compute_mode,
-                        self._word_f16.ctypes.data,
-                        vocab_sz,
-                        self._type_f16.ctypes.data,
-                        int(self.pad_id),
-                    )
-                    if h_ptr:
-                        self._handles[s_len] = h_ptr
-                        self._bucket_sources[s_len] = (mf_mc, fn_str)
+                    link_p = resolved_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
+                    if link_p.exists() and link_p.resolve() == mf_mc:
+                        self._bucket_sources[s_len] = (mf_mc, f"s{s_len}")
+                if not self._bucket_sources:
+                    self._bucket_sources.update(_discover_mf_metadata_buckets(mf_mc))
+                if not self._bucket_sources:
+                    for s_len in _CANDIDATE_SEQ_LENS:
+                        fn_str = f"s{s_len}"
+                        counts = (ctypes.c_int * 3)()
+                        self._lib.laya_ane_inspect_plan_fn(
+                            str(mf_mc).encode("utf-8"), fn_str.encode("utf-8"), self.compute_mode, counts
+                        )
+                        if int(counts[0]) + int(counts[1]) + int(counts[2]) > 0:
+                            self._bucket_sources[s_len] = (mf_mc, fn_str)
             else:
                 for s_len in _CANDIDATE_SEQ_LENS:
                     raw_mc = resolved_dir / f"laya_typed_s{s_len}_w8.mlmodelc"
@@ -544,32 +599,67 @@ class LayaAneBackend(LayaTokenizerHelper):
                         continue
                     mc_res = raw_mc.resolve()
                     fn_str = f"s{s_len}" if mc_res.name == "laya_typed_w8.mlmodelc" else "main"
-                    h_ptr = self._lib.laya_ane_load_fn(
-                        str(mc_res).encode("utf-8"),
-                        fn_str.encode("utf-8"),
-                        H,
-                        s_len,
-                        local_half,
-                        self.pipe_depth,
-                        self.compute_mode,
-                        self._word_f16.ctypes.data,
-                        vocab_sz,
-                        self._type_f16.ctypes.data,
-                        int(self.pad_id),
-                    )
-                    if h_ptr:
-                        self._handles[s_len] = h_ptr
-                        self._bucket_sources[s_len] = (mc_res, fn_str)
+                    self._bucket_sources[s_len] = (mc_res, fn_str)
 
-            if not self._handles:
+            if not self._bucket_sources:
                 raise RuntimeError(f"Failed to load any Laya ANE CoreML buckets from {resolved_dir}")
 
-            self.seq_buckets: tuple[int, ...] = tuple(sorted(self._handles.keys()))
-            self._h256 = self._handles.get(256)
-            self._h512 = self._handles.get(512)
+            self.seq_buckets: tuple[int, ...] = tuple(sorted(self._bucket_sources.keys()))
+            if not lazy_load:
+                for s_len in self.seq_buckets:
+                    try:
+                        self._ensure_bucket_handle(s_len)
+                    except RuntimeError:
+                        pass
+                if not self._handles:
+                    raise RuntimeError(f"Failed to load any Laya ANE CoreML buckets from {resolved_dir}")
+                self.seq_buckets = tuple(sorted(self._handles.keys()))
+                self._bucket_sources = {s: self._bucket_sources[s] for s in self.seq_buckets}
         except Exception:
             self.close()
             raise
+
+    @property
+    def _h256(self) -> Any:
+        handles = getattr(self, "_handles", None)
+        return handles.get(256) if handles else None
+
+    @property
+    def _h512(self) -> Any:
+        handles = getattr(self, "_handles", None)
+        return handles.get(512) if handles else None
+
+    def _ensure_bucket_handle(self, s_len: int) -> Any:
+        """Return cached native handle for bucket `s_len`, lazily loading it under `_exec_lock` on first use."""
+        handle = self._handles.get(s_len)
+        if handle:
+            return handle
+        with self._exec_lock:
+            handle = self._handles.get(s_len)
+            if handle:
+                return handle
+            src = self._bucket_sources.get(s_len)
+            if src is None:
+                raise RuntimeError(f"Missing Laya ANE CoreML bucket source for s{s_len}")
+            mc_path, fn_str = src
+            H, local_half, vocab_sz = self._load_dims
+            h_ptr = self._lib.laya_ane_load_fn(
+                str(mc_path).encode("utf-8"),
+                fn_str.encode("utf-8"),
+                H,
+                int(s_len),
+                local_half,
+                self.pipe_depth,
+                self.compute_mode,
+                self._word_f16.ctypes.data,
+                vocab_sz,
+                self._type_f16.ctypes.data,
+                int(self.pad_id),
+            )
+            if not h_ptr:
+                raise RuntimeError(f"Failed to load Laya ANE CoreML bucket s{s_len} from {mc_path} ({fn_str})")
+            self._handles[s_len] = h_ptr
+            return h_ptr
 
     def __enter__(self) -> "LayaAneBackend":
         return self
@@ -714,7 +804,7 @@ class LayaAneBackend(LayaTokenizerHelper):
             indices = by_bucket[s_lim]
             if not indices:
                 continue
-            handle = self._handles[s_lim]
+            handle = self._ensure_bucket_handle(s_lim)
             raw_marker_logits = self._exec_bucket_markers(
                 [encoded_items[i] for i in indices],
                 s_lim,
@@ -776,8 +866,6 @@ class LayaAneBackend(LayaTokenizerHelper):
                 h_ptr = handles.pop(s_len, None)
                 if h_ptr:
                     self._lib.laya_ane_free(h_ptr)
-        self._h256 = None
-        self._h512 = None
 
 
 __all__ = [

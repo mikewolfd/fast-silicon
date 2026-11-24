@@ -7,15 +7,18 @@ from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 import gc
+import json
 import os
 from pathlib import Path
 import platform
 import resource
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -539,6 +542,7 @@ class FourBucketMemoryProbe:
         vm = probe_task_vm_info()
         mapped = probe_mapped_files(self.model_directories or None)
         daemons = self._daemon_probe.poll()
+        rusage_v6 = read_process_rusage_v6(os.getpid())
 
         phys_b = int(fp["phys_footprint_bytes"])
         neural_nf_b = max(0, int(vm["ledger_tag_neural_nofootprint_bytes"]))
@@ -546,8 +550,20 @@ class FourBucketMemoryProbe:
         all_map_b = int(mapped["total_bytes"])
         daemon_delta_b = int(daemons["total_footprint_delta_bytes"])
 
+        peak_phys_b = max(
+            int(fp.get("lifetime_max_phys_footprint_bytes", phys_b)),
+            int(rusage_v6["lifetime_max_phys_footprint_bytes"]) if rusage_v6 is not None else 0,
+        )
+        peak_neural_b = max(
+            neural_nf_b,
+            int(rusage_v6["lifetime_max_neural_footprint_bytes"]) if rusage_v6 is not None else 0,
+        )
+
         combined_model_b = phys_b + neural_nf_b + model_map_b + daemon_delta_b
         combined_all_b = phys_b + neural_nf_b + all_map_b + daemon_delta_b
+        # Lifetime-max phys_footprint already captures mapped pages when they were resident at peak,
+        # so do not double-count current clean mapped_files onto lifetime_max_phys_footprint_bytes.
+        peak_combined_model_b = max(combined_model_b, peak_phys_b + peak_neural_b)
 
         return {
             "phys_footprint": fp,
@@ -562,10 +578,13 @@ class FourBucketMemoryProbe:
                 "eviction": evict_stats,
             },
             "ane_daemons": daemons,
+            "peak_footprint_gb": round(peak_phys_b / 1e9, 4),
             "combined_with_model_mapped_bytes": combined_model_b,
             "combined_with_all_mapped_bytes": combined_all_b,
             "combined_with_model_mapped_gb": round(combined_model_b / 1e9, 4),
             "combined_with_all_mapped_gb": round(combined_all_b / 1e9, 4),
+            "peak_combined_with_model_mapped_bytes": peak_combined_model_b,
+            "peak_combined_with_model_mapped_gb": round(peak_combined_model_b / 1e9, 4),
         }
 
     def delta(self, *, evict_mapped: bool = False) -> dict[str, Any]:
@@ -1127,6 +1146,8 @@ def collect_daemon_four_bucket_metrics(
     daemon_fp_delta_bytes = int(daemon_info.get("total_footprint_delta_bytes", 0))
     daemon_rss_delta_bytes = int(daemon_info.get("total_rss_delta_bytes", 0))
     combined_model_bytes = phys_bytes + neural_nf_bytes + mapped_model_bytes + daemon_fp_delta_bytes
+    peak_neural_bytes = max(neural_nf_bytes, max_neural_rusage_bytes)
+    peak_combined_model_bytes = max(combined_model_bytes, max_phys_bytes + peak_neural_bytes)
 
     return {
         "pid": target_pid,
@@ -1145,9 +1166,215 @@ def collect_daemon_four_bucket_metrics(
         "ane_daemon_permission_limited": bool(daemon_info.get("permission_limited", False)),
         "combined_with_model_mapped_mb": round(combined_model_bytes / mib, 2),
         "combined_with_model_mapped_gb": round(combined_model_bytes / 1e9, 4),
+        "peak_combined_with_model_mapped_bytes": peak_combined_model_bytes,
+        "peak_combined_with_model_mapped_mb": round(peak_combined_model_bytes / mib, 2),
+        "peak_combined_with_model_mapped_gb": round(peak_combined_model_bytes / 1e9, 4),
         "four_bucket_deltas": four_bucket_deltas,
         "ane_daemons": daemon_info if daemon_info else None,
     }
+
+
+EXIT_SKIP: int = 3
+
+
+def _coerce_subprocess_text(val: bytes | str | None) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    return val
+
+
+def _tail_lines(text: str | None, max_lines: int = 20) -> list[str]:
+    if not text or max_lines <= 0:
+        return []
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return lines[-max_lines:]
+
+
+def write_worker_json(
+    payload: Any,
+    *,
+    worker_out_file: str | Path | None = None,
+    marker: str | None = None,
+) -> None:
+    """Atomically write worker JSON to ``worker_out_file`` when given, or emit ``marker`` to stdout."""
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if worker_out_file is not None and str(worker_out_file).strip():
+        dest = Path(worker_out_file)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.tmp.", dir=str(dest.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fp:
+                fp.write(serialized)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, dest)
+            return
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    line = f"{marker}{serialized}" if marker else serialized
+    print(line, flush=True)
+
+
+def _extract_marked_json(text: str, markers: Sequence[str]) -> Any | None:
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        for marker in markers:
+            if not marker:
+                continue
+            idx = line.find(marker)
+            if idx < 0:
+                continue
+            candidate = line[idx + len(marker) :].strip()
+            if not candidate:
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                decoder = json.JSONDecoder()
+                for offset, ch in enumerate(candidate):
+                    if ch in "{[":
+                        try:
+                            obj, _ = decoder.raw_decode(candidate, offset)
+                            return obj
+                        except json.JSONDecodeError:
+                            continue
+    return None
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        rem_out, rem_err = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        rem_out, rem_err = "", ""
+    return _coerce_subprocess_text(rem_out), _coerce_subprocess_text(rem_err)
+
+
+def run_isolated_json_worker(
+    cmd: Sequence[str],
+    *,
+    worker_out_arg: str | None = "--worker-out-file",
+    worker_out_file: str | Path | None = None,
+    marker: str | None = None,
+    markers: Sequence[str] | None = None,
+    timeout_sec: float = 300.0,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    skip_exit_codes: Sequence[int] = (EXIT_SKIP,),
+    stderr_tail_lines: int = 20,
+) -> dict[str, Any]:
+    """Run an isolated worker subprocess and extract its structured JSON result.
+
+    Launches in a fresh session (``start_new_session=True``), kills the full
+    process group with ``os.killpg(..., SIGKILL)`` on timeout, supports atomic
+    ``--worker-out-file`` output with substring marker fallback, handles
+    ``EXIT_SKIP == 3`` cleanly, and returns a 20-line stderr tail on exit.
+    """
+    eff_markers: tuple[str, ...] = tuple(
+        m for m in ([marker] if marker else []) + list(markers or ()) if m
+    )
+    eff_env = dict(os.environ)
+    if env:
+        eff_env.update({str(k): str(v) for k, v in env.items()})
+
+    tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
+    out_path: Path | None = Path(worker_out_file) if worker_out_file is not None else None
+    worker_cmd = list(cmd)
+    if worker_out_arg:
+        if worker_out_arg in worker_cmd:
+            idx = worker_cmd.index(worker_out_arg)
+            if out_path is None and idx + 1 < len(worker_cmd):
+                out_path = Path(worker_cmd[idx + 1])
+        else:
+            if out_path is None:
+                tmp_ctx = tempfile.TemporaryDirectory(prefix="fs_worker_")
+                out_path = Path(tmp_ctx.name) / "worker_out.json"
+            worker_cmd.extend([worker_out_arg, str(out_path)])
+
+    try:
+        proc = subprocess.Popen(
+            worker_cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            env=eff_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out_s, err_s = proc.communicate(timeout=float(timeout_sec))
+        except subprocess.TimeoutExpired as exc:
+            rem_out, rem_err = _kill_process_group(proc)
+            full_out = _coerce_subprocess_text(exc.stdout) + rem_out
+            full_err = _coerce_subprocess_text(exc.stderr) + rem_err
+            return {
+                "status": "timeout",
+                "returncode": proc.returncode,
+                "payload": None,
+                "source": None,
+                "timed_out": True,
+                "stderr_tail": _tail_lines(full_err, stderr_tail_lines),
+                "stdout": full_out,
+                "stderr": full_err,
+            }
+
+        out_s = _coerce_subprocess_text(out_s)
+        err_s = _coerce_subprocess_text(err_s)
+        rc = int(proc.returncode or 0)
+
+        payload: Any | None = None
+        source: str | None = None
+        parse_error: str | None = None
+        if out_path is not None and out_path.is_file():
+            try:
+                payload = json.loads(out_path.read_text(encoding="utf-8"))
+                source = "out_file"
+            except Exception as exc:
+                parse_error = f"invalid worker_out_file JSON: {exc}"
+        if payload is None and eff_markers:
+            for stream_text in (out_s, err_s):
+                payload = _extract_marked_json(stream_text, eff_markers)
+                if payload is not None:
+                    source = "marker"
+                    break
+
+        stderr_tail = _tail_lines(err_s, stderr_tail_lines)
+        if rc in set(skip_exit_codes):
+            status = "skipped"
+        elif rc == 0 and payload is not None:
+            status = "ok"
+        else:
+            status = "failed"
+        res: dict[str, Any] = {
+            "status": status,
+            "returncode": rc,
+            "payload": payload,
+            "source": source,
+            "timed_out": False,
+            "stderr_tail": stderr_tail,
+            "stdout": out_s,
+            "stderr": err_s,
+        }
+        if parse_error is not None and status == "failed":
+            res["parse_error"] = parse_error
+        return res
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
 
 def summarize_cold_warm_latencies(
@@ -1224,6 +1451,7 @@ __all__ = [
     "DEFAULT_PAST_ARM_MARGIN",
     "DeviceMemoryGuard",
     "DeviceMemorySnapshot",
+    "EXIT_SKIP",
     "FourBucketMemoryProbe",
     "check_metal_working_set_headroom",
     "check_system_quiescence",
@@ -1242,8 +1470,10 @@ __all__ = [
     "probe_mapped_files",
     "probe_task_vm_info",
     "read_process_rusage_v6",
+    "run_isolated_json_worker",
     "summarize_cold_warm_latencies",
     "wired_limit",
+    "write_worker_json",
 ]
 
 

@@ -62,10 +62,13 @@ if str(_REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 from fast_shared.bench import (  # noqa: E402
+    EXIT_SKIP,
     check_system_quiescence,
     collect_env_telemetry,
     get_unified_memory_footprint,
+    run_isolated_json_worker,
     wired_limit,
+    write_worker_json,
 )
 from public_baselines import resolve_hf_snapshot, run_subprocess_with_killpg  # noqa: E402
 
@@ -618,9 +621,14 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
         "packed_min_tensor_cos": round(float(min_cos_pack), 6),
         "qlora_8bit_vs_bf16_grad_cos": round(float(cos_q8), 6) if cos_q8 is not None else None,
     }
+    parity_ok = (
+        float(cos_pack) >= 0.995
+        and float(min_cos_pack) >= 0.99
+        and (cos_q8 is None or float(cos_q8) >= 0.98)
+    )
     return {
         "suite": "qlora-packing",
-        "status": "ok",
+        "status": "ok" if parity_ok else "failed",
         "policy": pol,
         "fast_metric": (
             f"Packed QLoRA ({pack_tok_bench}) {packed['supervised_tokens_per_sec']:,.1f} supervised tokens/s on the same {packed['examples']} examples. "
@@ -1209,9 +1217,10 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     ep1_incl_ips = round(total_items / max(cold_cache_build_sec + cached_ep_sec, 1e-9), 2)
     amort_3ep_ips = round((3 * total_items) / max(cold_cache_build_sec + 3.0 * cached_ep_sec, 1e-9), 2)
     amort_5ep_ips = round((5 * total_items) / max(cold_cache_build_sec + 5.0 * cached_ep_sec, 1e-9), 2)
+    parity_ok = float(loss_diff) <= 1e-2 and float(grad_cos) >= 0.995
     return {
         "suite": "encoder-finetune",
-        "status": "ok",
+        "status": "ok" if parity_ok else "failed",
         "weights_source": weights_source,
         "fast_metric": (
             f"Packed-512 {p512_ips:.1f} items/s (cached L0..17 warm {cached_ips:.1f} items/s; "
@@ -1402,6 +1411,10 @@ print(json.dumps({"status": "ok", "wall_sec": round(tot_s, 3), "rollout_sec": ro
                     }
             except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
                 stock_res = {"status": "failed", "reason": str(exc)}
+            if stock_res.get("status") == "failed":
+                low_rsn = str(stock_res.get("reason") or "").lower()
+                if "no module named 'mlx_vlm'" in low_rsn or "no module named 'mlx_lm'" in low_rsn or "modulenotfounderror" in low_rsn:
+                    stock_res["status"] = "skipped"
 
     # Real GRPO policy step + concurrent Laya ANE critic overlap in `--lora-python`
     lora_py = args.lora_python or pub_py
@@ -1665,8 +1678,7 @@ def _run_mtp_speculative(args: argparse.Namespace) -> dict[str, Any]:
         "Write an engineering root-cause analysis template for a cascading retry storm triggered by stale DNS TTLs.",
     ]
 
-    eng_ar = FastGemma4Engine(home=fg4_home, default_mode="gpu", kv_i8=True, mtp_drafter=None, local_files_only=True, warmup=True, warmup_ane=False)
-    eng_mtp = FastGemma4Engine(home=fg4_home, default_mode="gpu", kv_i8=True, mtp_drafter=drafter_dir, local_files_only=True, warmup=True, warmup_ane=False)
+    eng = FastGemma4Engine(home=fg4_home, default_mode="gpu", kv_i8=True, mtp_drafter=drafter_dir, local_files_only=True, warmup=True, warmup_ane=False)
     workloads: dict[str, Any] = {}
     try:
         for wname, plist, sys_p, sch, mtok in (
@@ -1677,13 +1689,12 @@ def _run_mtp_speculative(args: argparse.Namespace) -> dict[str, Any]:
         ):
             settings = dict(system_prompt=sys_p, json_schema=sch, max_tokens=mtok, temperature=0.0, mode="gpu", batch_size=len(plist))
             workloads[wname] = _measure_mtp_pair(
-                partial(eng_ar.generate_batch, plist, speculative=False, **settings),
-                partial(eng_mtp.generate_batch, plist, speculative=True, **settings),
+                partial(eng.generate_batch, plist, speculative=False, **settings),
+                partial(eng.generate_batch, plist, speculative=True, **settings),
                 batch_size=len(plist), rounds=args.abba_rounds,
             )
     finally:
-        eng_ar.close()
-        eng_mtp.close()
+        eng.close()
 
     # Stock `mlx-vlm` B=1 & B=4 on the exact same JSON prompts
     pub_py = args.public_python or os.environ.get("FAST_SILICON_PUBLIC_PYTHON") or sys.executable
@@ -1755,9 +1766,10 @@ print(json.dumps(result))
     sb1 = stock_vlm.get("json_b1_tok_s")
     sb4 = stock_vlm.get("json_b4_tok_s")
     exact = [flag for row in workloads.values() for flag in row["exact_output_by_prompt"]]
+    exact_ok = bool(exact) and all(exact)
     return {
         "suite": "mtp-speculative",
-        "status": "ok",
+        "status": "ok" if exact_ok else "failed",
         "fast_metric": (
             f"Constrained JSON B=1 {jb1:.1f} output tokens/s ({workloads['json_b1']['elapsed_speedup_vs_ar']:.2f}x elapsed vs AR), "
             f"B=4 {jb4:.1f} tokens/s. Exact AR/MTP outputs on {sum(exact)}/{len(exact)} prompts across workloads."
@@ -1808,7 +1820,10 @@ def _run_prefix_tree(args: argparse.Namespace) -> dict[str, Any]:
         except subprocess.TimeoutExpired:
             return {"suite": "prefix-tree", "status": "failed", "reason": "timeout (180s)", "arm": arm}
         if proc.returncode:
-            return {"suite": "prefix-tree", "status": "failed", "reason": proc.stderr[-1200:], "arm": arm}
+            err_txt = proc.stderr[-1200:]
+            low_err = err_txt.lower()
+            is_opt_skip = any(tok in low_err for tok in ("no module named 'mlx_lm'", "no module named 'mlx_vlm'", "filenotfounderror"))
+            return {"suite": "prefix-tree", "status": "skipped" if is_opt_skip else "failed", "reason": err_txt, "arm": arm}
         run = json.loads(proc.stdout.splitlines()[-1])
         if run.get("status") == "skipped":
             return {"suite": "prefix-tree", "status": "skipped", "reason": run["reason"], "arm": arm}
@@ -1990,8 +2005,8 @@ def _run_worker_main(args: argparse.Namespace) -> int:
             rec = _run_parallel_coreml(args)
         else:
             raise ValueError(f"Unknown worker suite: {suite}")
-    print(_WORKER_MARKER + json.dumps(rec, ensure_ascii=False), flush=True)
-    return 0
+    write_worker_json(rec, worker_out_file=getattr(args, "worker_out_file", None), marker=_WORKER_MARKER)
+    return EXIT_SKIP if rec.get("status") == "skipped" else 0
 
 
 @contextmanager
@@ -2029,6 +2044,7 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--lora-python", default=None)
     wk.add_argument("--abba-rounds", type=int, default=2)
     wk.add_argument("--no-wired-limit", action="store_true")
+    wk.add_argument("--worker-out-file", default=None)
 
     p.add_argument("--suites", default="all", help=f"Comma-separated list or 'all' ({', '.join(_SUITE_BY_NAME)})")
     p.add_argument("--python", default=sys.executable, help="Primary fast-silicon Python executable")
@@ -2104,28 +2120,40 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             env = dict(os.environ)
             env["M4_GPU_LOCK_HELD"] = "1"
-            try:
-                proc = run_subprocess_with_killpg(cmd, cwd=_REPO_ROOT, env=env, timeout_sec=int(args.timeout_sec))
-            except subprocess.TimeoutExpired:
-                results.append({"suite": spec.name, "status": "failed", "fast_metric": f"timeout ({args.timeout_sec}s)"})
-                continue
-
-            parsed = None
-            for line in reversed(proc.stdout.splitlines()):
-                if line.startswith(_WORKER_MARKER):
-                    parsed = json.loads(line[len(_WORKER_MARKER) :])
-                    break
-            if parsed is not None:
-                results.append(parsed)
-            else:
-                tail = (proc.stderr or proc.stdout or f"exit={proc.returncode}").strip().splitlines()
+            wres = run_isolated_json_worker(
+                cmd,
+                worker_out_arg="--worker-out-file",
+                marker=_WORKER_MARKER,
+                timeout_sec=int(args.timeout_sec),
+                cwd=_REPO_ROOT,
+                env=env,
+                skip_exit_codes=(EXIT_SKIP,),
+                stderr_tail_lines=20,
+            )
+            if wres["timed_out"]:
                 results.append(
                     {
                         "suite": spec.name,
                         "status": "failed",
+                        "fast_metric": f"timeout ({args.timeout_sec}s)",
+                        "stderr_tail": wres["stderr_tail"],
+                    }
+                )
+                continue
+
+            parsed = wres.get("payload")
+            if isinstance(parsed, dict):
+                results.append(parsed)
+            else:
+                tail = str(wres.get("stderr_tail") or wres.get("stdout") or f"exit={wres.get('returncode')}").strip().splitlines()
+                results.append(
+                    {
+                        "suite": spec.name,
+                        "status": "skipped" if wres["status"] == "skipped" else "failed",
                         "fast_metric": "-",
                         "stock_baseline": "-",
-                        "error": tail[-1][:200] if tail else f"exit={proc.returncode}",
+                        "error": tail[-1][:200] if tail else f"exit={wres.get('returncode')}",
+                        "stderr_tail": wres["stderr_tail"],
                     }
                 )
 

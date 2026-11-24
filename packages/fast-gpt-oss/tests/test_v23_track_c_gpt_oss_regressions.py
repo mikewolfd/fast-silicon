@@ -360,3 +360,65 @@ def test_gpt_oss_f16_intermediates_beat_bf16_vs_fp32_ref_gpu() -> None:
         assert cos_f16 >= 0.999
         assert cos_f16 > cos_bf16
         assert err_f16 < err_bf16
+
+
+def test_gpt_oss_shared_loop_breaker_catches_periodic_cycles_and_preserves_stops_cpu() -> None:
+    """Verify shared `compute_loop_breaker_penalties` catches `p=1..8` cycles in `fast-gpt-oss` and spares stops."""
+    from types import SimpleNamespace
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    # 1. p=1, p=2, and p=6 periodic suffixes trigger 2x base_penalty (10.0) while respecting stop tokens
+    assert _find_repeated_4gram_penalties([7] * 6) == pytest.approx({7: 10.0})
+    assert _find_repeated_4gram_penalties([7] * 6, stop_token_ids=frozenset({7})) == {}
+    assert _find_repeated_4gram_penalties([10, 20] * 4) == pytest.approx({10: 10.0})
+    assert _find_repeated_4gram_penalties([101, 102, 103, 104, 105, 106] * 3).get(101) == pytest.approx(10.0)
+
+    # 2. _sample_row_from_eval breaks a p=2 periodic loop via -10.0 penalty and never suppresses final stop tokens
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        vocab_n = 32
+        eng = FastGptOssEngine.__new__(FastGptOssEngine)
+        eng.model = SimpleNamespace(
+            new_to_old=np.arange(vocab_n, dtype=np.int32),
+            old_to_new=np.arange(vocab_n, dtype=np.int32),
+            _cold_lm_head=None,
+        )
+        eng.tokenizer = SimpleNamespace(final_stop_token_ids=frozenset({1}))
+
+        lg_np = np.full((1, vocab_n), -20.0, dtype=np.float32)
+        lg_np[0, 10] = 8.0   # +7.0 above alt, broken by 2x penalty (-10.0 -> -2.0 < 1.0)
+        lg_np[0, 15] = 1.0
+        pack = eng._eval_logits_for_sampling(mx.array(lg_np, dtype=mx.float32), temperature=0.0, top_p=1.0)
+
+        picked_break, _ = eng._sample_row_from_eval(
+            pack,
+            0,
+            grammar=None,
+            matcher=None,
+            temperature=0.0,
+            top_p=1.0,
+            rng=np.random.default_rng(0),
+            recent_ids=[10, 20] * 4,
+        )
+        assert picked_break == 15
+
+        lg_stop = np.full((1, vocab_n), -20.0, dtype=np.float32)
+        lg_stop[0, 1] = 8.0
+        lg_stop[0, 15] = 1.0
+        pack_stop = eng._eval_logits_for_sampling(mx.array(lg_stop, dtype=mx.float32), temperature=0.0, top_p=1.0)
+        picked_stop, _ = eng._sample_row_from_eval(
+            pack_stop,
+            0,
+            grammar=None,
+            matcher=None,
+            temperature=0.0,
+            top_p=1.0,
+            rng=np.random.default_rng(0),
+            recent_ids=[1, 1, 1, 1, 1, 1],
+        )
+        assert picked_stop == 1
+    finally:
+        mx.set_default_device(prev_dev)
+

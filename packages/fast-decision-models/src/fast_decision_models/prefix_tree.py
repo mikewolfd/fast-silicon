@@ -34,9 +34,15 @@ def recommended_prefix_budget_bytes(host_ram_bytes: int) -> int:
     return 512 * _MIB
 
 
+def _is_dtype_metadata(obj: Any) -> bool:
+    """Return True for MLX/NumPy dtype descriptor objects stored alongside quantized tensors."""
+    cls = type(obj)
+    return cls.__name__.lower().endswith("dtype") and str(getattr(cls, "__module__", "")).startswith(("mlx", "numpy"))
+
+
 def payload_nbytes(obj: Any) -> int:
     """Recursively measure exact payload bytes for bytes-like objects, array-likes (`.nbytes`), or nested containers."""
-    if obj is None:
+    if obj is None or _is_dtype_metadata(obj):
         return 0
     if isinstance(obj, (bytes, bytearray)):
         return len(obj)
