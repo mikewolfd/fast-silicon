@@ -31,7 +31,7 @@ from .prefix_tree import (
 _KEV_SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 _KEV_CACHE_LIMIT_BYTES = 512 << 20
 _KEV_CLEAR_CACHE_THRESHOLD_BYTES = 256 << 20
-_MIN_LCP_GROUP_TOKENS = 32
+_MIN_LCP_GROUP_TOKENS = 128
 _TIGHT_WAVE_PAD_BUDGET = 16
 
 KEV_SPECIAL_TOKENS: tuple[str, ...] = (
@@ -317,7 +317,7 @@ def _partition_exact_lcp_groups(
     *,
     min_lcp: int = _MIN_LCP_GROUP_TOKENS,
 ) -> tuple[list[tuple[list[int], int]], list[int]]:
-    """Group incoming item indices by `(prefix_32, exact_lcp >= min_lcp)` before length sorting.
+    """Group incoming item indices by `(prefix_min_lcp, exact_lcp >= min_lcp)` before length sorting.
 
     Returns `(groups, singletons)` where each entry in `groups` is `(member_indices, lcp_tokens)`.
     """
@@ -1793,6 +1793,7 @@ class KevMlxBackend:
         out_by_orig: list[list[tuple[list[float], list[float]]]],
         *,
         br_chunk_lim: int,
+        eff_b: int | None = None,
         temperature: float | None = None,
     ) -> None:
         """Evaluate all sibling candidate `tail + branch` rows in batched `B=8..16` waves against `prefix_cache`."""
@@ -1879,10 +1880,16 @@ class KevMlxBackend:
         if not flat_cands:
             return
 
+        # Sort tails deterministically by length so multi-candidate groups don't right-pad short tails
+        # out to the longest tail in unsorted batches; cap wave batch by `eff_b` when long tails exist.
+        flat_cands.sort(key=lambda x: (len(x[3]), x[0], x[1]))
+        max_tail = max(len(x[3]) for x in flat_cands)
+        tail_step = min(br_chunk_lim, eff_b) if (eff_b is not None and max_tail > 64) else br_chunk_lim
+
         N_tot = len(flat_cands)
         n_groups = len(group_members)
-        for c0 in range(0, N_tot, br_chunk_lim):
-            sub = flat_cands[c0 : c0 + br_chunk_lim]
+        for c0 in range(0, N_tot, tail_step):
+            sub = flat_cands[c0 : c0 + tail_step]
             n_sub = len(sub)
             max_c = max(len(x[3]) for x in sub)
             c_np = np.full((n_sub, max_c), self.pad_id, dtype=np.int32)
@@ -2010,6 +2017,7 @@ class KevMlxBackend:
                     encoded_all,
                     out_by_orig,
                     br_chunk_lim=br_chunk_lim,
+                    eff_b=eff_b,
                     temperature=temperature,
                 )
                 del merged_cache, single_caches
@@ -2112,6 +2120,7 @@ class KevMlxBackend:
                     encoded_all,
                     out_by_orig,
                     br_chunk_lim=br_chunk_lim,
+                    eff_b=eff_b,
                     temperature=temperature,
                 )
                 del p_cache, h_pref
@@ -2167,6 +2176,7 @@ class KevMlxBackend:
                 encoded_all,
                 out_by_orig,
                 br_chunk_lim=br_chunk_lim,
+                eff_b=eff_b,
                 temperature=temperature,
             )
             del p_cache, h_pref

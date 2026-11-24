@@ -2,7 +2,7 @@
 
 Turn short English queries and passages into 384-number vectors with `BAAI/bge-small-en-v1.5`. One warm 24-token query took 0.49 ms on the M4 Pro and 0.79 ms on the base M5. Across 1,000 pretokenized documents the package processed 187,150 and 200,646 tokens/s on those machines.
 
-`fast-bge-small` runs short queries on the Apple Neural Engine (ANE) and can split bulk encoding between the GPU and ANE. It includes a Python API, an OpenAI-compatible `/v1/embeddings` server, a resumable Parquet CLI, and the standalone `bge-ane-cli`. Inference uses neither `torch` nor `transformers`. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
+`fast-bge-small` runs short queries on the Apple Neural Engine (ANE) and can split bulk encoding between the GPU and ANE. It includes a Python API, an OpenAI-compatible `/v1/embeddings` server, a resumable Parquet CLI, and the standalone `bge-ane-cli`. Inference uses neither `torch` nor `transformers`. Prebuilt Core ML ANE artifact: [`mikewolfd/bge-small-en-v1.5-coreml-ane`](https://huggingface.co/mikewolfd/bge-small-en-v1.5-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Quick start
 
@@ -49,15 +49,16 @@ The retrieval score averages the ranking scores for 150 NanoBEIR queries and 175
 
 Prepending document headers when chunking Parquet files raised 175-query legal passage ranking from 0.305 to 0.444 and character recall from 0.631 to 0.710. For vector search, `eng.build_index(corpus)` compresses embeddings 4× into symmetric INT8 (386 B/chunk) with negligible score change (−0.0013 on NanoBEIR, +0.0026 on LegalBench). At 16,000 or more documents, it adds a 48-byte binary Hamming prefilter that searches 100,000 vectors in **0.50 ms per query** versus 1.46 ms in FP32 BLAS (2.95× faster). Unlike Matryoshka-trained models, truncating BGE-small to 256 dimensions drops NanoBEIR ranking by 0.0184, so backfill defaults preserve all 384 dimensions. [Chunking and compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
 
-### 2. Throughput, latency & parallel Core ML build
+### 2. Stock `mlx-embeddings` GPU vs. `fast-bge-small` (`gpu` / `ane` / `hetero`)
 
-| Benchmark | Base M5 (24 GB) | M4 Pro (48 GB) | Takeaway |
-|---|---|---|---|
-| **Corpus throughput (`hetero`)** | **200,646 tokens/s** (1.85 GB) | **187,150 tokens/s** (2.09 GB) | Both runs encoded the same 249,303 tokens in 1,000 documents. |
-| **Single-query latency (ANE)** | **0.79 ms** | **0.49 ms** | Median for one warm 24-token query. |
-| sidekickd FP16 corpus | 34,318 tokens/s | 31,608 tokens/s | Same token IDs as `fast-bge-small`, with tokenization and IPC outside timing. |
-| sidekickd FP16 single query | 1.608 ms | 1.696 ms | Median of 30 warm calls on the same 24-token input. |
-| **Parallel Core ML build (9 shapes)** | 5.02 s serial, **2.24 s** (4 workers) | 9.37 s serial, **4.38 s** (4 workers) | Bit-identical outputs across all nine shapes on each host. [Build checks](../../docs/benchmarks/capability-corrections-20261121.json) |
+| Host | Workload | Stock `mlx-embeddings` GPU | `fast-bge-small` `gpu` | `fast-bge-small` `ane` | **`fast-bge-small` `hetero`** | Public Core ML (`sidekickd` FP16) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| **Base M5 (24 GB)** | Warm single 24-tok query | `4.42 ms` | `1.29 ms` (`3.4×` stock) | **`0.79 ms`** (`5.6×` stock) | ANE-routed | `1.61 ms` |
+| **Base M5 (24 GB)** | Bulk text throughput | `106.96 docs/s` (Tier-1 `1.16` EOT) | `152,937 tok/s` | `63,850 tok/s` | **`201,181 tok/s`** (`200,646` 1K corpus) | `34,318 tok/s` |
+| **M4 Pro (48 GB)** | Warm single 24-tok query | `4.85 ms` | `1.98 ms` (`2.4×` stock) | **`0.48–0.49 ms`** (`10.0×` stock) | ANE-routed | `1.70 ms` |
+| **M4 Pro (48 GB)** | Bulk text throughput *(2026-11-24 contended)* | `123.12 docs/s` (Tier-1 `1.32` EOT) | `121,730 tok/s` | `59,304 tok/s` | **`192,512 tok/s`** (`187,150` 1K quiet) | `31,608 tok/s` |
+
+Parallel 9-shape Core ML build (`--jobs 4`): **`2.24 s`** on Base M5 (vs `5.02 s` serial) and **`4.38 s`** on M4 Pro (vs `9.37 s` serial) with bit-identical outputs across all shapes. [Build checks](../../docs/benchmarks/capability-corrections-20261121.json) · [Dual-Mac receipt](../../docs/benchmarks/dual-mac-suite-20261124.json)
 
 ### 3. Mode breakdown (`bge-small bench --n 4000`, M4 Pro 48 GB)
 

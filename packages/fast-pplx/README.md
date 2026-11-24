@@ -2,7 +2,7 @@
 
 Use `fast-pplx` to find a passage whose meaning depends on the surrounding text. On 175 legal questions, encoding each passage with its neighbors raised the score for ranking relevant passages in the first ten results from **0.359 to 0.703**. Stock contextual MLX also scored **0.703**. On the full 325-query base M5 workload, the project finished in **136.5 seconds** and stock took **601.5 seconds**. Both returned usable results for all 325 queries. [Scored retrieval runs](../../docs/benchmarks/document-workloads.json)
 
-`fast-pplx` runs Perplexity’s `pplx-embed-v2-context-0.6b` model locally. Its mixed mode (`hetero2`) sends short inputs to the Apple Neural Engine (ANE) and long inputs to the GPU. The M4 Pro GPU processed a 32,768-token input with a measured process footprint of 2.69 GB. The package includes a Python API, an OpenAI-compatible `/v1/embeddings` server, resumable contextual Parquet ingestion, and a native ANE command-line tool. [Full benchmark tables](../../docs/BENCHMARKS.md)
+`fast-pplx` runs Perplexity’s `pplx-embed-v2-context-0.6b` model locally. Its mixed mode (`hetero2`) sends short inputs to the Apple Neural Engine (ANE) and long inputs to the GPU. The M4 Pro GPU processed a 32,768-token input with a measured process footprint of 2.69 GB. The package includes a Python API, an OpenAI-compatible `/v1/embeddings` server, resumable contextual Parquet ingestion, and a native ANE command-line tool. Prebuilt Core ML ANE artifact: [`mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane`](https://huggingface.co/mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane) · [Full benchmark tables](../../docs/BENCHMARKS.md)
 
 ## Quick start
 
@@ -57,7 +57,7 @@ fast-pplx embed-images page1.png page2.png --chunks 8 --crop-margins --build-ind
 
 | Setting | Recommendation | Why |
 | :--- | :--- | :--- |
-| `mode="auto"` (`hetero2`) | Default when ANE bundles are staged | Routes single short `B=1` queries directly to Metal GPU on M5+ (`Apple10` NAX) and ANE on M4 (`Apple9`); for batches, packs `<= 512` inputs into Pure-ANE buckets using first-fit-decreasing bin packing (`-60%` pad waste) while GPU handles longer windows (`19,443 tok/s` on M5, `17,793 tok/s` on M4 Pro). |
+| `mode="auto"` (`hetero2`) | Default when ANE bundles are staged | Routes single short `B=1` queries directly to Metal GPU on M5+ (`Apple10` NAX) and ANE/GPU via `hetero2`; for batches, packs `<= 512` inputs into Pure-ANE buckets using first-fit-decreasing bin packing (`-60%` pad waste) while GPU handles longer windows (**22,273 tok/s** on Base M5, **15,212 tok/s** on contended M4 Pro in mixed workload). |
 | `[D] ` prefix + `tanh` space | Default for all document paths | Prepends `[D] ` while excluding its tokens from pooling (matching upstream non-contextual & contextual behavior), uses `round(tanh(x) * 127)` output space by default (pass `apply_tanh=False` for raw linear projections), and defaults `--context-tokens` chunking to non-overlapping (`overlap=0`). |
 | `--ane-profile balanced` | Default ANE build profile | Closes 73%+ of the ANE-to-GPU cosine gap (`>= 0.999` mean cosine) with negligible throughput cost versus `--ane-profile fast`. Across 325 retrieval queries, `hetero2` cuts wall time 1.71–1.75× on M4 Pro and 1.28–1.34× on M5 versus GPU alone. |
 | `--context-tokens 2048` | Default for multi-chunk documents | Encodes 256-token passages inside 2,048-token windows and repeats up to 128 header tokens per window, raising `LegalBench-RAG` ranking from 0.453 to 0.735 (Tier-1) and 0.515 to 0.683 (Tier-2) with zero extra memory. |
@@ -86,15 +86,19 @@ The selected M5 run split oversized documents into windows so all 325 queries ha
 
 On official `LongEmbed` per-length splits (50 queries against 100 documents at one length), multi-vector `MaxSim` reaches **1.000 `nDCG@10`** at every length from 4K to 32K. When pooling all 400 passkey documents across `[4K, 8K, 16K, 32K]`, identical target entities exist in all four splits, which caps any length-invariant ranker near 0.640–0.680 while still achieving 1.000 `Recall@10`. [LongEmbed and compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
 
-### 3. Throughput & latency across sequence lengths
+### 3. Stock `pplx-context-mlx` GPU vs. `fast-pplx` (`gpu` / `ane` / `hetero2`, Wave 3 verified)
 
-| Workload | M4 Pro (48 GB) | Base M5 (24 GB) | Comparison & notes |
-| :--- | ---: | ---: | :--- |
-| Single short query (`S=15`, ANE) | **4.18 ms** (0.25 GB) | **5.52 ms** (0.25 GB) | 2.16× faster than stock `pplx-context-mlx` (9.04 ms); 6.87× faster than PyTorch MPS |
-| Short passages (`S=256`, batch 8) | **14,884 tok/s** | **15,235 tok/s** | 1.68× (M4 Pro) and 1.32× (M5) vs stock `pplx-context-mlx` |
-| Long windows (`S=4096`, batch 4) | **7,531 tok/s** (3.06 GB) | **9,697 tok/s** | 1.26× faster than stock `pplx-context-mlx`; 4.16× less OS memory than PyTorch MPS (12.70 GB) |
-| Mixed corpus (64 docs, `FFD hetero2`) | **17,793 tok/s** | **19,443 tok/s** | 1.84× faster than GPU-only on M4 Pro and 1.17× on M5 |
-| Single 32,768-token document (streamed GPU) | **2,720 tok/s** (2.69 GB) | Verified (`<= 19.2 GB`) | `MappedEmbedding` keeps the 1.02 GB token table mmap-backed on CPU; streamed 1,024-token GDN + 512-token SDPA holds Metal peak to 1.78 GB |
+| Workload | Host | Stock `pplx-context-mlx` (`fp16` GPU) | `fast-pplx` `gpu` | `fast-pplx` `ane` (`balanced`) | **`fast-pplx` `hetero2`** | Speedup / Notes |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- |
+| Single short query (`B=1`, `S=15`) | Base M5 *(quiescent)* | `9.04 ms` | `7.09 ms` (`2,117 tok/s`) | `9.06 ms` (`0.26 GB`) | **`5.80 ms`** (`2,586 tok/s`) | **1.56×** vs. Stock (`1.22×` vs. `gpu`, `0.91 GB`) |
+| Single short query (`B=1`, `S=15`) | M4 Pro *(contended)* | — | **`5.76 ms`** (`2,604 tok/s`) | `7.55 ms` (`4.18 ms` prior quiet) | `6.50 ms` (`2,309 tok/s`) | Apple9 `B=1` prefers GPU (`4.18 ms` prior quiet `ane` = `2.16×` vs `9.04 ms` Stock) |
+| Query batch (`B=32`, `S=15`) | Base M5 / M4 Pro | — | **`10,706`** / `6,906 tok/s` | `4,381` / `4,457 tok/s` | `9,098` / **`9,249 tok/s`** | `hetero2` `1.34×` vs `gpu` on M4 Pro (`1.26 ms`); `gpu` `1.09 ms` on M5 |
+| Short passages (`S=128`, baseline) | Base M5 / M4 Pro | `11,707` / `8,735 tok/s` | — | **`12,754`** / **`12,856 tok/s`** (`13,542` / `13,464` `--ane-profile fast`) | — | `balanced` closes `73%` of ANE-vs-GPU cosine gap (`0.9988`) |
+| Short passages (`S=256`, batch 8) | Base M5 / M4 Pro | `10,384` / `8,425 tok/s` | `19,332` / `11,812 tok/s` | `13,407` / `13,516 tok/s` | **`27,234`** / **`21,345 tok/s`** | **`2.62×` (M5) / `2.53×` (M4 Pro)** vs. Stock `pplx-context-mlx` |
+| Passages (`S=512`, batch 8) | Base M5 / M4 Pro | — | `19,419` / `11,776 tok/s` | `11,988` / `12,175 tok/s` | **`28,415`** / **`19,060 tok/s`** | `55.5 docs/s` M5 (`1.46×` `gpu`), `37.2 docs/s` M4 Pro (`1.62×` `gpu`) |
+| Mixed short + long (`28` docs) | Base M5 / M4 Pro | — | `16,636` / `10,357 tok/s` | — | **`22,273`** / **`15,212 tok/s`** | **`1.34×` (M5) / `1.47×` (M4 Pro)** vs. `gpu`-only (`ane=24, gpu=4`) |
+| Long windows (`S=4096`, batch 4) | Base M5 / M4 Pro | — | **`9,697`** / **`7,531 tok/s`** | GPU-routed | GPU-routed | `1.26×` faster than Stock on M4 Pro; `4.16×` less OS RAM than PyTorch MPS (`12.70 GB`) |
+| Single 32,768-tok doc (streamed) | M4 Pro / Base M5 | — | **`2,720 tok/s`** (M4 Pro, `2.69 GB`) / Verified `<= 19.2 GB` (M5) | GPU-routed | GPU-routed | `MappedEmbedding` mmaps `1.02 GB` embed table on CPU; `1.78 GB` Metal peak |
 
 ### 4. Direct visual page embeddings (`encode_images`, `build_image_index`, Metal GPU)
 

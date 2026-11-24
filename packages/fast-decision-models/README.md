@@ -2,7 +2,7 @@
 
 Use typed Laya to help a person prioritize extracted records for review. In a 48-document pilot with 12 known defects, the first ten selected by the existing rules contained four defects. Laya alone found five, and rules plus Laya found seven. Making Laya a blocking check increased M5 extraction time from 93.31 to 160.71 seconds while held-out quality stayed at 89.38. Keep automatic acceptance on the pipeline’s validated field checks. [Review-queue pilot](../../docs/benchmarks/review-20261121.md#decision-scoring) · [Extraction results](../../docs/benchmarks/decisions-20261121.json)
 
-Laya scores choices on the Apple Neural Engine while other work uses the GPU. On 250 four-way choices, this implementation picked the preferred answer 73 times (29.2%), compared with 76 for NMTZ Core ML and 79 for stock MLX. Use training rewards that have passed a separate task-quality check. Kev scores choices on the GPU and reuses cached work when several questions share a passage. Both models support Python and the `decision-models score` CLI. [Scored results](../../docs/benchmarks/decisions-20261121.json) · [Public Core ML comparisons](../../docs/benchmarks/coreml-20261120.json)
+Laya scores choices on the Apple Neural Engine while other work uses the GPU. On 250 four-way choices, this implementation picked the preferred answer 73 times (29.2%), compared with 76 for NMTZ Core ML and 79 for stock MLX. Use training rewards that have passed a separate task-quality check. Kev scores choices on the GPU and reuses cached work when several questions share a passage. Both models support Python and the `decision-models score` CLI. Prebuilt Hugging Face artifacts: [`mikewolfd/laya-typed-decisions-421m-coreml-ane`](https://huggingface.co/mikewolfd/laya-typed-decisions-421m-coreml-ane) · [`mikewolfd/kev-0.8b-mlx-w8`](https://huggingface.co/mikewolfd/kev-0.8b-mlx-w8) · [Scored results](../../docs/benchmarks/decisions-20261121.json) · [Public Core ML comparisons](../../docs/benchmarks/coreml-20261120.json)
 
 ## Quick start
 
@@ -33,17 +33,17 @@ with Kev08bMlxBackend(quant_mode="auto", batch_docs=8) as kev:  # prefix_cache_m
 
 Both Laya and Kev score the same 600 RAGTruth examples, 550 CLINC150 utterances, and 250 RewardBench-2 comparisons. Effective outcome throughput (EOT) divides total score by elapsed seconds after warmup.
 
-| Host | Implementation | Correct / 1,400 | `S_obj,e2e` | Time after warmup | Score units/s | Measured memory |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| **M5 (quiescent)** | **Project `laya-hetero` (ANE + compiled GPU)** | **704** | **0.5029** | **37.9 s** | **18.586** | **3.72 GB** |
-| M5 | Stock MLX ModernBERT 8-bit | 702 | 0.5014 | 73.9 s | 9.496 | 1.88 GB |
-| **M5 (quiescent)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **76.7 s** | **9.266** | **1.59 GB** |
-| M5 | NMTZ Core ML | 699 | 0.4993 | 88.4 s | 7.909 | 2.73 GB |
-| M5 | `ahmedandaloes` in Apple CoreAI | 699 | 0.4993 | 940.7 s | 0.743 | 0.33 GB + 1.68 GB mapped |
-| **M4 Pro (contended)** | **Project `laya-hetero` (ANE + compiled GPU)** | **707** | **0.5050** | **59.3 s** | **11.932** | **3.30 GB** |
-| M4 Pro | NMTZ Core ML | 699 | 0.4993 | 92.0 s | 7.598 | 2.94 GB |
-| M4 Pro | Stock MLX ModernBERT 8-bit | 703 | 0.5021 | 130.7 s | 5.380 | 2.00 GB |
-| **M4 Pro (contended)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **133.1 s** | **5.341** | **1.52 GB** |
+| Host | Implementation | Correct / 1,400 | `S_obj,e2e` | Time after warmup | Throughput (`q/s`) | Score units/s | Measured memory |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **M5 (quiescent)** | **Project `laya-hetero` (ANE + compiled GPU)** | **704** | **0.5029** | **37.9 s** | **36.96** | **18.586** | **3.72 GB** |
+| M5 | Stock MLX ModernBERT 8-bit | 702 | 0.5014 | 73.9 s | 18.94 | 9.496 | 1.88 GB |
+| **M5 (quiescent)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **76.7 s** | **18.25** | **9.266** | **1.59 GB** |
+| M5 | NMTZ Core ML | 699 | 0.4993 | 88.4 s | 15.84 | 7.909 | 2.73 GB |
+| M5 | `ahmedandaloes` in Apple CoreAI | 699 | 0.4993 | 940.7 s | 1.49 | 0.743 | 0.33 GB + 1.68 GB mapped |
+| **M4 Pro (contended)** | **Project `laya-hetero` (ANE + compiled GPU)** | **707** | **0.5050** | **59.3 s** | **23.63** | **11.932** | **3.30 GB** |
+| M4 Pro | NMTZ Core ML | 699 | 0.4993 | 92.0 s | 15.22 | 7.598 | 2.94 GB |
+| M4 Pro | Stock MLX ModernBERT 8-bit | 703 | 0.5021 | 130.7 s | 10.71 | 5.380 | 2.00 GB |
+| **M4 Pro (contended)** | **Project `laya-ane`, 6-bucket pre-warmed** | **711** | **0.5079** | **133.1 s** | **10.52** | **5.341** | **1.52 GB** |
 
 All six multifunction Core ML buckets (`s64, s128, s192, s256, s384, s512`) in `laya_typed_w8.mlmodelc` place **100% of their `10,538` operations on the Neural Engine** (`[10538, 0, 0]`, `0` GPU/CPU ops). Explicit two-pass centered FP16 `LayerNorm` scaling (`tok_emb` `base_inv_scale=4.0`, `l14..l18` `s_eff_floor=1/128`, `l19..l27` `max_ln_gain=4.0`, head/scorer `base_inv_scale=0.0625`, post-quantization pass removal including `common::fuse_layernorm_or_instancenorm`, and split-head `mb.einsum`) lifts ANE accuracy to **`711/1400` (`0.5079`)** on both Macs while beating NMTZ Core ML on quiescent M5 wall time (`76.7 s` vs `88.4 s`) at `1.59 GB` memory (`2.73 GB` NMTZ). `laya-hetero` adds compiled MLX GPU execution with makespan splitting and a zero-thread `n=1` fast path (`37.9 s` / `18.586` EOT on M5; `59.3 s` / `11.932` EOT on contended M4 Pro). Optional `CoreAI-Opt` 8-bit export reduces `RAGTruth` calibration error (`ECE-15`) by 14.3%, and casting macOS 27.2.1 `.aimodel` exports to FP16 unlocks 1,652 ANE operations (`23.0 ms` at `S=256`, 15.4× faster than stock CoreAI). [CoreAI audit](../../docs/BENCHMARKS.md#7-coreai-audit-of-22-decisions) · [Wave 3 Laya & FP16 LN fixes](../../docs/benchmarks/rca-and-laya-fixes-20261124.json)
 
@@ -57,19 +57,20 @@ All six multifunction Core ML buckets (`s64, s128, s192, s256, s384, s512`) in `
 
 ### 2. `Kev-0.8B` / `Kev-4B` GPU scoring & shared-passage prefix cache (1,400 items)
 
-| Host | Engine | Mean score | EOT (score/s) | Time after warmup | Measured memory |
-|---|---|---:|---:|---:|---:|
-| Base M5 (Wave 3) | `fast-decision-models` W8, NAX `bf16` guard + cache | **0.5257** | **4.885** | 150.7 s | 2.23 GB |
-| Base M5 | `fast-decision-models` W8, automatic cache (baseline) | 0.5250 | 4.395 | 167.2 s | 1.78 GB |
-| Base M5 | FluidInference public Core ML FP16 | 0.5214 | 2.269 | 321.7 s | 1.29 GB |
-| Base M5 | Stock `mlx-lm` 8-bit | 0.5236 | **5.039** | 145.5 s | 2.28 GB |
-| M4 Pro | `fast-decision-models` W8, automatic cache | **0.5257** | **3.415** | 215.2 s | 2.29 GB |
-| M4 Pro | FluidInference public Core ML FP16 | 0.5207 | 1.674 | 435.4 s | 9.04 GB |
-| M4 Pro | Stock `mlx-lm` 8-bit | 0.5229 | 3.249 | 225.3 s | 2.10 GB |
+| Host | Engine | Mean score | `q/s` | EOT (score/s) | Time after warmup | Measured memory |
+|---|---|---:|---:|---:|---:|---:|
+| **Base M5 (quiescent, LCP>=128 + sorted tails)** | **`fast-decision-models` W8, NAX `bf16` guard + cache** | **0.5264** | **11.40** | **6.000** | **122.8 s** | **2.20 GB** |
+| Base M5 | Stock `mlx-lm` 8-bit GPU | 0.5236 | 9.62 | 5.039 | 145.5 s | 2.28 GB |
+| Base M5 | `fast-decision-models` W8, Wave 3 pre-fix (`min_lcp=32`) | 0.5257 | 9.29 | 4.885 | 150.7 s | 2.23 GB |
+| Base M5 | FluidInference public Core ML FP16 | 0.5214 | 4.35 | 2.269 | 321.7 s | 1.29 GB |
+| **M4 Pro (baseline)** | **`fast-decision-models` W8, automatic cache** | **0.5250** | **6.51** | **3.415** | **215.2 s** | **2.29 GB** |
+| M4 Pro (contended, LCP>=128 + sorted tails) | `fast-decision-models` W8, sorted tails | 0.5250 | 5.73 | 3.008 | 244.3 s | 3.27 GB |
+| M4 Pro (baseline) | Stock `mlx-lm` 8-bit GPU | 0.5229 | 6.21 | 3.249 | 225.3 s | 2.10 GB |
+| M4 Pro (baseline) | FluidInference public Core ML FP16 | 0.5207 | 3.22 | 1.674 | 435.4 s | 9.04 GB |
 
-The public Core ML graph clips combined state and question inputs at 1,024 tokens (truncating 164 of 600 RAGTruth examples), whereas `fast-decision-models` accepts up to 1,024 state tokens and 2,048 combined tokens. On `Kev-4B`, cached recurrent `GatedDeltaNet` snapshots are compressed 3.76× in block-32 INT8 with zero logit drift between cold and warm hits.
+Raising `_MIN_LCP_GROUP_TOKENS` from `32` to `128` keeps short 49-token `RewardBench-2` prompt overlaps on the 1-pass path instead of right-padding unsorted candidate tails across wide batches, and deterministically sorting longer shared-prefix tails cuts Base M5 Tier-1 wall time from `150.7 s` to **`122.8 s` (`1.18×` faster than Stock `mlx-lm`, `+0.28 pp` higher score)**. The public Core ML graph clips combined state and question inputs at 1,024 tokens (truncating 164 of 600 RAGTruth examples), whereas `fast-decision-models` accepts up to 1,024 state tokens and 2,048 combined tokens. On `Kev-4B`, cached recurrent `GatedDeltaNet` snapshots are compressed 3.76× in block-32 INT8 with zero logit drift between cold and warm hits.
 
-When eight questions share two 432–1,015-token passages, automatic 256-token `PrefixTree` caching (`prefix_cache_mb="auto"`) requires two sightings before caching a snapshot under `"auto"` and `"backfill"` profiles. That avoids cold-burst slowdowns (**1.0039× cold**, `0 B` held, circuit breaker closed) while speeding warm shared passages **2.394×** with zero answer flips (**1,113 to 488 ms** on M5; **1,650 to 453 ms** on M4 Pro). Under `profile="interactive"` (overridable via `prefix_admission_min_hits`), it caches on the first sighting and passes the Base M5 `prefix-tree` suite with **`0.0` cold-vs-warm logit difference** (**`3.04×` vs. stock `mlx-lm`**, **`1.54×` vs. plain**, `2.91 GB` peak). [Prefix-cache probe](../../docs/BENCHMARKS.md#62-kev-prefix-reuse-on-repeated-passages) · [2-hit admission validation](../../docs/BENCHMARKS.md#142-apple10-nax-meta-only-inline-xor-kev-2-hit-admission-and-ovisocr2-tuning) · [Dual-Mac rerun receipt](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes)
+When questions are mostly unique (`1` question/state in Tier-1), Kev achieves `1.18×` over Stock `mlx-lm` on Base M5 through sorted batching; on **shared passages** where Stock `mlx-lm` recomputes the context every call, `PrefixTree` (`prefix_cache_mb="auto"`) accelerates scoring much further. On eight 432–1,015-token passages, 2-hit admission avoids cold-burst slowdowns (**1.0039× cold**, `0 B` held, circuit breaker closed) while speeding warm shared passages **2.394×** with zero answer flips (**1,113 to 488 ms** on M5 vs `862 ms` Stock; **1,650 to 453 ms** on M4 Pro vs `1,287 ms` Stock). Under `profile="interactive"` (1-hit admission), it reaches **`27.65 q/s` warm `B=8` (`289.3 ms`) / `18.45 q/s` warm `B=1` (`54.2 ms`)** on Base M5 with **`0.0` cold-vs-warm logit difference** (**`2.971×` vs. stock `mlx-lm` `9.31 q/s`**, **`1.662×` vs. plain `16.64 q/s`**, `2.91 GB` peak). [Prefix-cache probe](../../docs/BENCHMARKS.md#62-kev-prefix-reuse-on-repeated-passages) · [2-hit admission validation](../../docs/BENCHMARKS.md#142-apple10-nax-meta-only-inline-xor-kev-2-hit-admission-and-ovisocr2-tuning) · [Dual-Mac rerun receipt](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes)
 
 ### 3. Encoder fine-tuning & disaggregated GPU + ANE RLVR (`GRPO`)
 

@@ -2541,4 +2541,87 @@ def test_build_decision_models_unwraps_bucket_compile_result_cpu(monkeypatch: An
         sys.modules.pop(spec.name, None)
 
 
+def test_kev_min_lcp_group_threshold_and_tail_sorting_cpu() -> None:
+    """Verify `_MIN_LCP_GROUP_TOKENS == 128` skips short shared prompts and long tails sort + chunk by `eff_b`."""
+    from fast_decision_models.kev_mlx import (
+        _MIN_LCP_GROUP_TOKENS,
+        KevMlxBackend,
+        _partition_exact_lcp_groups,
+    )
+
+    assert _MIN_LCP_GROUP_TOKENS == 128
+
+    # Short 49-token shared prefixes must stay in singletons under default `min_lcp`;
+    # >= 128-token shared prefixes must group together.
+    short_prefix = list(range(10, 59))
+    long_prefix = list(range(100, 232))
+    encoded = [
+        (short_prefix + [901, 902, 903], [{"ids": [1, 2], "decide": 1, "opts": [0]}]),
+        (short_prefix + [904, 905, 906, 907], [{"ids": [1, 2], "decide": 1, "opts": [0]}]),
+        (long_prefix + [801, 802], [{"ids": [1, 2], "decide": 1, "opts": [0]}]),
+        (long_prefix + [803, 804, 805], [{"ids": [1, 2], "decide": 1, "opts": [0]}]),
+    ]
+    groups, singles = _partition_exact_lcp_groups([0, 1, 2, 3], encoded)
+    assert singles == [0, 1]
+    assert groups == [([2, 3], 132)]
+
+    # Verify `_score_candidates_against_prefix_cache` sorts variable-length candidate tails (> 64 tokens)
+    # and caps batch size by `eff_b` (4 instead of `br_chunk_lim=16`) while scattering to original slots.
+    class _FakeMx:
+        int32 = np.int32
+        bfloat16 = np.float32
+
+        @staticmethod
+        def array(x, dtype=None):
+            return np.asarray(x, dtype=dtype)
+
+        @staticmethod
+        def arange(n, dtype=None):
+            return np.arange(n, dtype=dtype)
+
+    seen_calls: list[tuple[int, int]] = []
+
+    class _FakeBackbone:
+        _supports_stateless_fused_pass = True
+
+        def __call__(self, ids_mx, *_args, **_kwargs):
+            seen_calls.append(tuple(ids_mx.shape))
+            return ids_mx
+
+    fake = object.__new__(KevMlxBackend)
+    fake._mx = _FakeMx
+    fake._np = np
+    fake.pad_id = 0
+    fake.backbone = _FakeBackbone()
+    fake._score_pointer_fp32 = lambda h_mx, decs, _opts, **_kw: [([float(row[d]), 0.0], [float(d), 0.0]) for row, d in zip(h_mx, decs)]
+
+    # 5 candidates in the same 132-tok prefix group with descending tail lengths (between 70 and 200 tokens)
+    p_len = 132
+    prefix = list(range(p_len))
+    tail_lens = [190, 72, 150, 80, 110]
+    encoded_all = [
+        (prefix + [1000 + i] * tl, [{"ids": [5000 + i, 6000 + i, 7000 + i], "decide": 2, "opts": [0, 1]}])
+        for i, tl in enumerate(tail_lens)
+    ]
+    out_by_orig = [[] for _ in range(len(tail_lens))]
+    fake._score_candidates_against_prefix_cache(
+        [],
+        [p_len],
+        [0],
+        p_len,
+        [[0, 1, 2, 3, 4]],
+        encoded_all,
+        out_by_orig,
+        br_chunk_lim=16,
+        eff_b=3,
+    )
+
+    # Sorted tail+branch lengths: 75, 83, 113 | 153, 193 -> max batch width 113 and 193 (instead of single 5x193!)
+    assert seen_calls == [(3, 113), (2, 193)]
+    for idx in range(len(tail_lens)):
+        probs, _logits = out_by_orig[idx][0]
+        assert probs == [float(7000 + idx), 0.0]
+
+
+
 

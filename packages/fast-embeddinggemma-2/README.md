@@ -2,7 +2,7 @@
 
 Encode up to 2,048 tokens per passage and choose an embedding width from 128 to 768 dimensions. Bulk encoding reached 38,517 tokens/s on M4 Pro and 48,803 on M5. On the public retrieval benchmark, the package delivered 4.33–4.80× the score per second of stock MLX and 6.24× that of Apple CoreAI on M5.
 
-`fast-embeddinggemma-2` runs the 300M-parameter `google/embeddinggemma-2` text encoder on the Metal GPU and Apple Neural Engine (ANE) together for bulk encoding. A 24-token query on the ANE took 2.11 ms on M4 Pro and 2.58 ms on M5. The package includes a Python API, OCR-aware Parquet ingestion, an OpenAI-compatible `/v1/embeddings` endpoint with `dimensions` support, and a standalone `emb2-ane-cli`. Inference uses MLX and Core ML. [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
+`fast-embeddinggemma-2` runs the 300M-parameter `google/embeddinggemma-2` text encoder on the Metal GPU and Apple Neural Engine (ANE) together for bulk encoding. A 24-token query on the ANE took 2.11 ms on M4 Pro and 2.58 ms on M5. The package includes a Python API, OCR-aware Parquet ingestion, an OpenAI-compatible `/v1/embeddings` endpoint with `dimensions` support, and a standalone `emb2-ane-cli`. Inference uses MLX and Core ML. Prebuilt Core ML ANE artifact: [`mikewolfd/embeddinggemma-2-coreml-ane`](https://huggingface.co/mikewolfd/embeddinggemma-2-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Quick start
 
@@ -58,15 +58,17 @@ Both public Core ML exports accept up to 512 tokens per input, whereas 136 of th
 
 Prepending document headers when chunking Parquet windows raised 175-query legal passage ranking from 0.380 to 0.505 and character recall from 0.721 to 0.811. Because EmbeddingGemma-2 is Matryoshka-trained, `eng.build_index(corpus)` defaults to 512-dimensional INT8 vectors (514 B/chunk, **6× smaller** than 768d FP32) with +0.0038 higher LegalBench ranking; at 16,000 or more documents, adding its 64-byte binary Hamming prefilter cuts single-query 100,000-document search from 2.23 ms to **0.50 ms** (4.43× faster). [Compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
 
-### 2. Corpus throughput & single-query latency
+### 2. Stock `mlx-vlm` GPU vs. `fast-embeddinggemma-2` (`gpu` / `ane` / `hetero`)
 
-| Workload | Base M5 (24 GB) | M4 Pro (48 GB) | Comparison & notes |
-|---|---:|---:|---|
-| **Corpus throughput (`hetero`)** | **48,803 tok/s** (2.76 GB) | **38,517 tok/s** (3.26 GB) | Same 551,889 tokens across 2,000 docs; OpenInfinity INT8 packed reached 14,945 tok/s on M5 and Apple CoreAI BF16 reached 12,482 tok/s. |
-| **Single-query latency (ANE)** | **2.58 ms** | **2.11 ms** | 24-token query in the 32-token ANE graph; OpenInfinity INT8 took 2.59 ms, FluidInference FP16 took 2.70–4.33 ms, and CoreAI BF16 took 9.38 ms. |
-| **Document OCR (`hetero2`, 2,000 docs)** | — | **32,569 tok/s** (17.2 s) | 2.75× faster than GPU-only (11,844 tok/s, 47.3 s) by packing short inputs across nine Pure-ANE buckets (`32..512`, 0 CPU/GPU ops). |
+| Host | Workload | Stock `mlx-vlm` 8-bit GPU | `fast-embeddinggemma-2` `gpu` | `fast-embeddinggemma-2` `ane` | **`fast-embeddinggemma-2` `hetero`** | Public Core ML (`OpenInfinity INT8` / `Fluid FP16`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| **Base M5 (24 GB)** | Warm single 24-tok query | `8.48 ms` | `5.02 ms` (`1.7×` stock) | **`2.58 ms`** (`3.3×` stock) | ANE-routed | `2.59 ms` / `4.33 ms` (`CoreAI 9.38 ms`) |
+| **Base M5 (24 GB)** | Bulk text throughput | `64.91 docs/s` (Tier-1 `1.09` EOT) | `30,430 tok/s` | `21,888 tok/s` | **`49,106 tok/s`** (`48,803` 2K corpus) | `14,945` / `14,187 tok/s` (`CoreAI 12,482`) |
+| **M4 Pro (48 GB)** | Warm single 24-tok query | `8.39 ms` | `7.72 ms` (`1.1×` stock) | **`2.08–2.11 ms`** (`4.0×` stock) | ANE-routed | `2.59 ms` / `2.70 ms` |
+| **M4 Pro (48 GB)** | Bulk text throughput *(2026-11-24 contended)* | `46.05 docs/s` (Tier-1 `0.75` EOT) | `17,936 tok/s` | `21,445 tok/s` | **`36,809 tok/s`** (`38,517` 2K quiet) | `14,294` / `14,251 tok/s` |
+| **M4 Pro (48 GB)** | Document OCR (2,000 docs, `hetero2`) | — | `11,844 tok/s` (`47.3 s`) | — | **`32,569 tok/s`** (`17.2 s`, `2.75×` GPU) | — |
 
-Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum cosine similarity against the FP16 reference is `0.999998` on GPU, `0.999728` in `hetero2`, and `0.999887` on a single 24-token ANE query.
+Across a 64-document verification fixture (`embeddinggemma-2 verify`), minimum cosine similarity against the FP16 reference is `0.999998` on GPU, `0.999728` in `hetero2`, and `0.999887` on a single 24-token ANE query. [Dual-Mac receipt](../../docs/benchmarks/dual-mac-suite-20261124.json)
 
 ### 3. Optional lazy image encoding, CPU prefetch & cross-modal retrieval
 
