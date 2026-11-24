@@ -96,6 +96,7 @@ Pre-compiled Core ML ANE bundles and pre-quantized MLX checkpoints eliminate loc
 | `fast-pplx` | [`mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane`](https://huggingface.co/mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane) | 4-stage `W8A16` balanced Core ML ANE bundles (`64..512`) + FP16 weights + mmap `embed_tokens` |
 | `fast-embeddinggemma-2` | [`mikewolfd/embeddinggemma-2-coreml-ane`](https://huggingface.co/mikewolfd/embeddinggemma-2-coreml-ane) | 9 packed `W8A16` ANE bundles (`32..512`) + 3 CPU-SME bundles + FP16 weights + tokenizer |
 | `fast-bge-small` | [`mikewolfd/bge-small-en-v1.5-coreml-ane`](https://huggingface.co/mikewolfd/bge-small-en-v1.5-coreml-ane) | 9 FP16 Pure-ANE buckets (`s16..s512`) + weights + tokenizer |
+| `fast-gemma4` | [`mikewolfd/gemma-4-e2b-it-early14-coreml-ane`](https://huggingface.co/mikewolfd/gemma-4-e2b-it-early14-coreml-ane) | Stock `Early14` Core ML ANE prefill bundles (`fp16` + `w8`, `1,326` ANE ops) + `150K` vocab remap (LLM/MTP weights pull directly from upstream HF) |
 
 ## Acknowledgments
 

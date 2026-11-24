@@ -6,7 +6,7 @@ The engine uses the 262,144-token vocabulary shipped with the checkpoint. By def
 
 ## Quick start
 
-From the `fast-silicon` workspace root, install the package and prepare the model. This example runs on the GPU.
+From the `fast-silicon` workspace root, install the package and prepare the model. This example runs on the GPU (prebuilt optional `Early14` Core ML ANE bundles: [`mikewolfd/gemma-4-e2b-it-early14-coreml-ane`](https://huggingface.co/mikewolfd/gemma-4-e2b-it-early14-coreml-ane)).
 
 ```bash
 uv sync --python 3.13 --package fast-gemma4 --inexact
