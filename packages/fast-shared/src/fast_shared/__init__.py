@@ -86,8 +86,15 @@ from .fault_injection import (
     FaultInjectionResult,
     run_fault_injection_suite,
 )
-from .grammar import normalize_json_schema, safe_argmax_1d, sample_unconstrained, validate_json_against_schema
+from .grammar import (
+    detect_catastrophic_token_loop,
+    normalize_json_schema,
+    safe_argmax_1d,
+    sample_unconstrained,
+    validate_json_against_schema,
+)
 from .hf import DEFAULT_TOKENIZER_FILES, copy_tokenizer_files, resolve_hf_model_dir
+from .pld_drafter import OCRPLDDrafter, PromptLookupDrafter, filter_drafts_with_grammar
 from .hw_check import (
     SUPPORTED_APPLE_SILICON_PROFILES,
     TESTED_REFERENCE_HARDWARE,
@@ -159,6 +166,15 @@ _LAZY_MLX_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "should_use_mpp_int8_linear",
         "should_use_mpp_w4a8",
         "should_use_mpp_w8a8",
+    ),
+    ".mpp_linear": (
+        "MppBucketedLinearGroup",
+        "MppPackState",
+        "MppQuantizedLinear",
+        "resolve_mpp_env_bool",
+        "wrap_bucketed_group_if_mpp_eligible",
+        "wrap_linear_if_mpp_eligible",
+        "wrap_quantized_linears_with_mpp",
     ),
 }
 _LAZY_MLX_SYMBOL_MAP: dict[str, str] = {
@@ -371,8 +387,12 @@ __all__ = [
     "MIN_SHARED_PREFIX_TOKENS",
     "ManagedHTTPServer",
     "MappedEmbedding",
+    "MppBucketedLinearGroup",
+    "MppPackState",
+    "MppQuantizedLinear",
     "MemoryAdaptation",
     "MemoryPressureLevel",
+    "OCRPLDDrafter",
     "OpenAIChatAdapter",
     "PackedEncoderBatch",
     "PackedSegmentSpan",
@@ -381,6 +401,7 @@ __all__ = [
     "ParquetEmbedSummary",
     "ParquetExtractSummary",
     "ProfileMode",
+    "PromptLookupDrafter",
     "QuantizedKVCache",
     "SUPPORTED_APPLE_SILICON_PROFILES",
     "ScoreMode",
@@ -437,6 +458,7 @@ __all__ = [
     "default_roofline_ceilings",
     "dequantize_int8_symmetric",
     "detect_apple10_d256_force_fused",
+    "detect_catastrophic_token_loop",
     "dispatch_chat_completion",
     "dispatch_completion",
     "embed_parquet",
@@ -452,6 +474,7 @@ __all__ = [
     "extract_jsonl",
     "extract_parquet",
     "extract_request_param",
+    "filter_drafts_with_grammar",
     "find_common_prefix_len",
     "format_hardware_summary",
     "format_hardware_warning",
@@ -511,6 +534,7 @@ __all__ = [
     "resolve_index_spec",
     "resolve_input_files",
     "resolve_llm_text_column",
+    "resolve_mpp_env_bool",
     "resolve_text_column",
     "run_deferred_retries",
     "run_deferred_retries_async",
@@ -542,6 +566,9 @@ __all__ = [
     "validate_json_against_schema",
     "warn_if_untested_hardware",
     "wired_limit",
+    "wrap_bucketed_group_if_mpp_eligible",
+    "wrap_linear_if_mpp_eligible",
+    "wrap_quantized_linears_with_mpp",
 ]
 
 

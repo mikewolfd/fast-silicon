@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from fast_shared.hw_check import supports_apple10_nax
-from fast_shared.kv_quant import SpecBucketedLinearGroup
 import fast_shared.metal_mpp_int8 as _metal_mpp_int8
 from fast_shared.metal_mpp_int8 import (
     mpp_quantized_linear,
     pack_affine_weights_for_mpp_i8,
     quantize_activations_i8_k64,
 )
-from fast_shared.runtime_lessons import sample_host_memory
+import fast_shared.mpp_linear as _shared_mpp
+from fast_shared.mpp_linear import resolve_mpp_env_bool
 
-_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_ORIG_PACK_FN = pack_affine_weights_for_mpp_i8
+_ORIG_QUANT_FN = quantize_activations_i8_k64
+_ORIG_MPP_LINEAR_FN = mpp_quantized_linear
+
 _FALSY: frozenset[str] = frozenset({"0", "false", "no", "off"})
 
 # Empirically calibrated Apple10 NAX thresholds (Base M5 24 GB + M4 Pro 48 GB parity/Cat-4 suite):
@@ -33,18 +36,6 @@ _MIN_DIM_MEDIUM = 1024
 _MAX_DIM_MEDIUM = 3584
 _MIN_MACS_MEDIUM = 3_600_000
 _MIN_M_W8A8_MEDIUM = 128
-
-
-def _parse_env_bool(name: str) -> bool | None:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return None
-    norm = raw.strip().lower()
-    if norm in _TRUTHY:
-        return True
-    if norm in _FALSY:
-        return False
-    return None
 
 
 def resolve_qwen_mpp_mode(
@@ -69,7 +60,7 @@ def resolve_qwen_mpp_mode(
     if raw_mode in ("w4a8", "4bit", "w4"):
         return True, False
     for env_name in ("FAST_SILICON_QWEN3_MPP_W8A8", "FAST_SILICON_MPP_W8A8"):
-        parsed = _parse_env_bool(env_name)
+        parsed = resolve_mpp_env_bool(env_name)
         if parsed is not None:
             return True, parsed
     return True, False
@@ -94,6 +85,15 @@ def _w4a8_min_m(k: int, n: int) -> int | None:
     return None
 
 
+def _qwen_min_m_fn(k: int, n: int, bits: int) -> int | None:
+    b = int(bits)
+    if b == 4:
+        return _w4a8_min_m(int(k), int(n))
+    if b == 8:
+        return _w8a8_min_m(int(k), int(n))
+    return None
+
+
 def is_eligible_qwen_mpp_shape(
     k: int,
     n: int,
@@ -105,12 +105,7 @@ def is_eligible_qwen_mpp_shape(
     """Return True if static weight shape/format can ever accelerate under Qwen3 Apple10 MPP prefill."""
     if str(mode) != "affine" or int(group_size) != 64:
         return False
-    b = int(bits)
-    if b == 4:
-        return _w4a8_min_m(int(k), int(n)) is not None
-    if b == 8:
-        return _w8a8_min_m(int(k), int(n)) is not None
-    return False
+    return _qwen_min_m_fn(int(k), int(n), int(bits)) is not None
 
 
 def should_use_qwen_mpp_linear(
@@ -135,29 +130,13 @@ def should_use_qwen_mpp_linear(
     if str(mode) != "affine" or int(group_size) != 64:
         return False
     b = int(bits)
-    m_i, k_i, n_i = int(m), int(k), int(n)
-    if b == 4:
-        min_m = _w4a8_min_m(k_i, n_i)
-        return min_m is not None and m_i >= min_m
-    if b == 8:
-        if not w8_on:
-            return False
-        min_m = _w8a8_min_m(k_i, n_i)
-        return min_m is not None and m_i >= min_m
-    return False
+    if b == 8 and not w8_on:
+        return False
+    min_m = _qwen_min_m_fn(int(k), int(n), b)
+    return min_m is not None and int(m) >= min_m
 
 
-def _default_pack_budgets() -> tuple[int, int]:
-    try:
-        host_ram_bytes = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
-    except Exception:
-        host_ram_bytes = 24 * (1 << 30)
-    if 0 < host_ram_bytes <= 32 * (1 << 30):
-        return int(0.28 * host_ram_bytes), int(0.15 * host_ram_bytes)
-    return int(0.35 * host_ram_bytes), int(0.12 * host_ram_bytes)
-
-
-class QwenMppPackState:
+class QwenMppPackState(_shared_mpp.MppPackState):
     """Shared lazy weight-pack cache, budget guard, and group activation-quantization slot."""
 
     def __init__(
@@ -169,28 +148,14 @@ class QwenMppPackState:
         max_pack_bytes: int | None = None,
         min_avail_bytes: int | None = None,
     ) -> None:
-        def_max, def_min = _default_pack_budgets()
-        self.enabled = bool(enabled and apple10_nax)
-        self.apple10_nax = bool(apple10_nax)
-        self.allow_w8a8 = bool(allow_w8a8)
-        self.max_pack_bytes = def_max if max_pack_bytes is None else max(0, int(max_pack_bytes))
-        self.min_avail_bytes = def_min if min_avail_bytes is None else max(0, int(min_avail_bytes))
-        self.packed_weights: dict[int, tuple[mx.array, mx.array, int]] = {}
-        self.packed_bytes: int = 0
-        self.active_shared_xq: tuple[int, int, tuple[mx.array, mx.array]] | None = None
-        self.w4_calls: int = 0
-        self.w8_calls: int = 0
-        self.shared_quant_calls: int = 0
-        self.budget_skips: int = 0
-
-    @staticmethod
-    def estimate_pack_bytes(k: int, n: int, *, bits: int = 8) -> int:
-        if bool(getattr(_metal_mpp_int8, "PACKS_META_ONLY", False)):
-            return 4 * int(n) * (int(k) // 64)
-        return (int(k) * int(n) * int(bits)) // 8 + 2 * int(n) * (int(k) // 64)
-
-    def can_pack_estimate(self, k: int, n: int, *, bits: int = 8) -> bool:
-        return (self.packed_bytes + self.estimate_pack_bytes(k, n, bits=bits)) <= self.max_pack_bytes
+        super().__init__(
+            apple10_nax=apple10_nax,
+            allow_w8a8=allow_w8a8,
+            enabled=enabled,
+            min_m_fn=_qwen_min_m_fn,
+            max_pack_bytes=max_pack_bytes,
+            min_avail_bytes=min_avail_bytes,
+        )
 
     def get_or_pack(
         self,
@@ -200,239 +165,92 @@ class QwenMppPackState:
         k: int,
         n: int,
     ) -> tuple[mx.array, mx.array] | None:
-        mid = id(lin)
-        cached = self.packed_weights.get(mid)
-        if cached is not None:
-            return cached[0], cached[1]
-        est_bytes = self.estimate_pack_bytes(k, n, bits=bits)
-        if self.packed_bytes + est_bytes > self.max_pack_bytes:
-            self.budget_skips += 1
-            return None
-        try:
-            snap = sample_host_memory()
-            avail = int(getattr(snap, "available_bytes", 0) or 0)
-            if avail > 0 and (avail - est_bytes) < self.min_avail_bytes:
-                self.budget_skips += 1
-                return None
-        except Exception:
-            pass
-        wp, wm = pack_affine_weights_for_mpp_i8(
-            mx.stop_gradient(lin.weight),
-            mx.stop_gradient(lin.scales),
-            mx.stop_gradient(lin.biases),
-            bits=int(bits),
-            group_size=64,
-        )
-        mx.eval(wp, wm)  # guard: allow-eval
-        actual_bytes = int(wp.nbytes) + int(wm.nbytes)
-        self.packed_weights[mid] = (wp, wm, actual_bytes)
-        self.packed_bytes += actual_bytes
-        return wp, wm
-
-    def clear(self) -> int:
-        released = len(self.packed_weights)
-        self.packed_weights.clear()
-        self.packed_bytes = 0
-        self.active_shared_xq = None
-        return released
+        if pack_affine_weights_for_mpp_i8 is not _ORIG_PACK_FN:
+            orig = _shared_mpp.pack_affine_weights_for_mpp_i8
+            _shared_mpp.pack_affine_weights_for_mpp_i8 = pack_affine_weights_for_mpp_i8
+            try:
+                return super().get_or_pack(lin, bits=bits, k=k, n=n)
+            finally:
+                _shared_mpp.pack_affine_weights_for_mpp_i8 = orig
+        return super().get_or_pack(lin, bits=bits, k=k, n=n)
 
 
-class MppQuantizedLinear(nn.Module):
-    """Wrap `nn.QuantizedLinear` to accelerate large Apple10 prefill GEMMs while preserving decode and autograd VJP."""
-
-    def __init__(
-        self,
-        linear: nn.QuantizedLinear,
-        *,
-        bits: int,
-        k: int,
-        n: int,
-        state: QwenMppPackState,
-    ) -> None:
-        super().__init__()
-        self.linear = linear
-        self._mpp_bits = int(bits)
-        self._mpp_k = int(k)
-        self._mpp_n = int(n)
-        self._mpp_state = state
-
-        @mx.custom_function
-        def _mpp_op(x_in: mx.array) -> mx.array:
-            lin = self.linear
-            packed_ent = self._mpp_state.packed_weights.get(id(lin))
-            packed = (packed_ent[0], packed_ent[1]) if packed_ent is not None else None
-            m_i = x_in.size // self._mpp_k
-            shared_slot = self._mpp_state.active_shared_xq
-            pre_xq = (
-                shared_slot[2]
-                if (shared_slot is not None and shared_slot[0] == m_i and shared_slot[1] == self._mpp_k)
-                else None
-            )
-            bias_arr = lin.bias if "bias" in lin else None
-            out = mpp_quantized_linear(
-                x_in,
-                mx.stop_gradient(lin.weight),
-                mx.stop_gradient(lin.scales),
-                mx.stop_gradient(lin.biases),
-                bits=self._mpp_bits,
-                group_size=64,
-                mode="affine",
-                bias=mx.stop_gradient(bias_arr) if bias_arr is not None else None,
-                out_dtype=x_in.dtype,
-                packed_weights=packed,
-                prequantized_x=pre_xq,
-            )
-            return out
-
-        @_mpp_op.vjp
-        def _mpp_vjp(_primals: Any, cotangent: mx.array, _outputs: Any) -> tuple[mx.array]:
-            lin = self.linear
-            dx = mx.quantized_matmul(
-                cotangent,
-                mx.stop_gradient(lin.weight),
-                scales=mx.stop_gradient(lin.scales),
-                biases=mx.stop_gradient(lin.biases),
-                transpose=False,
-                group_size=64,
-                bits=self._mpp_bits,
-                mode="affine",
-            )
-            return (dx,)
-
-        self._mpp_op = _mpp_op
-
-    @property
-    def weight(self) -> mx.array:
-        return self.linear.weight
-
-    @property
-    def scales(self) -> mx.array:
-        return self.linear.scales
-
-    @property
-    def biases(self) -> Any:
-        return getattr(self.linear, "biases", None)
-
-    @property
-    def bias(self) -> Any:
-        return self.linear.bias if "bias" in self.linear else None
-
-    @property
-    def bits(self) -> int:
-        return int(self.linear.bits)
-
-    @property
-    def group_size(self) -> int:
-        return int(self.linear.group_size)
-
-    @property
-    def mode(self) -> str:
-        return str(self.linear.mode)
-
-    def _qualifies_for_m(self, m: int) -> bool:
-        st = self._mpp_state
-        return should_use_qwen_mpp_linear(
-            m,
-            self._mpp_k,
-            self._mpp_n,
-            bits=self._mpp_bits,
-            group_size=64,
-            mode="affine",
-            apple10_nax=st.apple10_nax,
-            allow_w8a8=st.allow_w8a8,
-            enabled=st.enabled,
-        )
+class MppQuantizedLinear(_shared_mpp.MppQuantizedLinear):
+    """Delegate `MppQuantizedLinear` to `fast_shared.mpp_linear` while honoring local monkeypatches."""
 
     def __call__(self, x: mx.array) -> mx.array:
-        st = self._mpp_state
-        if not st.enabled:
-            return self.linear(x)
-        m = x.size // self._mpp_k if (x.size > 0 and self._mpp_k > 0) else 0
-        if not self._qualifies_for_m(m):
-            return self.linear(x)
-        packed = st.get_or_pack(self.linear, bits=self._mpp_bits, k=self._mpp_k, n=self._mpp_n)
-        if packed is None:
-            return self.linear(x)
-        if self._mpp_bits == 4:
-            st.w4_calls += 1
-        else:
-            st.w8_calls += 1
-        return self._mpp_op(x)
+        if mpp_quantized_linear is not _ORIG_MPP_LINEAR_FN:
+            orig = _shared_mpp.mpp_quantized_linear
+            _shared_mpp.mpp_quantized_linear = mpp_quantized_linear
+            try:
+                return super().__call__(x)
+            finally:
+                _shared_mpp.mpp_quantized_linear = orig
+        return super().__call__(x)
 
 
-class MppBucketedLinearGroup(nn.Module):
-    """Wrap multi-bucket `SpecBucketedLinearGroup` so qualifying buckets share one `i8` activation quant pass."""
-
-    def __init__(self, group: SpecBucketedLinearGroup, state: QwenMppPackState) -> None:
-        super().__init__()
-        self.group = group
-        self._state = state
-
-    @property
-    def buckets(self) -> list[Any]:
-        return self.group.buckets
-
-    def set_lora_slices(self, slices: Any) -> None:
-        self.group.set_lora_slices(slices)
-
-    def clear_lora(self) -> None:
-        self.group.clear_lora()
+class MppBucketedLinearGroup(_shared_mpp.MppBucketedLinearGroup):
+    """Delegate `MppBucketedLinearGroup` to `fast_shared.mpp_linear` while honoring local monkeypatches."""
 
     def __call__(self, x: mx.array) -> dict[str, mx.array]:
-        st = self._state
-        if not st.enabled or st.active_shared_xq is not None or len(self.group.buckets) < 2:
-            return self.group(x)
-        k = int(x.shape[-1])
-        if k <= 0 or (k % 64) != 0:
-            return self.group(x)
-        m = x.size // k if x.size > 0 else 0
-        if m < _MIN_M_W8A8_LARGE:
-            return self.group(x)
-        elig = 0
-        for bucket in self.group.buckets:
-            if isinstance(bucket, MppQuantizedLinear) and bucket._mpp_k == k and bucket._qualifies_for_m(m):
-                if id(bucket.linear) in st.packed_weights or st.can_pack_estimate(
-                    k, bucket._mpp_n, bits=bucket._mpp_bits
-                ):
-                    elig += 1
-        if elig < 2:
-            return self.group(x)
-        st.shared_quant_calls += 1
-        xq, xm = quantize_activations_i8_k64(mx.stop_gradient(x).reshape(m, k))
-        st.active_shared_xq = (m, k, (xq, xm))
-        try:
-            return self.group(x)
-        finally:
-            st.active_shared_xq = None
+        if quantize_activations_i8_k64 is not _ORIG_QUANT_FN or mpp_quantized_linear is not _ORIG_MPP_LINEAR_FN:
+            orig_q = _shared_mpp.quantize_activations_i8_k64
+            orig_m = _shared_mpp.mpp_quantized_linear
+            _shared_mpp.quantize_activations_i8_k64 = quantize_activations_i8_k64
+            _shared_mpp.mpp_quantized_linear = mpp_quantized_linear
+            try:
+                return super().__call__(x)
+            finally:
+                _shared_mpp.quantize_activations_i8_k64 = orig_q
+                _shared_mpp.mpp_quantized_linear = orig_m
+        return super().__call__(x)
 
 
-def _wrap_linear_if_eligible(mod: Any, state: QwenMppPackState) -> Any:
-    if not isinstance(mod, nn.QuantizedLinear):
-        return mod
-    if getattr(mod, "biases", None) is None:
-        return mod
-    bits = int(getattr(mod, "bits", 0))
-    gs = int(getattr(mod, "group_size", 0))
-    mode = str(getattr(mod, "mode", ""))
-    if bits not in (4, 8) or gs != 64 or mode != "affine":
-        return mod
-    k = int(mod.scales.shape[-1]) * 64
-    n = int(mod.weight.shape[0])
-    if not is_eligible_qwen_mpp_shape(k, n, bits=bits, group_size=gs, mode=mode):
-        return mod
-    return MppQuantizedLinear(mod, bits=bits, k=k, n=n, state=state)
+def wrap_linear_if_mpp_eligible(
+    mod: Any,
+    state: _shared_mpp.MppPackState,
+    *,
+    is_eligible_fn: Callable[[int, int, int], bool] | None = None,
+    qualifies_fn: Callable[[int, int, int, int], bool] | None = None,
+) -> Any:
+    """Delegate linear wrapping to `fast_shared.mpp_linear.wrap_linear_if_mpp_eligible`."""
+    elig = is_eligible_fn or (lambda k, n, b: is_eligible_qwen_mpp_shape(k, n, bits=b))
+    res = _shared_mpp.wrap_linear_if_mpp_eligible(
+        mod,
+        state,
+        is_eligible_fn=elig,
+        qualifies_fn=qualifies_fn,
+    )
+    if type(res) is _shared_mpp.MppQuantizedLinear:
+        res.__class__ = MppQuantizedLinear
+    return res
 
 
-def _wrap_group_if_eligible(group: Any, state: QwenMppPackState) -> Any:
+def wrap_bucketed_group_if_mpp_eligible(
+    group: Any,
+    state: _shared_mpp.MppPackState,
+    *,
+    is_eligible_fn: Callable[[int, int, int], bool] | None = None,
+    qualifies_fn: Callable[[int, int, int, int], bool] | None = None,
+    min_shared_m: int = _MIN_M_W8A8_LARGE,
+) -> Any:
+    """Delegate bucketed-group wrapping to `fast_shared.mpp_linear.wrap_bucketed_group_if_mpp_eligible`."""
     if isinstance(group, MppBucketedLinearGroup):
         return group
-    if not isinstance(group, SpecBucketedLinearGroup):
-        return group
-    group.buckets = [_wrap_linear_if_eligible(b, state) for b in group.buckets]
-    mpp_count = sum(1 for b in group.buckets if isinstance(b, MppQuantizedLinear))
-    if mpp_count >= 2:
-        return MppBucketedLinearGroup(group, state)
-    return group
+    elig = is_eligible_fn or (lambda k, n, b: is_eligible_qwen_mpp_shape(k, n, bits=b))
+    res = _shared_mpp.wrap_bucketed_group_if_mpp_eligible(
+        group,
+        state,
+        is_eligible_fn=elig,
+        qualifies_fn=qualifies_fn,
+        min_shared_m=min_shared_m,
+    )
+    if type(res) is _shared_mpp.MppBucketedLinearGroup:
+        for b in res.group.buckets:
+            if type(b) is _shared_mpp.MppQuantizedLinear:
+                b.__class__ = MppQuantizedLinear
+        res.__class__ = MppBucketedLinearGroup
+    return res
 
 
 def install_qwen_mpp_linears(
@@ -461,27 +279,27 @@ def install_qwen_mpp_linears(
         mlp = getattr(layer, "mlp", None)
         if mlp is not None:
             if hasattr(mlp, "gate_up"):
-                mlp.gate_up = _wrap_group_if_eligible(mlp.gate_up, state)
+                mlp.gate_up = wrap_bucketed_group_if_mpp_eligible(mlp.gate_up, state)
             if hasattr(mlp, "down_proj"):
-                mlp.down_proj = _wrap_linear_if_eligible(mlp.down_proj, state)
+                mlp.down_proj = wrap_linear_if_mpp_eligible(mlp.down_proj, state)
             sh_exp = getattr(mlp, "shared_expert", None)
             if sh_exp is not None:
                 if hasattr(sh_exp, "gate_up"):
-                    sh_exp.gate_up = _wrap_group_if_eligible(sh_exp.gate_up, state)
+                    sh_exp.gate_up = wrap_bucketed_group_if_mpp_eligible(sh_exp.gate_up, state)
                 if hasattr(sh_exp, "down_proj"):
-                    sh_exp.down_proj = _wrap_linear_if_eligible(sh_exp.down_proj, state)
+                    sh_exp.down_proj = wrap_linear_if_mpp_eligible(sh_exp.down_proj, state)
         lin_attn = getattr(layer, "linear_attn", None)
         if lin_attn is not None:
             if hasattr(lin_attn, "in_group"):
-                lin_attn.in_group = _wrap_group_if_eligible(lin_attn.in_group, state)
+                lin_attn.in_group = wrap_bucketed_group_if_mpp_eligible(lin_attn.in_group, state)
             if hasattr(lin_attn, "out_proj"):
-                lin_attn.out_proj = _wrap_linear_if_eligible(lin_attn.out_proj, state)
+                lin_attn.out_proj = wrap_linear_if_mpp_eligible(lin_attn.out_proj, state)
         self_attn = getattr(layer, "self_attn", None)
         if self_attn is not None:
             if hasattr(self_attn, "qkvg_group"):
-                self_attn.qkvg_group = _wrap_group_if_eligible(self_attn.qkvg_group, state)
+                self_attn.qkvg_group = wrap_bucketed_group_if_mpp_eligible(self_attn.qkvg_group, state)
             if hasattr(self_attn, "o_proj"):
-                self_attn.o_proj = _wrap_linear_if_eligible(self_attn.o_proj, state)
+                self_attn.o_proj = wrap_linear_if_mpp_eligible(self_attn.o_proj, state)
     return state
 
 

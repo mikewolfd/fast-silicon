@@ -2358,7 +2358,7 @@ def test_hetero2_apple10_preseed_no_starvation_cpu(tmp_path: Path) -> None:
             pass
 
     def _make_short_batch(n_docs: int) -> list[list[int]]:
-        return [[100 + i] + [4] * ((i % 6) + 1) for i in range(n_docs)]
+        return [[100 + i] + [4] * (32 + (i % 6)) for i in range(n_docs)]
 
     def _assert_exact_rows(vecs: np.ndarray, toks: list[list[int]]) -> None:
         assert vecs.shape == (len(toks), 8)
@@ -2421,6 +2421,230 @@ def test_hetero2_apple10_preseed_no_starvation_cpu(tmp_path: Path) -> None:
         assert st_20["gpu_items"] >= 14
         assert st_20["ane_items"] == 6
         assert st_20["gpu_items"] + st_20["ane_items"] == 20
+
+
+def test_should_inline_gpu_short_batch_and_apple10_tiny_query_routing(tmp_path: Path) -> None:
+    """Verify `_should_inline_gpu_short_batch` and M5 tiny-batch inline GPU dispatch without thread spawn."""
+    from fast_pplx.engine import FastPplx, _should_inline_gpu_short_batch
+
+    tiny_8 = [(i, [4] * 12) for i in range(8)]
+    assert _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    assert not _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=False, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    assert not _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=True, contextual=True, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    assert not _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=True, contextual=False, eff_mode="hetero", has_gpu=True, has_long_items=False
+    )
+    assert not _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=False, has_long_items=False
+    )
+    assert not _should_inline_gpu_short_batch(
+        8, tiny_8, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=True
+    )
+    # >32 tokens per item or >1024 total tokens -> False on multi-item M5 batch
+    over_32_tok = [(0, [4] * 33), (1, [4] * 8)]
+    assert not _should_inline_gpu_short_batch(
+        2, over_32_tok, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    exact_1024 = [(i, [4] * 32) for i in range(32)]
+    assert _should_inline_gpu_short_batch(
+        32, exact_1024, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    over_1024 = [(i, [4] * 32) for i in range(32)] + [(32, [4])]
+    assert not _should_inline_gpu_short_batch(
+        33, over_1024, is_apple10=True, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+    # n_items == 1 fast path works regardless of is_apple10 or >32 tok length
+    assert _should_inline_gpu_short_batch(
+        1, [(0, [4] * 64)], is_apple10=False, contextual=False, eff_mode="hetero2", has_gpu=True, has_long_items=False
+    )
+
+    tok = ContextualTokenizer(_write_synthetic_tokenizer(tmp_path), DEFAULT_PPLX_CONFIG)
+
+    class _InlineGPU:
+        max_seq_len = 32768
+
+        def encode_tokens(self, token_lists, *, batch_size=16, dimensions=None, output_dtype="float32", normalize=True, apply_tanh=True):
+            del batch_size, output_dtype, normalize, apply_tanh
+            d = int(dimensions or 8)
+            out = np.zeros((len(token_lists), d), dtype=np.float32)
+            for idx, ids in enumerate(token_lists):
+                out[idx, 0] = float(ids[0])
+                out[idx, 1] = float(len(ids))
+            return out
+
+        def close(self) -> None:
+            pass
+
+    class _InlineANE:
+        caps = (64, 128)
+        max_cap = 128
+
+        def run_buckets(self, buckets, *, out_dim, apply_tanh_int8, apply_l2_norm):
+            del apply_tanh_int8, apply_l2_norm
+            out = []
+            for bkt in buckets:
+                live = [t for t in bkt.targets if t.end > t.start]
+                mat = np.zeros((len(live), out_dim), dtype=np.float32)
+                for row_i, tgt in enumerate(live):
+                    mat[row_i, 0] = float(bkt.token_ids[tgt.start])
+                    mat[row_i, 1] = float(tgt.end - tgt.start)
+                out.append((bkt, mat))
+            return out
+
+        def close(self) -> None:
+            pass
+
+    tiny_batch = [[10 + i] + [4] * 7 for i in range(8)]
+    with FastPplx(
+        home=tmp_path,
+        mode="hetero2",
+        dimensions=8,
+        _gpu_backend=_InlineGPU(),
+        _ane_backend=_InlineANE(),
+        _tokenizer=tok,
+    ) as eng:
+        eng.runtime_telemetry["is_apple10"] = True
+        orig_thread = threading.Thread
+
+        def _no_thread(*_a, **_kw):
+            raise AssertionError("M5 tiny non-contextual batch must run inline without threads")
+
+        threading.Thread = _no_thread  # type: ignore[assignment]
+        try:
+            out_m5 = eng.encode_tokens(tiny_batch, dimensions=8, normalize=False, apply_tanh=False)
+        finally:
+            threading.Thread = orig_thread  # type: ignore[assignment]
+        assert out_m5.shape == (8, 8)
+        assert eng.last_stats["gpu_items"] == 8
+        assert eng.last_stats["gpu_stolen_items"] == 8
+        assert eng.last_stats["ane_items"] == 0
+
+        eng.runtime_telemetry["is_apple10"] = False
+        out_m4 = eng.encode_tokens(tiny_batch, dimensions=8, normalize=False, apply_tanh=False)
+        assert out_m4.shape == (8, 8)
+        assert eng.last_stats["ane_items"] >= 1
+        assert eng.last_stats["gpu_items"] + eng.last_stats["ane_items"] == 8
+
+
+def test_pplx_mpp_min_m_and_wrap_quantized_linears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `_pplx_mpp_min_m`, `FAST_SILICON_PPLX_MPP` gate, and `contextual_projection` exclusion."""
+    import mlx.nn as nn
+    from fast_pplx.gpu import PplxModel, _pplx_mpp_min_m, _quantize_pplx_linear_weights
+    from fast_shared.mpp_linear import MppQuantizedLinear, resolve_mpp_env_bool, wrap_quantized_linears_with_mpp
+
+    assert _pplx_mpp_min_m(1024, 3584, 8) == 128
+    assert _pplx_mpp_min_m(3584, 1024, 8) == 128
+    assert _pplx_mpp_min_m(1024, 7168, 8) == 128
+    assert _pplx_mpp_min_m(1024, 5120, 8) == 128
+    assert _pplx_mpp_min_m(1024, 8224, 8) is None
+    assert _pplx_mpp_min_m(2048, 1024, 8) is None
+    assert _pplx_mpp_min_m(1024, 3584, 4) is None
+    assert _pplx_mpp_min_m(1020, 3584, 8) is None
+
+    prev_dev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        cfg = PplxConfig(
+            hidden_size=1024,
+            num_hidden_layers=2,
+            intermediate_size=3584,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=256,
+            rope_dim=64,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            vocab_size=64,
+            embedding_dim=1024,
+            layer_types=("linear_attention", "full_attention"),
+        )
+        model = PplxModel(cfg, has_embed_module=False)
+        model.set_dtype(mx.float16)
+        _quantize_pplx_linear_weights(model, bits=8, group_size=64)
+        mx.eval(model.parameters())
+
+        # Also add a synthetic QuantizedLinear contextual_projection to verify skip_attr_substrings works even if quantized.
+        syn = nn.Module()
+        syn.qkv_proj = nn.QuantizedLinear(1024, 3584, bias=False, group_size=64, bits=8)
+        syn.small_proj = nn.QuantizedLinear(1024, 1024, bias=False, group_size=64, bits=8)
+        syn.contextual_projection = nn.QuantizedLinear(1024, 3584, bias=False, group_size=64, bits=8)
+        mx.eval(syn.parameters())
+
+        monkeypatch.setenv("FAST_SILICON_PPLX_MPP", "0")
+        env_off = resolve_mpp_env_bool("FAST_SILICON_PPLX_MPP")
+        assert env_off is False
+        st_off = wrap_quantized_linears_with_mpp(
+            syn,
+            min_m_fn=_pplx_mpp_min_m,
+            apple10_nax=True,
+            allow_w8a8=True,
+            enabled=bool(env_off),
+            skip_attr_substrings=("contextual_projection",),
+        )
+        assert st_off.enabled is False
+        assert isinstance(syn.qkv_proj, nn.QuantizedLinear)
+
+        monkeypatch.delenv("FAST_SILICON_PPLX_MPP", raising=False)
+        env_on = resolve_mpp_env_bool("FAST_SILICON_PPLX_MPP")
+        assert env_on is None
+        st_on = wrap_quantized_linears_with_mpp(
+            model,
+            min_m_fn=_pplx_mpp_min_m,
+            apple10_nax=True,
+            allow_w8a8=True,
+            enabled=True,
+            skip_attr_substrings=("contextual_projection",),
+        )
+        assert st_on.enabled is True
+        assert isinstance(model.layers[0].mlp.gate_up_proj, MppQuantizedLinear)
+        assert isinstance(model.layers[0].mlp.down_proj, MppQuantizedLinear)
+        assert isinstance(model.layers[1].self_attn.qkv_proj, MppQuantizedLinear)
+        assert isinstance(model.layers[1].self_attn.o_proj, nn.QuantizedLinear)
+        assert isinstance(model.layers[0].linear_attn.out_proj, nn.QuantizedLinear)
+        assert isinstance(model.contextual_projection, nn.Linear)
+
+        st_syn = wrap_quantized_linears_with_mpp(
+            syn,
+            min_m_fn=_pplx_mpp_min_m,
+            apple10_nax=True,
+            allow_w8a8=True,
+            enabled=True,
+            skip_attr_substrings=("contextual_projection",),
+        )
+        assert st_syn.enabled is True
+        assert isinstance(syn.qkv_proj, MppQuantizedLinear)
+        assert isinstance(syn.small_proj, nn.QuantizedLinear)
+        assert isinstance(syn.contextual_projection, nn.QuantizedLinear)
+
+        # Verify FastPplxGPU.close() invokes _mpp_state.clear() safely
+        import fast_pplx.gpu as pplx_gpu_mod
+        from fast_pplx.gpu import FastPplxGPU
+
+        cleared = {"n": 0}
+        orig_clear = st_on.clear
+
+        def _spy_clear() -> int:
+            cleared["n"] += 1
+            return orig_clear()
+
+        monkeypatch.setattr(st_on, "clear", _spy_clear)
+        monkeypatch.setattr(pplx_gpu_mod, "clear_mlx_arena", lambda *_a, **_kw: None)
+        gpu_stub = FastPplxGPU.__new__(FastPplxGPU)
+        gpu_stub._mpp_state = st_on
+        gpu_stub.close()
+        assert cleared["n"] == 1
+    finally:
+        mx.set_default_device(prev_dev)
+
 
 
 

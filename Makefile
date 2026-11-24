@@ -66,6 +66,7 @@ test-cpu: hw-check
 		packages/fast-gpt-oss/tests/test_v23_track_c_gpt_oss_regressions.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_cpu.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_gdn_state_cpu.py \
+		packages/fast-qwen3/tests/test_fast_qwen3_rolling_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_regions_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_whitepatch_vocab_cpu.py \

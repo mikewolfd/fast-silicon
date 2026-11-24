@@ -20,12 +20,14 @@ from fast_shared.grammar import (
     GrammarHelper,
     apply_loop_breaker_penalties_1d,
     compute_loop_breaker_penalties,
+    detect_catastrophic_token_loop,
     normalize_json_schema,
     safe_argmax_1d,
     sample_unconstrained,
     validate_json_against_schema,
 )
 from fast_shared.kv_quant import KVMode, normalize_kv_mode
+from fast_shared.pld_drafter import PromptLookupDrafter, filter_drafts_with_grammar
 from fast_shared.prefix_tree import (
     DEFAULT_CHUNK_TOKENS,
     PrefixTree,
@@ -50,12 +52,12 @@ from .multimodal_batch import (
 )
 from .mtp_drafter import (
     Qwen3MtpDrafter,
-    draft_prompt_lookup_tokens,
     recommended_draft_k,
     should_use_speculative_qwen,
     verify_draft_sequence_b1,
 )
 from .paths import DEFAULT_HF_REPO, Qwen3Paths, resolve_paths
+from .rolling import RollingHybridCache, run_qwen3_decode_rolling
 from .tokenizer import (
     FastQwen3Tokenizer,
     QwenVocabRemapper,
@@ -138,6 +140,9 @@ def _safe_argmax_with_nan_guard(logits_2d: mx.array) -> mx.array:
     return am
 
 
+_ENABLE_ROLLING_AUTO: bool = False
+
+
 class FastQwen3Engine:
     """Unified Qwen3.5 / Qwen3.6 inference & structured-extraction engine (`M4` / `M5`)."""
 
@@ -193,12 +198,19 @@ class FastQwen3Engine:
         )
         if prefix_cache_mb is None or prefix_cache_mb == 0:
             tree_budget = 0
+            tree_admission_min_hits = 2
         elif str(prefix_cache_mb).strip().lower() == "auto":
             tree_budget = recommended_prefix_budget_bytes(host_ram_bytes)
+            tree_admission_min_hits = 2
         else:
             tree_budget = max(0, int(prefix_cache_mb)) << 20
+            tree_admission_min_hits = 1
         self.prefix_tree: PrefixTree | None = (
-            PrefixTree(chunk_tokens=DEFAULT_CHUNK_TOKENS, byte_budget=tree_budget)
+            PrefixTree(
+                chunk_tokens=DEFAULT_CHUNK_TOKENS,
+                byte_budget=tree_budget,
+                admission_min_hits=tree_admission_min_hits,
+            )
             if tree_budget > 0
             else None
         )
@@ -334,7 +346,11 @@ class FastQwen3Engine:
             return "q8" if self.kv_i8_mode else "bf16"
         mode_s = str(self.kv_i8_mode).strip().lower()
         if mode_s == "auto":
-            q_ctx_cutoff = 8192 if self._is_low_ram else 16384
+            q_ctx_cutoff = (
+                (16384 if self._is_low_ram else 32768)
+                if self._is_apple10
+                else (8192 if self._is_low_ram else 16384)
+            )
             pressure_cutoff = 262_144 if self._is_low_ram else 524_288
             bs = max(1, int(batch_size))
             ctx = max(1, int(kv_alloc))
@@ -390,6 +406,7 @@ class FastQwen3Engine:
         kv_alloc: int,
         use_kvi8: bool | str,
         limit: int,
+        sightings: int = 1,
     ) -> tuple[list[DeltaSlotCache | GrowingKVCache], int]:
         """Restore longest cached `PrefixTree` branch and atomically publish newly crossed `256`-tok chunks."""
         ptree = self.prefix_tree
@@ -399,6 +416,7 @@ class FastQwen3Engine:
 
         ids_list = [int(t) for t in token_ids]
         match = ptree.match(ids_list, limit=limit, needs_snapshot=True)
+        n_full_chunks = limit // ct
         if not match.is_empty and match.snapshot is not None:
             ptree.record(match, restored=True)
             cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
@@ -420,16 +438,33 @@ class FastQwen3Engine:
             start_pos = match.reused_tokens
             parent_key: str | None = match.keys[-1]
             depth = len(match.keys)
+            should_write = bool(ptree.should_write_snapshots()) and n_full_chunks > depth
         else:
-            ptree.record(match, restored=False)
             cache = self.model.make_cache(kv_step=kv_alloc, kv_i8=use_kvi8)
             start_pos = 0
             parent_key = None
             depth = 0
+            if n_full_chunks > 0:
+                admit_fn = getattr(ptree, "admit_prefix", None)
+                should_write = (
+                    bool(admit_fn(ids_list, profile="auto", sightings=sightings))
+                    if callable(admit_fn)
+                    else bool(ptree.should_write_snapshots())
+                )
+            else:
+                should_write = False
+            ptree.record(
+                match,
+                restored=False,
+                count_for_circuit_breaker=(
+                    should_write
+                    or ptree.circuit_breaker_open
+                    or getattr(ptree, "admission_min_hits", 1) <= 1
+                ),
+            )
 
         # Publish each newly crossed chunk atomically with its exact GDN snapshot (roll back if budget exceeded).
-        n_full_chunks = limit // ct
-        if ptree.should_write_snapshots() and n_full_chunks > depth:
+        if should_write and n_full_chunks > depth:
             for d in range(depth + 1, n_full_chunks + 1):
                 c_start = (d - 1) * ct
                 c_end = d * ct
@@ -493,7 +528,7 @@ class FastQwen3Engine:
         assert tail_buf is not None
         return tail_buf
 
-    def _lookup_or_build_prefix(self, prefix_ids: Sequence[int]) -> HybridPrefixSnapshot:
+    def _lookup_or_build_prefix(self, prefix_ids: Sequence[int], *, sightings: int = 1) -> HybridPrefixSnapshot:
         key = tuple(int(t) for t in prefix_ids)
         if key in self._prefix_cache:
             self._prefix_cache.move_to_end(key)
@@ -504,6 +539,7 @@ class FastQwen3Engine:
             kv_alloc=max(256, len(key) + 64),
             use_kvi8=use_kvi8,
             limit=max(0, len(key) - 1),
+            sightings=sightings,
         )
         tail = list(key[start_pos:])
         if tail:
@@ -623,7 +659,7 @@ class FastQwen3Engine:
     ) -> tuple[mx.array | None, dict[int, int], dict[int, np.ndarray]]:
         """Project active rows; evaluate `[M]` GPU argmax only when `eager_fp32=False`."""
         if not need_rows:
-            mx.eval(h_2d)  # guard: allow-eval
+            getattr(mx, "async_eval", mx.eval)(h_2d)
             return None, {}, {}
         if len(need_rows) == row_count:
             sl_raw = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
@@ -1000,12 +1036,15 @@ class FastQwen3Engine:
                 hidden_size=self.model.cfg.hidden_size,
                 is_moe=self.model.cfg.is_moe,
             )
-            and matcher is None
+            and (matcher is None or (speculative is True and hasattr(matcher, "deep_copy")))
             and not collect_telemetry
         )
 
+        old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
         mtp_cache = self.mtp_drafter.make_cache() if (use_spec and self.mtp_drafter is not None) else None
         history_ids = list(prompt_ids) + list(answer_ids)
+        def _decode_tokens(tids: Sequence[int]) -> str:
+            return self.tokenizer.decode(tids)
 
         # Sample first non-FF token from prefill logits (lazy GPU argmax when thinking_budget <= 0)
         if len(answer_ids) < max_tokens and (matcher is None or not matcher.is_stopped()):
@@ -1088,14 +1127,36 @@ class FastQwen3Engine:
             _ = self.mtp_drafter.forward_hidden(seed_next, seed_prev_h, self.model, mtp_cache)
 
         draft_k = recommended_draft_k(1, has_grammar=gram is not None) if use_spec else 0
+        pld_drafter = (
+            PromptLookupDrafter(
+                prompt_ids,
+                max_ngram=4,
+                min_ngram=2,
+                max_k=max(1, draft_k),
+                use_cursor=True,
+                window_relock=True,
+            )
+            if (use_spec and self.mtp_drafter is None)
+            else None
+        )
 
         for _step in range(max_tokens):
             if not pending_tokens or len(answer_ids) >= max_tokens or (matcher is not None and matcher.is_stopped()):
                 break
-            if use_spec and len(pending_tokens) == 1 and (max_tokens - len(answer_ids)) >= 2:
+            if len(answer_ids) >= 24 and detect_catastrophic_token_loop(answer_ids, decode_fn=_decode_tokens) is not None:
+                hit_max_tokens = True
+                pending_tokens = []
+                break
+            if (
+                use_spec
+                and len(pending_tokens) == 1
+                and (max_tokens - len(answer_ids)) >= 2
+                and (matcher is None or not matcher.is_stopped())
+            ):
                 last_tok = pending_tokens[0]
-                cap_k = min(draft_k, max_tokens - len(answer_ids))
+                cap_k = min(draft_k, max_tokens - len(answer_ids) - 1)
                 drafts: list[int] = []
+                mtp_prev_off = 0
                 if self.mtp_drafter is not None and mtp_cache is not None:
                     mtp_prev_off = mtp_cache.offset
                     pen_near = compute_loop_breaker_penalties(
@@ -1136,7 +1197,6 @@ class FastQwen3Engine:
                     else:
                         d_tok = last_tok
                         d_prev_h = cur_h_1d[None, None, :]
-                        old_to_new = self.model.vocab_remap.old_to_new if self.model.vocab_remap is not None else None
                         for _ in range(cap_k):
                             dh = self.mtp_drafter.forward_hidden(
                                 mx.array([[d_tok]], dtype=mx.int32),
@@ -1168,22 +1228,45 @@ class FastQwen3Engine:
                             d_prev_h = dh
                         if not drafts:
                             mtp_cache.rewind_to(mtp_prev_off)
-                else:
-                    drafts = draft_prompt_lookup_tokens(history_ids, cap_k)
+                elif pld_drafter is not None:
+                    pld_ctx = answer_ids if len(answer_ids) >= 2 else history_ids[-min(len(history_ids), 4) :]
+                    drafts = pld_drafter.draft(pld_ctx, max_k=cap_k)
+
+                if matcher is not None and drafts:
+                    drafts = filter_drafts_with_grammar(
+                        drafts,
+                        matcher,
+                        self.tokenizer.stop_token_ids,
+                        json_gram=gram,
+                        vocab_size=self.model.vocab_n,
+                        new_to_old=self._new_to_old,
+                        old_to_new=old_to_new,
+                    )
+                    if not drafts and mtp_cache is not None and self.mtp_drafter is not None:
+                        mtp_cache.rewind_to(min(mtp_cache.offset, mtp_prev_off + 1))
 
                 if drafts:
+                    spec_matcher = matcher.deep_copy() if matcher is not None else None
+
                     def _pick_greedy(step_idx: int, step_logits: np.ndarray) -> int:
                         hist_slice = answer_ids + drafts[:step_idx]
                         t_out, _ = self._select_next_token(
                             step_logits,
                             full_hidden_1d=None,
-                            matcher=None,
-                            gram=None,
+                            matcher=spec_matcher,
+                            gram=(gram if spec_matcher is not None else None),
                             recent_tokens=hist_slice,
                             temperature=0.0,
                             repeat_penalty=True,
                             collect_telemetry=False,
                         )
+                        if (
+                            step_idx < len(drafts)
+                            and t_out == int(drafts[step_idx])
+                            and t_out not in self.tokenizer.stop_token_ids
+                            and spec_matcher is not None
+                        ):
+                            spec_matcher.consume_token(t_out)
                         return t_out
 
                     emitted, acc_h, n_drafts_matched = verify_draft_sequence_b1(
@@ -1199,7 +1282,9 @@ class FastQwen3Engine:
                     cur_h_1d = acc_h[0, -1]
                     stopped = False
                     last_emitted: int | None = None
-                    for etok in emitted:
+                    next_pending: list[int] = []
+                    for idx_e, etok in enumerate(emitted):
+                        last_e = idx_e == (len(emitted) - 1)
                         if etok in self.tokenizer.stop_token_ids:
                             stopped = True
                             break
@@ -1210,6 +1295,33 @@ class FastQwen3Engine:
                         answer_ids.append(etok)
                         history_ids.append(etok)
                         last_emitted = etok
+                        next_pending = [etok]
+                        if matcher is not None:
+                            matcher.consume_token(etok)
+                            if matcher.is_stopped():
+                                if last_e:
+                                    next_pending = []
+                                    stopped = True
+                                    break
+                                continue
+                            if last_e:
+                                ff_more = [
+                                    int(t)
+                                    for t in matcher.compute_ff_tokens()
+                                    if int(t) not in self.tokenizer.stop_token_ids
+                                ]
+                                if ff_more:
+                                    rem_toks = max(0, max_tokens - len(answer_ids))
+                                    used_ff = ff_more[:rem_toks]
+                                    if used_ff:
+                                        matcher.consume_tokens(used_ff)
+                                        answer_ids.extend(used_ff)
+                                        history_ids.extend(used_ff)
+                                        next_pending.extend(used_ff)
+                                    if matcher.is_stopped():
+                                        next_pending = []
+                                        stopped = True
+                                        break
 
                     if mtp_cache is not None and self.mtp_drafter is not None:
                         # Re-sync MTP cache cleanly with exact target hidden states `acc_h` (fixes offset/bonus drift).
@@ -1223,10 +1335,10 @@ class FastQwen3Engine:
                                 mtp_cache,
                             )
 
-                    if stopped or last_emitted is None:
+                    if stopped or not next_pending or last_emitted is None:
                         pending_tokens = []
                         break
-                    pending_tokens = [last_emitted]
+                    pending_tokens = next_pending
                     continue
 
             # Standard 1-step (or multi-FF-token) advance
@@ -1447,6 +1559,8 @@ class FastQwen3Engine:
         )
         pending_q: list[list[int]] = [[] for _ in range(b_sz)]
         wave_mask_fallbacks = 0
+        def _decode_tokens(tids: Sequence[int]) -> str:
+            return self.tokenizer.decode(tids)
 
         for _step in range(max_tokens + 1):
             cur_b = len(live_rows)
@@ -1521,9 +1635,23 @@ class FastQwen3Engine:
                         done[w_i] = True
                         hit_max[w_i] = True
                         continue
+                    if (
+                        len(ans_ids[w_i]) >= 24
+                        and detect_catastrophic_token_loop(ans_ids[w_i], decode_fn=_decode_tokens) is not None
+                    ):
+                        done[w_i] = True
+                        hit_max[w_i] = True
+                        continue
                     pending_q[w_i] = [tid] + ff_clean
                 else:
                     if len(ans_ids[w_i]) >= max_tokens:
+                        done[w_i] = True
+                        hit_max[w_i] = True
+                        continue
+                    if (
+                        len(ans_ids[w_i]) >= 24
+                        and detect_catastrophic_token_loop(ans_ids[w_i], decode_fn=_decode_tokens) is not None
+                    ):
                         done[w_i] = True
                         hit_max[w_i] = True
                         continue
@@ -1637,6 +1765,7 @@ class FastQwen3Engine:
         compact_active: bool = True,
         max_pad_ratio: float | None = 1.8,
         max_wave_tokens: int | None = None,
+        rolling: bool | str = "auto",
         **_ignored_kwargs: Any,
     ) -> GenerationBatchResult:
         """Generate structured or free-text completions over a batch of prompts with LCP hybrid caching."""
@@ -1847,6 +1976,25 @@ class FastQwen3Engine:
                     else []
                 )
 
+                roll_req = rolling is True or (
+                    isinstance(rolling, str) and rolling.strip().lower() == "auto" and _ENABLE_ROLLING_AUTO
+                )
+                min_roll_docs = 2 if rolling is True else 16
+                roll_b = (
+                    min(eff_wave_bs, 32)
+                    if (not self._is_low_ram and batch_size is None)
+                    else eff_wave_bs
+                )
+                max_roll_pf = max((len(e) for e in encoded), default=0)
+                eff_roll_cap = max(128, max_roll_pf + int(max_tokens) + 16)
+                can_roll = (
+                    roll_req
+                    and n_docs >= min_roll_docs
+                    and roll_b >= 2
+                    and not use_two_phase
+                    and self._resolve_kv_i8(roll_b, eff_roll_cap) == "bf16"
+                )
+
                 if n_docs == 1 or eff_wave_bs <= 1 or use_two_phase:
                     b1_snap: HybridPrefixSnapshot | None = None
                     if (
@@ -1873,6 +2021,60 @@ class FastQwen3Engine:
                             collect_telemetry=collect_telemetry,
                             fallback_counter=fb_counter,
                         )
+                elif can_roll:
+                    roll_pfx_cache: list[DeltaSlotCache | GrowingKVCache] | None = None
+                    roll_pfx_len = 0
+                    if (
+                        (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None)
+                        and len(sys_prefix_ids) >= 32
+                        and any(len(enc) > len(sys_prefix_ids) and enc[: len(sys_prefix_ids)] == sys_prefix_ids for enc in encoded)
+                    ):
+                        roll_snap = self._lookup_or_build_prefix(sys_prefix_ids, sightings=n_docs)
+                        if roll_snap is not None:
+                            roll_pfx_len = len(sys_prefix_ids)
+                            max_lcp_seen = max(max_lcp_seen, roll_pfx_len)
+                            roll_pfx_cache = restore_hybrid_cache(
+                                roll_snap, batch_size=1, kv_step=eff_roll_cap, kv_i8="bf16"
+                            )
+
+                    def _roll_prefix_restore(
+                        full_ids: Sequence[int], rcache: RollingHybridCache, slot_id: int
+                    ) -> int:
+                        if (
+                            roll_pfx_cache is not None
+                            and roll_pfx_len > 0
+                            and len(full_ids) > roll_pfx_len
+                            and list(full_ids[:roll_pfx_len]) == sys_prefix_ids
+                        ):
+                            return rcache.restore_slot_from_hybrid_cache(slot_id, roll_pfx_cache)
+                        return 0
+
+                    roll_items, roll_stats = run_qwen3_decode_rolling(
+                        self.model,
+                        self.tokenizer,
+                        encoded,
+                        grammars,
+                        schema_objs,
+                        self._finalize_item,
+                        self._select_tokens_from_hidden,
+                        B_slots=roll_b,
+                        Cap=eff_roll_cap,
+                        max_tokens=int(max_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        slot_seeds=[(int(seed) + i) if seed is not None else None for i in range(n_docs)],
+                        gdn_state_mode="auto",
+                        collect_telemetry=collect_telemetry,
+                        prefill_chunk_size=512,
+                        prefix_restore_fn=_roll_prefix_restore if roll_pfx_cache is not None else None,
+                    )
+                    for idx, item in enumerate(roll_items):
+                        results[idx] = item
+                    extra_stats["rolling"] = True
+                    extra_stats["rolling_stats"] = roll_stats
+                    extra_stats["mask_fallbacks"] = int(roll_stats.get("mask_fallbacks", 0) or 0)
+                    if hasattr(mx, "clear_cache"):
+                        mx.clear_cache()
                 else:
                     # Bucket by prompt length (`128`-tok buckets) first to bound ragged pad waste across mixed-schema batches,
                     # then group identical GrammarHelper instances inside each length bucket so FF steps align cleanly.
@@ -1934,7 +2136,7 @@ class FastQwen3Engine:
                             wave_encs = [encoded[i] for i in chunk_idx]
                             w_lcp, w_sufs = split_lcp_ids(wave_encs, min_lcp=32)
                             w_snap = (
-                                self._lookup_or_build_prefix(w_lcp)
+                                self._lookup_or_build_prefix(w_lcp, sightings=len(wave_encs))
                                 if (w_lcp and (self.max_prefix_cache_entries > 0 or self.prefix_tree is not None))
                                 else None
                             )

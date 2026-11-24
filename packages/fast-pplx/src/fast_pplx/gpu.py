@@ -40,6 +40,8 @@ from fast_shared.embeddings import (
     truncate_and_normalize,
 )
 from fast_shared.hf import resolve_hf_model_dir
+from fast_shared.hw_check import supports_apple10_nax
+from fast_shared.mpp_linear import MppPackState, resolve_mpp_env_bool, wrap_quantized_linears_with_mpp
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
 from .paths import RepoPaths, resolve_paths
@@ -2212,6 +2214,19 @@ def _resolve_max_length(max_length: int | None, max_seq_len: int) -> int:
     return min(ml, max_seq_len)
 
 
+def _pplx_mpp_min_m(k: int, n: int, bits: int) -> int | None:
+    """Return minimum batch*seq rows `M` for Apple10 NAX `W8A8` dispatch on `PplxModel` linears."""
+    if int(bits) != 8:
+        return None
+    kk = int(k)
+    nn_dim = int(n)
+    if (kk % 64) != 0 or (nn_dim % 64) != 0:
+        return None
+    if min(kk, nn_dim) < 1024 or max(kk, nn_dim) < 3584 or (kk * nn_dim) < 3_600_000:
+        return None
+    return 128
+
+
 def _quantize_pplx_linear_weights(model: PplxModel, *, bits: int = 8, group_size: int = 64) -> None:
     """Quantize backbone linear projections while keeping embeddings, RMSNorms, conv1d, and contextual head native."""
     nn.quantize(
@@ -2303,10 +2318,12 @@ class FastPplxGPU:
         self.local_files_only = bool(local_files_only)
         self._vision_dir: Path | None = None
         self._vision_model: Any | None = None
+        self._mpp_state: MppPackState | None = None
         self.runtime_telemetry = {
             **get_mlx_runtime_telemetry(),
             "state_dtype": self.state_dtype_name,
             "quantize_weights": self.quantize_weights,
+            "mpp_w8a8": False,
         }
 
         set_mlx_cache_limit(self.cache_limit_mb)
@@ -2418,6 +2435,18 @@ class FastPplxGPU:
             if self.quantize_weights == "w8":
                 _quantize_pplx_linear_weights(self.model, bits=8, group_size=64)
                 mx.eval(self.model.parameters())
+                has_nax = bool(supports_apple10_nax())
+                env_mpp = resolve_mpp_env_bool("FAST_SILICON_PPLX_MPP")
+                mpp_enabled = bool(has_nax and (env_mpp is not False))
+                self._mpp_state = wrap_quantized_linears_with_mpp(
+                    self.model,
+                    min_m_fn=_pplx_mpp_min_m,
+                    apple10_nax=has_nax,
+                    allow_w8a8=True,
+                    enabled=mpp_enabled,
+                    skip_attr_substrings=("contextual_projection",),
+                )
+                self.runtime_telemetry["mpp_w8a8"] = bool(self._mpp_state.enabled)
         except Exception:
             self.close()
             raise
@@ -3249,6 +3278,9 @@ class FastPplxGPU:
 
     def close(self) -> None:
         self._vision_model = None
+        mpp_state = getattr(self, "_mpp_state", None)
+        if mpp_state is not None:
+            mpp_state.clear()
         if getattr(self, "_mapped_embed", None) is not None:
             self._mapped_embed.close()
             self._mapped_embed = None

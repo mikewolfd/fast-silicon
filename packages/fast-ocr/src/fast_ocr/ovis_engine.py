@@ -25,10 +25,13 @@ from fast_shared.grammar import (
     GrammarHelper,
     apply_loop_breaker_penalties_1d,
     compute_loop_breaker_penalties,
+    _token_tail_repeat_4gram_rate,
+    detect_catastrophic_token_loop,
     normalize_json_schema,
     safe_argmax_1d,
     sample_unconstrained,
 )
+from fast_shared.pld_drafter import filter_drafts_with_grammar
 from fast_shared.kv_quant import KVMode, normalize_kv_mode
 from fast_qwen3.model import FastQwen3Model, Qwen3Config
 from fast_qwen3.mtp_drafter import verify_draft_sequence_b1
@@ -414,37 +417,6 @@ def _consume_table_token_and_ff(
     return [int(t) for t in table_gram.advance_text_and_maybe_lock(delta, int(token_id)) if int(t) not in stop_ids]
 
 
-def _json_matcher_has_any_pruned_token(
-    matcher: Any,
-    json_gram: Any,
-    new_to_old: np.ndarray,
-) -> bool:
-    """Return True if at least one token in `new_to_old` is legal under `matcher`."""
-    _ = new_to_old
-    mask_lock = getattr(json_gram, "_mask_lock", None)
-    mask_ptr = getattr(json_gram, "_mask_ptr", None)
-    mask_nbytes = getattr(json_gram, "_mask_nbytes", None)
-    mask_buf = getattr(json_gram, "_mask_buf", None)
-    k_word = getattr(json_gram, "k_word", None)
-    k_bit = getattr(json_gram, "k_bit", None)
-    if (
-        mask_lock is not None
-        and mask_ptr is not None
-        and mask_nbytes is not None
-        and mask_buf is not None
-        and k_word is not None
-        and k_bit is not None
-    ):
-        with mask_lock:
-            matcher.unsafe_compute_mask_ptr(mask_ptr, mask_nbytes)
-            allowed = ((mask_buf[k_word] >> k_bit) & 1) != 0
-            return bool(np.any(allowed))
-    probe_fn = getattr(json_gram, "has_any_allowed", None)
-    if callable(probe_fn):
-        return bool(probe_fn(matcher))
-    return True
-
-
 def _filter_json_safe_drafts(
     json_matcher: Any,
     json_gram: Any,
@@ -455,150 +427,16 @@ def _filter_json_safe_drafts(
     new_to_old: np.ndarray,
     old_to_new: np.ndarray | None = None,
 ) -> list[int]:
-    """Prefix-filter `drafts` so every speculative step matches greedy `json_matcher` semantics.
-
-    Stops BEFORE any token that is outside `new_to_old`, rejected by `json_matcher`, would put
-    `json_matcher` into `is_stopped()`, would emit non-empty `compute_ff_tokens()`, or would leave
-    zero valid tokens in `new_to_old` (where non-speculative decode falls back via `hidden_1d`).
-    """
-    if not drafts or json_matcher.is_stopped():
-        return []
-    sim = json_matcher.deep_copy()
-    if not _json_matcher_has_any_pruned_token(sim, json_gram, new_to_old):
-        return []
-    safe: list[int] = []
-    for raw_dt in drafts:
-        dt = int(raw_dt)
-        if dt in stop_ids or dt < 0 or dt >= int(vocab_size):
-            break
-        if old_to_new is not None and (dt >= len(old_to_new) or int(old_to_new[dt]) < 0):
-            break
-        if not sim.validate_tokens([dt]):
-            break
-        if not sim.consume_token(dt):
-            break
-        if sim.is_stopped():
-            break
-        ff = [int(t) for t in sim.compute_ff_tokens() if int(t) not in stop_ids]
-        if ff:
-            break
-        if not _json_matcher_has_any_pruned_token(sim, json_gram, new_to_old):
-            break
-        safe.append(dt)
-    return safe
-
-
-_TABLE_MARKUP_MARKERS: tuple[str, ...] = ("<td", "</td", "<tr", "</tr", "<th", "</th", "|")
-
-
-def detect_catastrophic_token_loop(
-    token_ids: Sequence[int],
-    *,
-    min_repeats: int = 16,
-    max_period: int = 8,
-    decode_fn: Callable[[Sequence[int]], str] | None = None,
-    table_min_repeats: int = 40,
-    tail_window: int = 128,
-    min_tail_tokens: int = 192,
-    tail_repeat_rate_threshold: float = 0.60,
-    table_tail_repeat_rate_threshold: float = 0.82,
-    long_max_period: int = 64,
-) -> tuple[int, int] | None:
-    """Detect extreme consecutive periodic collapse (`p=1..max_period`) or long-period tail collapse.
-
-    Returns `(period, consecutive_repeats)` (or `(0, len(token_ids))` for aperiodic/tail-4gram collapse)
-    without false-flagging normal dense HTML/GFM table markup, else `None`.
-    """
-    n = len(token_ids)
-    req_base = max(4, int(min_repeats))
-    if n < req_base:
-        return None
-    req_tbl = max(req_base, int(table_min_repeats))
-    for p in range(1, max(1, int(max_period)) + 1):
-        if n < p * req_base:
-            continue
-        pat = [int(t) for t in token_ids[n - p : n]]
-        reps = 1
-        pos = n - 2 * p
-        while pos >= 0:
-            ok = True
-            for j in range(p):
-                if int(token_ids[pos + j]) != pat[j]:
-                    ok = False
-                    break
-            if not ok:
-                break
-            reps += 1
-            if reps >= req_tbl:
-                break
-            pos -= p
-        if reps >= req_base:
-            if decode_fn is not None and reps < req_tbl:
-                txt = decode_fn(pat).lower()
-                if any(m in txt for m in _TABLE_MARKUP_MARKERS):
-                    continue
-            return (p, reps)
-
-    eff_min_tail = max(int(min_tail_tokens), int(tail_window), 16)
-    if n >= eff_min_tail:
-        win = max(16, int(tail_window))
-        rep4 = _token_tail_repeat_4gram_rate(token_ids, tail_len=win)
-        long_match: tuple[int, int] | None = None
-        last_tok = int(token_ids[n - 1])
-        for p in range(max(1, int(max_period)) + 1, int(long_max_period) + 1):
-            if n < 3 * p:
-                break
-            if int(token_ids[n - 1 - p]) != last_tok:
-                continue
-            pat = [int(t) for t in token_ids[n - p : n]]
-            reps = 1
-            pos = n - 2 * p
-            while pos >= 0:
-                ok = True
-                for j in range(p):
-                    if int(token_ids[pos + j]) != pat[j]:
-                        ok = False
-                        break
-                if not ok:
-                    break
-                reps += 1
-                pos -= p
-            if reps >= 3 and (p * reps) >= 144:
-                long_match = (p, reps)
-                break
-
-        if long_match is not None or rep4 >= float(tail_repeat_rate_threshold):
-            has_table_markup = False
-            if decode_fn is not None:
-                tail_txt = decode_fn(token_ids[-win:]).lower()
-                has_table_markup = any(m in tail_txt for m in _TABLE_MARKUP_MARKERS)
-            if not has_table_markup:
-                return long_match if long_match is not None else (0, n)
-            if long_match is not None and long_match[1] >= 6 and (long_match[0] * long_match[1]) >= eff_min_tail:
-                return long_match
-            if rep4 >= float(table_tail_repeat_rate_threshold):
-                return (0, n)
-    return None
-
-
-def _token_tail_repeat_4gram_rate(token_ids: Sequence[int], *, tail_len: int = 256) -> float:
-    """Fraction of repeated 4-grams in the trailing `tail_len` tokens (catches longer-period loops)."""
-    n = len(token_ids)
-    if n < 16:
-        return 0.0
-    sub = token_ids[max(0, n - int(tail_len)) :]
-    m = len(sub) - 3
-    if m <= 0:
-        return 0.0
-    seen: set[tuple[int, int, int, int]] = set()
-    dups = 0
-    for i in range(m):
-        gram = (int(sub[i]), int(sub[i + 1]), int(sub[i + 2]), int(sub[i + 3]))
-        if gram in seen:
-            dups += 1
-        else:
-            seen.add(gram)
-    return float(dups) / float(m)
+    """Prefix-filter `drafts` so every speculative step matches greedy `json_matcher` semantics."""
+    return filter_drafts_with_grammar(
+        drafts,
+        json_matcher,
+        stop_ids,
+        json_gram=json_gram,
+        vocab_size=vocab_size,
+        new_to_old=new_to_old,
+        old_to_new=old_to_new,
+    )
 
 
 def _normalize_per_item_int(

@@ -3488,3 +3488,71 @@ def test_materialize_hf_snapshot_resolves_symlinks_and_offline_guard_cpu(tmp_pat
     assert partial_calls == [("mikewolfd/demo-repo", True), ("mikewolfd/demo-repo", False)]
     assert (dst_partial / "weights" / "w.bin").read_bytes() == b"weights-payload"
 
+
+def test_loop_detector_pld_drafter_and_mpp_linear_cpu() -> None:
+    """Verify shared `detect_catastrophic_token_loop`, `PromptLookupDrafter`, and `MppPackState`/`wrap_quantized_linears_with_mpp`."""
+    import sys
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from fast_shared import PromptLookupDrafter, detect_catastrophic_token_loop, filter_drafts_with_grammar
+    from fast_shared.mpp_linear import MppPackState, MppQuantizedLinear, wrap_quantized_linears_with_mpp
+
+    # 1. Catastrophic loop detector (p=2 repeat + table markup guard)
+    assert detect_catastrophic_token_loop([1, 2, 3, 4]) is None
+    assert detect_catastrophic_token_loop([10, 20] * 16) == (2, 16)
+    assert detect_catastrophic_token_loop([7] * 16, decode_fn=lambda _ids: "<td>") is None
+
+    # 2. PromptLookupDrafter + grammar filter
+    drafter = PromptLookupDrafter([101, 102, 103, 104, 105, 106], max_ngram=4, min_ngram=2, max_k=3)
+    assert drafter.draft([101, 102]) == [103, 104, 105]
+
+    class _FakeMatcher:
+        def __init__(self, stopped: bool = False, step: int = 0) -> None:
+            self._stopped = stopped
+            self._step = step
+
+        def is_stopped(self) -> bool:
+            return self._stopped
+
+        def deep_copy(self) -> _FakeMatcher:
+            return _FakeMatcher(self._stopped, self._step)
+
+        def validate_tokens(self, toks: list[int]) -> bool:
+            return int(toks[0]) != 105
+
+        def consume_token(self, _tok: int) -> bool:
+            self._step += 1
+            return True
+
+        def compute_ff_tokens(self) -> list[int]:
+            return [999] if self._step == 2 else []
+
+    # Stops before token 105 (invalid) and before FF jump at step 2
+    assert filter_drafts_with_grammar([103, 104, 105], _FakeMatcher(), frozenset({0})) == [103]
+
+    # 3. Generic MppPackState & wrap_quantized_linears_with_mpp
+    assert "mlx.core" in sys.modules
+    lin_big = nn.QuantizedLinear(1024, 3584, bias=False, group_size=64, bits=8, mode="affine")
+    lin_small = nn.QuantizedLinear(256, 256, bias=False, group_size=64, bits=8, mode="affine")
+
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.big = lin_big
+            self.small = lin_small
+
+    blk = _Block()
+    state = wrap_quantized_linears_with_mpp(
+        blk,
+        min_m_fn=lambda k, n, b: 128 if (b == 8 and min(k, n) >= 1024 and max(k, n) >= 3584) else None,
+        apple10_nax=True,
+        allow_w8a8=True,
+        enabled=True,
+    )
+    assert isinstance(blk.big, MppQuantizedLinear)
+    assert blk.small is lin_small
+    assert isinstance(state, MppPackState) and state.min_m_for(1024, 3584, 8) == 128
+
+

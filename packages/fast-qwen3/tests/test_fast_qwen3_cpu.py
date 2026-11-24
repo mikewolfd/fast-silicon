@@ -1641,21 +1641,23 @@ def test_engine_non_lcp_make_cache_batch_size_and_kv_mode_cutoff_cpu(
         assert eng._resolve_kv_i8(64, 4096) == "q4_quarot"
         assert eng._resolve_kv_i8(1, 8192) == "q4_quarot"
 
-        # Apple10 NAX, low RAM (24 GB Base M5)
+        # Apple10 NAX, low RAM (24 GB Base M5): ctx cutoff raised to 16384 to preserve BF16 NAX flash-attn
         eng._is_apple10 = True
         eng._is_low_ram = True
         assert eng._resolve_kv_i8(16, 512) == "bf16"
         assert eng._resolve_kv_i8(32, 512) == "bf16"
         assert eng._resolve_kv_i8(64, 2048) == "bf16"
+        assert eng._resolve_kv_i8(1, 8192) == "bf16"
         assert eng._resolve_kv_i8(64, 4096) == "q4_quarot"
-        assert eng._resolve_kv_i8(1, 8192) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 16384) == "q4_quarot"
 
-        # Apple10 NAX, high RAM (48 GB M5 Pro)
+        # Apple10 NAX, high RAM (48 GB M5 Pro): ctx cutoff raised to 32768
         eng._is_low_ram = False
         assert eng._resolve_kv_i8(32, 512) == "bf16"
         assert eng._resolve_kv_i8(64, 4096) == "bf16"
+        assert eng._resolve_kv_i8(1, 16384) == "bf16"
         assert eng._resolve_kv_i8(64, 8192) == "q4_quarot"
-        assert eng._resolve_kv_i8(1, 16384) == "q4_quarot"
+        assert eng._resolve_kv_i8(1, 32768) == "q4_quarot"
 
         # Non-64-divisible head_dim falls back to q8 when pressure/ctx cutoff triggers
         eng.model.cfg.head_dim = 96
@@ -2179,6 +2181,330 @@ def test_engine_lazy_gpu_argmax_fallback_and_batch_stats_cpu(
             r_eng.close()
     finally:
         eng.close()
+
+
+def test_q1_prefix_2hit_admission_async_eval_and_early_loop_abort_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Q1: PrefixTree 2-hit admission (`auto`), `mx.async_eval` on pure-FF steps, and early loop abort."""
+    import types
+    import fast_qwen3.engine as engine_mod
+    from fast_shared.prefix_tree import PrefixTree
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    w = _make_synthetic_qwen3_weights(cfg, seed=53, include_mtp=False)
+    model = FastQwen3Model(cfg, w)
+
+    # 1. `prefix_cache_mb="auto"` sets admission_min_hits=2: cold 1st sightings do not store snapshots or trip breaker;
+    #    2nd sighting admits and stores; 3rd sighting hits & reuses >=256 tokens.
+    eng_auto = FastQwen3Engine(
+        model=model,
+        tokenizer=tok,
+        warmup=False,
+        prefix_cache_mb="auto",
+        max_prefix_cache_entries=0,
+    )
+    try:
+        assert eng_auto.prefix_tree is not None
+        assert eng_auto.prefix_tree.admission_min_hits == 2
+        # Use chunk_tokens=16 to exercise 18 cold unique prefixes cleanly on CPU without tripping circuit breaker
+        eng_auto.prefix_tree = PrefixTree(chunk_tokens=16, byte_budget=8 << 20, admission_min_hits=2)
+        for i in range(18):
+            cold_prompt = f"#{i:02d}_unique_{i * 7919}_cold_payload_with_extra_words_to_cross_sixteen_tokens."
+            _ = eng_auto.generate(cold_prompt, max_tokens=2, temperature=0.0, speculative=False)
+        assert eng_auto.prefix_tree.node_count == 0
+        assert eng_auto.prefix_tree.snapshot_count == 0
+        assert eng_auto.prefix_tree.bytes_held == 0
+        assert eng_auto.prefix_tree.circuit_breaker_open is False
+
+        shared = "Repeated statutory block for two-hit admission check. " * 2
+        r1 = eng_auto.generate(shared + "Q1", max_tokens=4, temperature=0.0, speculative=False)
+        assert eng_auto.prefix_tree.node_count == 0
+        r2 = eng_auto.generate(shared + "Q2", max_tokens=4, temperature=0.0, speculative=False)
+        assert eng_auto.prefix_tree.node_count >= 1 and eng_auto.prefix_tree.snapshot_count >= 1
+        r3 = eng_auto.generate(shared + "Q3", max_tokens=4, temperature=0.0, speculative=False)
+        assert eng_auto.prefix_tree.hits >= 1 and eng_auto.prefix_tree.reused_tokens >= 16
+        assert r1.completion_tokens >= 1 and r2.completion_tokens >= 1 and r3.completion_tokens >= 1
+    finally:
+        eng_auto.close()
+
+    # 2. Pure-FF `_project_needed_rows(..., need_rows=[])` calls `mx.async_eval` instead of synchronous `mx.eval`
+    async_calls: list[int] = []
+    real_async_eval = mx.async_eval
+
+    def _spy_async_eval(*args: Any, **kwargs: Any) -> Any:
+        async_calls.append(len(args))
+        return real_async_eval(*args, **kwargs)
+
+    monkeypatch.setattr(engine_mod.mx, "async_eval", _spy_async_eval)
+    eng_ff = FastQwen3Engine(model=model, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        h_2d = mx.zeros((2, cfg.hidden_size), dtype=mx.bfloat16)
+        sl, gm, lm = eng_ff._project_needed_rows(h_2d, [], 2, eager_fp32=False)
+        assert sl is None and gm == {} and lm == {}
+        assert len(async_calls) == 1
+    finally:
+        eng_ff.close()
+
+    # 3. Early catastrophic loop abort in `_decode_single` & `_decode_wave_batched` (and table-markup exemption)
+    loop_tok = tok.encode("x", add_special_tokens=False)[0]
+    eos_id = tok.eos_token_id
+    vocab_sz = tok.vocab_size
+
+    class _LoopStubModel:
+        def __init__(self) -> None:
+            self.cfg = types.SimpleNamespace(head_dim=64, hidden_size=16, is_moe=False)
+            self.model_dir = None
+            self.vocab_remap = None
+            self.vocab_n = vocab_sz
+            self.has_full_vocab_fallback = False
+            self.emit_fn: Any = None
+
+        def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False, batch_size: int = 1) -> list[dict[str, Any]]:
+            return [{"step": 0, "b": batch_size}]
+
+        def precompute_rope_trig(self, pos_mx: mx.array) -> tuple[mx.array, mx.array]:
+            sh = (int(pos_mx.shape[0]), 1, int(pos_mx.shape[1]), 4)
+            return mx.zeros(sh, dtype=mx.bfloat16), mx.zeros(sh, dtype=mx.bfloat16)
+
+        def forward_hidden(self, input_ids: mx.array, cache: list[dict[str, Any]], **_kw: Any) -> mx.array:
+            b, s = int(input_ids.shape[0]), int(input_ids.shape[1])
+            step_i = int(cache[0]["step"])
+            cache[0]["step"] = step_i + 1
+            arr = np.zeros((b, s, 16), dtype=np.float32)
+            for r in range(b):
+                arr[r, :, 0] = float(r)
+                arr[r, :, 1] = float(step_i)
+            return mx.array(arr, dtype=mx.bfloat16)
+
+        def project_logits(self, h: mx.array, full_vocab: bool = False) -> mx.array:
+            b, s, _ = int(h.shape[0]), int(h.shape[1]), int(h.shape[2])
+            out = np.full((b, s, vocab_sz), -20.0, dtype=np.float32)
+            for r in range(b):
+                slot_i = int(round(float(h[r, 0, 0].item())))
+                step_i = int(round(float(h[r, 0, 1].item())))
+                tok_pick = self.emit_fn(slot_i, step_i)
+                out[r, 0, tok_pick] = 15.0
+            return mx.array(out, dtype=mx.bfloat16)
+
+    loop_m = _LoopStubModel()
+    eng_loop = FastQwen3Engine(model=loop_m, tokenizer=tok, warmup=False, prefix_cache_mb=0)
+    try:
+        # 3a. Single-item p=1 loop aborts early at 24 tokens (not 64) with finish_reason="length"
+        loop_m.emit_fn = lambda _slot, _step: loop_tok
+        res_single = eng_loop.generate("Loop single", max_tokens=64, temperature=0.0, speculative=False)
+        assert len(res_single.token_ids) == 24
+        assert res_single.finish_reason == "length"
+
+        # 3b. Valid HTML table markup (`<td>`) repeated < 40 times is NOT false-flagged at 24 tokens
+        #     (requires forcing table token despite loop-breaker by stopping cleanly at 30 via EOS)
+        td_ids = tok.encode("<td>", add_special_tokens=False)
+        if len(td_ids) == 1:
+            td_only = td_ids[0]
+            loop_m.emit_fn = lambda _slot, step: td_only if step < 30 else eos_id
+            res_tbl = eng_loop.generate("Table test", max_tokens=64, temperature=0.0, speculative=False)
+            assert res_tbl.finish_reason == "stop" or len(res_tbl.token_ids) >= 30
+        else:
+            # ByteLevel tiny tokenizer encodes "<td>" as 4 byte tokens -> period 4; 6x4=24 < table_min_repeats*4
+            loop_m.emit_fn = lambda _slot, step: td_ids[step % len(td_ids)] if step < 28 else eos_id
+            res_tbl = eng_loop.generate("Table test", max_tokens=64, temperature=0.0, speculative=False)
+            assert res_tbl.finish_reason == "stop"
+            assert len(res_tbl.token_ids) == 28
+
+        # 3c. Batched wave: slot 0 stops via EOS at 2 tokens, slot 1 loops and aborts early at 24 (< max_tokens=64)
+        loop_m.emit_fn = lambda slot, step: (
+            (loop_tok if step == 0 else eos_id) if slot == 0 else loop_tok
+        )
+        res_wave = eng_loop.generate_batch(
+            ["Short A", "Looping B longer prompt"],
+            max_tokens=64,
+            batch_size=2,
+            temperature=0.0,
+        )
+        assert res_wave.items[0].finish_reason == "stop" and len(res_wave.items[0].token_ids) == 1
+        assert res_wave.items[1].finish_reason == "length" and len(res_wave.items[1].token_ids) == 24
+    finally:
+        eng_loop.close()
+
+
+def test_q2_grammar_speculative_verify_pld_and_mtp_exact_parity_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Q2: grammar-checked speculative verify (`PromptLookupDrafter` + `Qwen3MtpDrafter`) matches greedy 1-step."""
+    import fast_qwen3.engine as engine_mod
+    from fast_qwen3.model import GrowingKVCache
+    from fast_qwen3.mtp_drafter import should_use_speculative_qwen
+
+    tok = _make_tiny_byte_tokenizer(tmp_path)
+    cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)
+    w = _make_synthetic_qwen3_weights(cfg, seed=67, include_mtp=True)
+    model = FastQwen3Model(cfg, w)
+    drafter = Qwen3MtpDrafter(cfg, w, norm_add_one=False)
+
+    # 1. Verify should_use_speculative_qwen gating: auto ON for >=9B dense native MTP, auto OFF for 4B, ON with speculative=True
+    assert should_use_speculative_qwen(
+        1, 0.0, speculative=None, has_drafter_or_lookup=True, has_native_mtp=True, hidden_size=4096, is_moe=False
+    ) is True
+    assert should_use_speculative_qwen(
+        1, 0.0, speculative=None, has_drafter_or_lookup=True, has_native_mtp=False, hidden_size=2560, is_moe=False
+    ) is False
+    assert should_use_speculative_qwen(
+        1, 0.0, speculative=True, has_drafter_or_lookup=True, has_native_mtp=False, hidden_size=2560, is_moe=False
+    ) is True
+
+    # Multi-field JSON schema with deterministic FF bridges (`{"tag":"`, `","count":`, `,"ok":`, `}`)
+    schema = {
+        "type": "object",
+        "properties": {
+            "tag": {"type": "string", "enum": ["alpha_record", "beta_record"]},
+            "count": {"type": "integer", "enum": [1234, 5678]},
+            "ok": {"type": "boolean"},
+        },
+        "required": ["tag", "count", "ok"],
+        "additionalProperties": False,
+    }
+
+    # 2. PromptLookupDrafter (mtp_drafter=None, 4B-OptiQ path) with prompt containing exact enum strings
+    #    so step-0 and mid-generation drafts propose both accepted drafts, mid-draft mismatches, and trailing FF!
+    eng_pld = FastQwen3Engine(model=model, tokenizer=tok, mtp_drafter=None, warmup=False, prefix_cache_mb=0)
+    try:
+        prompt_pld = (
+            'Candidate record alpha_record beta_record 1234 5678 true false. '
+            'Extract JSON matching schema for alpha_record 1234.'
+        )
+        r_pld_off = eng_pld.generate(prompt_pld, json_schema=schema, max_tokens=64, temperature=0.0, speculative=False)
+        r_pld_on = eng_pld.generate(prompt_pld, json_schema=schema, max_tokens=64, temperature=0.0, speculative=True)
+        assert r_pld_off.valid_schema is True and r_pld_on.valid_schema is True
+        assert r_pld_on.token_ids == r_pld_off.token_ids
+        assert r_pld_on.parsed == r_pld_off.parsed
+        assert r_pld_on.finish_reason == r_pld_off.finish_reason
+
+        # Also check unconstrained PromptLookupDrafter parity on repetitive prompt
+        r_unc_off = eng_pld.generate(prompt_pld, max_tokens=16, temperature=0.0, speculative=False)
+        r_unc_on = eng_pld.generate(prompt_pld, max_tokens=16, temperature=0.0, speculative=True)
+        assert r_unc_on.token_ids == r_unc_off.token_ids
+    finally:
+        eng_pld.close()
+
+    # 3. Native MTP drafter + grammar-checked speculative verify parity
+    eng_mtp = FastQwen3Engine(model=model, tokenizer=tok, mtp_drafter=drafter, warmup=False, prefix_cache_mb=0)
+    try:
+        r_mtp_off = eng_mtp.generate(
+            "Emit structured record alpha_record.",
+            json_schema=schema,
+            max_tokens=64,
+            temperature=0.0,
+            speculative=False,
+        )
+        r_mtp_on = eng_mtp.generate(
+            "Emit structured record alpha_record.",
+            json_schema=schema,
+            max_tokens=64,
+            temperature=0.0,
+            speculative=True,
+        )
+        assert r_mtp_off.valid_schema is True and r_mtp_on.valid_schema is True
+        assert r_mtp_on.token_ids == r_mtp_off.token_ids
+        assert r_mtp_on.parsed == r_mtp_off.parsed
+    finally:
+        eng_mtp.close()
+
+    # 4. Scripted deterministic test specifically exercising:
+    #    (a) accepted draft + mid-draft mismatch + bonus token, and
+    #    (b) trailing `compute_ff_tokens()` emitted right after speculative verify!
+    import types
+
+    open_schema = {
+        "type": "object",
+        "properties": {
+            "tag": {"type": "string", "minLength": 4, "maxLength": 12},
+            "ok": {"type": "boolean"},
+        },
+        "required": ["tag", "ok"],
+        "additionalProperties": False,
+    }
+
+    class _ScriptedSpecModel:
+        def __init__(self) -> None:
+            self.cfg = types.SimpleNamespace(
+                head_dim=64,
+                hidden_size=16,
+                is_moe=False,
+                linear_conv_kernel_dim=4,
+            )
+            self.model_dir = None
+            self.vocab_remap = None
+            self.vocab_n = tok.vocab_size
+            self.has_full_vocab_fallback = False
+
+        def make_cache(self, *, kv_step: int = 256, kv_i8: bool | str = False, batch_size: int = 1) -> list[GrowingKVCache]:
+            return [GrowingKVCache(step=kv_step, kv_i8=kv_i8)]
+
+        def forward_hidden(self, input_ids: mx.array, cache: list[GrowingKVCache], **_kw: Any) -> mx.array:
+            b, s = int(input_ids.shape[0]), int(input_ids.shape[1])
+            k_dummy = mx.zeros((b, 1, s, 64), dtype=mx.bfloat16)
+            v_dummy = mx.zeros((b, 1, s, 64), dtype=mx.bfloat16)
+            cache[0].update_and_fetch(k_dummy, v_dummy)
+            h_arr = np.zeros((b, s, 16), dtype=np.float32)
+            h_arr[:, :, 0] = np.asarray(input_ids).astype(np.float32)
+            return mx.array(h_arr, dtype=mx.bfloat16)
+
+        def project_logits(self, h: mx.array, full_vocab: bool = False) -> mx.array:
+            b, s, _ = int(h.shape[0]), int(h.shape[1]), int(h.shape[2])
+            out = np.full((b, s, tok.vocab_size), -20.0, dtype=np.float32)
+            q_tok = tok.encode('"', add_special_tokens=False)[0]
+            a_tok = tok.encode("a", add_special_tokens=False)[0]
+            l_tok = tok.encode("l", add_special_tokens=False)[0]
+            p_tok = tok.encode("p", add_special_tokens=False)[0]
+            h_tok = tok.encode("h", add_special_tokens=False)[0]
+            z_tok = tok.encode("z", add_special_tokens=False)[0]
+            t_tok = tok.encode("t", add_special_tokens=False)[0]
+            col_tok = tok.encode(":", add_special_tokens=False)[0]
+            # Prompt has `"alph` -> drafts [l, p, h] after `"a`; target accepts `l, p`, mismatches `h -> z`,
+            # then after `z` emits `"` which triggers trailing `compute_ff_tokens()` = `,"ok":`!
+            next_map = {
+                q_tok: a_tok,
+                a_tok: l_tok,
+                l_tok: p_tok,
+                p_tok: z_tok,
+                z_tok: q_tok,
+                col_tok: t_tok,
+            }
+            for r in range(b):
+                for pos in range(s):
+                    cur_tid = int(round(float(h[r, pos, 0].item())))
+                    nxt = next_map.get(cur_tid, t_tok)
+                    out[r, pos, nxt] = 15.0
+            return mx.array(out, dtype=mx.bfloat16)
+
+    scr_m = _ScriptedSpecModel()
+    verify_trace: list[tuple[list[int], list[int], int]] = []
+    real_verify = engine_mod.verify_draft_sequence_b1
+
+    def _spy_verify(*args: Any, **kwargs: Any) -> Any:
+        drafts_arg = list(args[3])
+        emitted, acc_h, n_matched = real_verify(*args, **kwargs)
+        verify_trace.append((drafts_arg, list(emitted), int(n_matched)))
+        return emitted, acc_h, n_matched
+
+    monkeypatch.setattr(engine_mod, "verify_draft_sequence_b1", _spy_verify)
+    eng_scr = FastQwen3Engine(model=scr_m, tokenizer=tok, mtp_drafter=None, warmup=False, prefix_cache_mb=0)
+    try:
+        scr_prompt = 'seed "alph and more'
+        res_scr_off = eng_scr.generate(scr_prompt, json_schema=open_schema, max_tokens=64, temperature=0.0, speculative=False)
+        res_scr_on = eng_scr.generate(scr_prompt, json_schema=open_schema, max_tokens=64, temperature=0.0, speculative=True)
+        assert res_scr_off.valid_schema is True and res_scr_on.valid_schema is True
+        assert res_scr_on.token_ids == res_scr_off.token_ids
+        assert res_scr_on.parsed == {"tag": "alpz", "ok": True}
+        assert len(verify_trace) >= 1
+        # Verify partial draft acceptance + mid-draft mismatch (drafted [l, p, h], matched [l, p], emitted [l, p, z])
+        assert any(n_m == 2 and len(d) == 3 and len(e) == 3 for d, e, n_m in verify_trace)
+    finally:
+        eng_scr.close()
+
 
 
 

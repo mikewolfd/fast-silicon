@@ -92,6 +92,33 @@ def resolve_hetero_initial_seed(
     return gpu_seed, ane_seed
 
 
+def _should_inline_gpu_short_batch(
+    n_items: int,
+    short_items: Sequence[tuple[int, Sequence[int]] | tuple[int, Sequence[int], Any]],
+    *,
+    is_apple10: bool,
+    contextual: bool,
+    eff_mode: str,
+    has_gpu: bool,
+    has_long_items: bool,
+) -> bool:
+    """Return True when a non-contextual `hetero2` batch should run inline on Metal GPU without threads."""
+    if eff_mode != "hetero2" or not has_gpu or contextual or has_long_items:
+        return False
+    if n_items == 1 and len(short_items) == 1:
+        return True
+    if not is_apple10 or n_items < 1 or len(short_items) != n_items:
+        return False
+    max_len = 0
+    total_len = 0
+    for it in short_items:
+        ln = len(it[1])
+        if ln > max_len:
+            max_len = ln
+        total_len += ln
+    return max_len <= 32 and total_len <= 1024
+
+
 class _PplxSlotBuffers(ctypes.Structure):
     _fields_ = [
         ("slot_idx", ctypes.c_int),
@@ -1412,25 +1439,36 @@ class FastPplx:
             )
             return ctx_out if contextual else flat_out
 
-        # Zero-thread inline fast path for single-item short inputs:
+        # Zero-thread inline fast path for single-item short inputs and tiny Apple10 (M5) query batches:
         # - Apple9 (M4 Pro: 6.57ms GPU vs 7.71ms ANE) and Apple10+ (M5 NAX: ~6.1ms GPU vs ~9.0ms ANE)
-        #   `hetero2`: single-item Metal GPU beats ANE without thread-spawn overhead at exact FP16 parity.
+        #   `hetero2`: single-item Metal GPU beats ANE without thread-spawn overhead at exact FP16 parity,
+        #   and M5 tiny non-contextual batches (<=32 tok/item, <=1024 total tok) avoid ANE + thread-spawn tax.
         # - Deterministic `hetero` / `ane`: single ANE slot handles <= max_ane_cap deterministically.
+        is_apple10 = bool(self.runtime_telemetry.get("is_apple10", False))
+        if _should_inline_gpu_short_batch(
+            n_items,
+            [(idx, ids) for idx, ids, _ in short_items],
+            is_apple10=is_apple10,
+            contextual=contextual,
+            eff_mode=eff_mode,
+            has_gpu=self.gpu is not None,
+            has_long_items=bool(long_items),
+        ):
+            res = _encode_gpu(items)
+            self._set_call_stats(
+                {
+                    "mode": eff_mode,
+                    "ane_items": 0,
+                    "ane_buckets": 0,
+                    "gpu_items": len(items),
+                    "gpu_stolen_items": len(items),
+                    "deterministic": False,
+                    "elapsed_s": round(time.perf_counter() - t0, 4),
+                }
+            )
+            return res
+
         if n_items == 1 and not contextual and len(short_items) == 1:
-            if eff_mode == "hetero2" and self.gpu is not None:
-                res = _encode_gpu(items)
-                self._set_call_stats(
-                    {
-                        "mode": eff_mode,
-                        "ane_items": 0,
-                        "ane_buckets": 0,
-                        "gpu_items": 1,
-                        "gpu_stolen_items": 1,
-                        "deterministic": False,
-                        "elapsed_s": round(time.perf_counter() - t0, 4),
-                    }
-                )
-                return res
             buckets = pack_ane_buckets(short_items, supported_caps=ane_caps)
             done = self.ane.run_buckets(
                 buckets,
@@ -1461,7 +1499,6 @@ class FastPplx:
         mu = threading.Lock()
         errors: list[BaseException] = []
         counts = {"ane_items": 0, "ane_buckets": 0, "gpu_items": 0, "gpu_stolen_items": 0}
-        is_apple10 = bool(self.runtime_telemetry.get("is_apple10", False))
         ane_chunk_take, steal_min_chunk, steal_cap, steal_num, steal_den = resolve_hetero_schedule(
             is_apple10=is_apple10,
             batch_size=batch_size,
