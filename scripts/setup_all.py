@@ -609,6 +609,16 @@ def _plan_gpt_oss(
     )
 
 
+def _is_qwen3_snapshot_cached(home: Path) -> bool:
+    try:
+        from fast_qwen3.paths import resolve_paths
+
+        resolve_paths(home).resolve_model_dir(repo_id=_QWEN3_HF_REPO, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
 def _plan_qwen3(
     home: Path,
     *,
@@ -617,7 +627,9 @@ def _plan_qwen3(
     python_exe: str,
 ) -> PackagePlan:
     art = home / "artifacts"
-    hf_cached = hf_checker(_QWEN3_HF_REPO)
+    hf_cached = bool(hf_checker(_QWEN3_HF_REPO)) or (
+        hf_checker is _is_hf_snapshot_cached and _is_qwen3_snapshot_cached(home)
+    )
     tok_ok = (art / "tokenizer" / "tokenizer.json").is_file()
     actions = [
         StepAction(

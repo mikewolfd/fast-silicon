@@ -431,6 +431,7 @@ def test_engine_per_doc_grammars_mtp_dispatch_gate_cpu(monkeypatch: pytest.Monke
         e._maybe_get_ane_ring = lambda *_a, **_kw: None  # type: ignore[assignment]
         e.resolve_runtime_ane_ring_variant = lambda *_a, **_kw: "fp16"  # type: ignore[assignment]
         e._effective_ane_ring_variant = lambda: "fp16"  # type: ignore[assignment]
+        e.get_grammar = lambda *_a, **_kw: _StubGrammar()  # type: ignore[assignment]
         return e
 
     g_list_4 = [_StubGrammar([10, 11]) for _ in range(4)]
@@ -567,3 +568,194 @@ def test_mtp_drafter_b1_parity_and_b8_gate_gpu() -> None:
             mx.clear_cache()
             if acquired_lock:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+def test_forward_verify_mtp_slot_singleton_strictly_b1_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`forward_verify_mtp_slot` uses singleton verify kernels at B=1 and standard batched linears at B>=2."""
+    import mlx.nn as nn
+    import fast_gemma4.model as fg4_model
+
+    m = fg4_model.FastGemma4Model.__new__(fg4_model.FastGemma4Model)
+    nn.Module.__init__(m)
+    m.eps = 1e-6
+    m.first_kv_shared = 2
+    m.n_q_heads = 2
+    m.n_kv_heads = 1
+    m.window_size = 64
+    m.softcap = 30.0
+    m.kv_i8 = False
+    m.use_fused_softcap_argmax = False
+    m.vec4_reduce = False
+
+    direct_calls: list[str] = []
+    svl_calls: list[str] = []
+    singleton_flags: list[tuple[str, bool]] = []
+
+    class _TrackedLin(nn.Module):
+        def __init__(self, tag: str, out_dim: int) -> None:
+            super().__init__()
+            self.tag = tag
+            self.out_dim = out_dim
+
+        def __call__(self, x: mx.array) -> mx.array:
+            direct_calls.append(self.tag)
+            return mx.zeros((*x.shape[:-1], self.out_dim), dtype=mx.float32)
+
+    m.lm_head = _TrackedLin("lm_head", 16)
+    m.layers = [
+        {
+            "is_shared": False,
+            "is_full": True,
+            "prev_kv": 0,
+            "w_in": mx.ones((8,), dtype=mx.float32),
+            "w_qn": mx.ones((4,), dtype=mx.float32),
+            "w_kn": mx.ones((4,), dtype=mx.float32),
+            "inv_freq": mx.ones((2,), dtype=mx.float32),
+            "qkv_proj": _TrackedLin("qkv_proj", 16),
+            "o_proj": _TrackedLin("o_proj", 8),
+        }
+    ]
+
+    def _fake_svl(mod: nn.Module, x: mx.array) -> mx.array:
+        svl_calls.append(getattr(mod, "tag", "unknown"))
+        return mx.zeros((*x.shape[:-1], getattr(mod, "out_dim", 8)), dtype=mx.float32)
+
+    def _fake_embed_pli(toks: mx.array, *, singleton: bool = False):
+        singleton_flags.append(("embed_pli", singleton))
+        return mx.zeros((*toks.shape, 8), dtype=mx.float32), None
+
+    def _fake_ffn_ple(h: mx.array, attn_out: mx.array, pli, i: int, l: dict, *, singleton: bool = False):
+        singleton_flags.append(("ffn_ple", singleton))
+        return h + attn_out, h + attn_out
+
+    monkeypatch.setattr(fg4_model, "_singleton_verify_linear", _fake_svl)
+    monkeypatch.setattr(m, "_compute_embed_and_pli", _fake_embed_pli)
+    monkeypatch.setattr(m, "_run_ffn_and_ple", _fake_ffn_ple)
+    monkeypatch.setattr(m, "_get_sdpa_meta", lambda _cache, _B: (1, 1, None, None))
+    monkeypatch.setattr(
+        m, "_precompute_scatter_pos", lambda off_b, l_sys, swa_cap, L_q: (mx.zeros_like(off_b)[:, None], mx.zeros_like(off_b)[:, None])
+    )
+    monkeypatch.setattr(
+        fg4_model,
+        "fused_qkv_packed_norm_rope_ragged",
+        lambda qkv, *_a, **_kw: (
+            mx.zeros((*qkv.shape[:2], 2, 4), dtype=mx.float32),
+            mx.zeros((*qkv.shape[:2], 1, 4), dtype=mx.float32),
+            mx.zeros((*qkv.shape[:2], 1, 4), dtype=mx.float32),
+        ),
+    )
+    monkeypatch.setattr(fg4_model, "scatter_kv_slot_precomputed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        fg4_model, "mqa8_sdpa_prefix_ragged_slot", lambda q, *_a, **_kw: mx.zeros((*q.shape[:2], 8), dtype=mx.float32)
+    )
+    monkeypatch.setattr(fg4_model, "logit_softcap", lambda _sc, x: x)
+
+    for bsz, expect_singleton in ((1, True), (4, False)):
+        direct_calls.clear()
+        svl_calls.clear()
+        singleton_flags.clear()
+        cache = {
+            "swa_cap": 16,
+            "l_sys": 1,
+            "k_sys": [mx.zeros((1, 1, 1, 4), dtype=mx.float32)],
+            "v_sys": [mx.zeros((1, 1, 1, 4), dtype=mx.float32)],
+            "layers": [{"ring": False, "cap": 16, "k": mx.zeros((4, 16, 1, 4)), "v": mx.zeros((4, 16, 1, 4))}],
+        }
+        toks = mx.zeros((bsz, 3), dtype=mx.int32)
+        off_b = mx.zeros((bsz,), dtype=mx.int32)
+        lg, am = m.forward_verify_mtp_slot(toks, cache, off_b, return_logits=True)
+        assert tuple(lg.shape) == (bsz, 3, 16) and tuple(am.shape) == (bsz, 3)
+        assert singleton_flags == [("embed_pli", expect_singleton), ("ffn_ple", expect_singleton)]
+        if expect_singleton:
+            assert svl_calls == ["qkv_proj", "o_proj", "lm_head"]
+            assert direct_calls == []
+        else:
+            assert svl_calls == []
+            assert direct_calls == ["qkv_proj", "o_proj", "lm_head"]
+
+
+def test_engine_explicit_mtp_declined_wave_stays_rolling_not_prompt_lookup_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicitly MTP-configured engines must stay on `run_decode_rolling` instead of PromptLookup when MTP declines `B > max_b`."""
+    import threading
+    import fast_gemma4.engine as eng_mod
+    from fast_gemma4.engine import FastGemma4Engine
+
+    class _StubGrammar:
+        upfront_ff: list[int] = []
+
+        def validate_token_sequence(self, _full_ids: list[int]) -> bool:
+            return True
+
+    class _StubTok:
+        bos_token_id = 2
+        stop_token_ids = frozenset({1})
+
+        def decode(self, _ids: list[int], skip_special_tokens: bool = True) -> str:
+            return "{}"
+
+    class _StubModel:
+        hidden_size = 1536
+        n_kv_heads = 1
+        window_size = 512
+
+    prompt_lookup_calls: list[int] = []
+    roll_calls: list[dict[str, object]] = []
+
+    def _forbid_prompt_lookup(*_a, **kw):
+        prompt_lookup_calls.append(1)
+        raise AssertionError("Declined MTP wave must not downgrade to run_decode_prompt_lookup")
+
+    def _fake_rolling(_model, _stop, _grammar, _pkv, sufs, **kw):
+        roll_calls.append({"n": len(sufs), "has_grammar": _grammar is not None, "kv_i8": kw.get("kv_i8")})
+        return {
+            "prefill_sec": 0.01,
+            "decode_sec": 0.01,
+            "gen_toks": [[10, 11] for _ in sufs],
+            "tot_out_tok": 2 * len(sufs),
+            "ff_tokens": 0,
+            "llm_steps": 1,
+            "ff_early14_steps": 0,
+            "mask_fallbacks": 0,
+        }
+
+    monkeypatch.setattr(eng_mod, "run_decode_prompt_lookup", _forbid_prompt_lookup)
+    monkeypatch.setattr(eng_mod, "run_decode_rolling", _fake_rolling)
+
+    def _make_engine(apple10: bool) -> FastGemma4Engine:
+        e = FastGemma4Engine.__new__(FastGemma4Engine)
+        e.model = _StubModel()  # type: ignore[assignment]
+        e.tokenizer = _StubTok()  # type: ignore[assignment]
+        e.mtp_drafter = object()  # type: ignore[assignment]
+        e._mtp_drafter_auto = False
+        e._mtp_drafter_auto_attempted = True
+        e.default_mode = "gpu"
+        e.profile = "auto"
+        e.ane_available = False
+        e.default_max_b_slots = 64
+        e._host_hw = {"supports_apple10": apple10, "gpu_family": "Apple10" if apple10 else "Apple9"}
+        e._host_ram_gib = 24.0 if apple10 else 48.0
+        e.silicon_policy = None
+        e._gpu_lock = threading.Lock()
+        e.kv_i8 = True
+        e.resolve_call_kv_i8 = lambda **_kw: True  # type: ignore[assignment]
+        e.encode_prompts = lambda ps, **_kw: [[2, 3, 4] for _ in ps]  # type: ignore[assignment]
+        e.get_prefix_kv = lambda _sys: {"l_sys": 1}  # type: ignore[assignment]
+        e._maybe_get_ane_ring = lambda *_a, **_kw: None  # type: ignore[assignment]
+        e.resolve_runtime_ane_ring_variant = lambda *_a, **_kw: "fp16"  # type: ignore[assignment]
+        e._effective_ane_ring_variant = lambda: "fp16"  # type: ignore[assignment]
+        e.get_grammar = lambda *_a, **_kw: _StubGrammar()  # type: ignore[assignment]
+        return e
+
+    e_a10 = _make_engine(apple10=True)
+    e_a10.generate_batch(["p"] * 4, max_tokens=8, temperature=0.0, speculative=True, mode="gpu")
+    e_a10.generate_batch(["p"] * 4, json_schema="{}", max_tokens=8, temperature=0.0, speculative=True, mode="gpu")
+
+    e_a9 = _make_engine(apple10=False)
+    e_a9.generate_batch(["p"] * 4, json_schema="{}", max_tokens=8, temperature=0.0, speculative=True, mode="gpu")
+
+    assert prompt_lookup_calls == []
+    assert len(roll_calls) == 3
+    assert all(c["n"] == 4 and c["kv_i8"] is True for c in roll_calls)
+

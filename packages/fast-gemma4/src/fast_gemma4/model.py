@@ -3217,7 +3217,12 @@ class FastGemma4Model:
             meta_swa = cache["meta_swa"]
             meta_full = cache["meta_full"]
 
-        h, pli = self._compute_embed_and_pli(toks, singleton=True)
+        use_singleton = B == 1
+
+        def _verify_lin(mod: nn.Module, x: mx.array) -> mx.array:
+            return _singleton_verify_linear(mod, x) if use_singleton else mod(x)
+
+        h, pli = self._compute_embed_and_pli(toks, singleton=use_singleton)
         x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
 
         for i, l in enumerate(self.layers):
@@ -3228,7 +3233,7 @@ class FastGemma4Model:
 
             if not l["is_shared"]:
                 if i == split_idx and keep_from_col > 0 and "kv_proj_only" in l:
-                    kv = _singleton_verify_linear(l["kv_proj_only"], x_in)
+                    kv = _verify_lin(l["kv_proj_only"], x_in)
                     k_rot, v_norm = fused_kv_only_norm_rope_ragged(
                         kv, l["w_kn"], l["inv_freq"], off_b, self.eps, n_kv=n_kv
                     )
@@ -3250,10 +3255,10 @@ class FastGemma4Model:
                     if pli is not None:
                         pli = mx.contiguous(pli[:, keep_from_col:, :, :])
                     off_b = off_b + int(keep_from_col)
-                    q_raw = _singleton_verify_linear(l["q_proj_split"], x_in)
+                    q_raw = _verify_lin(l["q_proj_split"], x_in)
                     q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
                 else:
-                    qkv = _singleton_verify_linear(l["qkv_proj"], x_in)
+                    qkv = _verify_lin(l["qkv_proj"], x_in)
                     q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
                         qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
                     )
@@ -3271,7 +3276,7 @@ class FastGemma4Model:
                         ring_cap = c["cap"] if c["ring"] else 0
                         scatter_kv_ragged(c["k"], c["v"], k_rot, v_norm, off_b, l_sys, ring_cap)
             else:
-                q_raw = _singleton_verify_linear(l["q_proj"], x_in)
+                q_raw = _verify_lin(l["q_proj"], x_in)
                 q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
 
             if is_slot_cache:
@@ -3304,12 +3309,12 @@ class FastGemma4Model:
                     vec4_reduce=self.vec4_reduce,
                 )
 
-            attn_out = _singleton_verify_linear(l["o_proj"], att)
-            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=True)
+            attn_out = _verify_lin(l["o_proj"], att)
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l, singleton=use_singleton)
 
         L_out = int(x_in.shape[1])
         cache["_last_x_in"] = x_in
-        raw_lg = _singleton_verify_linear(self.lm_head, x_in)
+        raw_lg = _verify_lin(self.lm_head, x_in)
         if return_logits:
             lg = logit_softcap(self.softcap, raw_lg)
             am_flat = safe_argmax_with_nan_guard(lg.reshape(B * L_out, -1), axis=-1).reshape(B, L_out)

@@ -25,6 +25,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Iterator, Mapping, Sequence
 import urllib.request
@@ -4066,7 +4067,15 @@ def _run_worker_main(args: argparse.Namespace) -> int:
                 else:
                     raise
 
-    print(_WORKER_MARKER + json.dumps({"records": recs}, ensure_ascii=False), flush=True)
+    payload = json.dumps({"records": recs}, ensure_ascii=False)
+    out_file = getattr(args, "worker_out_file", None)
+    if out_file:
+        out_path = Path(str(out_file))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        tmp_path.replace(out_path)
+    print(_WORKER_MARKER + payload, flush=True)
     return 0
 
 
@@ -4151,37 +4160,45 @@ def _spawn_isolated_worker(
 
     import signal
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(_REPO_ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        out_s, err_s = proc.communicate(timeout=int(args.timeout_sec))
-    except subprocess.TimeoutExpired:
+    with tempfile.TemporaryDirectory(prefix="fs_worker_") as td:
+        worker_out_file = Path(td) / "worker_records.json"
+        worker_cmd = list(cmd) + ["--worker-out-file", str(worker_out_file)]
+        proc = subprocess.Popen(
+            worker_cmd,
+            cwd=str(_REPO_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
-        proc.communicate()
-        return [
-            {
-                "package": pkg_name,
-                "category": _SPEC_BY_NAME[pkg_name].category if pkg_name in _SPEC_BY_NAME else 3,
-                "config_label": label or "default",
-                "status": "failed",
-                "error": f"timeout after {args.timeout_sec}s",
-                "gate_verdict": "FAIL",
-            }
-        ]
+            out_s, err_s = proc.communicate(timeout=int(args.timeout_sec))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.communicate()
+            return [
+                {
+                    "package": pkg_name,
+                    "category": _SPEC_BY_NAME[pkg_name].category if pkg_name in _SPEC_BY_NAME else 3,
+                    "config_label": label or "default",
+                    "status": "failed",
+                    "error": f"timeout after {args.timeout_sec}s",
+                    "gate_verdict": "FAIL",
+                }
+            ]
+
+        if proc.returncode == 0 and worker_out_file.is_file():
+            payload = json.loads(worker_out_file.read_text(encoding="utf-8"))
+            return list(payload.get("records", []))
 
     for line in reversed(out_s.splitlines()):
-        if line.startswith(_WORKER_MARKER):
-            payload = json.loads(line[len(_WORKER_MARKER) :])
+        idx = line.find(_WORKER_MARKER)
+        if idx >= 0:
+            payload = json.loads(line[idx + len(_WORKER_MARKER) :])
             return list(payload.get("records", []))
 
     err_tail = (err_s or out_s or f"exit={proc.returncode}").strip().splitlines()
@@ -5009,6 +5026,7 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--coreai-python", default=None)
     wk.add_argument("--pplx-mlx-path", default=None)
     wk.add_argument("--max-coarse-tokens", type=int, default=None)
+    wk.add_argument("--worker-out-file", default=None)
     wk.set_defaults(func=_run_worker_main)
     return p
 

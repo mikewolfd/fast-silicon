@@ -1508,7 +1508,11 @@ class FastGemma4Engine:
                         doc_indices=w_indices,
                         apple10_nax=self._engine_apple10_nax(),
                     )
-                use_spec = should_use_speculative(eff_spec, use_ane, Bw, temperature)
+                use_spec = (
+                    False
+                    if getattr(self, "mtp_drafter", None) is not None
+                    else should_use_speculative(eff_spec, use_ane, Bw, temperature)
+                )
                 if use_spec:
                     any_spec_used = True
                     w_prompts = [full_prompts[idx] for idx in w_indices]
@@ -1576,6 +1580,8 @@ class FastGemma4Engine:
                         )
                         is not None
                     )
+                if getattr(self, "mtp_drafter", None) is not None and not mtp_gate:
+                    return False
                 return mtp_gate or should_use_speculative(eff_spec, False, min(n_docs, wave_bs), temperature)
 
             if use_ane and resolved_grammars is None and ring_for_batch is None:

@@ -229,3 +229,60 @@ def test_setup_all_prebuilt_zero_compile_repos_and_offline_plan_cpu(tmp_path: Pa
     assert "AbstractFramework/kev-4b-mlx-4bit" in out_map
     assert all(local_only is True for _, local_only in pulled)
 
+
+def test_setup_all_qwen3_uses_complete_snapshot_check_for_partial_hf_cache_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial HF snapshots with config+tokenizer+safetensors satisfy _plan_qwen3 without full optiq_vision downloads."""
+    import fast_qwen3.paths as q3_paths
+
+    mod = _load_setup_all()
+    home = tmp_path / "fast-qwen3"
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    # Simulate huggingface_hub.snapshot_download(..., local_files_only=True) failing when optional vision weights
+    # are absent from the local cache, while fast_qwen3.paths.resolve_paths(...).resolve_model_dir confirms complete.
+    fake_hub_mod = ModuleType("huggingface_hub")
+
+    def _fail_full_snapshot(*_a, **_kw):
+        raise FileNotFoundError("optiq/optiq_vision.safetensors missing")
+
+    fake_hub_mod.snapshot_download = _fail_full_snapshot  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub_mod)
+
+    snap = tmp_path / "qwen3_snap"
+    (snap / "optiq").mkdir(parents=True)
+    (snap / "config.json").write_text("{}", encoding="utf-8")
+    (snap / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (snap / "model.safetensors").write_bytes(b"w")
+
+    class _FakeQwen3Paths:
+        def __init__(self, h: Path) -> None:
+            self.home = h
+
+        def resolve_model_dir(self, *, repo_id: str | None = None, local_files_only: bool = True) -> Path:
+            assert repo_id == mod._QWEN3_HF_REPO
+            assert local_files_only is True
+            assert q3_paths.Qwen3Paths.is_complete_snapshot(snap)
+            return snap
+
+    monkeypatch.setattr(q3_paths, "resolve_paths", lambda h=None: _FakeQwen3Paths(Path(h)))
+    plan = mod._plan_qwen3(
+        home,
+        force=False,
+        hf_checker=mod._is_hf_snapshot_cached,
+        python_exe=sys.executable,
+    )
+    assert plan.has_pending is False
+
+    # Custom hf_checker returning False (e.g., unit test overrides) still triggers pending download.
+    plan_missing = mod._plan_qwen3(
+        home,
+        force=False,
+        hf_checker=lambda _repo: False,
+        python_exe=sys.executable,
+    )
+    assert plan_missing.has_pending is True
+
+

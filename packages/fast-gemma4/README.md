@@ -74,7 +74,7 @@ Optional lazy multimodal image support is available via the `[vision]` extra (`u
 
 | Capability | Base M5 (24 GB) | M4 Pro (48 GB) | Takeaway |
 |---|---|---|---|
-| **Speculative `MTP` (`B=1` greedy JSON)** | **84.1 tok/s** (2.15× decode speedup on LiquidAI) | **121.4 tok/s** (up from 46.8 tok/s on fixture) | Enabled automatically at `B=1` on M5 and `B=1..2` on M4 Pro; dense GPU batching wins at larger batches. |
+| **Speculative `MTP` (`B=1` / `B=4` AR parity)** | **1.65×–1.68×** vs AR at `B=1` (`2.15×` vs unrestricted `mlx-vlm` JSON), **`1.00×` `json_b4`**, **`10/10` exact** (`9.30 GB`) | **1.49×–1.62×** vs AR at `B=1`, **`1.13×` `free_b4`**, **`10/10` exact** (`9.53 GB`) | `forward_verify_mtp_slot` gates singleton verify kernels strictly to `B=1` while `B>=2` uses standard batched linears, and explicit-MTP engines stay on dense `run_decode_rolling` when `B > max_b`. See [capability reruns](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes). |
 | **Shared-prefix `PrefixTree` reuse** | Zero system-KV cloning across batch slots | Up to **2.59×** faster across 4–8 shared-prefix candidates | Automatically reuses shared prompt prefixes (`>= 32` tokens). |
 | **Local 8-bit `QLoRA` adapter training** | **80.5–87.7 sup tok/s** in 4.85–6.76 GiB (`pack=1024, accum=2`) | **545.8 tok/s** packed 8-bit (`pack=2048`) | Sizing to `pack_tokens=1024, grad_accum=2, ckpt_tokens=512` eliminates 24 GB OOMs with matching loss and gradients. |
 | **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61–3.38 rollouts/s** (8.68 GB peak) | **1.81–3.15 rollouts/s** (7.11 GB vs 19.38 GB GPU critic) | Runs critic scoring on the Neural Engine concurrently with GPU rollouts and backward passes. |

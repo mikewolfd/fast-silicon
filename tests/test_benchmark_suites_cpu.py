@@ -2569,6 +2569,84 @@ def test_cat5_ocr_batch_policy_and_kie_batched_schemas_cpu(
     assert batch_calls[0]["schemas"][0] != batch_calls[0]["schemas"][1]
 
 
+def test_spawn_isolated_worker_handles_nonnewline_prefix_and_worker_out_file_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_spawn_isolated_worker recovers worker JSON both via --worker-out-file and non-newline stdout marker."""
+    import subprocess
+    from types import SimpleNamespace
+
+    out = _load_script("test_outcomes_worker_io", "benchmark_outcomes.py")
+    seen_cmds: list[list[str]] = []
+
+    def _fake_popen_file(cmd, **_kw):
+        seen_cmds.append(list(cmd))
+        out_path = Path(cmd[cmd.index("--worker-out-file") + 1])
+        out_path.write_text(
+            json.dumps({"records": [{"package": "fast-embeddinggemma-2", "status": "ok", "gate_verdict": "PASS"}]}),
+            encoding="utf-8",
+        )
+
+        class _Proc:
+            returncode = 0
+            pid = 12345
+
+            def communicate(self, timeout=None):
+                return ("E5RT STL exception without newline.", "")
+
+        return _Proc()
+
+    args = SimpleNamespace(
+        tier="tier1",
+        lockfile=None,
+        cache_dir=None,
+        local_files_only=True,
+        max_items=None,
+        smoke=False,
+        include_unconstrained_baseline=False,
+        no_wired_limit=True,
+        openai_url=None,
+        openai_model=None,
+        coreai_python=None,
+        pplx_mlx_path=None,
+        max_coarse_tokens=None,
+        timeout_sec=30,
+    )
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen_file)
+    recs = out._spawn_isolated_worker(
+        python_exe=sys.executable,
+        pkg_name="fast-embeddinggemma-2",
+        label="pk",
+        extra_flags="",
+        args=args,
+    )
+    assert seen_cmds and "--worker-out-file" in seen_cmds[0]
+    assert recs == [{"package": "fast-embeddinggemma-2", "status": "ok", "gate_verdict": "PASS"}]
+
+    # When --worker-out-file is absent/unwritten, substring match recovers marker preceded by non-newline C++ stderr/stdout.
+    def _fake_popen_stdout(cmd, **_kw):
+        class _Proc:
+            returncode = 0
+            pid = 12346
+
+            def communicate(self, timeout=None):
+                marker = out._WORKER_MARKER + json.dumps({"records": [{"package": "fast-bge-small", "status": "ok"}]})
+                return (f"E5RT STL noise...weights.bin.{marker}\n", "")
+
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen_stdout)
+    recs_stdout = out._spawn_isolated_worker(
+        python_exe=sys.executable,
+        pkg_name="fast-bge-small",
+        label="pk",
+        extra_flags="",
+        args=args,
+    )
+    assert recs_stdout == [{"package": "fast-bge-small", "status": "ok"}]
+
+
+
 
 
 

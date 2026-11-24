@@ -128,8 +128,13 @@ def cache_probe_arm(arm, records, kev_dir):
     if stock:
         scorer = PublicKev08bMlxBackend(Path(kev_dir), batch_docs=8)
     else:
-        scorer = Kev08bMlxBackend(kev_dir, quant_mode="w8", batch_docs=8,
-                                 prefix_cache_mb=0 if arm == "plain" else "auto")
+        scorer = Kev08bMlxBackend(
+            kev_dir,
+            quant_mode="w8",
+            batch_docs=8,
+            prefix_cache_mb=0 if arm == "plain" else "auto",
+            profile="interactive",
+        )
     load_seconds = time.perf_counter() - started
     tree = getattr(scorer, "prefix_tree", None)
     if (tree is not None) != (arm == "cached"):

@@ -1105,23 +1105,37 @@ class KevMlxBackend:
         prefix_cache_mb: int | Literal["auto"] | None,
         prefix_chunk_tokens: int,
         host_mem_bytes: int,
+        profile: Literal["auto", "backfill", "interactive"] | str = "auto",
+        prefix_admission_min_hits: int | None = None,
     ) -> tuple[PrefixTree | None, bool]:
         if prefix_tree is not None:
             return prefix_tree, False
+        eff_prof = str(profile).strip().lower()
+        eff_min_hits = (
+            max(1, int(prefix_admission_min_hits))
+            if prefix_admission_min_hits is not None
+            else (1 if eff_prof == "interactive" else 2)
+        )
         if prefix_cache_mb == "auto":
             return (
                 PrefixTree(
                     chunk_tokens=int(prefix_chunk_tokens),
                     byte_budget=recommended_prefix_budget_bytes(host_mem_bytes),
-                    admission_min_hits=2,
+                    admission_min_hits=eff_min_hits,
                 ),
                 True,
             )
         if prefix_cache_mb is not None and not isinstance(prefix_cache_mb, bool) and int(prefix_cache_mb) > 0:
+            explicit_min_hits = (
+                max(1, int(prefix_admission_min_hits))
+                if prefix_admission_min_hits is not None
+                else 1
+            )
             return (
                 PrefixTree(
                     chunk_tokens=int(prefix_chunk_tokens),
                     byte_budget=int(prefix_cache_mb) << 20,
+                    admission_min_hits=explicit_min_hits,
                 ),
                 True,
             )
@@ -1141,6 +1155,7 @@ class KevMlxBackend:
         prefix_cache_mb: int | Literal["auto"] | None = "auto",
         prefix_chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         prefix_snapshot_stride: int = 1,
+        prefix_admission_min_hits: int | None = None,
         compress_gdn_prefix_int8: bool | Literal["auto"] = "auto",
         profile: Literal["auto", "backfill", "interactive"] = "auto",
         tokenizer_path: Path | str | None = None,
@@ -1266,6 +1281,8 @@ class KevMlxBackend:
             prefix_cache_mb=prefix_cache_mb,
             prefix_chunk_tokens=prefix_chunk_tokens,
             host_mem_bytes=host_mem_bytes,
+            profile=self.profile,
+            prefix_admission_min_hits=prefix_admission_min_hits,
         )
 
         try:

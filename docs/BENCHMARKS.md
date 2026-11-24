@@ -934,7 +934,54 @@ Machine-readable validation receipt: [`benchmarks/v30-validation-20261123.json`]
 - **`L-7` Multi-Grid CoreML ANE `16L SigLIP` ViT (`KILL`):** Achieved **`100.0%` ANE placement (`1,736/1,736` ops on `CPU_AND_NE`)** at `10.53 img/s`, **`0` `R@1` drop** (`46/48 = 0.9583`), `min_cos = 0.9953` vs `FP32` (`GPU BF16` itself drifts to `0.9926` vs `FP32` on L15 `1,328` residual), and **`1.518–1.608×`** concurrent GPU+ANE work-stealing — **killed on Gate 2 memory (`+690.8 MB` `2`-grid / `+633.6 MB` `3`-grid vs `< +500 MB`)** because CoreML allocates `~250 MB` independent ANE heaps & IOSurfaces per active function even inside a shared-weight `MultiFunctionDescriptor`.
 - **`L-8` Auto-DPI Escalation Default (`KILL` -> Opt-in `confidence_escalate_dpi=None`):** Flagged exact `4/30` degraded `old_scans` pages (`mean_logprob < -0.15`), but `300/400 DPI` uncropped retries added `+162.1s..+202.1s` with `+0.0000` accuracy delta.
 
-### 14.5 Saved Benchmark Receipts Index
+## 15. Dual-Mac Full 4-Suite Verification and Post-Fix Reruns (2026-11-24)
+
+Machine-readable receipt combining all 4 baseline suites (`monorepo`, `outcomes_tier1`, `outcomes_vision`, `capabilities`) plus targeted post-fix reruns on both hosts: [`benchmarks/dual-mac-suite-20261124.json`](benchmarks/dual-mac-suite-20261124.json).
+
+- **Quiescence & contention disclosures:**
+  - The full 4-suite baseline ran quiescent (`0` warnings) on **Base Apple M5 (`24 GB`, `macOS 27.2.1`)** and with `--allow-contended` (`7` warnings) on **Apple M4 Pro (`48 GB`, `macOS 26.6`)**.
+  - Targeted post-fix reruns on both Macs executed while an independent background host workload was active on each machine; compare relative ratios (`MTP` vs `AR`, `cached` vs `plain`/`stock`) on reruns rather than raw contended vs quiescent throughput.
+
+### 15.1 Dual-Mac Baseline `benchmark_monorepo.py` Throughput & Peak Memory
+
+| Package | M4 Pro (`48 GB`) Highlight & Internal Ratio | M4 Pro Mem (`MLX / OS GB`) | Base M5 (`24 GB`) Highlight & Internal Ratio | Base M5 Mem (`MLX / OS GB`) |
+|---|---|---:|---|---:|
+| `fast-bge-small` | `121,730; 192,512; 59,304 tok/s`; B=1 ANE `0.48 ms` vs GPU `1.98 ms` (`4.10×`) | `1.048 / 1.881` | `152,937; 201,181; 63,850 tok/s`; B=1 ANE `0.79 ms` vs GPU `1.29 ms` (`1.62×`) | `0.954 / 1.663` |
+| `fast-embeddinggemma-2` | `17,936; 36,809; 21,445 tok/s`; B=1 ANE `2.08 ms` vs GPU `7.72 ms` (`3.72×`) | `1.251 / 2.523` | `30,430; 49,106; 21,888 tok/s`; B=1 ANE `2.58 ms` vs GPU `5.02 ms` (`1.94×`) | `1.128 / 2.321` |
+| `fast-pplx` (`hetero2` mixed) | `15,067.6 tok/s` (`805.83 ms`, `1.53×` vs bf16; B=1 ANE `7.53 ms`) | `1.964 / 2.743` | `22,100.1 tok/s` (`549.41 ms`, `1.35×` vs bf16; B=1 ANE `9.12 ms`) | `1.666 / 2.579` |
+| `fast-gemma4` | GPU `1,258 tok/s` (`5.64 docs/s`); ANE+GPU `1,182 tok/s` (`6.11 docs/s`, `1.08×`) | `8.480 / 13.045` | GPU `1,289 tok/s` (`6.42 docs/s`); Spec `342 eff tok/s` (ANE disabled on 24 GB) | `4.760 / 5.856` |
+| `fast-gpt-oss` | `B=8 190.7`, `B=64 385.8`, `B=128 444.1 dec tok/s` (`1.568 docs/s`) | `15.962 / 16.665` | `B=1 49.0`, `B=8 93.6`, `B=16 103.1 dec tok/s` (`0.382 docs/s`) | `13.422 / 14.265` |
+| `fast-decision-models` | `laya_ane 41.96 q/s`, `laya_hetero 110.55 q/s`, `kev_08b 101.5 q/s` | `3.051 / 3.957` | `laya_ane 44.39 q/s`, `laya_hetero 175.79 q/s`, `kev_08b 163.88 q/s` | `2.878 / 3.905` |
+
+### 15.2 Dual-Mac Tier-1 & Vision Outcome Suite Results (with M4 `fast-embeddinggemma-2` Reruns)
+
+| Package (`Config`) | Suite | M4 Pro (`Valid`, `S_obj,e2e`, `EOT u/s`, `4B Mem`, `Gate`) | Base M5 (`Valid`, `S_obj,e2e`, `EOT u/s`, `4B Mem`, `Gate`) |
+|---|---|---|---|
+| `fast-bge-small` (`hetero`) | NanoBEIR+LegalBench(325) | `325/325`, `0.4737`, `12.059`, `1.564 GB`, `PASS` | `325/325`, `0.4737`, `13.064`, `1.484 GB`, `PASS` |
+| `fast-embeddinggemma-2` (`hetero`) | NanoBEIR+LegalBench(500) | **`500/500`, `0.5359`, `1.143` (`234.5 s` contended rerun), `1.287 GB`, `PASS`** | `500/500`, `0.5371`, `4.658` (`57.7 s`), `2.081 GB`, `PASS` |
+| `fast-pplx` (`hetero2`) | NanoBEIR+LegalBench(325) | `325/325`, `0.7370`, `1.515`, `2.129 GB`, `PASS` | `325/325`, `0.7377`, `2.059`, `1.734 GB`, `PASS` |
+| `fast-decision-models` (`laya_ane`) | RAGTruth+CLINC+RB2(1400) | `1400/1400`, `0.5050`, `5.817`, `1.010 GB`, `PASS` | `1400/1400`, `0.5050`, `6.158`, `1.011 GB`, `PASS` |
+| `fast-decision-models` (`kev_08b_w8`) | RAGTruth+CLINC+RB2(1400) | `1400/1400`, `0.5257`, `2.757`, `2.881 GB`, `PASS` | `1400/1400`, `0.5250`, `4.760`, `2.263 GB`, `PASS` |
+| `fast-gemma4` Cat 3 (`gpu_fp16_kvbf16_cat3`) | IFBench+MMLU+MATH(435) | `303/435`, `0.3632`, `1.260`, `7.141 GB`, `FAIL` (repeat loops) | `303/435`, `0.3632`, `1.003`, `4.045 GB`, `FAIL` (repeat loops) |
+| `fast-gemma4` Cat 4 (`llg_on`) | LiquidAI+BFCL(300) | `300/300`, `0.8802`, `3.639`, `8.153 GB`, `PASS` | `300/300`, `0.8836`, `4.179`, `4.978 GB`, `PASS` |
+| `fast-qwen3` Cat 3 (`qwen3_auto_cat3`) | IFBench+MMLU+MATH(435) | `398/435`, `0.6621`, `0.601`, `4.109 GB`, `FAIL` (repeat loops) | `394/435`, `0.6460`, `0.391`, `4.212 GB`, `FAIL` (repeat loops) |
+| `fast-qwen3` Cat 4 (`llg_on`) | LiquidAI+BFCL(300) | `299/300`, `0.8929`, `0.608`, `4.602 GB`, `FAIL` | `300/300`, `0.8930`, `0.804`, `4.753 GB`, `FAIL` |
+| `fast-gpt-oss` Cat 3 / Cat 4 | Cat 3(435) / Cat 4(300) | Cat 3 `411/435`, `0.5885`, `0.409`, `12.041 GB`, `FAIL` / Cat 4 `300/300`, `0.8287`, `0.446`, `12.670 GB`, `PASS` | Excluded (`<= 24 GB` RAM policy) |
+| `fast-ocr` (`auto_gfm`) | olmOCR(42) / FinTabNet(30) / OmniDoc(24) | `0.4790` `PASS` / `0.8378` `PASS` / `0.5805` `FAIL` (`5.61–5.95 GB`) | `0.3994` `PASS` / `0.8599` `PASS` / `0.5820` `FAIL` (`4.70–5.80 GB`) |
+| `fast-embeddinggemma-2-vision` | VisualRetrieval(18) | **`18/18`, `0.9722`, `3.492` (`5.01 s` contended rerun), `4.656 GB`, `PASS`** | `18/18`, `1.0000`, `16.042` (`1.12 s`), `4.810 GB`, `PASS` |
+| `fast-pplx-vision` | VisualRetrieval(18) | `18/18`, `1.0000`, `6.140` (`2.93 s`), `4.122 GB`, `PASS` | `18/18`, `1.0000`, `8.872` (`2.03 s`), `3.802 GB`, `PASS` |
+| `fast-gemma4-vision` (`gemma4_vision_gfm`) | FinTabNet(30) / olmOCR(42) / OmniDoc(24) / CORD(30) | FinTabNet `0.5798` `PASS`; olmOCR `0.1736` / OmniDoc `0.3362` / CORD `0.5434` (`FAIL` loops) | FinTabNet `0.5800` `PASS`; olmOCR `0.1864` / OmniDoc `0.3387` / CORD `0.5446` (`FAIL` loops) |
+
+### 15.3 Targeted Post-Fix Capability Reruns & Root-Cause Engineering Notes
+
+1. **`fast-embeddinggemma-2` M4 Pro Core ML `e5bundlecache` repair & worker IPC hardening:** Clearing `30` incomplete `H16S.bundle` directories (missing `weights/weights.bin`) and `2` missing-`model.milhash` directories on M4 Pro restored all 9 `emb2_pk_s*_w8` buckets (`rc=0, ANE=2288, GPU=0, CPU=0`). Hardening `scripts/benchmark_outcomes.py` with atomic `--worker-out-file` IPC plus substring `_WORKER_MARKER` matching prevents non-newline native stdout/stderr text from discarding worker JSON records.
+2. **`KevMlxBackend` `profile="interactive"` 1-hit `PrefixTree` admission (`prefix-tree` Base M5 rerun):** Setting `admission_min_hits=1` for `profile="interactive"` (retaining `2` for `"auto"`/`"backfill"`) and passing `profile="interactive"` in `scripts/_kev_benchmark.py` eliminated the 1-shot cold-to-warm `0.051327` diff. Base M5 rerun passed cleanly (`status="ok"`, **`0.0` `cold_vs_warm_max_logit_diff` & `max_prob_diff`**, warm `B=1 5.63 q/s` / `B=8 9.59 q/s`, **`3.039×` vs stock `mlx-lm 3.15 q/s`**, `1.537×` vs plain, `2.910 GB` peak). Baseline M5 `encoder-finetune` (`33.1 items/s`, `1.31×`), `grpo-ane-critic` (`2.24/3.15 rollouts/s`, `4.48×`), and `parallel-coreml` (`9.25s`, `1.71×`) already passed (`M4 Pro`: `24.2 items/s` `1.28×`, `2.26/3.49 rollouts/s`, `12.37s` `1.78×`).
+3. **`fast-gemma4` `mtp-speculative` `B >= 2` singleton gate & declined-wave rolling retention:** Gating `_singleton_verify_linear` / `singleton=True` inside `forward_verify_mtp_slot` strictly to `B == 1` eliminated `B=4` Metal register spills, and keeping explicit-MTP engines on dense `run_decode_rolling` when MTP declines `B > max_b` prevented unconstrained `PromptLookup` fallback:
+   - **M4 Pro (1-round contended probe):** `free_b1` **`1.617×`** vs AR, `free_b4` **`0.185× -> 1.130×`** vs AR, `json_b1` **`1.488×`** vs AR, `json_b4` `0.920×` (`9.532 GB` peak), **`10/10` exact AR/MTP token matches** (up from `4/10`).
+   - **Base M5 (2-round contended rerun with stock `mlx-vlm`):** `free_b1` **`1.677×`** vs AR, `free_b4` **`0.560× -> 0.967×`** vs AR, `json_b1` **`1.648×`** vs AR (`33.5 vs 15.6 tok/s` unrestricted `mlx-vlm` = **`2.15×`**), `json_b4` **`0.861× -> 1.002×`** vs AR (`59.7 vs 45.5 tok/s` unrestricted `mlx-vlm`), `9.300 GB` peak, **`10/10` exact AR/MTP token matches** (up from `5/10`).
+4. **`setup_all.py` offline `qwen3` readiness & Category 3/4 repeat-loop probe:** Updating `_plan_qwen3` in `scripts/setup_all.py` to check `Qwen3Paths.is_complete_snapshot` made `setup_all.py --dry-run` report **`[READY]` across all 7 packages (`0.00 GB` pending)** on both Macs. Probing the `fast-gemma4` `math_500` first 16 items found the flagged item (`rep4=0.194`) finished cleanly with `finish_reason="stop"` and `exact_3x_periods=[]` (algebraic phrase reuse over 1,330 valid tokens rather than a cyclic loop), and a batched `fast-qwen3` `bfcl_v3` probe (`150` items) had `0` `length` truncations and `0` `rep4 >= 0.15` flags, so `compute_loop_breaker_penalties` remains unchanged.
+
+## 16. Saved Benchmark Receipts Index
 
 | Artifact | Scope |
 |---|---|
@@ -951,3 +998,4 @@ Machine-readable validation receipt: [`benchmarks/v30-validation-20261123.json`]
 | [`benchmarks/v23-validation-20261121.json`](benchmarks/v23-validation-20261121.json) | `v2.3` accuracy, precision & contextual gates (`Section 10`) |
 | [`benchmarks/v25-rd-winners-20261122.json`](benchmarks/v25-rd-winners-20261122.json) | `v2.5` `MaxSim` `32K`, `MRL + INT8`, `QuaRot` KV & CoreAI gates (`Section 12`) |
 | [`benchmarks/v30-validation-20261123.json`](benchmarks/v30-validation-20261123.json) | `v3.0` vision prefetch, NAX meta-only XOR, multimodal `MTP`, OCR confidence & negative gates (`Section 14`) |
+| [`benchmarks/dual-mac-suite-20261124.json`](benchmarks/dual-mac-suite-20261124.json) | 2026-11-24 dual-Mac 4-suite baseline & targeted post-fix rerun receipts (`Section 15`) |

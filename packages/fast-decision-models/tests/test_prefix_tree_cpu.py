@@ -644,7 +644,7 @@ def test_kev_exact_lcp_grouping_and_batched_shared_prefix_waves_cpu() -> None:
 
 def test_prefix_tree_two_hit_admission_and_kev_auto_routing_cpu() -> None:
     """Verify bounded 2-hit admission prevents cold thrashing while accelerating subsequent repeated prefixes."""
-    # 1. Resolve 'auto' sets admission_min_hits=2 while explicit budgets and injected trees keep 1.
+    # 1. Resolve 'auto' sets admission_min_hits=2 while interactive profile, explicit budgets, and injected trees keep 1.
     t_auto, owns_auto = Kev08bMlxBackend._resolve_prefix_tree(
         prefix_tree=None,
         prefix_cache_mb="auto",
@@ -653,6 +653,26 @@ def test_prefix_tree_two_hit_admission_and_kev_auto_routing_cpu() -> None:
     )
     assert t_auto is not None and owns_auto is True
     assert t_auto.admission_min_hits == 2
+
+    t_inter, owns_inter = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb="auto",
+        prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+        host_mem_bytes=24 << 30,
+        profile="interactive",
+    )
+    assert t_inter is not None and owns_inter is True
+    assert t_inter.admission_min_hits == 1
+
+    t_ovr, _ = Kev08bMlxBackend._resolve_prefix_tree(
+        prefix_tree=None,
+        prefix_cache_mb="auto",
+        prefix_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+        host_mem_bytes=24 << 30,
+        profile="interactive",
+        prefix_admission_min_hits=3,
+    )
+    assert t_ovr is not None and t_ovr.admission_min_hits == 3
 
     # 2. Pure PrefixTree unit behavior: bounded window + 1st-sight filter + 2nd-sight admit + interactive bypass.
     pt = PrefixTree(chunk_tokens=4, byte_budget=1 << 20, admission_min_hits=2, admission_window=8)
