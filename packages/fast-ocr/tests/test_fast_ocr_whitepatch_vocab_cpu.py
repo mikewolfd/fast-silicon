@@ -442,12 +442,14 @@ def test_ovis_b1_white_patch_drop_and_kv_mode(tmp_path: Path, monkeypatch: pytes
     assert cache_calls[0]["kv_i8"] == "bf16"
     assert cache_calls[0]["gdn_state_mode"] == "int8"
 
-    # On Apple9 (non-NAX) 24 GB host -> B=1 selects q4_quarot at max_tokens=4096; Apple10 NAX stays bf16.
+    # On Apple9 (non-NAX) 24 GB host -> B=1 stays bf16 at max_tokens=4096 and selects q4_quarot at max_tokens=8192; Apple10 NAX stays bf16 at both.
     monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: False)
     eng.ocr_image(img, drop_white_patches=True, max_tokens=4096)
+    assert cache_calls[-1]["kv_i8"] == "bf16"
+    eng.ocr_image(img, drop_white_patches=True, max_tokens=8192)
     assert cache_calls[-1]["kv_i8"] == "q4_quarot"
     monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
-    eng.ocr_image(img, drop_white_patches=True, max_tokens=4096)
+    eng.ocr_image(img, drop_white_patches=True, max_tokens=8192)
     assert cache_calls[-1]["kv_i8"] == "bf16"
 
 
@@ -588,8 +590,10 @@ def test_ocr_images_signature_prompt_builder_and_kv_resolver(tmp_path: Path, mon
     assert kv_res(4, 2048) == "bf16"
     assert kv_res(8, 2048) == "bf16"
     assert kv_res(16, 2048) == "bf16"
-    assert kv_res(32, 2048) == "q4_quarot"
-    assert kv_res(2, 4096) == "q4_quarot"
+    assert kv_res(32, 2048) == "bf16"
+    assert kv_res(2, 4096) == "bf16"
+    assert kv_res(64, 4096) == "q4_quarot"
+    assert kv_res(2, 8192) == "q4_quarot"
 
     monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
     assert kv_res(16, 2048) == "bf16"
@@ -602,8 +606,10 @@ def test_ocr_images_signature_prompt_builder_and_kv_resolver(tmp_path: Path, mon
     monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: False)
     assert kv_res(4, 4096) == "bf16"
     assert kv_res(16, 2048) == "bf16"
-    assert kv_res(32, 2048) == "q4_quarot"
-    assert kv_res(2, 8192) == "q4_quarot"
+    assert kv_res(32, 2048) == "bf16"
+    assert kv_res(2, 8192) == "bf16"
+    assert kv_res(64, 8192) == "q4_quarot"
+    assert kv_res(2, 16384) == "q4_quarot"
 
     monkeypatch.setattr("fast_ocr.ovis_engine._host_supports_apple10_nax", lambda: True)
     assert kv_res(32, 8192) == "bf16"

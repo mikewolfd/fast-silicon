@@ -186,7 +186,7 @@ def _add_shared_ocr_args(p: argparse.ArgumentParser, *, allow_all_backend: bool 
         "--kv-i8",
         type=_parse_cli_kv_mode,
         default=None,
-        help="KV cache precision ('auto' [default: q4_quarot at B>=8 or long ctx], 'q4_quarot', 'q8', 'bf16', or 'off')",
+        help="KV cache precision ('auto' [default: bf16; q4_quarot on long ctx or high batch*ctx pressure], 'q4_quarot', 'q8', 'bf16', or 'off')",
     )
     p.add_argument(
         "--gdn-state-mode",

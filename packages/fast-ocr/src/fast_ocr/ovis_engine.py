@@ -190,8 +190,9 @@ def resolve_ovis_kv_mode(
         elif ctx >= 32768 or (bs * ctx) >= 524_288:
             return "q4_quarot"
         return "bf16"
-    ctx_cutoff = 4096 if host_gb <= 28.0 else 8192
-    if bs >= 32 or ctx >= ctx_cutoff:
+    ctx_cutoff = 8192 if host_gb <= 28.0 else 16384
+    pressure_cutoff = 262_144 if host_gb <= 28.0 else 524_288
+    if ctx >= ctx_cutoff or (bs * ctx) >= pressure_cutoff:
         return "q4_quarot"
     return "bf16"
 
