@@ -1,6 +1,6 @@
 # fast-qwen3
 
-Extract schema-constrained JSON or call tools locally on Apple Silicon with Qwen 3.5 and Qwen 3.6 models (`0.8B` to `27B` dense and `35B-A3B` MoE). On 50 public extraction and tool tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returned **50/50 valid responses and scored 0.902** on both the 24 GB M5 and the 48 GB M4 Pro. Unconstrained stock `mlx-lm` on the same checkpoint returned 37/50 valid responses on M5 (0.662 score) and 35/50 on M4 Pro (0.623 score), giving `fast-qwen3` 1.53× and 1.38× the score per second. [Outcome tables and methodology](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
+Extract schema-constrained JSON or call tools locally on Apple Silicon with Qwen 3.5 and Qwen 3.6 models (`0.8B` to `27B` dense and `35B-A3B` MoE). On 50 public extraction and tool tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returned **50/50 valid responses and scored 0.902** on both the 24 GB M5 and the 48 GB M4 Pro (`1.53×` / `1.38×` EOT vs. unconstrained stock `mlx-lm`). On full 300-item Category 4 (`LiquidAI 150 + BFCL v3 150`), `fast-qwen3` hits **`300/300` (`0.8955` `S_obj,e2e`, `0.881` EOT, `0` loops, `PASS`)** on quiescent Base M5 and **`299/300` (`0.8930`, `F1=0.9526`, `BFCL=0.8333`)** on contended M4 Pro. [Outcome tables and methodology](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22) · [Wave 3 Category 3/4 results](../../docs/BENCHMARKS.md#162-post-fix-fast-qwen3-fast-ocr-fast-embeddinggemma-2-vision--fast-pplx-results)
 
 The engine runs Qwen’s hybrid 3:1 `GatedDeltaNet` + GQA architecture on MLX with mixed-bit `OptiQ` weight fusion, Apple10+ NAX `W4A8` prefill acceleration, compiled GDN and RoPE kernels, and recurrent prefix caching (`PrefixTree`). Thinking mode defaults off (`<think>\n\n</think>\n\n`), which matches or beats thinking on structured JSON and tool calls at roughly one-third the latency.
 
@@ -61,6 +61,7 @@ Measurements compare the 24 GB base M5 and the 48 GB M4 Pro under lock-serialize
 
 | Model preset | Workload | Base M5 (24 GB) | M4 Pro (48 GB) | Memory (M5 / M4 Pro) |
 | :--- | :--- | ---: | ---: | ---: |
+| `4B-OptiQ` (`4b`, constrained, Wave 3) | Full 300 Cat 4 (`LiquidAI 150 + BFCL 150`) | **0.8955 (`300/300`, `0.881` EOT, `0` loops, `PASS`)** | 0.8930 (`299/300`, `0.676` EOT, `2` loops, contended) | 4.76 / 4.99 GB |
 | `4B-OptiQ` (`4b`, constrained) | 50 public extraction + tool tasks | 0.902 score, 50/50 valid (0.513 score/s) | 0.902 score, 50/50 valid (0.396 score/s) | 5.26 / 5.18 GB |
 | Stock `mlx-lm` (`4B-OptiQ`, unconstrained) | Same 50 public tasks | 0.662 score, 37/50 valid (0.336 score/s) | 0.623 score, 35/50 valid (0.286 score/s) | 3.79 / 8.02 GB |
 | `9B-OptiQ` (`mtp_drafter`, constrained) | Same 50 public tasks | 0.886 score, 50/50 valid (0.402 score/s) | 0.887 score, 50/50 valid (0.277 score/s) | 8.39 / 8.79 GB |
@@ -81,7 +82,7 @@ Measurements compare the 24 GB base M5 and the 48 GB M4 Pro under lock-serialize
 
 | Option | Default | What it does |
 | :--- | :--- | :--- |
-| `kv_i8` | `"auto"` | Uses BF16 KV on short requests and switches to rotated 4-bit KV (`"q4_quarot"`, 3.56× smaller) at `>= 16K` tokens (`>= 8K` on 24 GB Macs) or batch `>= 16`. Pass `"q8"` for 8-bit KV or `False`/`"bf16"` for BF16 everywhere. |
+| `kv_i8` | `"auto"` | Uses BF16 KV on short/medium requests and switches to rotated 4-bit KV (`"q4_quarot"`, 3.56× smaller) at `>= 16K` tokens (`>= 8K` on 24 GB Macs) or high `batch*ctx` pressure (`>= 262_144` on `<= 28 GB`, `524_288` above). Pass `"q8"` for 8-bit KV or `False`/`"bf16"` for BF16 everywhere. |
 | `gdn_state_mode` (cache / `FAST_QWEN3_GDN_STATE_MODE`) | `"auto"` | Stores recurrent GDN state in `fp32` below `B=8` (`< 4` on `<= 28 GB` hosts) to avoid kernel launch overhead, and switches to `int8_blk32` (`3.76×` DRAM cut with `FP32` decay `g`) at larger batches. |
 | `enable_mpp_linear` / `mpp_w8a8` (model / `FAST_SILICON_QWEN3_MPP_W8A8`) | `"auto"` / `False` | Uses Apple10+ NAX `64×64` `W4A8` prefill on large 4-bit projections (`M >= 128`, `k, n >= 1536`) with inline XOR unpacking, saving `2.341 GB` on `4B-OptiQ` and `> 4.2 GB` on `9B-OptiQ` at zero diff (`1.183×` vs. `MLX qmm`). Set `FAST_SILICON_QWEN3_MPP_W8A8=1` for 8-bit NAX prefill (`4B-OptiQ` `+4.1%` EOT; kept opt-in because `9B-OptiQ` lost `-0.0045` on Category 4). |
 | `drop_white_patches` (multimodal batch) | `False` | Keeps all bright background patches by default because dropping white column gaps caused hallucinations on compact financial tables; pass `True` only to opt in. (`max_pad_ratio` wave splitting also stays inactive up to `1,024` tokens, giving `1.373×` on `FinTabNet-24`.) |
