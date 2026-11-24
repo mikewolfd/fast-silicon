@@ -8,6 +8,7 @@ from pathlib import Path
 
 _PKG_NAME = "fast-pplx"
 _ARTIFACT_SUBDIRS = ("weights", "tokenizer", "ane_models")
+DEFAULT_PREBUILT_HF_REPO = "mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane"
 
 
 def _has_direct_artifact_subdirs(path: Path) -> bool:
@@ -158,6 +159,31 @@ def require_runtime_paths(home: str | Path | None = None, require_ane: bool = Fa
             )
         if not p.ane_models_dir.exists():
             raise FileNotFoundError(f"Missing ANE models directory: {p.ane_models_dir}.")
+    return p
+
+
+def ensure_prebuilt_artifacts(
+    home: str | Path | None = None,
+    *,
+    repo_id: str = DEFAULT_PREBUILT_HF_REPO,
+    local_files_only: bool = False,
+    include_ane: bool = True,
+    force: bool = False,
+    downloader: object | None = None,
+) -> RepoPaths:
+    """Materialize prebuilt PPLX weights, tokenizer, and ANE stages from Hugging Face."""
+    from fast_shared.hf import materialize_hf_snapshot
+
+    p = resolve_paths(home)
+    subdirs = ("weights", "tokenizer", "ane_models") if include_ane else ("weights", "tokenizer")
+    materialize_hf_snapshot(
+        repo_id,
+        p.weights_dir.parent,
+        subdirs=subdirs,
+        local_files_only=local_files_only,
+        overwrite=force,
+        downloader=downloader,  # type: ignore[arg-type]
+    )
     return p
 
 

@@ -32,6 +32,7 @@ from .gpu import (
 )
 from .paths import (
     MmapTokenTable,
+    ensure_prebuilt_artifacts,
     load_or_mmap_token_table,
     require_runtime_paths,
     resolve_openinfinity_dir,
@@ -416,6 +417,7 @@ class FastEmbeddingGemma2:
         set_wired_limit: bool = True,
         llm_coexec: bool = False,
         vision_model_dir: str | Path | None = None,
+        auto_prebuilt: bool = True,
     ) -> None:
         self.dim = resolve_embedding_dim(dimensions, max_dim=EMBED_DIM)
         self._vision_model_dir: Path | None = (
@@ -432,6 +434,16 @@ class FastEmbeddingGemma2:
                 oi_tok = self.paths.tokenizer_json
             self.tokenizer = FastEmbeddingGemma2Tokenizer(oi_tok)
         else:
+            if auto_prebuilt and home is None:
+                cand = resolve_paths(None)
+                want_ane = (enable_ane is not False) and (default_mode != "gpu")
+                if not cand.weights_npz.exists() or not cand.tokenizer_json.exists() or (
+                    want_ane and not cand.ane_models_dir.exists()
+                ):
+                    try:
+                        ensure_prebuilt_artifacts(None, include_ane=want_ane)
+                    except Exception:
+                        pass
             self.paths = require_runtime_paths(home, require_ane=False)
             self.tokenizer = FastEmbeddingGemma2Tokenizer(self.paths.tokenizer_json)
 

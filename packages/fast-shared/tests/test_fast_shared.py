@@ -3407,3 +3407,84 @@ def test_prune_optional_nullable_fields_and_qat_provenance_hook_cpu(tmp_path: Pa
     in_jl.write_text('{"id": 1, "text": "hello"}\n', encoding="utf-8")
     pllm.extract_jsonl(eng_qat, in_jl, tmp_path / "out_qat.jsonl", system_prompt="s", json_schema=full_schema)
     assert set(eng_qat.seen_schemas[1]["properties"].keys()) == {"id", "title", "meta"}
+
+
+def test_materialize_hf_snapshot_resolves_symlinks_and_offline_guard_cpu(tmp_path: Path, monkeypatch) -> None:
+    """Verify `materialize_hf_snapshot` dereferences HF symlinks, filters subdirs, and honors `HF_HUB_OFFLINE`."""
+    from fast_shared.hf import is_hf_offline, materialize_hf_snapshot
+
+    snap = tmp_path / "hf_snap"
+    blobs = tmp_path / "hf_blobs"
+    (snap / "weights").mkdir(parents=True)
+    (snap / "ane_models" / "b.mlmodelc").mkdir(parents=True)
+    (snap / "extra").mkdir(parents=True)
+    blobs.mkdir(parents=True)
+
+    blob_w = blobs / "w.bin"
+    blob_w.write_bytes(b"weights-payload")
+    blob_m = blobs / "model.mil"
+    blob_m.write_bytes(b"mil-payload")
+
+    (snap / "README.md").write_text("# card", encoding="utf-8")
+    (snap / ".gitattributes").write_text("* filter=lfs", encoding="utf-8")
+    (snap / "weights" / "w.bin").symlink_to(blob_w)
+    (snap / "ane_models" / "b.mlmodelc" / "model.mil").symlink_to(blob_m)
+    (snap / "extra" / "skip.txt").write_text("skip-me", encoding="utf-8")
+
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_dl(*, repo_id: str, local_files_only: bool = False) -> Path:
+        calls.append((repo_id, local_files_only))
+        if local_files_only and not calls_allow_local[0]:
+            raise FileNotFoundError("not cached yet")
+        return snap
+
+    calls_allow_local = [False]
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    assert is_hf_offline(False) is False
+    dst = tmp_path / "mat_dst"
+    materialize_hf_snapshot(
+        "mikewolfd/demo-repo",
+        dst,
+        subdirs=("weights", "ane_models"),
+        downloader=_fake_dl,
+    )
+    assert calls == [("mikewolfd/demo-repo", True), ("mikewolfd/demo-repo", False)]
+    assert (dst / "weights" / "w.bin").read_bytes() == b"weights-payload"
+    assert not (dst / "weights" / "w.bin").is_symlink()
+    assert (dst / "ane_models" / "b.mlmodelc" / "model.mil").read_bytes() == b"mil-payload"
+    assert not (dst / "ane_models" / "b.mlmodelc" / "model.mil").is_symlink()
+    assert not (dst / "README.md").exists()
+    assert not (dst / ".gitattributes").exists()
+    assert not (dst / "extra").exists()
+
+    # Offline guard must never call `local_files_only=False`
+    calls.clear()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert is_hf_offline(False) is True
+    with pytest.raises(FileNotFoundError):
+        materialize_hf_snapshot("mikewolfd/demo-repo", tmp_path / "offline_dst", downloader=_fake_dl)
+    assert calls == [("mikewolfd/demo-repo", True)]
+
+    # Partial (README-only) local cache must fall back to `local_files_only=False` when online
+    partial_snap = tmp_path / "hf_partial_snap"
+    partial_snap.mkdir(parents=True)
+    (partial_snap / "README.md").write_text("# card only", encoding="utf-8")
+
+    partial_calls: list[tuple[str, bool]] = []
+
+    def _partial_dl(*, repo_id: str, local_files_only: bool = False) -> Path:
+        partial_calls.append((repo_id, local_files_only))
+        return partial_snap if local_files_only else snap
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    dst_partial = tmp_path / "mat_partial_dst"
+    materialize_hf_snapshot(
+        "mikewolfd/demo-repo",
+        dst_partial,
+        subdirs=("weights",),
+        downloader=_partial_dl,
+    )
+    assert partial_calls == [("mikewolfd/demo-repo", True), ("mikewolfd/demo-repo", False)]
+    assert (dst_partial / "weights" / "w.bin").read_bytes() == b"weights-payload"
+

@@ -19,10 +19,12 @@ import numpy as np
 
 from ._common import acquire_hw_lock
 from .paths import (
+    DEFAULT_KEV_08B_MLX_REPO,
     DEFAULT_KEV_4B_ADAPTER_REPO,
     DEFAULT_KEV_4B_BASE_REPO,
     DEFAULT_KEV_ADAPTER_REPO,
     DEFAULT_KEV_BASE_REPO,
+    DEFAULT_LAYA_COREML_REPO,
     DEFAULT_LAYA_REPO,
     ensure_laya_dylib,
     resolve_artifacts_dir,
@@ -1066,6 +1068,39 @@ def run_build_args(args: argparse.Namespace) -> int:
     run_all = not (
         args.compile_native or args.build_laya_ane or args.build_kev_mlx or args.quantize_existing_kev_w8
     )
+    from_source = bool(getattr(args, "from_source", False))
+    local_only = bool(getattr(args, "local_files_only", False))
+    kev_var = getattr(args, "kev_variant", "0.8b")
+    has_custom_src = bool(
+        args.laya_dir
+        or args.copy_compiled_laya_from
+        or args.kev_adapter_dir
+        or args.kev_base_dir
+        or args.coreai_preset
+        or args.backend == "coreai"
+    )
+
+    if run_all and not from_source and not has_custom_src:
+        from fast_shared.hf import materialize_hf_snapshot
+
+        dylib = compile_native_dylib(repo_root)
+        print(f"[NATIVE] Compiled {dylib}")
+        laya_out = out_artifacts / "laya_typed"
+        materialize_hf_snapshot(DEFAULT_LAYA_COREML_REPO, laya_out, local_files_only=local_only)
+        print(f"[LAYA] Materialized {DEFAULT_LAYA_COREML_REPO} -> {laya_out}")
+        if "4b" in str(kev_var).lower():
+            build_kev_mlx_artifacts(
+                repo_root,
+                artifacts_dir=out_artifacts,
+                kev_adapter_dir=args.kev_adapter_dir,
+                kev_base_dir=args.kev_base_dir,
+                kev_variant=kev_var,
+            )
+        else:
+            kev_out = out_artifacts / "kev_08b"
+            materialize_hf_snapshot(DEFAULT_KEV_08B_MLX_REPO, kev_out, local_files_only=local_only)
+            print(f"[KEV] Materialized {DEFAULT_KEV_08B_MLX_REPO} -> {kev_out}")
+        return 0
 
     if args.compile_native or run_all:
         dylib = compile_native_dylib(repo_root)
@@ -1091,7 +1126,6 @@ def run_build_args(args: argparse.Namespace) -> int:
             seq_lens=seq_lens,
             multifunction=bool(getattr(args, "multifunction", True)),
         )
-    kev_var = getattr(args, "kev_variant", "0.8b")
     if args.build_kev_mlx or run_all:
         build_kev_mlx_artifacts(
             repo_root,
@@ -1115,6 +1149,8 @@ def run_build_args(args: argparse.Namespace) -> int:
 def add_setup_weights_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--home", default=None, help="Override fast-decision-models root directory")
     parser.add_argument("--artifacts-dir", default=None, help="Override artifacts output directory")
+    parser.add_argument("--from-source", action="store_true", help="Compile Laya CoreML + merge/quantize Kev locally instead of pulling prebuilt HF repos")
+    parser.add_argument("--local-files-only", action="store_true", help="Resolve HF snapshots strictly from local cache")
     parser.add_argument("--compile-native", action="store_true", help="Compile native/laya_ane_runner.mm -> build/liblaya_ane_runner.dylib")
     parser.add_argument("--build-laya-ane", action="store_true", help="Build & stage Laya-Typed-421M CoreML ANE W8A16 bundles")
     parser.add_argument("--laya-dir", default=None, help="Local Laya-Typed checkpoint dir (defaults to HF download)")

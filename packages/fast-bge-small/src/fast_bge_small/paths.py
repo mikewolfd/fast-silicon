@@ -14,6 +14,7 @@ from fast_shared.paths import resolve_home_dir
 
 _PACKAGE_CACHE_NAME = "fast-bge-small"
 _HOME_ENV_VAR = "FAST_BGE_SMALL_HOME"
+DEFAULT_PREBUILT_HF_REPO = "mikewolfd/bge-small-en-v1.5-coreml-ane"
 
 
 @dataclass(frozen=True)
@@ -166,3 +167,28 @@ def load_or_mmap_host_tables(weights_npz: str | Path) -> tuple[np.ndarray, np.nd
     wt0_mm = np.memmap(wt0_bin, dtype=np.float16, mode="r", shape=(vocab_size, hidden_size))
     pos_mm = np.memmap(pos_bin, dtype=np.float16, mode="r", shape=(max_pos, hidden_size))
     return wt0_mm, pos_mm
+
+
+def ensure_prebuilt_artifacts(
+    home: str | Path | None = None,
+    *,
+    repo_id: str = DEFAULT_PREBUILT_HF_REPO,
+    local_files_only: bool = False,
+    include_ane: bool = True,
+    force: bool = False,
+    downloader: object | None = None,
+) -> RepoPaths:
+    """Materialize prebuilt weights, tokenizer, and Core ML ANE buckets from Hugging Face."""
+    from fast_shared.hf import materialize_hf_snapshot
+
+    p = resolve_paths(home)
+    subdirs = ("weights", "tokenizer", "ane_models") if include_ane else ("weights", "tokenizer")
+    materialize_hf_snapshot(
+        repo_id,
+        p.home / "artifacts",
+        subdirs=subdirs,
+        local_files_only=local_files_only,
+        overwrite=force,
+        downloader=downloader,  # type: ignore[arg-type]
+    )
+    return p

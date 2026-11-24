@@ -16,7 +16,7 @@ import numpy as np
 from fast_shared.hf import copy_tokenizer_files, resolve_hf_model_dir
 
 from .engine import FastGemma4Engine
-from .paths import DEFAULT_HF_REPO, resolve_paths
+from .paths import DEFAULT_HF_REPO, ensure_prebuilt_early14_artifacts, resolve_paths
 from .pipeline import extract_jsonl, extract_parquet
 from .server import FastGemma4Server
 
@@ -87,6 +87,15 @@ def _cmd_setup_weights(args: argparse.Namespace) -> int:
     model_dir = resolve_hf_model_dir(args.model_dir, DEFAULT_HF_REPO, local_files_only=args.local_files_only)
     copy_tokenizer_files(model_dir, paths.tokenizer_dir)
 
+    from_source = bool(getattr(args, "from_source", False))
+    if not from_source and not args.model_dir:
+        ensure_prebuilt_early14_artifacts(
+            args.home,
+            local_files_only=args.local_files_only,
+            include_ane=not args.skip_early14,
+        )
+        return 0
+
     script_vocab = _resolve_script(paths, "build_vocab_remap.py")
     if script_vocab.exists():
         rc = subprocess.call([sys.executable, str(script_vocab), "--home", str(paths.home)])
@@ -103,6 +112,15 @@ def _cmd_setup_weights(args: argparse.Namespace) -> int:
 
 def _cmd_setup_ane(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
+    from_source = bool(getattr(args, "from_source", False))
+    if not from_source and not getattr(args, "model_dir", None):
+        ensure_prebuilt_early14_artifacts(
+            args.home,
+            local_files_only=bool(getattr(args, "local_files_only", False)),
+            include_ane=True,
+        )
+        return 0
+
     script = _resolve_script(paths, "build_ane_models.py")
     if not script.exists():
         raise FileNotFoundError(f"Missing {script}")
@@ -507,15 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--home", default=None, help="Override FAST_GEMMA4_HOME directory")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sw = sub.add_parser("setup-weights", help="Copy tokenizer, build vocab remap, and export Early14 FP16 weights")
+    sw = sub.add_parser("setup-weights", help="Stage tokenizer + prebuilt vocab remap/Early14 ANE (or build from source with --from-source)")
     sw.add_argument("--model-dir", default=None)
     sw.add_argument("--local-files-only", action="store_true")
     sw.add_argument("--skip-early14", action="store_true")
+    sw.add_argument("--from-source", action="store_true", help="Build vocab remap + export Early14 weights locally instead of pulling prebuilt HF artifacts")
     sw.set_defaults(func=_cmd_setup_weights)
 
-    sa = sub.add_parser("setup-ane", help="Compile CoreML ANE Early14 prefix chunk bundles (.mlmodelc)")
+    sa = sub.add_parser("setup-ane", help="Download prebuilt CoreML ANE Early14 prefix bundles (or compile with --from-source)")
     sa.add_argument("--model-dir", default=None)
     sa.add_argument("--variant", choices=("both", "fp16", "w8"), default="both")
+    sa.add_argument("--local-files-only", action="store_true")
+    sa.add_argument("--from-source", action="store_true", help="Compile Core ML ANE bundles locally via build_ane_models.py")
     sa.set_defaults(func=_cmd_setup_ane)
 
     gn = sub.add_parser("generate", help="Generate structured JSON or text from a single prompt")

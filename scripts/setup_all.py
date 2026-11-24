@@ -69,9 +69,13 @@ _EMB2_ANE_SEQS: tuple[int, ...] = (32, 64, 128, 192, 256, 320, 384, 448, 512)
 _EMB2_CPU_SEQS: tuple[int, ...] = (256, 384, 512)
 
 _BGE_HF_REPO = "mlx-community/bge-small-en-v1.5-bf16"
+_BGE_PREBUILT_HF_REPO = "mikewolfd/bge-small-en-v1.5-coreml-ane"
 _EMB2_HF_REPO = "mlx-community/embeddinggemma-2-bf16"
+_EMB2_PREBUILT_HF_REPO = "mikewolfd/embeddinggemma-2-coreml-ane"
 _PPLX_HF_REPO = "perplexity-ai/pplx-embed-v2-context-0.6b"
+_PPLX_PREBUILT_HF_REPO = "mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane"
 _GEMMA4_HF_REPO = "lmstudio-community/gemma-4-E2B-it-MLX-4bit"
+_GEMMA4_EARLY14_HF_REPO = "mikewolfd/gemma-4-e2b-it-early14-coreml-ane"
 _GEMMA4_TEST_HF_REPOS: tuple[str, ...] = (
     "mlx-community/gemma-4-e2b-it-bf16",
     "mlx-community/gemma-4-E2B-it-qat-4bit",
@@ -81,28 +85,30 @@ _GPT_OSS_PREBUILT_HF_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q8"
 _QWEN3_HF_REPO = "mlx-community/Qwen3.5-4B-OptiQ-4bit"
 _OCR_HF_REPO = "mlx-community/OvisOCR2-8bit"
 _LAYA_HF_REPO = "convaiinnovations/laya-typed-decisions"
+_LAYA_PREBUILT_HF_REPO = "mikewolfd/laya-typed-decisions-421m-coreml-ane"
 _KEV_ADAPTER_HF_REPO = "jaredpalmer/kev-0.8b"
 _KEV_BASE_HF_REPO = "Qwen/Qwen3.5-0.8B-Base"
+_KEV_08B_PREBUILT_HF_REPO = "mikewolfd/kev-0.8b-mlx-w8"
 
 VETTED_PREBUILT_HF_REPOS: dict[str, tuple[str, ...]] = {
     "bge-small": (
-        "BAAI/bge-small-en-v1.5",
-        "sidekickd/bge-small-en-v1.5-coreml",
+        _BGE_PREBUILT_HF_REPO,
     ),
     "embeddinggemma-2": (
-        "OpenInfinity/embeddinggemma-2-coreml-int8",
+        _EMB2_PREBUILT_HF_REPO,
     ),
     "pplx": (
-        "perplexity-ai/pplx-embed-v2-context-0.6b",
+        _PPLX_PREBUILT_HF_REPO,
     ),
     "decision-models": (
-        "NMTZ/laya-typed-decisions-421m-coreml-ane",
-        "AbstractFramework/kev-0.8b-mlx-8bit",
+        _LAYA_PREBUILT_HF_REPO,
+        _KEV_08B_PREBUILT_HF_REPO,
         "AbstractFramework/kev-4b-mlx-4bit",
     ),
     "gemma4": (
-        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
-        "google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
+        _GEMMA4_HF_REPO,
+        _GEMMA4_EARLY14_HF_REPO,
+        "google/gemma-4-E2B-it-assistant",
     ),
     "gpt-oss": (
         _GPT_OSS_PREBUILT_HF_REPO,
@@ -158,13 +164,15 @@ def pull_prebuilt_package(
 
 @dataclass(frozen=True)
 class StepAction:
-    kind: str  # "native" | "hf_snapshot" | "subprocess"
+    kind: str  # "native" | "hf_snapshot" | "hf_materialize" | "subprocess"
     label: str
     needed: bool
     reason: str
     repo_id: str | None = None
     command: tuple[str, ...] = ()
     requires_coreml: bool = False
+    materialize_dst: Path | None = None
+    materialize_subdirs: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +247,7 @@ def _plan_bge_small(
     home: Path,
     *,
     force: bool,
+    from_source: bool = False,
     skip_ane: bool,
     hf_checker: Callable[[str], bool],
     python_exe: str,
@@ -248,7 +257,31 @@ def _plan_bge_small(
     weights_ok = (art / "weights" / "bge_small_f16.npz").is_file() and (art / "tokenizer" / "tokenizer.json").is_file()
     ane_dir = art / "ane_models"
     ane_ok = all((ane_dir / f"bge_b{b}_s{s}_fp16.mlmodelc").is_dir() for b, s in _BGE_REQUIRED_BUCKETS)
-    actions = [
+    if not from_source:
+        all_ok = weights_ok and (skip_ane or ane_ok)
+        subdirs = ("weights", "tokenizer") if skip_ane else ("weights", "tokenizer", "ane_models")
+        actions = (
+            StepAction(
+                kind="hf_materialize",
+                label=f"bge-small: pull prebuilt HF weights + tokenizer{' (no ANE)' if skip_ane else ' + ANE bundles'} ({_BGE_PREBUILT_HF_REPO})",
+                needed=force or not all_ok,
+                reason="forced" if force else ("present" if all_ok else "missing bge-small artifacts"),
+                repo_id=_BGE_PREBUILT_HF_REPO,
+                requires_coreml=False,
+                materialize_dst=art,
+                materialize_subdirs=subdirs,
+            ),
+        )
+        _ = hf_checker
+        return PackagePlan(
+            package="bge-small",
+            target_home=home,
+            approx_size_gb=0.15,
+            hf_repos=(_BGE_PREBUILT_HF_REPO,),
+            actions=actions,
+        )
+
+    actions_src = [
         StepAction(
             kind="subprocess",
             label="bge-small: export weights + tokenizer",
@@ -259,7 +292,7 @@ def _plan_bge_small(
         )
     ]
     if not skip_ane:
-        actions.append(
+        actions_src.append(
             StepAction(
                 kind="subprocess",
                 label="bge-small: compile ANE buckets (B=1/8, S=24..512 + S=256)",
@@ -281,7 +314,7 @@ def _plan_bge_small(
         target_home=home,
         approx_size_gb=0.15,
         hf_repos=(_BGE_HF_REPO,),
-        actions=tuple(actions),
+        actions=tuple(actions_src),
     )
 
 
@@ -289,6 +322,7 @@ def _plan_embeddinggemma_2(
     home: Path,
     *,
     force: bool,
+    from_source: bool = False,
     skip_ane: bool,
     hf_checker: Callable[[str], bool],
     python_exe: str,
@@ -300,7 +334,31 @@ def _plan_embeddinggemma_2(
     ane_ok = all((ane_dir / f"emb2_pk_s{s}_w8.mlmodelc").is_dir() for s in _EMB2_ANE_SEQS) and all(
         (ane_dir / f"emb2_cpu_s{s}_mix_w8.mlmodelc").is_dir() for s in _EMB2_CPU_SEQS
     )
-    actions = [
+    if not from_source:
+        all_ok = weights_ok and (skip_ane or ane_ok)
+        subdirs = ("weights", "tokenizer") if skip_ane else ("weights", "tokenizer", "ane_models")
+        actions = (
+            StepAction(
+                kind="hf_materialize",
+                label=f"embeddinggemma-2: pull prebuilt HF weights + tokenizer{' (no ANE)' if skip_ane else ' + ANE/CPU-SME bundles'} ({_EMB2_PREBUILT_HF_REPO})",
+                needed=force or not all_ok,
+                reason="forced" if force else ("present" if all_ok else "missing embeddinggemma-2 artifacts"),
+                repo_id=_EMB2_PREBUILT_HF_REPO,
+                requires_coreml=False,
+                materialize_dst=art,
+                materialize_subdirs=subdirs,
+            ),
+        )
+        _ = hf_checker
+        return PackagePlan(
+            package="embeddinggemma-2",
+            target_home=home,
+            approx_size_gb=0.65,
+            hf_repos=(_EMB2_PREBUILT_HF_REPO,),
+            actions=actions,
+        )
+
+    actions_src = [
         StepAction(
             kind="subprocess",
             label="embeddinggemma-2: export weights + tokenizer",
@@ -311,7 +369,7 @@ def _plan_embeddinggemma_2(
         )
     ]
     if not skip_ane:
-        actions.append(
+        actions_src.append(
             StepAction(
                 kind="subprocess",
                 label="embeddinggemma-2: compile ANE + CPU-SME CoreML bundles",
@@ -327,7 +385,7 @@ def _plan_embeddinggemma_2(
         target_home=home,
         approx_size_gb=0.65,
         hf_repos=(_EMB2_HF_REPO,),
-        actions=tuple(actions),
+        actions=tuple(actions_src),
     )
 
 
@@ -335,6 +393,7 @@ def _plan_pplx(
     home: Path,
     *,
     force: bool,
+    from_source: bool = False,
     skip_ane: bool,
     hf_checker: Callable[[str], bool],
     python_exe: str,
@@ -349,7 +408,30 @@ def _plan_pplx(
     )
     manifest_p = art / "ane_models" / "manifest.json"
     ane_ok = manifest_p.is_file() and any((art / "ane_models").glob("*.mlmodelc"))
-    actions = [
+    if not from_source:
+        all_ok = weights_ok and (skip_ane or ane_ok)
+        subdirs = ("weights", "tokenizer") if skip_ane else ("weights", "tokenizer", "ane_models")
+        actions = (
+            StepAction(
+                kind="hf_materialize",
+                label=f"pplx: pull prebuilt HF weights + tokenizer{' (no ANE)' if skip_ane else ' + ANE stages'} ({_PPLX_PREBUILT_HF_REPO})",
+                needed=force or not all_ok,
+                reason="forced" if force else ("present" if all_ok else "missing pplx artifacts"),
+                repo_id=_PPLX_PREBUILT_HF_REPO,
+                requires_coreml=False,
+                materialize_dst=art,
+                materialize_subdirs=subdirs,
+            ),
+        )
+        return PackagePlan(
+            package="pplx",
+            target_home=home,
+            approx_size_gb=1.8,
+            hf_repos=(_PPLX_PREBUILT_HF_REPO,),
+            actions=actions,
+        )
+
+    actions_src = [
         StepAction(
             kind="hf_snapshot",
             label=f"pplx: cache HF snapshot ({_PPLX_HF_REPO})",
@@ -371,7 +453,7 @@ def _plan_pplx(
         ),
     ]
     if not skip_ane:
-        actions.append(
+        actions_src.append(
             StepAction(
                 kind="subprocess",
                 label="pplx: compile CoreML ANE w8a16 stage bundles",
@@ -393,7 +475,7 @@ def _plan_pplx(
         target_home=home,
         approx_size_gb=1.8,
         hf_repos=(_PPLX_HF_REPO,),
-        actions=tuple(actions),
+        actions=tuple(actions_src),
     )
 
 
@@ -413,6 +495,7 @@ def _plan_decision_models(
     home: Path,
     *,
     force: bool,
+    from_source: bool = False,
     skip_ane: bool,
     hf_checker: Callable[[str], bool],
     python_exe: str,
@@ -420,9 +503,7 @@ def _plan_decision_models(
     pkg_dir = REPO_ROOT / "packages" / "fast-decision-models"
     art = home / "artifacts"
     laya_dir = art / "laya_typed"
-    mf_bundle_ok = _is_valid_mlmodelc(laya_dir / "laya_typed_w8.mlmodelc") and all(
-        _is_valid_mlmodelc(laya_dir / f"laya_typed_s{s}_w8.mlmodelc") for s in (64, 128, 256, 512)
-    )
+    mf_bundle_ok = _is_valid_mlmodelc(laya_dir / "laya_typed_w8.mlmodelc")
     standalone_ok = _is_valid_mlmodelc(laya_dir / "laya_typed_s256_w8.mlmodelc") and _is_valid_mlmodelc(
         laya_dir / "laya_typed_s512_w8.mlmodelc"
     )
@@ -436,6 +517,45 @@ def _plan_decision_models(
         ((kev_dir / "model_w8.safetensors").is_file() or (kev_dir / "model.safetensors").is_file())
         and (kev_dir / "tokenizer.json").is_file()
     )
+    if not from_source:
+        actions_pb: list[StepAction] = []
+        hf_list: list[str] = []
+        if not skip_ane:
+            hf_list.append(_LAYA_PREBUILT_HF_REPO)
+            actions_pb.append(
+                StepAction(
+                    kind="hf_materialize",
+                    label=f"decision-models: pull prebuilt 6-bucket Laya ANE ({_LAYA_PREBUILT_HF_REPO})",
+                    needed=force or not laya_ok,
+                    reason="forced" if force else ("present" if laya_ok else "missing laya_typed bundles"),
+                    repo_id=_LAYA_PREBUILT_HF_REPO,
+                    requires_coreml=False,
+                    materialize_dst=laya_dir,
+                    materialize_subdirs=None,
+                )
+            )
+        hf_list.append(_KEV_08B_PREBUILT_HF_REPO)
+        actions_pb.append(
+            StepAction(
+                kind="hf_materialize",
+                label=f"decision-models: pull prebuilt Kev-0.8B W8 ({_KEV_08B_PREBUILT_HF_REPO})",
+                needed=force or not kev_ok,
+                reason="forced" if force else ("present" if kev_ok else "missing kev_08b safetensors"),
+                repo_id=_KEV_08B_PREBUILT_HF_REPO,
+                requires_coreml=False,
+                materialize_dst=kev_dir,
+                materialize_subdirs=None,
+            )
+        )
+        _ = hf_checker
+        return PackagePlan(
+            package="decision-models",
+            target_home=home,
+            approx_size_gb=1.6,
+            hf_repos=tuple(hf_list),
+            actions=tuple(actions_pb),
+        )
+
     build_script = str(pkg_dir / "scripts" / "build_decision_models.py")
     actions: list[StepAction] = []
     if not skip_ane:
@@ -490,6 +610,7 @@ def _plan_gemma4(
     home: Path,
     *,
     force: bool,
+    from_source: bool = False,
     skip_ane: bool,
     skip_test_extras: bool,
     hf_checker: Callable[[str], bool],
@@ -504,6 +625,66 @@ def _plan_gemma4(
         (art / "ane_models" / "gemma4_early14_prefix_S256_fp16.mlmodelc").is_dir()
         and (art / "ane_models" / "gemma4_early14_prefix_S256_w8.mlmodelc").is_dir()
     )
+    if not from_source:
+        prebuilt_ok = (art / "vocab" / "vocab_remap_150786.npz").is_file() and (skip_ane or ane_ok)
+        tok_ok = (art / "tokenizer" / "tokenizer.json").is_file()
+        actions_pb: list[StepAction] = [
+            StepAction(
+                kind="hf_snapshot",
+                label=f"gemma4: download E2B-4bit runtime ({_GEMMA4_HF_REPO})",
+                needed=force or not hf_4bit,
+                reason="forced" if force else ("cached" if hf_4bit else "missing HF cache"),
+                repo_id=_GEMMA4_HF_REPO,
+            ),
+            StepAction(
+                kind="hf_materialize",
+                label=f"gemma4: pull prebuilt Early14 ANE + vocab_remap_150786 ({_GEMMA4_EARLY14_HF_REPO})",
+                needed=force or not prebuilt_ok,
+                reason="forced" if force else ("present" if prebuilt_ok else "missing vocab_remap_150786.npz or Early14 ANE"),
+                repo_id=_GEMMA4_EARLY14_HF_REPO,
+                requires_coreml=False,
+                materialize_dst=art,
+                materialize_subdirs=("vocab",) if skip_ane else ("ane_models", "vocab"),
+            ),
+            StepAction(
+                kind="subprocess",
+                label="gemma4: stage tokenizer files (--skip-early14)",
+                needed=force or not tok_ok,
+                reason="forced" if force else ("present" if tok_ok else "missing tokenizer.json"),
+                command=(
+                    python_exe,
+                    "-m",
+                    "fast_gemma4.cli",
+                    "--home",
+                    str(home),
+                    "setup-weights",
+                    "--skip-early14",
+                ),
+            ),
+        ]
+        hf_repos = [_GEMMA4_HF_REPO, _GEMMA4_EARLY14_HF_REPO]
+        if not skip_test_extras:
+            for repo in _GEMMA4_TEST_HF_REPOS:
+                hf_repos.append(repo)
+                cached = hf_checker(repo)
+                actions_pb.append(
+                    StepAction(
+                        kind="hf_snapshot",
+                        label=f"gemma4: cache full-test snapshot ({repo})",
+                        needed=force or not cached,
+                        reason="forced" if force else ("cached" if cached else "missing HF cache"),
+                        repo_id=repo,
+                    )
+                )
+        approx_gb = 4.2 if skip_test_extras else 17.0
+        return PackagePlan(
+            package="gemma4",
+            target_home=home,
+            approx_size_gb=approx_gb,
+            hf_repos=tuple(hf_repos),
+            actions=tuple(actions_pb),
+        )
+
     actions: list[StepAction] = [
         StepAction(
             kind="hf_snapshot",
@@ -757,6 +938,7 @@ def build_setup_plan(
     artifacts_root: Path | None = None,
     force: bool = False,
     prebuilt: bool = False,
+    from_source: bool = False,
     skip_native: bool = False,
     skip_ane: bool = False,
     skip_test_extras: bool = False,
@@ -816,22 +998,23 @@ def build_setup_plan(
         if prebuilt:
             plans.append(_plan_prebuilt_package(pkg, home, force=force, hf_checker=hf_checker))
         elif pkg == "bge-small":
-            plans.append(_plan_bge_small(home, force=force, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe))
+            plans.append(_plan_bge_small(home, force=force, from_source=from_source, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe))
         elif pkg == "embeddinggemma-2":
             plans.append(
-                _plan_embeddinggemma_2(home, force=force, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe)
+                _plan_embeddinggemma_2(home, force=force, from_source=from_source, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe)
             )
         elif pkg == "pplx":
-            plans.append(_plan_pplx(home, force=force, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe))
+            plans.append(_plan_pplx(home, force=force, from_source=from_source, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe))
         elif pkg == "decision-models":
             plans.append(
-                _plan_decision_models(home, force=force, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe)
+                _plan_decision_models(home, force=force, from_source=from_source, skip_ane=skip_ane, hf_checker=hf_checker, python_exe=python_exe)
             )
         elif pkg == "gemma4":
             plans.append(
                 _plan_gemma4(
                     home,
                     force=force,
+                    from_source=from_source,
                     skip_ane=skip_ane,
                     skip_test_extras=skip_test_extras,
                     hf_checker=hf_checker,
@@ -903,6 +1086,22 @@ def _execute_plan(
                 assert act.repo_id is not None
                 path = snapshot_download(repo_id=act.repo_id, local_files_only=False)
                 print(f"    cached -> {path}", flush=True)
+            elif act.kind == "hf_materialize":
+                assert act.repo_id is not None
+                shared_src = str(REPO_ROOT / "packages" / "fast-shared" / "src")
+                if shared_src not in sys.path:
+                    sys.path.insert(0, shared_src)
+                from fast_shared.hf import materialize_hf_snapshot
+
+                dst = act.materialize_dst or (plan.target_home / "artifacts")
+                materialize_hf_snapshot(
+                    act.repo_id,
+                    dst,
+                    subdirs=act.materialize_subdirs,
+                    local_files_only=False,
+                    overwrite=True,
+                )
+                print(f"    materialized -> {dst}", flush=True)
             elif act.kind == "subprocess":
                 subprocess.check_call(list(act.command), cwd=str(REPO_ROOT), env=env)
             else:
@@ -933,7 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prebuilt",
         action="store_true",
-        help="Zero-compile mode: pull vetted prebuilt HF checkpoints/CoreML bundles without local compilation",
+        help="Zero-compile HF snapshot mode (pulls vetted mikewolfd/* prebuilt HF repositories only)",
+    )
+    parser.add_argument(
+        "--from-source",
+        action="store_true",
+        help="Export weights and compile Core ML ANE bundles locally from upstream base checkpoints",
     )
     parser.add_argument("--skip-native", action="store_true", help="Skip `make native` and `cpu-query` builds")
     parser.add_argument("--skip-ane", action="store_true", help="Skip CoreML `.mlmodelc` compilation steps")
@@ -965,6 +1169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         artifacts_root=art_root,
         force=bool(args.force),
         prebuilt=bool(args.prebuilt),
+        from_source=bool(args.from_source),
         skip_native=bool(args.skip_native),
         skip_ane=bool(args.skip_ane),
         skip_test_extras=bool(args.skip_test_extras),
@@ -975,6 +1180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "prebuilt": bool(args.prebuilt),
+                "from_source": bool(args.from_source),
                 "packages": list(packages),
                 "target": args.target,
                 "native_actions": [asdict(a) for a in native_actions],

@@ -118,6 +118,18 @@ def _make_engine(args: argparse.Namespace) -> FastBgeSmall:
 
 def _cmd_setup_weights(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
+    from_source = bool(getattr(args, "from_source", False))
+    if not from_source and not args.model_dir:
+        from .paths import ensure_prebuilt_artifacts
+
+        ensure_prebuilt_artifacts(
+            args.home,
+            local_files_only=args.local_files_only,
+            include_ane=not bool(getattr(args, "skip_ane", False)),
+        )
+        print(f"Materialized prebuilt artifacts into {paths.home / 'artifacts'}")
+        return 0
+
     script = paths.home / "scripts" / "export_weights.py"
     if not script.exists():
         model_dir = resolve_hf_model_dir(
@@ -346,9 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--home", default=None, help="Override FAST_BGE_SMALL_HOME directory")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sw = sub.add_parser("setup-weights", help="Export bge_small_f16.npz + tokenizer into artifacts/")
+    sw = sub.add_parser("setup-weights", help="Download prebuilt ANE/FP16 artifacts (or export from source with --from-source)")
     sw.add_argument("--model-dir", default=None)
     sw.add_argument("--local-files-only", action="store_true")
+    sw.add_argument("--from-source", action="store_true", help="Export weights locally from HF base checkpoint instead of pulling prebuilt bundles")
+    sw.add_argument("--skip-ane", action="store_true", help="Pull only weights + tokenizer without Core ML ANE bundles")
     sw.set_defaults(func=_cmd_setup_weights)
 
     em = sub.add_parser("embed", help="Embed text arguments or --stdin lines")

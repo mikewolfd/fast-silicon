@@ -9,10 +9,11 @@ import subprocess
 from typing import Sequence
 
 DEFAULT_LAYA_REPO = "convaiinnovations/laya-typed-decisions"
+DEFAULT_LAYA_COREML_REPO = "mikewolfd/laya-typed-decisions-421m-coreml-ane"
 DEFAULT_LAYA_NMTZ_COREML_REPO = "NMTZ/laya-typed-decisions-421m-coreml-ane"
 DEFAULT_KEV_ADAPTER_REPO = "jaredpalmer/kev-0.8b"
 DEFAULT_KEV_BASE_REPO = "Qwen/Qwen3.5-0.8B-Base"
-DEFAULT_KEV_08B_MLX_REPO = "AbstractFramework/kev-0.8b-mlx-8bit"
+DEFAULT_KEV_08B_MLX_REPO = "mikewolfd/kev-0.8b-mlx-w8"
 DEFAULT_KEV_4B_ADAPTER_REPO = "jaredpalmer/kev-4b"
 DEFAULT_KEV_4B_BASE_REPO = "Qwen/Qwen3.5-4B-Base"
 DEFAULT_KEV_4B_MLX_REPO = "AbstractFramework/kev-4b-mlx-4bit"
@@ -248,6 +249,7 @@ __all__ = [
     "DEFAULT_KEV_4B_MLX_REPO",
     "DEFAULT_KEV_ADAPTER_REPO",
     "DEFAULT_KEV_BASE_REPO",
+    "DEFAULT_LAYA_COREML_REPO",
     "DEFAULT_LAYA_NMTZ_COREML_REPO",
     "DEFAULT_LAYA_REPO",
     "DEFAULT_MACOSX_DEPLOYMENT_TARGET",

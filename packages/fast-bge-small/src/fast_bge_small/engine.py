@@ -16,7 +16,7 @@ from fast_shared.embeddings import set_mlx_cache_limit
 from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
 from .gpu import FastBgeSmallGPU, pack_sequences
-from .paths import load_or_mmap_host_tables, require_runtime_paths
+from .paths import ensure_prebuilt_artifacts, load_or_mmap_host_tables, require_runtime_paths, resolve_paths
 from .tokenizer import FastBgeTokenizer
 
 _MULTIFUNCTION_CANDIDATES: tuple[str, ...] = (
@@ -178,7 +178,18 @@ class FastBgeSmall:
         verify_ane_plan: bool = True,
         mlx_cache_limit_mb: int | None = 512,
         set_wired_limit: bool = True,
+        auto_prebuilt: bool = True,
     ) -> None:
+        if auto_prebuilt and home is None:
+            cand = resolve_paths(None)
+            want_ane = (enable_ane is not False) and (default_mode != "gpu")
+            if not cand.weights_npz.exists() or not cand.tokenizer_json.exists() or (
+                want_ane and not cand.ane_models_dir.exists()
+            ):
+                try:
+                    ensure_prebuilt_artifacts(None, include_ane=want_ane)
+                except Exception:
+                    pass
         self.paths = require_runtime_paths(home, require_ane=False)
         self.tokenizer = FastBgeTokenizer(self.paths.tokenizer_json)
         self._gpu: FastBgeSmallGPU | None = None

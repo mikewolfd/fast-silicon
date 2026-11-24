@@ -1094,7 +1094,7 @@ def _resolve_original_kev_tokenizer_file(
 
 
 class KevMlxBackend:
-    """Unified Metal MLX runner for `Kev-0.8B` & `Kev-4B` (prebuilt `AbstractFramework/*` + local fused checkpoints)."""
+    """Unified Metal MLX runner for `Kev-0.8B` & `Kev-4B` (prebuilt `mikewolfd/kev-0.8b-mlx-w8` / `AbstractFramework/*` + local fused checkpoints)."""
 
     _DEFAULT_VARIANT: str = "0.8b"
 
@@ -1183,15 +1183,28 @@ class KevMlxBackend:
             os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes")
         )
 
+        def _is_complete_kev_snapshot(p: Path) -> bool:
+            return (
+                (p / "kev_meta_w8.json").is_file()
+                or (p / "kev_meta.json").is_file()
+                or (
+                    (p / "config.json").is_file()
+                    and ((p / "head.safetensors").is_file() or (p / "decision.json").is_file())
+                )
+            )
+
         def _resolve_kev_hf_repo(repo_id: str) -> Path:
             from fast_shared.hf import resolve_hf_model_dir
 
             if eff_offline:
                 return resolve_hf_model_dir(None, repo_id, local_files_only=True)
             try:
-                return resolve_hf_model_dir(None, repo_id, local_files_only=True)
+                cand = resolve_hf_model_dir(None, repo_id, local_files_only=True)
+                if _is_complete_kev_snapshot(cand):
+                    return cand
             except Exception:
-                return resolve_hf_model_dir(None, repo_id, local_files_only=False)
+                pass
+            return resolve_hf_model_dir(None, repo_id, local_files_only=False)
 
         # Resolve directory or HF repo ID
         resolved_dir: Path | None = None
@@ -2516,7 +2529,7 @@ class KevMlxBackend:
 
 
 class Kev08bMlxBackend(KevMlxBackend):
-    """Metal MLX `Kev-0.8B` runner (`W8` / prebuilt `AbstractFramework/kev-0.8b-mlx-8bit`, `PrefixTree` & 1-pass fast path)."""
+    """Metal MLX `Kev-0.8B` runner (`W8` / prebuilt `mikewolfd/kev-0.8b-mlx-w8`, `PrefixTree` & 1-pass fast path)."""
 
     _DEFAULT_VARIANT = "0.8b"
 

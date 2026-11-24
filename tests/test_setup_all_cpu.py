@@ -45,9 +45,37 @@ def test_setup_all_dry_run_and_target_planning_cpu(tmp_path: Path, capsys: pytes
     g4_plan = next(p for p in payload["plans"] if p["package"] == "gemma4")
     assert set(g4_plan["hf_repos"]) == {
         "lmstudio-community/gemma-4-E2B-it-MLX-4bit",
+        "mikewolfd/gemma-4-e2b-it-early14-coreml-ane",
         "mlx-community/gemma-4-e2b-it-bf16",
         "mlx-community/gemma-4-E2B-it-qat-4bit",
     }
+    assert all(not act["requires_coreml"] for p in payload["plans"] for act in p["actions"])
+    planned_default_repos = {repo for p in payload["plans"] for repo in p["hf_repos"]}
+    assert {
+        "mikewolfd/bge-small-en-v1.5-coreml-ane",
+        "mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane",
+        "mikewolfd/laya-typed-decisions-421m-coreml-ane",
+        "mikewolfd/kev-0.8b-mlx-w8",
+        "mikewolfd/gemma-4-e2b-it-early14-coreml-ane",
+    } <= planned_default_repos
+
+    # `--from-source` restores local weight-export + coremltools compilation actions
+    rc_src = mod.main(
+        [
+            "--dry-run",
+            "--json",
+            "--from-source",
+            "--skip-native",
+            "--artifacts-root",
+            str(tmp_path / "empty_src_root"),
+            "--packages",
+            "bge-small,pplx,decision-models,gemma4",
+        ]
+    )
+    assert rc_src == 0
+    payload_src = json.loads(capsys.readouterr().out)
+    assert payload_src["from_source"] is True
+    assert any(act["requires_coreml"] for p in payload_src["plans"] for act in p["actions"])
 
 
 def test_setup_all_marks_staged_artifacts_ready_and_validates_flags_cpu(tmp_path: Path) -> None:
@@ -184,12 +212,15 @@ def test_setup_all_prebuilt_zero_compile_repos_and_offline_plan_cpu(tmp_path: Pa
     mod = _load_setup_all()
 
     expected_repos = {
-        "OpenInfinity/embeddinggemma-2-coreml-int8",
-        "NMTZ/laya-typed-decisions-421m-coreml-ane",
-        "AbstractFramework/kev-0.8b-mlx-8bit",
+        "mikewolfd/bge-small-en-v1.5-coreml-ane",
+        "mikewolfd/embeddinggemma-2-coreml-ane",
+        "mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane",
+        "mikewolfd/laya-typed-decisions-421m-coreml-ane",
+        "mikewolfd/kev-0.8b-mlx-w8",
+        "mikewolfd/gemma-4-e2b-it-early14-coreml-ane",
         "AbstractFramework/kev-4b-mlx-4bit",
         "mlx-community/gpt-oss-20b-MXFP4-Q8",
-        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+        "google/gemma-4-E2B-it-assistant",
     }
     all_registered = {repo for repos in mod.VETTED_PREBUILT_HF_REPOS.values() for repo in repos}
     assert expected_repos <= all_registered
@@ -211,7 +242,15 @@ def test_setup_all_prebuilt_zero_compile_repos_and_offline_plan_cpu(tmp_path: Pa
     payload = json.loads(capsys.readouterr().out)
     assert payload["prebuilt"] is True
     planned_repos = { repo for plan in payload["plans"] for repo in plan["hf_repos"] }
-    assert expected_repos <= planned_repos
+    assert {
+        "mikewolfd/embeddinggemma-2-coreml-ane",
+        "mikewolfd/laya-typed-decisions-421m-coreml-ane",
+        "mikewolfd/kev-0.8b-mlx-w8",
+        "mikewolfd/gemma-4-e2b-it-early14-coreml-ane",
+        "AbstractFramework/kev-4b-mlx-4bit",
+        "mlx-community/gpt-oss-20b-MXFP4-Q8",
+        "google/gemma-4-E2B-it-assistant",
+    } <= planned_repos
     for plan in payload["plans"]:
         assert all(not act["requires_coreml"] for act in plan["actions"])
 
@@ -225,8 +264,8 @@ def test_setup_all_prebuilt_zero_compile_repos_and_offline_plan_cpu(tmp_path: Pa
         return d
 
     out_map = mod.pull_prebuilt_package("decision-models", local_files_only=True, downloader=_fake_downloader)
-    assert "NMTZ/laya-typed-decisions-421m-coreml-ane" in out_map
-    assert "AbstractFramework/kev-0.8b-mlx-8bit" in out_map
+    assert "mikewolfd/laya-typed-decisions-421m-coreml-ane" in out_map
+    assert "mikewolfd/kev-0.8b-mlx-w8" in out_map
     assert "AbstractFramework/kev-4b-mlx-4bit" in out_map
     assert all(local_only is True for _, local_only in pulled)
 

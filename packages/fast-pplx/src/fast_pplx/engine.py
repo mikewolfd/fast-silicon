@@ -20,7 +20,7 @@ from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, Window
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
 from .gpu import FastPplxGPU, _find_local_hf_snapshot, _resolve_max_length, get_mlx_runtime_telemetry
-from .paths import RepoPaths, resolve_paths
+from .paths import RepoPaths, ensure_prebuilt_artifacts, resolve_paths
 from .tokenizer import ContextualTokenizer
 
 EMBED_DIM = 1024
@@ -988,6 +988,7 @@ class FastPplx:
         _gpu_backend: Any | None = None,
         _ane_backend: Any | None = None,
         _tokenizer: Any | None = None,
+        auto_prebuilt: bool = True,
     ) -> None:
         if mode not in _VALID_MODES:
             raise ValueError(f"Unsupported mode {mode!r}; choose from {_VALID_MODES}")
@@ -1000,6 +1001,25 @@ class FastPplx:
             raise ValueError(f"Unsupported quantize_weights {quantize_weights!r}; expected 'none' or 'w8'")
 
         self.paths: RepoPaths = resolve_paths(home)
+        want_ane = enable_ane and (not bool(deterministic) or mode in ("ane", "hetero")) and mode in (
+            "auto",
+            "ane",
+            "hetero",
+            "hetero2",
+        )
+        if auto_prebuilt and home is None and model_dir is None and _gpu_backend is None and _ane_backend is None:
+            has_weights = self.paths.weights_npz.exists() or (self.paths.model_dir / "config.json").exists()
+            has_tok = self.paths.tokenizer_json.exists() or (self.paths.model_dir / "tokenizer.json").exists()
+            has_ane = (self.paths.ane_models_dir / "manifest.json").is_file()
+            if not has_weights or not has_tok or (want_ane and not has_ane):
+                try:
+                    ensure_prebuilt_artifacts(
+                        None,
+                        include_ane=want_ane,
+                        local_files_only=local_files_only,
+                    )
+                except Exception:
+                    pass
         self._requested_mode: str = mode
         self.dtype_name = dtype
         self.quantize_weights: Literal["none", "w8"] = "w8" if eff_qw == "w8" else "none"

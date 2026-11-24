@@ -1081,9 +1081,10 @@ def test_v2_exports_paths_and_stdlib_isolation_cpu() -> None:
     proc = subprocess.run([sys.executable, "-B", "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "OK"
 
-    assert paths_mod.DEFAULT_KEV_08B_MLX_REPO == "AbstractFramework/kev-0.8b-mlx-8bit"
+    assert paths_mod.DEFAULT_KEV_08B_MLX_REPO == "mikewolfd/kev-0.8b-mlx-w8"
     assert paths_mod.DEFAULT_KEV_4B_MLX_REPO == "AbstractFramework/kev-4b-mlx-4bit"
     assert paths_mod.DEFAULT_KEV_4B_ADAPTER_REPO == "jaredpalmer/kev-4b"
+    assert paths_mod.DEFAULT_LAYA_COREML_REPO == "mikewolfd/laya-typed-decisions-421m-coreml-ane"
     assert paths_mod.DEFAULT_LAYA_NMTZ_COREML_REPO == "NMTZ/laya-typed-decisions-421m-coreml-ane"
     assert hasattr(paths_mod, "resolve_kev_4b_dir")
 

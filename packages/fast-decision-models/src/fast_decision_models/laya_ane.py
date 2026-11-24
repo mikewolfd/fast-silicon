@@ -12,6 +12,7 @@ import warnings
 
 from ._common import softmax_2, softmax_vec
 from .paths import (
+    DEFAULT_LAYA_COREML_REPO,
     DEFAULT_LAYA_NMTZ_COREML_REPO,
     DEFAULT_LAYA_REPO,
     ensure_laya_dylib,
@@ -432,6 +433,7 @@ class LayaAneBackend(LayaTokenizerHelper):
         compute_mode: int = COMPUTE_MODE_CPU_AND_ANE,
         auto_prebuilt: bool = True,
         local_files_only: bool = False,
+        prebuilt_repo_id: str | None = DEFAULT_LAYA_COREML_REPO,
         nmtz_repo_id: str = DEFAULT_LAYA_NMTZ_COREML_REPO,
         laya_src_repo_id: str = DEFAULT_LAYA_REPO,
         max_len: int = 512,
@@ -471,6 +473,51 @@ class LayaAneBackend(LayaTokenizerHelper):
             self._word_f16 = np.ascontiguousarray(emb["word_f16"])
             self._type_f16 = np.ascontiguousarray(emb["type_f16"])
             self.artifact_source = "local_multifunction_w8" if has_local_mf else "local_per_bucket_w8"
+        elif auto_prebuilt and bool(prebuilt_repo_id) and (nmtz_repo_id == DEFAULT_LAYA_NMTZ_COREML_REPO):
+            from fast_shared.hf import materialize_hf_snapshot, resolve_hf_model_dir
+
+            assert prebuilt_repo_id is not None
+            if eff_offline:
+                snap_mf = resolve_hf_model_dir(None, prebuilt_repo_id, local_files_only=True)
+            else:
+                snap_mf = None
+                try:
+                    cand_mf = resolve_hf_model_dir(None, prebuilt_repo_id, local_files_only=True)
+                    if (cand_mf / "laya_typed_w8.mlmodelc").is_dir() and (cand_mf / "rl_agent_config.json").is_file():
+                        snap_mf = cand_mf
+                except Exception:
+                    pass
+                if snap_mf is None:
+                    snap_mf = resolve_hf_model_dir(None, prebuilt_repo_id, local_files_only=False)
+
+            mat_dir = (
+                Path.home()
+                / ".cache"
+                / "fast-decision-models"
+                / "prebuilt_laya"
+                / prebuilt_repo_id.replace("/", "--")
+                / snap_mf.name
+            )
+            materialize_hf_snapshot(
+                prebuilt_repo_id,
+                mat_dir,
+                local_files_only=True,
+                downloader=lambda repo_id, local_files_only=True: snap_mf,
+            )
+            resolved_dir = mat_dir
+            has_local_mf = (resolved_dir / "laya_typed_w8.mlmodelc").is_dir()
+
+            cfg = json.loads((resolved_dir / "rl_agent_config.json").read_text(encoding="utf-8"))
+            enc_cfg_p = resolved_dir / "encoder_config.json"
+            enc_cfg = json.loads(enc_cfg_p.read_text(encoding="utf-8")) if enc_cfg_p.is_file() else {}
+            local_half = int(enc_cfg.get("local_attention", 128)) // 2
+            tok_path = resolved_dir / "tokenizer" / "tokenizer.json"
+            super().__init__(tok_path, rl_agent_config=cfg, laya_dir=resolved_dir, max_len=max_len)
+
+            emb = np.load(resolved_dir / "laya_typed_emb_f16.npz")
+            self._word_f16 = np.ascontiguousarray(emb["word_f16"])
+            self._type_f16 = np.ascontiguousarray(emb["type_f16"])
+            self.artifact_source = "prebuilt_multifunction_w8"
         elif auto_prebuilt:
             import shutil
             from fast_shared.hf import resolve_hf_model_dir
@@ -500,9 +547,14 @@ class LayaAneBackend(LayaTokenizerHelper):
             if eff_offline:
                 snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=True)
             else:
+                snap_src = None
                 try:
-                    snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=True)
+                    cand_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=True)
+                    if (cand_src / "rl_agent_config.json").is_file():
+                        snap_src = cand_src
                 except Exception:
+                    pass
+                if snap_src is None:
                     snap_src = resolve_hf_model_dir(None, laya_src_repo_id, local_files_only=False)
 
             cfg = json.loads((snap_src / "rl_agent_config.json").read_text(encoding="utf-8"))

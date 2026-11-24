@@ -29,7 +29,7 @@ from fast_shared.hw_check import warn_if_untested_hardware
 from .config import DEFAULT_MODEL_NAME
 from .gpu import _find_local_hf_snapshot, get_mlx_runtime_telemetry
 from .parquet_pipeline import embed_contextual_parquet, embed_parquet, resolve_text_column
-from .paths import resolve_paths
+from .paths import DEFAULT_PREBUILT_HF_REPO, ensure_prebuilt_artifacts, resolve_paths
 
 _MODES: tuple[str, ...] = ("auto", "gpu", "ane", "hetero", "hetero2")
 _BENCH_MODES: tuple[str, ...] = ("auto", "gpu", "ane", "hetero", "hetero2", "all")
@@ -93,6 +93,16 @@ def _make_engine(args: argparse.Namespace, *, deterministic: bool = False) -> An
 
 def _cmd_setup_weights(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
+    from_source = bool(getattr(args, "from_source", False))
+    if not from_source and not args.model_dir:
+        ensure_prebuilt_artifacts(
+            args.home,
+            local_files_only=args.local_files_only,
+            include_ane=not bool(getattr(args, "skip_ane", False)),
+        )
+        print(f"Materialized prebuilt artifacts at {paths.weights_dir.parent}")
+        return 0
+
     script = paths.home / "scripts" / "export_weights.py"
     if not script.exists():
         pkg_script = Path(__file__).resolve().parents[2] / "scripts" / "export_weights.py"
@@ -137,6 +147,36 @@ def _cmd_setup_weights(args: argparse.Namespace) -> int:
 
 def _cmd_setup_ane(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.home)
+    has_custom = any(
+        (
+            bool(getattr(args, "from_source", False)),
+            bool(getattr(args, "model_dir", None)),
+            bool(getattr(args, "variant", None)),
+            bool(getattr(args, "seq_lens", None)),
+            bool(getattr(args, "precision", None)),
+            getattr(args, "layers_per_stage", None) is not None,
+            bool(getattr(args, "inv_mode", None)),
+            bool(getattr(args, "ane_profile", None)),
+            bool(getattr(args, "silu_mode", None)),
+            bool(getattr(args, "rmsnorm_mode", None)),
+            bool(getattr(args, "calib_stats", None)),
+            getattr(args, "ftz_alpha", None) is not None,
+            getattr(args, "backend", None) == "coreai",
+            getattr(args, "preserve_gdn_fp16", None) is False,
+        )
+    )
+    if not has_custom:
+        from fast_shared.hf import materialize_hf_snapshot
+
+        materialize_hf_snapshot(
+            DEFAULT_PREBUILT_HF_REPO,
+            paths.ane_models_dir.parent,
+            subdirs=("ane_models",),
+            local_files_only=bool(getattr(args, "local_files_only", False)),
+        )
+        print(f"Materialized prebuilt ANE stages into {paths.ane_models_dir}")
+        return 0
+
     script = paths.home / "scripts" / "build_ane_models.py"
     if not script.exists():
         pkg_script = Path(__file__).resolve().parents[2] / "scripts" / "build_ane_models.py"
@@ -711,13 +751,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_weights = sub.add_parser("setup-weights", help="Prepare local weights and tokenizer assets")
+    p_weights = sub.add_parser("setup-weights", help="Download prebuilt weights/ANE (or prepare from source with --from-source)")
     _add_common_engine_args(p_weights, include_ane_profile=False)
     p_weights.add_argument("--model-dir", default=None, help="Optional local HF snapshot directory")
     p_weights.add_argument("--local-files-only", action="store_true", help="Do not hit network")
+    p_weights.add_argument("--from-source", action="store_true", help="Prepare from upstream HF weights locally instead of pulling prebuilt HF bundles")
+    p_weights.add_argument("--skip-ane", action="store_true", help="Pull only weights + tokenizer without Core ML ANE stages")
 
-    p_ane = sub.add_parser("setup-ane", help="Build CoreML ANE bundles via scripts/build_ane_models.py")
+    p_ane = sub.add_parser("setup-ane", help="Download prebuilt Core ML ANE bundles (or build with --from-source)")
     _add_common_engine_args(p_ane, include_ane_profile=False)
+    p_ane.add_argument("--from-source", action="store_true", help="Compile Core ML ANE bundles locally via build_ane_models.py")
+    p_ane.add_argument("--local-files-only", action="store_true", help="Resolve HF snapshots strictly from local cache")
     p_ane.add_argument("--model-dir", default=None)
     p_ane.add_argument("--variant", default=None)
     p_ane.add_argument("--backend", choices=("coreml", "coreai"), default="coreml")

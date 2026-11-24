@@ -13,6 +13,7 @@ from fast_shared.hf import resolve_hf_model_dir
 from fast_shared.paths import resolve_home_dir
 
 DEFAULT_HF_REPO = "lmstudio-community/gemma-4-E2B-it-MLX-4bit"
+DEFAULT_EARLY14_ANE_HF_REPO = "mikewolfd/gemma-4-e2b-it-early14-coreml-ane"
 QAT_E2B_REPO = "google/gemma-4-E2B-it-qat-q4_0-unquantized"
 QAT_E4B_REPO = "google/gemma-4-E4B-it-qat-q4_0-unquantized"
 QAT_MOBILE_E2B_REPO = "mlx-community/gemma-4-E2B-it-qat-mobile"
@@ -251,3 +252,28 @@ def resolve_paths(home: str | Path | None = None) -> Gemma4Paths:
         ane_cli=build_root / "build" / "gemma4-ane-cli",
         local_hf_dir=art / "hf_model",
     )
+
+
+def ensure_prebuilt_early14_artifacts(
+    home: str | Path | None = None,
+    *,
+    repo_id: str = DEFAULT_EARLY14_ANE_HF_REPO,
+    local_files_only: bool = False,
+    include_ane: bool = True,
+    force: bool = False,
+    downloader: object | None = None,
+) -> Gemma4Paths:
+    """Materialize prebuilt stock `Early14` Core ML ANE bundles and `vocab_remap_150786.npz`."""
+    from fast_shared.hf import materialize_hf_snapshot
+
+    p = resolve_paths(home)
+    subdirs = ("ane_models", "vocab") if include_ane else ("vocab",)
+    materialize_hf_snapshot(
+        repo_id,
+        p.ane_models_dir.parent,
+        subdirs=subdirs,
+        local_files_only=local_files_only,
+        overwrite=force,
+        downloader=downloader,  # type: ignore[arg-type]
+    )
+    return p

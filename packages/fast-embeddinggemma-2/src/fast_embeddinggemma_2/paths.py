@@ -16,6 +16,7 @@ from fast_shared.paths import resolve_home_dir
 
 _PACKAGE_CACHE_NAME = "fast-embeddinggemma-2"
 _HOME_ENV_VAR = "FAST_EMBEDDINGGEMMA2_HOME"
+DEFAULT_PREBUILT_HF_REPO = "mikewolfd/embeddinggemma-2-coreml-ane"
 OPENINFINITY_REPO_ID = "OpenInfinity/embeddinggemma-2-coreml-int8"
 DEFAULT_VOCAB_SIZE = 262144
 DEFAULT_HIDDEN_SIZE = 512
@@ -366,3 +367,28 @@ def resolve_openinfinity_dir(
         raise FileNotFoundError(
             f"Could not resolve {repo_id!r} (local_files_only={local_files_only}): {exc}"
         ) from exc
+
+
+def ensure_prebuilt_artifacts(
+    home: str | Path | None = None,
+    *,
+    repo_id: str = DEFAULT_PREBUILT_HF_REPO,
+    local_files_only: bool = False,
+    include_ane: bool = True,
+    force: bool = False,
+    downloader: Any | None = None,
+) -> RepoPaths:
+    """Materialize prebuilt weights, tokenizer, and Core ML ANE/CPU-SME bundles from Hugging Face."""
+    from fast_shared.hf import materialize_hf_snapshot
+
+    p = resolve_paths(home)
+    subdirs = ("weights", "tokenizer", "ane_models") if include_ane else ("weights", "tokenizer")
+    materialize_hf_snapshot(
+        repo_id,
+        p.home / "artifacts",
+        subdirs=subdirs,
+        local_files_only=local_files_only,
+        overwrite=force,
+        downloader=downloader,
+    )
+    return p
