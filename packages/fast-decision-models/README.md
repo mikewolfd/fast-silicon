@@ -47,6 +47,14 @@ Both Laya and Kev score the same 600 RAGTruth examples, 550 CLINC150 utterances,
 
 All six multifunction Core ML buckets (`s64, s128, s192, s256, s384, s512`) in `laya_typed_w8.mlmodelc` place **100% of their `10,538` operations on the Neural Engine** (`[10538, 0, 0]`, `0` GPU/CPU ops). Explicit two-pass centered FP16 `LayerNorm` scaling (`tok_emb` `base_inv_scale=4.0`, `l14..l18` `s_eff_floor=1/128`, `l19..l27` `max_ln_gain=4.0`, head/scorer `base_inv_scale=0.0625`, post-quantization pass removal including `common::fuse_layernorm_or_instancenorm`, and split-head `mb.einsum`) lifts ANE accuracy to **`711/1400` (`0.5079`)** on both Macs while beating NMTZ Core ML on quiescent M5 wall time (`76.7 s` vs `88.4 s`) at `1.59 GB` memory (`2.73 GB` NMTZ). `laya-hetero` adds compiled MLX GPU execution with makespan splitting and a zero-thread `n=1` fast path (`37.9 s` / `18.586` EOT on M5; `59.3 s` / `11.932` EOT on contended M4 Pro). Optional `CoreAI-Opt` 8-bit export reduces `RAGTruth` calibration error (`ECE-15`) by 14.3%, and casting macOS 27.2.1 `.aimodel` exports to FP16 unlocks 1,652 ANE operations (`23.0 ms` at `S=256`, 15.4× faster than stock CoreAI). [CoreAI audit](../../docs/BENCHMARKS.md#7-coreai-audit-of-22-decisions) · [Wave 3 Laya & FP16 LN fixes](../../docs/benchmarks/rca-and-laya-fixes-20261124.json)
 
+| Laya Shape (`ms` / `q/s`) | M4 Pro ANE *(contended)* | M4 Pro GPU *(contended)* | M4 Pro Hetero *(contended)* | Base M5 ANE *(quiescent)* | Base M5 GPU *(quiescent)* | Base M5 Hetero *(quiescent)* |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1x_s64` | **5.11 (195.7)** | 8.87 (112.7) | 5.33 (187.7) | **6.53 (153.1)** | 10.30 (97.1) | 6.54 (152.9) |
+| `1x_short` | **5.09 (196.6)** | 12.80 (78.2) | 5.39 (185.5) | **6.53 (153.1)** | 11.97 (83.5) | 6.53 (153.2) |
+| `8x_512` | 377.09 (21.2) | 679.27 (11.8) | **284.21 (28.2)** | 342.53 (23.4) | 263.37 (30.4) | **172.71 (46.3)** |
+| `64x_short` | **325.34 (196.7)** | 487.51 (131.3) | 331.27 (193.2) | 411.94 (155.4) | 210.78 (303.6) | **200.98 (318.4)** |
+| `64x_mixed` | **1028.97 (62.2)** | 1939.23 (33.0) | 1244.54 (51.4) | 1008.38 (63.5) | 783.95 (81.6) | **578.90 (110.6)** |
+
 ### 2. `Kev-0.8B` / `Kev-4B` GPU scoring & shared-passage prefix cache (1,400 items)
 
 | Host | Engine | Mean score | EOT (score/s) | Time after warmup | Measured memory |
