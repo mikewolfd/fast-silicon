@@ -3609,6 +3609,72 @@ class FastGemma4Model:
                 mx.eval(x_or_lg, am)
         return x_or_lg, am, next_off
 
+    def forward_embeds_into_slots(
+        self,
+        inputs_embeds: mx.array,
+        ple_toks: mx.array,
+        cache: dict[str, Any],
+        off_b: mx.array,
+        slot_idx: mx.array,
+    ) -> None:
+        """Prefill `[B_w, L_q, H]` multimodal embeddings across all layers into persistent cache slots."""
+        b_sz, l_q = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+        rows = b_sz * l_q
+        l_sys = cache["l_sys"]
+        swa_cap = cache["swa_cap"]
+        use_kv_i8 = bool(cache.get("kv_i8", self.kv_i8))
+        k_sys_l = cache["k_sys"]
+        v_sys_l = cache["v_sys"]
+        doc_layers = cache["layers"]
+        ns_swa, ns_full, meta_swa, meta_full = self._get_sdpa_meta(cache, rows)
+        swa_slot, full_slot = self._precompute_scatter_pos(off_b, l_sys, swa_cap, l_q)
+        s_idx_sc = slot_idx if l_q == 1 else slot_idx[:, None]
+        default_n_q = getattr(self, "n_q_heads", 8)
+        default_n_kv = getattr(self, "n_kv_heads", 1)
+
+        h = inputs_embeds.astype(self.act_dtype)
+        pli = self._compute_pli_from_embeds(h, ple_toks, early14=False)
+        x_in = mx.fast.rms_norm(h, self.layers[0]["w_in"], self.eps)
+
+        for i, l in enumerate(self.layers):
+            kv_idx = l["prev_kv"]
+            c = doc_layers[kv_idx]
+            n_q = l.get("n_q_heads", default_n_q)
+            n_kv = l.get("n_kv_heads", default_n_kv)
+
+            if not l["is_shared"]:
+                pos_slot = swa_slot if c["ring"] else full_slot
+                qkv = self._apply_qlinear(l, "qkv_proj", x_in)
+                q_rot, k_rot, v_norm = fused_qkv_packed_norm_rope_ragged(
+                    qkv, l["w_qn"], l["w_kn"], l["inv_freq"], off_b, self.eps, n_q=n_q, n_kv=n_kv
+                )
+                if use_kv_i8:
+                    scatter_kv_i8_slot_precomputed(
+                        c["k"], c["k_s"], c["v"], c["v_s"], k_rot, v_norm, s_idx_sc, pos_slot
+                    )
+                else:
+                    scatter_kv_slot_precomputed(c["k"], c["v"], k_rot, v_norm, s_idx_sc, pos_slot)
+            else:
+                q_raw = self._apply_qlinear(l, "q_proj", x_in)
+                q_rot = fused_q_norm_rope_ragged(q_raw, l["w_qn"], l["inv_freq"], off_b, self.eps, n_q=n_q)
+
+            att = mqa8_sdpa_prefix_ragged_slot(
+                q_rot,
+                k_sys_l[kv_idx],
+                v_sys_l[kv_idx],
+                c["k"],
+                c["v"],
+                off_b,
+                slot_idx,
+                ns_full if l["is_full"] else ns_swa,
+                meta_full if l["is_full"] else meta_swa,
+                k_s_doc=c.get("k_s"),
+                v_s_doc=c.get("v_s"),
+                vec4_reduce=self.vec4_reduce,
+            )
+            attn_out = self._apply_qlinear(l, "o_proj", att)
+            h, x_in = self._run_ffn_and_ple(h, attn_out, pli, i, l)
+
     def build_cpu_ane_embed_tables(self):
         """One-time dequantization of `embed_tokens` + PLI layers `0..13` to CPU FP16 tables (~2.68 GB)."""
         emb = self.embed_tokens

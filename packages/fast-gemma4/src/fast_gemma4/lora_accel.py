@@ -153,7 +153,7 @@ def chunked_softcap_ce_loss(
 
 
 class CompiledOptimizerStep:
-    """Compiles gradient scaling, global-norm clipping, and ``AdamW`` parameter updates into one graph."""
+    """Gradient scaling, global-norm clipping, and ``AdamW`` parameter updates (`compiled=False` safe default)."""
 
     def __init__(
         self,
@@ -161,10 +161,12 @@ class CompiledOptimizerStep:
         model: nn.Module,
         *,
         max_grad_norm: float = 1.0,
-        compiled: bool = True,
+        compiled: bool = False,
     ) -> None:
         self.optimizer = optimizer
         self.max_grad_norm = float(max_grad_norm)
+        # Keep compiled=False by default: on MLX 0.32.x, mutating self.optimizer.learning_rate inside
+        # mx.compile(_raw_step) can stall parameter updates across deep LoRA graphs (delta=0.0).
         self.compiled = bool(compiled)
         trainable = model.trainable_parameters()
         self.optimizer.init(trainable)
@@ -216,7 +218,11 @@ class CompiledOptimizerStep:
     ) -> mx.array:
         """Scale, clip, and apply one optimizer update to ``model.trainable_parameters()``."""
         inv_acc = mx.array(1.0 / float(max(1, accum_divisor)), dtype=mx.float32)
-        lr_arr = mx.array(float(lr), dtype=mx.float32)
+        if self.compiled:
+            lr_arr: Any = mx.array(float(lr), dtype=mx.float32)
+        else:
+            lr_arr = float(lr)
+            self.optimizer.learning_rate = lr_arr
         new_params, grad_norm = self._step_fn(
             model.trainable_parameters(), grads, inv_acc, lr_arr
         )
@@ -829,6 +835,129 @@ def compute_packed_tail_ce_loss(
         ltype = getattr(layer, "layer_type", "full_attention")
         r_table = rope_tables.get(ltype)
         m_layer = masks[idx]
+        if use_ckpt:
+
+            def _ckpt_fn(
+                h_in: mx.array,
+                pli_in: mx.array | None,
+                kvs_in: Any,
+                _l: Any = layer,
+                _m: Any = m_layer,
+                _rt: RopeTable | None = r_table,
+            ) -> tuple[mx.array, tuple[mx.array, mx.array], int]:
+                return forward_gemma4_layer(
+                    _l,
+                    h_in,
+                    _m,
+                    per_layer_input=pli_in,
+                    shared_kv=kvs_in,
+                    rope_table=_rt,
+                )
+
+            h, kvs, off = nn.utils.checkpoint(layer, _ckpt_fn)(
+                h, pli_list[idx], kvs
+            )
+        else:
+            h, kvs, off = forward_gemma4_layer(
+                layer,
+                h,
+                m_layer,
+                per_layer_input=pli_list[idx],
+                shared_kv=kvs,
+                rope_table=r_table,
+            )
+        intermediates[idx] = (kvs, off)
+
+    h_norm = tm.norm(h)
+    h_ans_2d = h_norm[0, ans_indices, :]
+    lm_head_fn = (
+        tm.embed_tokens.as_linear
+        if getattr(lm, "tie_word_embeddings", True)
+        else lm.lm_head
+    )
+    return chunked_softcap_ce_loss(
+        lm_head_fn,
+        h_ans_2d,
+        y_flat,
+        softcap=getattr(lm, "final_logit_softcapping", None),
+        token_weights=token_weights,
+        chunk_size=chunk_size,
+        compiled=compiled_ce,
+    )
+
+
+def recommended_packed_use_ckpt(
+    bin_tokens: int,
+    *,
+    host_ram_gb: float | None = None,
+) -> bool:
+    """Return True when packed token count exceeds the host RAM checkpoint-free safe budget (`<=1024` on <=28 GB)."""
+    eff_ram = _detect_host_ram_gib() if host_ram_gb is None else float(host_ram_gb)
+    if eff_ram > 0.0 and eff_ram <= 28.0:
+        return int(bin_tokens) > 1024
+    return int(bin_tokens) > 2048
+
+
+def run_frozen_prefix_single_mask(
+    model: Any,
+    packed_bin: PackedBin,
+    first_lora_layer: int,
+) -> tuple[mx.array, dict[str, mx.array], list[tuple[Any, Any]], list[mx.array | None], dict[str, RopeTable]]:
+    """Run frozen bottom layers using single-launch block-diagonal masks & precomputed `RopeTable`s."""
+    tm = model.language_model.model
+    h, pli_list = _compute_embed_and_ple(tm, packed_bin.input_ids)
+    masks_by_type = build_packed_attention_masks(
+        packed_bin.segment_ids,
+        window_size=getattr(tm, "window_size", None),
+        dtype=h.dtype,
+    )
+    rope_tables = build_rope_tables_for_model(tm, packed_bin.position_ids, h.dtype)
+    intermediates: list[tuple[Any, Any]] = [(None, None)] * len(tm.layers)
+    for idx in range(first_lora_layer):
+        layer = tm.layers[idx]
+        prev_idx = tm.previous_kvs[idx]
+        kvs, off = intermediates[prev_idx]
+        lt = getattr(layer, "layer_type", "full_attention")
+        h, kvs, off = forward_gemma4_layer(
+            layer,
+            h,
+            masks_by_type[lt],
+            per_layer_input=pli_list[idx],
+            shared_kv=kvs,
+            rope_table=rope_tables[lt],
+            offset=0,
+        )
+        intermediates[idx] = (kvs, off)
+    return h, masks_by_type, intermediates, pli_list, rope_tables
+
+
+def compute_packed_tail_single_mask(
+    model: Any,
+    h: mx.array,
+    masks_by_type: dict[str, mx.array],
+    prefix_intermediates: list[tuple[Any, Any]],
+    pli_list: list[mx.array | None],
+    rope_tables: dict[str, RopeTable],
+    ans_indices: mx.array,
+    y_flat: mx.array,
+    token_weights: mx.array | None,
+    first_lora_layer: int,
+    *,
+    use_ckpt: bool = False,
+    chunk_size: int = 256,
+    compiled_ce: bool = True,
+) -> mx.array:
+    """Run trainable upper layers with single-launch block-diagonal SDPA masks (zero per-segment slices)."""
+    lm = model.language_model
+    tm = lm.model
+    intermediates = list(prefix_intermediates)
+    for idx in range(first_lora_layer, len(tm.layers)):
+        layer = tm.layers[idx]
+        prev_idx = tm.previous_kvs[idx]
+        kvs, off = intermediates[prev_idx]
+        lt = getattr(layer, "layer_type", "full_attention")
+        m_layer = masks_by_type[lt]
+        r_table = rope_tables[lt]
         if use_ckpt:
 
             def _ckpt_fn(

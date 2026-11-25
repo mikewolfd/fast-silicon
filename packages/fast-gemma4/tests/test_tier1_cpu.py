@@ -1711,7 +1711,7 @@ def test_mtp_drafter_apple10_nax_vs_apple9_gating_and_cache_cpu() -> None:
         assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, apple10_nax=True) is False
         assert fg4_mtp.should_use_mtp_drafter(sentinel, False, b, 0.0, speculative=True, apple10_nax=True) is False
 
-    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 4
+    assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 3
     assert fg4_mtp.recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=True) == 3
     for bad_b in (0, 2, 3, 4, 8):
         with pytest.raises(ValueError, match="strictly gated"):

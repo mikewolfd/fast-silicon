@@ -358,7 +358,9 @@ def _get_fd_params_arr(cap: int, s_q: int, split_len: int, n_splits: int) -> mx.
     return arr
 
 
-def _can_use_flash_decode_metal(dt: mx.Dtype, n_q: int, n_kv: int, hd: int) -> bool:
+def _can_use_flash_decode_metal(dt: mx.Dtype, n_q: int, n_kv: int, hd: int, s_q: int = 1) -> bool:
+    if s_q <= 0 or s_q > 8:
+        return False
     if not (mx.metal.is_available() and mx.default_device().type == mx.DeviceType.gpu):
         return False
     if dt not in (mx.bfloat16, mx.float16):
@@ -394,7 +396,7 @@ def attend_rolling_flash_decode(
     valid_arr = valid_lens.astype(mx.int32) if valid_lens.dtype != mx.int32 else valid_lens
     if not (
         use_kernel
-        and _can_use_flash_decode_metal(dt, n_q, n_kv, hd)
+        and _can_use_flash_decode_metal(dt, n_q, n_kv, hd, s_q=s_q)
         and k_buf.dtype == dt
         and v_buf.dtype == dt
     ):
@@ -642,8 +644,9 @@ class RollingKVCache:
             raise ValueError(f"max_valid={eff_max} exceeds Cap={self.cap}")
 
         n_q = int(q_b_h_1_d.shape[1])
+        s_q_cur = int(q_b_h_1_d.shape[2])
         if (
-            _can_use_flash_decode_metal(q_b_h_1_d.dtype, n_q, self.n_kv, self.head_dim)
+            _can_use_flash_decode_metal(q_b_h_1_d.dtype, n_q, self.n_kv, self.head_dim, s_q=s_q_cur)
             and self.k_buf.dtype == q_b_h_1_d.dtype
             and self.v_buf.dtype == q_b_h_1_d.dtype
         ):
@@ -1648,7 +1651,7 @@ def run_qwen3_decode_rolling(
     while True:
         active_slots = [s for s in range(eff_b_slots) if slot_doc[s] >= 0]
         if pending:
-            refill_min = min(len(pending), max(1, eff_b_slots // 4))
+            refill_min = 1
             if len(free_slots) >= refill_min or not active_slots:
                 k_refill = min(len(free_slots), len(pending))
                 r_docs = pending[:k_refill]

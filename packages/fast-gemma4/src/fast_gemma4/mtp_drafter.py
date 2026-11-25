@@ -122,8 +122,9 @@ def recommended_mtp_draft_k(
 ) -> int:
     """Select roof-line optimal draft depth `K` for Apple9 (`1 <= B <= 4`) or Apple10+ NAX (`B == 1`).
 
-    - `Apple10+ NAX` (M5+): strictly `B == 1` (`K = 3` with grammar, `K = 4` free-text); for `B >= 2`,
-      NAX TensorOps (`M >= 8`) already accelerate batched decode by `1.5x–1.9x`, whereas MTP adds overhead.
+    - `Apple10+ NAX` (M5+): strictly `B == 1` (`K = 3` for both constrained JSON and free-text,
+      outperforming `K = 4` by `1.12x-1.13x` wall time); for `B >= 2`, NAX TensorOps accelerate
+      batched decode directly whereas MTP adds overhead.
     - `Apple9` (M4):
       - `B == 1`: `K = 3` (`L_q = 4`, optimal `2.63x` JSON / `2.13x` free-text; `K = 4` also strong on free-text).
       - `2 <= B <= 4`: `K = 2` keeps `M = B * (K + 1) <= 12 < 16`, staying below the `16 <= M <= 64`
@@ -143,6 +144,8 @@ def recommended_mtp_draft_k(
             f"(never enable for B >= 8); got B={b}"
         )
     if b == 1:
+        if is_nax:
+            return 3
         return 3 if has_grammar else 4
     return 2
 

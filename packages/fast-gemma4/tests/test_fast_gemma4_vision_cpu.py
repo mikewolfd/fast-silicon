@@ -510,3 +510,92 @@ def test_multimodal_online_catastrophic_loop_abort_cpu() -> None:
     finally:
         mx.set_default_device(prev_dev)
 
+
+def test_generate_multimodal_batch_rolling_and_delegation_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Track A H2 `generate_multimodal_batch` (`n=1` fallback, `n>=2` rolling, `generate_batch` delegation)."""
+    import threading
+    from types import SimpleNamespace
+    import fast_gemma4.engine as eng_mod
+    from fast_gemma4.engine import GenerationItem
+
+    eng = object.__new__(FastGemma4Engine)
+    eng._gpu_lock = threading.Lock()
+    eng._is_low_ram = True
+    eng.default_max_b_slots = 64
+
+    b1_calls: list[Any] = []
+    eng._generate_multimodal = lambda p, imgs, **_kw: (  # type: ignore[method-assign]
+        b1_calls.append((p, len(imgs)))
+        or GenerationItem("{\"ok\":true}", {"ok": True}, [5], 10, 1, True, True, "stop")
+    )
+    eng.last_multimodal_stats = {"vision_sec": 0.01, "prefill_sec": 0.02, "decode_sec": 0.03}
+
+    r1 = eng.generate_batch(
+        ["doc0"],
+        images_list=[[np.zeros((8, 8, 3), dtype=np.uint8)]],
+        max_tokens=16,
+    )
+    assert len(b1_calls) == 1
+    assert r1.stats["multimodal_rolling"] is False
+    assert r1.items[0].parsed == {"ok": True}
+
+    # Multi-doc rolling path (n=2): stub vision, tokenizer, prefix KV, embeds, and run_decode_rolling.
+    vis_batches: list[int] = []
+
+    class _FakeVis:
+        cfg = SimpleNamespace(
+            boi_token_id=200,
+            image_token_id=201,
+            eoi_token_id=202,
+            default_output_length=4,
+            patch_size=4,
+            pooling_kernel_size=1,
+        )
+
+        def encode_images(self, vinputs, batch_size=8):
+            vis_batches.append(len(vinputs))
+            return [mx.zeros((vi.num_soft_tokens, 8), dtype=mx.bfloat16) for vi in vinputs]
+
+    eng._ensure_vision_model = lambda: _FakeVis()  # type: ignore[method-assign]
+    eng.tokenizer = SimpleNamespace(
+        stop_token_ids=frozenset({1}),
+        decode=lambda ids, skip_special_tokens=True: '{"ok":true}',
+    )  # type: ignore[assignment]
+    eng._expand_multimodal_prompt_ids = lambda p, cnts, **_kw: ([10, 11, 200, 201, 201, 202, 12], [(3, 5)])  # type: ignore[method-assign]
+    eng.get_prefix_kv = lambda sys_ids: {"l_sys": len(sys_ids), "k_sys": [], "v_sys": []}  # type: ignore[method-assign]
+    eng.model = SimpleNamespace(
+        hidden_size=8,
+        embed_scale=1.0,
+        embed_tokens=lambda ids: mx.zeros((int(ids.shape[0]), int(ids.shape[1]), 8), dtype=mx.bfloat16),
+        prefill_slots_lazy_lg=object(),
+        forward_embeds_into_slots=lambda *_a, **_kw: None,
+        forward_decode_step_slot=lambda toks, cache, off_b, slot_mx, **_kw: (
+            mx.zeros((int(toks.shape[0]), 1, 8), dtype=mx.bfloat16),
+            mx.zeros((int(toks.shape[0]),), dtype=mx.int32),
+        ),
+    )  # type: ignore[assignment]
+
+    seen_roll_kw: dict[str, Any] = {}
+
+    def _fake_roll(_m, _stops, _g, _pkv, tagged_sufs, **kw):
+        seen_roll_kw.update(kw)
+        assert callable(eng.model.prefill_slots_lazy_lg)
+        return {
+            "gen_toks": [[5, 6] for _ in tagged_sufs],
+            "prefill_sec": 0.01,
+            "decode_sec": 0.02,
+            "tot_out_tok": 2 * len(tagged_sufs),
+            "ff_tokens": 0,
+        }
+
+    monkeypatch.setattr(eng_mod, "run_decode_rolling", _fake_roll)
+    img = np.zeros((16, 16, 3), dtype=np.uint8)
+    r2 = eng.generate_batch(["doc0", "doc1"], images_list=[[img], [img]], max_tokens=32, batch_size=8)
+    assert vis_batches == [2]
+    assert seen_roll_kw["b_slots"] == 2
+    assert seen_roll_kw["kv_i8"] is False  # short ctx <= 1024 defaults kv_i8=False
+    assert seen_roll_kw["swa_ring_cap"] >= 1024
+    assert r2.stats["multimodal_rolling"] is True
+    assert r2.stats["valid_json_count"] == 2
+    assert eng.model.prefill_slots_lazy_lg is not None
+

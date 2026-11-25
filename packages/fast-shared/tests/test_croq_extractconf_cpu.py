@@ -438,3 +438,42 @@ def test_extractconf_preparsed_schema_dict_parity_and_single_json_loads_cpu(
     assert loads_inputs.count(schema_str) == 1
     assert len(loads_inputs) == 1 + 6
 
+
+def test_extractconf_step_list_telemetry_normalization_cpu() -> None:
+    """Verify `normalize_extraction_telemetry` aggregates `list[dict]` step telemetry (`FastGemma4Engine`)."""
+    from fast_shared.extractconf import (
+        compute_extractconf_risk,
+        extract_extractconf_features,
+        normalize_extraction_telemetry,
+    )
+
+    ok_empty, tel_empty = normalize_extraction_telemetry([])
+    assert ok_empty is False
+    assert tel_empty.steps == 1
+
+    step_list = [
+        {"h_pre": 0.12, "top2_margin": 4.2, "lse_all": 10.0, "lse_valid": 9.8, "mask_fallback": 0},
+        {"h_pre": 0.48, "top2_margin": 0.6, "lse_all": 11.0, "lse_valid": 10.2, "mask_fallback": 1},
+    ]
+    ok, tel = normalize_extraction_telemetry(step_list)
+    assert ok is True
+    assert tel.steps == 2
+    assert tel.mask_fallbacks == 1
+    assert abs(tel.mean_h_pre - 0.30) < 1e-6
+    assert abs(tel.max_h_pre - 0.48) < 1e-6
+    assert abs(tel.mean_top2_margin - 2.4) < 1e-6
+    assert abs(tel.min_top2_margin - 0.6) < 1e-6
+    assert abs(tel.max_neg_log_z_valid - 0.8) < 1e-6
+
+    feats = extract_extractconf_features(
+        parsed={"name": "ok"},
+        valid_json=True,
+        valid_schema=True,
+        telemetry=step_list,
+    )
+    assert len(feats) == 18
+    assert feats[0] == 1.0
+    assert abs(feats[1] - 0.30) < 1e-6
+    risk = compute_extractconf_risk(parsed={"name": "ok"}, valid_json=True, valid_schema=True, telemetry=step_list)
+    assert 0.0 <= risk <= 1.0
+

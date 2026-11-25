@@ -109,12 +109,77 @@ class ExtractionTelemetry:
         }
 
 
+def _aggregate_step_telemetry(steps_seq: Sequence[Any]) -> dict[str, Any] | None:
+    """Collapse per-step telemetry dicts (`list[dict]`) into the canonical dict shape."""
+    if not steps_seq:
+        return None
+    h_pre: list[float] = []
+    top2_margin: list[float] = []
+    lse_all: list[float] = []
+    lse_valid: list[float] = []
+    nlz: list[float] = []
+    fb_cnt = 0
+    valid_steps = 0
+    for step in steps_seq:
+        if not isinstance(step, Mapping):
+            continue
+        valid_steps += 1
+        h_val = step.get("h_pre")
+        if isinstance(h_val, (int, float, np.number)) and not isinstance(h_val, bool):
+            hf = float(h_val)
+            if math.isfinite(hf):
+                h_pre.append(hf)
+        m_val = step.get("top2_margin")
+        if isinstance(m_val, (int, float, np.number)) and not isinstance(m_val, bool):
+            mf = float(m_val)
+            if math.isfinite(mf):
+                top2_margin.append(mf)
+        la_val = step.get("lse_all")
+        lv_val = step.get("lse_valid")
+        la_ok = isinstance(la_val, (int, float, np.number)) and not isinstance(la_val, bool) and math.isfinite(float(la_val))
+        lv_ok = isinstance(lv_val, (int, float, np.number)) and not isinstance(lv_val, bool) and math.isfinite(float(lv_val))
+        if la_ok and lv_ok:
+            laf = float(la_val)
+            lvf = float(lv_val)
+            lse_all.append(laf)
+            lse_valid.append(lvf)
+            nlz.append(max(0.0, laf - lvf))
+        else:
+            nz_val = step.get("neg_log_z_valid", step.get("neg_log_z"))
+            if isinstance(nz_val, (int, float, np.number)) and not isinstance(nz_val, bool):
+                nzf = float(nz_val)
+                if math.isfinite(nzf):
+                    nlz.append(max(0.0, nzf))
+        if step.get("mask_fallback") or step.get("was_masked"):
+            fb_cnt += 1
+    if valid_steps == 0:
+        return None
+    out: dict[str, Any] = {
+        "h_pre": h_pre,
+        "top2_margin": top2_margin,
+        "steps": valid_steps,
+        "mask_fallbacks": fb_cnt,
+    }
+    if nlz:
+        out["neg_log_z_valid"] = nlz
+    if lse_all and len(lse_all) == len(lse_valid):
+        out["lse_all"] = lse_all
+        out["lse_valid"] = lse_valid
+    return out
+
+
 def normalize_extraction_telemetry(telemetry: Any) -> tuple[bool, ExtractionTelemetry]:
     """Normalize an `ExtractionTelemetry`, dict, or step-wise arrays into `ExtractionTelemetry`."""
     if telemetry is None:
         return False, ExtractionTelemetry()
     if isinstance(telemetry, ExtractionTelemetry):
         return True, telemetry
+
+    if isinstance(telemetry, Sequence) and not isinstance(telemetry, (str, bytes)):
+        agg = _aggregate_step_telemetry(telemetry)
+        if agg is None:
+            return False, ExtractionTelemetry()
+        telemetry = agg
 
     if hasattr(telemetry, "to_flat_features") and callable(telemetry.to_flat_features):
         telemetry = telemetry.to_flat_features()

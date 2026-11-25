@@ -2624,5 +2624,110 @@ def test_kev_min_lcp_group_threshold_and_tail_sorting_cpu() -> None:
         assert probs == [float(7000 + idx), 0.0]
 
 
+def test_calibration_profiles_and_decision_cascade_cpu() -> None:
+    """Verify Track D H3 Platt/Temperature calibration, 0 rank flips, and lazy `Laya -> Kev` cascade."""
+    import fast_decision_models as fdm
+    from fast_decision_models.scorers import (
+        CalibrationProfile,
+        DecisionCascadeScorer,
+        apply_multiclass_temperature,
+        fit_multiclass_temperature,
+        fit_platt_scaling,
+    )
+
+    assert fdm.DecisionCascadeScorer is DecisionCascadeScorer
+
+    rng = np.random.default_rng(2026)
+    # 1. Binary Platt scaling
+    raw_logits = np.linspace(-3.0, 3.0, 40)
+    y_bin = (raw_logits > 0.2).astype(np.float64)
+    a, b = fit_platt_scaling(raw_logits, y_bin, from_probs=False)
+    prof_bin = CalibrationProfile(model_id="laya", task_key="ragtruth", method="platt", platt_a=a, platt_b=b)
+    prof_bin_rt = CalibrationProfile.from_dict(prof_bin.to_dict())
+    assert prof_bin_rt == prof_bin
+    p_cal = prof_bin_rt.apply([0.2, 0.8], from_probs=True)
+    assert p_cal.shape == (2,) and 0.0 < p_cal[0] < p_cal[1] < 1.0
+
+    # 2. Overconfident multiclass temperature scaling preserves top-1 rankings with lower NLL
+    y_mc = rng.integers(0, 4, size=60)
+    base_logits = rng.normal(0.0, 0.5, size=(60, 4))
+    base_logits[np.arange(60), y_mc] += 0.35
+    sharp = np.exp((base_logits / 0.1) - np.max(base_logits / 0.1, axis=1, keepdims=True))
+    probs_sharp = sharp / np.sum(sharp, axis=1, keepdims=True)
+    t_fit = fit_multiclass_temperature(probs_sharp, y_mc, from_probs=True)
+    assert t_fit > 1.0
+    probs_cal = apply_multiclass_temperature(probs_sharp, t_fit, from_probs=True)
+    assert np.array_equal(np.argmax(probs_cal, axis=1), np.argmax(probs_sharp, axis=1))
+    nll_raw = -float(np.mean(np.log(np.clip(probs_sharp[np.arange(60), y_mc], 1e-30, 1.0))))
+    nll_cal = -float(np.mean(np.log(np.clip(probs_cal[np.arange(60), y_mc], 1e-30, 1.0))))
+    assert nll_cal < nll_raw
+
+    # 3. DecisionCascadeScorer: confident items stay on primary (factory not called when 0 escalations)
+    class _FakePrimary:
+        def encode_item(self, st, qdef, on_truncate="ignore"):
+            return (st, qdef)
+
+        def score_noul_batch(self, encs):
+            return [0.25 if "bad" in str(st) else 0.75 for st, _ in encs]
+
+        def score_choice_batch(self, encs):
+            out = []
+            for st, qdef in encs:
+                if qdef["id"] == "s1":
+                    out.append([0.85, 0.10, 0.05] if st == "easy" else [0.40, 0.35, 0.25])
+                else:
+                    out.append([0.90, 0.10])
+            return out
+
+    factory_calls = 0
+
+    class _FakeKev:
+        def score_multi_states(self, pairs, batch_docs=8):
+            out = []
+            for _st, qdefs in pairs:
+                if qdefs[0]["id"] == "s1":
+                    out.append([([0.10, 0.80, 0.10], [0.0, 2.0, 0.0])])
+                else:
+                    out.append([([0.20, 0.80], [0.0, 1.0])])
+            return out
+
+    def _kev_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return _FakeKev()
+
+    cascade = DecisionCascadeScorer(
+        _FakePrimary(),
+        escalation_factory=_kev_factory,
+        binary_profile=prof_bin,
+        confidence_threshold=0.60,
+    )
+    bin_out = cascade.score_binary_batch(["good doc", "bad doc"], {"id": "rt", "type": "noul"})
+    assert len(bin_out) == 2 and bin_out[0] > bin_out[1]
+    assert factory_calls == 0
+
+    # All confident -> zero escalations -> factory still not called!
+    res_easy = cascade.score_multiclass_cascade(
+        ["easy", "easy"],
+        {"id": "s1", "options": ["d0", "d1", "out_of_scope"]},
+        stage1_labels=["d0", "d1", "out_of_scope"],
+        stage2_qdefs={"d0": {"id": "s2_d0"}, "d1": {"id": "s2_d1"}},
+    )
+    assert res_easy["esc_count"] == 0
+    assert factory_calls == 0
+
+    # Mixed confident + uncertain -> lazy load once and escalate only uncertain item!
+    res_mix = cascade.score_multiclass_cascade(
+        ["easy", "hard"],
+        {"id": "s1", "options": ["d0", "d1", "out_of_scope"]},
+        stage1_labels=["d0", "d1", "out_of_scope"],
+        stage2_qdefs={"d0": {"id": "s2_d0"}, "d1": {"id": "s2_d1"}},
+    )
+    assert factory_calls == 1
+    assert res_mix["escalated_indices"] == [1]
+    assert res_mix["stage2_preds"][0][0] == "d0"
+    assert res_mix["stage2_preds"][1][0] == "d1"
+
+
 
 

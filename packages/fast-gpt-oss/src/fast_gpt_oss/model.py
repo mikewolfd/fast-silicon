@@ -617,14 +617,55 @@ class FastGptOssModel:
         if compile_kernels:
             self._ensure_kernels()
 
+    def _read_tokenizer_vocab_size(
+        self,
+        tokenizer_json_path: str | Path | None,
+    ) -> int | None:
+        tok_json = (
+            Path(tokenizer_json_path)
+            if tokenizer_json_path
+            else Path(self.model_dir) / "tokenizer.json"
+        )
+        if not tok_json.is_file():
+            return None
+        try:
+            tj = json.loads(tok_json.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        max_id = -1
+        model_vocab = tj.get("model", {}).get("vocab", {})
+        if isinstance(model_vocab, dict) and model_vocab:
+            max_id = max(max_id, max(int(v) for v in model_vocab.values()))
+        for at in tj.get("added_tokens", ()) or ():
+            if isinstance(at, dict) and "id" in at:
+                max_id = max(max_id, int(at["id"]))
+        return (max_id + 1) if max_id >= 0 else None
+
     def _resolve_kept_vocab_ids(
         self,
         *,
         vocab_out: int | None,
         vocab_remap_npz: str | Path | None,
         tokenizer_json_path: str | Path | None,
+        tokenizer_vocab_size: int | None = None,
     ) -> np.ndarray | None:
-        if not (vocab_out and 0 < int(vocab_out) < self.full_vocab_size):
+        tok_v = (
+            tokenizer_vocab_size
+            if tokenizer_vocab_size is not None
+            else self._read_tokenizer_vocab_size(tokenizer_json_path)
+        )
+        effective_full = (
+            min(self.full_vocab_size, tok_v)
+            if (tok_v is not None and 0 < tok_v < self.full_vocab_size)
+            else self.full_vocab_size
+        )
+        if vocab_out is None or int(vocab_out) >= effective_full:
+            if effective_full < self.full_vocab_size:
+                return np.arange(effective_full, dtype=np.int32)
+            return None
+        if int(vocab_out) <= 0:
+            if effective_full < self.full_vocab_size:
+                return np.arange(effective_full, dtype=np.int32)
             return None
         target_v = int(vocab_out)
         kept_ids: np.ndarray | None = None
@@ -650,7 +691,7 @@ class FastGptOssModel:
                 stacklevel=3,
             )
         if kept_ids is not None:
-            valid_mask = (kept_ids >= 0) & (kept_ids < self.full_vocab_size)
+            valid_mask = (kept_ids >= 0) & (kept_ids < effective_full)
             if not bool(np.all(valid_mask)):
                 kept_ids = kept_ids[valid_mask]
             if len(kept_ids) == 0:
@@ -732,10 +773,18 @@ class FastGptOssModel:
                     del lm_s_raw, lm_b_raw
 
                     self.full_vocab_size = int(lm_w.shape[0])
+                    tok_vocab_sz = self._read_tokenizer_vocab_size(tokenizer_json_path)
+                    effective_full = (
+                        min(self.full_vocab_size, tok_vocab_sz)
+                        if (tok_vocab_sz is not None and 0 < tok_vocab_sz < self.full_vocab_size)
+                        else self.full_vocab_size
+                    )
+                    self._tokenizer_vocab_size = tok_vocab_sz
                     kept_ids = self._resolve_kept_vocab_ids(
                         vocab_out=vocab_out,
                         vocab_remap_npz=vocab_remap_npz,
                         tokenizer_json_path=tokenizer_json_path,
+                        tokenizer_vocab_size=tok_vocab_sz,
                     )
                     self.lm_w, self.lm_s, self.lm_b, self.new_to_old, self.old_to_new = prune_lm_head_tensors(
                         lm_w,
@@ -747,8 +796,10 @@ class FastGptOssModel:
                         self.lm_w = self.lm_w.astype(mx.float16)
                     self.vocab_n = int(self.lm_w.shape[0])
 
-                    if self.vocab_n < self.full_vocab_size:
-                        cold_ids = np.flatnonzero(self.old_to_new < 0).astype(np.int32)
+                    if self.vocab_n < effective_full:
+                        cold_ids = np.flatnonzero(
+                            (self.old_to_new[:effective_full] < 0)
+                        ).astype(np.int32)
                         cw = _gather_rows(lm_w, cold_ids)
                         if not self.lm_quant:
                             cw = cw.astype(mx.float16)

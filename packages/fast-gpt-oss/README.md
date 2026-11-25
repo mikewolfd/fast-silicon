@@ -62,7 +62,7 @@ By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (prev
 | **Hydragen v2 shared-prefix SDPA** | Computes shared system-prompt attention once across the whole batch with zero KV cloning | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
 | **Zero-sync hybrid MXFP4 MoE** | Routes all 24 MoE layers on GPU without CPU syncs, splitting dense expert tiles to Metal 4 `MPP::matmul2d` (on M5 `Apple10 NAX`) and sparse tiles to coalesced QMV | [`kernels.py`](src/fast_gpt_oss/kernels.py), [`model.py`](src/fast_gpt_oss/model.py) |
 | **Circular SWA-128 & mixed precision** | Keeps residuals in BF16, layer intermediates in FP16 with FP32 accumulators, and sliding-window KV in a fixed 128-slot ring | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
-| **Harmony prompt, schema & vocab** | Retains all 201,088 `o200k` input and output tokens by default (optional `vocab_out=131072` pruning available), uses NaN-safe GPU argmax, and compacts finished slots mid-wave | [`engine.py`](src/fast_gpt_oss/engine.py), [`tokenizer.py`](src/fast_gpt_oss/tokenizer.py) |
+| **Harmony prompt, schema & vocab** | Trims trailing non-vocab checkpoint padding rows beyond `tokenizer.json` under `vocab_out=None` (skipping unused cold LM head rows, with optional `vocab_out=131072` pruning), uses NaN-safe GPU/CPU argmax, and compacts finished slots mid-wave | [`engine.py`](src/fast_gpt_oss/engine.py), [`model.py`](src/fast_gpt_oss/model.py), [`tokenizer.py`](src/fast_gpt_oss/tokenizer.py) |
 
 ## CLI, Parquet & HTTP server
 

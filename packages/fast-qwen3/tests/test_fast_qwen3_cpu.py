@@ -290,6 +290,40 @@ def test_double_4bit_quant_guard_and_bf16_optiq_merge() -> None:
     )
     assert "l.scales" in merged and int(merged["l.weight"].shape[-1]) == (128 * 8) // 32
 
+    # Track F H3: selective 4-bit -> 8-bit promotion on LoRA-touched stems succeeds with high cosine parity
+    # while leaving untouched 4-bit MLP weights in 4-bit and keeping 4-bit -> 4-bit strictly blocked.
+    from fast_qwen3.kernels import build_8bit_touched_schedule
+
+    w_mlp4, sc_mlp4, bi_mlp4 = mx.quantize((mx.random.normal((64, 128)) * 0.05).astype(mx.bfloat16), group_size=64, bits=4)
+    base_mix = {
+        "l.weight": wq4,
+        "l.scales": sc4,
+        "l.biases": bi4,
+        "mlp.weight": w_mlp4,
+        "mlp.scales": sc_mlp4,
+        "mlp.biases": bi_mlp4,
+    }
+    sched = build_8bit_touched_schedule({"l": (la, lb, 2.0)})
+    assert sched == {"l": 8}
+    merged_m3 = merge_lora_weights_safe(
+        base_mix,
+        {"l": (la, lb, 2.0)},
+        promote_4bit_to_8bit=True,
+        group_size=64,
+    )
+    assert int(merged_m3["l.weight"].shape[-1]) == (128 * 8) // 32
+    assert int(merged_m3["mlp.weight"].shape[-1]) == int(w_mlp4.shape[-1])  # Untouched MLP stays 4-bit
+    x_probe = mx.random.normal((4, 128)).astype(mx.bfloat16)
+    w4_dq = mx.dequantize(wq4, sc4, bi4, group_size=64, bits=4, dtype=mx.float32)
+    ref_y = x_probe.astype(mx.float32) @ (w4_dq + (lb.astype(mx.float32) @ la.astype(mx.float32)) * 2.0).T
+    w8_dq = mx.dequantize(merged_m3["l.weight"], merged_m3["l.scales"], merged_m3["l.biases"], group_size=64, bits=8, dtype=mx.float32)
+    got_y = x_probe.astype(mx.float32) @ w8_dq.T
+    mx.eval(ref_y, got_y)
+    r_np = np.asarray(ref_y).reshape(-1)
+    g_np = np.asarray(got_y).reshape(-1)
+    cos = float(np.dot(r_np, g_np) / max(float(np.linalg.norm(r_np) * np.linalg.norm(g_np)), 1e-12))
+    assert cos >= 0.999
+
 
 def test_vlm_header_skip_and_rmsnorm_autodetect(tmp_path: Path) -> None:
     cfg = _small_dense_cfg()

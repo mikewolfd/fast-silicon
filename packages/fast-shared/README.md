@@ -55,7 +55,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.prefix_tree` / `pld_drafter` | `PrefixTree`, `admit_prefix`, `quantize_gdn_state_block32`, `PromptLookupDrafter`, `filter_drafts_with_grammar` |
 | `fast_shared.embeddings` | `MappedEmbedding`, `truncate_and_normalize`, `tile_aligned_slices`, `set_mlx_cache_limit` |
 | `fast_shared.parquet_pipeline` | `embed_parquet`, `CorpusBackfillConfig`, `plan_header_anchored_windows` |
-| `fast_shared.grammar` / `pipeline_llm` | `GrammarHelper`, `detect_catastrophic_token_loop`, `extract_parquet`, `run_deferred_retries` |
+| `fast_shared.grammar` / `pipeline_llm` / `extractconf` | `GrammarHelper`, `detect_catastrophic_token_loop`, `extract_parquet`, `run_deferred_retries`, `normalize_extraction_telemetry`, `ExtractConfCalibrator` |
 | `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
 | `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates` |

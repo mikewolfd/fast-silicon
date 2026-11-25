@@ -84,6 +84,7 @@ FluidInference Core ML clips combined inputs at 1,024 tokens (truncating 164 of 
 | --- | --- | --- |
 | **Laya-Typed-421M ANE & Hetero** | 6-bucket multifunction Core ML (`s64..s512`, `10,538` ANE ops, `0` GPU/CPU), FP16 LayerNorm scaling, split-head `einsum`, `lazy_load`, and `laya-hetero` makespan split | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`laya_hetero.py`](src/fast_decision_models/laya_hetero.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
 | **Kev-0.8B & Kev-4B MLX** | Lossless 8-bit (`g64`) with NAX `bf16` guard, mixed-bit linear projection fusion, `@mx.compile` forward, and hit-aware 256-tok `PrefixTree` (block-32 INT8 GDN state on `4B`) | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
+| **Calibration & Cascades** | Pure-NumPy Platt scaling, multiclass temperature calibration (`CalibrationProfile`), and `DecisionCascadeScorer` (`LayaHetero -> Kev-0.8B` routing: `2.65x` faster than `Kev-0.8B`, `+4.14 pp` to `+6.50 pp` accuracy gain, `4.64 GB` peak) | [`calibration.py`](src/fast_decision_models/calibration.py), [`scorers.py`](src/fast_decision_models/scorers.py) |
 
 ## CLI & verification
 

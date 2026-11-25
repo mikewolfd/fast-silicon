@@ -2077,7 +2077,8 @@ def test_streamed_shard_load_and_cold_lm_head_fallback_cpu(tmp_path: Path, monke
     assert m._cold_lm_head is not None
     assert int(cjk_tid) not in set(m.new_to_old.tolist())
     assert int(cjk_tid) in set(m._cold_lm_head["ids"].tolist())
-    assert int(m.lm_w.shape[0]) + int(m._cold_lm_head["w"].shape[0]) == m.full_vocab_size
+    expected_vocab = m._tokenizer_vocab_size or m.full_vocab_size
+    assert int(m.lm_w.shape[0]) + int(m._cold_lm_head["w"].shape[0]) == expected_vocab
 
     # Verify `fallback_to_full_vocab=True` cleanly scores `_cold_lm_head` on a non-ASCII CJK `const` schema without raising ValueError!
     prev_dev = mx.default_device()
@@ -2741,6 +2742,72 @@ def test_gpt_oss_route_f32_fp64_parity_cpu() -> None:
             np.testing.assert_allclose(scores_np[row, ord_got], w64[row, ord_exp], rtol=1e-5, atol=1e-5)
     finally:
         mx.set_default_device(prev_dev)
+
+
+def test_vocab_out_none_strips_padding_and_penalty_nan_safe_cpu(tmp_path: Path) -> None:
+    """Verify `vocab_out=None` trims trailing non-vocab padding rows and penalty recompute handles NaNs."""
+    import mlx.core as mx
+    from fast_gpt_oss.engine import FastGptOssEngine
+
+    mdir = tmp_path / "ckpt_pad_vocab"
+    mdir.mkdir(parents=True, exist_ok=True)
+    tok_dst = _write_synthetic_o200k_tokenizer(mdir)
+
+    # Determine tokenizer vocab size and pad `lm_head.weight` beyond it (like 201088 > 200019).
+    m_tmp = object.__new__(FastGptOssModel)
+    m_tmp.model_dir = mdir
+    tok_v = m_tmp._read_tokenizer_vocab_size(tok_dst)
+    assert tok_v is not None and tok_v > 0
+    pad_v = tok_v + 64
+    m_tmp.full_vocab_size = pad_v
+    kept = m_tmp._resolve_kept_vocab_ids(
+        vocab_out=None,
+        vocab_remap_npz=None,
+        tokenizer_json_path=tok_dst,
+    )
+    assert kept is not None
+    assert len(kept) == tok_v
+    assert int(kept[-1]) == tok_v - 1
+
+    # Also test penalty recompute NaN safety via `safe_argmax_1d` -> EOS fallback.
+    tok = FastGptOssTokenizer(tok_dst)
+    eng = object.__new__(FastGptOssEngine)
+    eng.tokenizer = tok
+    n2o = np.arange(tok.vocab_size, dtype=np.int32)
+    eng.model = type(
+        "_M",
+        (),
+        {
+            "new_to_old": n2o,
+            "old_to_new": n2o,
+            "_cold_lm_head": None,
+        },
+    )()
+
+    lg = np.full((1, tok.vocab_size), np.nan, dtype=np.float32)
+    tok_id, _masked = eng._sample_row_from_eval(
+        {"mode": "top1", "lg_2d": mx.array(lg, dtype=mx.float32), "hf_2d": None, "top1_cpu": [5]},
+        0,
+        grammar=None,
+        matcher=None,
+        temperature=0.0,
+        top_p=1.0,
+        rng=np.random.default_rng(0),
+        recent_ids=None,
+    )
+    assert 0 <= tok_id < tok.vocab_size
+    tok_id_nan_pen, _ = eng._sample_row_from_eval(
+        {"mode": "top1", "lg_2d": mx.array(lg, dtype=mx.float32), "hf_2d": None, "top1_cpu": [5]},
+        0,
+        grammar=None,
+        matcher=None,
+        temperature=0.0,
+        top_p=1.0,
+        rng=np.random.default_rng(0),
+        recent_ids=[5] * 6,
+    )
+    # Trigger penalty recompute path when candidate token 5 has active repeat penalty on an all-NaN row:
+    assert tok_id_nan_pen == tok.return_token_id
 
 
 

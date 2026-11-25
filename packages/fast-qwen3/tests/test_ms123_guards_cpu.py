@@ -260,3 +260,62 @@ def test_multimodal_rolling_ram_cap_and_shortest_first_cpu() -> None:
         assert st["b_slots"] <= 2
     finally:
         mx.set_default_device(prev)
+
+
+def test_ms2_sq8_cap_and_apple10_gdn_b1_tgt1_crossover_cpu() -> None:
+    """Verify Track E `s_q <= 8` MS2 cap and `B=1, T>1` Apple10 NAX GDN parity."""
+    from fast_qwen3.rolling import _can_use_flash_decode_metal, attend_rolling_flash_decode
+
+    assert _can_use_flash_decode_metal(mx.bfloat16, 8, 2, 128, s_q=8) == bool(
+        mx.metal.is_available() and mx.default_device().type == mx.DeviceType.gpu
+    )
+    assert _can_use_flash_decode_metal(mx.bfloat16, 8, 2, 128, s_q=9) is False
+
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        rng = np.random.default_rng(19)
+        q = mx.array(rng.normal(0.0, 0.25, (1, 4, 9, 64)).astype(np.float32), dtype=mx.bfloat16)
+        k_buf = mx.array(rng.normal(0.0, 0.25, (2, 24, 2, 64)).astype(np.float32), dtype=mx.bfloat16)
+        v_buf = mx.array(rng.normal(0.0, 0.25, (2, 24, 2, 64)).astype(np.float32), dtype=mx.bfloat16)
+        out_sq9 = attend_rolling_flash_decode(
+            q,
+            k_buf,
+            v_buf,
+            mx.array([1], dtype=mx.int32),
+            mx.array([15], dtype=mx.int32),
+            scale=64**-0.5,
+            max_valid=15,
+            use_kernel=True,
+        )
+        ref_sq9 = attend_rolling_flash_decode(
+            q,
+            k_buf,
+            v_buf,
+            mx.array([1], dtype=mx.int32),
+            mx.array([15], dtype=mx.int32),
+            scale=64**-0.5,
+            max_valid=15,
+            use_kernel=False,
+        )
+        mx.eval(out_sq9, ref_sq9)
+        assert float(mx.max(mx.abs(out_sq9.astype(mx.float32) - ref_sq9.astype(mx.float32))).item()) == 0.0
+
+        # Apple10 B=1 T=4 slot-indexed GDN parity check on CPU device
+        qg = mx.array(rng.normal(0.0, 0.25, (1, 4, 2, 32)).astype(np.float32), dtype=mx.bfloat16)
+        kg = mx.array(rng.normal(0.0, 0.25, (1, 4, 2, 32)).astype(np.float32), dtype=mx.bfloat16)
+        vg = mx.array(rng.normal(0.0, 0.25, (1, 4, 4, 32)).astype(np.float32), dtype=mx.bfloat16)
+        gg = mx.array(rng.uniform(0.7, 0.99, (1, 4, 4)).astype(np.float32), dtype=mx.float32)
+        bg = mx.array(rng.uniform(0.05, 0.5, (1, 4, 4)).astype(np.float32), dtype=mx.bfloat16)
+        pool = mx.zeros((3, 4, 32, 32), dtype=mx.float32)
+        y_nax, st_nax = gdn_delta_update_slot_indexed(
+            qg, kg, vg, gg, bg, mx.array([2], dtype=mx.int32), state_pool=pool, state_mode="fp32", apple10_nax=True
+        )
+        y_a9, st_a9 = gdn_delta_update_slot_indexed(
+            qg, kg, vg, gg, bg, mx.array([2], dtype=mx.int32), state_pool=pool, state_mode="fp32", apple10_nax=False
+        )
+        mx.eval(y_nax, st_nax, y_a9, st_a9)
+        assert float(mx.max(mx.abs(y_nax.astype(mx.float32) - y_a9.astype(mx.float32))).item()) < 1e-4
+        assert float(mx.max(mx.abs(st_nax.astype(mx.float32) - st_a9.astype(mx.float32))).item()) < 1e-4
+    finally:
+        mx.set_default_device(prev)

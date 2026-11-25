@@ -59,7 +59,7 @@ def test_should_use_mtp_drafter_strict_batch_gate() -> None:
 def test_recommended_mtp_draft_k_and_hard_gate() -> None:
     assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=False) == 4
     assert recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=False) == 3
-    assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 4
+    assert recommended_mtp_draft_k(1, has_grammar=False, apple10_nax=True) == 3
     assert recommended_mtp_draft_k(1, has_grammar=True, apple10_nax=True) == 3
     for b in (2, 3, 4):
         assert recommended_mtp_draft_k(b, has_grammar=False, apple10_nax=False) == 2

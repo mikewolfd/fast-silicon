@@ -1095,6 +1095,24 @@ def fused_gdn_pre_recurrence(
     return q_o, k_o, v_o, g_o, beta_o.astype(dt), cs_out
 
 
+_APPLE10_NAX_GDN_CACHE: bool | None = None
+
+
+def _host_is_apple10_nax() -> bool:
+    global _APPLE10_NAX_GDN_CACHE
+    if _APPLE10_NAX_GDN_CACHE is not None:
+        return _APPLE10_NAX_GDN_CACHE
+    res = False
+    try:
+        from fast_shared.hw_check import probe_host_hardware, supports_apple10_nax
+
+        res = bool(supports_apple10_nax(probe_host_hardware()))
+    except Exception:
+        res = False
+    _APPLE10_NAX_GDN_CACHE = res
+    return res
+
+
 def gdn_delta_update_slot_indexed(
     q: mx.array,
     k: mx.array,
@@ -1107,9 +1125,10 @@ def gdn_delta_update_slot_indexed(
     scales_pool: mx.array | None = None,
     state_pool: mx.array | None = None,
     state_mode: str = "int8_blk32",
+    apple10_nax: bool | None = None,
     use_kernel: bool = True,
 ) -> tuple[mx.array, mx.array | tuple[mx.array, mx.array]]:
-    """Zero-copy slot-indexed `GdnDecodeShared` reading `[slot_ids]` from persistent pools."""
+    """Zero-copy slot-indexed `GdnDecodeShared` reading `[slot_ids]` with Apple10 `B=1,T>1` native crossover."""
     mode = normalize_gdn_state_mode(state_mode)
     if g.ndim == 4 and int(g.shape[-1]) == 1:
         g = mx.squeeze(g, axis=-1)
@@ -1134,6 +1153,41 @@ def gdn_delta_update_slot_indexed(
         return mx.zeros((b_act, t_len, hv, dv), dtype=in_dtype), mx.zeros(
             (b_act, hv, dv, dk), dtype=st_dt
         )
+
+    is_nax = _host_is_apple10_nax() if apple10_nax is None else bool(apple10_nax)
+    native_b1_tgt1 = bool(
+        b_act == 1
+        and t_len > 1
+        and is_nax
+        and mx.metal.is_available()
+        and mx.default_device().type == mx.DeviceType.gpu
+        and g_f32.ndim == 3
+    )
+    if native_b1_tgt1:
+        if mode == "int8_blk32" and codes_pool is not None and scales_pool is not None:
+            st_sub_f32 = dequantize_gdn_state_int8(
+                mx.take(codes_pool, slot_idx, axis=0),
+                mx.take(scales_pool, slot_idx, axis=0),
+                dtype=mx.float32,
+            )
+        elif state_pool is not None:
+            raw_sub = mx.take(state_pool, slot_idx, axis=0)
+            st_sub_f32 = raw_sub if raw_sub.dtype == mx.float32 else raw_sub.astype(mx.float32)  # guard: allow-fp32
+        elif codes_pool is not None and scales_pool is not None:
+            st_sub_f32 = dequantize_gdn_state_int8(
+                mx.take(codes_pool, slot_idx, axis=0),
+                mx.take(scales_pool, slot_idx, axis=0),
+                dtype=mx.float32,
+            )
+        else:
+            st_sub_f32 = mx.zeros((b_act, hv, dv, dk), dtype=mx.float32)  # guard: allow-fp32
+        y_nat, st_nat = mx.fast.gated_delta_update(
+            q, k_in, v_in, g_f32, beta.astype(in_dtype), st_sub_f32
+        )
+        if mode == "int8_blk32":
+            return y_nat.astype(in_dtype), quantize_gdn_state_blk32(st_nat)
+        st_dt = mx.bfloat16 if mode == "bf16" else mx.float32
+        return y_nat.astype(in_dtype), (st_nat if st_nat.dtype == st_dt else st_nat.astype(st_dt))
 
     metal_ok = (
         use_kernel

@@ -988,3 +988,67 @@ def test_train_lora_cli_exposes_accel_flags() -> None:
         "--no-compile",
     ):
         assert flag in out, f"Missing CLI flag {flag} in train_lora.py --help"
+
+
+def test_compiled_optimizer_default_false_and_single_mask_parity_cpu() -> None:
+    """Verify `CompiledOptimizerStep` defaults `compiled=False` with real updates and single-mask gradient parity."""
+    from fast_gemma4.lora_accel import (
+        compute_packed_tail_single_mask,
+        recommended_packed_use_ckpt,
+        run_frozen_prefix_single_mask,
+    )
+
+    assert recommended_packed_use_ckpt(1024, host_ram_gb=24.0) is False
+    assert recommended_packed_use_ckpt(1025, host_ram_gb=24.0) is True
+    assert recommended_packed_use_ckpt(1536, host_ram_gb=48.0) is False
+    assert recommended_packed_use_ckpt(2049, host_ram_gb=48.0) is True
+
+    m = _make_mini_model(seed=41, first_lora_layer=2, nonzero_b=True)
+    opt = optim.AdamW(learning_rate=1e-3, weight_decay=0.01)
+    stepper = CompiledOptimizerStep(opt, m, max_grad_norm=1.0)
+    assert stepper.compiled is False
+
+    ex1 = ([11, 22, 33, 44, 55, 66], 3)
+    ex2 = ([71, 72, 73, 74, 75, 76, 77], 4)
+    tot_ans = (len(ex1[0]) - ex1[1]) + (len(ex2[0]) - ex2[1])
+    l1, g1 = _unpacked_single_doc_loss(m, ex1[0], ex1[1], first_lora_layer=2)
+    l2, g2 = _unpacked_single_doc_loss(m, ex2[0], ex2[1], first_lora_layer=2)
+    w1 = mx.array(float(len(ex1[0]) - ex1[1]) / float(tot_ans), dtype=mx.float32)
+    w2 = mx.array(float(len(ex2[0]) - ex2[1]) / float(tot_ans), dtype=mx.float32)
+    ref_grads = tree_map(lambda a, b: a * w1.astype(a.dtype) + b * w2.astype(b.dtype), g1, g2)
+    ref_loss = (
+        float(l1.item()) * (len(ex1[0]) - ex1[1]) + float(l2.item()) * (len(ex2[0]) - ex2[1])
+    ) / float(tot_ans)
+    mx.eval(ref_grads)
+
+    pbin = pack_examples_to_bin([ex1, ex2], pack_tokens=0, pad_to_fixed=False, pad_multiple=8, loss_norm="token")
+    h_pre, masks_by_type, pre_ints, pli_list, rope_tables = run_frozen_prefix_single_mask(m, pbin, first_lora_layer=2)
+    vg_single = nn.value_and_grad(m, compute_packed_tail_single_mask)
+    loss_s, grads_s = vg_single(
+        m,
+        h_pre,
+        masks_by_type,
+        pre_ints,
+        pli_list,
+        rope_tables,
+        pbin.ans_indices,
+        pbin.y_flat,
+        None,
+        2,
+        use_ckpt=False,
+        compiled_ce=True,
+    )
+    mx.eval(loss_s, grads_s)
+    assert abs(ref_loss - float(loss_s.item())) < 5e-3
+    gcos, _, _ = grad_tree_cosine(ref_grads, grads_s)
+    assert gcos >= 0.999
+
+    before_w = dict(tree_flatten(m.trainable_parameters()))
+    stepper.step(m, grads_s, lr=5e-4, accum_divisor=1)
+    mx.eval(m.trainable_parameters())
+    after_w = dict(tree_flatten(m.trainable_parameters()))
+    max_delta = max(
+        float(mx.max(mx.abs(after_w[k].astype(mx.float32) - before_w[k].astype(mx.float32))).item())
+        for k in before_w
+    )
+    assert max_delta > 0.0

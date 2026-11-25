@@ -31,6 +31,7 @@ import numpy as np
 from fast_shared.grammar import (
     compute_loop_breaker_penalties,
     normalize_json_schema,
+    safe_argmax_1d,
     sample_unconstrained,
     validate_json_against_schema,
 )
@@ -620,7 +621,11 @@ class FastGptOssEngine:
                 if top1_old in penalties or temperature > 0.0:
                     step_was_masked[0] = grammar is not None
                     biased = _lazy_full_row()
-                    top1_new = int(np.argmax(biased))
+                    top1_new = safe_argmax_1d(biased)
+                    if top1_new < 0:
+                        eos_old = int(getattr(self.tokenizer, "return_token_id", 0))
+                        eos_pruned = self._map_old_to_pruned_idx(eos_old, n2o)
+                        top1_new = eos_pruned if eos_pruned >= 0 else 0
             if grammar is not None:
                 step_was_masked[0] = True
                 return grammar.pick_valid_token(

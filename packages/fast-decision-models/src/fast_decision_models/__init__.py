@@ -26,6 +26,8 @@ from .paths import (
 )
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "CalibrationProfile": (".calibration", "CalibrationProfile"),
+    "DecisionCascadeScorer": (".calibration", "DecisionCascadeScorer"),
     "KEV_SPECIAL_TOKENS": (".kev_mlx", "KEV_SPECIAL_TOKENS"),
     "Kev08bMlxBackend": (".kev_mlx", "Kev08bMlxBackend"),
     "Kev4bMlxBackend": (".kev_mlx", "Kev4bMlxBackend"),
@@ -37,10 +39,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "PrefixMatch": (".prefix_tree", "PrefixMatch"),
     "PrefixTree": (".prefix_tree", "PrefixTree"),
     "acquire_hw_lock": ("._common", "acquire_hw_lock"),
+    "apply_multiclass_temperature": (".calibration", "apply_multiclass_temperature"),
+    "apply_platt_scaling": (".calibration", "apply_platt_scaling"),
     "build_kev_mlx_artifacts": (".builder", "build_kev_mlx_artifacts"),
     "build_laya_ane_artifacts": (".builder", "build_laya_ane_artifacts"),
+    "check_probability_validity": (".calibration", "check_probability_validity"),
     "compile_native_dylib": (".builder", "compile_native_dylib"),
     "encode_kev_questions": (".kev_mlx", "encode_kev_questions"),
+    "fit_multiclass_temperature": (".calibration", "fit_multiclass_temperature"),
+    "fit_platt_scaling": (".calibration", "fit_platt_scaling"),
     "quantize_kev_w8_artifacts": (".builder", "quantize_kev_w8_artifacts"),
     "recommended_prefix_budget_bytes": (".prefix_tree", "recommended_prefix_budget_bytes"),
     "resolve_kev_special_ids": (".kev_mlx", "resolve_kev_special_ids"),
@@ -58,6 +65,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "CalibrationProfile",
     "DEFAULT_KEV_08B_MLX_REPO",
     "DEFAULT_KEV_4B_ADAPTER_REPO",
     "DEFAULT_KEV_4B_BASE_REPO",
@@ -67,6 +75,7 @@ __all__ = [
     "DEFAULT_LAYA_COREML_REPO",
     "DEFAULT_LAYA_NMTZ_COREML_REPO",
     "DEFAULT_LAYA_REPO",
+    "DecisionCascadeScorer",
     "DecisionModelPaths",
     "KEV_SPECIAL_TOKENS",
     "Kev08bMlxBackend",
@@ -79,11 +88,16 @@ __all__ = [
     "PrefixMatch",
     "PrefixTree",
     "acquire_hw_lock",
+    "apply_multiclass_temperature",
+    "apply_platt_scaling",
     "build_kev_mlx_artifacts",
     "build_laya_ane_artifacts",
+    "check_probability_validity",
     "compile_native_dylib",
     "encode_kev_questions",
     "ensure_laya_dylib",
+    "fit_multiclass_temperature",
+    "fit_platt_scaling",
     "quantize_kev_w8_artifacts",
     "recommended_prefix_budget_bytes",
     "resolve_artifacts_dir",

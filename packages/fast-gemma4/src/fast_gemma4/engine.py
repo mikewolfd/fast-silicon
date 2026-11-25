@@ -1363,6 +1363,489 @@ class FastGemma4Engine:
                 telemetry=None,
             )
 
+    def generate_multimodal_batch(
+        self,
+        prompts: Sequence[PromptInput],
+        images_list: Sequence[Sequence[Any] | Any | None],
+        *,
+        system_prompt: str | None = None,
+        json_schema: str | dict[str, Any] | None = None,
+        per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+        batch_size: int | None = None,
+        speculative: bool | None = None,
+        use_chat_template: bool = True,
+        enable_thinking: bool = False,
+        reasoning_effort: str | None = None,
+        reasoning_budget: int | None = None,
+        whitespace_flexible: bool | None = None,
+        max_whitespace_run: int | None = None,
+        max_soft_tokens: int | None = None,
+        kv_i8: bool | None = None,
+        collect_telemetry: bool = False,
+        collect_valid_lse: bool = False,
+    ) -> GenerationBatchResult:
+        """Execute batched continuous multimodal rolling (`n >= 2`) or `B=1` MTP (`n == 1` / `batch_size == 1`)."""
+        if len(images_list) != len(prompts):
+            raise ValueError(f"Mismatched images_list={len(images_list)} vs prompts={len(prompts)}")
+        if per_doc_grammars is not None and len(per_doc_grammars) != len(prompts):
+            raise ValueError(f"Mismatched per_doc_grammars={len(per_doc_grammars)} vs prompts={len(prompts)}")
+
+        n_docs = len(prompts)
+        if n_docs == 0:
+            return GenerationBatchResult(items=[], stats={"docs": 0, "docs_per_sec": 0.0, "decode_tok_s": 0.0})
+
+        norm_imgs: list[list[Any]] = []
+        for entry in images_list:
+            if entry is None:
+                norm_imgs.append([])
+            elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
+                norm_imgs.append(list(entry))
+            else:
+                norm_imgs.append([entry])
+
+        eff_thinking = bool(enable_thinking)
+        if not eff_thinking and json_schema is None and per_doc_grammars is None:
+            if reasoning_effort is not None and str(reasoning_effort).strip().lower() not in ("", "none", "skip", "off", "0"):
+                eff_thinking = True
+            elif reasoning_budget is not None and int(reasoning_budget) > 0:
+                eff_thinking = True
+
+        # Fall back to single-item path for n=1, explicit batch_size=1, sampling, or mixed empty-image batches.
+        if (
+            n_docs == 1
+            or (batch_size is not None and int(batch_size) <= 1)
+            or float(temperature) > 0.0
+            or any(not ims for ims in norm_imgs)
+        ):
+            t_all0 = time.perf_counter()
+            items: list[GenerationItem] = []
+            tot_pre = 0.0
+            tot_dec = 0.0
+            tot_vis = 0.0
+            tot_prompt = 0
+            tot_comp = 0
+            valid_json_cnt = 0
+            valid_schema_cnt = 0
+            for idx in range(n_docs):
+                doc_schema = per_doc_grammars[idx] if (per_doc_grammars is not None and isinstance(per_doc_grammars[idx], (str, dict))) else json_schema
+                if norm_imgs[idx]:
+                    it = self._generate_multimodal(
+                        prompts[idx],
+                        norm_imgs[idx],
+                        system_prompt=system_prompt,
+                        json_schema=doc_schema,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        seed=seed + idx,
+                        speculative=speculative,
+                        use_chat_template=use_chat_template,
+                        enable_thinking=eff_thinking,
+                        reasoning_effort=reasoning_effort,
+                        reasoning_budget=reasoning_budget,
+                        whitespace_flexible=whitespace_flexible,
+                        max_whitespace_run=max_whitespace_run,
+                        max_soft_tokens=max_soft_tokens,
+                    )
+                    st = self.last_multimodal_stats
+                    tot_vis += float(st.get("vision_sec", 0.0))
+                    tot_pre += float(st.get("prefill_sec", 0.0))
+                    tot_dec += float(st.get("decode_sec", 0.0))
+                else:
+                    it = self.generate(
+                        prompts[idx],
+                        system_prompt=system_prompt,
+                        json_schema=doc_schema,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        seed=seed + idx,
+                        speculative=speculative,
+                        use_chat_template=use_chat_template,
+                        enable_thinking=eff_thinking,
+                        reasoning_effort=reasoning_effort,
+                        reasoning_budget=reasoning_budget,
+                        whitespace_flexible=whitespace_flexible,
+                        max_whitespace_run=max_whitespace_run,
+                    )
+                items.append(it)
+                tot_prompt += int(it.prompt_tokens)
+                tot_comp += int(it.completion_tokens)
+                if it.valid_json:
+                    valid_json_cnt += 1
+                if it.valid_schema:
+                    valid_schema_cnt += 1
+            elapsed = time.perf_counter() - t_all0
+            return GenerationBatchResult(
+                items=items,
+                stats={
+                    "mode_requested": "gpu",
+                    "mode_used": "gpu",
+                    "multimodal_rolling": False,
+                    "rolling": False,
+                    "docs": n_docs,
+                    "vision_sec": tot_vis,
+                    "prefill_sec": tot_pre,
+                    "decode_sec": tot_dec,
+                    "elapsed_sec": elapsed,
+                    "decode_tok_s": tot_comp / max(tot_dec, 1e-9),
+                    "docs_per_sec": n_docs / max(elapsed, 1e-9),
+                    "prompt_tokens": tot_prompt,
+                    "completion_tokens": tot_comp,
+                    "valid_json_count": valid_json_cnt,
+                    "valid_schema_count": valid_schema_cnt,
+                },
+            )
+
+        from fast_shared.gemma4_vision import preprocess_gemma4_image
+
+        with self._gpu_lock:
+            t_all0 = time.perf_counter()
+            vis = self._ensure_vision_model()
+            boi_id = int(getattr(vis.cfg, "boi_token_id", getattr(self.model, "boi_token_id", 255999)))
+            img_id = int(getattr(vis.cfg, "image_token_id", getattr(self.model, "image_token_id", 258880)))
+            eoi_id = int(getattr(vis.cfg, "eoi_token_id", getattr(self.model, "eoi_token_id", 258882)))
+            eff_soft = int(max_soft_tokens) if max_soft_tokens is not None else int(vis.cfg.default_output_length)
+            patch_sz = int(getattr(vis.cfg, "patch_size", 16))
+            pool_k = int(getattr(vis.cfg, "pooling_kernel_size", 3))
+
+            default_cap = 8 if getattr(self, "_is_low_ram", False) else 16
+            eff_b_slots = min(
+                n_docs,
+                max(1, int(batch_size)) if batch_size is not None else default_cap,
+                int(getattr(self, "default_max_b_slots", 256)),
+            )
+
+            tv0 = time.perf_counter()
+            flat_vinputs: list[Any] = []
+            doc_img_slices: list[tuple[int, int]] = []
+            doc_vis_counts: list[list[int]] = []
+            for ims in norm_imgs:
+                s0 = len(flat_vinputs)
+                cnts: list[int] = []
+                for im in ims:
+                    vi = preprocess_gemma4_image(
+                        im,
+                        patch_size=patch_sz,
+                        pooling_kernel_size=pool_k,
+                        max_soft_tokens=eff_soft,
+                    )
+                    flat_vinputs.append(vi)
+                    cnts.append(int(vi.num_soft_tokens))
+                doc_img_slices.append((s0, len(flat_vinputs)))
+                doc_vis_counts.append(cnts)
+
+            flat_feats = vis.encode_images(flat_vinputs, batch_size=min(8, max(1, eff_b_slots)))
+            if flat_feats:
+                mx.eval(*flat_feats)
+            vision_sec = time.perf_counter() - tv0
+
+            grammar = (
+                self.get_grammar(
+                    json_schema,
+                    whitespace_flexible=whitespace_flexible,
+                    max_whitespace_run=max_whitespace_run,
+                )
+                if (json_schema is not None and per_doc_grammars is None)
+                else None
+            )
+            resolved_grammars: list[Any] | None = None
+            if per_doc_grammars is not None:
+                resolved_grammars = []
+                for g_spec in per_doc_grammars:
+                    if g_spec is None:
+                        resolved_grammars.append(None)
+                    elif isinstance(g_spec, (str, dict)):
+                        resolved_grammars.append(
+                            self.get_grammar(
+                                g_spec,
+                                whitespace_flexible=whitespace_flexible,
+                                max_whitespace_run=max_whitespace_run,
+                            )
+                        )
+                    else:
+                        resolved_grammars.append(g_spec)
+
+            expanded_list: list[list[int]] = []
+            spans_list: list[list[tuple[int, int]]] = []
+            first_img_pos = 10**9
+            for d in range(n_docs):
+                exp_ids, v_spans = self._expand_multimodal_prompt_ids(
+                    prompts[d],
+                    doc_vis_counts[d],
+                    system_prompt=system_prompt,
+                    use_chat_template=use_chat_template,
+                    enable_thinking=eff_thinking,
+                    boi_token_id=boi_id,
+                    image_token_id=img_id,
+                    eoi_token_id=eoi_id,
+                )
+                if v_spans:
+                    first_img_pos = min(first_img_pos, int(v_spans[0][0]))
+                expanded_list.append(exp_ids)
+                spans_list.append(v_spans)
+
+            lcp = min(len(x) for x in expanded_list)
+            for k_i in range(lcp):
+                t0_k = expanded_list[0][k_i]
+                if any(x[k_i] != t0_k for x in expanded_list[1:]):
+                    lcp = k_i
+                    break
+            lcp = max(1, min(lcp, first_img_pos))
+            sys_ids = expanded_list[0][:lcp]
+            pkv = self.get_prefix_kv(sys_ids)
+
+            doc_pre_embeds: list[mx.array] = []
+            doc_pre_ple: list[mx.array] = []
+            tagged_sufs: list[list[int]] = []
+            upfront_lists: list[list[int]] = []
+            max_suf_len = 0
+            for d in range(n_docs):
+                doc_g = resolved_grammars[d] if resolved_grammars is not None else grammar
+                up_ff = list(getattr(doc_g, "upfront_ff", ())) if doc_g is not None else []
+                upfront_lists.append(up_ff)
+                full_ids = expanded_list[d] + up_ff
+                text_ids = [0 if int(t) == img_id else int(t) for t in full_ids]
+                base_emb = (
+                    self.model.embed_tokens(mx.array([text_ids], dtype=mx.int32))
+                    * self.model.embed_scale
+                )
+                fs0, _ = doc_img_slices[d]
+                parts: list[mx.array] = []
+                cursor = 0
+                for img_local_i, (s0, s1) in enumerate(spans_list[d]):
+                    if s0 > cursor:
+                        parts.append(base_emb[:, cursor:s0, :])
+                    slen = s1 - s0
+                    vf = flat_feats[fs0 + img_local_i][:slen]
+                    parts.append(vf[None, :, :].astype(base_emb.dtype))
+                    cursor = s1
+                if cursor < len(text_ids):
+                    parts.append(base_emb[:, cursor:, :])
+                full_emb = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+
+                suf_emb = full_emb[:, lcp:, :]
+                suf_ple = mx.array([text_ids[lcp:]], dtype=mx.int32)
+                mx.eval(suf_emb, suf_ple)
+                doc_pre_embeds.append(suf_emb)
+                doc_pre_ple.append(suf_ple)
+
+                real_suf = list(full_ids[lcp:])
+                max_suf_len = max(max_suf_len, len(real_suf))
+                tagged = list(real_suf)
+                tagged[0] = -(d + 1)
+                tagged_sufs.append(tagged)
+
+            total_max_len = lcp + max_suf_len
+            eff_kv_i8 = bool(kv_i8) if kv_i8 is not None else (total_max_len > 1024)
+            swa_cap_req = 1 << max(10, (total_max_len + 32 - 1).bit_length())
+            doc_cap_req = total_max_len + int(max_tokens) + 64
+
+            orig_prefill = self.model.prefill_slots_lazy_lg
+
+            def _mm_prefill_slots(
+                sub_sufs: list[list[int]],
+                slot_indices: list[int],
+                cache: dict[str, Any],
+                *,
+                group_size: int = 16,
+                return_logits: bool = True,
+                async_eval: bool = False,
+                collect_telemetry: bool = False,
+                valid_mask_u32: mx.array | None = None,
+            ) -> tuple[mx.array, mx.array, list[int]]:
+                k_act = len(sub_sufs)
+                l_sys_i = int(cache["l_sys"])
+                doc_ids = [-int(s[0]) - 1 for s in sub_sufs]
+                pre_lens = [len(s) - 1 for s in sub_sufs]
+                max_pre = max(pre_lens)
+                if max_pre > 0:
+                    h_dim = int(self.model.hidden_size)
+                    emb_rows: list[mx.array] = []
+                    ple_rows: list[mx.array] = []
+                    for r, d_idx in enumerate(doc_ids):
+                        plen = pre_lens[r]
+                        e_d = doc_pre_embeds[d_idx][:, :plen, :]
+                        p_d = doc_pre_ple[d_idx][:, :plen]
+                        if plen < max_pre:
+                            e_d = mx.concatenate(
+                                [e_d, mx.zeros((1, max_pre - plen, h_dim), dtype=e_d.dtype)],
+                                axis=1,
+                            )
+                            p_d = mx.concatenate(
+                                [p_d, mx.zeros((1, max_pre - plen), dtype=mx.int32)],
+                                axis=1,
+                            )
+                        emb_rows.append(e_d)
+                        ple_rows.append(p_d)
+                    batch_emb = mx.concatenate(emb_rows, axis=0)
+                    batch_ple = mx.concatenate(ple_rows, axis=0)
+                    slot_mx_pre = mx.array(slot_indices, dtype=mx.int32)
+                    chunk_sz = 128
+                    for t0 in range(0, max_pre, chunk_sz):
+                        t1 = min(max_pre, t0 + chunk_sz)
+                        off_b = mx.full((k_act,), l_sys_i + t0, dtype=mx.int32)
+                        self.model.forward_embeds_into_slots(
+                            batch_emb[:, t0:t1, :],
+                            batch_ple[:, t0:t1],
+                            cache,
+                            off_b,
+                            slot_mx_pre,
+                        )
+
+                last_toks = mx.array([sub_sufs[r][-1] for r in range(k_act)], dtype=mx.int32)[:, None]
+                last_off = mx.array([l_sys_i + pre_lens[r] for r in range(k_act)], dtype=mx.int32)
+                slot_mx = mx.array(slot_indices, dtype=mx.int32)
+                want_telem = bool(collect_telemetry or valid_mask_u32 is not None)
+                if want_telem:
+                    x_or_lg, am = self.model.forward_decode_step_slot(
+                        last_toks,
+                        cache,
+                        last_off,
+                        slot_mx,
+                        n_keep=k_act,
+                        return_logits=return_logits,
+                        collect_telemetry=collect_telemetry,
+                        valid_mask_u32=valid_mask_u32,
+                    )
+                else:
+                    x_or_lg, am = self.model.forward_decode_step_slot(
+                        last_toks,
+                        cache,
+                        last_off,
+                        slot_mx,
+                        n_keep=k_act,
+                        return_logits=return_logits,
+                    )
+                next_offs = [l_sys_i + len(sub_sufs[r]) for r in range(k_act)]
+                telem_mx = cache.get("_last_telemetry") if want_telem else None
+                if async_eval:
+                    if telem_mx is not None:
+                        mx.async_eval(x_or_lg, am, telem_mx)
+                    else:
+                        mx.async_eval(x_or_lg, am)
+                else:
+                    if telem_mx is not None:
+                        mx.eval(x_or_lg, am, telem_mx)
+                    else:
+                        mx.eval(x_or_lg, am)
+                return x_or_lg, am, next_offs
+
+            roll_extra_kw: dict[str, Any] = {}
+            if collect_telemetry or collect_valid_lse:
+                roll_extra_kw["collect_telemetry"] = bool(collect_telemetry)
+                roll_extra_kw["collect_valid_lse"] = bool(collect_valid_lse)
+
+            self.model.prefill_slots_lazy_lg = _mm_prefill_slots  # type: ignore[method-assign]
+            try:
+                roll_res = run_decode_rolling(
+                    self.model,
+                    self.tokenizer.stop_token_ids,
+                    grammar,
+                    pkv,
+                    tagged_sufs,
+                    max_tokens=int(max_tokens),
+                    b_slots=eff_b_slots,
+                    doc_cap_full=doc_cap_req,
+                    swa_ring_cap=swa_cap_req,
+                    kv_i8=eff_kv_i8,
+                    temperature=0.0,
+                    top_p=float(top_p),
+                    seed=int(seed),
+                    per_doc_grammars=resolved_grammars,
+                    use_ane_ring=False,
+                    **roll_extra_kw,
+                )
+            finally:
+                self.model.prefill_slots_lazy_lg = orig_prefill  # type: ignore[method-assign]
+
+            gen_toks_all = roll_res["gen_toks"]
+            roll_telem = roll_res.get("telemetry")
+            roll_valid_schemas = roll_res.get("valid_schemas")
+            items_out: list[GenerationItem] = []
+            valid_json_cnt = 0
+            valid_schema_cnt = 0
+            tot_prompt = 0
+            tot_comp = 0
+            for d in range(n_docs):
+                g_d = list(gen_toks_all[d])
+                full_out_ids = upfront_lists[d] + g_d
+                doc_g = resolved_grammars[d] if resolved_grammars is not None else grammar
+                txt = self.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+                parsed = None
+                is_json = False
+                is_schema = doc_g is None
+                try:
+                    parsed = json.loads(txt)
+                    is_json = True
+                    valid_json_cnt += 1
+                except Exception:
+                    pass
+                if doc_g is not None:
+                    if roll_valid_schemas is not None:
+                        is_schema = bool(roll_valid_schemas[d])
+                    else:
+                        is_schema = bool(doc_g.validate_token_sequence(full_out_ids))
+                if is_schema:
+                    valid_schema_cnt += 1
+                finish_reason = (
+                    "length"
+                    if len(g_d) >= int(max_tokens) and not (doc_g is not None and is_schema)
+                    else "stop"
+                )
+                p_len = len(expanded_list[d])
+                c_len = len(full_out_ids)
+                tot_prompt += p_len
+                tot_comp += c_len
+                telem_d = roll_telem[d] if (roll_telem is not None and d < len(roll_telem)) else None
+                items_out.append(
+                    GenerationItem(
+                        text=txt,
+                        parsed=parsed,
+                        token_ids=full_out_ids,
+                        prompt_tokens=p_len,
+                        completion_tokens=c_len,
+                        valid_json=is_json,
+                        valid_schema=is_schema,
+                        finish_reason=finish_reason,
+                        telemetry=telem_d,
+                    )
+                )
+
+            elapsed = time.perf_counter() - t_all0
+            dec_sec = float(roll_res.get("decode_sec", 0.0))
+            tot_out_tok = int(roll_res.get("tot_out_tok", 0))
+            stats = {
+                "mode_requested": "gpu",
+                "mode_used": "gpu",
+                "multimodal_rolling": True,
+                "rolling": True,
+                "b_slots": eff_b_slots,
+                "kv_i8": eff_kv_i8,
+                "swa_ring_cap": swa_cap_req,
+                "docs": n_docs,
+                "lcp": lcp,
+                "vision_sec": vision_sec,
+                "prefill_sec": float(roll_res.get("prefill_sec", 0.0)),
+                "decode_sec": dec_sec,
+                "elapsed_sec": elapsed,
+                "decode_tok_s": tot_out_tok / max(dec_sec, 1e-9),
+                "docs_per_sec": n_docs / max(elapsed, 1e-9),
+                "prompt_tokens": tot_prompt,
+                "completion_tokens": tot_comp,
+                "ff_tokens": int(roll_res.get("ff_tokens", 0)),
+                "valid_json_count": valid_json_cnt,
+                "valid_schema_count": valid_schema_cnt,
+                "peak_gb": mx.get_peak_memory() / (1024**3),
+            }
+            if n_docs >= 8 and callable(getattr(mx, "clear_cache", None)):
+                mx.clear_cache()
+            return GenerationBatchResult(items=items_out, stats=stats)
+
     def generate(
         self,
         prompt: PromptInput,
@@ -1534,6 +2017,8 @@ class FastGemma4Engine:
         whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
+        images_list: Sequence[Sequence[Any] | Any | None] | None = None,
+        max_soft_tokens: int | None = None,
         use_ane_ring: bool | str = "auto",
         ane_cohort_size: int = 16,
         enable_ff_jump: bool = True,
@@ -1544,6 +2029,38 @@ class FastGemma4Engine:
     ) -> GenerationBatchResult:
         if not prompts:
             return GenerationBatchResult(items=[], stats={"docs_per_sec": 0.0, "decode_tok_s": 0.0})
+
+        if images_list is not None:
+            if len(images_list) != len(prompts):
+                raise ValueError(f"Mismatched images_list={len(images_list)} vs prompts={len(prompts)}")
+            has_any_image = any(
+                (item is not None and (not isinstance(item, Sequence) or isinstance(item, (str, bytes)) or len(item) > 0))
+                for item in images_list
+            )
+            if has_any_image:
+                return self.generate_multimodal_batch(
+                    prompts,
+                    images_list,
+                    system_prompt=system_prompt,
+                    json_schema=json_schema,
+                    per_doc_grammars=per_doc_grammars,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    seed=seed,
+                    batch_size=batch_size,
+                    speculative=speculative,
+                    use_chat_template=use_chat_template,
+                    enable_thinking=enable_thinking,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_budget=reasoning_budget,
+                    whitespace_flexible=whitespace_flexible,
+                    max_whitespace_run=max_whitespace_run,
+                    max_soft_tokens=max_soft_tokens,
+                    kv_i8=kv_i8 if isinstance(kv_i8, bool) else None,
+                    collect_telemetry=collect_telemetry,
+                    collect_valid_lse=collect_valid_lse,
+                )
 
         if per_doc_grammars is not None and len(per_doc_grammars) != len(prompts):
             raise ValueError(f"Mismatched per_doc_grammars={len(per_doc_grammars)} vs prompts={len(prompts)}")
