@@ -2,13 +2,13 @@
 
 High-throughput schema-constrained JSON extraction and tool calling on Apple Silicon with Qwen 3.5 and Qwen 3.6 (`0.8B` to `27B` dense and `35B-A3B` MoE). On 300 public JSON extraction and tool-calling tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returns **300/300 valid schemas** at **0.896 score** on Base M5 (**299/300**, **0.893** on M4 Pro) with zero repeat loops.
 
-Zero telemetry, no account, and runs 100% offline after initial weight download (~2.6-3.1 GB for default 4B checkpoint). Combines Qwen's hybrid 3:1 `GatedDeltaNet` + GQA architecture with compiled Metal GDN/RoPE kernels, M5 (`Apple10 NAX`) prefill packing (`2.34-4.2+ GB` RAM saved at zero logit drift), 4-bit rotated KV caching (`2.1x` faster 16K decode), and 256-token `PrefixTree` state reuse. [Cross-silicon benchmarks](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
+Zero telemetry, no account, and runs 100% offline after initial weight download (~3.3 GB for default 4B checkpoint). Combines Qwen's hybrid 3:1 `GatedDeltaNet` + GQA architecture with compiled Metal GDN/RoPE kernels, M5 (`Apple10 NAX`) prefill packing (`2.34-4.2+ GB` RAM saved at zero logit drift), 4-bit rotated KV caching (`2.1x` faster 16K decode), and 256-token `PrefixTree` state reuse. [Cross-silicon benchmarks](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Checked with `mlx-community/Qwen3.5-4B-OptiQ-4bit` (`4b`), `0.8b-bf16`, and `9b-optiq`.
+- Apple Silicon Mac (`M1-M5`), macOS 14+ (GPU-only MLX; `macOS 15+` for the full monorepo ANE stack; verified on macOS 26.6 and 27.2.1), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Checked with `mlx-community/Qwen3.5-4B-OptiQ-4bit` (`4b`), `0.8b-bf16`, and `9b-optiq`.
 
-## Quickstart (~2.6-3.1 GB default 4B model)
+## Quickstart (~3.3 GB default 4B model)
 
 ```bash
 git clone https://github.com/mikewolfd/fast-silicon

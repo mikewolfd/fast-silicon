@@ -1,6 +1,6 @@
 # fast-ocr
 
-Convert PDFs, scanned pages, and dense financial tables into clean Markdown and rectangular GFM tables locally on Apple Silicon. Routes work across three tiers without training: native PDF text bypass via `pypdfium2` (`139-220 pp/s`), isolated Apple Vision on the 16-core Neural Engine (`9.6 pp/s`), and lazy Qwen3.5 VLM escalation (`OvisOCR2-8bit` or `NuExtract3`) backed by [`fast-qwen3`](../fast-qwen3/README.md).
+Convert PDFs, scanned pages, and dense financial tables into clean Markdown and rectangular GFM tables locally on Apple Silicon. Routes work across three tiers without training: native PDF text bypass via `pypdfium2` (`139-220 pp/s`), isolated Apple Vision on the 16-core Neural Engine (`5-9.6 pp/s`), and lazy Qwen3.5 VLM escalation (`OvisOCR2-8bit` or `NuExtract3`) backed by [`fast-qwen3`](../fast-qwen3/README.md).
 
 Across a 96-page public benchmark suite (`olmOCR-bench`, `FinTabNet-OTSL`, `OmniDocBench-EN`), the `auto` router scores **0.616 on `olmOCR(42)` (`42/42`)**, **0.894 TEDS on `FinTabNet(30)` (`30/30`)**, and **0.657-0.687 on `OmniDocBench(24)`**, running **1.22-2.05x** faster than stock `mlx_vlm OvisOCR2-8bit` on full VLM pages and **3.47x** faster on mixed digital PDFs with region splicing. Zero telemetry, no account, and runs 100% offline.
 
@@ -14,7 +14,7 @@ Raw multi-column table crops often drop alignment pipes or collapse adjacent cel
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Non-macOS targets (Linux, Windows, Intel Macs) are unsupported because Apple Vision requires macOS frameworks.
+- Apple Silicon Mac (`M1-M5`), macOS 15+ recommended across the monorepo (Apple Vision and MLX support `macOS 14+`; verified on macOS 26.6 and 27.2.1), Python 3.12+, and `uv`. Non-macOS targets (Linux, Windows, Intel Macs) are unsupported because Apple Vision requires macOS frameworks.
 - Clean digital PDFs and Apple Vision ANE OCR require zero Hugging Face weights; VLM escalation downloads `mlx-community/OvisOCR2-8bit` (~2.6 GB) once when first used.
 
 ## Quickstart
@@ -47,7 +47,7 @@ with FastOCR(backend="auto") as ocr:
 | Tier | Trigger | Behavior |
 | --- | --- | --- |
 | **Native PDF text** | Clean digital text pages (`0` control garble) | Extracts `pypdfium2` text directly without rasterizing (`139-220 pp/s`), stripping stamps while rasterizing vector-outlined pages. |
-| **Apple Vision ANE** | Clean single-column scans / raster pages | Runs isolated macOS `VNRecognizeTextRequest` with multi-band dedup (`workers=4` reaches `9.61 pp/s`), 360-deg orientation, tiny-crop upscaling, and GFM synthesis. |
+| **Apple Vision ANE** | Clean single-column scans / raster pages | Runs isolated macOS `VNRecognizeTextRequest` with multi-band dedup (`workers=4` reaches `9.61 pp/s` on resized table crops; `4.97-7.55 pp/s` full pages), 360-deg orientation, tiny-crop upscaling, and GFM synthesis. |
 | **Qwen3.5 VLM (`Ovis`)** | Tables, ledgers, formulas, or low-conf pages | Escalates asynchronously behind ANE pre-analysis in `batch_size=16` waves (`FastOvisOCREngine`). |
 
 - **Preprocessing & speculative decode:** Ink-tight cropping cuts ViT tokens `56-61%`; camera-gated `--deskew auto` boosts `CORD-v2` recall `+10.9 pp` at `1.64x` speed (`0/106` false warps on flat scans); Latin/math head pruning trims the Ovis head to 140K tokens (`--no-latin-only` disables); and grammar-safe prompt-lookup decoding (`K=4`) runs `1.14-1.85x` faster at exact parity while async `B=1` logprob confidence detects errors (`0.914` AUROC on `FinTabNet-30`) at zero wall overhead.

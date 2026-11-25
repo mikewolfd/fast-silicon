@@ -6,7 +6,7 @@ Zero telemetry, no account, and runs 100% offline after initial ~0.30-0.65 GB pr
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Sequences beyond 2,048 tokens are truncated. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-embeddinggemma-2 native`, optional when passing `default_mode="gpu"`).
+- Apple Silicon Mac (`M1-M5`), macOS 15+ (required for Core ML ANE buckets and native runner; `macOS 14+` for GPU-only `default_mode="gpu"`), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Sequences beyond 2,048 tokens are truncated. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-embeddinggemma-2 native`, optional when passing `default_mode="gpu"`).
 
 ## Quickstart
 
@@ -54,6 +54,8 @@ Mean score averages 150 NanoBEIR queries and 175 LegalBench-RAG queries across s
 | M4 Pro | Public Core ML (OpenInfinity INT8) | 0.5183 | 1.649 | 157.2 s | 1.03 GB | 2.21x MLX |
 | M4 Pro | Stock `mlx-vlm` (8-bit) | 0.5353 | 0.746 | 358.6 s | 39.03 GB | 1.00x MLX |
 
+*Memory note: Stock `mlx-vlm` reports `19.41 GB` (M5) and `39.03 GB` (M4 Pro) because it leaves MLX's Metal buffer cache uncapped up to macOS's 80% wired ceiling, whereas `fast-embeddinggemma-2` sets `mlx_cache_limit_mb=512`.*
+
 Both public Core ML exports clip at 512 tokens, whereas 136 of the 144 long LegalBench passages exceed 512 tokens. At 512 tokens all three score identically (`0.516-0.518` whole-passage `nDCG@10`); supporting 2,048 tokens brings every answer span into view and lifts `nDCG@10` to **0.569** (`0.336 -> 0.903` visible character recall@10). On M5, OpenInfinity INT8 uses less RAM (`0.84 GB` vs. `3.43 GB`), while `fast-embeddinggemma-2` finishes 2.6x faster (`57.1 s` vs. `148.9 s`). [Legal 512 vs 2048 analysis](../../docs/benchmarks/embeddinggemma-legal-512-20261121.json) · [Public Core ML details](../../docs/BENCHMARKS.md#public-core-ml-results)
 
 Prepending document titles raises 175-query legal passage ranking from `0.380` to `0.505` (`0.721 -> 0.811` recall). `eng.build_index(corpus)` defaults to 512d INT8 (`514 B/chunk`, 6x smaller than 768d FP32) and adds a 64-byte binary Hamming prefilter at 16,000+ docs, searching 100,000 vectors in **0.50 ms** (4.43x faster than FP32 BLAS). [Compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
@@ -100,7 +102,7 @@ Install with `uv sync --python 3.13 --package fast-embeddinggemma-2 --extra visi
   --chunk --max-chunk-tokens 512 --overlap 64 --drop-text-col --include-chunk-text
 .venv/bin/embeddinggemma-2 serve --host 127.0.0.1 --port 8080 --dimensions 256
 .venv/bin/embeddinggemma-2 embed-images page_1.png page_2.png --batch-size 8 --json
-.venv/bin/pytest -v packages/fast-embeddinggemma-2/tests
+.venv/bin/pytest -v packages/fast-embeddinggemma-2/tests   # Requires --extra dev
 ```
 
 ## Limitations, Prior Art & License

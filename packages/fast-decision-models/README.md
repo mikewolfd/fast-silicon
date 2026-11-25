@@ -2,11 +2,11 @@
 
 Local zero-shot classifiers and typed decision scorers for Apple Silicon (`Laya-Typed-421M`, `Kev-0.8B`, and `Kev-4B`). Score binary checks (`noul`), multi-way choices (`choice`), and numeric scales (`score`) in a single forward pass with calibrated probabilities, running `Laya` 100% on the 16-core Apple Neural Engine (`5.1 ms` single query) or in concurrent GPU+ANE `hetero` mode (`37.9 s` for 1,400 items, `2.0x` stock MLX, `25x` faster than Apple CoreAI).
 
-Zero telemetry, no account, and runs 100% offline after initial weight download (~0.95 GB for Laya ANE + Kev-0.8B; ~4.90 GB for full suite including Kev-4B). Prebuilt Hugging Face artifacts: [`mikewolfd/laya-typed-decisions-421m-coreml-ane`](https://huggingface.co/mikewolfd/laya-typed-decisions-421m-coreml-ane) · [`mikewolfd/kev-0.8b-mlx-w8`](https://huggingface.co/mikewolfd/kev-0.8b-mlx-w8) · [Scored results](../../docs/benchmarks/decisions-20261121.json) · [Public Core ML comparisons](../../docs/benchmarks/coreml-20261120.json).
+Zero telemetry, no account, and runs 100% offline after initial weight download (~1.3-1.6 GB for Laya ANE + Kev-0.8B; ~4.90 GB for full suite including Kev-4B). Prebuilt Hugging Face artifacts: [`mikewolfd/laya-typed-decisions-421m-coreml-ane`](https://huggingface.co/mikewolfd/laya-typed-decisions-421m-coreml-ane) · [`mikewolfd/kev-0.8b-mlx-w8`](https://huggingface.co/mikewolfd/kev-0.8b-mlx-w8) · [Scored results](../../docs/benchmarks/decisions-20261121.json) · [Public Core ML comparisons](../../docs/benchmarks/coreml-20261120.json).
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Core ML ANE and Metal GPU execution. Xcode Command Line Tools are required to compile the native `Laya` ANE `.dylib` runner (`make -C packages/fast-decision-models native`; GPU-only `Kev` needs no native build).
+- Apple Silicon Mac (`M1-M5`), macOS 15+ (required for Laya multifunction Core ML ANE and native runner; `macOS 14+` for GPU-only Kev), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Core ML ANE and Metal GPU execution. Xcode Command Line Tools are required to compile the native `Laya` ANE `.dylib` runner (`make -C packages/fast-decision-models native`; GPU-only `Kev` needs no native build).
 
 ## Quickstart
 
@@ -16,7 +16,7 @@ cd fast-silicon
 uv sync --python 3.13 --package fast-decision-models --inexact
 make -C packages/fast-decision-models native
 
-.venv/bin/decision-models setup-weights --build-kev-mlx   # Stages ~0.95 GB Laya ANE + Kev-0.8B W8
+.venv/bin/decision-models setup-weights   # Downloads ~1.3 GB prebuilt Laya ANE + Kev-0.8B W8
 .venv/bin/decision-models verify --backend kev-0.8b
 ```
 
@@ -91,9 +91,9 @@ FluidInference Core ML clips combined inputs at 1,024 tokens (truncating 164 of 
 .venv/bin/decision-models score --backend kev-0.8b --type choice \
   --question "Which subsystem caused the alert?" --criteria "network,storage,authentication" \
   --state "Primary DB volume reached 99% utilization and paused writes." --json
-.venv/bin/decision-models setup-weights --quantize-existing-kev-w8
-.venv/bin/decision-models setup-weights --build-laya-ane
-.venv/bin/pytest -v packages/fast-decision-models/tests
+.venv/bin/decision-models setup-weights --quantize-existing-kev-w8   # Requires a local BF16 model.safetensors
+.venv/bin/decision-models setup-weights --build-laya-ane            # Compiles from source; requires --extra build
+.venv/bin/pytest -v packages/fast-decision-models/tests             # Requires --extra dev
 ```
 
 ## Limitations, Prior Art & License

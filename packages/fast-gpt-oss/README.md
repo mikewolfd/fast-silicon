@@ -1,12 +1,12 @@
 # fast-gpt-oss
 
-Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 24-48 GB+ Apple Silicon Macs (with `B=8` auto-clamp on 16 GB) for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **13.4-14.3 GB** peak RAM on a 24 GB M5 (`103.1 tok/s` at `B=16`) and scale to **444-454 tok/s** at `B=128` (`14.8-16.7 GB` peak) on a 48 GB M4 Pro.
+Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 24-48 GB+ Apple Silicon Macs (with `B=8` auto-clamp on 16 GB) for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **13.4-14.3 GB** peak RAM on a 24 GB M5 (`103.1 tok/s` at `B=16`) and scale to **444.1 tok/s** at `B=128` (`15.96 GB` MLX / `16.67 GB` peak) on a 48 GB M4 Pro.
 
 Zero telemetry, no account, and runs 100% offline after weight download (~11-12 GB `MXFP4-Q8` default checkpoint). [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), verified on 24-48 GB+ unified memory (`16 GB` auto-clamps to `B=8`, unverified on 16 GB hardware), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported.
+- Apple Silicon Mac (`M1-M5`), verified on 24-48 GB+ unified memory (`16 GB` auto-clamps to `B=8`, unverified on 16 GB hardware), macOS 14+ (GPU-only MLX; `macOS 15+` for the full monorepo ANE stack; verified on macOS 26.6 and 27.2.1), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported.
 
 ## Quickstart (~11-12 GB model download)
 
@@ -24,7 +24,7 @@ uv sync --python 3.13 --package fast-gpt-oss --inexact
 
 | Unified memory | Auto wave-batch cap | Measured footprint & expected usage |
 | --- | --- | --- |
-| **48 GB+ (`M4/M5 Pro/Max`)** | `B=64` default (up to `B=128`) | Verified `10.5-14.8 GB` active MLX (`16.7 GB` peak combined @ `B=128`, **444-454 tok/s**, **1.48-1.57 docs/s**). |
+| **48 GB+ (`M4/M5 Pro/Max`)** | `B=64` default (up to `B=128`) | Verified `15.96 GB` MLX / `16.67 GB` peak @ `B=128` (**444.1 tok/s**, **1.568 docs/s** in the monorepo suite). |
 | **24 GB (`Base M5`)** | `B=16` (`<= 26 GiB` clamp) | Verified `13.42 GB` Metal / `14.27 GB` combined (**49.0 tok/s** `B=1`, **93.6 tok/s** `B=8`, **103.1 tok/s** `B=16`). |
 | **16 GB / 32 GB** | `B=8` (16 GB) / `B=32` (32 GB) | Automatically clamps batch waves from host RAM so ~11 GB resident weights stay out of swap (auto-clamp only; unverified on 16 GB hardware). |
 
@@ -48,10 +48,10 @@ Split on the 50 tasks: `24/25` valid extraction (`0.653` F1) vs. stock `17/25` (
 | **M4 Pro (48 GB)** | Sequential `B=1` (8) | 8/8 | - | 16.10 s wall | 88.0 | 0.497 | 10.50 GB MLX |
 | **M4 Pro (48 GB)** | Batched `B=8` (8) | 8/8 | 2.82 s | 6.22 s decode | 184.2-190.7 | 0.883 | 10.92 GB MLX |
 | **M4 Pro (48 GB)** | Batched `B=64` (64) | 64/64 | 22.89 s | 24.40 s decode | 374.3-385.8 | 1.350 | 12.60 GB MLX |
-| **M4 Pro (48 GB)** | **Batched `B=128` (128)** | **128/128** | **46.14 s** | **39.87 s decode** | **444.1-454.1** | **1.483-1.568** | **14.79 GB MLX / 16.67 GB comb** |
+| **M4 Pro (48 GB)** | **Batched `B=128` (128)** | **128/128** | **46.14 s** | **39.87 s decode** | **444.1** | **1.568** | **15.96 GB MLX / 16.67 GB peak** |
 | **Base M5 (24 GB)** | `B=1` / `B=8` / **`B=16`** | - | - | - | `49.0 / 93.6` / **103.1** | **0.382** (`B=16`) | **13.42 GB Metal / 14.27 GB comb** |
 
-*Baseline note: On a separate non-matching `128`-token summary prompt (without a 512-token extraction schema), stock `mlx-lm` (`B=8`) measured `156.1 tok/s` (`1.188 docs/s`, `11.24 GB`).*
+*Baseline note: An earlier capacity suite run reached `454.1 dec tok/s` @ `B=128` with a `23.98 GB` suite footprint. Separately, on a non-matching `128`-token summary prompt (without a 512-token extraction schema), stock `mlx-lm` (`B=8`) measured `156.1 tok/s` (`1.188 docs/s`, `11.24 GB`).*
 
 By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (preventing expert-selection drift on 8-bit checkpoints), uses hybrid FP16 intermediates with FP32 accumulators, and pairs `reasoning_effort="low"` (`budget=48`) with 4-gram loop breaking: scoring **0.726 on MMLU-Redux**, **0.54 on MATH-500**, and **0.847 on BFCL** at `3.3-4.4x` faster wall time than pure FP32. [Precision & CoT ablations](../../docs/BENCHMARKS.md#track-c--fast-gemma4--fast-gpt-oss-precision-loop-breakers--cot-budgets)
 
@@ -71,7 +71,7 @@ By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (prev
 .venv/bin/gpt-oss extract input.jsonl out.jsonl --schema packages/fast-gpt-oss/tests/fixtures/extract_v1.schema.json
 .venv/bin/gpt-oss serve --port 8080 --coalesce-ms 10 --max-batch 64
 .venv/bin/gpt-oss bench --batches 8,64,128
-.venv/bin/pytest -v packages/fast-gpt-oss/tests
+.venv/bin/pytest -v packages/fast-gpt-oss/tests   # Requires --extra dev
 ```
 
 ## Limitations, Prior Art & License

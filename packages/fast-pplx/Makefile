@@ -1,7 +1,7 @@
 # Native C++/ObjC++ build for fast-pplx (Accelerate/NEON + CoreML staged ANE runner).
 #
 # Deployment & architecture notes:
-# - Default `-mcpu=apple-m4` is safe across M4 (Apple9) and M5+ (Apple10+) Macs.
+# - Default portable `-arch arm64` runs across M1-M5+ Macs (opt in via `TARGET_CPU=apple-m4`).
 # - Never pass blind `-mcpu=apple-m5`: Apple Clang 21 enables `+specres2` even though
 #   `FEAT_SPECRES`/`FEAT_SPECRES2` report 0 at runtime (guarded below with `+nospecres2`).
 # - For MLX source builds targeting M5 NAX, set `CMAKE_OSX_DEPLOYMENT_TARGET>=26.2`
@@ -13,7 +13,7 @@ CXX := clang++
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
 MACOSX_MIN_VERSION ?= 15.0
 TARGET_ARCH ?= arm64
-TARGET_CPU ?= apple-m4
+TARGET_CPU ?=
 CPU_FLAGS := $(if $(filter apple-m5,$(TARGET_CPU)),-mcpu=apple-m5+nospecres2,$(if $(TARGET_CPU),-mcpu=$(TARGET_CPU),))
 
 CXXFLAGS := -std=c++17 -O3 -arch $(TARGET_ARCH) -mmacosx-version-min=$(MACOSX_MIN_VERSION) $(CPU_FLAGS) \

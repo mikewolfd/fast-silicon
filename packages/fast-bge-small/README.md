@@ -6,7 +6,7 @@ Zero telemetry, no account, and runs 100% offline after initial ~0.15-0.35 GB pr
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-bge-small native`, optional when running GPU-only via `default_mode="gpu"`).
+- Apple Silicon Mac (`M1-M5`), macOS 15+ (required for Core ML ANE buckets and native runner; `macOS 14+` for GPU-only `default_mode="gpu"`), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-bge-small native`, optional when running GPU-only via `default_mode="gpu"`).
 
 ## Quickstart
 
@@ -53,6 +53,8 @@ Mean score averages ranking performance across 150 NanoBEIR queries and 175 Lega
 | M4 Pro | Public Core ML (`sidekickd` FP16) | 0.4739 | 2.382 | 64.7 s | 0.74 GB | 1.81x |
 | M4 Pro | Stock `mlx-embeddings` (8-bit) | 0.4774 | 1.319 | 117.6 s | 38.99 GB | 1.00x |
 
+*Memory note: Stock `mlx-embeddings` reports `18.78 GB` (M5) and `38.99 GB` (M4 Pro) because it leaves MLX's Metal buffer cache uncapped up to macOS's 80% wired ceiling, whereas `fast-bge-small` sets `mlx_cache_limit_mb=512`.*
+
 `fast-bge-small` runs 5.09x (M5) and 5.30x (M4 Pro) faster than the public `sidekickd` FP16 Core ML export at matching mean score (diff 0.0002, min cosine `>= 0.99996`), while `sidekickd` uses less unified memory (`0.54-0.74 GB` vs. `1.54-1.55 GB`). The alternative `michaeljelly/bge-small-en-coreml-v1.5` export returned non-finite first-token embeddings on CPU/GPU and low cosine similarity (`0.518-0.619`) on ANE. [Public Core ML details](../../docs/BENCHMARKS.md#public-core-ml-results)
 
 Prepending document headers during Parquet chunking raises 175-query legal passage ranking from `0.305` to `0.444` (`0.631` -> `0.710` recall). `eng.build_index(corpus)` compresses embeddings 4x into symmetric INT8 (`386 B/chunk`) and, at 16,000+ documents, adds a 48-byte binary Hamming prefilter that searches 100,000 vectors in **0.50 ms/query** vs. `1.46 ms` in FP32 BLAS (`2.95x` faster). Unlike Matryoshka-trained models, truncating BGE-small to 256d loses `0.0184` on NanoBEIR, so defaults keep all 384 dimensions. [Chunking and compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
@@ -97,8 +99,8 @@ On the 64-doc verification fixture (`bge-small verify`), minimum cosine similari
   --dtype float32 --chunk --max-body-tokens 510 --overlap 51 --filter-ocr --resume
 .venv/bin/bge-small serve --host 127.0.0.1 --port 8080
 .venv/bin/bge-small bench --mode all --n 4000
-.venv/bin/python packages/fast-bge-small/scripts/build_ane_models.py --jobs 4
-.venv/bin/pytest -v packages/fast-bge-small/tests
+.venv/bin/python packages/fast-bge-small/scripts/build_ane_models.py --jobs 4   # Requires --extra build
+.venv/bin/pytest -v packages/fast-bge-small/tests                        # Requires --extra dev
 ```
 
 ## Limitations, Prior Art & License

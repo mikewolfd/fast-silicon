@@ -1,12 +1,12 @@
 # fast-pplx
 
-Contextual passage embeddings and 4K-32K long-document search on Apple Silicon using Perplexity's `pplx-embed-v2-context-0.6b`. Encoding passages with surrounding document context lifts 175-query legal passage ranking from **0.359 to 0.703** while finishing a 325-query benchmark in **136.5 s** vs. stock `pplx-context-mlx`'s **601.5 s** (**4.4x** faster at equal accuracy).
+Contextual passage embeddings and 4K-32K long-document search on Apple Silicon using Perplexity's `pplx-embed-v2-context-0.6b`. Contextual 4K chunking lifts 175-query legal passage ranking from **0.359 (isolated) to 0.703**, matching stock `pplx-context-mlx` accuracy (`0.703`) while finishing a 325-query benchmark in **136.5 s** vs. stock's **601.5 s** (**4.4x** faster).
 
 Runs short batches on the 16-core Apple Neural Engine (ANE) and long or tiny query batches on the Metal GPU (`hetero2` cuts mixed batch wall time **1.34-1.75x** vs. GPU alone), with a 32,768-token GPU path in **2.69 GB** process footprint. Zero telemetry, no account, and runs 100% offline after initial ~1.8-2.4 GB prebuilt download. Prebuilt Core ML ANE artifact: [`mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane`](https://huggingface.co/mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane) · [Full benchmark tables](../../docs/BENCHMARKS.md).
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Metal GPU / Core ML execution. Xcode Command Line Tools are required to build the native ANE runner (`make -C packages/fast-pplx native`).
+- Apple Silicon Mac (`M1-M5`), macOS 15+ (required for Core ML ANE stages and native runner; `macOS 14+` for GPU-only), Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Metal GPU / Core ML execution. Xcode Command Line Tools are required to build the native ANE runner (`make -C packages/fast-pplx native`).
 
 ## Quickstart (~1.8-2.4 GB prebuilt download)
 
@@ -17,7 +17,7 @@ uv sync --python 3.13 --package fast-pplx --inexact
 make -C packages/fast-pplx native
 
 .venv/bin/fast-pplx setup-weights          # Stages ~1.8-2.4 GB prebuilt weights + ANE stages
-# Optional: compile Pure-ANE stages locally (`balanced` profile by default):
+# Optional: compile Pure-ANE stages locally (requires --extra build; `balanced` profile by default):
 # .venv/bin/fast-pplx setup-ane --precision w8a16
 ```
 

@@ -8,7 +8,7 @@ cd fast-silicon
 uv sync --extra dev --extra extract --extra build
 ```
 
-Preview required weights and Core ML bundles before downloading (~35 GB for all 8 model packages):
+Preview required weights and Core ML bundles before downloading (~36-38 GB full across all 8 model packages, or ~25.6 GB with `--skip-test-extras`):
 
 ```bash
 .venv/bin/python scripts/setup_all.py --dry-run

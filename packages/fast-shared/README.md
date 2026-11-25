@@ -6,7 +6,7 @@ Runs 100% locally with zero telemetry and zero runtime dependency on `torch` or 
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Linux, Windows, and Intel Macs are not supported for GPU/ANE modules.
+- Apple Silicon Mac (`M1-M5`), macOS 15+ for Core ML ANE and native modules (`macOS 14+` for GPU-only MLX), Python 3.12+, and `uv`. Linux, Windows, and Intel Macs are not supported for GPU/ANE modules.
 
 ## Quickstart
 
@@ -86,7 +86,7 @@ For per-package benchmark tables across all 8 model packages, see the [`fast-sil
 ```bash
 claude --plugin-dir ./packages/fast-shared
 python3 packages/fast-shared/skills/apple-silicon-ml-optimizer/scripts/query_capability_matrix.py --stats
-.venv/bin/pytest -v packages/fast-shared/tests
+.venv/bin/pytest -v packages/fast-shared/tests   # Requires --extra dev
 ```
 
 ## Limitations, Acknowledgments & License
