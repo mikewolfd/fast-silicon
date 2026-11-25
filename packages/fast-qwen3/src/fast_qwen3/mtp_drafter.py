@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .kernels import gpu_argmax_conf, gpu_argmax_nan
 from .model import (
     DeltaSlotCache,
     FastQwen3Model,
@@ -231,9 +232,14 @@ def verify_draft_sequence_b1(
     last_verified_token: int,
     draft_tokens: Sequence[int],
     *,
-    pick_token_fn: Any,
+    pick_token_fn: Any = None,
     stop_token_ids: frozenset[int],
     rope_offset_delta: int = 0,
+    pick_token_gpu_fn: (
+        Callable[[int, int, tuple[float, float, float] | None, Callable[[], np.ndarray]], int] | None
+    ) = None,
+    need_conf: bool = False,
+    vocab_limit: int | None = None,
 ) -> tuple[list[int], mx.array, int]:
     """Verify `K` draft tokens on `target_model` (`B=1`) in one `L_q = K + 1` pass with exact GDN rollback.
 
@@ -241,8 +247,9 @@ def verify_draft_sequence_b1(
       1. Before the verify pass (`S = K + 1`), every `GrowingKVCache` records `kv_prev_offset` and
          every `DeltaSlotCache` sets `record_verify_trace = True`.
       2. All linear/MoE/conv/attention projections execute ONCE across `[last_verified_token, *draft_tokens]`.
-      3. At each draft step `i in 0..K-1`, `pick_token_fn(step_idx=i, logits_1d=...)` selects the exact
-         greedy (or grammar-constrained greedy) target token `t_target`.
+      3. At each draft step `i in 0..K-1`, `pick_token_fn(step_idx=i, logits_1d=...)` or
+         `pick_token_gpu_fn(step_idx, top1_idx, stats, lazy_logits_fn)` selects the exact greedy
+         (or grammar-constrained greedy) target token `t_target`.
       4. If all `K` drafts match (`n_accepted_drafts == K`), `cache` already holds the exact state after
          all `K + 1` input tokens, and we emit `[d_0, ..., d_{K-1}, bonus_tok]` (`K + 1` tokens in 1 pass,
          `0` rollback ops!).
@@ -263,27 +270,77 @@ def verify_draft_sequence_b1(
 
     hidden = target_model.forward_hidden(inp, cache, rope_offset_delta=rope_offset_delta)
     logits = target_model.project_logits(hidden)
-    mx.eval(hidden, logits)
-    logits_np = np.asarray(logits[0].astype(mx.float32))
 
     emitted: list[int] = []
     consumed_inputs = 0  # How many tokens of `seq` remain valid in `cache`
 
-    for i in range(k_len):
-        target_tok = int(pick_token_fn(i, logits_np[i]))
-        consumed_inputs = i + 1
-        if target_tok == int(draft_tokens[i]):
-            emitted.append(target_tok)
-            if target_tok in stop_token_ids:
+    if pick_token_gpu_fn is not None:
+        logits_2d = logits[0]
+        if vocab_limit is not None and int(logits_2d.shape[-1]) > int(vocab_limit):
+            logits_2d = logits_2d[:, : int(vocab_limit)]
+        if need_conf:
+            idx_mx, stats_mx = gpu_argmax_conf(logits_2d)
+            mx.eval(hidden, idx_mx, stats_mx)  # guard: allow-eval
+            idx_list = idx_mx.tolist()  # guard: allow-sync
+            stats_list: list[list[float]] | None = stats_mx.tolist()  # guard: allow-sync
+        else:
+            idx_mx = gpu_argmax_nan(logits_2d)
+            mx.eval(hidden, idx_mx)  # guard: allow-eval
+            idx_list = idx_mx.tolist()  # guard: allow-sync
+            stats_list = None
+
+        def _lazy_row_np(step_i: int) -> np.ndarray:
+            row_f32 = logits_2d[step_i].astype(mx.float32)
+            mx.eval(row_f32)  # guard: allow-eval
+            return np.asarray(row_f32)  # guard: allow-sync
+
+        for i in range(k_len):
+            st_i = (
+                (float(stats_list[i][0]), float(stats_list[i][1]), float(stats_list[i][2]))
+                if stats_list is not None
+                else None
+            )
+            target_tok = int(pick_token_gpu_fn(i, int(idx_list[i]), st_i, lambda idx=i: _lazy_row_np(idx)))
+            consumed_inputs = i + 1
+            if target_tok == int(draft_tokens[i]):
+                emitted.append(target_tok)
+                if target_tok in stop_token_ids:
+                    break
+            else:
+                emitted.append(target_tok)
                 break
         else:
-            emitted.append(target_tok)
-            break
+            st_k = (
+                (float(stats_list[k_len][0]), float(stats_list[k_len][1]), float(stats_list[k_len][2]))
+                if stats_list is not None
+                else None
+            )
+            bonus_tok = int(
+                pick_token_gpu_fn(k_len, int(idx_list[k_len]), st_k, lambda idx=k_len: _lazy_row_np(idx))
+            )
+            emitted.append(bonus_tok)
+            consumed_inputs = k_len + 1
     else:
-        # All K drafts matched without hitting stop_token_ids -> sample bonus token K!
-        bonus_tok = int(pick_token_fn(k_len, logits_np[k_len]))
-        emitted.append(bonus_tok)
-        consumed_inputs = k_len + 1
+        if pick_token_fn is None:
+            raise ValueError("verify_draft_sequence_b1 requires pick_token_fn or pick_token_gpu_fn")
+        mx.eval(hidden, logits)  # guard: allow-eval
+        logits_np = np.asarray(logits[0].astype(mx.float32))  # guard: allow-sync
+
+        for i in range(k_len):
+            target_tok = int(pick_token_fn(i, logits_np[i]))
+            consumed_inputs = i + 1
+            if target_tok == int(draft_tokens[i]):
+                emitted.append(target_tok)
+                if target_tok in stop_token_ids:
+                    break
+            else:
+                emitted.append(target_tok)
+                break
+        else:
+            # All K drafts matched without hitting stop_token_ids -> sample bonus token K!
+            bonus_tok = int(pick_token_fn(k_len, logits_np[k_len]))
+            emitted.append(bonus_tok)
+            consumed_inputs = k_len + 1
 
     total_verify_len = k_len + 1
     if consumed_inputs == total_verify_len:

@@ -48,9 +48,9 @@ with FastOCR(backend="auto") as ocr:
 | --- | --- | --- |
 | **Native PDF text** | Clean digital text pages (`0` control garble) | Extracts `pypdfium2` text directly without rasterizing (`139-220 pp/s`), stripping stamps while rasterizing vector-outlined pages. |
 | **Apple Vision ANE** | Clean single-column scans / raster pages | Runs isolated macOS `VNRecognizeTextRequest` with multi-band dedup (`workers=4` reaches `9.61 pp/s` on resized table crops; `4.97-7.55 pp/s` full pages), 360-deg orientation, tiny-crop upscaling, and GFM synthesis. |
-| **Qwen3.5 VLM (`Ovis`)** | Tables, ledgers, formulas, or low-conf pages | Escalates asynchronously behind ANE pre-analysis in `batch_size=16` waves (`FastOvisOCREngine`). |
+| **Qwen3.5 VLM (`Ovis`)** | Tables, ledgers, formulas, or low-conf pages | Escalates asynchronously behind ANE pre-analysis (`FastOvisOCREngine`) via continuous rolling `B=8` batched speculative PLD (`K=4`), falling back to static length waves for JSON schemas, sampling, or telemetry. |
 
-- **Preprocessing & speculative decode:** Ink-tight cropping cuts ViT tokens `56-61%`; camera-gated `--deskew auto` boosts `CORD-v2` recall `+10.9 pp` at `1.64x` speed (`0/106` false warps on flat scans); Latin/math head pruning trims the Ovis head to 140K tokens (`--no-latin-only` disables); and grammar-safe prompt-lookup decoding (`K=4`) runs `1.14-1.85x` faster at exact parity while async `B=1` logprob confidence detects errors (`0.914` AUROC on `FinTabNet-30`) at zero wall overhead.
+- **Preprocessing & speculative decode:** Ink-tight cropping cuts ViT tokens `56-61%`; camera-gated `--deskew auto` boosts `CORD-v2` recall `+10.9 pp` at `1.64x` speed (`0/106` false warps on flat scans); Latin/math head pruning trims the Ovis head to 140K tokens (`--no-latin-only` disables); grammar-safe prompt-lookup decoding (`K=4`) plus continuous rolling `B=8` batching runs `1.27-1.49x` faster on mixed/multi-page batches with `-13%` to `-33.5%` peak RAM at parity; and on-GPU Metal SIMD argmax + scalar logprob confidence (`gpu_argmax_conf`) detects low-confidence tokens (`0.914` AUROC on `FinTabNet-30`) without full-vocab CPU copies (`+6.5%` to `+12.8%` full-page `B=1` decode).
 - **Memory & opt-in flags:** `--kv-i8 auto` keeps BF16 until context exceeds `16K/32K` on M5 or `8K/16K` on M4; `--gdn-state-mode auto` switches GDN recurrent state to `int8_blk32` (`3.76x` smaller) on large batches; `--triage-dpi` is opt-in on `run` (e.g. `100`) and defaults to `72` on `parquet`; `--region-routing` sends digital prose to `pypdfium2` and crops only tables (`3.47x` faster on mixed digital PDFs); `--zoom-recover` re-checks missing numbers (`0.994 -> 1.000` recall); and `--drop-white-patches` stays off by default.
 
 ## Benchmark highlights
@@ -65,7 +65,8 @@ Measured on 48 GB M4 Pro (`macOS 26.6`) and 24 GB Base M5 (`macOS 27.2.1`) ([cro
 | **`olmOCR-bench(4)` (forced VLM)** | `fast-ocr` (`OvisOCR2-8bit`) | **0.8438** (`4/4`, 5.75 GB) | **0.8438** (`4/4`, 5.01 GB) | **1.44x** (M4P) / **2.05x** (M5) vs stock `mlx_vlm OvisOCR2` |
 | **Mixed digital PDF splice** | `fast-ocr` (`--region-routing`) | **3.47x** (`2.75 s -> 0.79 s`) | Opt-in (`False` default) | Lifts `govinfo_uscourts` `+7.7 pp` to `0.9707` |
 | **Parallel ANE (`n=16` crops)** | `AppleVisionOCR` (`workers=4`) | **9.61 pp/s** (`1.67 s`, 1.59x serial) | - | `FastOCR.ocr_images(..., batch_size=16)` runs `9.47 pp/s` |
-| **`B=1` Logprob confidence** | `fast-ocr` (`vDSP`) | **0.9135** AUROC (`FinTabNet-30`) | `0` extra MLX RAM | `-2.0%` wall time, `30/30` exact parity |
+| **`B=1` Logprob confidence** | `fast-ocr` (`gpu_argmax_conf`) | **0.9135** AUROC (`FinTabNet-30`) | `0` extra MLX RAM | On-GPU Metal SIMD top-1/top-2/logsumexp (`+6.5-12.8%` `B=1` decode) |
+| **Rolling batched PLD (`B=16`)** | `fast-ocr` (`OvisOCR2-8bit`) | **1.49x** mixed / **1.27x** OmniDoc | **2.43-2.96 GB** | `Mixed(8+8)` **0.281** vs `0.189 pp/s`; `FinTabNet(30)` **-33.5%** RAM (`0.902` TEDS, `0` loops) |
 
 *(On small 2-page forced-VLM checks against stock `mlx_vlm OvisOCR2-8bit`, `FinTabNet(2)` ran `1.22-1.72x` and `OmniDocBench(2)` ran `1.51-1.53x`, `2.44-2.74x` faster than `GLM-OCR`/`LightOnOCR-2`.)* [Architecture & OCR specs](docs/OCR_RESEARCH_AND_ARCHITECTURE.md)
 

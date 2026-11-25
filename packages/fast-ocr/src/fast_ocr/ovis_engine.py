@@ -33,6 +33,7 @@ from fast_shared.grammar import (
 )
 from fast_shared.pld_drafter import filter_drafts_with_grammar
 from fast_shared.kv_quant import KVMode, normalize_kv_mode
+from fast_qwen3.kernels import gpu_argmax_conf, gpu_argmax_nan, stats_to_logprob_margin
 from fast_qwen3.model import FastQwen3Model, Qwen3Config
 from fast_qwen3.mtp_drafter import verify_draft_sequence_b1
 from fast_qwen3.multimodal_batch import (
@@ -623,11 +624,12 @@ class _StepConfidenceWorker:
 
 
 class _StepConfidenceSession:
-    """Per-page accumulator backed by `_StepConfidenceWorker` or synchronous evaluation."""
+    """Per-page accumulator backed by GPU scalar stats, `_StepConfidenceWorker`, or synchronous evaluation."""
 
     def __init__(self, worker: _StepConfidenceWorker | None) -> None:
         self._worker = worker
         self._sync_state = _StepConfidenceState() if worker is None else None
+        self._used_worker = False
         self.logprobs: list[float] = []
         self.margins: list[float] = []
 
@@ -636,6 +638,7 @@ class _StepConfidenceSession:
         if n <= 0 or chosen_idx < 0 or chosen_idx >= n:
             return
         if self._worker is not None:
+            self._used_worker = True
             self._worker.submit(logits_1d, chosen_idx, self.logprobs, self.margins)
         else:
             assert self._sync_state is not None
@@ -643,8 +646,15 @@ class _StepConfidenceSession:
             self.logprobs.append(lp)
             self.margins.append(margin)
 
+    def record_direct(self, lp: float, margin: float) -> None:
+        """Append GPU-computed `(logprob, margin)` directly, flushing any prior CPU-fallback worker items first."""
+        if self._used_worker and self._worker is not None:
+            self._worker.flush()
+        self.logprobs.append(float(lp))
+        self.margins.append(float(margin))
+
     def finish(self) -> LogprobConfidence:
-        if self._worker is not None:
+        if self._used_worker and self._worker is not None:
             self._worker.flush()
         return summarize_logprob_confidence(self.logprobs, margins=self.margins)
 
@@ -1073,8 +1083,28 @@ class FastOvisOCREngine:
             )
             last_h = h_full[:, -1:, :]
 
-        logits0 = self.lm.project_logits(last_h)
-        mx.eval(last_h, logits0)
+        vocab_limit = len(self._new_to_old) if getattr(self, "vocab_remap", None) is None else None
+        need_conf = conf_session is not None
+
+        def _eval_logits_argmax(
+            logits_mx: mx.array,
+            h_keep: mx.array,
+        ) -> tuple[int, tuple[float, float, float] | None, mx.array]:
+            l2d = logits_mx[0]
+            if vocab_limit is not None and int(l2d.shape[-1]) > vocab_limit:
+                l2d = l2d[:, :vocab_limit]
+            if need_conf:
+                i_mx, s_mx = gpu_argmax_conf(l2d)
+                mx.eval(h_keep, i_mx, s_mx)  # guard: allow-eval
+                i_val = int(i_mx.tolist()[0])  # guard: allow-sync
+                s_row = s_mx.tolist()[0]  # guard: allow-sync
+                return i_val, (float(s_row[0]), float(s_row[1]), float(s_row[2])), l2d
+            i_mx = gpu_argmax_nan(l2d)
+            mx.eval(h_keep, i_mx)  # guard: allow-eval
+            return int(i_mx.tolist()[0]), None, l2d  # guard: allow-sync
+
+        logits0_mx = self.lm.project_logits(last_h)
+        idx0_val, stats0_val, logits0_2d = _eval_logits_argmax(logits0_mx, last_h)
         prefill_ms = (time.perf_counter() - t_prefill0) * 1000.0
 
         # Prepare grammars / drafter for decode
@@ -1204,6 +1234,73 @@ class FastOvisOCREngine:
                 conf_session.submit(work, c_idx)
             return chosen_tok
 
+        def _pick_token_gpu(
+            top1_idx: int,
+            stats: tuple[float, float, float] | None,
+            lazy_logits_fn: Callable[[], np.ndarray],
+            *,
+            hidden_1d: mx.array | None,
+            recent_tokens: Sequence[int],
+            table_gram_override: DynamicTableRowGrammar | None = None,
+            json_matcher_override: Any | None = None,
+        ) -> int:
+            vocab_len = len(self._new_to_old)
+            if float(temperature) > 0.0 or top1_idx < 0 or top1_idx >= vocab_len:
+                return _pick_token(
+                    lazy_logits_fn(),
+                    hidden_1d=hidden_1d,
+                    recent_tokens=recent_tokens,
+                    table_gram_override=table_gram_override,
+                    json_matcher_override=json_matcher_override,
+                )
+
+            if eff_loop_breaker:
+                pen = compute_loop_breaker_penalties(
+                    recent_tokens,
+                    window=96,
+                    min_prior_hits=4,
+                    base_penalty=8.0,
+                    stop_token_ids=stop_ids,
+                )
+                if pen:
+                    return _pick_token(
+                        lazy_logits_fn(),
+                        hidden_1d=hidden_1d,
+                        recent_tokens=recent_tokens,
+                        table_gram_override=table_gram_override,
+                        json_matcher_override=json_matcher_override,
+                    )
+
+            active_json_matcher = json_matcher_override if json_matcher_override is not None else json_matcher
+            if active_json_matcher is not None and json_gram is not None:
+                return _pick_token(
+                    lazy_logits_fn(),
+                    hidden_1d=hidden_1d,
+                    recent_tokens=recent_tokens,
+                    table_gram_override=table_gram_override,
+                    json_matcher_override=json_matcher_override,
+                )
+
+            active_table_gram = table_gram_override if table_gram_override is not None else table_gram
+            if active_table_gram is not None and active_table_gram.is_active:
+                full_mask = active_table_gram.prepare_mask(vocab_size=self.tokenizer.vocab_size)
+                if full_mask is not None:
+                    cand_tok = int(self._new_to_old[top1_idx])
+                    if not bool(full_mask[cand_tok]):
+                        return _pick_token(
+                            lazy_logits_fn(),
+                            hidden_1d=hidden_1d,
+                            recent_tokens=recent_tokens,
+                            table_gram_override=table_gram_override,
+                            json_matcher_override=json_matcher_override,
+                        )
+
+            chosen_tok = int(self._new_to_old[top1_idx])
+            if conf_session is not None and chosen_tok not in stop_ids and stats is not None:
+                lp, margin = stats_to_logprob_margin(stats[0], stats[1], stats[2])
+                conf_session.record_direct(lp, margin)
+            return chosen_tok
+
         gen_ids: list[int] = []
         drafted_tokens = 0
         accepted_draft_tokens = 0
@@ -1229,12 +1326,23 @@ class FastOvisOCREngine:
                     rope_offset_delta=rope_delta,
                 )
                 last_h = sh_up[:, -1:, :]
-                logits0 = self.lm.project_logits(last_h)
-                mx.eval(last_h, logits0)
+                logits0_mx = self.lm.project_logits(last_h)
+                idx0_val, stats0_val, logits0_2d = _eval_logits_argmax(logits0_mx, last_h)
                 pending_tokens = []
 
-            cur_logits = np.asarray(logits0[0, 0].astype(mx.float32))
-            first_tok = _pick_token(cur_logits, hidden_1d=last_h[0, 0], recent_tokens=gen_ids)
+            def _lazy0() -> np.ndarray:
+                f32 = logits0_2d[0].astype(mx.float32)
+                mx.eval(f32)  # guard: allow-eval
+                return np.asarray(f32)  # guard: allow-sync
+
+            first_tok = _pick_token_gpu(
+                idx0_val,
+                stats0_val,
+                _lazy0,
+                hidden_1d=last_h[0, 0],
+                recent_tokens=gen_ids,
+            )
+            del logits0_mx, logits0_2d
             if first_tok in stop_ids:
                 hit_eos = True
             else:
@@ -1310,9 +1418,16 @@ class FastOvisOCREngine:
                     spec_gram = table_gram.clone() if table_gram is not None else None
                     spec_json_matcher = json_matcher.deep_copy() if json_matcher is not None else None
 
-                    def _pick_spec(step_idx: int, step_logits_1d: np.ndarray) -> int:
-                        tok = _pick_token(
-                            step_logits_1d,
+                    def _pick_spec_gpu(
+                        step_idx: int,
+                        top1_idx: int,
+                        stats: tuple[float, float, float] | None,
+                        lazy_fn: Callable[[], np.ndarray],
+                    ) -> int:
+                        tok = _pick_token_gpu(
+                            top1_idx,
+                            stats,
+                            lazy_fn,
                             hidden_1d=None,
                             recent_tokens=gen_ids + drafts[:step_idx],
                             table_gram_override=spec_gram,
@@ -1330,7 +1445,9 @@ class FastOvisOCREngine:
                         cache,
                         last_tok,
                         drafts,
-                        pick_token_fn=_pick_spec,
+                        pick_token_gpu_fn=_pick_spec_gpu,
+                        need_conf=need_conf,
+                        vocab_limit=vocab_limit,
                         stop_token_ids=stop_ids,
                         rope_offset_delta=rope_delta,
                     )
@@ -1382,10 +1499,22 @@ class FastOvisOCREngine:
             step_arr = mx.array([pending_tokens], dtype=mx.int32)
             sh = self.lm.forward_hidden(step_arr, cache, rope_offset_delta=rope_delta)
             last_h = sh[:, -1:, :]
-            sl_f32 = self.lm.project_logits(last_h)[0, 0].astype(mx.float32)
-            mx.eval(last_h, sl_f32)  # guard: allow-eval
-            nxt_logits = np.asarray(sl_f32)  # guard: allow-sync
-            nxt_tok = _pick_token(nxt_logits, hidden_1d=last_h[0, 0], recent_tokens=gen_ids)
+            step_logits_mx = self.lm.project_logits(last_h)
+            s_idx_val, s_stats_val, step_logits_2d = _eval_logits_argmax(step_logits_mx, last_h)
+
+            def _lazy_step() -> np.ndarray:
+                f32 = step_logits_2d[0].astype(mx.float32)
+                mx.eval(f32)  # guard: allow-eval
+                return np.asarray(f32)  # guard: allow-sync
+
+            nxt_tok = _pick_token_gpu(
+                s_idx_val,
+                s_stats_val,
+                _lazy_step,
+                hidden_1d=last_h[0, 0],
+                recent_tokens=gen_ids,
+            )
+            del step_logits_mx, step_logits_2d
             if nxt_tok in stop_ids:
                 hit_eos = True
                 break
@@ -1937,10 +2066,21 @@ class FastOvisOCREngine:
                         deskew_metas[i] = {"applied": False, "reason": "deskew_error"}
         load_ms_each = ((time.perf_counter() - t_load0) * 1000.0) / max(1, n_items)
 
+        rolling_eligible = bool(
+            float(temperature) <= 0.0
+            and not strict_md
+            and all(sc is None for sc in schema_seq)
+            and not eff_loop_breaker
+            and eff_conf_mode != "on"
+            and not eff_drop_white
+        )
+        use_batch_pld = bool(rolling_eligible and spec_req != "off")
+
         need_batch_ane = (
             do_orient
             or (do_zoom_req and any(sc is None for sc in schema_seq))
             or any(sc is not None for sc in schema_seq)
+            or (use_batch_pld and spec_req in ("auto", "vision+self"))
         )
         if need_batch_ane:
             missing_pos = [i for i, pre in enumerate(pre_seq) if pre is None]
@@ -2108,6 +2248,39 @@ class FastOvisOCREngine:
             if any(m != eff_min_pixels for m in auto_mins):
                 eff_min_px_per_item = auto_mins
 
+        has_any_native = any(bool(n and str(n).strip()) for n in native_seq)
+        batch_k_draft = max(k_draft, 6) if (draft_k is None and has_any_native) else k_draft
+        batch_drafters: list[OCRPLDDrafter | None] | None = None
+        batch_spec_modes: list[str] | None = None
+        if use_batch_pld:
+            batch_drafters = []
+            batch_spec_modes = []
+            for i in range(n_items):
+                primary_ids: list[int] = []
+                extra_ids: list[list[int]] = []
+                if spec_req in ("auto", "vision+self"):
+                    primary_txt, extra_txts = build_ordered_pld_corpus(
+                        pre_seq[i],
+                        native_pdf_text=native_seq[i],
+                    )
+                    if primary_txt:
+                        primary_ids = self.tokenizer.encode(primary_txt, add_special_tokens=False)
+                    for extra_t in extra_txts:
+                        eids = self.tokenizer.encode(extra_t, add_special_tokens=False)
+                        if eids:
+                            extra_ids.append(eids)
+                eff_sp = "vision+self" if primary_ids else "self"
+                batch_spec_modes.append(eff_sp)
+                batch_drafters.append(
+                    OCRPLDDrafter(
+                        primary_ids if eff_sp == "vision+self" else (),
+                        extra_token_ids=extra_ids if eff_sp == "vision+self" else (),
+                        max_ngram=4,
+                        min_ngram=2,
+                        max_k=batch_k_draft,
+                    )
+                )
+
         mm_results, mm_stats = batched_multimodal_generate(
             lm=self.lm,
             vision_model=self.vision_model,
@@ -2119,6 +2292,10 @@ class FastOvisOCREngine:
             old_to_new=self._old_to_new,
             grammars=json_grams,
             table_grammars=table_grammars,
+            drafters=batch_drafters,
+            spec_modes=batch_spec_modes,
+            draft_k=batch_k_draft,
+            rolling=("auto" if rolling_eligible else False),
             max_tokens=tok_cap,
             temperature=temperature,
             repeat_penalty=eff_loop_breaker,
@@ -2251,9 +2428,9 @@ class FastOvisOCREngine:
             prefill_ms = mm_res.prefill_ms
             dec_ms = mm_res.decode_ms
             total_gen = len(gen_ids) + (1 if mm_res.hit_eos else 0)
-            drafted_tokens = 0
-            accepted_draft_tokens = 0
-            verify_passes = 0
+            drafted_tokens = int(getattr(mm_res, "drafted_tokens", 0))
+            accepted_draft_tokens = int(getattr(mm_res, "accepted_draft_tokens", 0))
+            verify_passes = int(getattr(mm_res, "verify_passes", 0))
             peak_gb = batch_peak_gb
             decode_tps = (total_gen / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
 

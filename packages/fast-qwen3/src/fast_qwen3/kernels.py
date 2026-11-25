@@ -16,6 +16,7 @@ from fast_shared.prefix_tree import (
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from functools import partial
+import math
 import os
 import re
 from typing import Any
@@ -321,3 +322,294 @@ def find_repeated_4gram_penalties(
         base_penalty=penalty,
         stop_token_ids=stop_token_ids,
     )
+
+
+_ARGMAX_CONF_KERNEL: Any | None = None
+_ARGMAX_NAN_KERNEL: Any | None = None
+
+
+def _get_argmax_conf_kernel() -> Any:
+    global _ARGMAX_CONF_KERNEL
+    if _ARGMAX_CONF_KERNEL is None:
+        source = """
+            uint row = threadgroup_position_in_grid.x;
+            uint tid = thread_index_in_threadgroup;
+            uint tpg = threads_per_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            uint n_simd = (tpg + 31) / 32;
+
+            device const T* row_ptr = x + row * V;
+
+            float local_max1 = -INFINITY;
+            int local_idx1 = 0x7fffffff;
+            float local_max2 = -INFINITY;
+            bool local_nan = false;
+
+            for (uint i = tid; i < V; i += tpg) {
+                float v = float(row_ptr[i]);
+                if (isnan(v)) {
+                    local_nan = true;
+                } else if (v > local_max1) {
+                    local_max2 = local_max1;
+                    local_max1 = v;
+                    local_idx1 = int(i);
+                } else if (v > local_max2) {
+                    local_max2 = v;
+                }
+            }
+
+            threadgroup float sg_max1[32];
+            threadgroup int sg_idx1[32];
+            threadgroup float sg_max2[32];
+            threadgroup uint sg_nan[32];
+
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float o_max1 = simd_shuffle_down(local_max1, offset);
+                int o_idx1 = simd_shuffle_down(local_idx1, offset);
+                float o_max2 = simd_shuffle_down(local_max2, offset);
+                uint o_nan = simd_shuffle_down(uint(local_nan), offset);
+                local_nan = local_nan || (o_nan != 0);
+                if (o_max1 > local_max1 || (o_max1 == local_max1 && o_idx1 < local_idx1)) {
+                    local_max2 = max(local_max1, o_max2);
+                    local_max1 = o_max1;
+                    local_idx1 = o_idx1;
+                } else {
+                    local_max2 = max(local_max2, o_max1);
+                }
+            }
+            if (simd_lane == 0) {
+                sg_max1[simd_group] = local_max1;
+                sg_idx1[simd_group] = local_idx1;
+                sg_max2[simd_group] = local_max2;
+                sg_nan[simd_group] = uint(local_nan);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_group == 0) {
+                float m1 = (tid < n_simd) ? sg_max1[tid] : -INFINITY;
+                int i1 = (tid < n_simd) ? sg_idx1[tid] : 0x7fffffff;
+                float m2 = (tid < n_simd) ? sg_max2[tid] : -INFINITY;
+                bool has_n = (tid < n_simd) ? (sg_nan[tid] != 0) : false;
+                for (uint offset = 16; offset > 0; offset >>= 1) {
+                    float om1 = simd_shuffle_down(m1, offset);
+                    int oi1 = simd_shuffle_down(i1, offset);
+                    float om2 = simd_shuffle_down(m2, offset);
+                    uint onan = simd_shuffle_down(uint(has_n), offset);
+                    has_n = has_n || (onan != 0);
+                    if (om1 > m1 || (om1 == m1 && oi1 < i1)) {
+                        m2 = max(m1, om2);
+                        m1 = om1;
+                        i1 = oi1;
+                    } else {
+                        m2 = max(m2, om1);
+                    }
+                }
+                if (tid == 0) {
+                    sg_max1[0] = m1;
+                    sg_idx1[0] = i1;
+                    sg_max2[0] = m2;
+                    sg_nan[0] = uint(has_n);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float row_max1 = sg_max1[0];
+            int row_idx1 = sg_idx1[0];
+            float row_max2 = sg_max2[0];
+            bool row_nan = (sg_nan[0] != 0);
+
+            float local_sum = 0.0f;
+            if (!row_nan) {
+                for (uint i = tid; i < V; i += tpg) {
+                    local_sum += metal::exp(float(row_ptr[i]) - row_max1);
+                }
+            }
+            local_sum = simd_sum(local_sum);
+            if (simd_lane == 0) {
+                sg_max1[simd_group] = local_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                float s = (tid < n_simd) ? sg_max1[tid] : 0.0f;
+                s = simd_sum(s);
+                if (tid == 0) {
+                    out_idx[row] = (row_nan || row_idx1 == 0x7fffffff) ? -1 : row_idx1;
+                    out_stats[row * 3 + 0] = row_max1;
+                    out_stats[row * 3 + 1] = row_max2;
+                    out_stats[row * 3 + 2] = row_nan ? NAN : (row_max1 + metal::log(max(s, 1e-30f)));
+                }
+            }
+        """
+        _ARGMAX_CONF_KERNEL = mx.fast.metal_kernel(
+            name="fast_qwen3_argmax_conf_stats",
+            input_names=["x"],
+            output_names=["out_idx", "out_stats"],
+            source=source,
+        )
+    return _ARGMAX_CONF_KERNEL
+
+
+def _get_argmax_nan_kernel() -> Any:
+    global _ARGMAX_NAN_KERNEL
+    if _ARGMAX_NAN_KERNEL is None:
+        source = """
+            uint row = threadgroup_position_in_grid.x;
+            uint tid = thread_index_in_threadgroup;
+            uint tpg = threads_per_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            uint n_simd = (tpg + 31) / 32;
+
+            device const T* row_ptr = x + row * V;
+
+            float local_max1 = -INFINITY;
+            int local_idx1 = 0x7fffffff;
+            bool local_nan = false;
+
+            for (uint i = tid; i < V; i += tpg) {
+                float v = float(row_ptr[i]);
+                if (isnan(v)) {
+                    local_nan = true;
+                } else if (v > local_max1) {
+                    local_max1 = v;
+                    local_idx1 = int(i);
+                }
+            }
+
+            threadgroup float sg_max1[32];
+            threadgroup int sg_idx1[32];
+            threadgroup uint sg_nan[32];
+
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float o_max1 = simd_shuffle_down(local_max1, offset);
+                int o_idx1 = simd_shuffle_down(local_idx1, offset);
+                uint o_nan = simd_shuffle_down(uint(local_nan), offset);
+                local_nan = local_nan || (o_nan != 0);
+                if (o_max1 > local_max1 || (o_max1 == local_max1 && o_idx1 < local_idx1)) {
+                    local_max1 = o_max1;
+                    local_idx1 = o_idx1;
+                }
+            }
+            if (simd_lane == 0) {
+                sg_max1[simd_group] = local_max1;
+                sg_idx1[simd_group] = local_idx1;
+                sg_nan[simd_group] = uint(local_nan);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_group == 0) {
+                float m1 = (tid < n_simd) ? sg_max1[tid] : -INFINITY;
+                int i1 = (tid < n_simd) ? sg_idx1[tid] : 0x7fffffff;
+                bool has_n = (tid < n_simd) ? (sg_nan[tid] != 0) : false;
+                for (uint offset = 16; offset > 0; offset >>= 1) {
+                    float om1 = simd_shuffle_down(m1, offset);
+                    int oi1 = simd_shuffle_down(i1, offset);
+                    uint onan = simd_shuffle_down(uint(has_n), offset);
+                    has_n = has_n || (onan != 0);
+                    if (om1 > m1 || (om1 == m1 && oi1 < i1)) {
+                        m1 = om1;
+                        i1 = oi1;
+                    }
+                }
+                if (tid == 0) {
+                    out_idx[row] = (has_n || i1 == 0x7fffffff) ? -1 : i1;
+                }
+            }
+        """
+        _ARGMAX_NAN_KERNEL = mx.fast.metal_kernel(
+            name="fast_qwen3_argmax_nan",
+            input_names=["x"],
+            output_names=["out_idx"],
+            source=source,
+        )
+    return _ARGMAX_NAN_KERNEL
+
+
+def _can_use_metal_argmax() -> bool:
+    return bool(mx.metal.is_available() and mx.default_device().type == mx.DeviceType.gpu)
+
+
+def gpu_argmax_conf(logits_2d: mx.array) -> tuple[mx.array, mx.array]:
+    """Compute `(top1_idx[rows], stats[rows, 3])` on GPU where `stats=[top1_val, top2_val, lse]` (`-1` on NaN)."""
+    if logits_2d.ndim != 2:
+        raise ValueError(f"Expected 2D logits array, got shape {logits_2d.shape}")
+    rows, vocab_n = int(logits_2d.shape[0]), int(logits_2d.shape[1])
+    if rows == 0:
+        return mx.zeros((0,), dtype=mx.int32), mx.zeros((0, 3), dtype=mx.float32)
+    if vocab_n == 0:
+        return mx.full((rows,), -1, dtype=mx.int32), mx.full((rows, 3), float("nan"), dtype=mx.float32)
+
+    if not _can_use_metal_argmax():
+        arr_f32 = logits_2d.astype(mx.float32)
+        has_nan = mx.any(mx.isnan(arr_f32), axis=-1)
+        top1_idx = mx.argmax(arr_f32, axis=-1).astype(mx.int32)
+        top1_val = mx.max(arr_f32, axis=-1)
+        if vocab_n == 1:
+            top2_val = mx.full((rows,), float("-inf"), dtype=mx.float32)
+        else:
+            col_ids = mx.arange(vocab_n, dtype=mx.int32)[None, :]
+            masked = mx.where(col_ids == top1_idx[:, None], mx.array(float("-inf"), dtype=mx.float32), arr_f32)
+            top2_val = mx.max(masked, axis=-1)
+        lse = mx.logsumexp(arr_f32, axis=-1)
+        idx = mx.where(has_nan, mx.array(-1, dtype=mx.int32), top1_idx)
+        stats = mx.where(has_nan[:, None], mx.array(float("nan"), dtype=mx.float32), mx.stack([top1_val, top2_val, lse], axis=-1))
+        return idx, stats
+
+    x = mx.contiguous(logits_2d)
+    dtype = x.dtype if x.dtype in (mx.bfloat16, mx.float16, mx.float32) else mx.float32
+    if x.dtype != dtype:
+        x = x.astype(dtype)
+    kernel = _get_argmax_conf_kernel()
+    tpg = 512
+    idx, stats = kernel(  # guard: allow-fp32
+        inputs=[x],
+        template=[("T", dtype), ("V", vocab_n)],
+        grid=(rows * tpg, 1, 1),
+        threadgroup=(tpg, 1, 1),
+        output_shapes=[(rows,), (rows, 3)],
+        output_dtypes=[mx.int32, mx.float32],
+    )
+    return idx, stats
+
+
+def gpu_argmax_nan(logits_2d: mx.array) -> mx.array:
+    """Compute `top1_idx[rows]` (`-1` on NaN or empty vocab) without copying logits to CPU."""
+    if logits_2d.ndim != 2:
+        raise ValueError(f"Expected 2D logits array, got shape {logits_2d.shape}")
+    rows, vocab_n = int(logits_2d.shape[0]), int(logits_2d.shape[1])
+    if rows == 0:
+        return mx.zeros((0,), dtype=mx.int32)
+    if vocab_n == 0:
+        return mx.full((rows,), -1, dtype=mx.int32)
+
+    if not _can_use_metal_argmax():
+        arr_f32 = logits_2d.astype(mx.float32)
+        has_nan = mx.any(mx.isnan(arr_f32), axis=-1)
+        top1_idx = mx.argmax(arr_f32, axis=-1).astype(mx.int32)
+        return mx.where(has_nan, mx.array(-1, dtype=mx.int32), top1_idx)
+
+    x = mx.contiguous(logits_2d)
+    dtype = x.dtype if x.dtype in (mx.bfloat16, mx.float16, mx.float32) else mx.float32
+    if x.dtype != dtype:
+        x = x.astype(dtype)
+    kernel = _get_argmax_nan_kernel()
+    tpg = 512
+    (idx,) = kernel(
+        inputs=[x],
+        template=[("T", dtype), ("V", vocab_n)],
+        grid=(rows * tpg, 1, 1),
+        threadgroup=(tpg, 1, 1),
+        output_shapes=[(rows,)],
+        output_dtypes=[mx.int32],
+    )
+    return idx
+
+
+def stats_to_logprob_margin(top1_val: float, top2_val: float, lse: float) -> tuple[float, float]:
+    """Convert `(top1_val, top2_val, lse)` GPU scalars to `(logprob, margin)` matching `_StepConfidenceState`."""
+    if not math.isfinite(top1_val):
+        return -60.0, 0.0
+    lp = min(0.0, top1_val - lse) if math.isfinite(lse) else -60.0
+    margin = (top1_val - top2_val) if top2_val > -1e29 else 0.0
+    return float(lp), float(margin)

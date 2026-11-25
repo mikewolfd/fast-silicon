@@ -188,3 +188,35 @@ Following Sections 5–7, additional landed runtime optimizations and Category 5
 4. **3-Branch Category 5 Gov-Doc Corpus (`configs/outcome_benchmarks.lock.json` `24` Datasets + `us_gov_ocr`):**
    - Integrated `vrdu_ad_buy`, `vrdu_registration`, `doclaynet_gov`, opt-in `puredocbench_legal_gov` (`453` `03_legal_gov` images staged on Base M5 across `clean`/`digital`/`real`; `72/72` EN resolved), and 8-source `us_gov_ocr` (`PLAW`, `BILLS`, `USCODE`, `FR` `<GPOTABLE>`, `BUDGET` `.xlsx`, `USCOURTS`, `scotus_opinions`, auto-staged LoC `btp-data`).
    - On `US-Gov-OCR(27)`, `public-pypdfium2` scored `1.0` on single-column `uscourts`/`scotus` yet `0.2979` overall (`0.0` `table_teds`), whereas `fast-ocr` (`AutoOCRPipeline` with repaired opt-in `region_routing`) reached **`0.6065` overall** (`0.6054` `table_teds`, **`0.9707` `govinfo_uscourts`**). See [`OCR_BENCHMARKS_AND_BASELINES.md`](OCR_BENCHMARKS_AND_BASELINES.md) and [`docs/BENCHMARKS.md#14`](../../../docs/BENCHMARKS.md#14-v30-vision-prefetch-nax-meta-only-packing-multimodal-mtp-and-ocr-confidence-2026-11-23).
+
+---
+
+## 9. 2026-11-25 `OvisOCR2` Hardware-Optimization Campaign (`A1 + B1 + B2`)
+
+Five parallel M4 Pro optimization streams evaluated zero-regression speedups on `mlx-community/OvisOCR2-8bit`:
+
+1. **Promoted & Integrated (`fast-qwen3` + `fast-ocr`):**
+   - **A1 (GPU SIMD Argmax + Scalar Confidence):** `gpu_argmax_nan` and `gpu_argmax_conf` in `fast_qwen3.kernels` compute top-1 index, top-2 value, and `logsumexp` directly on GPU (`-1` on NaN, with CPU fallback and lazy single-row pull for grammars/loop-breaker/temperature). Delivered `0/46` token diffs (`<= 8e-6` logprob diff, `0.0` margin diff) and `+6.5%` to `+12.8%` `B=1` full-page decode speedup (`olmOCR(8)` / `OmniDoc(6)`).
+   - **B1 (Batched Speculative PLD, `B=2..8 x K=4`):** `rollback_gdn_batched` freezes finished/mismatching slots zero-GEMM via `gdn_delta_update(..., mask=...)` across `fp32`/`bf16`/`int8_blk32`, paired with `scatter_kv_and_rewind` for contiguous BF16 and quantized `_qcache` (`q8`/`q4_quarot`) KV buffers. Delivered `0/4` token diffs vs `B=1` PLD (`FinTabNet(4)` `TEDS=0.969005`), `4.76x` `olmOCR(8)` decode vs static `B=16` AR, and `2.03x` `FinTabNet(16)` `pp/s` vs `B=1` PLD.
+   - **B2 (Continuous Rolling Multimodal Batching, `rolling_B=8_PLD`):** `rolling_multimodal_generate` in `fast_qwen3.multimodal_rolling` replaces finished slots immediately via `B=1` prefill + `scatter_single_item_cache_into_slot` and compacts active tail rows once queued work drains (`FastOvisOCREngine.ocr_images` enables this automatically via `rolling="auto"` on eligible greedy unconstrained batches).
+
+2. **Quiescent Stacked Before-vs-After Receipts (`mlx-community/OvisOCR2-8bit`, M4 Pro 48 GB):**
+
+| Suite | Config | Wall (s) | Pages/s | Decode tok/s | Peak RAM (GB) | Accuracy | Loops |
+|---|---|---:|---:|---:|---:|---|---:|
+| `FinTabNet-OTSL(30)` | Before: static `B=16` AR | 24.00 | 1.2502 | 681.98 | 3.658 | `TEDS 0.8937` / `NumF1 0.8829` | 0 |
+| `FinTabNet-OTSL(30)` | After: `B=16` (`rolling_B=8` PLD+A1) | 24.60 | 1.2193 | 668.01 | **2.434 (-33.5%)** | **`TEDS 0.9020`** / **`NumF1 0.8888`** | 0 |
+| `Mixed(8 FTN + 8 OmniDoc)` | Before: static `B=16` AR (`5` waves) | 84.88 | 0.1885 | 225.18 | 2.972 | `FTN 0.9143` / `OmniDoc 0.8073` | 0 |
+| `Mixed(8 FTN + 8 OmniDoc)` | After: `B=16` (`rolling_B=8` PLD+A1, `1` wave) | **57.02** | **0.2806 (1.49x)** | **359.26 (1.60x)** | **2.908 (-2.2%)** | `FTN 0.9145` / `OmniDoc 0.8073` | 0 |
+| `OmniDocBench-EN(12)` | Before: static `B=16` AR | 84.38 | 0.1422 | 290.52 | 3.414 | `OmniDoc 0.8160` (`table 0.8773`) | 0 |
+| `OmniDocBench-EN(12)` | After: `B=16` (`rolling_B=8` PLD+A1) | **66.63** | **0.1801 (1.27x)** | **393.82 (1.36x)** | **2.955 (-13.4%)** | `OmniDoc 0.8158` (`table 0.8772`) | 0 |
+| `olmOCR-bench(16)` | After: `B=16` (`rolling_B=8` PLD+A1) | 237.33 | 0.0674 | 198.87 | **4.548** | `overall 0.6993` (`no_hf 0.7682`) | 0 |
+| `olmOCR-bench(16)` | After: `B=1` (PLD+A1) | **186.42** | **0.0858** | **331.94** | 4.927 | `overall 0.6993` (`no_hf 0.7682`) | 0 |
+
+3. **Evaluated & Killed (Not Shipped):**
+   - **A2 (Vision-seeded dynamic `lm_head` slicing, `140K -> ~18.5K`):** Collapsed `olmOCR(8)` (`0.7103 -> 0.4836`) and `OmniDoc(6)` (`0.8651 -> 0.4934`) by omitting LaTeX/HTML tokens.
+   - **C (`OptiQ-4bit`, `4-bit` MLP/GDN/embed + `8-bit` self_attn, `BF16` ViT):** Passed accuracy and cut peak RAM `-0.4` to `-0.8 GB`, but quiescent speedups (`1.07x-1.20x` decode / `1.05x-1.16x` wall) fell below the `>= 1.25x` gate; `4-bit self_attn` regressed accuracy (`OmniDoc 0.826 -> 0.786`).
+   - **D1 (`FP16` ViT + native RoPE):** Missed cosine floor (`min_cos=0.9980 < 0.9995`), slowed M4 Pro ViT (`1.008x-1.038x`), and dropped `FTN` TEDS `-0.005`.
+   - **D2 (Zero-training early-layer windowed ViT):** Dropped `FTN` TEDS `-0.0218` (`rowband`) and `-0.0968` (`block_16x16`).
+   - **D3 (Default-on digital-PDF table splice):** Triggered `splice_tables` on `0/42` `olmOCR` and `0/27` `US-Gov` PDFs (`1.001x-1.004x` wall).
+   - **E1 / E2 (`GFM` prompt / `r=8` table-only LoRA):** Model ignored `DEFAULT_GFM_STRICT_PROMPT` (`28/30` HTML, `-0.0649` TEDS); table-only LoRA achieved `30/30` GFM (`1.435x` fewer tokens) but broke prose/layout (`OmniDoc(8) 0.8262 -> 0.6800`) and slowed unmerged `B=16` decode (`71.4 -> 25.85 tok/s`).

@@ -29,7 +29,15 @@ from fast_shared.kv_quant import KVMode
 from fast_shared.qwen35_vision import compute_mrope_positions, precompute_mrope_trig
 from fast_shared.vision_preprocess import QwenVisionInputs, build_qwen_vision_inputs, load_image
 
+from .kernels import gpu_argmax_nan
 from .model import DeltaSlotCache, GrowingKVCache, compact_hybrid_cache
+from .multimodal_rolling import (
+    build_ragged_attn_mask,
+    rollback_gdn_batched,
+    rolling_multimodal_generate,
+    scatter_kv_and_rewind,
+    scatter_single_item_cache_into_slot,
+)
 
 
 def host_phys_memory_gb() -> float:
@@ -300,6 +308,9 @@ class BatchedMMItemResult:
     image_grids: list[tuple[int, int, int]] = field(default_factory=list)
     telemetry: list[dict[str, float]] | None = None
     dropped_visual_tokens: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    verify_passes: int = 0
 
 
 def batched_multimodal_generate(
@@ -314,6 +325,11 @@ def batched_multimodal_generate(
     old_to_new: np.ndarray | None,
     grammars: Sequence[GrammarHelper | None],
     table_grammars: Sequence[Any | None] | None = None,
+    drafters: Sequence[Any | None] | None = None,
+    spec_modes: Sequence[str] | None = None,
+    draft_k: int = 4,
+    rolling: bool | str = False,
+    rolling_max_batch_size: int = 8,
     max_tokens: int = 512,
     temperature: float = 0.0,
     top_p: float = 1.0,
@@ -337,7 +353,7 @@ def batched_multimodal_generate(
     prefill_chunk_size: int = 512,
     mrope_section: tuple[int, int, int] | None = None,
 ) -> tuple[list[BatchedMMItemResult], dict[str, Any]]:
-    """Run grid-bucketed ViT + 3D MRoPE chunked prefill + active-compacted decode over mixed items."""
+    """Run grid-bucketed ViT + 3D MRoPE chunked prefill + active-compacted or rolling decode."""
     n_items = len(images_per_item)
     if n_items == 0:
         return [], {
@@ -348,6 +364,48 @@ def batched_multimodal_generate(
             "decode_ms": 0.0,
             "dropped_visual_tokens": 0,
         }
+
+    rolling_req = rolling is True or (isinstance(rolling, str) and rolling.strip().lower() == "auto")
+    rolling_ok = (
+        rolling_req
+        and n_items >= 2
+        and float(temperature) <= 0.0
+        and not repeat_penalty
+        and not collect_telemetry
+        and not drop_white_patches
+        and all(g is None for g in grammars)
+        and (table_grammars is None or all(tg is None for tg in table_grammars))
+    )
+    if rolling_ok:
+        use_pld_rolling = drafters is not None and any(d is not None for d in drafters)
+        return rolling_multimodal_generate(
+            lm=lm,
+            vision_model=vision_model,
+            tokenizer=tokenizer,
+            images_per_item=images_per_item,
+            prompt_builder=prompt_builder,
+            image_token_id=image_token_id,
+            new_to_old=new_to_old,
+            drafters=drafters,
+            spec_modes=spec_modes,
+            draft_k=draft_k,
+            use_pld=use_pld_rolling,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            rolling_max_batch_size=rolling_max_batch_size,
+            kv_step=kv_step,
+            kv_i8_resolver=kv_i8_resolver,
+            gdn_state_mode=gdn_state_mode,
+            stop_ids=stop_ids,
+            pad_token_id=pad_token_id,
+            prefill_chunk_size=prefill_chunk_size,
+            mrope_section=mrope_section,
+            compact_tail=compact_active,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            min_pixels_per_item=min_pixels_per_item,
+            max_pixels_per_item=max_pixels_per_item,
+        )
 
     if min_pixels_per_item is not None and len(min_pixels_per_item) != n_items:
         raise ValueError(f"Expected {n_items} min_pixels_per_item entries, got {len(min_pixels_per_item)}")
@@ -677,7 +735,58 @@ def batched_multimodal_generate(
 
         cur_h = mx.stack([slot_cur_h[b_i] for b_i in range(b_sz)], axis=0)  # type: ignore[misc]
         logits0 = lm.project_logits(cur_h[:, None, :])[:, 0, :]
-        mx.eval(cur_h, logits0)  # guard: allow-eval
+        live_rows = list(range(b_sz))
+        vocab_remap = getattr(lm, "vocab_remap", None)
+        vocab_n_len = len(new_to_old)
+
+        def _extract_greedy_or_logits(
+            logits_2d: mx.array,
+            target_r: list[int],
+        ) -> tuple[dict[int, int], dict[int, np.ndarray]]:
+            rows_tok: dict[int, int] = {}
+            rows_np: dict[int, np.ndarray] = {}
+            if not target_r:
+                return rows_tok, rows_np
+            can_gpu = (
+                isinstance(logits_2d, mx.array)
+                and float(temperature) <= 0.0
+                and not repeat_penalty
+                and not collect_telemetry
+                and all(
+                    matchers_all[wave[live_rows[r]][0]] is None
+                    and (
+                        tgrams_all[wave[live_rows[r]][0]] is None
+                        or not getattr(tgrams_all[wave[live_rows[r]][0]], "is_active", False)
+                    )
+                    for r in target_r
+                )
+            )
+            if can_gpu:
+                l_slice = (
+                    logits_2d[:, :vocab_n_len]
+                    if (vocab_remap is None and int(logits_2d.shape[-1]) > vocab_n_len)
+                    else logits_2d
+                )
+                idx_mx = gpu_argmax_nan(l_slice)
+                mx.eval(cur_h, idx_mx)  # guard: allow-eval
+                idxs = idx_mx.tolist()  # guard: allow-sync
+                for pos, r in enumerate(target_r):
+                    top1 = int(idxs[pos])
+                    if 0 <= top1 < vocab_n_len:
+                        rows_tok[r] = int(new_to_old[top1])
+                    else:
+                        row_f32 = l_slice[pos].astype(mx.float32)
+                        mx.eval(row_f32)  # guard: allow-eval
+                        rows_np[r] = np.asarray(row_f32)  # guard: allow-sync
+                return rows_tok, rows_np
+
+            mx.eval(cur_h, logits_2d)  # guard: allow-eval
+            arr = np.asarray(logits_2d.astype(mx.float32))  # guard: allow-sync
+            for pos, r in enumerate(target_r):
+                rows_np[r] = arr[pos]
+            return rows_tok, rows_np
+
+        cur_tok_map, cur_logits_map = _extract_greedy_or_logits(logits0, list(range(b_sz)))
         mx.synchronize()
         pf_ms_w = (time.perf_counter() - t_pf0) * 1000.0
         pf_ms_total += pf_ms_w
@@ -689,11 +798,8 @@ def batched_multimodal_generate(
         t_dec0 = time.perf_counter()
         done_w = [False] * b_sz
         pending_q: list[list[int]] = [[] for _ in range(b_sz)]
-        arr_logits0 = np.asarray(logits0.astype(mx.float32))
-        cur_logits_map: dict[int, np.ndarray] = {b_i: arr_logits0[b_i] for b_i in range(b_sz)}
         true_pos = [len(r[1]) + int(r[3]) for r in wave]
         kv_cursor = max_s
-        live_rows = list(range(b_sz))
         any_ragged_live = any_ragged
         suf_end_arr = (
             mx.array([prompt_lens[w_i] for w_i in live_rows], dtype=mx.int32)[:, None, None, None]
@@ -701,7 +807,12 @@ def batched_multimodal_generate(
             else None
         )
 
-        def _advance_slot_token(w_i: int, logits_1d: np.ndarray, h_1d: mx.array) -> None:
+        def _advance_slot_token(
+            w_i: int,
+            logits_1d: np.ndarray | None,
+            h_1d: mx.array,
+            fast_tok: int | None = None,
+        ) -> None:
             orig_i = wave[w_i][0]
             m_i = matchers_all[orig_i]
             g_i = grammars[orig_i]
@@ -714,24 +825,29 @@ def batched_multimodal_generate(
                 done_w[w_i] = True
                 return
 
-            tid, tel = select_next_token_1d(
-                logits_1d,
-                lm=lm,
-                new_to_old=new_to_old,
-                old_to_new=old_to_new,
-                stop_token_ids=stop_ids,
-                vocab_size=vocab_size,
-                full_hidden_1d=h_1d,
-                matcher=m_i,
-                gram=g_i,
-                table_gram=tg_i,
-                recent_tokens=ans_all[orig_i],
-                temperature=temperature,
-                top_p=top_p,
-                rng=rngs_all[orig_i],
-                repeat_penalty=repeat_penalty,
-                collect_telemetry=collect_telemetry,
-            )
+            if fast_tok is not None:
+                tid = int(fast_tok)
+                tel = None
+            else:
+                assert logits_1d is not None
+                tid, tel = select_next_token_1d(
+                    logits_1d,
+                    lm=lm,
+                    new_to_old=new_to_old,
+                    old_to_new=old_to_new,
+                    stop_token_ids=stop_ids,
+                    vocab_size=vocab_size,
+                    full_hidden_1d=h_1d,
+                    matcher=m_i,
+                    gram=g_i,
+                    table_gram=tg_i,
+                    recent_tokens=ans_all[orig_i],
+                    temperature=temperature,
+                    top_p=top_p,
+                    rng=rngs_all[orig_i],
+                    repeat_penalty=repeat_penalty,
+                    collect_telemetry=collect_telemetry,
+                )
             if tel is not None and tels_all[orig_i] is not None:
                 tels_all[orig_i].append(tel)  # type: ignore[union-attr]
             if tid in stop_ids:
@@ -793,7 +909,12 @@ def batched_multimodal_generate(
                 r for r, w_i in enumerate(live_rows) if not done_w[w_i] and not pending_q[w_i]
             ]
             for r in need_sample_r:
-                _advance_slot_token(live_rows[r], cur_logits_map[r], cur_h[r])
+                _advance_slot_token(
+                    live_rows[r],
+                    cur_logits_map.get(r),
+                    cur_h[r],
+                    fast_tok=cur_tok_map.get(r),
+                )
 
             alive_r = [
                 r for r, w_i in enumerate(live_rows) if not done_w[w_i] and pending_q[w_i]
@@ -868,21 +989,18 @@ def batched_multimodal_generate(
             need_next_r = [
                 r for r, w_i in enumerate(live_rows) if not done_w[w_i] and not pending_q[w_i]
             ]
+            cur_tok_map = {}
             cur_logits_map = {}
             if not need_next_r:
                 mx.eval(cur_h)  # guard: allow-eval
             elif len(need_next_r) == cur_b:
                 sl_all = lm.project_logits(cur_h[:, None, :])[:, 0, :]
-                mx.eval(cur_h, sl_all)  # guard: allow-eval
-                arr_all = np.asarray(sl_all.astype(mx.float32))
-                cur_logits_map = {r: arr_all[r] for r in range(cur_b)}
+                cur_tok_map, cur_logits_map = _extract_greedy_or_logits(sl_all, need_next_r)
             else:
                 idx_mx = mx.array(need_next_r, dtype=mx.int32)
                 sub_h = mx.take(cur_h, idx_mx, axis=0)[:, None, :]
                 sl_sub = lm.project_logits(sub_h)[:, 0, :]
-                mx.eval(cur_h, sl_sub)  # guard: allow-eval
-                arr_sub = np.asarray(sl_sub.astype(mx.float32))
-                cur_logits_map = {r: arr_sub[pos] for pos, r in enumerate(need_next_r)}
+                cur_tok_map, cur_logits_map = _extract_greedy_or_logits(sl_sub, need_next_r)
 
             for w_i in live_rows:
                 if not done_w[w_i]:
@@ -929,10 +1047,15 @@ def batched_multimodal_generate(
 __all__ = [
     "BatchedMMItemResult",
     "batched_multimodal_generate",
+    "build_ragged_attn_mask",
     "compute_safe_white_patch_keep_mask",
     "compute_step_telemetry",
     "default_wave_token_budget",
     "host_phys_memory_gb",
     "pack_length_waves",
+    "rollback_gdn_batched",
+    "rolling_multimodal_generate",
+    "scatter_kv_and_rewind",
+    "scatter_single_item_cache_into_slot",
     "select_next_token_1d",
 ]

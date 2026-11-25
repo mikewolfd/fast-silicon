@@ -67,10 +67,12 @@ test-cpu: hw-check
 		packages/fast-qwen3/tests/test_fast_qwen3_cpu.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_gdn_state_cpu.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_rolling_cpu.py \
+		packages/fast-qwen3/tests/test_fast_qwen3_multimodal_rolling_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_regions_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_whitepatch_vocab_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_confidence_splice_cpu.py \
+		packages/fast-ocr/tests/test_fast_ocr_gpu_argmax_rolling_cpu.py \
 		packages/fast-gemma4/tests/test_per_doc_grammar.py \
 		packages/fast-gemma4/tests/test_packager_cpu.py \
 		packages/fast-gemma4/tests/test_tier1_cpu.py \
