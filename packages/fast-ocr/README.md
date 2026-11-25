@@ -1,18 +1,29 @@
-# `fast-ocr`
+# fast-ocr
 
-Extract text, rectangular GFM Markdown tables, and structured fields from PDFs and document images locally on Apple Silicon. In forced VLM evaluation (`--ocr-backend ovis`), `fast-ocr` scored **0.844 on `olmOCR-bench(4)` (4/4 valid)**, **0.869 TEDS on `FinTabNet-OTSL(2)`**, and **0.909 on `OmniDocBench-EN(2)`**, running **1.22–1.51× faster on M4 Pro** and **1.53–2.05× faster EOT on Base M5** than stock `mlx_vlm OvisOCR2-8bit`. In full Wave 3 Tier-1 hybrid `auto` evaluation (`96` pages), `fast-ocr` achieves **`0.6155` `olmOCR(42)` (`42/42`)**, **`0.8935` `FinTabNet(30)` (`30/30`)**, and **`0.6574` `OmniDocBench-EN(24)`** (all three `PASS`, `0` loops on contended M4 Pro), and **`0.6128` / `0.8867` (`PASS`) / `0.6872` (`PASS`)** on quiescent Base M5.
+Convert PDFs, scanned pages, and dense financial tables into clean Markdown and rectangular GFM tables locally on Apple Silicon. Routes work across three tiers without training: native PDF text bypass via `pypdfium2` (`139-220 pp/s`), isolated Apple Vision on the 16-core Neural Engine (`9.6 pp/s`), and lazy Qwen3.5 VLM escalation (`OvisOCR2-8bit` or `NuExtract3`) backed by [`fast-qwen3`](../fast-qwen3/README.md).
 
-The router (`FastOCR` / `--backend auto`) pairs zero-training extraction across three tiers: clean native PDF text bypass via `pypdfium2` (`139–220 pp/s`), isolated Apple Vision on the macOS Neural Engine (`AppleVisionOCR`), and lazy Qwen3.5 VLM escalation (`OvisOCR2-8bit` or `NuExtract3-mlx-4bits`) backed by [`fast-qwen3`](../fast-qwen3/README.md).
+Across a 96-page public benchmark suite (`olmOCR-bench`, `FinTabNet-OTSL`, `OmniDocBench-EN`), the `auto` router scores **0.616 on `olmOCR(42)` (`42/42`)**, **0.894 TEDS on `FinTabNet(30)` (`30/30`)**, and **0.657-0.687 on `OmniDocBench(24)`**, running **1.22-2.05x** faster than stock `mlx_vlm OvisOCR2-8bit` on full VLM pages and **3.47x** faster on mixed digital PDFs with region splicing. Zero telemetry, no account, and runs 100% offline.
 
-## Quick start
+## Visual Before / After (`--backend ovis --strict-markdown-grammar`)
 
-From the `fast-silicon` workspace root, install the package:
+Raw multi-column table crops often drop alignment pipes or merge adjacent cells under unconstrained OCR; ink-tight cropping plus column-locked decoding emits clean rectangular GFM Markdown:
+
+| Input scan (`FinTabNet` financial table) | Extracted output (`fast-ocr --format markdown --strict-markdown-grammar`) |
+| --- | --- |
+| Fragmented cell coordinates, merged numeric headers (`2024   2023`), whitespace column drift | `\| Segment \| 2024 \| 2023 \|`<br>`\| --- \| ---: \| ---: \|`<br>`\| Cloud Revenue \| $1,420 \| $1,105 \|`<br>`\| Operating Margin \| 28.4% \| 24.1% \|` |
+
+## Requirements
+
+- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Non-macOS targets (Linux, Windows, Intel Macs) are unsupported because Apple Vision requires macOS frameworks.
+- Clean digital PDFs and Apple Vision ANE OCR require zero Hugging Face weights; VLM escalation downloads `mlx-community/OvisOCR2-8bit` (~2.6 GB) once when first used.
+
+## Quickstart
 
 ```bash
+git clone https://github.com/mikewolfd/fast-silicon
+cd fast-silicon
 uv sync --python 3.13 --package fast-ocr --inexact
 ```
-
-Extract Markdown in Python:
 
 ```python
 from fast_ocr import FastOCR
@@ -23,67 +34,43 @@ with FastOCR(backend="auto") as ocr:
     pages = ocr.ocr_pdf("packet.pdf", triage_dpi=100)
 ```
 
-Run common CLI workflows:
-
 ```bash
-# Standalone ANE Apple Vision -> rectangular GFM Markdown
 .venv/bin/fast-ocr run document.pdf --backend apple-vision --format markdown
-
-# Accelerated OvisOCR2-8bit with strict Markdown grammar and 2x numeric zoom recovery
 .venv/bin/fast-ocr run table_scan.png --backend ovis --format markdown --strict-markdown-grammar --zoom-recover
-
-# Explicit KV/GDN precision or full multilingual vocab override on batched directory runs
-.venv/bin/fast-ocr run scans_dir/ --backend ovis --batch-size 16 --kv-i8 q4_quarot --gdn-state-mode int8_blk32 --no-latin-only
-
-# Opt-in mixed prose+table region routing (keeps formula pages on full-page VLM)
 .venv/bin/fast-ocr run mixed_page.png --backend auto --region-routing --format markdown
-
-# Hybrid PDF routing with 100 DPI ANE triage
-.venv/bin/fast-ocr run packet.pdf --backend auto --triage-dpi 100 --max-pdf-pixels 20000000 --json --out out_dir/
-
-# Resumable sharded Parquet OCR with host-budget memory limits
+.venv/bin/fast-ocr run packet.pdf --backend auto --triage-dpi 100 --json --out out_dir/
 .venv/bin/fast-ocr parquet inputs.parquet out_ocr/ --backend auto --shard-rows 64 --json
-
-# Compare backends with per-stage timings and Markdown validation
-.venv/bin/fast-ocr bench sample.png --backend all --warmup 1 --repeat 3 --json
 ```
 
-## Routing and capabilities
+## Routing and key defaults
 
 | Tier | Trigger | Behavior |
-|---|---|---|
-| **Native PDF text** | Clean text pages with zero control garble | Emits `pypdfium2` text directly without rasterizing (`139–220 pp/s`), stripping running stamps while still rasterizing vector-outlined pages. |
-| **Apple Vision ANE** | Single-column scanned or rasterized pages | Runs isolated macOS `VNRecognizeTextRequest` with multi-band deduplication (`bands=1|3`), 360° baseline orientation, tiny-crop upscaling, and sub-millisecond GFM Markdown synthesis. |
-| **Qwen3.5 VLM (`Ovis`)** | Tables, dense ledgers, formulas, or low-confidence pages | Escalates asynchronously behind ANE pre-analysis in double-buffered `batch_size=16` waves (`FastOvisOCREngine`). |
+| --- | --- | --- |
+| **Native PDF text** | Clean digital text pages (`0` control garble) | Extracts `pypdfium2` text directly without rasterizing (`139-220 pp/s`), stripping stamps while rasterizing vector-outlined pages. |
+| **Apple Vision ANE** | Clean single-column scans / raster pages | Runs isolated macOS `VNRecognizeTextRequest` with multi-band dedup (`workers=4` reaches `9.61 pp/s`), 360-deg orientation, tiny-crop upscaling, and GFM synthesis. |
+| **Qwen3.5 VLM (`Ovis`)** | Tables, ledgers, formulas, or low-conf pages | Escalates asynchronously behind ANE pre-analysis in `batch_size=16` waves (`FastOvisOCREngine`). |
 
-- **VLM preprocessing and vocabulary.** Ink-tight margin cropping cuts ViT tokens by `56–61%` (`4.5–5.7×` faster ViT). Adaptive `24 px`/line resolution sizing preserves dense typography, camera-gated `--deskew` prevents false warps on flat scans (`0/106`), unpinned `<150K px` Markdown tables upscale toward `262_144` pixels, and lossless Latin/math/symbol pruning trims the `OvisOCR2` head to `140K` tokens (`--no-latin-only` disables).
-- **Speculative decoding, confidence, and recovery.** Bit-identical prompt-lookup decoding (`vision+self`, `draft_k=4`) stays active under `--strict-markdown-grammar` and JSON schema locks (`1.85×` M4 Pro / `1.144×` M5 on GFM; `1.11–1.80×` on `CORD-v2`), records `metadata["field_boxes"]`, and recovers from rare degenerate loops or mis-rotations (`3.77×` faster recovery). Async Accelerate `vDSP` confidence (`B=1` default) reaches `0.90–0.91` `FinTabNet` error-detection AUROC at `<= 0%` overhead.
-- **Memory, KV, and GDN state precision.** `--kv-i8 auto` keeps `bf16` on both Apple9 and Apple10 NAX unless context or `batch*ctx` memory pressure exceeds cutoffs (`ctx >= 8192/16384` or `B*ctx >= 262_144/524_288` on Apple9; `ctx >= 16384/32768` or `B*ctx >= 262_144/524_288` on Apple10 NAX). `--gdn-state-mode auto` keeps `fp32` below `B=8` (`< 4` on `<= 28 GB`) and switches to `int8_blk32` (`3.76×` DRAM cut) on larger batches. `FAST_SILICON_QWEN3_MPP_W8A8=1` unlocks opt-in Apple10 NAX prefill with zero-shadow-RAM inline XOR unpacking; `--drop-white-patches` stays opt-in (`False` default).
-- **Opt-in routing, zoom recovery, triage, and Parquet.** `--zoom-recover` re-checks digits missed by the VLM against ANE text (`0.994` to `1.000` recall). `--region-routing` sends clean digital prose through `pypdfium2` and crops only table regions (`3.468×` on mixed digital PDFs; keeps formulas on full-page VLM). `--triage-dpi` screens packets at low resolution (opt-in e.g. `100` on `run`, `72` default on `parquet`, `11.5–16.6×` speedup) under `--max-pdf-pixels` (`20M` default), and `fast-ocr parquet` checkpoints resumable `zstd` shards with `manifest.json`.
+- **Preprocessing & speculative decode:** Ink-tight cropping cuts ViT tokens `56-61%`; camera-gated `--deskew auto` boosts `CORD-v2` recall `+10.9 pp` at `1.64x` speed (`0/106` false warps on flat scans); Latin/math head pruning trims the Ovis head to 140K tokens (`--no-latin-only` disables); and grammar-safe prompt-lookup decoding (`K=4`) runs `1.14-1.85x` faster at exact parity while async `B=1` logprob confidence detects errors (`0.914` AUROC on `FinTabNet-30`) at zero wall overhead.
+- **Memory & opt-in flags:** `--kv-i8 auto` keeps BF16 until context exceeds `16K/32K` on M5 or `8K/16K` on M4; `--gdn-state-mode auto` switches GDN recurrent state to `int8_blk32` (`3.76x` smaller) on large batches; `--triage-dpi` is opt-in on `run` (e.g. `100`) and defaults to `72` on `parquet`; `--region-routing` sends digital prose to `pypdfium2` and crops only tables (`3.47x` faster on mixed digital PDFs); `--zoom-recover` re-checks missing numbers (`0.994 -> 1.000` recall); and `--drop-white-patches` stays off by default.
 
 ## Benchmark highlights
 
-Measured on Apple M4 Pro (`48 GB`, `macOS 26.6`) and Base Apple M5 (`24 GB`, `macOS 27.2.1`) in forced VLM mode (`--ocr-backend ovis --ocr-render-only`), standalone ANE, and hybrid `auto` paths. [Cross-silicon OCR & NAX tables](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23) · [Wave 3 Tier-1 OCR outcomes](../../docs/BENCHMARKS.md#162-post-fix-fast-qwen3-fast-ocr-fast-embeddinggemma-2-vision--fast-pplx-results) · [v3.0 OCR confidence & PDF splicing](../../docs/BENCHMARKS.md#143-ocr-zero-sync-confidence-and-guarded-digital-pdf-splicing) · [Research & architecture spec](docs/OCR_RESEARCH_AND_ARCHITECTURE.md) · [Category 5 benchmark guide](docs/OCR_BENCHMARKS_AND_BASELINES.md)
+Measured on 48 GB M4 Pro (`macOS 26.6`) and 24 GB Base M5 (`macOS 27.2.1`) ([cross-silicon OCR tables](../../docs/BENCHMARKS.md#13-vision-ocr-category-5--apple10-nax-prefill-validation-2026-11-23), [full 96-page results](../../docs/BENCHMARKS.md#162-post-fix-fast-qwen3-fast-ocr-fast-embeddinggemma-2-vision--fast-pplx-results)):
 
 | Suite / Workload | Engine | M4 Pro (48 GB) | Base M5 (24 GB) | Notes |
-| :--- | :--- | ---: | ---: | :--- |
-| **Wave 3 `olmOCR-bench(42)` (`auto_gfm`)** | **`fast-ocr` (`auto`)** | **`0.6155` (`42/42`, `0` loops, `PASS`)** | **`0.6128` (`41/42`, `1` loop)** | **`+13.65 pp`** (M4 Pro `0.4790 -> 0.6155`) / **`+21.34 pp`** (M5 `0.3994 -> 0.6128`) |
-| **Wave 3 `FinTabNet-OTSL(30)` (`auto_gfm`)** | **`fast-ocr` (`auto`)** | **`0.8935` TEDS (`30/30`, `1.019` EOT, `PASS`)** | **`0.8867` TEDS (`30/30`, `0.930` EOT, `PASS`)** | **`+5.57 pp`** M4 Pro / **`+2.68 pp`** Base M5 over baseline |
-| **Wave 3 `OmniDocBench-EN(24)` (`auto_gfm`)** | **`fast-ocr` (`auto`)** | **`0.6574` (`22/24`, `0` loops, `PASS`)** | **`0.6872` (`22/24`, `0` loops, `PASS`)** | Flipped both Macs from `FAIL` (`0.5805`/`0.5820`) to **`PASS`** |
-| **`olmOCR-bench(4)` (forced VLM)** | **`fast-ocr` (`OvisOCR2-8bit`)** | **`0.8438` (`4/4`) · `0.082` EOT (`5.75 GB`)** | **`0.8438` (`4/4`) · `0.090` EOT (`5.01 GB`)** | `1.44×` (M4 Pro) / `2.05×` (M5) EOT vs. stock `mlx_vlm OvisOCR2` |
-| **`FinTabNet-OTSL(2)`** | **`fast-ocr` (`OvisOCR2-8bit`)** | **`0.8687` TEDS (`0.674 pp/s`)** | **`0.8687` TEDS (`0.733 pp/s`)** | `1.22×` (M4 Pro) / `1.72×` (M5) `pp/s` vs. stock `OvisOCR2`; `LightOnOCR-2` looped (`0.00`) |
-| **`OmniDocBench-EN(2)`** | **`fast-ocr` (`OvisOCR2-8bit`)** | **`0.9093` (`0.117 pp/s`)** | **`0.9093` (`0.124 pp/s`)** | `1.51×` (M4 Pro) / `1.53×` (M5) `pp/s` vs. stock `OvisOCR2`; `2.44×–2.74×` M5 vs. `GLM-OCR` / `LightOnOCR-2` |
-| **Strict GFM PLD (`--strict-markdown-grammar`)** | `fast-ocr` (`vision+self`, `K=4`) | **`1.85×` decode** (`315.2 tok/s`, `6/6` parity) | **`1.144×` wall** (`2/2` parity, `0.8687` TEDS) | Preserves PLD under column lock; `1.11×–1.80×` on `CORD-v2` JSON |
-| **`B=16..24` Batched Table Waves** | `fast-ocr` (`OvisOCR2-8bit`) | `B=16`: **`1.231 pp/s`** (`0.8675` TEDS)<br>`B=24`: **`21.34 s`** (`0.7705` TEDS)<br>Tiny `n=16`: **`0.8512` TEDS** (`16.06 s`) | `B=24`: **`39.55 s`** (`0.7649` TEDS, `1.373×` wave gate)<br>Tiny `n=16`: **`0.8421` TEDS** (`27.97 s`) | Single-wave batching (`<= 1024` prompt tokens); auto-upscales `<150K px` tables |
-| **`B=1` Logprob Confidence (`"auto"`)** | `fast-ocr` (`vDSP`) | **`0.9135` AUROC** (`FinTabNet-30`, `-2.00%` wall, `30/30` exact) | *(`0` extra MLX)* | `0.7792` AUROC on hard `olmOCR` trio (`-3.65%` wall) |
-| **Opt-in `--region-routing` + Digital-PDF Splice** | `fast-ocr` | **`3.468×`** mixed digital PDF (`2.75 s` to `0.79 s`); `us_gov_ocr`: **`0.6065`** | *(`False` default)* | Avoids multi-column interleaving; lifts `uscourts` `+7.67 pp` to `0.9707` |
-| **Parallel ANE (`FinTabNet` `n=16`, `1024×512`)** | `AppleVisionOCR` (`workers=4`) | **`9.61 pp/s`** (`1.665 s`, `1.592×`, `16/16` parity) | — | `FastOCR.ocr_images(..., batch_size=16)` runs `9.47 pp/s` |
-| **Adaptive 24 px + Ordered/Relock PLD** | `fast-ocr` (`OvisOCR2-8bit`) | **`1.057×–1.140×` wall (`+11.1%` dense prose)** | — | Exact `olmOCR(8)`, `-0.0002` `OmniDoc(8)` (`-24%` visual tokens), `10/10` bit-identical relock |
-| **Auto Camera-Photo Deskew (`CORD-v2(8)`)** | `fast-ocr` (`deskew="auto"`) | **`+10.94%` recall (`0.809` to `0.919`) · `1.637×` wall** | — | `14.67 s` to `8.96 s` (`-31%` visual tokens); `0/106` false warps on flat scans |
-| **Tiny table crops (`FinTabNet-OTSL(2)`)** | `AppleVisionOCR` (`ANE`) | **`0.6121` (`7.03 pp/s`)** | **`0.5914` (`25.16 pp/s`, `14.88` EOT)** | Bicubic upscaling resolves macOS 27.2.1 tiny-crop drops (`0.0000` to `0.5914`) |
+| --- | --- | ---: | ---: | --- |
+| **`olmOCR-bench(42)` (`auto`)** | **`fast-ocr` (`auto`)** | **0.6155** (`42/42`, 0 loops) | **0.6128** (`41/42`, 1 loop) | `+13.7 pp` (M4P) / `+21.3 pp` (M5) vs pre-triage baseline |
+| **`FinTabNet-OTSL(30)` (`auto`)** | **`fast-ocr` (`auto`)** | **0.8935** TEDS (`30/30`, 1.02 score/s) | **0.8867** TEDS (`30/30`, 0.93 score/s) | `+5.6 pp` (M4P) / `+2.7 pp` (M5) over baseline |
+| **`OmniDocBench-EN(24)` (`auto`)** | **`fast-ocr` (`auto`)** | **0.6574** (`22/24`, 0 loops) | **0.6872** (`22/24`, 0 loops) | `+7.7 pp` (M4P) / `+10.5 pp` (M5) over baseline |
+| **`olmOCR-bench(4)` (forced VLM)** | `fast-ocr` (`OvisOCR2-8bit`) | **0.8438** (`4/4`, 5.75 GB) | **0.8438** (`4/4`, 5.01 GB) | **1.44x** (M4P) / **2.05x** (M5) vs stock `mlx_vlm OvisOCR2` |
+| **Mixed digital PDF splice** | `fast-ocr` (`--region-routing`) | **3.47x** (`2.75 s -> 0.79 s`) | Opt-in (`False` default) | Lifts `govinfo_uscourts` `+7.7 pp` to `0.9707` |
+| **Parallel ANE (`n=16` crops)** | `AppleVisionOCR` (`workers=4`) | **9.61 pp/s** (`1.67 s`, 1.59x serial) | - | `FastOCR.ocr_images(..., batch_size=16)` runs `9.47 pp/s` |
+| **`B=1` Logprob confidence** | `fast-ocr` (`vDSP`) | **0.9135** AUROC (`FinTabNet-30`) | `0` extra MLX RAM | `-2.0%` wall time, `30/30` exact parity |
 
-## Scope & License
+*(On small 2-page forced-VLM checks against stock `mlx_vlm OvisOCR2-8bit`, `FinTabNet(2)` ran `1.22-1.72x` and `OmniDocBench(2)` ran `1.51-1.53x`, `2.44-2.74x` faster than `GLM-OCR`/`LightOnOCR-2`.)* [Architecture & OCR specs](docs/OCR_RESEARCH_AND_ARCHITECTURE.md)
 
-Verified on **Apple M4 Pro (`48 GB`, `macOS 26.6`)** and **Base Apple M5 (`24 GB`, `macOS 27.2.1`)**. Non-macOS targets are unsupported because Apple Vision requires macOS frameworks.
+## Limitations, Prior Art & License
 
-**Michael Deeb** ([`@mikewolfd`](https://github.com/mikewolfd)) · **TealWolf Consulting LLC** · [MIT License](../../LICENSE).
+- **Limitations:** macOS only (`VNRecognizeTextRequest` is unavailable on Linux/Windows). M4 Pro hosts on macOS `< 27.2` run slower on Apple Vision tiny-crop ANE upscaling than macOS 27.2.1+. Forced-VLM `latin_only=True` prunes non-Latin output heads to 140K tokens for speed; pass `--no-latin-only` for CJK or Cyrillic documents.
+- **Prior art:** Combines Apple `Vision`, `pypdfium2`, `mlx_vlm`, `llguidance`, and `mlx-community/OvisOCR2-8bit` / `NuExtract3` checkpoints. For fast 1-vector page retrieval without full OCR text generation, use [`fast-embeddinggemma-2`](../fast-embeddinggemma-2) or [`fast-pplx`](../fast-pplx).
+- **License:** Package code is [MIT licensed](LICENSE); upstream VLM weights keep their original licenses (Qwen / AIDC / Numind).

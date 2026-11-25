@@ -1,19 +1,22 @@
 # fast-gemma4
 
-Extract fields into schema-constrained JSON or call tools locally with Gemma 4 E2B. On the 24 GB M5, the strict default returned **150/150 valid extractions at 0.946 field F1** and made **123/150 correct tool decisions** in the normal benchmark. Stock `mlx-vlm` scored 0.923 on the same documents, with 146 valid extractions and 120 correct tool decisions. Both loaded the same public instruction-tuned 4-bit checkpoint. [Extraction, tool calls and timing](../../docs/BENCHMARKS.md#structured-generation)
+High-throughput local JSON extraction, tool calling, speculative decoding, and 8-bit QLoRA on Apple Silicon with `google/gemma-4-E2B-it`. Holds **128 concurrent rolling batch slots inside 6.13 GB active MLX memory** at **10.46 valid docs/s** (`1,479 tok/s` on Base M5: `5.2x` stock `mlx-vlm` valid doc rate and `9.8x` Apple CoreAI `B=1`), while returning **150/150 valid extractions at 0.946 field F1** on multilingual forms.
 
-The engine uses the 262,144-token vocabulary shipped with the checkpoint. By default, `llguidance` enforces the JSON schema as tokens are generated and requires one space after each key’s colon (`": "`), which scored 0.946 F1 versus 0.924 unconstrained. Pass `--compact-json` (`whitespace_flexible=False`) for minified JSON or `--whitespace-flexible` for optional whitespace. The optional English-oriented `--vocab-out 150786` profile speeds up output-head projections on ASCII workloads but reduces multilingual field accuracy. [Vocabulary and grammar experiments](../../docs/benchmarks/gemma-grammar-20261121.json)
+Zero telemetry, no account, and runs 100% offline after initial weight download (~10.4 GB full setup with Early14 Core ML ANE + MTP assistant; smaller when skipping ANE via `--skip-early14`). Prebuilt Early14 Core ML ANE artifact: [`mikewolfd/gemma-4-e2b-it-early14-coreml-ane`](https://huggingface.co/mikewolfd/gemma-4-e2b-it-early14-coreml-ane) · [Full benchmarks](../../docs/BENCHMARKS.md#structured-generation).
 
-## Quick start
+## Requirements
 
-From the `fast-silicon` workspace root, install the package and prepare the model. This example runs on the GPU (prebuilt optional `Early14` Core ML ANE bundles: [`mikewolfd/gemma-4-e2b-it-early14-coreml-ane`](https://huggingface.co/mikewolfd/gemma-4-e2b-it-early14-coreml-ane)).
+- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Checked with `lmstudio-community/gemma-4-E2B-it-MLX-4bit`.
+
+## Quickstart
 
 ```bash
+git clone https://github.com/mikewolfd/fast-silicon
+cd fast-silicon
 uv sync --python 3.13 --package fast-gemma4 --inexact
-.venv/bin/gemma4 setup-weights --skip-early14
-```
 
-Run this example with `.venv/bin/python`:
+.venv/bin/gemma4 setup-weights --skip-early14   # GPU-only weights (~2.5-3 GB); omit flag to add ~1 GB Early14 ANE
+```
 
 ```python
 from contextlib import closing
@@ -31,82 +34,67 @@ with closing(FastGemma4Engine(default_mode="gpu", mtp_drafter=None)) as engine:
         max_tokens=128,
     )
     if item.valid_schema:
-        print(item.parsed)
+        print(item.parsed)  # {'entity': 'Ocean Lab', 'topic': 'coral'}
 ```
 
-On the M4 Pro this printed `{'entity': 'Ocean Lab', 'topic': 'coral'}`. For compact output on disk or over the wire, serialize `item.parsed` after validation with `json.dumps(item.parsed, ensure_ascii=False, separators=(",", ":"))`.
+## Grammar formatting & baseline fairness
 
-Optional lazy multimodal image support is available via the `[vision]` extra (`uv pip install -e ".[vision]"`): pass `images=[...]` and `max_soft_tokens=280` to `engine.generate(...)`. Text-only calls keep `_vision_model=None` and never import `PIL` or load vision weights (`0` text-side overhead).
+The engine uses the full 262,144-token vocabulary from the checkpoint. By default, `llguidance` enforces your JSON schema token-by-token and inserts one space after each colon (`": "`), which scored **0.946 F1** vs. **0.924 unconstrained** (minified `whitespace_flexible=False` breaks Gemma's normal `" \"` token merge and lowers multilingual accuracy; `--vocab-out 150786` speeds ASCII-only heads but hurts non-English fields). [Grammar & vocab experiments](../../docs/benchmarks/gemma-grammar-20261121.json)
 
-## CLI, Parquet & HTTP server
-
-```bash
-# Structured generation, resumable Parquet/JSONL extraction, and OpenAI SSE server
-.venv/bin/gemma4 generate --json 'Extract entity: Acme Cloud grew 12%.'
-# Optional lazy multimodal image input (install extra: `uv pip install -e ".[vision]"`)
-.venv/bin/gemma4 generate --image receipt.png --max-soft-tokens 280 'Transcribe totals as Markdown.'
-.venv/bin/gemma4 parquet docs.parquet out_shards/ --model-dir /ckpt \
-  --schema schema.json --system-file sys.txt --max-pages 2 --max-chars 8000 --drop-text-col --resume
-.venv/bin/gemma4 extract docs.jsonl out.jsonl --schema schema.json --system-file sys.txt
-.venv/bin/gemma4 serve --host 127.0.0.1 --port 8080 --coalesce-ms 10
-
-# Optional Core ML ANE Early14 prefill ring (`fp16` default, or domain-calibrated `w8`)
-.venv/bin/gemma4 setup-ane --variant both
-.venv/bin/python scripts/build_ane_models.py --variant w8 --awq-mse --calib-file docs.jsonl
-
-# Local 8-bit QLoRA adapter training (`--pack-tokens 1024 --grad-accum 2` on 24 GB Macs)
-.venv/bin/python scripts/train_lora.py --pairs pairs.json --adapter-dir out_lora --out-model-dir out_ckpt \
-  --qlora-8bit --pack-tokens 2048 --shared-sys-kv
-```
+When comparing against unconstrained stock `mlx-vlm` below, invalid JSON outputs receive 0 credit in end-to-end scoring; both validity lift (`150/150` vs. `146/150`) and raw elapsed time (`144.4 s` vs. `172.2 s`) are shown separately.
 
 ## Benchmark highlights
 
-### 1. Public outcomes & batch capacity
+### 1. Structured extraction, tools & batch capacity
 
-| Workload | Base M5 (24 GB) | M4 Pro (48 GB) | Comparison & notes |
-|---|---|---|---|
-| **Tier-1 Cat-4 JSON + tool calls (300 tasks, `llg_on`)** | **4.179 score/s** (300/300 valid, 0.8836 `S_obj,e2e`, 4.98 GB) | **3.639 score/s** (300/300 valid, 0.8802 `S_obj,e2e`, 8.15 GB) | Batched 2026-11-24 Tier-1 run (`PASS` on both Macs). [Tier-1 suite](../../docs/BENCHMARKS.md#152-dual-mac-tier-1--vision-outcome-suite-results-with-m4-fast-embeddinggemma-2-reruns) |
-| **Strict JSON + tool calls (`B=8`, 300 tasks)** | **1.835 score/s** (300/300 valid, 0.946 field F1, 144.4 s) | — | **1.22×** unconstrained stock `mlx-vlm` (1.501 score/s, 286/300 valid, 0.923 F1, 172.2 s) on the same checkpoint. |
-| **Historical minified 150K profile (300 tasks)** | 2.717 score/s (299/300 valid, 82.7 s) | 2.412 score/s (299/300 valid, 92.9 s) | Faster output head, lower multilingual field F1 (0.749 combined score vs 0.883 repaired strict). |
-| **Reasoning & instruction following (435 tasks)** | **0.843 score/s** (0.352 score, 181.5 s) | 0.892 score/s (0.359 score, 174.8 s) | 1.03× (M5) and 0.94× (M4 Pro) vs stock `mlx-vlm` (0.366 score). |
-| **Batch-128 extraction fixtures (`kv_i8`)** | **10.46 valid docs/s** (GPU, 6.13 GB MLX) | **8.78 valid docs/s** (ANE+GPU) · 6.87 (GPU) | Holds 128 rolling slots inside 6.1–6.9 GB active MLX RAM, whereas unchunked batch 64 in stock `mlx-vlm` OOMs at 34.4 GB. |
+| Workload | Base M5 (`24 GB`) | M4 Pro (`48 GB`) | Baseline comparison |
+| --- | --- | --- | --- |
+| **300-task JSON + tools (batched, strict)** | **4.179 score/s** (300/300 valid, 0.884 score, 4.98 GB) | **3.639 score/s** (300/300 valid, 0.880 score, 8.15 GB) | Batched rolling scheduler (`max_b_slots=128` on 24 GB) |
+| **300-task JSON + tools (`B=8` M5)** | **1.835 score/s** (150/150 extract 0.946 F1, 123/150 tools, 144.4 s) | - | Unconstrained `mlx-vlm`: `1.501` (146/150 extract 0.923 F1, 120/150 tools, 172.2 s) |
+| **Reasoning (`435` MMLU + MATH + IFBench)** | **0.843 score/s** (0.352 score, 181.5 s) | **0.892 score/s** (0.359 score, 174.8 s) | Stock `mlx-vlm`: `0.818` M5 / `0.951` M4 Pro (0.366 score) |
+| **Batch-128 extraction (`kv_i8`)** | **10.46 valid docs/s** (`1,479 tok/s`, 6.13 GB MLX) | **8.78 valid docs/s** (ANE+GPU) / **6.87** (GPU) | **5.2x** `mlx-vlm` valid rate (`B=128` fits in 6.1 GB; stock OOMs at 34.4 GB on `B=64`) |
 
-### 2. Speculative decoding, prefix reuse & local training
+### 2. Speculative decoding (`MTP`), prefix reuse & local QLoRA
 
-| Capability | Base M5 (24 GB) | M4 Pro (48 GB) | Takeaway |
-|---|---|---|---|
-| **Speculative `MTP` (`B=1` / `B=4` AR parity)** | **1.65×–1.68×** vs. AR at `B=1` (`2.15×` vs. unconstrained `mlx-vlm` JSON), **`1.00×` `json_b4`**, **`10/10` exact** (`9.30 GB`) | **1.49×–1.62×** vs. AR at `B=1`, **`1.13×` `free_b4`**, **`10/10` exact** (`9.53 GB`) | Keeps single-slot verify kernels on `B=1`, uses batched linears for `B >= 2`, and stays on dense rolling decode when MTP declines oversized batches. [Capability reruns](../../docs/BENCHMARKS.md#153-targeted-post-fix-capability-reruns--root-cause-engineering-notes) |
-| **Shared-prefix `PrefixTree` reuse** | Zero system-KV cloning across batch slots | Up to **2.59×** faster across 4–8 shared-prefix candidates | Automatically reuses shared prompt prefixes (`>= 32` tokens). |
-| **Local 8-bit `QLoRA` adapter training** | **80.5–87.7 sup tok/s** in 4.85–6.76 GiB (`pack=1024, accum=2`) | **545.8 tok/s** packed 8-bit (`pack=2048`) | Sizing to `pack_tokens=1024, grad_accum=2, ckpt_tokens=512` prevents 24 GB OOMs with matching loss and gradients. |
-| **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61–3.38 rollouts/s** (8.68 GB peak) | **1.81–3.15 rollouts/s** (7.11 GB vs. 19.38 GB GPU critic) | Runs critic scoring on the Neural Engine concurrently with GPU rollouts and backward passes. |
+| Capability | Base M5 (`24 GB`) | M4 Pro (`48 GB`) | Takeaway |
+| --- | --- | --- | --- |
+| **Speculative `MTP` (`B=1` / `B=4` vs AR)** | **1.65-1.68x** `B=1` (**2.15x** vs `mlx-vlm`), **1.00x** `json_b4`, `10/10` exact (9.30 GB) | **1.49-1.62x** `B=1`, **1.13x** `free_b4`, `10/10` exact (9.53 GB) | Keeps singleton verify on `B=1`, batched linears on `B>=2`, and dense rolling decode when oversaturated |
+| **Shared-prefix `PrefixTree`** | Zero system-KV cloning across batch slots | Up to **2.59x** across 4-8 shared-prefix candidates | Automatically reuses shared prefixes `>= 32` tokens |
+| **8-bit `QLoRA` (`shared-sys-kv`)** | **533-1,097 tok/s** in 5.2-7.3 GB (`pack=1024`, `accum=2`) | **546-1,385 tok/s** (`pack=2048`) | Auto-sizes pack length by RAM to avoid 24 GB OOM at matching loss and gradients |
+| **Disaggregated `GRPO` + `Laya` ANE critic** | **2.61-3.38 rollouts/s** (8.68 GB peak) | **1.81-3.15 rollouts/s** (7.11 GB vs. 19.38 GB GPU) | Runs critic scoring on ANE concurrently with GPU rollouts and backward passes |
 
-#### Optional lazy multimodal vision & multimodal `MTP`
-
-On Base M5 (`24 GB`), multimodal speculative decoding (`MTP`) speeds `FinTabNet(4)` end to end by **2.123×** (`34.05 s` down to `16.04 s`, rising from `48.81` to `103.62 tok/s` with `4/4` exact token and text parity) and speeds `CORD-v2(4)` JSON by **1.505×** (`26.02 s` down to `17.28 s` with `4/4` parity; `max_tokens=1024` raises valid JSON to `1.00`). [Multimodal MTP receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
-
-On M4 Pro (`48 GB`), optional `generate(..., images=...)` leaves text-only latency and memory unchanged (`63.09 tok/s`, `3.33 GB` MLX peak, zero vision weights loaded). `Gemma-4 E2B-4bit` (`4.24–4.30 GB` MLX / `5.43 GB` RSS) scored `0.7665` TEDS (`0.170 pp/s`) at `280` soft tokens and `0.8293` TEDS (`0.9053` NumF1) at `1,120` on `FinTabNet`, `1.000` schema validity (`0.2566` F1, `0.506 pp/s`, `95.9 tok/s`) on `CORD-v2`, `0.5128` (`0.364 pp/s`) on `OmniDocBench-EN(2)`, and `0.1667` on `olmOCR-bench(2)`. `E4B-bf16` (`14.9–15.1 GB` MLX / `17.05 GB` RSS, `16–29 tok/s`) lifted `olmOCR-bench(2)` to `0.500` (`3/3` `old_scans_math`) while trailing `E2B` on `FinTabNet` (`0.3932`) and `CORD-v2` (`0.1146`). Use [`fast-ocr`](../fast-ocr) (`OvisOCR2-8bit`) for dedicated document OCR and `fast-gemma4` vision for lightweight multimodal extraction and VQA. [Vision & OCR benchmarks](../../docs/BENCHMARKS.md#136-optional-gemma-4--embeddinggemma-2-vision--cross-modal-retrieval-m4-pro-verified)
+**Optional lazy vision & multimodal `MTP`:** Install `uv sync --python 3.13 --package fast-gemma4 --extra vision --inexact`. Text-only calls keep zero vision weights in RAM (`63.09 tok/s`, `3.33 GB` MLX peak). With images passed (`generate(..., images=...)`), multimodal `MTP` on Base M5 speeds `FinTabNet(4)` **2.12x** (`34.05 s -> 16.04 s`, `48.8 -> 103.6 tok/s`, 4/4 exact parity) and `CORD-v2(4)` JSON **1.51x** (`26.02 s -> 17.28 s`, 4/4 parity). For full-document OCR benchmarks at scale, use [`fast-ocr`](../fast-ocr). [Vision & MTP receipts](../../docs/BENCHMARKS.md#141-vision-retrieval-cpu-image-prefetch-and-multimodal-mtp)
 
 ## Automatic hardware dispatch (`"auto"` defaults)
 
-`FastGemma4Engine()` probes chip generation and RAM via `DynamicSiliconPolicy` so callers do not have to hand-tune options per Mac:
+`FastGemma4Engine()` probes Apple Silicon generation and unified RAM automatically:
 
-| Option | `"auto"` behavior | Manual override |
-|---|---|---|
-| `mtp_drafter` | Lazily loads the ~150 MiB draft assistant only on greedy single-stream GPU calls (`B=1` on M5, `B=1..2` on M4 Pro); costs 0 MB on batch ETL. | Pass `False` / `None` to disable, or `True` to load eagerly. |
-| `use_ane_ring` (`generate_batch`) | Uses the `Early14` Pure-ANE prefill ring on `>= 32 GB` M4 Macs for batches `>= 16`; stays pure GPU on M5 `NAX` (where GPU reaches 10.46 docs/s) and on 24 GB hosts. | Pass `False` to force GPU or `True` to require the ANE ring. |
-| `ane_ring_variant` | Uses `fp16` (`1.0 GB`, safe for arbitrary base or LoRA weights) on `> 24 GB` Macs; uses calibrated Hadamard `w8` (`504 MB`, `7,815 tok/s` chunk prefill) on `<= 24 GB` Macs only when a verified calibration manifest is present. | Pass `"fp16"` or `"w8"`. |
+| Option | `"auto"` behavior | Override |
+| --- | --- | --- |
+| `mtp_drafter` | Lazily loads the ~150 MiB draft assistant only for greedy single/low-batch GPU calls (`B=1` on M5, `B=1..2` on M4 Pro); 0 MB cost on batch ETL. | Pass `False`/`None` to disable, or `True` to preload |
+| `use_ane_ring` (`generate_batch`) | Enables `Early14` Pure-ANE prefill on `>= 32 GB` M4 Macs (`B >= 16`); stays pure GPU on M5 `NAX` (where GPU reaches 10.46 docs/s) and 24 GB Macs. | Pass `False` (GPU) or `True` (force ANE) |
+| `ane_ring_variant` | Uses `fp16` (1.0 GB) on `> 24 GB` hosts and calibrated `w8` (504 MB) on `<= 24 GB` hosts when present. | Pass `"fp16"` or `"w8"` |
 
 ## What keeps it fast
 
 | Component | How it works | Source |
-|---|---|---|
-| **Rolling Metal GPU + `kv_i8`** | Continuous 128-slot scheduler, INT8 KV cache compression, fused BF16 GeGLU, Apple10 NAX inline XOR packing without duplicate weight buffers (`max_diff=0.0`), and FP32 logit softcapping (`0/1,024` greedy mismatches vs. FP32) | [`model.py`](src/fast_gemma4/model.py), [`kernels.py`](src/fast_gemma4/kernels.py) |
-| **Schema grammar & loop guard** | Zero-allocation `llguidance` bitmasking, multi-token forced-prefix jumps, deferred length-truncation retries, and a cycle/4-gram loop breaker | [`grammar.py`](src/fast_gemma4/grammar.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
-| **Pure-ANE `Early14` prefill ring** | Power-of-2 residual-scale folding keeps Layer 10–14 activations inside FP16 range (`1,326` ANE ops, `0` GPU/CPU) with zero-copy `IOSurface` handoff to Metal | [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py), [`native/gemma4_ane_prefix.mm`](native/gemma4_ane_prefix.mm) |
-| **Local `QLoRA` acceleration** | Compiled chunked softcap cross-entropy + AdamW, variable-length FFD sequence packing, and shared system-prompt KV backward passes | [`lora_accel.py`](src/fast_gemma4/lora_accel.py), [`scripts/train_lora.py`](scripts/train_lora.py) |
+| --- | --- | --- |
+| **Rolling Metal GPU + `kv_i8`** | Continuous 128-slot scheduler, INT8 KV compression, fused BF16 GeGLU, Apple10 NAX inline XOR packing without duplicate weight buffers (`max_diff=0.0`), and FP32 logit softcap | [`model.py`](src/fast_gemma4/model.py), [`kernels.py`](src/fast_gemma4/kernels.py) |
+| **Schema grammar & loop guard** | Zero-allocation `llguidance` bitmasking, forced-prefix jumps, deferred length-truncation retries, and 4-gram loop breaking | [`grammar.py`](src/fast_gemma4/grammar.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
+| **Pure-ANE `Early14` prefill ring** | Residual-scale folding keeps Layer 10-14 activations inside FP16 (`1,326` ANE ops, `0` GPU/CPU) with zero-copy `IOSurface` handoff | [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py), [`native/gemma4_ane_prefix.mm`](native/gemma4_ane_prefix.mm) |
+| **Local `QLoRA` acceleration** | Compiled chunked softcap cross-entropy + AdamW, FFD sequence packing, and shared system-prompt KV backward passes | [`lora_accel.py`](src/fast_gemma4/lora_accel.py), [`scripts/train_lora.py`](scripts/train_lora.py) |
 
-## Scope & License
+## CLI, Parquet & HTTP server
 
-Verified on **Apple M4 Pro (`48 GB`, `macOS 26.6`)** and **Base Apple M5 (`24 GB`, `macOS 27.2.1`)** under `/tmp/m4_gpu_validation.lock`. Detailed precision ablations and negative-gate records are in [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md).
+```bash
+.venv/bin/gemma4 generate --json 'Extract entity: Acme Cloud grew 12%.'
+.venv/bin/gemma4 parquet docs.parquet out_shards/ --schema schema.json --system-file sys.txt --drop-text-col --resume
+.venv/bin/gemma4 serve --host 127.0.0.1 --port 8080 --coalesce-ms 10
+.venv/bin/python packages/fast-gemma4/scripts/train_lora.py --pairs pairs.json --adapter-dir out_lora --out-model-dir out_ckpt --qlora-8bit --pack-tokens 2048 --shared-sys-kv
+```
 
-**Michael Deeb** ([`@mikewolfd`](https://github.com/mikewolfd)) · **TealWolf Consulting LLC** · [MIT License](LICENSE).
+## Limitations, Prior Art & License
+
+- **Limitations:** HTTP `serve` batches completed responses rather than token-by-token streams. `Early14` ANE prefill improves M4 Pro throughput (`8.78` vs. `6.87` docs/s) while Base M5 `NAX` GPU is already faster without it. On free-form reasoning (no schema), `fast-gemma4` matches `mlx-vlm` speed (`0.94x` M4 Pro, `1.03x` M5) rather than outpacing it.
+- **Prior art:** Built on `mlx`, `mlx-vlm`, `llguidance`, `coremltools`, and `lmstudio-community/gemma-4-E2B-it-MLX-4bit`.
+- **License:** Package code is [MIT licensed](LICENSE); Gemma 4 weights are governed by Google's Gemma Terms of Use. Verified on 48 GB M4 Pro and 24 GB Base M5.

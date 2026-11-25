@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 310" width="880" height="310" role="img" aria-label="fast-silicon batch speedup versus stock MLX on Apple Silicon">
+  <rect width="880" height="310" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <text x="24" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#e6edf3">fast-silicon vs. Stock MLX on Apple Silicon (Batch Throughput Multiplier)</text>
+  <text x="24" y="54" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Measured on Base M5 (24 GB, macOS 27.2.1) and M4 Pro (48 GB, macOS 26.6); dashed line marks 1.0x stock MLX baseline.</text>
+
+  <!-- 1.0x reference line at x = 280 + 28 = 308 (scale: 28px per 1.0x) -->
+  <line x1="308" y1="74" x2="308" y2="274" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="308" y="294" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#8b949e">1.0x Stock MLX</text>
+
+  <!-- Row 1: BGE-small (11.26x -> 315px) -->
+  <text x="24" y="100" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">BGE-small retrieval (M5)</text>
+  <rect x="280" y="84" width="315" height="22" rx="4" fill="#2f81f7"/>
+  <text x="605" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">11.3x MLX (200.6k tok/s, 11.8s vs 133.8s)</text>
+
+  <!-- Row 2: Gemma 4 E2B (5.18x -> 145px) -->
+  <text x="24" y="134" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">Gemma 4 E2B JSON B=128 (M5)</text>
+  <rect x="280" y="118" width="145" height="22" rx="4" fill="#2f81f7"/>
+  <text x="435" y="134" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">5.2x mlx-vlm (10.5 valid docs/s, 9.8x CoreAI B=1)</text>
+
+  <!-- Row 3: EmbeddingGemma-2 (4.80x -> 134px) -->
+  <text x="24" y="168" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">EmbeddingGemma-2 2K (M4 Pro)</text>
+  <rect x="280" y="152" width="134" height="22" rx="4" fill="#2f81f7"/>
+  <text x="424" y="168" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">4.8x MLX (4.3x M5, 3.3x Core ML, 48.8k tok/s)</text>
+
+  <!-- Row 4: PPLX-0.6B (4.41x -> 123px) -->
+  <text x="24" y="202" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">PPLX-0.6B contextual (M5)</text>
+  <rect x="280" y="186" width="123" height="22" rx="4" fill="#2f81f7"/>
+  <text x="413" y="202" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">4.4x MLX (136.5s vs 601.5s, 325 queries)</text>
+
+  <!-- Row 5: OvisOCR2 (2.05x -> 57px) -->
+  <text x="24" y="236" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">OvisOCR2 scans &amp; tables (M5)</text>
+  <rect x="280" y="220" width="57" height="22" rx="4" fill="#3fb950"/>
+  <text x="347" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">2.0x mlx-vlm (3.5x mixed PDF splice, 9.6 pp/s ANE)</text>
+
+  <!-- Row 6: Laya-421M (1.96x -> 55px) -->
+  <text x="24" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e6edf3">Laya-421M decisions (M5)</text>
+  <rect x="280" y="254" width="55" height="22" rx="4" fill="#3fb950"/>
+  <text x="345" y="270" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6edf3">2.0x MLX (37.9s vs 73.9s, 25x CoreAI)</text>
+</svg>
