@@ -243,26 +243,19 @@ def _parse_ver_tuple(ver_str: str) -> tuple[int, ...]:
 
 
 def _detect_apple10_d256_force_fused(mx: Any) -> bool:
-    """Return True only on Apple10 (M5+) + macOS >= 26.2 + MLX >= 0.32.2 supporting `force_fused` D256 SDPA."""
-    if os.environ.get("MLX_METAL_NO_NAX") == "1":
-        return False
+    """Delegate Apple10 D256 `force_fused` detection to shared `fast_shared.hw_check`."""
     try:
-        dev = mx.device_info()
+        from fast_shared.hw_check import detect_apple10_d256_force_fused
+
+        dev = None
+        if mx is not None and hasattr(mx, "device_info"):
+            try:
+                dev = mx.device_info()
+            except Exception:
+                dev = None
+        return bool(detect_apple10_d256_force_fused(device_info=dev))
     except Exception:
         return False
-    dev_name = str(dev.get("device_name", "")).lower()
-    arch = str(dev.get("architecture", "")).lower()
-    is_m5 = ("m5" in dev_name) or ("apple10" in arch) or ("g17" in arch)
-    if not is_m5:
-        return False
-    mac_ver = _parse_ver_tuple(platform.mac_ver()[0])
-    if mac_ver and mac_ver < (26, 2):
-        return False
-    mlx_ver = _parse_ver_tuple(getattr(mx, "__version__", "0.0.0"))
-    if mlx_ver < (0, 32, 2):
-        return False
-    doc = getattr(mx.fast.scaled_dot_product_attention, "__doc__", "") or ""
-    return "force_fused" in doc
 
 
 def _build_state_attn_mask(mx: Any, pad_lens: Sequence[int], s_max: int, act_dtype: Any) -> Any:

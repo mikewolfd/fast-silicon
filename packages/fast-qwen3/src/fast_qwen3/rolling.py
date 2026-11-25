@@ -12,9 +12,461 @@ import numpy as np
 
 from fast_shared.grammar import GrammarHelper, detect_catastrophic_token_loop
 
-from .gdn_kernels import quantize_gdn_state_blk32, resolve_gdn_state_mode
+from .gdn_kernels import (
+    fused_gdn_pre_recurrence,
+    gdn_delta_update_slot_indexed,
+    quantize_gdn_state_blk32,
+    resolve_gdn_state_mode,
+)
 from .kernels import apply_partial_rope_trig, fused_sigmoid_attn_gate
-from .model import DeltaSlotCache, FastQwen3Model, GrowingKVCache, dequantize_gdn_state_int8
+from .model import (
+    DeltaSlotCache,
+    FastQwen3Model,
+    GrowingKVCache,
+    _use_gdn_metal_override,
+    dequantize_gdn_state_int8,
+)
+
+
+_FLASH_DECODE_1PASS_SRC = """
+    constexpr int kGqa = N_Q / N_KV;
+    constexpr int kElemsPerLane = HD / 32;
+    constexpr int kTileT = 8;
+    constexpr int kThreads = kGqa * 32;
+
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+
+    uint blk = threadgroup_position_in_grid.z;
+    uint s_q = params[1];
+    uint q_i = blk % s_q;
+    uint tmp = blk / s_q;
+    uint h_kv = tmp % N_KV;
+    uint b_idx = tmp / N_KV;
+    uint h_q = h_kv * kGqa + sg;
+
+    int vlen = valid_lens[b_idx];
+    int k_limit = (s_q == 1) ? vlen : min(vlen, vlen - int(s_q) + int(q_i) + 1);
+    size_t q_off = (((size_t(b_idx) * N_Q + h_q) * s_q + q_i) * HD) + lane * kElemsPerLane;
+
+    if (k_limit <= 0) {
+      #pragma unroll
+      for (int j = 0; j < kElemsPerLane; ++j) {
+        out[q_off + j] = T(0.0f);
+      }
+      return;
+    }
+
+    float scale = scale_arr[0];
+    float q_reg[kElemsPerLane];
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      q_reg[j] = float(q[q_off + j]) * scale;
+    }
+
+    threadgroup T sh_k[kTileT * HD];
+    threadgroup T sh_v[kTileT * HD];
+
+    uint slot_b = uint(slot_ids[b_idx]);
+    uint cap = params[0];
+    size_t kv_slot_base = size_t(slot_b) * size_t(cap) * N_KV * HD + size_t(h_kv) * HD;
+    size_t kv_t_stride = size_t(N_KV) * HD;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float o_acc[kElemsPerLane];
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      o_acc[j] = 0.0f;
+    }
+
+    for (int t_base = 0; t_base < k_limit; t_base += kTileT) {
+      int n_rows = min(kTileT, k_limit - t_base);
+      int total_elems = n_rows * HD;
+      for (int idx = int(tid) * 2; idx < total_elems; idx += kThreads * 2) {
+        int r = idx / HD;
+        int d = idx - r * HD;
+        size_t g_off = kv_slot_base + size_t(t_base + r) * kv_t_stride + d;
+        sh_k[idx + 0] = k_buf[g_off + 0];
+        sh_k[idx + 1] = k_buf[g_off + 1];
+        sh_v[idx + 0] = v_buf[g_off + 0];
+        sh_v[idx + 1] = v_buf[g_off + 1];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      int d0 = int(lane) * kElemsPerLane;
+      for (int r = 0; r < n_rows; ++r) {
+        const threadgroup T* kr = sh_k + r * HD + d0;
+        const threadgroup T* vr = sh_v + r * HD + d0;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < kElemsPerLane; ++j) {
+          dot += q_reg[j] * float(kr[j]);
+        }
+        dot += simd_shuffle_xor(dot, 1);
+        dot += simd_shuffle_xor(dot, 2);
+        dot += simd_shuffle_xor(dot, 4);
+        dot += simd_shuffle_xor(dot, 8);
+        dot += simd_shuffle_xor(dot, 16);
+
+        float m_new = max(m_i, dot);
+        float alpha = (m_i == -INFINITY) ? 0.0f : metal::exp(m_i - m_new);
+        float p = metal::exp(dot - m_new);
+        l_i = l_i * alpha + p;
+        #pragma unroll
+        for (int j = 0; j < kElemsPerLane; ++j) {
+          o_acc[j] = o_acc[j] * alpha + p * float(vr[j]);
+        }
+        m_i = m_new;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      out[q_off + j] = T(o_acc[j] * inv_l);
+    }
+"""
+
+_FLASH_DECODE_SPLIT_P1_SRC = """
+    constexpr int kGqa = N_Q / N_KV;
+    constexpr int kElemsPerLane = HD / 32;
+    constexpr int kTileT = 8;
+    constexpr int kThreads = kGqa * 32;
+
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+
+    uint split_id = threadgroup_position_in_grid.y;
+    uint blk = threadgroup_position_in_grid.z;
+    uint cap = params[0];
+    uint s_q = params[1];
+    uint split_len = params[2];
+    uint n_splits = params[3];
+
+    uint q_i = blk % s_q;
+    uint tmp = blk / s_q;
+    uint h_kv = tmp % N_KV;
+    uint b_idx = tmp / N_KV;
+    uint h_q = h_kv * kGqa + sg;
+
+    int vlen = valid_lens[b_idx];
+    int k_limit = (s_q == 1) ? vlen : min(vlen, vlen - int(s_q) + int(q_i) + 1);
+    int t_start = int(split_id * split_len);
+    int t_end = min(k_limit, t_start + int(split_len));
+
+    size_t ml_base = ((((size_t(b_idx) * N_Q + h_q) * s_q + q_i) * n_splits + split_id) * 2);
+    size_t po_base = ((((size_t(b_idx) * N_Q + h_q) * s_q + q_i) * n_splits + split_id) * HD) + lane * kElemsPerLane;
+
+    if (t_start >= t_end) {
+      if (lane == 0) {
+        ml_part[ml_base + 0] = -INFINITY;
+        ml_part[ml_base + 1] = 0.0f;
+      }
+      #pragma unroll
+      for (int j = 0; j < kElemsPerLane; ++j) {
+        o_part[po_base + j] = T(0.0f);
+      }
+      return;
+    }
+
+    size_t q_off = (((size_t(b_idx) * N_Q + h_q) * s_q + q_i) * HD) + lane * kElemsPerLane;
+    float scale = scale_arr[0];
+    float q_reg[kElemsPerLane];
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      q_reg[j] = float(q[q_off + j]) * scale;
+    }
+
+    threadgroup T sh_k[kTileT * HD];
+    threadgroup T sh_v[kTileT * HD];
+
+    uint slot_b = uint(slot_ids[b_idx]);
+    size_t kv_slot_base = size_t(slot_b) * size_t(cap) * N_KV * HD + size_t(h_kv) * HD;
+    size_t kv_t_stride = size_t(N_KV) * HD;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float o_acc[kElemsPerLane];
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      o_acc[j] = 0.0f;
+    }
+
+    for (int t_base = t_start; t_base < t_end; t_base += kTileT) {
+      int n_rows = min(kTileT, t_end - t_base);
+      int total_elems = n_rows * HD;
+      for (int idx = int(tid) * 2; idx < total_elems; idx += kThreads * 2) {
+        int r = idx / HD;
+        int d = idx - r * HD;
+        size_t g_off = kv_slot_base + size_t(t_base + r) * kv_t_stride + d;
+        sh_k[idx + 0] = k_buf[g_off + 0];
+        sh_k[idx + 1] = k_buf[g_off + 1];
+        sh_v[idx + 0] = v_buf[g_off + 0];
+        sh_v[idx + 1] = v_buf[g_off + 1];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      int d0 = int(lane) * kElemsPerLane;
+      for (int r = 0; r < n_rows; ++r) {
+        const threadgroup T* kr = sh_k + r * HD + d0;
+        const threadgroup T* vr = sh_v + r * HD + d0;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < kElemsPerLane; ++j) {
+          dot += q_reg[j] * float(kr[j]);
+        }
+        dot += simd_shuffle_xor(dot, 1);
+        dot += simd_shuffle_xor(dot, 2);
+        dot += simd_shuffle_xor(dot, 4);
+        dot += simd_shuffle_xor(dot, 8);
+        dot += simd_shuffle_xor(dot, 16);
+
+        float m_new = max(m_i, dot);
+        float alpha = (m_i == -INFINITY) ? 0.0f : metal::exp(m_i - m_new);
+        float p = metal::exp(dot - m_new);
+        l_i = l_i * alpha + p;
+        #pragma unroll
+        for (int j = 0; j < kElemsPerLane; ++j) {
+          o_acc[j] = o_acc[j] * alpha + p * float(vr[j]);
+        }
+        m_i = m_new;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+      ml_part[ml_base + 0] = m_i;
+      ml_part[ml_base + 1] = l_i;
+    }
+    float inv_ls = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      o_part[po_base + j] = T(o_acc[j] * inv_ls);
+    }
+"""
+
+_FLASH_DECODE_SPLIT_P2_SRC = """
+    constexpr int kElemsPerLane = HD / 32;
+    uint lane = thread_index_in_simdgroup;
+    uint blk = threadgroup_position_in_grid.z;
+    uint s_q = params[1];
+    uint n_splits = params[3];
+
+    uint q_i = blk % s_q;
+    uint tmp = blk / s_q;
+    uint h_q = tmp % N_Q;
+    uint b_idx = tmp / N_Q;
+
+    size_t head_base = ((size_t(b_idx) * N_Q + h_q) * s_q + q_i);
+    size_t ml_head = head_base * n_splits * 2;
+    size_t po_head = head_base * n_splits * HD + lane * kElemsPerLane;
+
+    float m_max = -INFINITY;
+    for (uint s = 0; s < n_splits; ++s) {
+      float ls = ml_part[ml_head + s * 2 + 1];
+      if (ls > 0.0f) {
+        m_max = max(m_max, ml_part[ml_head + s * 2 + 0]);
+      }
+    }
+
+    size_t out_off = head_base * HD + lane * kElemsPerLane;
+    if (m_max == -INFINITY) {
+      #pragma unroll
+      for (int j = 0; j < kElemsPerLane; ++j) {
+        out[out_off + j] = T(0.0f);
+      }
+      return;
+    }
+
+    float l_tot = 0.0f;
+    float o_acc[kElemsPerLane];
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      o_acc[j] = 0.0f;
+    }
+
+    for (uint s = 0; s < n_splits; ++s) {
+      float ls = ml_part[ml_head + s * 2 + 1];
+      if (ls > 0.0f) {
+        float ms = ml_part[ml_head + s * 2 + 0];
+        float sw = ls * metal::exp(ms - m_max);
+        l_tot += sw;
+        size_t s_off = po_head + size_t(s) * HD;
+        #pragma unroll
+        for (int j = 0; j < kElemsPerLane; ++j) {
+          o_acc[j] += float(o_part[s_off + j]) * sw;
+        }
+      }
+    }
+
+    float inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kElemsPerLane; ++j) {
+      out[out_off + j] = T(o_acc[j] * inv_l);
+    }
+"""
+
+_FLASH_DECODE_KERNELS: dict[str, Any] = {}
+_FD_SCALE_CACHE: dict[float, mx.array] = {}
+_FD_PARAMS_CACHE: dict[tuple[int, int, int, int], mx.array] = {}
+
+
+def _get_flash_decode_kernels() -> dict[str, Any]:
+    """Lazily compile Metal Flash-Decode kernels (1-pass + split-K pass1/pass2)."""
+    if not _FLASH_DECODE_KERNELS:
+        _FLASH_DECODE_KERNELS["1pass"] = mx.fast.metal_kernel(
+            name="fast_qwen3_flash_decode_1pass",
+            input_names=["q", "k_buf", "v_buf", "slot_ids", "valid_lens", "params", "scale_arr"],
+            output_names=["out"],
+            source=_FLASH_DECODE_1PASS_SRC,
+        )
+        _FLASH_DECODE_KERNELS["split_p1"] = mx.fast.metal_kernel(
+            name="fast_qwen3_flash_decode_split_p1",
+            input_names=["q", "k_buf", "v_buf", "slot_ids", "valid_lens", "params", "scale_arr"],
+            output_names=["o_part", "ml_part"],
+            source=_FLASH_DECODE_SPLIT_P1_SRC,
+        )
+        _FLASH_DECODE_KERNELS["split_p2"] = mx.fast.metal_kernel(
+            name="fast_qwen3_flash_decode_split_p2",
+            input_names=["o_part", "ml_part", "params"],
+            output_names=["out"],
+            source=_FLASH_DECODE_SPLIT_P2_SRC,
+        )
+    return _FLASH_DECODE_KERNELS
+
+
+def _get_fd_scale_arr(scale: float) -> mx.array:
+    arr = _FD_SCALE_CACHE.get(scale)
+    if arr is None:
+        arr = mx.array([scale], dtype=mx.float32)  # guard: allow-fp32
+        if len(_FD_SCALE_CACHE) < 32:
+            _FD_SCALE_CACHE[scale] = arr
+    return arr
+
+
+def _get_fd_params_arr(cap: int, s_q: int, split_len: int, n_splits: int) -> mx.array:
+    key = (cap, s_q, split_len, n_splits)
+    arr = _FD_PARAMS_CACHE.get(key)
+    if arr is None:
+        arr = mx.array([cap, s_q, split_len, n_splits], dtype=mx.uint32)
+        if len(_FD_PARAMS_CACHE) < 256:
+            _FD_PARAMS_CACHE[key] = arr
+    return arr
+
+
+def _can_use_flash_decode_metal(dt: mx.Dtype, n_q: int, n_kv: int, hd: int) -> bool:
+    if not (mx.metal.is_available() and mx.default_device().type == mx.DeviceType.gpu):
+        return False
+    if dt not in (mx.bfloat16, mx.float16):
+        return False
+    if hd < 32 or (hd % 32) != 0 or (hd % 2) != 0 or (2 * 8 * hd * 2) > 28672:
+        return False
+    if n_kv <= 0 or (n_q % n_kv) != 0 or (n_q // n_kv) > 32:
+        return False
+    return True
+
+
+def attend_rolling_flash_decode(
+    q: mx.array,
+    k_buf: mx.array,
+    v_buf: mx.array,
+    slot_ids: mx.array,
+    valid_lens: mx.array,
+    *,
+    scale: float,
+    max_valid: int,
+    force_splits: int | None = None,
+    use_kernel: bool = True,
+) -> mx.array:
+    """Zero-copy slot-indexed Flash-Decode SDPA with dynamic Split-K and CPU/MLX fallback."""
+    b_act, n_q, s_q, hd = (int(d) for d in q.shape)
+    cap = int(k_buf.shape[1])
+    n_kv = int(k_buf.shape[2])
+    if max_valid <= 0 or b_act == 0:
+        return mx.zeros_like(q)
+
+    dt = q.dtype
+    slot_idx = slot_ids.astype(mx.int32) if slot_ids.dtype != mx.int32 else slot_ids
+    valid_arr = valid_lens.astype(mx.int32) if valid_lens.dtype != mx.int32 else valid_lens
+    if not (
+        use_kernel
+        and _can_use_flash_decode_metal(dt, n_q, n_kv, hd)
+        and k_buf.dtype == dt
+        and v_buf.dtype == dt
+    ):
+        eff_max = min(cap, int(max_valid))
+        k_b = mx.take(k_buf[:, :eff_max, :, :], slot_idx, axis=0).transpose(0, 2, 1, 3)
+        v_b = mx.take(v_buf[:, :eff_max, :, :], slot_idx, axis=0).transpose(0, 2, 1, 3)
+        k_pos = mx.arange(eff_max, dtype=mx.int32)[None, None, None, :]
+        if s_q == 1:
+            allow = k_pos < valid_arr[:, None, None, None]
+        else:
+            q_pos = (valid_arr - s_q)[:, None, None, None] + mx.arange(s_q, dtype=mx.int32)[None, None, :, None]
+            allow = (k_pos < valid_arr[:, None, None, None]) & (k_pos <= q_pos)
+        nz = valid_arr > 0
+        # For valid_len == 0 rows, expose position 0 in mask (safe finite softmax) then zero output row.
+        safe_allow = mx.where(nz[:, None, None, None], allow, k_pos == 0)
+        mask_bf16 = mx.where(
+            safe_allow,
+            mx.array(0.0, dtype=mx.bfloat16),
+            mx.array(-1e9, dtype=mx.bfloat16),
+        )
+        raw_out = mx.fast.scaled_dot_product_attention(q, k_b, v_b, scale=float(scale), mask=mask_bf16)
+        return mx.where(nz[:, None, None, None], raw_out, mx.zeros_like(raw_out))
+
+    qc = mx.contiguous(q)
+    gqa = n_q // n_kv
+    tg_threads = gqa * 32
+    total_blks = b_act * n_kv * s_q
+    scale_arr = _get_fd_scale_arr(float(scale))
+    kerns = _get_flash_decode_kernels()
+
+    if force_splits is not None:
+        n_splits = max(1, int(force_splits))
+    elif max_valid < 256 or total_blks >= 64:
+        n_splits = 1
+    else:
+        target_tgs = 80
+        want = max(1, (target_tgs + total_blks - 1) // total_blks)
+        max_by_len = max(1, max_valid // 64)
+        n_splits = min(16, want, max_by_len)
+
+    if n_splits <= 1:
+        params = _get_fd_params_arr(cap, s_q, max_valid, 1)
+        (out,) = kerns["1pass"](
+            inputs=[qc, k_buf, v_buf, slot_idx, valid_arr, params, scale_arr],
+            template=[("T", dt), ("N_Q", n_q), ("N_KV", n_kv), ("HD", hd)],
+            grid=(tg_threads, 1, total_blks),
+            threadgroup=(tg_threads, 1, 1),
+            output_shapes=[qc.shape],
+            output_dtypes=[dt],
+        )
+        return out
+
+    split_len = max(64, ((max_valid + n_splits - 1) // n_splits + 7) // 8 * 8)
+    n_splits_eff = max(1, (max_valid + split_len - 1) // split_len)
+    params = _get_fd_params_arr(cap, s_q, split_len, n_splits_eff)
+    o_part, ml_part = kerns["split_p1"](  # guard: allow-fp32
+        inputs=[qc, k_buf, v_buf, slot_idx, valid_arr, params, scale_arr],
+        template=[("T", dt), ("N_Q", n_q), ("N_KV", n_kv), ("HD", hd)],
+        grid=(tg_threads, n_splits_eff, total_blks),
+        threadgroup=(tg_threads, 1, 1),
+        output_shapes=[(b_act, n_q, s_q, n_splits_eff, hd), (b_act, n_q, s_q, n_splits_eff, 2)],
+        output_dtypes=[dt, mx.float32],
+    )
+    (out,) = kerns["split_p2"](
+        inputs=[o_part, ml_part, params],
+        template=[("T", dt), ("N_Q", n_q), ("N_KV", n_kv), ("HD", hd)],
+        grid=(32, 1, b_act * n_q * s_q),
+        threadgroup=(32, 1, 1),
+        output_shapes=[qc.shape],
+        output_dtypes=[dt],
+    )
+    return out
 
 
 class RollingKVCache:
@@ -188,6 +640,22 @@ class RollingKVCache:
             return mx.zeros_like(q_b_h_1_d)
         if eff_max > self.cap:
             raise ValueError(f"max_valid={eff_max} exceeds Cap={self.cap}")
+
+        n_q = int(q_b_h_1_d.shape[1])
+        if (
+            _can_use_flash_decode_metal(q_b_h_1_d.dtype, n_q, self.n_kv, self.head_dim)
+            and self.k_buf.dtype == q_b_h_1_d.dtype
+            and self.v_buf.dtype == q_b_h_1_d.dtype
+        ):
+            return attend_rolling_flash_decode(
+                q_b_h_1_d,
+                self.k_buf,
+                self.v_buf,
+                slot_idx,
+                valid_arr,
+                scale=float(scale),
+                max_valid=eff_max,
+            )
 
         k_b = mx.take(self.k_buf[:, :eff_max, :, :], slot_idx, axis=0).transpose(0, 2, 1, 3)
         v_b = mx.take(self.v_buf[:, :eff_max, :, :], slot_idx, axis=0).transpose(0, 2, 1, 3)
@@ -757,12 +1225,115 @@ def forward_hidden_rolling(
     h = model.embed_tokens(toks_2d)
     cos_a, sin_a = model.precompute_rope_trig(pos_arr[:, None])
 
+    b_act = int(toks_2d.shape[0])
+    env_metal = _use_gdn_metal_override()
+    use_slot_gdn = bool(
+        mx.metal.is_available()
+        and mx.default_device().type == mx.DeviceType.gpu
+        and int(toks_2d.shape[1]) == 1
+        and b_act > 0
+    )
+    active_list = (
+        [int(x) for x in slot_ids]
+        if not isinstance(slot_ids, mx.array)
+        else [int(x) for x in slot_idx.tolist()]
+    )
+
     for layer, entry in zip(model.layers, cache.layer_caches):
         if layer.is_linear:
             assert isinstance(entry, RollingDeltaSlotCache)
-            sub_c = entry.slice_for_slots(slot_idx)
-            h = h + layer.linear_attn(layer.input_layernorm(h), sub_c)
-            entry.scatter_from_subcache(slot_idx, sub_c)
+            la = layer.linear_attn
+            use_gdn_kernel = (
+                entry.state_mode == "int8_blk32"
+                or (entry.state_mode == "bf16" and env_metal is not False)
+                or (env_metal is True)
+            )
+            can_fused_gdn = bool(
+                use_slot_gdn
+                and use_gdn_kernel
+                and entry.conv_depth == 3
+                and la.conv_k == 4
+                and la.head_k_dim == la.head_v_dim
+                and la.head_k_dim >= 32
+                and (la.head_k_dim % 32) == 0
+                and h.dtype in (mx.bfloat16, mx.float16)
+            )
+            if can_fused_gdn:
+                is_contig_full = (
+                    b_act == entry.b_slots and active_list == list(range(entry.b_slots))
+                )
+                ins = la.in_group(layer.input_layernorm(h))
+                qkv = ins["qkv"]
+                z = ins["z"].reshape(b_act, 1, la.num_v_heads, la.head_v_dim)
+                b_gate = ins["b"]
+                a_gate = ins["a"]
+                cw_raw = la.conv1d.weight
+                cached_id = getattr(la, "_conv_w_2d_src_id", None)
+                cw_2d = getattr(la, "_conv_w_2d_cached", None)
+                if cw_2d is None or cached_id != id(cw_raw):
+                    cw_2d = mx.contiguous(cw_raw[:, :, 0])
+                    la._conv_w_2d_cached = cw_2d
+                    la._conv_w_2d_src_id = id(cw_raw)
+
+                q_g, k_g, v_g, g_g, beta_g, cs_new = fused_gdn_pre_recurrence(
+                    qkv,
+                    entry.conv_state,
+                    slot_idx,
+                    cw_2d,
+                    a_gate,
+                    b_gate,
+                    la.A_log,
+                    la.dt_bias,
+                    hk=la.num_k_heads,
+                    hv=la.num_v_heads,
+                    head_dim=la.head_k_dim,
+                    inv_scale=la._inv_scale,
+                    rms_eps=la._rms_eps,
+                )
+                y_g, rec_new = gdn_delta_update_slot_indexed(
+                    q_g,
+                    k_g,
+                    v_g,
+                    g_g,
+                    beta_g,
+                    slot_idx,
+                    codes_pool=entry.rec_codes,
+                    scales_pool=entry.rec_scales,
+                    state_pool=entry.rec_state,
+                    state_mode=entry.state_mode,
+                )
+                if is_contig_full:
+                    entry.conv_state = cs_new.astype(entry.conv_state.dtype)
+                    if entry.state_mode == "int8_blk32":
+                        assert isinstance(rec_new, tuple)
+                        entry.rec_codes, entry.rec_scales = rec_new
+                    else:
+                        assert not isinstance(rec_new, tuple)
+                        entry.rec_state = rec_new
+                else:
+                    entry.conv_state[slot_idx] = cs_new.astype(entry.conv_state.dtype)
+                    if entry.state_mode == "int8_blk32":
+                        assert isinstance(rec_new, tuple)
+                        assert entry.rec_codes is not None and entry.rec_scales is not None
+                        entry.rec_codes[slot_idx] = rec_new[0]
+                        entry.rec_scales[slot_idx] = rec_new[1]
+                    else:
+                        assert not isinstance(rec_new, tuple)
+                        assert entry.rec_state is not None
+                        entry.rec_state[slot_idx] = rec_new.astype(entry.rec_state.dtype)
+
+                normed = la.norm(y_g, z).reshape(b_act, 1, la.value_dim)
+                delta = la.out_proj(normed)
+                if la._out_lora is not None:
+                    la_t, lb_t, sc = la._out_lora
+                    delta = delta + (
+                        mx.matmul(mx.matmul(normed.astype(mx.bfloat16), la_t), lb_t) * sc
+                    ).astype(delta.dtype)
+                h = h + delta
+            else:
+                sub_c = entry.slice_for_slots(slot_idx)
+                h = h + layer.linear_attn(layer.input_layernorm(h), sub_c)
+                entry.scatter_from_subcache(slot_idx, sub_c)
         else:
             assert isinstance(entry, RollingKVCache)
             h = h + _full_attn_step(
@@ -1172,6 +1743,8 @@ __all__ = [
     "RollingDeltaSlotCache",
     "RollingHybridCache",
     "RollingKVCache",
+    "_can_use_flash_decode_metal",
+    "attend_rolling_flash_decode",
     "forward_hidden_rolling",
     "run_qwen3_decode_rolling",
 ]

@@ -84,92 +84,40 @@ def _parse_version_tuple(raw: str) -> tuple[int, ...]:
 
 
 def _probe_sdpa_force_fused() -> bool:
-    try:
-        q = mx.zeros((1, 4, 8, 64), dtype=mx.float16)
-        k = mx.zeros((1, 2, 8, 64), dtype=mx.float16)
-        v = mx.zeros((1, 2, 8, 64), dtype=mx.float16)
-        _ = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, force_fused=False)
-        return True
-    except TypeError:
-        return False
-    except Exception:
-        return False
+    from fast_shared.hw_check import _probe_sdpa_force_fused as _shared_probe
+
+    return bool(_shared_probe())
 
 
 def probe_metal_capabilities() -> dict[str, Any]:
-    """Probe Apple9/Apple10/Metal4/OS/MLX/TF32/SDPA capabilities once per process."""
+    """Probe Apple9/Apple10/Metal4/OS/MLX/TF32/SDPA capabilities once via `fast_shared.hw_check`."""
     global _METAL_CAP_CACHE
     if _METAL_CAP_CACHE is not None:
         return dict(_METAL_CAP_CACHE)
 
-    mac_ver_str = platform.mac_ver()[0] or ""
+    from fast_shared.hw_check import probe_host_hardware
+
+    hw = probe_host_hardware()
+    mac_ver_str = str(hw.get("macos_version") or platform.mac_ver()[0] or "")
     macos_version = _parse_version_tuple(mac_ver_str)
-    build_ver = ""
-    if platform.system() == "Darwin":
-        try:
-            build_ver = subprocess.check_output(
-                ["sw_vers", "-buildVersion"], text=True, stderr=subprocess.DEVNULL, timeout=2
-            ).strip()
-        except Exception:
-            build_ver = ""
-
-    apple9 = False
-    apple10 = False
-    metal4 = False
-    supports_placement_sparse: bool | None = None
-    if platform.system() == "Darwin":
-        try:
-            metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
-            objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-            metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
-            objc.sel_registerName.argtypes = [ctypes.c_char_p]
-            objc.sel_registerName.restype = ctypes.c_void_p
-            dev = metal.MTLCreateSystemDefaultDevice()
-            if dev:
-                msg_family = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
-                    ("objc_msgSend", objc)
-                )
-                sel_family = objc.sel_registerName(b"supportsFamily:")
-                apple9 = bool(msg_family(dev, sel_family, 1009))
-                apple10 = bool(msg_family(dev, sel_family, 1010))
-                metal4 = bool(msg_family(dev, sel_family, 5002))
-                msg_resp = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
-                    ("objc_msgSend", objc)
-                )
-                sel_resp = objc.sel_registerName(b"respondsToSelector:")
-                sel_sparse = objc.sel_registerName(b"supportsPlacementSparse")
-                if msg_resp(dev, sel_resp, sel_sparse):
-                    msg_bool = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
-                    supports_placement_sparse = bool(msg_bool(dev, sel_sparse))
-                cf_rel = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
-                cf_rel(dev, objc.sel_registerName(b"release"))
-        except Exception:
-            pass
-
-    dev_info: dict[str, Any] = {}
-    try:
-        dev_info = dict(mx.device_info())
-    except Exception:
-        pass
-
-    mlx_ver_str = str(getattr(mx, "__version__", "0.0.0"))
+    mlx_ver_str = str(hw.get("mlx_version") or getattr(mx, "__version__", "0.0.0"))
     mlx_version = _parse_version_tuple(mlx_ver_str)
     sdpa_force_fused = (mlx_version >= (0, 32, 2)) and _probe_sdpa_force_fused()
 
     _METAL_CAP_CACHE = {
         "macos_version": macos_version,
         "macos_version_str": mac_ver_str,
-        "macos_build": build_ver,
+        "macos_build": str(hw.get("macos_build") or ""),
         "mlx_version": mlx_version,
         "mlx_version_str": mlx_ver_str,
         "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "1"),
-        "apple9": apple9,
-        "apple10": apple10,
-        "metal4": metal4,
-        "supports_placement_sparse": supports_placement_sparse,
+        "apple9": bool(hw.get("supports_apple9", False)),
+        "apple10": bool(hw.get("supports_apple10", False)),
+        "metal4": bool(hw.get("supports_metal4", False)),
+        "supports_placement_sparse": hw.get("supports_placement_sparse"),
         "sdpa_supports_force_fused": sdpa_force_fused,
-        "device_name": str(dev_info.get("device_name", "")),
-        "architecture": str(dev_info.get("architecture", "")),
+        "device_name": str(hw.get("brand") or ""),
+        "architecture": str(hw.get("mlx_architecture") or ""),
     }
     return dict(_METAL_CAP_CACHE)
 
@@ -313,7 +261,7 @@ def should_force_fused_sdpa(
     sdpa_supports_force_fused: bool = True,
     macos_version: tuple[int, ...] = (26, 2),
 ) -> bool:
-    """Gate SDPA `force_fused=True` strictly to M5 (Apple10) FP16 SWA D256 at S in {384, 512}.
+    """Gate SDPA `force_fused=True` strictly to M5 (Apple10) FP16 SWA D256 at `seq_l >= 128`.
 
     Never enabled on Apple9 (M4 Pro regresses +6% on 8x512) and never on D512 full-attention layers.
     """
@@ -323,7 +271,7 @@ def should_force_fused_sdpa(
         and tuple(macos_version) >= (26, 2)
         and bool(is_swa)
         and int(hd) == 256
-        and int(seq_l) in (384, 512)
+        and int(seq_l) >= 128
         and dtype == mx.float16
     )
 

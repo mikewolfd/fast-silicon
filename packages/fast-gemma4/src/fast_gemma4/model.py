@@ -73,17 +73,19 @@ def _supports_mpp_bf16() -> bool:
 
 
 def _detect_gpu_family() -> str:
-    """Classify Apple Silicon GPU family (`apple9` for M4, `apple10` for M5+/NAX)."""
+    """Classify Apple Silicon GPU family (`apple9` for M4, `apple10` for M5+/NAX) via `fast_shared.hw_check`."""
     try:
-        dev_info_fn = getattr(mx, "device_info", None)
-        if not callable(dev_info_fn):
-            return "apple9"
-        info = dev_info_fn()
-        name = str(info.get("device_name", "")).lower()
-        arch = str(info.get("architecture", "")).lower()
-        if "m5" in name or "m6" in name or "apple10" in arch or "g17" in arch:
+        from fast_shared.hw_check import probe_host_hardware, supports_apple10_nax
+
+        hw = probe_host_hardware()
+        if supports_apple10_nax(hw):
             return "apple10"
-        if "m4" in name or "apple9" in arch or "g16" in arch:
+        fam = str(hw.get("gpu_family") or "").lower()
+        arch = str(hw.get("mlx_architecture") or "").lower()
+        name = str(hw.get("brand") or "").lower()
+        if "apple10" in fam or "m5" in name or "m6" in name or "g17" in arch:
+            return "apple10"
+        if "apple9" in fam or "m4" in name or "g16" in arch:
             return "apple9"
     except Exception:
         pass

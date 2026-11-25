@@ -88,7 +88,7 @@ On the 64-doc verification fixture (`bge-small verify`), minimum cosine similari
 | Component | How it works | Source |
 | --- | --- | --- |
 | **16-core ANE runner** | Pure-ANE Core ML buckets with a 4-slot async ring, NEON FP16 transpose, and Layer-11 `[CLS]` slicing | [`native/bge_ane_runner.mm`](native/bge_ane_runner.mm) |
-| **Metal GPU** | Packed variable-length batching with zero attention padding, bidirectional FlashAttention, and fused GELU + LayerNorm | [`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py) |
+| **Metal GPU** | Packed variable-length batching with zero attention padding, Apple10 NAX Metal 4 `MPP::matmul2d` `32x64` FlashAttention (`1.454x` attention / `213.5k tok/s` `hetero` / `173.2k tok/s` `gpu` on Base M5), and fused GELU + LayerNorm | [`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py) |
 | **Work-stealing scheduler** | GPU pulls longest sequences forward while ANE pulls shortest backward, with 4-batch Parquet prefetch (1.18-1.33x faster) | [`src/fast_bge_small/`](src/fast_bge_small/) |
 
 ## CLI, Parquet & HTTP server

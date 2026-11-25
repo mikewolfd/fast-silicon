@@ -130,6 +130,11 @@ from .ir_dtype_guard import (
 _OPTIONAL_IMPORT_ERRORS: dict[str, ImportError] = {}
 
 _LAZY_MLX_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    ".argmax": (
+        "gpu_argmax_conf",
+        "gpu_argmax_nan",
+        "stats_to_logprob_margin",
+    ),
     ".kv_quant": (
         "VALID_KV_MODES",
         "HadamardTransformBank",
@@ -484,6 +489,8 @@ __all__ = [
     "get_hadamard_bank",
     "get_or_pack_affine_module_weights",
     "get_unified_memory_footprint",
+    "gpu_argmax_conf",
+    "gpu_argmax_nan",
     "interleaved_abba",
     "iter_chat_sse_events",
     "iter_completion_sse_events",
@@ -554,6 +561,7 @@ __all__ = [
     "slice_first_pages_utf8",
     "slice_ocr_pages_utf8",
     "split_conformal_quantile",
+    "stats_to_logprob_margin",
     "summarize_accelerator_placement",
     "summarize_cold_warm_latencies",
     "supports_apple10_nax",

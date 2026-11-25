@@ -539,7 +539,7 @@ class FastGptOssModel:
         self,
         model_dir: str | Path,
         *,
-        vocab_out: int | None = 131072,
+        vocab_out: int | None = None,
         vocab_remap_npz: str | Path | None = None,
         tokenizer_json_path: str | Path | None = None,
         compile_kernels: bool = True,
@@ -605,7 +605,7 @@ class FastGptOssModel:
         self._b1_moe_combine_c = _get_compiled_b1_moe_combine()
         self._nax_moe_combine_c = _get_compiled_nax_moe_combine()
         self._is_m5_nax_moe = _detect_m5_nax_moe(mx)
-        self._moe_hot_threshold = 12 if self._is_m5_nax_moe else 8
+        self._moe_hot_threshold = 8
         self._moe_tile_chunk_tokens = 256
         self._fast_all_quant = bool(
             self.emb_quant
@@ -1102,11 +1102,11 @@ class FastGptOssModel:
         scores_2d: Any,
         ld: dict[str, Any],
     ) -> Any:
-        """Unified multi-token MoE residual update: M5 NAX `n_tok >= 2` or Apple9 chunked tile-table MPP."""
+        """Unified multi-token MoE residual update: Hot-MPP + Cold-QMV (`hot_threshold=8`) with NAX fallback."""
         import mlx.core as mx
 
         n_tok = int(pn_2d.shape[0])
-        if (self._is_m5_nax_moe and n_tok >= 2) or self._kernels is None:
+        if self._kernels is None:
             return self._moe_gather_qmm_nax(pn_2d, h_2d, inds_2d, scores_2d, ld)
 
         chunk = int(self._moe_tile_chunk_tokens)
@@ -1533,11 +1533,14 @@ class FastGptOssModel:
         l_sys = int(batch_cache["L_sys"])
         suf_lens = [len(s) for s in suffix_lists]
         batch_cache["suf_max"] = max(suf_lens) if suf_lens else 0
+        eff_cd = int(chunk_docs)
+        if b_tot > 1 and sum(suf_lens) > 1536 and suf_lens:
+            eff_cd = max(1, min(eff_cd, 1536 // max(1, batch_cache["suf_max"])))
         last_logits = []
         last_hfs = []
 
-        for b0 in range(0, b_tot, chunk_docs):
-            b1 = min(b_tot, b0 + chunk_docs)
+        for b0 in range(0, b_tot, eff_cd):
+            b1 = min(b_tot, b0 + eff_cd)
             sub = suffix_lists[b0:b1]
             sub_lens = [len(x) for x in sub]
             flat_ids: list[int] = []

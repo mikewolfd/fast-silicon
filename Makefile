@@ -46,6 +46,7 @@ guard:
 test-cpu: hw-check
 	$(PYTHON) -m pytest -v \
 		packages/fast-shared/tests/test_ir_dtype_guard_cpu.py \
+		packages/fast-shared/tests/test_argmax_cpu.py \
 		packages/fast-shared/tests/test_fast_shared.py \
 		packages/fast-shared/tests/test_gemma4_vision_cpu.py \
 		packages/fast-shared/tests/test_outcome_eval_cpu.py \
@@ -68,6 +69,7 @@ test-cpu: hw-check
 		packages/fast-qwen3/tests/test_fast_qwen3_gdn_state_cpu.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_rolling_cpu.py \
 		packages/fast-qwen3/tests/test_fast_qwen3_multimodal_rolling_cpu.py \
+		packages/fast-qwen3/tests/test_ms123_guards_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_regions_cpu.py \
 		packages/fast-ocr/tests/test_fast_ocr_whitepatch_vocab_cpu.py \
@@ -112,5 +114,5 @@ sync-clean-check:
 
 leak-check:
 	@! rg -n -i "/users/|\.gemini|antigravity|\.cache/archive-release|focus-macbook|~/work|~/desktop|~/documents|~/downloads|congress|docmeta|hhrg|crpt|senate|committee|appropriations|fused_v4|rosters_lookup" \
-		packages scripts tests docs pyproject.toml .agents LICENSE .gitignore uv.lock README.md
-	@! rg -n -i "~/" docs README.md pyproject.toml .agents LICENSE .gitignore uv.lock
+		packages scripts tests docs pyproject.toml .agents LICENSE .gitignore uv.lock README.md CHANGELOG.md
+	@! rg -n -i "~/" docs README.md CHANGELOG.md pyproject.toml .agents LICENSE .gitignore uv.lock

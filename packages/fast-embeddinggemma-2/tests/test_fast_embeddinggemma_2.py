@@ -661,17 +661,17 @@ def test_plain_matmul_and_force_fused_sdpa_gate() -> None:
     trunk_src = ast.get_source_segment(src, trunk_fn) or ""
     assert "mx.matmul(" in trunk_src and "_mpp_matmul(" not in trunk_src
 
-    # Apple10 (M5) + SWA + D256 + S in (384, 512) + FP16 + macOS >= 26.2 -> True
-    for seq_l in (384, 512):
+    # Apple10 (M5) + SWA + D256 + S >= 128 + FP16 + macOS >= 26.2 -> True
+    for seq_l in (128, 192, 256, 320, 384, 448, 512):
         assert emb2_gpu.should_force_fused_sdpa(
             is_apple10=True, is_swa=True, hd=256, seq_l=seq_l, dtype=mx.float16,
             sdpa_supports_force_fused=True, macos_version=(26, 2),
         )
-    # NEVER on Apple9 (M4 Pro), NEVER on D512, NEVER on other seq_l, NEVER on macOS < 26.2
+    # NEVER on Apple9 (M4 Pro), NEVER on D512, NEVER on seq_l < 128, NEVER on macOS < 26.2
     assert not emb2_gpu.should_force_fused_sdpa(is_apple10=False, is_swa=True, hd=256, seq_l=512)
     assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=False, hd=512, seq_l=512)
     assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=True, hd=512, seq_l=512)
-    for bad_s in (64, 128, 192, 256, 320, 448, 640, 1024, 2048):
+    for bad_s in (32, 64, 96, 127):
         assert not emb2_gpu.should_force_fused_sdpa(is_apple10=True, is_swa=True, hd=256, seq_l=bad_s)
     assert not emb2_gpu.should_force_fused_sdpa(
         is_apple10=True, is_swa=True, hd=256, seq_l=512, macos_version=(26, 1)

@@ -22,19 +22,19 @@ from .model import (
 MAX_MTP_BATCH_APPLE9: int = 4
 
 
-def _host_supports_apple10_nax() -> bool:
-    try:
-        from fast_shared.hw_check import probe_host_hardware, supports_apple10_nax
+_CACHED_APPLE10_NAX: bool | None = None
 
-        hw = probe_host_hardware()
-        if isinstance(hw, dict):
-            probe = dict(hw)
-            probe.setdefault("system", "Darwin")
-            probe.setdefault("machine", "arm64")
-            return bool(supports_apple10_nax(probe))
-    except Exception:
-        pass
-    return False
+
+def _host_supports_apple10_nax() -> bool:
+    global _CACHED_APPLE10_NAX
+    if _CACHED_APPLE10_NAX is None:
+        try:
+            from fast_shared.hw_check import supports_apple10_nax
+
+            _CACHED_APPLE10_NAX = bool(supports_apple10_nax())
+        except Exception:
+            _CACHED_APPLE10_NAX = False
+    return _CACHED_APPLE10_NAX
 
 
 def should_use_speculative_qwen(

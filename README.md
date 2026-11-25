@@ -55,15 +55,15 @@ Pair that dual-accelerator scheduler with zero-padding sequence packing, shared 
 
 | Workload | Package | What you get | Prebuilt download |
 | --- | --- | --- | --- |
-| Search short English passages | [`fast-bge-small`](packages/fast-bge-small) | 384d vectors; **0.49 ms** warm query (M4 Pro), **200.6k tok/s** bulk (**11.3x** stock MLX). | ~0.15-0.35 GB |
-| Index 2K passages & page images | [`fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | Up to 2,048 tokens (128-768d); **48.8k tok/s** (**4.3-4.8x** MLX, **3.3x** Core ML), **19.0 img/s** lazy vision. | ~0.30-0.65 GB |
-| Contextual passage & 32K search | [`fast-pplx`](packages/fast-pplx) | Contextual 4K chunking lifts legal nDCG from 0.359 (isolated) to 0.703, matching stock `pplx-context-mlx` at **4.4x** speed; `MaxSim` covers 4K-32K docs. | ~1.8-2.4 GB |
+| Search short English passages | [`fast-bge-small`](packages/fast-bge-small) | 384d vectors; **0.49 ms** warm query (M4 Pro), **200.6-213.5k tok/s** bulk (**11.3x** stock MLX; M5 NAX `32x64` MPP FA). | ~0.15-0.35 GB |
+| Index 2K passages & page images | [`fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | Up to 2,048 tokens (128-768d); **48.8k tok/s** (**4.3-4.8x** MLX, **3.3x** Core ML), **19.0 img/s** lazy vision, `1.73-1.93x` M5 SWA at `S>=128`. | ~0.30-0.65 GB |
+| Contextual passage & 32K search | [`fast-pplx`](packages/fast-pplx) | Contextual 4K chunking lifts legal nDCG from 0.359 (isolated) to 0.703 (`4.4x` stock), **25.8k tok/s** M5 `hetero2`, `w512_ov64` `MaxSim` `+8.33 pp` 32K recall. | ~1.8-2.4 GB |
 | Score decisions & rerank choices | [`fast-decision-models`](packages/fast-decision-models) | 100% Pure-ANE 421M `Laya` (**5.1 ms** query, 1,400 items in **37.9 s** hetero) + `Kev-0.8B/4B` with prefix cache. | ~1.3-4.9 GB |
 | High-throughput JSON & tools (2B) | [`fast-gemma4`](packages/fast-gemma4) | **10.5 valid docs/s** at `B=128` (**5.2x** `mlx-vlm` valid rate across B=128 vs B=64; 150/150 valid at 0.946 F1; 4.8-6.3 GB MLX). | ~4.2-5.4 GB (~10.4-17.0 GB with test extras) |
-| Reasoning, tools & 16K JSON (4B/9B) | [`fast-qwen3`](packages/fast-qwen3) | Hybrid GatedDeltaNet + 4-bit QuaRot KV (**2.1x** faster at 16K); **300/300** valid on 300 JSON/tool tasks. | ~3.3 GB |
-| Extract Markdown & tables from PDFs | [`fast-ocr`](packages/fast-ocr) | Clean PDF bypass (**139-220 pp/s**), parallel Apple Vision ANE (**5-9.6 pp/s**), and `OvisOCR2-8bit` VLM (**1.5-3.5x**). | ~2.60 GB |
-| Batch 20B MXFP4 MoE generation | [`fast-gpt-oss`](packages/fast-gpt-oss) | `gpt-oss-20b` verified across **24-48 GB+ Macs** (**103 tok/s** @ B=16 on 24 GB M5; **444 tok/s** @ B=128 on 48 GB; auto-clamps on 16 GB). | ~12.10 GB |
-| Shared runtime & compact index | [`fast-shared`](packages/fast-shared) | Dynamic chip dispatch, `CompactRetrievalIndex` (0.50 ms @ 100k vecs), `PrefixTree`, KV quant, and Parquet ETL. | - |
+| Reasoning, tools & 16K JSON (4B/9B) | [`fast-qwen3`](packages/fast-qwen3) | Hybrid GDN + slot-indexed Flash-Decode/GDN rolling (**503.5 tok/s** @ `B=64`, up to `3.88x` decode), 4-bit QuaRot KV; **300/300** JSON/tools. | ~3.3 GB |
+| Extract Markdown & tables from PDFs | [`fast-ocr`](packages/fast-ocr) | Clean PDF bypass (**139-220 pp/s**), parallel ANE (**5-9.6 pp/s**), court-caption filter (`+3.64 pp`), `3.15M` ViT cap (`1.87x` olmOCR, `-1.94 GB`). | ~2.60 GB |
+| Batch 20B MXFP4 MoE generation | [`fast-gpt-oss`](packages/fast-gpt-oss) | `gpt-oss-20b` across **24-48 GB+ Macs** (M5 Hot-MPP **1.71x** @ B=8, full 201K vocab **`+34.5 pp`** extraction F1; **444 tok/s** @ B=128 on 48 GB). | ~12.10 GB |
+| Shared runtime & compact index | [`fast-shared`](packages/fast-shared) | Unified `hw_check` dispatch, 1-pass NaN/Inf GPU `argmax`, `CompactRetrievalIndex` (`0.39-0.50 ms` @ 100k), `PrefixTree`, KV quant, Parquet ETL. | - |
 
 ## Cross-silicon benchmarks (`M4 Pro 48 GB` vs. `Base M5 24 GB`)
 
@@ -110,4 +110,4 @@ Pre-compiled `.mlmodelc` Core ML bundles and pre-quantized MLX checkpoints skip 
 - **Compared to public Core ML exports & Apple CoreAI:** Standalone Core ML models save RAM on single models, while `fast-silicon` adds long-context GPU fallback (`2K-32K`), batch work-stealing, and unified Python/Parquet CLIs.
 - **Acknowledgments:** [`zm2231/pplx-context-mlx`](https://github.com/zm2231/pplx-context-mlx) (MIT) inspired `fast-pplx` memmap embeddings, tile-aligned slicing, and parity testing. Built on `mlx`, `mlx-lm`, `coremltools`, `llguidance`, `pypdfium2`, and upstream weights from BAAI, Google, Qwen, Perplexity, OpenAI, and ConvAI.
 
-Code is [MIT licensed](LICENSE) (downloaded upstream model weights remain subject to their original licenses). For contributor workflows, sibling repo syncing, and test suites, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Code is [MIT licensed](LICENSE) (downloaded upstream model weights remain subject to their original licenses). See [CHANGELOG.md](CHANGELOG.md) for release history and [CONTRIBUTING.md](CONTRIBUTING.md) for contributor workflows, sibling repo syncing, and test suites.

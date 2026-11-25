@@ -89,7 +89,7 @@ Install with `uv sync --python 3.13 --package fast-embeddinggemma-2 --extra visi
 
 | Component | How it works | Source |
 | --- | --- | --- |
-| **Metal GPU** | Native `mx.matmul` projections, fused GeGLU + Per-Layer Embedding kernels, fused QKV norm + RoPE, and variable-length packing to 2,048 tokens | [`src/fast_embeddinggemma_2/gpu.py`](src/fast_embeddinggemma_2/gpu.py) |
+| **Metal GPU** | Native `mx.matmul` projections, fused GeGLU + Per-Layer Embedding kernels, fused QKV norm + RoPE, Apple10 `force_fused` SWA (`1.73-1.93x` at `seq_l >= 128`, `-193` to `-301 MB` MLX), and variable-length packing to 2,048 tokens | [`src/fast_embeddinggemma_2/gpu.py`](src/fast_embeddinggemma_2/gpu.py) |
 | **Pure-ANE Core ML (`W8A16`)** | Nine packed sequence buckets (`32..512`, `2,288` ANE ops, `0` CPU/GPU ops), 4-slot async ring, NEON untiling, and Accelerate `cblas_sgemm` projection | [`native/emb2_coreml_runner.mm`](native/emb2_coreml_runner.mm), [`native/emb2_fast_io.cpp`](native/emb2_fast_io.cpp) |
 | **CPU-SME (opt-in `hetero3`)** | Mixed FP16 matmul / FP32 norm+softmax Core ML graphs (`256, 384, 512`) for standalone CPU/3-way runs | [`scripts/build_ane_models.py`](scripts/build_ane_models.py) |
 

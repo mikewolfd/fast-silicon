@@ -186,8 +186,10 @@ def test_detect_apple10_d256_force_fused(monkeypatch) -> None:
     assert detect_apple10_d256_force_fused({"device_name": "Apple M4 Pro", "architecture": "applegpu_g16"}, "26.6") is False
     assert detect_apple10_d256_force_fused({"device_name": "Apple M5", "architecture": "applegpu_g17"}, "26.1") is False
 
-    sig_has_force = "force_fused" in inspect.signature(mx.fast.scaled_dot_product_attention).parameters
-    assert detect_apple10_d256_force_fused({"device_name": "Apple M5", "architecture": "applegpu_g17"}, "27.2") is sig_has_force
+    from fast_shared.hw_check import _probe_sdpa_force_fused
+
+    ff_ok = _probe_sdpa_force_fused()
+    assert detect_apple10_d256_force_fused({"device_name": "Apple M5", "architecture": "applegpu_g17"}, "27.2") is ff_ok
 
     monkeypatch.setenv("MLX_METAL_NO_NAX", "1")
     assert detect_apple10_d256_force_fused({"device_name": "Apple M5", "architecture": "applegpu_g17"}, "27.2") is False

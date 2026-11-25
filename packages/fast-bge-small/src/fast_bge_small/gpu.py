@@ -13,6 +13,7 @@ import numpy as np
 
 from fast_shared.bench import clear_mlx_arena
 from fast_shared.metal_mpp import (
+    HEADER_MPP as _HEADER_MPP,
     HEADER_SIMDGROUP as _HEADER_SG,
     HEADER_STD as _HEADER_STD,
     make_mpp_matmul_kernel,
@@ -40,75 +41,30 @@ def _parse_version_tuple(raw: str) -> tuple[int, ...]:
 
 
 def probe_metal_capabilities() -> dict[str, Any]:
-    """Query Apple9/Apple10/Metal4/OS/MLX/TF32 runtime capabilities once per process."""
+    """Query Apple9/Apple10/Metal4/OS/MLX/TF32 runtime capabilities once via `fast_shared.hw_check`."""
     global _METAL_CAP_CACHE
     if _METAL_CAP_CACHE is not None:
         return dict(_METAL_CAP_CACHE)
 
-    mac_ver_str = platform.mac_ver()[0] or ""
+    from fast_shared.hw_check import probe_host_hardware
+
+    hw = probe_host_hardware()
+    mac_ver_str = str(hw.get("macos_version") or platform.mac_ver()[0] or "")
     macos_version = _parse_version_tuple(mac_ver_str)
-    build_ver = ""
-    if platform.system() == "Darwin":
-        try:
-            build_ver = subprocess.check_output(
-                ["sw_vers", "-buildVersion"], text=True, stderr=subprocess.DEVNULL, timeout=2
-            ).strip()
-        except Exception:
-            build_ver = ""
-
-    apple9 = False
-    apple10 = False
-    metal4 = False
-    supports_placement_sparse: bool | None = None
-    if platform.system() == "Darwin":
-        try:
-            metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
-            objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-            metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
-            objc.sel_registerName.argtypes = [ctypes.c_char_p]
-            objc.sel_registerName.restype = ctypes.c_void_p
-            dev = metal.MTLCreateSystemDefaultDevice()
-            if dev:
-                msg_family = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
-                    ("objc_msgSend", objc)
-                )
-                sel_family = objc.sel_registerName(b"supportsFamily:")
-                apple9 = bool(msg_family(dev, sel_family, 1009))
-                apple10 = bool(msg_family(dev, sel_family, 1010))
-                metal4 = bool(msg_family(dev, sel_family, 5002))
-                msg_resp = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
-                    ("objc_msgSend", objc)
-                )
-                sel_resp = objc.sel_registerName(b"respondsToSelector:")
-                sel_sparse = objc.sel_registerName(b"supportsPlacementSparse")
-                if msg_resp(dev, sel_resp, sel_sparse):
-                    msg_bool = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
-                    supports_placement_sparse = bool(msg_bool(dev, sel_sparse))
-                cf_rel = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
-                cf_rel(dev, objc.sel_registerName(b"release"))
-        except Exception:
-            pass
-
-    dev_info: dict[str, Any] = {}
-    try:
-        dev_info = dict(mx.device_info())
-    except Exception:
-        pass
-
-    mlx_ver_str = str(getattr(mx, "__version__", "0.0.0"))
+    mlx_ver_str = str(hw.get("mlx_version") or getattr(mx, "__version__", "0.0.0"))
     _METAL_CAP_CACHE = {
         "macos_version": macos_version,
         "macos_version_str": mac_ver_str,
-        "macos_build": build_ver,
+        "macos_build": str(hw.get("macos_build") or ""),
         "mlx_version": _parse_version_tuple(mlx_ver_str),
         "mlx_version_str": mlx_ver_str,
         "mlx_enable_tf32": os.environ.get("MLX_ENABLE_TF32", "1"),
-        "apple9": apple9,
-        "apple10": apple10,
-        "metal4": metal4,
-        "supports_placement_sparse": supports_placement_sparse,
-        "device_name": str(dev_info.get("device_name", "")),
-        "architecture": str(dev_info.get("architecture", "")),
+        "apple9": bool(hw.get("supports_apple9", False)),
+        "apple10": bool(hw.get("supports_apple10", False)),
+        "metal4": bool(hw.get("supports_metal4", False)),
+        "supports_placement_sparse": hw.get("supports_placement_sparse"),
+        "device_name": str(hw.get("brand") or ""),
+        "architecture": str(hw.get("mlx_architecture") or ""),
     }
     return dict(_METAL_CAP_CACHE)
 
@@ -384,6 +340,149 @@ _FA32_KERNEL = mx.fast.metal_kernel(
     source=_FA32_SRC,
 )
 
+# Apple10 (M5+ NAX) Metal 4 MPP::matmul2d 32x64 (4 simdgroup) varlen Flash Attention for d_head=32.
+_FA32_MPP_32x64_SRC = """
+    uint tid = thread_position_in_threadgroup.x; // 0..127
+    uint sg = tid >> 5;                          // 0..3
+    uint lane = tid & 31;                        // 0..31
+    uint tile_idx = threadgroup_position_in_grid.y;
+    uint h = threadgroup_position_in_grid.z;     // 0..11
+
+    uint base_t = tile_idx * 4;
+    uint q_start = (uint)tiles[base_t + 0];
+    uint q_end   = (uint)tiles[base_t + 1];
+    uint kv_start = (uint)tiles[base_t + 2];
+    uint kv_end   = (uint)tiles[base_t + 3];
+    uint q_cnt = q_end - q_start;
+
+    threadgroup half Qs[32 * 32];
+    threadgroup half Ks[64 * 32];
+    threadgroup half Vs[64 * 32];
+    threadgroup half Ps[32 * 64];
+    threadgroup float S_smem[32 * 64];
+    threadgroup float alpha_tg[32];
+    threadgroup float l_tg[32];
+
+    uint h_off = h * 32;
+    uint lr = tid >> 2;             // 0..31
+    uint lc = (tid & 3) * 8;        // 0, 8, 16, 24
+    if (lr < q_cnt) {
+        const device half* qp = QKV + (q_start + lr) * 1152 + h_off + lc;
+        *(threadgroup half4*)(Qs + lr * 32 + lc) = *(const device half4*)(qp);
+        *(threadgroup half4*)(Qs + lr * 32 + lc + 4) = *(const device half4*)(qp + 4);
+    } else {
+        *(threadgroup half4*)(Qs + lr * 32 + lc) = half4(0.0h);
+        *(threadgroup half4*)(Qs + lr * 32 + lc + 4) = half4(0.0h);
+    }
+    if (tid < 32) l_tg[tid] = 0.0f;
+
+    constexpr auto desc_qk = matmul2d_descriptor(
+        32, 64, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    constexpr auto desc_pv = matmul2d_descriptor(
+        32, 32, 64, false, false, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<desc_qk, execution_simdgroups<4>> op_qk;
+    matmul2d<desc_pv, execution_simdgroups<4>> op_pv;
+
+    auto tQ = tensor<threadgroup half, extents<int32_t, 32, 32>, tensor_inline>(Qs, extents<int32_t, 32, 32>());
+    auto tK = tensor<threadgroup half, extents<int32_t, 32, 64>, tensor_inline>(Ks, extents<int32_t, 32, 64>());
+    auto tP = tensor<threadgroup half, extents<int32_t, 64, 32>, tensor_inline>(Ps, extents<int32_t, 64, 32>());
+    auto tV = tensor<threadgroup half, extents<int32_t, 32, 64>, tensor_inline>(Vs, extents<int32_t, 32, 64>());
+    auto tS = tensor<threadgroup float, extents<int32_t, 64, 32>, tensor_inline>(S_smem, extents<int32_t, 64, 32>());
+    auto tO = tensor<threadgroup float, extents<int32_t, 32, 32>, tensor_inline>(S_smem, extents<int32_t, 32, 32>());
+
+    auto cS = op_qk.get_destination_cooperative_tensor<decltype(tQ), decltype(tK), float>();
+    auto cO = op_pv.get_destination_cooperative_tensor<decltype(tP), decltype(tV), float>();
+    auto bO = op_pv.get_destination_cooperative_tensor<decltype(tP), decltype(tV), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < cO.get_capacity(); ++i) {
+        if (cO.is_valid_element(i)) cO[i] = 0.0f;
+    }
+
+    float m_reg[8];
+    float l_reg[8];
+    #pragma unroll
+    for (uint rr = 0; rr < 8; ++rr) {
+        m_reg[rr] = -1e30f;
+        l_reg[rr] = 0.0f;
+    }
+
+    const float scale_log2e = 0.17677669529663687f * 1.4426950408889634f;
+
+    for (uint kb = kv_start; kb < kv_end; kb += 64) {
+        #pragma unroll
+        for (uint half_i = 0; half_i < 2; ++half_i) {
+            uint row_loc = half_i * 32 + lr;
+            uint k_row = kb + row_loc;
+            if (k_row < kv_end) {
+                const device half* kp = QKV + k_row * 1152 + 384 + h_off + lc;
+                const device half* vp = QKV + k_row * 1152 + 768 + h_off + lc;
+                *(threadgroup half4*)(Ks + row_loc * 32 + lc) = *(const device half4*)(kp);
+                *(threadgroup half4*)(Ks + row_loc * 32 + lc + 4) = *(const device half4*)(kp + 4);
+                *(threadgroup half4*)(Vs + row_loc * 32 + lc) = *(const device half4*)(vp);
+                *(threadgroup half4*)(Vs + row_loc * 32 + lc + 4) = *(const device half4*)(vp + 4);
+            } else {
+                *(threadgroup half4*)(Ks + row_loc * 32 + lc) = half4(0.0h);
+                *(threadgroup half4*)(Ks + row_loc * 32 + lc + 4) = half4(0.0h);
+                *(threadgroup half4*)(Vs + row_loc * 32 + lc) = half4(0.0h);
+                *(threadgroup half4*)(Vs + row_loc * 32 + lc + 4) = half4(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        op_qk.run(tQ, tK, cS);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool k0_valid = (kb + lane) < kv_end;
+        bool k1_valid = (kb + 32 + lane) < kv_end;
+        #pragma unroll
+        for (uint rr = 0; rr < 8; ++rr) {
+            uint qr = sg * 8 + rr;
+            float s0 = k0_valid ? (S_smem[qr * 64 + lane] * scale_log2e) : -1e30f;
+            float s1 = k1_valid ? (S_smem[qr * 64 + 32 + lane] * scale_log2e) : -1e30f;
+            float rmax = simd_max(max(s0, s1));
+            float m_new = max(m_reg[rr], rmax);
+            float alpha = exp2(m_reg[rr] - m_new);
+            float p0 = k0_valid ? exp2(s0 - m_new) : 0.0f;
+            float p1 = k1_valid ? exp2(s1 - m_new) : 0.0f;
+            float rsum = simd_sum(p0 + p1);
+            m_reg[rr] = m_new;
+            l_reg[rr] = l_reg[rr] * alpha + rsum;
+            if (lane == 0) {
+                alpha_tg[qr] = alpha;
+                l_tg[qr] = l_reg[rr];
+            }
+            Ps[qr * 64 + lane] = (half)p0;
+            Ps[qr * 64 + 32 + lane] = (half)p1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        op_pv.run(tP, tV, bO);
+        #pragma unroll
+        for (uint16_t i = 0; i < cO.get_capacity(); ++i) {
+            if (cO.is_valid_element(i)) {
+                uint r = uint(cO.get_multidimensional_index(i)[1]);
+                cO[i] = cO[i] * alpha_tg[r] + bO[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    cO.store(tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lr < q_cnt) {
+        device half* outp = Out + (q_start + lr) * 384 + h_off + lc;
+        float inv_l = 1.0f / l_tg[lr];
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            outp[j] = (half)(S_smem[lr * 32 + lc + j] * inv_l);
+        }
+    }
+"""
+
 # ---------------------------------------------------------------------------
 # 5. Layer 11 CLS-only Attention (Q_cls: [N_docs, 384], KV: [M_tok, 768])
 # ---------------------------------------------------------------------------
@@ -481,6 +580,23 @@ def _build_mpp_kernels(caps: dict[str, Any] | None = None):
 
 
 _MPP_QKV, _MPP_BIAS_RES, _MPP_BIAS_GELU = _build_mpp_kernels()
+
+
+def _build_fa32_mpp_32x64_kernel(caps: dict[str, Any] | None = None):
+    """Instantiate Apple10 NAX MPP::matmul2d FA32 kernel only on Metal 4 + Apple10 hosts."""
+    c = caps if caps is not None else probe_metal_capabilities()
+    if not (should_use_fused_mpp(c) and bool(c.get("apple10", False))):
+        return None
+    return mx.fast.metal_kernel(
+        name="bge_varlen_fa32_mpp_32x64",
+        input_names=["QKV", "tiles"],
+        output_names=["Out"],
+        header=_HEADER_MPP,
+        source=_FA32_MPP_32x64_SRC,
+    )
+
+
+_FA32_MPP_32x64_KERNEL = _build_fa32_mpp_32x64_kernel()
 
 
 def _plan_packed_batches(token_lists, max_tokens: int = 8192) -> list[list[tuple[int, Any]]]:
@@ -700,7 +816,8 @@ class FastBgeSmallGPU:
         for l in range(11):
             ld = self.layers[l]
             qkv = mx.matmul(h, ld["w_qkv"].T) + ld["b_qkv"]
-            attn_out = _FA32_KERNEL(
+            fa_kern = _FA32_MPP_32x64_KERNEL if _FA32_MPP_32x64_KERNEL is not None else _FA32_KERNEL
+            attn_out = fa_kern(
                 inputs=[qkv, tiles_mx],
                 grid=(128, nt, 12),
                 threadgroup=(128, 1, 1),
@@ -787,7 +904,8 @@ class FastBgeSmallGPU:
                 output_shapes=[(M_pad, 1152)],
                 output_dtypes=[mx.float16],
             )[0]
-            attn_out = _FA32_KERNEL(
+            fa_kern = _FA32_MPP_32x64_KERNEL if _FA32_MPP_32x64_KERNEL is not None else _FA32_KERNEL
+            attn_out = fa_kern(
                 inputs=[qkv, tiles_mx],
                 grid=(128, nt, 12),
                 threadgroup=(128, 1, 1),

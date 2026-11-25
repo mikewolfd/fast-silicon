@@ -39,7 +39,7 @@ The current default checkpoint is `MXFP4-Q8`, while the outcome comparison table
 | **Structured extraction + tools (50 tasks)** | **0.318 score/s** (49/50 valid, 0.506 score, 79.7 s, 12.8 GB) | 0.197 score/s (32/50 valid, 0.576 score, 146.2 s, 14.3 GB) | **1.61x score/s**, 1.83x faster wall, -1.5 GB RAM |
 | **Reasoning (`75` MMLU + MATH + IFBench)** | **0.174 score/s** (40/75 valid, 0.307 score, 132.3 s, 12.3 GB) | 0.141 score/s (69/75 valid, 0.360 score, 191.0 s, 12.1 GB) | **1.23x score/s**, 1.44x faster wall |
 
-Split on the 50 tasks: `24/25` valid extraction (`0.653` F1) vs. stock `17/25` (`0.591` F1), and `9/25` correct tools vs. stock `14/25`. A CPU grammar audit confirmed every one of the 150 reference tool calls is expressible under the 131,072-token pruned output vocabulary.
+Split on the 50 tasks: `24/25` valid extraction (`0.653` F1) vs. stock `17/25` (`0.591` F1), and `9/25` correct tools vs. stock `14/25`. Default checkpoints keep the full `201K` `o200k` output vocabulary (`vocab_out=None`, lifting Base M5 `LiquidAI` extraction F1 by `+34.50 pp` to `0.9518` at `1.24x` faster wall time with NaN-safe GPU argmax, while keeping explicit `--vocab-out 131072` pruning opt-in). Restoring `Hot-MPP + Cold-QMV` (`hot_threshold=8`) on Apple10 NAX adds **`1.709x` E2E (`2.734x` prefill)** at `B=8` (`11.69 GB` MLX peak) and `1.443x` at `B=4` on Base M5.
 
 ### 2. Batch scaling (`benchmark_monorepo.py`, 512-token JSON schema fixtures)
 
@@ -62,7 +62,7 @@ By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (prev
 | **Hydragen v2 shared-prefix SDPA** | Computes shared system-prompt attention once across the whole batch with zero KV cloning | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
 | **Zero-sync hybrid MXFP4 MoE** | Routes all 24 MoE layers on GPU without CPU syncs, splitting dense expert tiles to Metal 4 `MPP::matmul2d` (on M5 `Apple10 NAX`) and sparse tiles to coalesced QMV | [`kernels.py`](src/fast_gpt_oss/kernels.py), [`model.py`](src/fast_gpt_oss/model.py) |
 | **Circular SWA-128 & mixed precision** | Keeps residuals in BF16, layer intermediates in FP16 with FP32 accumulators, and sliding-window KV in a fixed 128-slot ring | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
-| **Harmony prompt, schema & vocab** | Retains all 201,088 `o200k` input tokens, prunes `lm_head` to 131,072 output tokens (with cold full-vocab fallback), and compacts finished slots mid-wave | [`engine.py`](src/fast_gpt_oss/engine.py), [`tokenizer.py`](src/fast_gpt_oss/tokenizer.py) |
+| **Harmony prompt, schema & vocab** | Retains all 201,088 `o200k` input and output tokens by default (optional `vocab_out=131072` pruning available), uses NaN-safe GPU argmax, and compacts finished slots mid-wave | [`engine.py`](src/fast_gpt_oss/engine.py), [`tokenizer.py`](src/fast_gpt_oss/tokenizer.py) |
 
 ## CLI, Parquet & HTTP server
 

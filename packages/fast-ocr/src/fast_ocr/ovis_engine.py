@@ -2248,6 +2248,41 @@ class FastOvisOCREngine:
             if any(m != eff_min_pixels for m in auto_mins):
                 eff_min_px_per_item = auto_mins
 
+        eff_rolling_max = 8
+        if (
+            rolling_eligible
+            and int(eff_bs) >= 16
+            and n_items >= 16
+            and int(tok_cap) <= 2048
+            and host_phys_memory_gb() > 28.0
+        ):
+            est_vis = [
+                (
+                    lambda hw: (hw[0] // 32) * (hw[1] // 32)
+                )(
+                    smart_resize_qwen(
+                        proc_imgs[i].height,
+                        proc_imgs[i].width,
+                        factor=32,
+                        min_pixels=(
+                            eff_min_px_per_item[i]
+                            if eff_min_px_per_item is not None and eff_min_px_per_item[i] is not None
+                            else eff_min_pixels
+                        ),
+                        max_pixels=(
+                            max_px_per_item[i]
+                            if max_px_per_item is not None and max_px_per_item[i] is not None
+                            else eff_max_pixels
+                        ),
+                    )
+                )
+                for i in range(n_items)
+            ]
+            if max(est_vis, default=0) <= 512:
+                # MS4b: uniform compact tables run faster at B=16 AR (K=0) than B=8 PLD.
+                eff_rolling_max = min(int(eff_bs), 16)
+                use_batch_pld = False
+
         has_any_native = any(bool(n and str(n).strip()) for n in native_seq)
         batch_k_draft = max(k_draft, 6) if (draft_k is None and has_any_native) else k_draft
         batch_drafters: list[OCRPLDDrafter | None] | None = None
@@ -2296,6 +2331,7 @@ class FastOvisOCREngine:
             spec_modes=batch_spec_modes,
             draft_k=batch_k_draft,
             rolling=("auto" if rolling_eligible else False),
+            rolling_max_batch_size=eff_rolling_max,
             max_tokens=tok_cap,
             temperature=temperature,
             repeat_penalty=eff_loop_breaker,

@@ -41,6 +41,7 @@ from fast_shared.embeddings import (
 )
 from fast_shared.hf import resolve_hf_model_dir
 from fast_shared.hw_check import supports_apple10_nax
+from fast_shared.metal_mpp import HEADER_STD
 from fast_shared.mpp_linear import MppPackState, resolve_mpp_env_bool, wrap_quantized_linears_with_mpp
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_PPLX_CONFIG, PplxConfig
@@ -118,11 +119,18 @@ def normalize_state_dtype(state_dtype: str | None = None, *, state_fp32: bool = 
 
 
 def _sdpa_supports_force_fused() -> bool:
+    """Probe runtime support for `mx.fast.scaled_dot_product_attention(..., force_fused=...)`."""
     try:
-        sig = inspect.signature(mx.fast.scaled_dot_product_attention)
-        return "force_fused" in sig.parameters
-    except (TypeError, ValueError):
-        return False
+        from fast_shared.hw_check import _probe_sdpa_force_fused
+
+        return bool(_probe_sdpa_force_fused())
+    except Exception:
+        try:
+            q = mx.zeros((1, 1, 1, 8), dtype=mx.float16)
+            _ = mx.fast.scaled_dot_product_attention(q, q, q, scale=1.0, force_fused=False)
+            return True
+        except Exception:
+            return False
 
 
 _SDPA_SUPPORTS_FORCE_FUSED = _sdpa_supports_force_fused()
@@ -1554,6 +1562,91 @@ def _build_varlen_mask_and_rope(
     return sdpa_mask, rope_cos, rope_sin
 
 
+_PPLX_QKV_NORM_ROPE_BCAST_SRC = """
+    #pragma clang fp reassociate(off)
+    uint row = threadgroup_position_in_grid.x;
+    uint sg = thread_position_in_threadgroup.x >> 5;  // 0..11 (0..7 Q, 8..9 K, 10..11 V)
+    uint lane = thread_position_in_threadgroup.x & 31;
+    uint B = (uint)Dims[0];
+    uint L = (uint)Dims[1];
+    uint M = B * L;
+    if (row >= M) return;
+    uint b = row / L;
+    uint l = row - b * L;
+    uint c_row = ((uint)C_shape[0] == 1u) ? l : row;
+
+    uint src_off = (sg < 8u) ? (sg * 512u) : (4096u + (sg - 8u) * 256u);
+    const device T* sp = QKV + (size_t)row * 5120u + src_off;
+
+    float4 x_lo = float4(*(const device vec<T, 4>*)(sp + lane * 4u));
+    float4 x_hi = float4(*(const device vec<T, 4>*)(sp + 128u + lane * 4u));
+
+    if (sg >= 10u) {
+        uint vh = sg - 10u;
+        device T* vp = V + ((size_t)(b * 2u + vh) * L + l) * 256u;
+        *(device vec<T, 4>*)(vp + lane * 4u)       = vec<T, 4>(x_lo);
+        *(device vec<T, 4>*)(vp + 128u + lane * 4u) = vec<T, 4>(x_hi);
+        return;
+    }
+
+    if (sg < 8u) {
+        const device T* gp_in = sp + 256u;
+        device T* gp_out = Gate + (size_t)row * 2048u + sg * 256u;
+        *(device vec<T, 4>*)(gp_out + lane * 4u)       = *(const device vec<T, 4>*)(gp_in + lane * 4u);
+        *(device vec<T, 4>*)(gp_out + 128u + lane * 4u) = *(const device vec<T, 4>*)(gp_in + 128u + lane * 4u);
+    }
+
+    float sq = dot(x_lo, x_lo) + dot(x_hi, x_hi);
+    float tot = simd_sum(sq);
+    float inv = rsqrt(tot * (1.0f / 256.0f) + float(Eps[0]));
+
+    const device float* wp = (sg < 8u) ? Wq : Wk;
+    float4 w_lo = *(const device float4*)(wp + lane * 4u);
+    float4 w_hi = *(const device float4*)(wp + 128u + lane * 4u);
+
+    float4 n_lo = (x_lo * inv) * w_lo;
+    float4 n_hi = (x_hi * inv) * w_hi;
+
+    float mate0 = simd_shuffle_xor(n_lo.x, 8);
+    float mate1 = simd_shuffle_xor(n_lo.y, 8);
+    float mate2 = simd_shuffle_xor(n_lo.z, 8);
+    float mate3 = simd_shuffle_xor(n_lo.w, 8);
+
+    if (lane < 16u) {
+        uint c_idx = (lane & 7u) * 4u;
+        float4 c4 = float4(*(const device vec<T, 4>*)(C + (size_t)c_row * 32u + c_idx));
+        float4 s4 = float4(*(const device vec<T, 4>*)(S_sin + (size_t)c_row * 32u + c_idx));
+        float4 mate4 = float4(mate0, mate1, mate2, mate3);
+        if (lane < 8u) {
+            n_lo = n_lo * c4 - mate4 * s4;
+        } else {
+            n_lo = n_lo * c4 + mate4 * s4;
+        }
+    }
+
+    device T* dst = (sg < 8u)
+        ? (Q + ((size_t)(b * 8u + sg) * L + l) * 256u)
+        : (K + ((size_t)(b * 2u + (sg - 8u)) * L + l) * 256u);
+    *(device vec<T, 4>*)(dst + lane * 4u)       = vec<T, 4>(n_lo);
+    *(device vec<T, 4>*)(dst + 128u + lane * 4u) = vec<T, 4>(n_hi);
+"""
+
+_PPLX_QKV_NORM_ROPE_BCAST_KERN: Any | None = None
+
+
+def _get_pplx_qkv_norm_rope_kernel() -> Any:
+    global _PPLX_QKV_NORM_ROPE_BCAST_KERN
+    if _PPLX_QKV_NORM_ROPE_BCAST_KERN is None:
+        _PPLX_QKV_NORM_ROPE_BCAST_KERN = mx.fast.metal_kernel(
+            name="pplx_qkv_norm_rope_bhld_bcast",
+            input_names=["QKV", "Wq", "Wk", "C", "S_sin", "Eps", "Dims"],
+            output_names=["Q", "K", "V", "Gate"],
+            header=HEADER_STD,
+            source=_PPLX_QKV_NORM_ROPE_BCAST_SRC,
+        )
+    return _PPLX_QKV_NORM_ROPE_BCAST_KERN
+
+
 class PplxAttention(nn.Module):
     """Bidirectional grouped-query attention with output gating, fused [Q,K] norm+RoPE, and Apple9/Apple10 dispatch."""
 
@@ -1586,6 +1679,22 @@ class PplxAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = PplxRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self._eps_arr_f32: mx.array | None = None
+        self._rope_tbl_cache: dict[Any, tuple[mx.array, mx.array]] = {}
+
+    def _get_rope_tables(self, seq_len: int, dtype: mx.Dtype) -> tuple[mx.array, mx.array]:
+        cached = self._rope_tbl_cache.get(dtype)
+        if cached is not None and int(cached[0].shape[0]) >= seq_len:
+            return cached
+        cap = max(int(seq_len), _STREAMED_SEQ_THRESHOLD)
+        inv_freq = 1.0 / (
+            self.rope_theta ** (np.arange(0, self.rope_dim, 2, dtype=np.float64) / self.rope_dim)
+        )
+        ang = np.arange(cap, dtype=np.float64)[:, None] * inv_freq[None, :]
+        cos_mx = mx.array(np.cos(ang).astype(np.float32), dtype=dtype)
+        sin_mx = mx.array(np.sin(ang).astype(np.float32), dtype=dtype)
+        self._rope_tbl_cache[dtype] = (cos_mx, sin_mx)
+        return cos_mx, sin_mx
 
     def _run_sdpa(
         self,
@@ -1636,37 +1745,75 @@ class PplxAttention(nn.Module):
     ) -> mx.array:
         B, S, _ = x.shape
         qkv = self.qkv_proj(x)
-        q_and_gate, keys, values = mx.split(
-            qkv,
-            [self.q_proj_dim, self.q_proj_dim + self.kv_proj_dim],
-            axis=-1,
-        )
-        q_and_gate = q_and_gate.reshape(B, S, self.num_heads, 2 * self.head_dim)
-        queries, gate = mx.split(q_and_gate, 2, axis=-1)
-        gate = gate.reshape(B, S, self.num_heads * self.head_dim)
-
-        keys_4d = keys.reshape(B, S, self.num_kv_heads, self.head_dim)
         qw = self.q_norm.weight
         kw = self.k_norm.weight
-        qw_f32 = qw if qw.dtype == mx.float32 else qw.astype(mx.float32)
-        kw_f32 = kw if kw.dtype == mx.float32 else kw.astype(mx.float32)
-        queries_hsd = _norm_qk_head_hsd(queries, qw_f32, self.rms_norm_eps)
-        keys_hsd = _norm_qk_head_hsd(keys_4d, kw_f32, self.rms_norm_eps)
-        values = values.reshape(B, S, self.num_kv_heads, self.head_dim).swapaxes(1, 2)
+        qw_f32 = qw if qw.dtype == mx.float32 else qw.astype(mx.float32)  # guard: allow-fp32
+        kw_f32 = kw if kw.dtype == mx.float32 else kw.astype(mx.float32)  # guard: allow-fp32
 
-        qk_hsd = mx.concatenate([queries_hsd, keys_hsd], axis=1)
-        if rope_cos is not None and rope_sin is not None:
-            qk_hsd = _apply_custom_partial_rope(qk_hsd, rope_cos, rope_sin, self.rope_dim)
-        else:
-            qk_hsd = mx.fast.rope(
-                qk_hsd,
-                self.rope_dim,
-                traditional=False,
-                base=self.rope_theta,
-                scale=1.0,
-                offset=0,
+        can_fused_prologue = bool(
+            mx.metal.is_available()
+            and mx.default_device().type == mx.DeviceType.gpu
+            and self.num_heads == 8
+            and self.num_kv_heads == 2
+            and self.head_dim == 256
+            and self.rope_dim == 64
+            and x.dtype in (mx.float16, mx.bfloat16)
+            and B > 0
+            and S > 0
+        )
+        if can_fused_prologue:
+            if rope_cos is not None and rope_sin is not None:
+                c_in = rope_cos[:, 0, :, :] if rope_cos.ndim == 4 else rope_cos
+                s_in = rope_sin[:, 0, :, :] if rope_sin.ndim == 4 else rope_sin
+                if c_in.dtype != x.dtype:
+                    c_in = c_in.astype(x.dtype)
+                if s_in.dtype != x.dtype:
+                    s_in = s_in.astype(x.dtype)
+            else:
+                ct, st = self._get_rope_tables(S, x.dtype)
+                c_in = ct[:S][None, :, :]
+                s_in = st[:S][None, :, :]
+            if self._eps_arr_f32 is None:
+                self._eps_arr_f32 = mx.array([self.rms_norm_eps], dtype=mx.float32)  # guard: allow-fp32
+            dims = mx.array([B, S], dtype=mx.int32)
+            qkv_2d = mx.contiguous(qkv).reshape(B * S, 5120)
+            kern = _get_pplx_qkv_norm_rope_kernel()
+            queries, keys, values, gate = kern(
+                inputs=[qkv_2d, qw_f32, kw_f32, mx.contiguous(c_in), mx.contiguous(s_in), self._eps_arr_f32, dims],
+                template=[("T", x.dtype)],
+                grid=(B * S * 384, 1, 1),
+                threadgroup=(384, 1, 1),
+                output_shapes=[(B, 8, S, 256), (B, 2, S, 256), (B, 2, S, 256), (B, S, 2048)],
+                output_dtypes=[x.dtype, x.dtype, x.dtype, x.dtype],
             )
-        queries, keys = mx.split(qk_hsd, [self.num_heads], axis=1)
+        else:
+            q_and_gate, keys, values = mx.split(
+                qkv,
+                [self.q_proj_dim, self.q_proj_dim + self.kv_proj_dim],
+                axis=-1,
+            )
+            q_and_gate = q_and_gate.reshape(B, S, self.num_heads, 2 * self.head_dim)
+            queries, gate = mx.split(q_and_gate, 2, axis=-1)
+            gate = gate.reshape(B, S, self.num_heads * self.head_dim)
+
+            keys_4d = keys.reshape(B, S, self.num_kv_heads, self.head_dim)
+            queries_hsd = _norm_qk_head_hsd(queries, qw_f32, self.rms_norm_eps)
+            keys_hsd = _norm_qk_head_hsd(keys_4d, kw_f32, self.rms_norm_eps)
+            values = values.reshape(B, S, self.num_kv_heads, self.head_dim).swapaxes(1, 2)
+
+            qk_hsd = mx.concatenate([queries_hsd, keys_hsd], axis=1)
+            if rope_cos is not None and rope_sin is not None:
+                qk_hsd = _apply_custom_partial_rope(qk_hsd, rope_cos, rope_sin, self.rope_dim)
+            else:
+                qk_hsd = mx.fast.rope(
+                    qk_hsd,
+                    self.rope_dim,
+                    traditional=False,
+                    base=self.rope_theta,
+                    scale=1.0,
+                    offset=0,
+                )
+            queries, keys = mx.split(qk_hsd, [self.num_heads], axis=1)
 
         if S <= _STREAMED_SEQ_THRESHOLD or sdpa_mask == "causal":
             attn_out = self._run_sdpa(queries, keys, values, sdpa_mask)

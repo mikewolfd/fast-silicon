@@ -223,7 +223,7 @@ class FastGptOssEngine:
         *,
         home: str | Path | None = None,
         model_dir: str | Path | None = None,
-        vocab_out: int | None = DEFAULT_KEPT_VOCAB_SIZE,
+        vocab_out: int | None = None,
         default_reasoning_effort: str = "low",
         default_mode: str = "auto",
         min_prefix_cache_tokens: int = 8,
@@ -509,16 +509,27 @@ class FastGptOssEngine:
                 "lse_np": np.asarray(lse_mx, dtype=np.float32),
             }
 
-        top1_mx = mx.argmax(lg_2d, axis=-1)
+        if hasattr(lg_2d, "ndim") and hasattr(lg_2d, "dtype"):
+            from fast_shared.argmax import gpu_argmax_nan
+
+            top1_mx = gpu_argmax_nan(lg_2d)
+        else:
+            top1_mx = mx.argmax(lg_2d, axis=-1)
         if keep_hf is not None:
             mx.eval(top1_mx, keep_hf)
         else:
             mx.eval(top1_mx)
+        top1_list = [int(t) for t in top1_mx.tolist()]
+        if any(t < 0 for t in top1_list):
+            eos_old = int(getattr(self.tokenizer, "return_token_id", 0))
+            eos_pruned = self._map_old_to_pruned_idx(eos_old, self.model.new_to_old)
+            safe_fallback = eos_pruned if eos_pruned >= 0 else 0
+            top1_list = [safe_fallback if t < 0 else t for t in top1_list]
         return {
             "mode": "top1",
             "lg_2d": lg_2d,
             "hf_2d": keep_hf,
-            "top1_cpu": top1_mx.tolist(),
+            "top1_cpu": top1_list,
         }
 
     def _map_old_to_pruned_idx(self, old_tid: int, n2o: np.ndarray) -> int:

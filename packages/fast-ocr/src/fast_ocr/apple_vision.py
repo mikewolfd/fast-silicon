@@ -504,6 +504,11 @@ def recognize_banded_detections(
     return dets
 
 
+_ISOLATED_DELIMITER_TEXTS: frozenset[str] = frozenset(
+    {"(", ")", "[", "]", "{", "}", "|", "\u00a7", "\u2022", "\u00b7", "-", "\u2013", "\u2014"}
+)
+
+
 def analyze_page_from_lines(
     lines: Sequence[OCRLine],
     image: Image.Image | None,
@@ -527,8 +532,15 @@ def analyze_page_from_lines(
     heights = [ln.box.height for ln in lines if ln.box.height > 0.0]
     med_h = float(np.median(heights)) if heights else 0.0
 
+    # Exclude isolated delimiter tokens (court-caption ')', bullets, brackets) from column/band clustering.
+    layout_lines = [
+        ln for ln in lines if ln.text.strip() and ln.text.strip() not in _ISOLATED_DELIMITER_TEXTS
+    ]
+    if not layout_lines:
+        layout_lines = list(lines)
+
     # Estimate horizontal band alignment & column structure
-    x_starts = sorted(ln.box.x0 for ln in lines)
+    x_starts = sorted(ln.box.x0 for ln in layout_lines)
     estimated_columns = 1
     multi_cell_bands = 0
     formula_bands = 0
@@ -544,9 +556,9 @@ def analyze_page_from_lines(
                 is_formula = True
         return is_formula, m_hits
 
-    if len(lines) >= 6:
+    if len(layout_lines) >= 6:
         # Count distinct horizontal bands that contain multiple horizontally separated detections
-        sorted_y = sorted(lines, key=lambda ln: ln.box.y0)
+        sorted_y = sorted(layout_lines, key=lambda ln: ln.box.y0)
         band_tol = max(0.008, med_h * 0.7)
         max_cells_in_band = 1
         cur_band: list[OCRLine] = []
@@ -586,10 +598,10 @@ def analyze_page_from_lines(
             if sep >= 2:
                 multi_cell_bands += 1
                 max_cells_in_band = max(max_cells_in_band, sep)
-        estimated_columns = max_cells_in_band if multi_cell_bands >= 3 else (2 if len(x_starts) >= 12 and (sum(1 for l in lines if l.box.x0 > 0.48) >= 4 and sum(1 for l in lines if l.box.x1 < 0.48) >= 4) else 1)
+        estimated_columns = max_cells_in_band if multi_cell_bands >= 3 else (2 if len(x_starts) >= 12 and (sum(1 for l in layout_lines if l.box.x0 > 0.48) >= 4 and sum(1 for l in layout_lines if l.box.x1 < 0.48) >= 4) else 1)
         table_score = min(1.0, (multi_cell_bands / 6.0) * 0.6 + min(1.0, currency_hits / 8.0) * 0.4)
     else:
-        for ln in lines:
+        for ln in layout_lines:
             is_f, m_hits = _accumulate_band((ln,))
             total_math_hits += m_hits
             if is_f:

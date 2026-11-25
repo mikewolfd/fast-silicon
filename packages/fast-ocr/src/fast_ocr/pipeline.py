@@ -199,13 +199,24 @@ def _recognize_vision_worker_chunk(
     return results
 
 
+def _default_vision_workers() -> int:
+    """Cap ANE multiprocessing workers to `2` on <=28 GB Macs and `4` on >=36 GB hosts."""
+    try:
+        from fast_shared.hw_check import probe_host_hardware
+
+        mem_gb = float(probe_host_hardware().get("mem_gb") or 24.0)
+        return 2 if mem_gb <= 28.0 else 4
+    except Exception:
+        return 2
+
+
 def run_vision_batch_parallel(
     vision: Any,
     sources: Sequence[str | Path | Image.Image | np.ndarray | bytes | bytearray | memoryview],
     page_indices: Sequence[int],
     *,
     output_format: OutputFormat,
-    workers: int = 4,
+    workers: int | None = None,
     min_batch: int = 4,
     min_total_pixels: int = 2_000_000,
 ) -> list[OCRResult] | None:
@@ -251,7 +262,8 @@ def run_vision_batch_parallel(
         else:
             return None
 
-    n_workers = max(1, min(int(workers), len(payloads)))
+    eff_workers = _default_vision_workers() if workers is None else int(workers)
+    n_workers = max(1, min(eff_workers, len(payloads)))
     if n_workers <= 1:
         return None
     indexed = list(zip((int(i) for i in page_indices), payloads))

@@ -565,9 +565,12 @@ def test_tf32_telemetry_chip_gated_attention_and_fp32_norms(tmp_path: Path) -> N
         PplxAttention,
         PplxRMSNorm,
         _detect_gpu_family_info,
+        _sdpa_supports_force_fused,
         get_mlx_runtime_telemetry,
         normalize_qk,
     )
+
+    assert _sdpa_supports_force_fused() is True
 
     # Importing fast_pplx / fast_pplx.gpu / fast_pplx.cli must NEVER force MLX_ENABLE_TF32=0 globally.
     clean_env = {k: v for k, v in os.environ.items() if k != "MLX_ENABLE_TF32"}

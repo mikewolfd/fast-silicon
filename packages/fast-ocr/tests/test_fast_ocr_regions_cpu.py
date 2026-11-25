@@ -124,8 +124,12 @@ def test_ordered_pld_corpus_and_adaptive_max_pixels() -> None:
     assert large_mp < 1_600_000
     assert estimate_visual_tokens((1700, 2200), max_pixels=large_mp) < estimate_visual_tokens((1700, 2200)) * 0.45
 
-    # Tiny font (med_h=0.008 * 2200 = 17.6 px) or low confidence -> keeps full 16.78M native budget!
-    assert compute_adaptive_max_pixels(_mk_analysis(med_h=0.008), (1700, 2200)) == 16_777_216
+    # Tiny-font or low-confidence escalations keep full 16.78M native budget; normal pages cap at 3.15M!
+    assert compute_adaptive_max_pixels(_mk_analysis(med_h=0.008), (1700, 2200)) == 3_145_728
+    assert compute_adaptive_max_pixels(
+        _mk_analysis(med_h=0.008, reasons=("tiny_font_scan",)),
+        (1700, 2200),
+    ) == 16_777_216
     assert compute_adaptive_max_pixels(
         _mk_analysis(med_h=0.020, reasons=("low_vision_confidence",)),
         (1700, 2200),
@@ -141,6 +145,30 @@ def test_ordered_pld_corpus_and_adaptive_max_pixels() -> None:
     uncropped_mp = compute_adaptive_max_pixels(_mk_analysis(med_h=0.020), (4900, 6100))
     assert 786_432 <= cropped_mp < uncropped_mp < 3_000_000
     assert REGION_CROP_MIN_PIXELS == 4096
+
+
+def test_court_caption_delimiter_filter_cpu() -> None:
+    """Verify T3B: isolated ')' delimiters in court captions do not trigger false multi_column escalation."""
+    from fast_ocr.apple_vision import analyze_page_from_lines
+
+    caption_lines = [
+        OCRLine("UNITED STATES DISTRICT COURT", 0.99, OCRBox(0.10, 0.08, 0.45, 0.10)),
+        OCRLine(")", 0.99, OCRBox(0.52, 0.08, 0.53, 0.10)),
+        OCRLine("PLAINTIFF CORP,", 0.99, OCRBox(0.10, 0.12, 0.35, 0.14)),
+        OCRLine(")", 0.99, OCRBox(0.52, 0.12, 0.53, 0.14)),
+        OCRLine("v.", 0.99, OCRBox(0.10, 0.16, 0.14, 0.18)),
+        OCRLine(")", 0.99, OCRBox(0.52, 0.16, 0.53, 0.18)),
+        OCRLine("DEFENDANT INC.,", 0.99, OCRBox(0.10, 0.20, 0.35, 0.22)),
+        OCRLine(")", 0.99, OCRBox(0.52, 0.20, 0.53, 0.22)),
+        OCRLine("Case No. 25-cv-01234", 0.99, OCRBox(0.60, 0.16, 0.85, 0.18)),
+        OCRLine("MEMORANDUM OPINION AND ORDER", 0.99, OCRBox(0.10, 0.28, 0.65, 0.30)),
+        OCRLine("The Court considers the motion filed on behalf of the parties.", 0.99, OCRBox(0.10, 0.34, 0.88, 0.36)),
+        OCRLine("All facts are drawn from the public record below.", 0.99, OCRBox(0.10, 0.38, 0.85, 0.40)),
+    ]
+    pa = analyze_page_from_lines(caption_lines, None, 1700, 2200)
+    assert pa.table_score < 0.35
+    assert "multi_column_table" not in pa.escalation_reasons
+    assert "two_column_layout" not in pa.escalation_reasons
 
 
 def test_region_only_escalation_and_merge_roundtrip() -> None:

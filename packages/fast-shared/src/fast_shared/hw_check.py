@@ -647,34 +647,58 @@ def supports_apple10_nax(hw: dict[str, Any] | None = None) -> bool:
     return True
 
 
+def _probe_sdpa_force_fused() -> bool:
+    """Probe runtime support for `mx.fast.scaled_dot_product_attention(..., force_fused=...)`."""
+    try:
+        import inspect
+        import mlx.core as mx
+
+        fn = mx.fast.scaled_dot_product_attention
+        try:
+            sig = inspect.signature(fn)
+            if "force_fused" in sig.parameters:
+                return True
+        except (TypeError, ValueError):
+            pass
+        # nanobind C++ builtins expose (*args, **kwargs) without explicit kwargs in inspect.signature;
+        # probe a tiny tensor call once instead.
+        q = mx.zeros((1, 1, 1, 8), dtype=mx.float16)
+        _ = fn(q, q, q, scale=1.0, force_fused=False)
+        return True
+    except Exception:
+        return False
+
+
+_CACHED_SDPA_FORCE_FUSED: bool | None = None
+
+
 def detect_apple10_d256_force_fused(
     device_info: Mapping[str, Any] | None = None,
     macos_version: str | None = None,
 ) -> bool:
     """Return True on Apple10 (M5+) + macOS >= 26.2 + MLX supporting `force_fused` D=256 SDPA."""
+    global _CACHED_SDPA_FORCE_FUSED
     if os.environ.get("MLX_METAL_NO_NAX") == "1":
         return False
-    try:
-        import inspect
-        import mlx.core as mx
-
-        sig = inspect.signature(mx.fast.scaled_dot_product_attention)
-        if "force_fused" not in sig.parameters:
-            return False
-    except Exception:
+    if _CACHED_SDPA_FORCE_FUSED is None:
+        _CACHED_SDPA_FORCE_FUSED = _probe_sdpa_force_fused()
+    if not _CACHED_SDPA_FORCE_FUSED:
         return False
 
     info = dict(device_info) if device_info is not None else {}
     if not info:
-        try:
-            import mlx.core as mx
-
-            info = dict(mx.device_info())
-        except Exception:
-            return False
-    dev_name = str(info.get("device_name", "")).lower()
-    arch = str(info.get("architecture", "")).lower()
-    is_m5_plus = ("m5" in dev_name) or ("m6" in dev_name) or ("apple10" in arch) or ("g17" in arch)
+        hw = probe_host_hardware()
+        info = {
+            "device_name": hw.get("brand", ""),
+            "architecture": hw.get("mlx_architecture", ""),
+            "supports_apple10": hw.get("supports_apple10"),
+        }
+    if info.get("supports_apple10") is True:
+        is_m5_plus = True
+    else:
+        dev_name = str(info.get("device_name", "")).lower()
+        arch = str(info.get("architecture", "")).lower()
+        is_m5_plus = ("m5" in dev_name) or ("m6" in dev_name) or ("apple10" in arch) or ("g17" in arch)
     if not is_m5_plus:
         return False
     mac_ver = parse_version_tuple(platform.mac_ver()[0] if macos_version is None else macos_version)

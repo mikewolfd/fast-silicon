@@ -39,7 +39,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | **Compact retrieval & `MaxSim`** | `fast_shared.retrieval_index` | `CompactRetrievalIndex` compresses embeddings 4-6x into symmetric INT8 (with Matryoshka truncation) and pairs an ARM64 NEON 1-bit Hamming prefilter (`rerank_top_r=256`) to search 100,000 vectors in **0.50-0.66 ms/query** (`3.0-4.4x` faster than FP32 BLAS), plus multi-window `MaxSim`. |
 | **Quantized KV & mixed-bit fusion** | `fast_shared.kv_quant` | `QuantizedKVCache` runs attention over packed 8-bit (`q8`) and rotated 4-bit (`q4_quarot`, 3.56x smaller KV, 2.13x faster decode than 8-bit KV at 16K) caches, plus `SpecBucketedLinearGroup`. |
 | **Shared vision & OCR primitives** | `fast_shared.qwen35_vision`, `gemma4_vision`, `vision_preprocess` | Ported Qwen3.5 & Gemma-4 vision towers, 3D MRoPE helpers, ink cropping, lazy MLX imports, and public OCR evaluators (`outcome_eval.ocr`). |
-| **Hybrid `PrefixTree` & speculative decode** | `fast_shared.prefix_tree`, `pld_drafter` | 256-token SHA-256 prefix cache for KV and block-32 INT8 GatedDeltaNet states (3.76x smaller) with 2-hit admission and circuit-breaker protection, plus grammar-checked prompt-lookup drafting. |
+| **Hybrid `PrefixTree`, GPU argmax & PLD** | `fast_shared.prefix_tree`, `argmax`, `pld_drafter` | 256-token SHA-256 prefix cache for KV and block-32 INT8 GatedDeltaNet states (3.76x smaller), single-pass NaN/Inf-safe Metal `gpu_argmax_conf`/`gpu_argmax_nan` (2x less vocab DRAM traffic), and grammar-checked prompt-lookup drafting. |
 | **Schema grammars & resumable ETL** | `fast_shared.grammar`, `pipeline_llm`, `parquet_pipeline` | Per-document `llguidance` JSON Schema enforcement, 4-gram loop detection, deferred retries on truncated outputs, header-anchored Parquet chunking (+33-46% legal retrieval lift), and resumable shards. |
 | **Core ML / Core AI & Metal 4 MPP** | `fast_shared.coreai_pipeline`, `parallel_coreml`, `ir_dtype_guard`, `mpp_linear` | Parallel Core ML bucket compilation (2.0-2.1x faster), FP16 `.aimodel` ANE lowering on macOS 27.2.1, static AST/MIL dtype lints (`fast-ir-guard`), and inline-XOR Apple10 NAX linear wrappers. |
 | **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic evaluators and interleaved regression gates. |
@@ -59,7 +59,8 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
 | `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates` |
-| `fast_shared.hw_check` / `ir_dtype_guard` / `roofline` | `fast-silicon-hw-check`, `fast-ir-guard`, `fast-silicon-probe`, `fast-silicon-audit` |
+| `fast_shared.hw_check` / `ir_dtype_guard` / `roofline` | `fast-silicon-hw-check`, `supports_apple10_nax`, `detect_apple10_d256_force_fused`, `fast-ir-guard`, `fast-silicon-probe`, `fast-silicon-audit` |
+| `fast_shared.argmax` | `gpu_argmax_conf`, `gpu_argmax_nan`, `stats_to_logprob_margin` |
 | `fast_shared.metal_mpp` / `metal_mpp_int8` / `mpp_linear` / `ane_ffn` | `HEADER_MPP`, `mpp_linear_bf16`, `mpp_quantized_linear`, `MppQuantizedLinear`, `AneWave`, C++/ObjC++ headers |
 
 ## Shared Parquet controls

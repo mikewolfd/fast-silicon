@@ -82,7 +82,7 @@ The paired score difference vs. stock is `+0.0008` (95% CI `-0.0036` to `+0.0053
 | Indexing mode | Quality vs. FP32 whole-doc | Index size / peak Metal RAM | Speedup & query latency |
 | --- | --- | --- | --- |
 | Single-vector whole doc (up to 32K) | `0.047` on 32K passkey, `0.895` on `2wikimqa` | 4.00 KiB/doc / 4.27 GB Metal peak | 2,205.5 s GPU encode / 2.82 ms @ 100K docs |
-| **`build_index(..., multivector=True)` (`MaxSim`)** | **1.000** on 32K split (**0.674** pooled), **0.985** `2wikimqa` | 15.97 KiB/doc / **1.72 GB Metal peak** (2.48x lower) | **955.4 s GPU encode (2.31x faster)** |
+| **`build_index(..., multivector=True)` (`MaxSim`)** | **1.000** on 32K split (**0.674** pooled), **0.985** `2wikimqa`; optional `w512_ov64` lifts Base M5 `LongEmbed passkey R@1` `+8.33 pp` (`0.792 -> 0.875`) | 15.97 KiB/doc / **1.72 GB Metal peak** (2.48x lower) | **955.4 s GPU encode (2.31x faster)** |
 | `build_index(..., mode="int8")` (`<16K`) | `-0.0007` NanoBEIR, `-0.0012` LegalBench | 1,026 B/vec (3.99x smaller) | 2.11 ms/query @ 100K docs |
 | **`build_index(..., mode="binary_int8")` (`>=16K`)** | `+0.0006` NanoBEIR, `-0.0012` LegalBench @ Top-64 | 128 B binary + 1,026 B INT8 (3.55x smaller) | **0.66 ms/query @ 100K docs (4.28x faster)** |
 
@@ -93,7 +93,7 @@ The paired score difference vs. stock is `+0.0008` (95% CI `-0.0036` to `+0.0053
 | Single query (`B=1, S=15`) | Base M5 | `9.04 ms` | `7.09 ms` (2,117 tok/s) | `9.06 ms` (0.26 GB) | **`5.80 ms`** (2,586 tok/s) | **1.56x** stock (**1.22x** GPU, 0.91 GB) |
 | Single query (`B=1, S=15`) | M4 Pro | - | **`5.76 ms`** (2,604 tok/s) | `4.18 ms` (quiet) | `6.50 ms` (2,309 tok/s) | `B=1` routes inline on Metal GPU |
 | Query batch (`B=32, S=15`) | Base M5 / M4 Pro | - | **`0.0383 s`** (10,706 tok/s) / `6,906` | `0.0876 s` (`4,381`) / `4,457` | **`0.0383 s`** (inline GPU) / **`0.0518 s`** (`9,249`) | M5 routes tiny non-contextual batches inline on GPU (**2.29x** ANE, `cos=0.9996`); M4 Pro uses ANE+GPU |
-| Passages (`S=256, B=8`) | Base M5 / M4 Pro | `10,384` / `8,425 tok/s` | `19,332` / `11,812` | `13,407` / `13,516` | **`27,234` / `21,345 tok/s`** | **2.62x (M5) / 2.53x (M4 Pro)** stock |
+| Passages (`S=256, B=8` / M5 corpus) | Base M5 / M4 Pro | `10,384` / `8,425 tok/s` | `19,332` / `11,812` | `13,407` / `13,516` | **`25,776-28,415` / `21,345 tok/s`** | **2.62x (M5) / 2.53x (M4 Pro)** stock; fused QKV-Norm+RoPE + `force_fused` add `+5.3-7.6%` E2E (`3.19x` prologue) |
 | Passages (`S=512, B=8`) | Base M5 / M4 Pro | - | `19,419` / `11,776` | `11,988` / `12,175` | **`28,415` / `19,060 tok/s`** | `55.5 docs/s` M5 / `37.2 docs/s` M4 Pro |
 | Mixed short+long (`28` docs) | Base M5 / M4 Pro | - | `16,636` / `10,357` | - | **`22,273` / `15,212 tok/s`** | **1.34x (M5) / 1.47x (M4 Pro)** GPU |
 | Long windows (`S=4096, B=4`) | Base M5 / M4 Pro | - | **`9,697` / `7,531 tok/s`** | GPU-routed | GPU-routed | **1.26x** stock on M4 Pro; 4.16x less RAM than PyTorch MPS |

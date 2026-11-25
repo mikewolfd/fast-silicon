@@ -269,6 +269,9 @@ def rolling_multimodal_generate(
     max_pixels: int = 16777216,
     min_pixels_per_item: Sequence[int | None] | None = None,
     max_pixels_per_item: Sequence[int | None] | None = None,
+    long_page_single_threshold_vis_tok: int = 8000,
+    sort_shortest_first: bool = True,
+    host_mem_gb: float | None = None,
 ) -> tuple[list[BatchedMMItemResult], dict[str, Any]]:
     """Continuous rolling multimodal decode with immediate finished-slot admission and batched speculative PLD."""
     from .multimodal_batch import BatchedMMItemResult, _make_hybrid_cache
@@ -373,25 +376,6 @@ def rolling_multimodal_generate(
         )
         pending_meta.append((i, p_ids, v_spans, int(rope_delta), r_cos[0], r_sin[0]))
 
-    b_slots = max(1, min(int(batch_size), max(1, int(rolling_max_batch_size)), n_items))
-    max_prompt_len = max((len(r[1]) for r in pending_meta), default=1)
-    est_ctx = max_prompt_len + int(max_tokens) + 64
-    use_kvi8: KVMode | bool = (
-        kv_i8_resolver(b_slots, est_ctx) if callable(kv_i8_resolver) else kv_i8_resolver
-    )
-    eff_gdn_mode = resolve_gdn_state_mode(
-        gdn_state_mode,
-        batch_size=b_slots,
-        head_k_dim=int(lm.cfg.linear_key_head_dim),
-    )
-    active_cache = _make_hybrid_cache(
-        lm,
-        kv_step=kv_step,
-        kv_i8=use_kvi8,
-        gdn_state_mode=eff_gdn_mode,
-        batch_size=b_slots,
-    )
-
     ans_all: list[list[int]] = [[] for _ in range(n_items)]
     hit_eos_all = [False] * n_items
     hit_max_all = [False] * n_items
@@ -401,6 +385,12 @@ def rolling_multimodal_generate(
     pf_ms_item = [0.0] * n_items
     dec_ms_item = [0.0] * n_items
     pf_ms_total = 0.0
+    dec_ms_acc = 0.0
+    total_decode_steps = 0
+    slot_step_capacity = 0
+    active_slot_steps = 0
+    replacements = 0
+    compactions = 0
 
     drafters_all = list(drafters) if drafters is not None else [None] * n_items
     spec_modes_all = list(spec_modes) if spec_modes is not None else ["off"] * n_items
@@ -410,335 +400,401 @@ def rolling_multimodal_generate(
     chunk_sz = max(64, int(prefill_chunk_size))
     conv_k = int(lm.cfg.linear_conv_kernel_dim)
 
-    slot_orig_idx: list[int] = [-1] * b_slots
-    slot_done: list[bool] = [True] * b_slots
-    slot_pending: list[list[int]] = [[] for _ in range(b_slots)]
-    slot_true_pos: list[int] = [0] * b_slots
-    slot_kv_len: list[int] = [0] * b_slots
+    if host_mem_gb is not None:
+        eff_host_gb = float(host_mem_gb)
+    else:
+        try:
+            from fast_shared.hw_check import probe_host_hardware
 
-    def _prefill_and_admit(
-        slot_r: int,
-        meta_row: tuple[int, list[int], list[tuple[int, int]], int, mx.array, mx.array],
-    ) -> None:
-        nonlocal pf_ms_total
-        orig_i, p_ids, v_spans, rope_delta_i, c_i, s_i = meta_row
-        l_i = len(p_ids)
-        t_p0 = time.perf_counter()
+            eff_host_gb = float(probe_host_hardware().get("mem_gb") or 24.0)
+        except Exception:
+            eff_host_gb = 24.0
+    lm_hidden = int(getattr(getattr(lm, "cfg", None), "hidden_size", 1024))
 
-        base_i = lm.embed_tokens(mx.array([p_ids], dtype=mx.int32))[0]
-        vf_list = vis_feats[orig_i]
-        if v_spans:
-            parts: list[mx.array] = []
-            vf_k = 0
-            tok_cur = 0
-            for s0, s1 in v_spans:
-                if s0 > tok_cur:
-                    parts.append(base_i[tok_cur:s0, :])
-                vf_k_arr = vf_list[vf_k]
-                assert vf_k_arr is not None
-                parts.append(vf_k_arr.astype(base_i.dtype))
-                vf_k += 1
-                tok_cur = s1
-            if tok_cur < l_i:
-                parts.append(base_i[tok_cur:, :])
-            comb = mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
-        else:
-            comb = base_i
+    vis_tok_counts = [sum(vi.num_visual_tokens for vi in item_vins[i]) for i in range(n_items)]
+    vis_thresh = int(long_page_single_threshold_vis_tok)
+    if vis_thresh > 0 and n_items > 1:
+        norm_rows = [r for r in pending_meta if vis_tok_counts[r[0]] < vis_thresh]
+        long_rows = [r for r in pending_meta if vis_tok_counts[r[0]] >= vis_thresh]
+    else:
+        norm_rows = list(pending_meta)
+        long_rows = []
+    if sort_shortest_first and len(norm_rows) > 1:
+        norm_rows.sort(key=lambda r: len(r[1]))
 
-        emb_1 = comb[None, :, :]
-        cos_1 = c_i[None, :, :, :]
-        sin_1 = s_i[None, :, :, :]
+    def _resolve_pool_b_slots(pool_rows: list[Any], req_max: int) -> tuple[int, KVMode | bool, str]:
+        p_max_prompt = max((len(r[1]) for r in pool_rows), default=1)
+        p_est_ctx = p_max_prompt + int(max_tokens) + 64
+        capped_max = max(1, int(req_max))
+        if eff_host_gb <= 28.0:
+            ram_cap = 2 if (lm_hidden > 1536 and p_est_ctx >= 8192) else 4
+            capped_max = min(capped_max, ram_cap)
+        pool_b = max(1, min(int(batch_size), capped_max, len(pool_rows)))
+        p_kvi8: KVMode | bool = (
+            kv_i8_resolver(pool_b, p_est_ctx) if callable(kv_i8_resolver) else kv_i8_resolver
+        )
+        p_gdn = resolve_gdn_state_mode(
+            gdn_state_mode,
+            batch_size=pool_b,
+            head_k_dim=int(lm.cfg.linear_key_head_dim),
+            host_gb=eff_host_gb,
+        )
+        return pool_b, p_kvi8, p_gdn
 
-        item_cache = _make_hybrid_cache(
+    first_b_slots = 0
+
+    def _run_pool(pool_rows: list[Any], req_max_slots: int) -> None:
+        nonlocal pf_ms_total, dec_ms_acc, total_decode_steps, slot_step_capacity
+        nonlocal active_slot_steps, replacements, compactions, first_b_slots
+        if not pool_rows:
+            return
+        pool_n = len(pool_rows)
+        b_slots, use_kvi8, eff_gdn_mode = _resolve_pool_b_slots(pool_rows, req_max_slots)
+        if first_b_slots == 0:
+            first_b_slots = b_slots
+        active_cache = _make_hybrid_cache(
             lm,
-            kv_step=max(256, min(kv_step, l_i + 64)),
+            kv_step=kv_step,
             kv_i8=use_kvi8,
             gdn_state_mode=eff_gdn_mode,
-            batch_size=1,
+            batch_size=b_slots,
         )
-        last_h: mx.array | None = None
-        for c0 in range(0, l_i, chunk_sz):
-            c1 = min(l_i, c0 + chunk_sz)
-            ch = lm.forward_hidden(
-                None,
-                item_cache,
-                inputs_embeds=emb_1[:, c0:c1, :],
-                attn_mask="causal",
-                rope_trig=(cos_1[:, :, c0:c1, :], sin_1[:, :, c0:c1, :]),
+
+        slot_orig_idx: list[int] = [-1] * b_slots
+        slot_done: list[bool] = [True] * b_slots
+        slot_pending: list[list[int]] = [[] for _ in range(b_slots)]
+        slot_true_pos: list[int] = [0] * b_slots
+        slot_kv_len: list[int] = [0] * b_slots
+
+        def _prefill_and_admit(
+            slot_r: int,
+            meta_row: tuple[int, list[int], list[tuple[int, int]], int, mx.array, mx.array],
+        ) -> None:
+            nonlocal pf_ms_total
+            orig_i, p_ids, v_spans, rope_delta_i, c_i, s_i = meta_row
+            l_i = len(p_ids)
+            t_p0 = time.perf_counter()
+
+            base_i = lm.embed_tokens(mx.array([p_ids], dtype=mx.int32))[0]
+            vf_list = vis_feats[orig_i]
+            if v_spans:
+                parts: list[mx.array] = []
+                vf_k = 0
+                tok_cur = 0
+                for s0, s1 in v_spans:
+                    if s0 > tok_cur:
+                        parts.append(base_i[tok_cur:s0, :])
+                    vf_k_arr = vf_list[vf_k]
+                    assert vf_k_arr is not None
+                    parts.append(vf_k_arr.astype(base_i.dtype))
+                    vf_k += 1
+                    tok_cur = s1
+                if tok_cur < l_i:
+                    parts.append(base_i[tok_cur:, :])
+                comb = mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+            else:
+                comb = base_i
+
+            emb_1 = comb[None, :, :]
+            cos_1 = c_i[None, :, :, :]
+            sin_1 = s_i[None, :, :, :]
+
+            item_cache = _make_hybrid_cache(
+                lm,
+                kv_step=max(256, min(kv_step, l_i + 64)),
+                kv_i8=use_kvi8,
+                gdn_state_mode=eff_gdn_mode,
+                batch_size=1,
             )
-            mx.eval(ch)  # guard: allow-eval
-            last_h = ch[:, -1:, :]
-        assert last_h is not None
-        logits0 = lm.project_logits(last_h)[:, 0, :]
-        if vocab_remap is None and int(logits0.shape[-1]) > vocab_n:
-            logits0 = logits0[:, :vocab_n]
-        idx0_mx = gpu_argmax_nan(logits0)
-        mx.eval(idx0_mx)  # guard: allow-eval
-        idx0 = int(idx0_mx.tolist()[0])  # guard: allow-sync
-        if 0 <= idx0 < vocab_n:
-            first_tok = int(new_to_old[idx0])
-        else:
-            row_f32 = logits0[0].astype(mx.float32)
-            mx.eval(row_f32)  # guard: allow-eval
-            first_tok = int(new_to_old[safe_argmax_1d(np.asarray(row_f32))])  # guard: allow-sync
+            last_h: mx.array | None = None
+            for c0 in range(0, l_i, chunk_sz):
+                c1 = min(l_i, c0 + chunk_sz)
+                ch = lm.forward_hidden(
+                    None,
+                    item_cache,
+                    inputs_embeds=emb_1[:, c0:c1, :],
+                    attn_mask="causal",
+                    rope_trig=(cos_1[:, :, c0:c1, :], sin_1[:, :, c0:c1, :]),
+                )
+                mx.eval(ch)  # guard: allow-eval
+                last_h = ch[:, -1:, :]
+            assert last_h is not None
+            logits0 = lm.project_logits(last_h)[:, 0, :]
+            if vocab_remap is None and int(logits0.shape[-1]) > vocab_n:
+                logits0 = logits0[:, :vocab_n]
+            idx0_mx = gpu_argmax_nan(logits0)
+            mx.eval(idx0_mx)  # guard: allow-eval
+            idx0 = int(idx0_mx.tolist()[0])  # guard: allow-sync
+            if 0 <= idx0 < vocab_n:
+                first_tok = int(new_to_old[idx0])
+            else:
+                row_f32 = logits0[0].astype(mx.float32)  # guard: allow-fp32
+                mx.eval(row_f32)  # guard: allow-eval
+                first_tok = int(new_to_old[safe_argmax_1d(np.asarray(row_f32))])  # guard: allow-sync
 
-        scatter_single_item_cache_into_slot(
-            active_cache,
-            item_cache,
-            slot_r,
-            len(slot_orig_idx),
-            slot_kv_len,
-            l_i,
-            kv_step,
-        )
-        del item_cache, emb_1, cos_1, sin_1, comb, base_i
-        vis_feats[orig_i] = []
+            scatter_single_item_cache_into_slot(
+                active_cache,
+                item_cache,
+                slot_r,
+                len(slot_orig_idx),
+                slot_kv_len,
+                l_i,
+                kv_step,
+            )
+            del item_cache, emb_1, cos_1, sin_1, comb, base_i
+            vis_feats[orig_i] = []
 
-        mx.synchronize()
-        pf_ms = (time.perf_counter() - t_p0) * 1000.0
-        pf_ms_total += pf_ms
-        pf_ms_item[orig_i] = pf_ms
+            mx.synchronize()
+            pf_ms = (time.perf_counter() - t_p0) * 1000.0
+            pf_ms_total += pf_ms
+            pf_ms_item[orig_i] = pf_ms
 
-        slot_orig_idx[slot_r] = orig_i
-        slot_true_pos[slot_r] = l_i + rope_delta_i
-        if first_tok in stop_ids:
-            hit_eos_all[orig_i] = True
-            slot_done[slot_r] = True
-            slot_pending[slot_r] = []
-        else:
-            ans_all[orig_i].append(first_tok)
-            if len(ans_all[orig_i]) >= max_tokens:
-                hit_max_all[orig_i] = True
+            slot_orig_idx[slot_r] = orig_i
+            slot_true_pos[slot_r] = l_i + rope_delta_i
+            if first_tok in stop_ids:
+                hit_eos_all[orig_i] = True
                 slot_done[slot_r] = True
                 slot_pending[slot_r] = []
             else:
-                slot_done[slot_r] = False
-                slot_pending[slot_r] = [first_tok]
+                ans_all[orig_i].append(first_tok)
+                if len(ans_all[orig_i]) >= max_tokens:
+                    hit_max_all[orig_i] = True
+                    slot_done[slot_r] = True
+                    slot_pending[slot_r] = []
+                else:
+                    slot_done[slot_r] = False
+                    slot_pending[slot_r] = [first_tok]
 
-    queue_idx = 0
-    for r in range(b_slots):
-        while queue_idx < n_items and slot_done[r]:
-            _prefill_and_admit(r, pending_meta[queue_idx])
-            queue_idx += 1
-
-    dec_ms_acc = 0.0
-    total_decode_steps = 0
-    slot_step_capacity = 0
-    active_slot_steps = 0
-    replacements = 0
-    compactions = 0
-
-    while True:
-        admitted_any = False
-        for r in range(len(slot_orig_idx)):
-            while slot_done[r] and queue_idx < n_items:
-                _prefill_and_admit(r, pending_meta[queue_idx])
-                replacements += 1
+        queue_idx = 0
+        for r in range(b_slots):
+            while queue_idx < pool_n and slot_done[r]:
+                _prefill_and_admit(r, pool_rows[queue_idx])
                 queue_idx += 1
-                admitted_any = True
-        if admitted_any and hasattr(mx, "clear_cache"):
-            mx.clear_cache()
 
-        cur_b = len(slot_orig_idx)
-        alive_r = [r for r in range(cur_b) if not slot_done[r] and slot_pending[r]]
-        if not alive_r:
-            break
+        while True:
+            admitted_any = False
+            for r in range(len(slot_orig_idx)):
+                while slot_done[r] and queue_idx < pool_n:
+                    _prefill_and_admit(r, pool_rows[queue_idx])
+                    replacements += 1
+                    queue_idx += 1
+                    admitted_any = True
+            if admitted_any and hasattr(mx, "clear_cache"):
+                mx.clear_cache()
 
-        if compact_tail and queue_idx >= n_items and cur_b >= 4 and len(alive_r) < cur_b:
-            if len(alive_r) <= (cur_b * 5) // 8 or (cur_b - len(alive_r)) >= 4:
-                compact_hybrid_cache(active_cache, alive_r)
-                slot_orig_idx = [slot_orig_idx[r] for r in alive_r]
-                slot_done = [slot_done[r] for r in alive_r]
-                slot_pending = [slot_pending[r] for r in alive_r]
-                slot_true_pos = [slot_true_pos[r] for r in alive_r]
-                slot_kv_len = [slot_kv_len[r] for r in alive_r]
-                cur_b = len(slot_orig_idx)
-                alive_r = list(range(cur_b))
-                new_max_kv = max(slot_kv_len) if slot_kv_len else 0
-                for entry in active_cache:
-                    if isinstance(entry, GrowingKVCache) and entry.offset > new_max_kv:
-                        entry.rewind_to(new_max_kv)
-                compactions += 1
+            cur_b = len(slot_orig_idx)
+            alive_r = [r for r in range(cur_b) if not slot_done[r] and slot_pending[r]]
+            if not alive_r:
+                break
 
-        t_step0 = time.perf_counter()
-        total_decode_steps += 1
-        slot_step_capacity += cur_b
-        active_slot_steps += len(alive_r)
+            if compact_tail and queue_idx >= pool_n and cur_b >= 4 and len(alive_r) < cur_b:
+                if len(alive_r) <= (cur_b * 5) // 8 or (cur_b - len(alive_r)) >= 4:
+                    compact_hybrid_cache(active_cache, alive_r)
+                    slot_orig_idx = [slot_orig_idx[r] for r in alive_r]
+                    slot_done = [slot_done[r] for r in alive_r]
+                    slot_pending = [slot_pending[r] for r in alive_r]
+                    slot_true_pos = [slot_true_pos[r] for r in alive_r]
+                    slot_kv_len = [slot_kv_len[r] for r in alive_r]
+                    cur_b = len(slot_orig_idx)
+                    alive_r = list(range(cur_b))
+                    new_max_kv = max(slot_kv_len) if slot_kv_len else 0
+                    for entry in active_cache:
+                        if isinstance(entry, GrowingKVCache) and entry.offset > new_max_kv:
+                            entry.rewind_to(new_max_kv)
+                    compactions += 1
 
-        drafts_r: list[list[int]] = [[] for _ in range(cur_b)]
-        if eff_use_pld:
+            t_step0 = time.perf_counter()
+            total_decode_steps += 1
+            slot_step_capacity += cur_b
+            active_slot_steps += len(alive_r)
+
+            drafts_r: list[list[int]] = [[] for _ in range(cur_b)]
+            if eff_use_pld:
+                for r in range(cur_b):
+                    if slot_done[r] or len(slot_pending[r]) != 1:
+                        continue
+                    orig_i = slot_orig_idx[r]
+                    dr = drafters_all[orig_i]
+                    sp_mode = spec_modes_all[orig_i]
+                    rem_r = max_tokens - len(ans_all[orig_i])
+                    if dr is not None and sp_mode != "off" and rem_r >= 2:
+                        drafts_r[r] = dr.draft(ans_all[orig_i], mode=sp_mode, max_k=min(draft_k, rem_r - 1))
+
+            k_max = max((len(d) for d in drafts_r), default=0) if eff_use_pld else 0
+            l_q = (k_max + 1) if k_max > 0 else 1
+
+            step_rows: list[list[int]] = []
+            valid_masks: list[list[float]] = []
+            step_valid_lens: list[int] = []
+            has_invalid = False
             for r in range(cur_b):
-                if slot_done[r] or len(slot_pending[r]) != 1:
-                    continue
-                orig_i = slot_orig_idx[r]
-                dr = drafters_all[orig_i]
-                sp_mode = spec_modes_all[orig_i]
-                rem_r = max_tokens - len(ans_all[orig_i])
-                if dr is not None and sp_mode != "off" and rem_r >= 2:
-                    drafts_r[r] = dr.draft(ans_all[orig_i], mode=sp_mode, max_k=min(draft_k, rem_r - 1))
-
-        k_max = max((len(d) for d in drafts_r), default=0) if eff_use_pld else 0
-        l_q = (k_max + 1) if k_max > 0 else 1
-
-        step_rows: list[list[int]] = []
-        valid_masks: list[list[float]] = []
-        has_invalid = False
-        for r in range(cur_b):
-            if slot_done[r] or not slot_pending[r]:
-                step_rows.append([pad_token_id] * l_q)
-                valid_masks.append([0.0] * l_q)
-                has_invalid = True
-            elif k_max > 0:
-                seq_r = [slot_pending[r][0]] + drafts_r[r]
-                pad_r = l_q - len(seq_r)
-                if pad_r > 0:
-                    step_rows.append(seq_r + [pad_token_id] * pad_r)
-                    valid_masks.append([1.0] * len(seq_r) + [0.0] * pad_r)
+                if slot_done[r] or not slot_pending[r]:
+                    step_rows.append([pad_token_id] * l_q)
+                    valid_masks.append([0.0] * l_q)
+                    step_valid_lens.append(0)
                     has_invalid = True
+                elif k_max > 0:
+                    seq_r = [slot_pending[r][0]] + drafts_r[r]
+                    step_valid_lens.append(len(seq_r))
+                    pad_r = l_q - len(seq_r)
+                    if pad_r > 0:
+                        step_rows.append(seq_r + [pad_token_id] * pad_r)
+                        valid_masks.append([1.0] * len(seq_r) + [0.0] * pad_r)
+                        has_invalid = True
+                    else:
+                        step_rows.append(seq_r)
+                        valid_masks.append([1.0] * l_q)
                 else:
-                    step_rows.append(seq_r)
-                    valid_masks.append([1.0] * l_q)
-            else:
-                step_rows.append([slot_pending[r][0]])
-                valid_masks.append([1.0])
+                    step_rows.append([slot_pending[r][0]])
+                    valid_masks.append([1.0])
+                    step_valid_lens.append(1)
 
-        step_inp = mx.array(step_rows, dtype=mx.int32)
-        kv_prev = max(slot_kv_len) if slot_kv_len else 0
-        p_mat = (
-            np.array(slot_true_pos, dtype=np.int32)[:, None]
-            + np.arange(l_q, dtype=np.int32)[None, :]
-        )
-        r_trig_s = lm.precompute_rope_trig(mx.array(p_mat, dtype=mx.int32))
-        d_mask_s = build_ragged_attn_mask(slot_kv_len, kv_prev, l_q)
-        v_scale_s = (
-            mx.array([[[v] for v in vm] for vm in valid_masks], dtype=mx.bfloat16)
-            if has_invalid
-            else None
-        )
+            step_inp = mx.array(step_rows, dtype=mx.int32)
+            kv_prev = max(slot_kv_len) if slot_kv_len else 0
+            p_mat = (
+                np.array(slot_true_pos, dtype=np.int32)[:, None]
+                + np.arange(l_q, dtype=np.int32)[None, :]
+            )
+            r_trig_s = lm.precompute_rope_trig(mx.array(p_mat, dtype=mx.int32))
+            d_mask_s = build_ragged_attn_mask(slot_kv_len, kv_prev, l_q)
+            v_scale_s = (
+                mx.array([[[v] for v in vm] for vm in valid_masks], dtype=mx.bfloat16)
+                if has_invalid
+                else None
+            )
+            v_lens_s = mx.array(step_valid_lens, dtype=mx.int32) if has_invalid else None
 
-        for entry in active_cache:
-            if isinstance(entry, DeltaSlotCache):
-                entry.record_verify_trace = k_max > 0
+            for entry in active_cache:
+                if isinstance(entry, DeltaSlotCache):
+                    entry.record_verify_trace = k_max > 0
 
-        sh = lm.forward_hidden(
-            step_inp,
-            active_cache,
-            valid_token_scale=v_scale_s,
-            attn_mask=d_mask_s,
-            rope_trig=r_trig_s,
-        )
-        logits_step = lm.project_logits(sh)
-        if vocab_remap is None and int(logits_step.shape[-1]) > vocab_n:
-            logits_step = logits_step[:, :, :vocab_n]
-        flat_logits = logits_step.reshape(cur_b * l_q, int(logits_step.shape[-1]))
-        flat_idx_mx = gpu_argmax_nan(flat_logits)
-        mx.eval(flat_idx_mx)  # guard: allow-eval
-        flat_idxs = flat_idx_mx.tolist()  # guard: allow-sync
+            sh = lm.forward_hidden(
+                step_inp,
+                active_cache,
+                valid_token_scale=v_scale_s,
+                valid_lengths=v_lens_s,
+                attn_mask=d_mask_s,
+                rope_trig=r_trig_s,
+            )
+            logits_step = lm.project_logits(sh)
+            if vocab_remap is None and int(logits_step.shape[-1]) > vocab_n:
+                logits_step = logits_step[:, :, :vocab_n]
+            flat_logits = logits_step.reshape(cur_b * l_q, int(logits_step.shape[-1]))
+            flat_idx_mx = gpu_argmax_nan(flat_logits)
+            mx.eval(flat_idx_mx)  # guard: allow-eval
+            flat_idxs = flat_idx_mx.tolist()  # guard: allow-sync
 
-        tok_step_np = np.empty((cur_b, l_q), dtype=np.int32)
-        for r_i in range(cur_b):
-            if slot_done[r_i]:
-                continue
-            for q_i in range(l_q):
-                top1 = int(flat_idxs[r_i * l_q + q_i])
-                if 0 <= top1 < vocab_n:
-                    tok_step_np[r_i, q_i] = int(new_to_old[top1])
-                else:
-                    row_f32 = logits_step[r_i, q_i].astype(mx.float32)
-                    mx.eval(row_f32)  # guard: allow-eval
-                    tok_step_np[r_i, q_i] = int(new_to_old[safe_argmax_1d(np.asarray(row_f32))])  # guard: allow-sync
-
-        n_acc = [0] * cur_b
-        if k_max > 0:
-            for r in range(cur_b):
-                if slot_done[r]:
-                    n_acc[r] = 0
+            tok_step_np = np.empty((cur_b, l_q), dtype=np.int32)
+            for r_i in range(cur_b):
+                if slot_done[r_i]:
                     continue
-                orig_i = slot_orig_idx[r]
-                d_r = drafts_r[r]
-                k_r = len(d_r)
-                if k_r > 0:
-                    drafted_all[orig_i] += k_r
-                    verify_passes_all[orig_i] += 1
-                emitted_r: list[int] = []
-                consumed_r = 0
-                for idx_d in range(k_r):
-                    target_tok = int(tok_step_np[r, idx_d])
-                    consumed_r = idx_d + 1
-                    if target_tok == int(d_r[idx_d]):
-                        emitted_r.append(target_tok)
-                        if target_tok in stop_ids:
+                for q_i in range(l_q):
+                    top1 = int(flat_idxs[r_i * l_q + q_i])
+                    if 0 <= top1 < vocab_n:
+                        tok_step_np[r_i, q_i] = int(new_to_old[top1])
+                    else:
+                        row_f32 = logits_step[r_i, q_i].astype(mx.float32)  # guard: allow-fp32
+                        mx.eval(row_f32)  # guard: allow-eval
+                        tok_step_np[r_i, q_i] = int(new_to_old[safe_argmax_1d(np.asarray(row_f32))])  # guard: allow-sync
+
+            n_acc = [0] * cur_b
+            if k_max > 0:
+                for r in range(cur_b):
+                    if slot_done[r]:
+                        n_acc[r] = 0
+                        continue
+                    orig_i = slot_orig_idx[r]
+                    d_r = drafts_r[r]
+                    k_r = len(d_r)
+                    if k_r > 0:
+                        drafted_all[orig_i] += k_r
+                        verify_passes_all[orig_i] += 1
+                    emitted_r: list[int] = []
+                    consumed_r = 0
+                    for idx_d in range(k_r):
+                        target_tok = int(tok_step_np[r, idx_d])
+                        consumed_r = idx_d + 1
+                        if target_tok == int(d_r[idx_d]):
+                            emitted_r.append(target_tok)
+                            if target_tok in stop_ids:
+                                break
+                        else:
+                            emitted_r.append(target_tok)
                             break
                     else:
-                        emitted_r.append(target_tok)
-                        break
-                else:
-                    bonus_tok = int(tok_step_np[r, k_r])
-                    emitted_r.append(bonus_tok)
-                    consumed_r = k_r + 1
+                        bonus_tok = int(tok_step_np[r, k_r])
+                        emitted_r.append(bonus_tok)
+                        consumed_r = k_r + 1
 
-                if k_r > 0:
-                    accepted_all[orig_i] += max(0, consumed_r - 1)
+                    if k_r > 0:
+                        accepted_all[orig_i] += max(0, consumed_r - 1)
 
-                next_pending: list[int] = []
-                for etok in emitted_r:
-                    if etok in stop_ids:
-                        hit_eos_all[orig_i] = True
-                        slot_done[r] = True
-                        break
-                    if len(ans_all[orig_i]) >= max_tokens:
-                        hit_max_all[orig_i] = True
-                        slot_done[r] = True
-                        break
-                    ans_all[orig_i].append(etok)
-                    next_pending = [etok]
+                    next_pending: list[int] = []
+                    for etok in emitted_r:
+                        if etok in stop_ids:
+                            hit_eos_all[orig_i] = True
+                            slot_done[r] = True
+                            break
+                        if len(ans_all[orig_i]) >= max_tokens:
+                            hit_max_all[orig_i] = True
+                            slot_done[r] = True
+                            break
+                        ans_all[orig_i].append(etok)
+                        next_pending = [etok]
 
-                if slot_done[r] or len(ans_all[orig_i]) >= max_tokens:
-                    if not hit_eos_all[orig_i] and len(ans_all[orig_i]) >= max_tokens:
-                        hit_max_all[orig_i] = True
-                    slot_done[r] = True
-                    slot_pending[r] = []
-                    n_acc[r] = 0
-                else:
-                    slot_pending[r] = next_pending
-                    slot_true_pos[r] += consumed_r
-                    n_acc[r] = consumed_r
-
-            rollback_gdn_batched(active_cache, n_acc, l_q, conv_k, cur_b)
-            slot_kv_len = scatter_kv_and_rewind(active_cache, slot_kv_len, n_acc, kv_prev, l_q, cur_b)
-        else:
-            for r in range(cur_b):
-                if slot_done[r]:
-                    n_acc[r] = 0
-                    continue
-                orig_i = slot_orig_idx[r]
-                nxt_tok = int(tok_step_np[r, 0])
-                if nxt_tok in stop_ids:
-                    hit_eos_all[orig_i] = True
-                    slot_done[r] = True
-                    slot_pending[r] = []
-                    n_acc[r] = 0
-                else:
-                    ans_all[orig_i].append(nxt_tok)
-                    if len(ans_all[orig_i]) >= max_tokens:
-                        hit_max_all[orig_i] = True
+                    if slot_done[r] or len(ans_all[orig_i]) >= max_tokens:
+                        if not hit_eos_all[orig_i] and len(ans_all[orig_i]) >= max_tokens:
+                            hit_max_all[orig_i] = True
                         slot_done[r] = True
                         slot_pending[r] = []
                         n_acc[r] = 0
                     else:
-                        slot_pending[r] = [nxt_tok]
-                        slot_true_pos[r] += 1
-                        n_acc[r] = 1
-            slot_kv_len = scatter_kv_and_rewind(active_cache, slot_kv_len, n_acc, kv_prev, 1, cur_b)
-        dec_ms_acc += (time.perf_counter() - t_step0) * 1000.0
+                        slot_pending[r] = next_pending
+                        slot_true_pos[r] += consumed_r
+                        n_acc[r] = consumed_r
 
-    mx.synchronize()
+                rollback_gdn_batched(active_cache, n_acc, l_q, conv_k, cur_b)
+                slot_kv_len = scatter_kv_and_rewind(active_cache, slot_kv_len, n_acc, kv_prev, l_q, cur_b)
+            else:
+                for r in range(cur_b):
+                    if slot_done[r]:
+                        n_acc[r] = 0
+                        continue
+                    orig_i = slot_orig_idx[r]
+                    nxt_tok = int(tok_step_np[r, 0])
+                    if nxt_tok in stop_ids:
+                        hit_eos_all[orig_i] = True
+                        slot_done[r] = True
+                        slot_pending[r] = []
+                        n_acc[r] = 0
+                    else:
+                        ans_all[orig_i].append(nxt_tok)
+                        if len(ans_all[orig_i]) >= max_tokens:
+                            hit_max_all[orig_i] = True
+                            slot_done[r] = True
+                            slot_pending[r] = []
+                            n_acc[r] = 0
+                        else:
+                            slot_pending[r] = [nxt_tok]
+                            slot_true_pos[r] += 1
+                            n_acc[r] = 1
+                slot_kv_len = scatter_kv_and_rewind(active_cache, slot_kv_len, n_acc, kv_prev, 1, cur_b)
+            dec_ms_acc += (time.perf_counter() - t_step0) * 1000.0
+
+        mx.synchronize()
+        del active_cache
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+    if norm_rows:
+        _run_pool(norm_rows, rolling_max_batch_size)
+    for lr in long_rows:
+        _run_pool([lr], 1)
+
+    b_slots = first_b_slots or max(1, min(int(batch_size), max(1, int(rolling_max_batch_size)), n_items))
     dec_ms_total = dec_ms_acc
     for i in range(n_items):
         dec_ms_item[i] = dec_ms_total / max(1, n_items)
-    del active_cache
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
 
     results = [
         BatchedMMItemResult(
