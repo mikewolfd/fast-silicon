@@ -15,7 +15,6 @@ from fast_shared import (
     QuantizedKVCache,
     build_engine_index,
     dequantize_int8_symmetric,
-    fused_quantized_sdpa,
     normalize_kv_mode,
     pack_binary_bits,
     quantize_int8_symmetric,
@@ -142,6 +141,174 @@ def test_quantize_int8_and_window_scoring_edge_cases() -> None:
     assert ms[0, 2] == pytest.approx(0.8)
 
 
+def test_compact_retrieval_index_from_prequantized_zero_copy_and_bitwise_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(314)
+    docs = rng.standard_normal((128, 96)).astype(np.float32)
+    docs /= np.linalg.norm(docs, axis=1, keepdims=True)
+    queries = docs[:4].copy() + 0.03 * rng.standard_normal((4, 96)).astype(np.float32)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+
+    # 1. binary_int8 zero-copy parity vs regular CompactRetrievalIndex (NEON + NumPy 2 bitwise_count + LUT fallback)
+    ref_bin = CompactRetrievalIndex(docs, mode="binary_int8", use_neon=True)
+    assert ref_bin.codes_i8 is not None and ref_bin.scales_f16 is not None and ref_bin.binary_u8 is not None
+
+    pq_bin = CompactRetrievalIndex.from_prequantized(
+        mode="binary_int8",
+        dim=96,
+        codes_i8=ref_bin.codes_i8,
+        scales_f16=ref_bin.scales_f16,
+        binary_u8=ref_bin.binary_u8,
+        use_neon=True,
+    )
+    assert pq_bin.binary_bits == 96
+    assert pq_bin.codes_i8 is ref_bin.codes_i8
+    assert pq_bin.scales_f16 is ref_bin.scales_f16
+    assert pq_bin.binary_u8 is ref_bin.binary_u8
+    assert np.shares_memory(pq_bin.codes_i8, ref_bin.codes_i8)
+    assert np.shares_memory(pq_bin.scales_f16, ref_bin.scales_f16)
+    assert np.shares_memory(pq_bin.binary_u8, ref_bin.binary_u8)
+
+    idx_ref, sc_ref = ref_bin.search(queries, k=5, rerank_top_r=64)
+    idx_pq, sc_pq = pq_bin.search(queries, k=5, rerank_top_r=64)
+    assert np.array_equal(idx_pq, idx_ref)
+    np.testing.assert_allclose(sc_pq, sc_ref, atol=1e-6)
+
+    # Verify non-NEON NumPy 2 bitwise_count and NumPy <2 _POPCOUNT_LUT fallback produce exact parity!
+    pq_bin_np = CompactRetrievalIndex.from_prequantized(
+        mode="binary_int8",
+        dim=96,
+        codes_i8=ref_bin.codes_i8,
+        scales_f16=ref_bin.scales_f16,
+        binary_u8=ref_bin.binary_u8,
+        use_neon=False,
+    )
+    idx_bc, sc_bc = pq_bin_np.search(queries, k=5, rerank_top_r=64)
+    assert np.array_equal(idx_bc, idx_ref)
+    np.testing.assert_allclose(sc_bc, sc_ref, atol=1e-4)
+
+    monkeypatch.delattr(np, "bitwise_count", raising=False)
+    idx_lut, sc_lut = pq_bin_np.search(queries, k=5, rerank_top_r=64)
+    assert np.array_equal(idx_lut, idx_bc)
+    np.testing.assert_allclose(sc_lut, sc_bc, atol=1e-6)
+
+    # 2. int8 zero-copy parity
+    ref_i8 = CompactRetrievalIndex(docs, mode="int8", use_neon=True)
+    assert ref_i8.codes_i8 is not None and ref_i8.scales_f16 is not None
+    pq_i8 = CompactRetrievalIndex.from_prequantized(
+        mode="int8",
+        dim=96,
+        codes_i8=ref_i8.codes_i8,
+        scales_f16=ref_i8.scales_f16,
+        use_neon=True,
+    )
+    assert pq_i8.codes_i8 is ref_i8.codes_i8
+    assert pq_i8.scales_f16 is ref_i8.scales_f16
+    i_r, s_r = ref_i8.search(queries, k=5)
+    i_p, s_p = pq_i8.search(queries, k=5)
+    assert np.array_equal(i_p, i_r)
+    np.testing.assert_allclose(s_p, s_r, atol=1e-6)
+
+    # 3. fp16 & fp32 zero-copy parity
+    for dense_mode in ("fp16", "fp32"):
+        ref_d = CompactRetrievalIndex(docs, mode=dense_mode)
+        assert ref_d.dense_vecs is not None
+        pq_d = CompactRetrievalIndex.from_prequantized(
+            mode=dense_mode,
+            dim=96,
+            dense_vecs=ref_d.dense_vecs,
+        )
+        assert pq_d.dense_vecs is ref_d.dense_vecs
+        assert np.shares_memory(pq_d.dense_vecs, ref_d.dense_vecs)
+        di_r, ds_r = ref_d.search(queries, k=5)
+        di_p, ds_p = pq_d.search(queries, k=5)
+        assert np.array_equal(di_p, di_r)
+        np.testing.assert_allclose(ds_p, ds_r, atol=1e-6)
+
+    # 4. Empty N=0 prequantized index and validation errors
+    empty_idx = CompactRetrievalIndex.from_prequantized(
+        mode="binary_int8",
+        dim=64,
+        codes_i8=np.empty((0, 64), dtype=np.int8),
+        scales_f16=np.empty((0,), dtype=np.float16),
+        binary_u8=np.empty((0, 8), dtype=np.uint8),
+    )
+    assert empty_idx.num_docs == 0
+    ei, es = empty_idx.search(np.ones(64, dtype=np.float32), k=3)
+    assert np.all(ei == -1) and es.shape == (3,)
+
+    with pytest.raises(ValueError, match="binary_bits"):
+        CompactRetrievalIndex.from_prequantized(
+            mode="binary_int8",
+            dim=64,
+            codes_i8=np.zeros((2, 64), dtype=np.int8),
+            scales_f16=np.ones((2,), dtype=np.float16),
+            binary_u8=np.zeros((2, 8), dtype=np.uint8),
+            binary_bits=128,
+        )
+    with pytest.raises(ValueError, match="dtype"):
+        CompactRetrievalIndex.from_prequantized(
+            mode="int8",
+            dim=64,
+            codes_i8=np.zeros((2, 64), dtype=np.float32),
+            scales_f16=np.ones((2,), dtype=np.float16),
+        )
+    with pytest.raises(ValueError, match="shape"):
+        CompactRetrievalIndex.from_prequantized(
+            mode="fp16",
+            dim=64,
+            dense_vecs=np.zeros((2, 32), dtype=np.float16),
+        )
+
+
+def test_binary_topr_rerank_dim70_chunked_non_neon_fallback_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fast_shared.retrieval_index as ri
+
+    assert ri._BINARY_POPCOUNT_CHUNK_ROWS == 32_768
+
+    dim = 70  # Non-multiple of 8 (n_bytes=9, trailing 2 bits zero-padded)
+    n_docs = 128
+    rng = np.random.default_rng(7070)
+    docs = rng.standard_normal((n_docs, dim)).astype(np.float32)
+    docs[0, 0] = 0.0
+    docs[0, -1] = 0.0
+    docs /= np.linalg.norm(docs, axis=1, keepdims=True)
+    docs[-1] = 0.0  # Explicit exact-zero row
+
+    queries = docs[:4].copy() + 0.03 * rng.standard_normal((4, dim)).astype(np.float32)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+
+    idx_neon = CompactRetrievalIndex(docs, mode="binary_int8", use_neon=True)
+    assert idx_neon.binary_u8 is not None and idx_neon.binary_u8.shape == (n_docs, 9)
+    assert np.all(idx_neon.binary_u8[-1] == 0)
+
+    top_neon, sc_neon = idx_neon.search(queries, k=5, rerank_top_r=48)
+    assert np.array_equal(top_neon[:, 0], np.arange(4, dtype=np.int32))
+
+    # Exercise multi-chunk non-NEON path (37-row chunks over 128 docs -> 4 chunks with partial tail).
+    monkeypatch.setattr(ri, "_BINARY_POPCOUNT_CHUNK_ROWS", 37)
+    idx_np = CompactRetrievalIndex.from_prequantized(
+        mode="binary_int8",
+        dim=dim,
+        codes_i8=idx_neon.codes_i8,
+        scales_f16=idx_neon.scales_f16,
+        binary_u8=idx_neon.binary_u8,
+        use_neon=False,
+    )
+    top_bc, sc_bc = idx_np.search(queries, k=5, rerank_top_r=48)
+    assert np.array_equal(top_bc, top_neon)
+    np.testing.assert_allclose(sc_bc, sc_neon, atol=1e-4)
+
+    # Also verify _POPCOUNT_LUT chunked fallback produces identical results.
+    monkeypatch.delattr(np, "bitwise_count", raising=False)
+    top_lut, sc_lut = idx_np.search(queries, k=5, rerank_top_r=48)
+    assert np.array_equal(top_lut, top_bc)
+    np.testing.assert_allclose(sc_lut, sc_bc, atol=1e-6)
+
+
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 def test_hadamard_transform_bank_orthogonality_cpu(head_dim: int) -> None:
     prev_dev = mx.default_device()
@@ -232,7 +399,6 @@ def test_quantized_kv_cache_and_quarot_sdpa_parity_cpu() -> None:
         mx.eval(out_q4_raw, out_q4)
         raw_f = np.asarray(out_q4_raw.astype(mx.float32)).reshape(-1)
         q4_f = np.asarray(out_q4.astype(mx.float32)).reshape(-1)
-        cos_raw = float(np.dot(ref_f, raw_f) / (np.linalg.norm(ref_f) * np.linalg.norm(raw_f)))
         cos_q4 = float(np.dot(ref_f, q4_f) / (np.linalg.norm(ref_f) * np.linalg.norm(q4_f)))
         err_raw = float(np.linalg.norm(ref_f - raw_f) / np.linalg.norm(ref_f))
         err_q4 = float(np.linalg.norm(ref_f - q4_f) / np.linalg.norm(ref_f))

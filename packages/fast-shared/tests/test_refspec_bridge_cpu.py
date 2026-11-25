@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import struct
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -32,7 +33,7 @@ from fast_shared.refspec_bridge import (
     export_pack_concept_texts,
     format_candidate_concept_summary,
 )
-from fast_shared.retrieval_index import CompactRetrievalIndex
+from fast_shared.retrieval_index import CompactRetrievalIndex, pack_binary_bits
 
 
 def _unit_vec(seed: int, dim: int) -> np.ndarray:
@@ -426,9 +427,15 @@ def test_no_runtime_refspec_import_and_exports_match() -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 assert not alias.name.startswith("refspec"), f"Forbidden refspec import: {alias.name}"
+                assert not alias.name.startswith("fast_decision_models"), (
+                    f"Forbidden fast_decision_models import: {alias.name}"
+                )
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             assert not mod.startswith("refspec"), f"Forbidden refspec import: {mod}"
+            assert not mod.startswith("fast_decision_models"), (
+                f"Forbidden fast_decision_models import: {mod}"
+            )
 
     for sym in rb.__all__:
         assert hasattr(fast_shared, sym), f"Missing {sym} from fast_shared"
@@ -464,7 +471,7 @@ def test_structural_protocol_compatibility_with_refspec() -> None:
     assert list(sig_enc.parameters) == ["text"]
 
 
-def test_runtime_checkable_refspec_protocols() -> None:
+def test_runtime_checkable_refspec_protocols(tmp_path: Path) -> None:
     proto_mod: Any = None
     mod_name = "_refspec_protocols_check"
     cleanup_mod = False
@@ -488,8 +495,9 @@ def test_runtime_checkable_refspec_protocols() -> None:
 
     try:
         qenc = FastSiliconQueryEncoder(_FakeFastBgeSmall())
+        vecs = np.stack([_unit_vec(1, 32), _unit_vec(2, 32)], axis=0)
         sidx = CompactRetrievalSemanticIndex(
-            np.stack([_unit_vec(1, 32), _unit_vec(2, 32)], axis=0),
+            vecs,
             [10, 20],
             pack_sha256="sha256:" + "1" * 64,
             pack_id="urn:ref:vocabulary-pack:" + "2" * 64,
@@ -497,10 +505,19 @@ def test_runtime_checkable_refspec_protocols() -> None:
             model_id="BAAI/bge-small-en-v1.5",
             mode="int8",
         )
-        reranker = LayaRerankFusion(_FakeLayaBackend(lambda _s, _q: 0.5))
-        assert isinstance(qenc, proto_mod.QueryEncoder)
-        assert isinstance(sidx, proto_mod.SemanticIndex)
-        assert isinstance(reranker, proto_mod.CandidateReranker)
+        vpack_file = tmp_path / "proto_check.vpack"
+        _write_synthetic_vpack(vpack_file, vecs, [[10], [20]], mode="binary_i8")
+        reranker = LayaRerankFusion(
+            _FakeLayaBackend(lambda _s, _q: 0.5),
+            binary_profile=(1.0, 0.0),
+            escalation_backend=_FakeKevBackend(lambda _s, _q: 0.8),
+            attach_confidence=True,
+        )
+        with CompactRetrievalSemanticIndex.from_vpack(vpack_file) as vpack_sidx:
+            assert isinstance(qenc, proto_mod.QueryEncoder)
+            assert isinstance(sidx, proto_mod.SemanticIndex)
+            assert isinstance(vpack_sidx, proto_mod.SemanticIndex)
+            assert isinstance(reranker, proto_mod.CandidateReranker)
     finally:
         if cleanup_mod:
             sys.modules.pop(mod_name, None)
@@ -1585,3 +1602,969 @@ def test_format_candidate_concept_summary_caps_long_label_and_broader() -> None:
     assert len(c_parts["Concept"]) <= 50 and c_parts["Concept"].endswith("...")
     assert len(c_parts["Broader"]) <= 40 and c_parts["Broader"].endswith("...")
     assert c_parts["Definition"] == definition
+
+
+# ---------------------------------------------------------------------------
+# Track 2 Item 1b: Zero-Copy .vpack v2 Reader Tests
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_vpack(
+    out_path: Path,
+    vectors: np.ndarray,
+    rids_per_vector: Sequence[Sequence[int]],
+    *,
+    mode: str,
+    pack_sha256: str = "sha256:" + "a" * 64,
+    pack_id: str = "urn:ref:vocabulary-pack:" + "b" * 64,
+    source_manifest_digest: str = "sha256:" + "c" * 64,
+    model_id: str = "BAAI/bge-m3",
+    schema_version: str = "2",
+) -> str:
+    """Write a byte-exact RefSpec v2 ``.vpack`` binary container and return its ``sha256:...`` digest."""
+    arr = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    arr = np.where(norms > 1e-12, arr / np.maximum(norms, 1e-12), np.float32(0.0))
+    n_vecs, dim = arr.shape
+
+    def _align64(offset: int) -> int:
+        rem = offset % 64
+        return offset if rem == 0 else offset + (64 - rem)
+
+    def _quant_i8(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        max_abs = np.max(np.abs(mat), axis=1)
+        scales = np.where(max_abs > 1e-12, max_abs / 127.0, 1.0).astype(np.float32)
+        q = np.rint(mat / scales[:, None]).clip(-127, 127).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scales.astype(np.float16))
+
+    sections: list[tuple[str, bytes]] = []
+    n_clusters = 0
+    if mode == "ivf_i8":
+        n_clusters = min(4, n_vecs)
+        centroids = np.ascontiguousarray(arr[:n_clusters], dtype=np.float32)
+        c_offsets = np.zeros(n_clusters + 1, dtype=np.uint32)
+        if n_clusters > 0:
+            c_offsets[1:] = n_vecs
+        q_i8, s_f16 = _quant_i8(arr)
+        sections.append(("centroids_f32", centroids.tobytes()))
+        sections.append(("cluster_offsets_u32", c_offsets.tobytes()))
+        sections.append(("vectors", q_i8.tobytes()))
+        sections.append(("scales_f16", s_f16.tobytes()))
+    elif mode == "binary_i8":
+        q_i8, s_f16 = _quant_i8(arr)
+        bin_u8 = np.ascontiguousarray(np.packbits(arr > 0, axis=1))
+        sections.append(("vectors", q_i8.tobytes()))
+        sections.append(("scales_f16", s_f16.tobytes()))
+        sections.append(("binary_u8", bin_u8.tobytes()))
+    elif mode == "flat_f16":
+        v_f16 = np.ascontiguousarray(arr.astype(np.float16))
+        sections.append(("vectors", v_f16.tobytes()))
+    else:
+        raise ValueError(f"Unsupported test mode: {mode}")
+
+    rid_offsets = np.zeros(n_vecs + 1, dtype=np.uint32)
+    flat_rids: list[int] = []
+    max_rid = 0
+    for i, rids in enumerate(rids_per_vector):
+        for r in rids:
+            ri = int(r)
+            flat_rids.append(ri)
+            if ri > max_rid:
+                max_rid = ri
+        rid_offsets[i + 1] = len(flat_rids)
+    rids_u32 = np.asarray(flat_rids, dtype=np.uint32)
+    rid_to_vidx = np.full(max_rid + 1, 0xFFFFFFFF, dtype=np.uint32)
+    for vidx, rids in enumerate(rids_per_vector):
+        for r in rids:
+            ri = int(r)
+            if rid_to_vidx[ri] == 0xFFFFFFFF:
+                rid_to_vidx[ri] = vidx
+
+    sections.append(("rid_offsets_u32", rid_offsets.tobytes()))
+    sections.append(("rids_u32", rids_u32.tobytes()))
+    sections.append(("rid_to_vidx_u32", rid_to_vidx.tobytes()))
+
+    magic = b"RFVP0001"
+    base_header: dict[str, Any] = {
+        "recordType": "AtlasSemanticSidecar",
+        "schemaVersion": schema_version,
+        "packId": pack_id,
+        "packSha256": pack_sha256,
+        "sourceManifestDigest": source_manifest_digest,
+        "modelId": model_id,
+        "mode": mode,
+        "dimensions": int(dim),
+        "uniqueVectorCount": int(n_vecs),
+        "mappedResourceCount": int(rids_u32.size),
+        "maxRid": int(max_rid),
+        "nClusters": int(n_clusters),
+        "builtAt": "2026-11-25T00:00:00Z",
+        "sections": {},
+    }
+    sec_meta: dict[str, dict[str, int]] = {}
+    header_bytes = b""
+    for _ in range(6):
+        cand = dict(base_header, sections=sec_meta)
+        header_bytes = json.dumps(cand, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        cursor = _align64(len(magic) + 8 + len(header_bytes))
+        new_meta: dict[str, dict[str, int]] = {}
+        for name, payload in sections:
+            off = _align64(cursor)
+            new_meta[name] = {"offset": off, "nbytes": len(payload)}
+            cursor = off + len(payload)
+        if new_meta == sec_meta:
+            break
+        sec_meta = new_meta
+
+    with out_path.open("wb") as handle:
+        handle.write(magic)
+        handle.write(struct.pack("<Q", len(header_bytes)))
+        handle.write(header_bytes)
+        for name, payload in sections:
+            pad = sec_meta[name]["offset"] - handle.tell()
+            if pad > 0:
+                handle.write(b"\x00" * pad)
+            handle.write(payload)
+
+    return f"sha256:{hashlib.sha256(out_path.read_bytes()).hexdigest()}"
+
+
+@pytest.mark.parametrize("dim", [70, 128, 384])
+@pytest.mark.parametrize("vpack_mode,expected_idx_mode", [
+    ("binary_i8", "binary_int8"),
+    ("ivf_i8", "int8"),
+    ("flat_f16", "fp16"),
+])
+def test_compact_semantic_index_from_vpack_all_modes_zero_copy_and_lifecycle(
+    tmp_path: Path,
+    dim: int,
+    vpack_mode: str,
+    expected_idx_mode: str,
+) -> None:
+    n_vecs = 64
+    rng = np.random.default_rng(2026 + dim)
+    raw = rng.standard_normal((n_vecs, dim)).astype(np.float32)
+    # Plant exact zero coordinates in row 0 and an explicit exact all-zero row at the end!
+    raw[0, 0] = 0.0
+    raw[0, -1] = 0.0
+    vecs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+    vecs[-1] = 0.0
+
+    # Vector 0 maps to 3 deduplicated rids [10, 20, 30]; vector 1 maps to [100] (leaving gaps!).
+    rids_per_vec: list[list[int]] = [[10, 20, 30], [100]] + [[200 + i * 2] for i in range(2, n_vecs)]
+    zero_row_rid = 200 + (n_vecs - 1) * 2
+    vpack_path = tmp_path / f"sidecar_{vpack_mode}_{dim}.vpack"
+    digest = _write_synthetic_vpack(vpack_path, vecs, rids_per_vec, mode=vpack_mode)
+
+    # Also test bare hex digest pin (without "sha256:" prefix).
+    raw_hex = digest.removeprefix("sha256:")
+    with CompactRetrievalSemanticIndex.from_vpack(
+        vpack_path,
+        trusted_sidecar_digest=raw_hex,
+        rerank_top_r=64,
+        use_neon=True,
+    ) as sidx:
+        assert sidx.mode == expected_idx_mode
+        assert sidx.vpack_mode == vpack_mode
+        assert sidx.dimensions == dim
+        assert sidx.num_docs == n_vecs
+        assert sidx.model_id == "BAAI/bge-m3"
+        assert sidx.pack_sha256 == "sha256:" + "a" * 64
+        assert sidx.pack_id == "urn:ref:vocabulary-pack:" + "b" * 64
+        assert sidx.source_manifest_digest == "sha256:" + "c" * 64
+        # Must NOT materialize giant Python dict on mmap open!
+        assert sidx._rid_to_primary_window is None
+        assert sidx._rid_to_vidx_u32 is not None
+        assert sidx.nbytes > 0
+
+        # Prove 100% zero-copy: every buffer view shares memory directly with the mmap!
+        assert sidx._mm is not None
+        mm_u8 = np.frombuffer(sidx._mm, dtype=np.uint8)
+        try:
+            assert np.shares_memory(sidx._rid_offsets, mm_u8)
+            assert np.shares_memory(sidx._rids, mm_u8)
+            assert np.shares_memory(sidx._rid_to_vidx_u32, mm_u8)
+            assert sidx._rid_offsets.flags.owndata is False
+            if vpack_mode == "binary_i8":
+                assert sidx.index.codes_i8 is not None and np.shares_memory(sidx.index.codes_i8, mm_u8)
+                assert sidx.index.scales_f16 is not None and np.shares_memory(sidx.index.scales_f16, mm_u8)
+                assert sidx.index.binary_u8 is not None and np.shares_memory(sidx.index.binary_u8, mm_u8)
+                # Strict `arr > 0` parity with pack_binary_bits (including exact zeros & non-mult-8 tail!)
+                expected_bits = pack_binary_bits(vecs, bits=dim)
+                assert np.array_equal(sidx.index.binary_u8, expected_bits)
+                assert np.all(sidx.index.binary_u8[-1] == 0)
+            elif vpack_mode == "ivf_i8":
+                assert sidx.index.codes_i8 is not None and np.shares_memory(sidx.index.codes_i8, mm_u8)
+                assert sidx.index.scales_f16 is not None and np.shares_memory(sidx.index.scales_f16, mm_u8)
+            else:
+                assert sidx.index.dense_vecs is not None and np.shares_memory(sidx.index.dense_vecs, mm_u8)
+        finally:
+            del mm_u8
+
+        # Search parity: vector 0 expands to all 3 deduplicated rids [10, 20, 30] with ~1.0 cosine!
+        hits = sidx.search_rids(vecs[0], top_k=5, min_cosine=0.55)
+        assert len(hits) >= 3
+        assert {hits[0][0], hits[1][0], hits[2][0]} == {10, 20, 30}
+        assert all(sc > 0.99 for _, sc in hits[:3])
+
+        # Also verify single-rid vector 10 -> rid=200 + 10*2 = 220!
+        hits10 = sidx.search_rids(vecs[10], top_k=2, min_cosine=0.80)
+        assert hits10 and hits10[0][0] == 220 and hits10[0][1] > 0.99
+
+        # vector_for_rid O(1) mmap lookup parity + edge cases (exact zero row, missing gap, OOB, neg, bool)
+        for rid, expected_vidx in ((10, 0), (20, 0), (30, 0), (100, 1), (220, 10)):
+            reconstructed = sidx.vector_for_rid(rid)
+            assert reconstructed is not None
+            assert reconstructed.dtype == np.float32
+            assert reconstructed.shape == (dim,)
+            assert np.isclose(float(np.linalg.norm(reconstructed)), 1.0, atol=1e-5)
+            assert float(np.dot(reconstructed, vecs[expected_vidx])) > 0.995
+
+        zero_vec = sidx.vector_for_rid(zero_row_rid)
+        assert zero_vec is not None
+        assert zero_vec.dtype == np.float32 and zero_vec.shape == (dim,)
+        assert np.all(zero_vec == 0.0)
+
+        assert sidx.vector_for_rid(55) is None  # 0xFFFFFFFF gap inside [0, max_rid]
+        assert sidx.vector_for_rid(999999) is None  # out of bounds
+        assert sidx.vector_for_rid(-1) is None  # negative
+        assert sidx.vector_for_rid(True) is None  # bool rejected
+        assert sidx.vector_for_rid(False) is None
+        assert sidx.vector_for_rid(np.bool_(True)) is None  # type: ignore[arg-type]
+
+        # Non-NEON parity check against the same .vpack file
+        with CompactRetrievalSemanticIndex.from_vpack(
+            vpack_path, trusted_sidecar_digest=digest, rerank_top_r=64, use_neon=False
+        ) as sidx_np:
+            hits_np = sidx_np.search_rids(vecs[10], top_k=3, min_cosine=0.50)
+            assert hits_np[0][0] == hits10[0][0]
+            assert hits_np[0][1] == pytest.approx(hits10[0][1], abs=1e-3)
+
+    # Idempotent close() after context exit & closed-index guard
+    sidx.close()
+    assert sidx.nbytes == 0
+    with pytest.raises(ValueError, match="closed"):
+        sidx.search_rids(vecs[0], top_k=1)
+    with pytest.raises(ValueError, match="closed"):
+        sidx.vector_for_rid(10)
+
+
+@pytest.mark.parametrize("vpack_mode", ["binary_i8", "ivf_i8", "flat_f16"])
+def test_compact_semantic_index_from_vpack_empty_zero_vectors(
+    tmp_path: Path,
+    vpack_mode: str,
+) -> None:
+    dim = 70
+    empty_vecs = np.empty((0, dim), dtype=np.float32)
+    vpack_path = tmp_path / f"empty_n0_{vpack_mode}.vpack"
+    digest = _write_synthetic_vpack(vpack_path, empty_vecs, [], mode=vpack_mode)
+
+    with CompactRetrievalSemanticIndex.from_vpack(
+        vpack_path, trusted_sidecar_digest=digest, use_neon=True
+    ) as sidx:
+        assert sidx.num_docs == 0
+        assert sidx.dimensions == dim
+        assert sidx.search_rids(np.ones(dim, dtype=np.float32), top_k=5, min_cosine=0.0) == []
+        assert sidx.vector_for_rid(0) is None
+
+
+def test_compact_semantic_index_from_vpack_rejects_corrupt_files_without_fd_leak(
+    tmp_path: Path,
+) -> None:
+    vecs = np.stack([_unit_vec(i, 32) for i in range(4)], axis=0)
+    valid_path = tmp_path / "valid.vpack"
+    _write_synthetic_vpack(valid_path, vecs, [[1], [2], [3], [4]], mode="binary_i8")
+    valid_bytes = valid_path.read_bytes()
+
+    fd_dir = Path("/dev/fd")
+    fds_before = len(list(fd_dir.iterdir())) if fd_dir.is_dir() else None
+
+    # 1. Missing file -> ValueError
+    with pytest.raises(ValueError, match="not found"):
+        CompactRetrievalSemanticIndex.from_vpack(tmp_path / "does_not_exist.vpack")
+
+    # 2. Digest mismatch -> ValueError
+    with pytest.raises(ValueError, match="digest mismatch"):
+        CompactRetrievalSemanticIndex.from_vpack(
+            valid_path,
+            trusted_sidecar_digest="sha256:" + "0" * 64,
+        )
+
+    # 3. Empty file -> ValueError
+    empty_path = tmp_path / "empty.vpack"
+    empty_path.write_bytes(b"")
+    with pytest.raises(ValueError, match="empty or truncated"):
+        CompactRetrievalSemanticIndex.from_vpack(empty_path)
+
+    # 4. Bad magic -> ValueError
+    bad_magic = tmp_path / "bad_magic.vpack"
+    bad_magic.write_bytes(b"NOPE0001" + valid_bytes[8:])
+    with pytest.raises(ValueError, match="magic"):
+        CompactRetrievalSemanticIndex.from_vpack(bad_magic)
+
+    # 5. Truncated payload -> ValueError (section bounds check before frombuffer!)
+    truncated = tmp_path / "truncated.vpack"
+    truncated.write_bytes(valid_bytes[:-32])
+    with pytest.raises(ValueError, match="bounds invalid"):
+        CompactRetrievalSemanticIndex.from_vpack(truncated)
+
+    # 6. Unsupported schemaVersion == "1" -> ValueError
+    v1_path = tmp_path / "v1.vpack"
+    _write_synthetic_vpack(v1_path, vecs, [[1], [2], [3], [4]], mode="flat_f16", schema_version="1")
+    with pytest.raises(ValueError, match="schemaVersion"):
+        CompactRetrievalSemanticIndex.from_vpack(v1_path)
+
+    # 7. Corrupt JSON header -> ValueError
+    bad_json = tmp_path / "bad_json.vpack"
+    bad_hdr = b"{not-json"
+    bad_json.write_bytes(b"RFVP0001" + struct.pack("<Q", len(bad_hdr)) + bad_hdr + b"\x00" * 64)
+    with pytest.raises(ValueError, match="Malformed vpack JSON header"):
+        CompactRetrievalSemanticIndex.from_vpack(bad_json)
+
+    # 8. Out-of-bounds rid_offsets_u32 endpoint mismatch -> ValueError (tests post-frombuffer cleanup!)
+    corrupt_hdr_len = struct.unpack("<Q", valid_bytes[8:16])[0]
+    hdr_dict = json.loads(valid_bytes[16 : 16 + corrupt_hdr_len].decode("utf-8"))
+    off_ro = hdr_dict["sections"]["rid_offsets_u32"]["offset"]
+    mut = bytearray(valid_bytes)
+    struct.pack_into("<I", mut, off_ro, 99)  # rid_offsets[0] != 0
+    bad_endpoints = tmp_path / "bad_endpoints.vpack"
+    bad_endpoints.write_bytes(bytes(mut))
+    with pytest.raises(ValueError, match="rid_offsets_u32 endpoints invalid"):
+        CompactRetrievalSemanticIndex.from_vpack(bad_endpoints)
+
+    # 9. Non-monotonic rid_offsets_u32 with valid endpoints [0, 3, 1, 3, 4] -> ValueError
+    mut_mono = bytearray(valid_bytes)
+    struct.pack_into("<IIIII", mut_mono, off_ro, 0, 3, 1, 3, 4)
+    bad_mono = tmp_path / "bad_monotonic.vpack"
+    bad_mono.write_bytes(bytes(mut_mono))
+    with pytest.raises(ValueError, match="monotonically non-decreasing"):
+        CompactRetrievalSemanticIndex.from_vpack(bad_mono)
+
+    # 10. Unaligned section offset (rid_offsets_u32 offset % 4 != 0, scales_f16 offset % 2 != 0) -> ValueError
+    def _rewrite_vpack_header(src_bytes: bytes, mutate_fn: Any) -> bytes:
+        h_len = struct.unpack("<Q", src_bytes[8:16])[0]
+        hdr = json.loads(src_bytes[16 : 16 + h_len].decode("utf-8"))
+        mutate_fn(hdr)
+        new_h = json.dumps(hdr, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        # Pad file tail with extra bytes so shifted offsets stay within file bounds.
+        assert len(new_h) <= h_len + 64
+        body_start = min(sec["offset"] for sec in hdr["sections"].values())
+        pad_len = max(0, body_start - (16 + len(new_h)))
+        # Keep original body aligned by reusing exact tail from original body_start when header fits.
+        orig_body_start = min(
+            sec["offset"]
+            for sec in json.loads(src_bytes[16 : 16 + h_len].decode("utf-8"))["sections"].values()
+        )
+        assert 16 + len(new_h) <= orig_body_start
+        return (
+            b"RFVP0001"
+            + struct.pack("<Q", len(new_h))
+            + new_h
+            + b"\x00" * (orig_body_start - (16 + len(new_h)))
+            + src_bytes[orig_body_start:]
+            + b"\x00" * max(16, pad_len)
+        )
+
+    unaligned_u32 = tmp_path / "unaligned_u32.vpack"
+    unaligned_u32.write_bytes(
+        _rewrite_vpack_header(
+            valid_bytes,
+            lambda h: h["sections"]["rid_offsets_u32"].update(
+                {"offset": h["sections"]["rid_offsets_u32"]["offset"] + 2}
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        CompactRetrievalSemanticIndex.from_vpack(unaligned_u32)
+
+    unaligned_f16 = tmp_path / "unaligned_f16.vpack"
+    unaligned_f16.write_bytes(
+        _rewrite_vpack_header(
+            valid_bytes,
+            lambda h: h["sections"]["scales_f16"].update(
+                {"offset": h["sections"]["scales_f16"]["offset"] + 1}
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="2-byte aligned"):
+        CompactRetrievalSemanticIndex.from_vpack(unaligned_f16)
+
+    flat_path = tmp_path / "valid_flat_f16.vpack"
+    _write_synthetic_vpack(flat_path, vecs, [[1], [2], [3], [4]], mode="flat_f16")
+    unaligned_flat = tmp_path / "unaligned_flat_f16.vpack"
+    unaligned_flat.write_bytes(
+        _rewrite_vpack_header(
+            flat_path.read_bytes(),
+            lambda h: h["sections"]["vectors"].update(
+                {"offset": h["sections"]["vectors"]["offset"] + 1}
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="2-byte aligned"):
+        CompactRetrievalSemanticIndex.from_vpack(unaligned_flat)
+
+    # 11. Symlink rejection (both valid target and dangling symlink) -> ValueError
+    sym_valid = tmp_path / "link_valid.vpack"
+    sym_valid.symlink_to(valid_path)
+    with pytest.raises(ValueError, match="symlink"):
+        CompactRetrievalSemanticIndex.from_vpack(sym_valid)
+
+    sym_dangling = tmp_path / "link_dangling.vpack"
+    sym_dangling.symlink_to(tmp_path / "nonexistent_target.vpack")
+    with pytest.raises(ValueError, match="symlink"):
+        CompactRetrievalSemanticIndex.from_vpack(sym_dangling)
+
+    # Verify zero leaked file descriptors across all 11 error paths!
+    if fds_before is not None:
+        fds_after = len(list(fd_dir.iterdir()))
+        assert fds_after <= fds_before
+
+
+# ---------------------------------------------------------------------------
+# Track 2 Item 3a: Calibrated LayaRerankFusion + Kev Confidence Cascade Tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeKevBackend:
+    """Test double matching ``Kev08bMlxBackend.score_multi_states`` binary ``noul`` contract."""
+
+    def __init__(self, score_fn: Any) -> None:
+        self._score_fn = score_fn
+        self.calls: list[dict[str, Any]] = []
+        self.closed: bool = False
+
+    def score_multi_states(
+        self,
+        items: Sequence[tuple[Any, Sequence[Mapping[str, Any]]]],
+        *,
+        batch_docs: int | None = None,
+        temperature: float | None = None,
+    ) -> list[list[tuple[list[float], list[float]]]]:
+        self.calls.append({"items": items, "batch_docs": batch_docs, "temperature": temperature})
+        out: list[list[tuple[list[float], list[float]]]] = []
+        for state, qdefs in items:
+            doc_out: list[tuple[list[float], list[float]]] = []
+            for qd in qdefs:
+                assert qd["type"] == "noul"
+                assert "false" in qd["criteria"] and "true" in qd["criteria"]
+                p_true = float(self._score_fn(state, qd))
+                # Exact Kev08bMlxBackend return shape: ([P(false), P(true)], [logit_false, logit_true])
+                doc_out.append(([1.0 - p_true, p_true], [-1.0, 1.0]))
+            out.append(doc_out)
+        return out
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _DuckCalibrationProfile:
+    """Pure duck-typed Platt calibration profile matching ``CalibrationProfile.apply``."""
+
+    def __init__(self, platt_a: float, platt_b: float) -> None:
+        self.platt_a = platt_a
+        self.platt_b = platt_b
+        self.calls = 0
+
+    def apply(self, values: Any, *, from_probs: bool = True) -> np.ndarray:
+        assert from_probs is True
+        self.calls += 1
+        arr = np.asarray(values, dtype=np.float64)
+        p_c = np.clip(arr, 1e-7, 1.0 - 1e-7)
+        logits = np.log(p_c / (1.0 - p_c))
+        z = np.clip(self.platt_a * logits + self.platt_b, -30.0, 30.0)
+        return 1.0 / (1.0 + np.exp(-z))
+
+
+def test_laya_rerank_platt_calibration_profile_and_tuple_parity() -> None:
+    cands = [
+        {"id": "c1", "label": "Alpha Concept", "scheme": "mesh"},
+        {"id": "c2", "label": "Beta Concept", "scheme": "eurovoc"},
+    ]
+    raw_scores = {"Alpha": 0.80, "Beta": 0.25}
+    laya = _FakeLayaBackend(lambda _s, qd: raw_scores["Alpha"] if "Alpha" in qd["instructions"] else raw_scores["Beta"])
+
+    platt_a, platt_b = 0.65, -0.30
+    profile = _DuckCalibrationProfile(platt_a, platt_b)
+
+    r_obj = LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        binary_profile=profile,
+        attach_confidence=True,
+    )
+    r_tup = LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        binary_profile=(platt_a, platt_b),
+        attach_confidence=True,
+    )
+
+    out_obj = r_obj.rerank(query="alpha query", candidates=cands, limit=2)
+    out_tup = r_tup.rerank(query="alpha query", candidates=cands, limit=2)
+
+    assert profile.calls == 1
+    assert [c["id"] for c in out_obj] == ["c1", "c2"]
+    assert [c["id"] for c in out_tup] == ["c1", "c2"]
+    for c_o, c_t in zip(out_obj, out_tup, strict=True):
+        assert c_o["layaScore"] == pytest.approx(c_t["layaScore"], abs=1e-6)
+        assert c_o["rerankConfidence"] == pytest.approx(c_t["rerankConfidence"], abs=1e-6)
+        assert c_o["rerankEscalated"] is False
+
+    # Verify exact numerical value against manual sigmoid(a * logit(p) + b)
+    expected_alpha = 1.0 / (1.0 + math.exp(-(platt_a * math.log(0.80 / 0.20) + platt_b)))
+    assert out_obj[0]["layaScore"] == pytest.approx(expected_alpha, abs=1e-5)
+    assert out_obj[0]["rerankConfidence"] == pytest.approx(expected_alpha, abs=1e-5)
+    # 0.646 lies between low=0.35 and high=0.70 -> "disambiguate"!
+    assert out_obj[0]["rerankDecision"] == "disambiguate"
+    assert out_obj[1]["rerankDecision"] == "low_confidence"
+    # Input dicts were never mutated!
+    assert all("rerankConfidence" not in c and "layaScore" not in c for c in cands)
+
+
+def test_laya_rerank_lazy_escalation_skipped_when_primary_confident() -> None:
+    created_kev: list[_FakeKevBackend] = []
+
+    def _kev_factory() -> _FakeKevBackend:
+        inst = _FakeKevBackend(lambda _s, _q: 0.5)
+        created_kev.append(inst)
+        return inst
+
+    laya = _FakeLayaBackend(
+        lambda _s, qd: 0.94 if "Clear Winner" in qd["instructions"] else 0.08
+    )
+    cands = [
+        {"id": "c1", "label": "Clear Loser", "scheme": "fast"},
+        {"id": "c2", "label": "Clear Winner", "scheme": "mesh"},
+    ]
+
+    with LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        escalation_factory=_kev_factory,
+        uncertainty_band=(0.30, 0.70),
+        escalation_margin=0.08,
+        attach_confidence=True,
+    ) as reranker:
+        out = reranker.rerank(query="clear medical concept", candidates=cands, limit=2)
+        # Confident scores (0.94 vs 0.08) outside (0.30, 0.70) and margin 0.86 > 0.08 -> ZERO escalation!
+        assert reranker.is_escalation_initialized is False
+        assert created_kev == []
+        assert [c["id"] for c in out] == ["c2", "c1"]
+        assert out[0]["rerankEscalated"] is False
+        assert out[0]["rerankDecision"] == "high_confidence"
+        assert out[1]["rerankEscalated"] is False
+        assert out[1]["rerankDecision"] == "low_confidence"
+
+
+def test_laya_rerank_lazy_escalation_uncertain_band_reorders_and_attaches_confidence() -> None:
+    created_kev: list[_FakeKevBackend] = []
+
+    def _kev_score(_state: Any, qd: Mapping[str, Any]) -> float:
+        ins = qd["instructions"]
+        if "True Match" in ins:
+            return 0.93
+        if "Ambiguous Distractor" in ins:
+            return 0.18
+        raise AssertionError(f"Unexpected candidate escalated to Kev: {ins}")
+
+    def _kev_factory() -> _FakeKevBackend:
+        inst = _FakeKevBackend(_kev_score)
+        created_kev.append(inst)
+        return inst
+
+    def _laya_score(_state: Any, qd: Mapping[str, Any]) -> float:
+        ins = qd["instructions"]
+        if "Ambiguous Distractor" in ins:
+            return 0.62  # inside uncertainty_band (0.30, 0.70)
+        if "True Match" in ins:
+            return 0.48  # inside uncertainty_band (0.30, 0.70)
+        return 0.07  # confident reject -> MUST NOT be escalated
+
+    cands = [
+        {"id": "exact_1", "label": "Exact Match", "scheme": "mesh", "matchReason": "exact_preferred"},
+        {"id": "ambig_1", "label": "Ambiguous Distractor", "scheme": "fast"},
+        {"id": "true_1", "label": "True Match", "scheme": "eurovoc"},
+        {"id": "reject_1", "label": "Confident Reject", "scheme": "fast"},
+        {"id": "tail_1", "label": "Tail Beyond MaxRerank", "scheme": "fast"},
+    ]
+    cands_snapshot = [dict(c) for c in cands]
+
+    with LayaRerankFusion(
+        _FakeLayaBackend(_laya_score),
+        max_rerank=3,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        escalation_factory=_kev_factory,
+        uncertainty_band=(0.30, 0.70),
+        escalation_margin=0.08,
+        max_escalation_candidates=2,
+        kev_batch_docs=4,
+        attach_confidence=True,
+    ) as reranker:
+        assert reranker.is_escalation_initialized is False
+        out = reranker.rerank(query="exact match", candidates=cands, limit=5)
+
+        assert reranker.is_escalation_initialized is True
+        assert len(created_kev) == 1
+        assert len(created_kev[0].calls) == 1
+        call = created_kev[0].calls[0]
+        assert call["batch_docs"] == 4
+        # Single shared query state with the full top_pool (capped at max_escalation_candidates=2)!
+        assert len(call["items"]) == 1
+        state_sent, qdefs_sent = call["items"][0]
+        assert state_sent == {"query": "exact match"}
+        assert len(qdefs_sent) == 2
+
+        # Exact stays pinned #1; Kev rescues True Match (0.93) over Ambiguous Distractor (0.18)!
+        assert [c["id"] for c in out] == ["exact_1", "true_1", "ambig_1", "reject_1", "tail_1"]
+
+        assert out[0]["rerankDecision"] == "exact"
+        assert out[0]["rerankConfidence"] == 1.0
+        assert out[0]["rerankEscalated"] is False
+
+        assert out[1]["rerankDecision"] == "high_confidence"
+        assert out[1]["rerankConfidence"] == pytest.approx(0.93, abs=1e-6)
+        assert out[1]["rerankEscalated"] is True
+
+        assert out[2]["rerankDecision"] == "low_confidence"
+        assert out[2]["rerankConfidence"] == pytest.approx(0.18, abs=1e-6)
+        assert out[2]["rerankEscalated"] is True
+
+        assert out[3]["rerankDecision"] == "low_confidence"
+        assert out[3]["rerankConfidence"] == pytest.approx(0.07, abs=1e-6)
+        assert out[3]["rerankEscalated"] is False
+
+        assert out[4]["rerankDecision"] == "low_confidence"
+        assert out[4]["rerankConfidence"] == 0.0
+        assert out[4]["rerankEscalated"] is False
+
+    # Lazily created escalation backend MUST be closed on exit; input dicts untouched!
+    assert created_kev[0].closed is True
+    assert cands == cands_snapshot
+
+
+def test_laya_rerank_close_margin_escalation_and_error_fallback() -> None:
+    # Both top-2 candidates score > 0.70 (outside uncertainty_band), yet within escalation_margin=0.08!
+    laya = _FakeLayaBackend(
+        lambda _s, qd: 0.84 if "Runner Up" in qd["instructions"] else (0.80 if "Better Match" in qd["instructions"] else 0.10)
+    )
+    kev = _FakeKevBackend(
+        lambda _s, qd: 0.96
+        if "Better Match" in qd["instructions"]
+        else (0.55 if "Runner Up" in qd["instructions"] else 0.09)
+    )
+    cands = [
+        {"id": "c1", "label": "Runner Up", "scheme": "mesh"},
+        {"id": "c2", "label": "Better Match", "scheme": "eurovoc"},
+        {"id": "c3", "label": "Low Distractor", "scheme": "fast"},
+    ]
+
+    with LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        escalation_backend=kev,
+        uncertainty_band=(0.30, 0.70),
+        escalation_margin=0.08,
+        attach_confidence=True,
+    ) as reranker:
+        out = reranker.rerank(query="close margin query", candidates=cands, limit=3)
+        assert [c["id"] for c in out] == ["c2", "c1", "c3"]
+        assert len(kev.calls) == 1
+        # Entire top_pool (all 3 candidates <= max_escalation_candidates=8) escalated coherently in ONE call!
+        assert len(kev.calls[0]["items"][0][1]) == 3
+        assert out[0]["rerankEscalated"] is True and out[0]["rerankDecision"] == "high_confidence"
+        assert out[1]["rerankEscalated"] is True and out[1]["rerankDecision"] == "disambiguate"
+        assert out[2]["rerankEscalated"] is True and out[2]["rerankDecision"] == "low_confidence"
+
+    # Externally injected escalation backend MUST NOT be closed by LayaRerankFusion.close()!
+    assert kev.closed is False
+
+    # fallback_on_error=True keeps primary Laya scores cleanly if escalation raises!
+    class _BrokenKev:
+        def score_multi_states(self, _items: Any, **_kw: Any) -> Any:
+            raise RuntimeError("Metal OOM")
+
+    reranker_fb = LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        escalation_backend=_BrokenKev(),
+        fallback_on_error=True,
+        attach_confidence=True,
+    )
+    fb_out = reranker_fb.rerank(query="close margin query", candidates=cands, limit=3)
+    assert [c["id"] for c in fb_out] == ["c1", "c2", "c3"]
+    assert all(c["rerankEscalated"] is False for c in fb_out)
+
+
+# ---------------------------------------------------------------------------
+# Track 2 Code-Review Regression Tests (Findings 1, 3, 5, 6, 9, 13)
+# ---------------------------------------------------------------------------
+
+
+def test_laya_rerank_full_top_pool_escalation_prevents_rank_inversion_and_applies_esc_profile() -> None:
+    # Platt calibration on Laya compresses c_top (0.92 -> ~0.77, outside band) while c_mid
+    # (0.60 -> ~0.55, inside band) triggers escalation. Both Laya and Kev prefer c_top > c_mid.
+    # Partial escalation would leave c_top at 0.77 and upgrade c_mid to Kev's 0.85 -> RANK INVERSION!
+    # Coherent full-top_pool escalation sends ALL 3 top_pool candidates in ONE call so c_top stays #1.
+    def _laya_score(_s: Any, qd: Mapping[str, Any]) -> float:
+        ins = qd["instructions"]
+        if "Top Contender" in ins:
+            return 0.92
+        if "Mid Contender" in ins:
+            return 0.60
+        return 0.05
+
+    def _kev_score(_s: Any, qd: Mapping[str, Any]) -> float:
+        ins = qd["instructions"]
+        if "Top Contender" in ins:
+            return 0.95
+        if "Mid Contender" in ins:
+            return 0.85
+        return 0.12
+
+    cands = [
+        {"id": "c_top", "label": "Top Contender", "scheme": "mesh"},
+        {"id": "c_mid", "label": "Mid Contender", "scheme": "eurovoc"},
+        {"id": "c_low", "label": "Low Distractor", "scheme": "fast"},
+    ]
+
+    kev_raw = _FakeKevBackend(_kev_score)
+    reranker = LayaRerankFusion(
+        _FakeLayaBackend(_laya_score),
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        binary_profile=(0.50, 0.0),
+        escalation_backend=kev_raw,
+        uncertainty_band=(0.30, 0.70),
+        escalation_margin=0.05,
+        attach_confidence=True,
+    )
+    out = reranker.rerank(query="cardiac surgery", candidates=cands, limit=3)
+
+    assert len(kev_raw.calls) == 1
+    assert len(kev_raw.calls[0]["items"][0][1]) == 3
+    assert [c["id"] for c in out] == ["c_top", "c_mid", "c_low"]
+    assert all(c["rerankEscalated"] is True for c in out)
+    assert out[0]["layaScore"] == pytest.approx(0.95, abs=1e-6)
+    assert out[1]["layaScore"] == pytest.approx(0.85, abs=1e-6)
+    assert out[2]["layaScore"] == pytest.approx(0.12, abs=1e-6)
+
+    # Optional escalation_binary_profile (both Platt tuple and duck-typed profile object) calibrates Kev output.
+    esc_a, esc_b = 0.60, -0.25
+    esc_profile = _DuckCalibrationProfile(esc_a, esc_b)
+    reranker_esc_obj = LayaRerankFusion(
+        _FakeLayaBackend(_laya_score),
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        binary_profile=(0.50, 0.0),
+        escalation_binary_profile=esc_profile,
+        escalation_backend=_FakeKevBackend(_kev_score),
+        uncertainty_band=(0.30, 0.70),
+        attach_confidence=True,
+    )
+    reranker_esc_tup = LayaRerankFusion(
+        _FakeLayaBackend(_laya_score),
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        binary_profile=(0.50, 0.0),
+        escalation_binary_profile=(esc_a, esc_b),
+        escalation_backend=_FakeKevBackend(_kev_score),
+        uncertainty_band=(0.30, 0.70),
+        attach_confidence=True,
+    )
+    out_obj = reranker_esc_obj.rerank(query="cardiac surgery", candidates=cands, limit=3)
+    out_tup = reranker_esc_tup.rerank(query="cardiac surgery", candidates=cands, limit=3)
+    assert esc_profile.calls == 1
+    expected_top = 1.0 / (1.0 + math.exp(-(esc_a * math.log(0.95 / 0.05) + esc_b)))
+    assert out_obj[0]["layaScore"] == pytest.approx(expected_top, abs=1e-5)
+    assert out_obj[0]["rerankConfidence"] == pytest.approx(expected_top, abs=1e-5)
+    for c_o, c_t in zip(out_obj, out_tup, strict=True):
+        assert c_o["layaScore"] == pytest.approx(c_t["layaScore"], abs=1e-6)
+        assert c_o["rerankEscalated"] is True
+
+    with pytest.raises(ValueError, match="escalation_binary_profile"):
+        LayaRerankFusion(_FakeLayaBackend(_laya_score), escalation_binary_profile=(True, 0.0))
+    with pytest.raises(TypeError, match="escalation_binary_profile"):
+        LayaRerankFusion(_FakeLayaBackend(_laya_score), escalation_binary_profile="invalid")
+
+
+def test_laya_rerank_close_margin_escalation_uses_primary_blended_under_default_prior() -> None:
+    # Default prior_weight=0.25 with m=2:
+    #   pos 0 (prior=1.0): cal_prob=0.72 -> primary_blended = 0.75*0.72 + 0.25*1.0 = 0.79
+    #   pos 1 (prior=0.5): cal_prob=0.85 -> primary_blended = 0.75*0.85 + 0.25*0.5 = 0.7625
+    # Both cal_probs > 0.70 (outside band) and |0.85 - 0.72| = 0.13 > 0.08, yet
+    # |primary_blended[0] - primary_blended[1]| = 0.0275 <= 0.08 -> MUST trigger escalation!
+    laya = _FakeLayaBackend(
+        lambda _s, qd: 0.72 if "First Prior" in qd["instructions"] else 0.85
+    )
+    kev = _FakeKevBackend(
+        lambda _s, qd: 0.40 if "First Prior" in qd["instructions"] else 0.97
+    )
+    cands = [
+        {"id": "c1", "label": "First Prior", "scheme": "fast"},
+        {"id": "c2", "label": "Second Better", "scheme": "mesh"},
+    ]
+
+    reranker = LayaRerankFusion(
+        laya,
+        deduplicate_labels=False,
+        escalation_backend=kev,
+        uncertainty_band=(0.30, 0.70),
+        escalation_margin=0.08,
+        attach_confidence=True,
+    )
+    assert reranker.prior_weight == pytest.approx(0.25)
+    out = reranker.rerank(query="near tie blended", candidates=cands, limit=2)
+
+    assert len(kev.calls) == 1
+    assert len(kev.calls[0]["items"][0][1]) == 2
+    assert [c["id"] for c in out] == ["c2", "c1"]
+    assert all(c["rerankEscalated"] is True for c in out)
+    assert out[0]["layaScore"] == pytest.approx(0.97, abs=1e-6)
+    assert out[1]["layaScore"] == pytest.approx(0.40, abs=1e-6)
+
+
+def test_laya_rerank_escalation_duck_typed_list_ndarray_and_bool_rejection() -> None:
+    class _DuckArrayKev:
+        def score_multi_states(
+            self,
+            items: Sequence[tuple[Any, Sequence[Mapping[str, Any]]]],
+            **_kw: Any,
+        ) -> list[list[Any]]:
+            _, qdefs = items[0]
+            assert len(qdefs) == 5
+            return [
+                [
+                    [np.array([0.1, 0.9]), np.array([-1.0, 1.0])],  # list of ndarrays -> 0.9
+                    np.array([0.15, 0.85]),  # bare 1D ndarray -> 0.85
+                    np.array([0.78]),  # 1-element ndarray -> 0.78
+                    0.66,  # plain float scalar -> 0.66
+                    np.bool_(True),  # bool rejected in scalar branch -> 0.5
+                ]
+            ]
+
+    laya = _FakeLayaBackend(lambda _s, _qd: 0.50)
+    cands = [{"id": f"c{i}", "label": f"Concept {i}", "scheme": "mesh"} for i in range(5)]
+    reranker = LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        escalation_backend=_DuckArrayKev(),
+        attach_confidence=True,
+    )
+    out = reranker.rerank(query="duck typed kev", candidates=cands, limit=5)
+
+    by_id = {c["id"]: c for c in out}
+    assert by_id["c0"]["layaScore"] == pytest.approx(0.90, abs=1e-6)
+    assert by_id["c1"]["layaScore"] == pytest.approx(0.85, abs=1e-6)
+    assert by_id["c2"]["layaScore"] == pytest.approx(0.78, abs=1e-6)
+    assert by_id["c3"]["layaScore"] == pytest.approx(0.66, abs=1e-6)
+    assert by_id["c4"]["layaScore"] == pytest.approx(0.50, abs=1e-6)
+    assert [c["id"] for c in out] == ["c0", "c1", "c2", "c3", "c4"]
+    assert all(c["rerankEscalated"] is True for c in out)
+
+
+def test_laya_rerank_exact_hidden_reason_is_pinned_as_exact() -> None:
+    laya = _FakeLayaBackend(lambda _s, _qd: 0.99)
+    cands = [
+        {"id": "non_exact", "label": "Semantic Distractor", "scheme": "fast"},
+        {
+            "id": "hidden_1",
+            "label": "Myocardial Infarction",
+            "scheme": "mesh",
+            "matchReason": "exact_hidden",
+        },
+        {
+            "id": "hidden_2",
+            "label": "Coronary Thrombosis",
+            "scheme": "eurovoc",
+            "_matchReason": "exact_hidden",
+        },
+    ]
+    reranker = LayaRerankFusion(
+        laya,
+        prior_weight=0.0,
+        deduplicate_labels=False,
+        attach_confidence=True,
+    )
+    out = reranker.rerank(query="heart attack typo", candidates=cands, limit=3)
+
+    assert [c["id"] for c in out] == ["hidden_1", "hidden_2", "non_exact"]
+    assert len(laya.score_batch_calls) == 1
+    assert len(laya.score_batch_calls[0]) == 1
+    assert out[0]["rerankDecision"] == "exact"
+    assert out[0]["rerankConfidence"] == 1.0
+    assert out[0]["rerankEscalated"] is False
+    assert out[1]["rerankDecision"] == "exact"
+    assert out[1]["rerankConfidence"] == 1.0
+    assert out[1]["rerankEscalated"] is False
+    assert out[2]["rerankDecision"] == "high_confidence"
+
+
+def test_laya_rerank_close_raising_primary_closes_escalation_idempotently_and_rejects_bool_thresholds() -> None:
+    primary_close_calls = 0
+    esc_close_calls = 0
+
+    class _RaisingCloseLaya(_FakeLayaBackend):
+        def close(self) -> None:
+            nonlocal primary_close_calls
+            primary_close_calls += 1
+            raise RuntimeError("primary close boom")
+
+    class _TrackingKev(_FakeKevBackend):
+        def close(self) -> None:
+            nonlocal esc_close_calls
+            esc_close_calls += 1
+            super().close()
+
+    reranker = LayaRerankFusion(
+        backend_factory=lambda: _RaisingCloseLaya(lambda _s, _qd: 0.50),
+        escalation_factory=lambda: _TrackingKev(lambda _s, _qd: 0.90),
+        deduplicate_labels=False,
+    )
+    reranker.rerank(
+        query="close cleanup test",
+        candidates=[{"id": "c1", "label": "Alpha", "scheme": "mesh"}],
+        limit=1,
+    )
+    assert reranker.is_initialized is True
+    assert reranker.is_escalation_initialized is True
+
+    with pytest.raises(RuntimeError, match="primary close boom"):
+        reranker.close()
+    assert primary_close_calls == 1
+    assert esc_close_calls == 1
+    assert reranker.is_initialized is False
+    assert reranker.is_escalation_initialized is False
+
+    # Repeated close() MUST be completely idempotent (no second close call, no exception)!
+    reranker.close()
+    assert primary_close_calls == 1
+    assert esc_close_calls == 1
+
+    # Bool / non-finite thresholds MUST raise ValueError.
+    laya = _FakeLayaBackend(lambda _s, _qd: 0.5)
+    for bad_kw in (
+        {"prior_weight": True},
+        {"prior_weight": False},
+        {"prior_weight": np.bool_(True)},
+        {"prior_weight": float("nan")},
+        {"prior_weight": float("inf")},
+        {"uncertainty_band": (False, 0.7)},
+        {"uncertainty_band": (0.3, True)},
+        {"uncertainty_band": (0.3, float("nan"))},
+        {"escalation_margin": True},
+        {"escalation_margin": np.bool_(False)},
+        {"escalation_margin": float("inf")},
+        {"high_confidence_threshold": True},
+        {"low_confidence_threshold": False},
+        {"high_confidence_threshold": float("nan")},
+        {"low_confidence_threshold": float("-inf")},
+    ):
+        with pytest.raises(ValueError):
+            LayaRerankFusion(laya, **bad_kw)  # type: ignore[arg-type]

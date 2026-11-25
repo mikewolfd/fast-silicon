@@ -39,6 +39,7 @@ VALID_INDEX_MODES: frozenset[str] = frozenset(
 VALID_WINDOW_AGGS: frozenset[str] = frozenset({"maxsim", "hybrid", "top2_mean", "mean"})
 
 _POPCOUNT_LUT: np.ndarray = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+_BINARY_POPCOUNT_CHUNK_ROWS: int = 32_768
 
 _NEON_CPP_SOURCE = r"""
 #include <arm_neon.h>
@@ -403,9 +404,18 @@ def _binary_topr_rerank_int8(
     out_idx = np.full((q_n, top_k), -1, dtype=np.int32)
     out_sc = np.full((q_n, top_k), -1e30, dtype=np.float32)
     doc_arange = np.arange(d_n, dtype=np.uint64)
+    bitwise_count = getattr(np, "bitwise_count", None)
+    chunk_rows = max(1, int(_BINARY_POPCOUNT_CHUNK_ROWS))
+    dists = np.empty(d_n, dtype=np.uint32)
     for qi in range(q_n):
-        xor_bytes = np.bitwise_xor(d_bits, q_bits[qi : qi + 1])
-        dists = _POPCOUNT_LUT[xor_bytes].sum(axis=1, dtype=np.uint32)
+        qb_row = q_bits[qi : qi + 1]
+        for start in range(0, d_n, chunk_rows):
+            end = min(start + chunk_rows, d_n)
+            xor_bytes = np.bitwise_xor(d_bits[start:end], qb_row)
+            if bitwise_count is not None:
+                dists[start:end] = bitwise_count(xor_bytes).sum(axis=1, dtype=np.uint32)
+            else:
+                dists[start:end] = _POPCOUNT_LUT[xor_bytes].sum(axis=1, dtype=np.uint32)
         packed = (dists.astype(np.uint64) << np.uint64(32)) | doc_arange
         if eff_r < d_n:
             cand_pos = np.argpartition(packed, eff_r - 1)[:eff_r]
@@ -609,6 +619,183 @@ class CompactRetrievalIndex:
             self.dense_vecs = np.ascontiguousarray(work, dtype=np.float16)
         else:
             self.dense_vecs = np.ascontiguousarray(work, dtype=np.float32)
+
+    @classmethod
+    def from_prequantized(
+        cls,
+        *,
+        mode: Literal["binary_int8", "int8", "fp16", "fp32"],
+        dim: int,
+        codes_i8: np.ndarray | None = None,
+        scales_f16: np.ndarray | None = None,
+        binary_u8: np.ndarray | None = None,
+        binary_bits: int | None = None,
+        dense_vecs: np.ndarray | None = None,
+        doc_offsets: np.ndarray | list[int] | tuple[int, ...] | None = None,
+        raw_dim: int | None = None,
+        is_mrl_trained: bool = False,
+        agg: WindowAgg = "maxsim",
+        hybrid_alpha: float = 0.7,
+        use_neon: bool = True,
+    ) -> "CompactRetrievalIndex":
+        """Construct a ``CompactRetrievalIndex`` directly from pre-quantized arrays with zero copying.
+
+        Arrays that are already C-contiguous with the expected dtype (including read-only ``mmap``
+        views from ``np.frombuffer``) are bound directly with zero vector copying or re-quantization.
+        """
+        valid_prequant_modes = ("binary_int8", "int8", "fp16", "fp32")
+        if mode not in valid_prequant_modes:
+            raise ValueError(f"mode must be one of {valid_prequant_modes}, got {mode!r}")
+        if isinstance(dim, (bool, np.bool_)) or not isinstance(dim, (int, np.integer)) or int(dim) <= 0:
+            raise ValueError(f"dim must be a positive integer, got {dim!r}")
+        eff_dim = int(dim)
+
+        if raw_dim is None:
+            eff_raw_dim = eff_dim
+        else:
+            if (
+                isinstance(raw_dim, (bool, np.bool_))
+                or not isinstance(raw_dim, (int, np.integer))
+                or int(raw_dim) < eff_dim
+            ):
+                raise ValueError(f"raw_dim must be an integer >= dim ({eff_dim}), got {raw_dim!r}")
+            eff_raw_dim = int(raw_dim)
+
+        if agg not in VALID_WINDOW_AGGS:
+            raise ValueError(f"agg must be one of {sorted(VALID_WINDOW_AGGS)}, got {agg!r}")
+        alpha_f = float(hybrid_alpha)
+        if not np.isfinite(alpha_f):
+            raise ValueError(f"hybrid_alpha must be finite, got {hybrid_alpha!r}")
+
+        def _bind_array(arr: np.ndarray, expected_dtype: Any, name: str) -> np.ndarray:
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(f"{name} must be a numpy.ndarray, got {type(arr).__name__}")
+            exp_dt = np.dtype(expected_dtype)
+            if arr.dtype != exp_dt:
+                raise ValueError(f"{name} must have dtype {exp_dt}, got {arr.dtype}")
+            if not arr.flags.c_contiguous:
+                return np.ascontiguousarray(arr)
+            return arr
+
+        bound_codes_i8: np.ndarray | None = None
+        bound_scales_f16: np.ndarray | None = None
+        bound_binary_u8: np.ndarray | None = None
+        bound_dense_vecs: np.ndarray | None = None
+        eff_binary_bits = 0
+
+        if mode in ("int8", "binary_int8"):
+            if codes_i8 is None or scales_f16 is None:
+                raise ValueError(f"mode={mode!r} requires both codes_i8 and scales_f16")
+            if dense_vecs is not None:
+                raise ValueError(f"mode={mode!r} does not accept dense_vecs")
+            bound_codes_i8 = _bind_array(codes_i8, np.int8, "codes_i8")
+            bound_scales_f16 = _bind_array(scales_f16, np.float16, "scales_f16")
+            if bound_codes_i8.ndim != 2 or int(bound_codes_i8.shape[1]) != eff_dim:
+                raise ValueError(
+                    f"codes_i8 must have shape [N, {eff_dim}], got {bound_codes_i8.shape}"
+                )
+            num_windows = int(bound_codes_i8.shape[0])
+            if num_windows < 0:
+                raise ValueError(f"codes_i8 row count must be non-negative, got {num_windows}")
+            if bound_scales_f16.ndim != 1 or int(bound_scales_f16.shape[0]) != num_windows:
+                raise ValueError(
+                    f"scales_f16 must have shape [{num_windows}], got {bound_scales_f16.shape}"
+                )
+            if mode == "binary_int8":
+                if binary_u8 is None:
+                    raise ValueError("mode='binary_int8' requires binary_u8")
+                if binary_bits is None:
+                    eff_binary_bits = eff_dim
+                else:
+                    if (
+                        isinstance(binary_bits, (bool, np.bool_))
+                        or not isinstance(binary_bits, (int, np.integer))
+                        or int(binary_bits) <= 0
+                        or int(binary_bits) > eff_dim
+                    ):
+                        raise ValueError(
+                            f"binary_bits must be an integer in [1, {eff_dim}], got {binary_bits!r}"
+                        )
+                    eff_binary_bits = int(binary_bits)
+                expected_bytes = (eff_binary_bits + 7) // 8
+                bound_binary_u8 = _bind_array(binary_u8, np.uint8, "binary_u8")
+                if bound_binary_u8.ndim != 2 or bound_binary_u8.shape != (num_windows, expected_bytes):
+                    raise ValueError(
+                        f"binary_u8 must have shape ({num_windows}, {expected_bytes}), "
+                        f"got {bound_binary_u8.shape}"
+                    )
+            else:
+                if binary_u8 is not None:
+                    raise ValueError("mode='int8' does not accept binary_u8")
+                if binary_bits is not None:
+                    raise ValueError("mode='int8' does not accept binary_bits")
+        else:
+            if dense_vecs is None:
+                raise ValueError(f"mode={mode!r} requires dense_vecs")
+            if codes_i8 is not None or scales_f16 is not None or binary_u8 is not None or binary_bits is not None:
+                raise ValueError(
+                    f"mode={mode!r} does not accept codes_i8, scales_f16, binary_u8, or binary_bits"
+                )
+            exp_dt = np.float16 if mode == "fp16" else np.float32
+            bound_dense_vecs = _bind_array(dense_vecs, exp_dt, "dense_vecs")
+            if bound_dense_vecs.ndim != 2 or int(bound_dense_vecs.shape[1]) != eff_dim:
+                raise ValueError(
+                    f"dense_vecs must have shape [N, {eff_dim}], got {bound_dense_vecs.shape}"
+                )
+            num_windows = int(bound_dense_vecs.shape[0])
+            if num_windows < 0:
+                raise ValueError(f"dense_vecs row count must be non-negative, got {num_windows}")
+
+        bound_doc_offsets: np.ndarray | None
+        bound_window_to_doc: np.ndarray | None
+        if doc_offsets is not None:
+            if (
+                isinstance(doc_offsets, np.ndarray)
+                and doc_offsets.dtype == np.int32
+                and doc_offsets.flags.c_contiguous
+            ):
+                off_arr = doc_offsets
+            else:
+                off_arr = np.ascontiguousarray(doc_offsets, dtype=np.int32)
+            if (
+                off_arr.ndim != 1
+                or off_arr.size < 1
+                or int(off_arr[0]) != 0
+                or int(off_arr[-1]) != num_windows
+                or bool(np.any(np.diff(off_arr) < 0))
+            ):
+                raise ValueError(
+                    f"doc_offsets must be 1D, non-decreasing, start at 0, and end at num_windows={num_windows}"
+                )
+            bound_doc_offsets = off_arr
+            bound_window_to_doc = np.repeat(
+                np.arange(off_arr.size - 1, dtype=np.int32),
+                np.diff(off_arr),
+            )
+            num_docs = int(off_arr.size) - 1
+        else:
+            bound_doc_offsets = None
+            bound_window_to_doc = None
+            num_docs = num_windows
+
+        obj = cls.__new__(cls)
+        obj.raw_dim = eff_raw_dim
+        obj.num_windows = num_windows
+        obj.is_mrl_trained = bool(is_mrl_trained)
+        obj.default_agg = agg
+        obj.default_hybrid_alpha = alpha_f
+        obj.use_neon = bool(use_neon)
+        obj.doc_offsets = bound_doc_offsets
+        obj.window_to_doc = bound_window_to_doc
+        obj.num_docs = num_docs
+        obj.mode = mode
+        obj.dim = eff_dim
+        obj.codes_i8 = bound_codes_i8
+        obj.scales_f16 = bound_scales_f16
+        obj.binary_u8 = bound_binary_u8
+        obj.dense_vecs = bound_dense_vecs
+        obj.binary_bits = eff_binary_bits
+        return obj
 
     @property
     def nbytes(self) -> int:
