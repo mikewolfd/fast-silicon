@@ -42,7 +42,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | **Hybrid `PrefixTree` & speculative decode** | `fast_shared.prefix_tree`, `pld_drafter` | 256-token SHA-256 prefix cache for KV and block-32 INT8 GatedDeltaNet states (3.76x smaller) with 2-hit admission and circuit-breaker protection, plus grammar-checked prompt-lookup drafting. |
 | **Schema grammars & resumable ETL** | `fast_shared.grammar`, `pipeline_llm`, `parquet_pipeline` | Per-document `llguidance` JSON Schema enforcement, 4-gram loop detection, deferred retries on truncated outputs, header-anchored Parquet chunking (+33-46% legal retrieval lift), and resumable shards. |
 | **Core ML / Core AI & Metal 4 MPP** | `fast_shared.coreai_pipeline`, `parallel_coreml`, `ir_dtype_guard`, `mpp_linear` | Parallel Core ML bucket compilation (2.0-2.1x faster), FP16 `.aimodel` ANE lowering on macOS 27.2.1, static AST/MIL dtype lints (`fast-ir-guard`), and inline-XOR Apple10 NAX linear wrappers. |
-| **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic evaluators and ABBA gates. |
+| **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic evaluators and interleaved regression gates. |
 
 ## Provided modules
 
@@ -85,7 +85,7 @@ For per-package benchmark tables across all 8 model packages, see the [`fast-sil
 
 ```bash
 claude --plugin-dir ./packages/fast-shared
-python3 skills/apple-silicon-ml-optimizer/scripts/query_capability_matrix.py --stats
+python3 packages/fast-shared/skills/apple-silicon-ml-optimizer/scripts/query_capability_matrix.py --stats
 .venv/bin/pytest -v packages/fast-shared/tests
 ```
 

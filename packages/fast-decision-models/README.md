@@ -6,7 +6,7 @@ Zero telemetry, no account, and runs 100% offline after initial weight download 
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Core ML ANE and Metal GPU execution. Xcode Command Line Tools are needed only to rebuild native ANE `.dylib` runners (`make native`).
+- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Core ML ANE and Metal GPU execution. Xcode Command Line Tools are required to compile the native `Laya` ANE `.dylib` runner (`make -C packages/fast-decision-models native`; GPU-only `Kev` needs no native build).
 
 ## Quickstart
 
@@ -14,6 +14,7 @@ Zero telemetry, no account, and runs 100% offline after initial weight download 
 git clone https://github.com/mikewolfd/fast-silicon
 cd fast-silicon
 uv sync --python 3.13 --package fast-decision-models --inexact
+make -C packages/fast-decision-models native
 
 .venv/bin/decision-models setup-weights --build-kev-mlx   # Stages ~0.95 GB Laya ANE + Kev-0.8B W8
 .venv/bin/decision-models verify --backend kev-0.8b
@@ -72,7 +73,7 @@ All six Core ML buckets (`64..512` tokens) in `laya_typed_w8.mlmodelc` place 100
 
 FluidInference Core ML clips combined inputs at 1,024 tokens (truncating 164 of 600 RAGTruth items), whereas `fast-decision-models` supports up to 1,024 state tokens and 2,048 combined tokens. Raising the prefix-grouping threshold to 128 tokens and deterministically sorting candidate tails eliminates padding waste on 1-question/state batches (`1.18x` vs. stock `mlx-lm` on M5). On **shared passages** (multiple criteria scored over the same document), `PrefixTree` (`prefix_cache_mb="auto"` with 2-hit admission) speeds warm scoring **2.39x** (`1,113 -> 488 ms` M5; `1,650 -> 453 ms` M4 Pro) with zero cold-burst thrash and zero answer flips; with `profile="interactive"` (1-hit admission), warm `B=8` hits **27.65 q/s (`2.97x` stock `mlx-lm`)** at exact `0.0` logit diff. [Prefix-cache benchmarks](../../docs/BENCHMARKS.md#62-kev-prefix-reuse-on-repeated-passages)
 
-### 3. Encoder fine-tuning & concurrent GPU + ANE RLVR (`GRPO`)
+### 3. Encoder fine-tuning & concurrent GPU + ANE reinforcement learning (`GRPO`)
 
 - **ModernBERT fine-tuning (`freeze < 18`):** Packing to 512 tokens and caching frozen layers hits **58.2 items/s** on Base M5 (1.96x stock MLX) and **40.8 items/s** on M4 Pro (2.02x stock) at `grad_cos = 0.99994`.
 - **Disaggregated `GRPO` rollouts (`fast-gemma4` GPU actor + `Laya` Pure-ANE critic):** Hits **2.61-3.38 rollouts/s** on M5 (8.68 GB peak) and **1.81-3.15 rollouts/s** on M4 Pro (7.11 GB vs. 19.38 GB GPU critic), hiding >99.96% of critic scoring behind GPU backward passes. [Training benchmarks](../../docs/BENCHMARKS.md#5-local-training--post-training-qlora-modernbert-grpo)

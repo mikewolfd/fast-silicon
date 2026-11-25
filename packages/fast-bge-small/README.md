@@ -2,11 +2,11 @@
 
 Turn short English queries and passages into 384-dimensional vectors with `BAAI/bge-small-en-v1.5`. Runs short queries on the 16-core Apple Neural Engine (`0.49 ms` on M4 Pro, `0.79 ms` on M5) and splits bulk encoding across GPU and ANE (`200,646 tok/s`, `11.3x` stock MLX).
 
-Zero telemetry, no account, and runs 100% offline after initial ~0.35 GB prebuilt weight download. Inference uses neither `torch` nor `transformers`. Prebuilt Core ML ANE artifact: [`mikewolfd/bge-small-en-v1.5-coreml-ane`](https://huggingface.co/mikewolfd/bge-small-en-v1.5-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md).
+Zero telemetry, no account, and runs 100% offline after initial ~0.15-0.35 GB prebuilt weight download. Inference uses neither `torch` nor `transformers`. Prebuilt Core ML ANE artifact: [`mikewolfd/bge-small-en-v1.5-coreml-ane`](https://huggingface.co/mikewolfd/bge-small-en-v1.5-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md).
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Xcode Command Line Tools are needed only to rebuild native ANE `.dylib` runners (`make native`).
+- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-bge-small native`, optional when running GPU-only via `default_mode="gpu"`).
 
 ## Quickstart
 
@@ -14,8 +14,9 @@ Zero telemetry, no account, and runs 100% offline after initial ~0.35 GB prebuil
 git clone https://github.com/mikewolfd/fast-silicon
 cd fast-silicon
 uv sync --python 3.13 --package fast-bge-small --inexact
+make -C packages/fast-bge-small native
 
-.venv/bin/bge-small setup-weights   # Downloads ~0.35 GB prebuilt weights + Core ML ANE buckets
+.venv/bin/bge-small setup-weights   # Downloads ~0.15-0.35 GB prebuilt weights + Core ML ANE buckets
 .venv/bin/bge-small verify
 ```
 
@@ -58,12 +59,14 @@ Prepending document headers during Parquet chunking raises 175-query legal passa
 
 ### 2. Stock `mlx-embeddings` vs. `fast-bge-small` (`gpu` / `ane` / `hetero`)
 
-| Host | Workload | Stock `mlx-embeddings` GPU | `fast-bge-small` `gpu` | `fast-bge-small` `ane` | **`fast-bge-small` `hetero`** | Public Core ML (`sidekickd` FP16) |
+| Host | Workload | Stock `mlx-embeddings` | `fast-bge-small` `gpu` | `fast-bge-small` `ane` | **`fast-bge-small` `hetero`** | Public Core ML (`sidekickd` FP16) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
 | **Base M5 (24 GB)** | Warm single 24-tok query | `4.42 ms` | `1.29 ms` (3.4x) | **`0.79 ms`** (5.6x) | ANE-routed | `1.61 ms` |
-| **Base M5 (24 GB)** | Bulk 1K-2K text corpus | `26,667 tok/s` | `152,937 tok/s` | `63,850 tok/s` | **`200,646 tok/s`** | `34,318 tok/s` |
+| **Base M5 (24 GB)** | Bulk 1K-2K text corpus | `106.96 docs/s` (text input) | `152,937 tok/s` | `63,850 tok/s` | **`200,646 tok/s`** | `34,318 tok/s` |
 | **M4 Pro (48 GB)** | Warm single 24-tok query | `4.85 ms` | `1.98 ms` (2.4x) | **`0.48-0.49 ms`** (10.0x) | ANE-routed | `1.70 ms` |
-| **M4 Pro (48 GB)** | Bulk 1K-2K text corpus | `30,694 tok/s` | `121,730 tok/s` | `59,304 tok/s` | **`187,150 tok/s`** | `31,608 tok/s` |
+| **M4 Pro (48 GB)** | Bulk 1K-2K text corpus | `123.12 docs/s` (text input) | `121,730 tok/s` | `59,304 tok/s` | **`187,150 tok/s`** | `31,608 tok/s` |
+
+*Measurement note: `fast-bge-small` and public Core ML bulk probes ran on matched pretokenized IDs (`tok/s`), whereas the stock `mlx-embeddings` bulk probe started from raw text (`docs/s`); for apples-to-apples timed runs on identical documents, see Table 1 above (`11.26x` M5, `9.58x` M4 Pro).*
 
 Parallel 9-shape Core ML compile (`--jobs 4`) completes in `2.24 s` on M5 (vs. `5.02 s` serial) and `4.38 s` on M4 Pro (vs. `9.37 s` serial) with bit-identical outputs. [Build checks](../../docs/benchmarks/capability-corrections-20261121.json) · [Dual-Mac receipt](../../docs/benchmarks/dual-mac-suite-20261124.json)
 

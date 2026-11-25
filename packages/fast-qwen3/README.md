@@ -2,13 +2,13 @@
 
 High-throughput schema-constrained JSON extraction and tool calling on Apple Silicon with Qwen 3.5 and Qwen 3.6 (`0.8B` to `27B` dense and `35B-A3B` MoE). On 300 public JSON extraction and tool-calling tasks, schema-constrained `Qwen3.5-4B-OptiQ-4bit` returns **300/300 valid schemas** at **0.896 score** on Base M5 (**299/300**, **0.893** on M4 Pro) with zero repeat loops.
 
-Zero telemetry, no account, and runs 100% offline after initial weight download (~3.1 GB for default 4B checkpoint). Combines Qwen's hybrid 3:1 `GatedDeltaNet` + GQA architecture with compiled Metal GDN/RoPE kernels, Apple10 NAX prefill packing (`2.34-4.2+ GB` RAM saved at zero logit drift), 4-bit rotated KV caching (`2.1x` faster 16K decode), and 256-token `PrefixTree` state reuse. [Cross-silicon benchmarks](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
+Zero telemetry, no account, and runs 100% offline after initial weight download (~2.6-3.1 GB for default 4B checkpoint). Combines Qwen's hybrid 3:1 `GatedDeltaNet` + GQA architecture with compiled Metal GDN/RoPE kernels, M5 (`Apple10 NAX`) prefill packing (`2.34-4.2+ GB` RAM saved at zero logit drift), 4-bit rotated KV caching (`2.1x` faster 16K decode), and 256-token `PrefixTree` state reuse. [Cross-silicon benchmarks](../../docs/BENCHMARKS.md#11-fast-qwen3-hybrid-gateddeltanet--optiq--lora-validation-2026-11-22)
 
 ## Requirements
 
 - Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Checked with `mlx-community/Qwen3.5-4B-OptiQ-4bit` (`4b`), `0.8b-bf16`, and `9b-optiq`.
 
-## Quickstart (~3.1 GB default 4B model)
+## Quickstart (~2.6-3.1 GB default 4B model)
 
 ```bash
 git clone https://github.com/mikewolfd/fast-silicon
@@ -63,15 +63,15 @@ Measured on 24 GB Base M5 and 48 GB M4 Pro. Against stock `mlx-lm 0.32.2` on the
 | `0.8B` (65K Latin vocab) | Shared-prefix JSON (`B=1` / `B=8`) | 178.3 / 658.5 tok/s (16.3 docs/s) | 240.3 / 767.5 tok/s (19.0 docs/s) | 4.81 / 4.99 GB |
 | `4B-OptiQ` (`kv_i8="q4_quarot"`) | 16K context decode (`B=4`) | Matches BF16 F1 (0.946, 18/18 passkeys) | **91.7 tok/s** (**2.13x** 8-bit KV) | 576 MB KV vs 2,048 MB BF16 |
 
-- **What keeps it fast:** `@mx.compile` GDN and RoPE kernels add `1.04-1.44x`; `GdnDecodeShared` (`int8_blk32` GDN state) cuts recurrent state RAM `3.76x` at `1.42-3.43x` decode speed; Apple10 NAX inline XOR packing skips `2.34-4.2+ GB` shadow buffers at zero logit diff (`1.18x` vs. `MLX qmm`); and `R2` GDN+Attention `BF16` LoRA adapters beat Attention+MLP alone by `+17.5 pp` (`66.7%` vs. `49.2%`). [Long-context KV & ABBA receipts](../../docs/BENCHMARKS.md#17-wave-5-dry-optimizations--dual-mac-abba-gates-fast-qwen3--fast-pplx-2026-11-24)
+- **What keeps it fast:** `@mx.compile` GDN and RoPE kernels add `1.04-1.44x`; `GdnDecodeShared` (`int8_blk32` GDN state) cuts recurrent state RAM `3.76x` at `1.42-3.43x` decode speed; M5 (`Apple10 NAX`) inline XOR packing skips `2.34-4.2+ GB` shadow buffers at zero logit diff (`1.18x` vs. `MLX qmm`); and `GDN+Attention BF16 LoRA` adapters beat Attention+MLP alone by `+17.5 pp` (`66.7%` vs. `49.2%`). [Long-context KV & regression gate receipts](../../docs/BENCHMARKS.md#17-wave-5-dry-optimizations--dual-mac-abba-gates-fast-qwen3--fast-pplx-2026-11-24)
 
 ## Key options & defaults
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `kv_i8` | `"auto"` | Keeps BF16 KV on short/medium calls and switches to rotated 4-bit KV (`"q4_quarot"`, 3.56x smaller) at `>=16K/32K` tokens on Apple10 NAX (`>=8K/16K` on Apple9 / `<=28 GB`) or high `batch*ctx` pressure (`262K/524K`). |
+| `kv_i8` | `"auto"` | Keeps BF16 KV on short/medium calls and switches to rotated 4-bit KV (`"q4_quarot"`, 3.56x smaller) at `>=16K/32K` tokens on M5 (`Apple10 NAX`, `>=8K/16K` on M4 `Apple9` / `<=28 GB`) or high `batch*ctx` pressure (`262K/524K`). |
 | `gdn_state_mode` | `"auto"` | Keeps GDN recurrent state in `fp32` below `B=8` (`<4` on `<=28 GB`) and compresses to `int8_blk32` (`3.76x` smaller) on larger batches. |
-| `enable_mpp_linear` / `FAST_SILICON_QWEN3_MPP_W8A8` | `"auto"` / off | Enables Apple10 NAX `W4A8` prefill on large 4-bit layers at zero diff; opt-in `W8A8=1` adds `+4.1%` on 4B extraction (kept opt-in because 9B lost `-0.0045` on tool/JSON tasks). |
+| `enable_mpp_linear` / `FAST_SILICON_QWEN3_MPP_W8A8` | `"auto"` / off | Enables M5 (`Apple10 NAX`) `W4A8` prefill on large 4-bit layers at zero diff; opt-in `W8A8=1` adds `+4.1%` on 4B extraction (kept opt-in because 9B lost `-0.0045` on tool/JSON tasks). |
 | `default_enable_thinking` | `False` | Skips `<think>` chains for deterministic extraction and tools (~3.2x faster at equal accuracy). When `True`, enforces a `>=384`-token budget so reasoning doesn't truncate. |
 | `prefix_cache_mb` | `"auto"` | Reuses 256-token prompt prefixes across calls in `PrefixTree` with 2-hit admission (avoiding cold cache churn) and block-32 INT8 GDN state snapshots. |
 | `mtp_drafter` / `speculative` | `None` (`"auto"`) | Auto-enables native MTP on 9B+ checkpoints (`1.28-1.92x` `B=1` speedup); keeps prompt-lookup speculation off under JSON schemas by default (pass `speculative=True` for verbatim copy-heavy extraction). |

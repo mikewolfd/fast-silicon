@@ -4,13 +4,13 @@ Convert PDFs, scanned pages, and dense financial tables into clean Markdown and 
 
 Across a 96-page public benchmark suite (`olmOCR-bench`, `FinTabNet-OTSL`, `OmniDocBench-EN`), the `auto` router scores **0.616 on `olmOCR(42)` (`42/42`)**, **0.894 TEDS on `FinTabNet(30)` (`30/30`)**, and **0.657-0.687 on `OmniDocBench(24)`**, running **1.22-2.05x** faster than stock `mlx_vlm OvisOCR2-8bit` on full VLM pages and **3.47x** faster on mixed digital PDFs with region splicing. Zero telemetry, no account, and runs 100% offline.
 
-## Visual Before / After (`--backend ovis --strict-markdown-grammar`)
+## Example: Strict Markdown Table Locking
 
-Raw multi-column table crops often drop alignment pipes or merge adjacent cells under unconstrained OCR; ink-tight cropping plus column-locked decoding emits clean rectangular GFM Markdown:
+Raw multi-column table crops often drop alignment pipes or collapse adjacent cells into whitespace-separated runs under unconstrained OCR. Ink-tight cropping plus column-locked decoding emits clean rectangular GFM Markdown (illustrative example):
 
-| Input scan (`FinTabNet` financial table) | Extracted output (`fast-ocr --format markdown --strict-markdown-grammar`) |
+| Unconstrained OCR text (illustrative collapsed cells) | `fast-ocr --format markdown --strict-markdown-grammar` |
 | --- | --- |
-| Fragmented cell coordinates, merged numeric headers (`2024   2023`), whitespace column drift | `\| Segment \| 2024 \| 2023 \|`<br>`\| --- \| ---: \| ---: \|`<br>`\| Cloud Revenue \| $1,420 \| $1,105 \|`<br>`\| Operating Margin \| 28.4% \| 24.1% \|` |
+| `Segment 2024 2023`<br>`Cloud Revenue $1,420 $1,105`<br>`Operating Margin 28.4% 24.1%` | `\| Segment \| 2024 \| 2023 \|`<br>`\| --- \| ---: \| ---: \|`<br>`\| Cloud Revenue \| $1,420 \| $1,105 \|`<br>`\| Operating Margin \| 28.4% \| 24.1% \|` |
 
 ## Requirements
 

@@ -1,12 +1,12 @@
 # fast-gpt-oss
 
-Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 16-48 GB+ Apple Silicon Macs for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **13.4-14.3 GB** peak RAM on a 24 GB M5 (`103.1 tok/s` at `B=16`) and scale to **444-454 tok/s** at `B=128` (`14.8-16.7 GB` peak) on a 48 GB M4 Pro.
+Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 24-48 GB+ Apple Silicon Macs (with `B=8` auto-clamp on 16 GB) for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **13.4-14.3 GB** peak RAM on a 24 GB M5 (`103.1 tok/s` at `B=16`) and scale to **444-454 tok/s** at `B=128` (`14.8-16.7 GB` peak) on a 48 GB M4 Pro.
 
 Zero telemetry, no account, and runs 100% offline after weight download (~11-12 GB `MXFP4-Q8` default checkpoint). [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`) with at least 16-24 GB unified memory, macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported.
+- Apple Silicon Mac (`M1-M5`), verified on 24-48 GB+ unified memory (`16 GB` auto-clamps to `B=8`, unverified on 16 GB hardware), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported.
 
 ## Quickstart (~11-12 GB model download)
 
@@ -26,13 +26,13 @@ uv sync --python 3.13 --package fast-gpt-oss --inexact
 | --- | --- | --- |
 | **48 GB+ (`M4/M5 Pro/Max`)** | `B=64` default (up to `B=128`) | Verified `10.5-14.8 GB` active MLX (`16.7 GB` peak combined @ `B=128`, **444-454 tok/s**, **1.48-1.57 docs/s**). |
 | **24 GB (`Base M5`)** | `B=16` (`<= 26 GiB` clamp) | Verified `13.42 GB` Metal / `14.27 GB` combined (**49.0 tok/s** `B=1`, **93.6 tok/s** `B=8`, **103.1 tok/s** `B=16`). |
-| **16 GB / 32 GB** | `B=8` (16 GB) / `B=32` (32 GB) | Automatically clamps batch waves from host RAM so ~11 GB resident weights stay out of swap. |
+| **16 GB / 32 GB** | `B=8` (16 GB) / `B=32` (32 GB) | Automatically clamps batch waves from host RAM so ~11 GB resident weights stay out of swap (auto-clamp only; unverified on 16 GB hardware). |
 
 ## Benchmark highlights
 
-### 1. Structured JSON, tool calls & reasoning (`M4 Pro 48 GB`, `gpt-oss-20b-MXFP4-Q4`)
+### 1. Structured JSON, tool calls & reasoning (`M4 Pro 48 GB`, recorded `MXFP4-Q4` run)
 
-On public extraction and tool tasks, `fast-gpt-oss` enforces JSON schemas via `llguidance`, whereas stock `mlx-lm` runs unconstrained and loses points on invalid JSON. Because both runs also used different reasoning/output settings, valid counts and quality are listed explicitly ([comparison notes](../../docs/benchmarks/review-20261121.md#generation-and-model-precision)):
+The current default checkpoint is `MXFP4-Q8`, while the outcome comparison table below records the verified `MXFP4-Q4` run prior to the Q8 default promotion. On public extraction and tool tasks, `fast-gpt-oss` enforces JSON schemas via `llguidance`, whereas stock `mlx-lm` runs unconstrained and loses points on invalid JSON. Because both runs also used different reasoning/output settings, valid counts and quality are listed explicitly ([comparison notes](../../docs/benchmarks/review-20261121.md#generation-and-model-precision)):
 
 | Workload | `fast-gpt-oss` | Stock `mlx-lm` | Comparison |
 | --- | --- | --- | --- |
@@ -60,15 +60,15 @@ By default, `fast-gpt-oss` keeps MoE router and combine reductions in FP32 (prev
 | Component | How it works | Source |
 | --- | --- | --- |
 | **Hydragen v2 shared-prefix SDPA** | Computes shared system-prompt attention once across the whole batch with zero KV cloning | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
-| **Zero-sync hybrid MXFP4 MoE** | Routes all 24 MoE layers on GPU without CPU syncs, splitting dense expert tiles to Metal 4 `MPP::matmul2d` (or Apple10 NAX) and sparse tiles to coalesced QMV | [`kernels.py`](src/fast_gpt_oss/kernels.py), [`model.py`](src/fast_gpt_oss/model.py) |
+| **Zero-sync hybrid MXFP4 MoE** | Routes all 24 MoE layers on GPU without CPU syncs, splitting dense expert tiles to Metal 4 `MPP::matmul2d` (on M5 `Apple10 NAX`) and sparse tiles to coalesced QMV | [`kernels.py`](src/fast_gpt_oss/kernels.py), [`model.py`](src/fast_gpt_oss/model.py) |
 | **Circular SWA-128 & mixed precision** | Keeps residuals in BF16, layer intermediates in FP16 with FP32 accumulators, and sliding-window KV in a fixed 128-slot ring | [`kernels.py`](src/fast_gpt_oss/kernels.py) |
 | **Harmony prompt, schema & vocab** | Retains all 201,088 `o200k` input tokens, prunes `lm_head` to 131,072 output tokens (with cold full-vocab fallback), and compacts finished slots mid-wave | [`engine.py`](src/fast_gpt_oss/engine.py), [`tokenizer.py`](src/fast_gpt_oss/tokenizer.py) |
 
 ## CLI, Parquet & HTTP server
 
 ```bash
-.venv/bin/gpt-oss parquet input.parquet out_dir --schema tests/fixtures/extract_v1.schema.json --drop-text-col
-.venv/bin/gpt-oss extract input.jsonl out.jsonl --schema tests/fixtures/extract_v1.schema.json
+.venv/bin/gpt-oss parquet input.parquet out_dir --schema packages/fast-gpt-oss/tests/fixtures/extract_v1.schema.json --drop-text-col
+.venv/bin/gpt-oss extract input.jsonl out.jsonl --schema packages/fast-gpt-oss/tests/fixtures/extract_v1.schema.json
 .venv/bin/gpt-oss serve --port 8080 --coalesce-ms 10 --max-batch 64
 .venv/bin/gpt-oss bench --batches 8,64,128
 .venv/bin/pytest -v packages/fast-gpt-oss/tests

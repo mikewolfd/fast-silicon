@@ -2,13 +2,13 @@
 
 Contextual passage embeddings and 4K-32K long-document search on Apple Silicon using Perplexity's `pplx-embed-v2-context-0.6b`. Encoding passages with surrounding document context lifts 175-query legal passage ranking from **0.359 to 0.703** while finishing a 325-query benchmark in **136.5 s** vs. stock `pplx-context-mlx`'s **601.5 s** (**4.4x** faster at equal accuracy).
 
-Runs short batches on the 16-core Apple Neural Engine (ANE) and long or tiny query batches on the Metal GPU (`hetero2` cuts mixed batch wall time **1.34-1.75x** vs. GPU alone), with a 32,768-token GPU path in **2.69 GB** process footprint. Zero telemetry, no account, and runs 100% offline after initial ~2.38 GB prebuilt download. Prebuilt Core ML ANE artifact: [`mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane`](https://huggingface.co/mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane) · [Full benchmark tables](../../docs/BENCHMARKS.md).
+Runs short batches on the 16-core Apple Neural Engine (ANE) and long or tiny query batches on the Metal GPU (`hetero2` cuts mixed batch wall time **1.34-1.75x** vs. GPU alone), with a 32,768-token GPU path in **2.69 GB** process footprint. Zero telemetry, no account, and runs 100% offline after initial ~1.8-2.4 GB prebuilt download. Prebuilt Core ML ANE artifact: [`mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane`](https://huggingface.co/mikewolfd/pplx-embed-v2-context-0.6b-coreml-ane) · [Full benchmark tables](../../docs/BENCHMARKS.md).
 
 ## Requirements
 
 - Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported for Metal GPU / Core ML execution. Xcode Command Line Tools are required to build the native ANE runner (`make -C packages/fast-pplx native`).
 
-## Quickstart (~2.38 GB prebuilt download)
+## Quickstart (~1.8-2.4 GB prebuilt download)
 
 ```bash
 git clone https://github.com/mikewolfd/fast-silicon
@@ -16,7 +16,7 @@ cd fast-silicon
 uv sync --python 3.13 --package fast-pplx --inexact
 make -C packages/fast-pplx native
 
-.venv/bin/fast-pplx setup-weights          # Stages ~2.38 GB prebuilt weights + ANE stages
+.venv/bin/fast-pplx setup-weights          # Stages ~1.8-2.4 GB prebuilt weights + ANE stages
 # Optional: compile Pure-ANE stages locally (`balanced` profile by default):
 # .venv/bin/fast-pplx setup-ane --precision w8a16
 ```
@@ -60,7 +60,7 @@ with FastPplx(mode="auto", dimensions=512) as model:  # hetero2 if ANE stages ex
 | Setting | Default | Behavior |
 | --- | --- | --- |
 | `mode="auto"` | `hetero2` (GPU + ANE) | Routes single `B=1` queries and M5 tiny batches (`<=32` tok/item, `<=1024` total) inline on Metal GPU (`2.29x` faster on M5 `B=32, S=15`); uses first-fit bin packing on `<=512` ANE chunks (`-60%` pad waste) and GPU above 512 tokens. |
-| `quantize_weights="none"` | `fp16` (`"w8"` opt-in) | Keeps full FP16 precision by default. Opt-in `"w8"` saves ~214 MB Metal RAM and enables Apple10 NAX `W8A8` (`1.07-1.08x` faster than `w8` without NAX at `>=0.9984` cosine vs. FP16). |
+| `quantize_weights="none"` | `fp16` (`"w8"` opt-in) | Keeps full FP16 precision by default. Opt-in `"w8"` saves ~214 MB Metal RAM and enables M5 (`Apple10 NAX`) `W8A8` (`1.07-1.08x` faster than `w8` without NAX at `>=0.9984` cosine vs. FP16). |
 | `--ane-profile balanced` | `balanced` | Closes 73%+ of the ANE-vs-GPU cosine gap (`>=0.999` mean cosine) at negligible throughput cost vs. `fast`. |
 | `--context-tokens 2048` | `2048` | Encodes 256-tok chunks inside 2,048-tok windows with up to 128 repeated header tokens (`0.453 -> 0.735` LegalBench nDCG). |
 | `dimensions=1024` + `INT8` | `1024` / `int8` | Preserves all 1,024 dims in 4x-smaller INT8 (`1,026 B/vec`, lossless vs. FP32); truncating PPLX to 512d drops legal ranking 3.7 pts. |

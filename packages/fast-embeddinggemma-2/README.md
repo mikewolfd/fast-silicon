@@ -2,11 +2,11 @@
 
 Encode up to 2,048 tokens per passage (128-768 Matryoshka dimensions) or embed document page images lazily with `google/embeddinggemma-2`. Splits bulk encoding across the Metal GPU and 16-core Apple Neural Engine (`48,803 tok/s` on M5: `4.3-4.8x` stock MLX, `3.3x` public Core ML, `6.2x` Apple CoreAI), with `2.1-2.6 ms` warm single queries.
 
-Zero telemetry, no account, and runs 100% offline after initial ~0.29 GB prebuilt download (text + ANE). Prebuilt Core ML ANE artifact: [`mikewolfd/embeddinggemma-2-coreml-ane`](https://huggingface.co/mikewolfd/embeddinggemma-2-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md).
+Zero telemetry, no account, and runs 100% offline after initial ~0.30-0.65 GB prebuilt download (text + ANE). Prebuilt Core ML ANE artifact: [`mikewolfd/embeddinggemma-2-coreml-ane`](https://huggingface.co/mikewolfd/embeddinggemma-2-coreml-ane) · [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md).
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Sequences beyond 2,048 tokens are truncated.
+- Apple Silicon Mac (`M1-M5`), macOS 14+, Python 3.12+, and `uv`. Windows, Linux, and Intel Macs are unsupported. Sequences beyond 2,048 tokens are truncated. Xcode Command Line Tools are required to compile the native ANE `.dylib` runner (`make -C packages/fast-embeddinggemma-2 native`, optional when passing `default_mode="gpu"`).
 
 ## Quickstart
 
@@ -14,8 +14,9 @@ Zero telemetry, no account, and runs 100% offline after initial ~0.29 GB prebuil
 git clone https://github.com/mikewolfd/fast-silicon
 cd fast-silicon
 uv sync --python 3.13 --package fast-embeddinggemma-2 --inexact
+make -C packages/fast-embeddinggemma-2 native
 
-.venv/bin/embeddinggemma-2 setup-weights   # Downloads ~0.29 GB prebuilt weights + Core ML ANE buckets
+.venv/bin/embeddinggemma-2 setup-weights   # Downloads ~0.30-0.65 GB prebuilt weights + Core ML ANE buckets
 .venv/bin/embeddinggemma-2 verify
 ```
 
@@ -62,10 +63,12 @@ Prepending document titles raises 175-query legal passage ranking from `0.380` t
 | Host | Workload | Stock `mlx-vlm` 8-bit | `fast-embeddinggemma-2` `gpu` | `fast-embeddinggemma-2` `ane` | **`fast-embeddinggemma-2` `hetero`** | Public Core ML (`OpenInfinity` / `Fluid`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
 | **Base M5 (24 GB)** | Warm single 24-tok query | `8.48 ms` | `5.02 ms` (1.7x) | **`2.58 ms`** (3.3x) | ANE-routed | `2.59 ms` / `4.33 ms` (`CoreAI 9.38 ms`) |
-| **Base M5 (24 GB)** | Bulk 2K text corpus | `16,094 tok/s` | `30,430 tok/s` | `21,888 tok/s` | **`48,803 tok/s`** | `14,945` / `14,187 tok/s` (`CoreAI 12,482`) |
+| **Base M5 (24 GB)** | Bulk 2K text corpus | `64.91 docs/s` (text input) | `30,430 tok/s` | `21,888 tok/s` | **`48,803 tok/s`** | `14,945` / `14,187 tok/s` (`CoreAI 12,482`) |
 | **M4 Pro (48 GB)** | Warm single 24-tok query | `8.39 ms` | `7.72 ms` (1.1x) | **`2.08-2.11 ms`** (4.0x) | ANE-routed | `2.59 ms` / `2.70 ms` |
-| **M4 Pro (48 GB)** | Bulk 2K text corpus | `11,419 tok/s` | `17,936 tok/s` | `21,445 tok/s` | **`38,517 tok/s`** | `14,294` / `14,251 tok/s` |
+| **M4 Pro (48 GB)** | Bulk 2K text corpus | `46.05 docs/s` (text input) | `17,936 tok/s` | `21,445 tok/s` | **`38,517 tok/s`** | `14,294` / `14,251 tok/s` |
 | **M4 Pro (48 GB)** | 2,000 OCR documents (`hetero2`) | - | `11,844 tok/s` (`47.3 s`) | - | **`32,569 tok/s`** (`17.2 s`, 2.75x GPU) | - |
+
+*Measurement note: `fast-embeddinggemma-2` and public Core ML/CoreAI bulk probes ran on matched pretokenized IDs (`tok/s`), whereas the stock `mlx-vlm` bulk probe started from raw text (`docs/s`); for apples-to-apples timed runs on identical documents, see Table 1 above (`4.33x` M5, `4.80x` M4 Pro).*
 
 Verification (`embeddinggemma-2 verify`, 64 docs) hits minimum cosine similarity `0.999998` (`gpu`), `0.999728` (`hetero2`), and `0.999887` (24-tok `ane`) vs. FP16. [Dual-Mac receipt](../../docs/benchmarks/dual-mac-suite-20261124.json)
 
@@ -104,4 +107,4 @@ Install with `uv sync --python 3.13 --package fast-embeddinggemma-2 --extra visi
 
 - **Limitations:** Text sequences past 2,048 tokens are truncated. Dual GPU+ANE `hetero` trades higher unified RAM (`2.49-3.43 GB`) for bulk throughput vs. OpenInfinity's 512-tok Core ML export (`0.84-1.03 GB`); pass `default_mode="ane"` if RAM is constrained. Vision encoding uses GPU+CPU only (`[vision]` extra).
 - **Prior art:** Compared directly against `mlx-vlm`, `OpenInfinity/embeddinggemma-2-coreml-int8`, `FluidInference`, and Apple CoreAI. Use [`fast-bge-small`](../fast-bge-small) for ultra-fast 384d English-only search or [`fast-pplx`](../fast-pplx) for contextual 4K-32K documents.
-- **License:** Package code is [MIT licensed](LICENSE); `google/embeddinggemma-2` weights remain subject to Google's Gemma Terms of Use. Verified on 48 GB M4 Pro and 24 GB Base M5.
+- **License:** Package code is [MIT licensed](LICENSE); `google/embeddinggemma-2` weights carry the Apache-2.0 license. Verified on 48 GB M4 Pro and 24 GB Base M5.

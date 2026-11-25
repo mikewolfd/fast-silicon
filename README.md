@@ -5,20 +5,21 @@ Local Apple Silicon engines for bulk embeddings, document OCR, decision scoring,
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/throughput_dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/throughput_light.svg">
-  <img alt="fast-silicon batch throughput multiplier versus stock MLX on Base M5 and M4 Pro" src="docs/assets/throughput_light.svg">
+  <img alt="fast-silicon batch throughput multiplier versus stock MLX on Base M5" src="docs/assets/throughput_light.svg">
 </picture>
 
 ## Requirements
 
 - **Supported:** Apple Silicon Macs (verified on 48 GB M4 Pro macOS 26.6 and 24 GB base M5 macOS 27.2.1), macOS 14+, Python 3.12+, and `uv`.
-- **Unsupported:** Windows, Linux, and Intel Macs (ANE runners and Apple Vision require macOS Apple Silicon frameworks). Xcode Command Line Tools are needed only if rebuilding native `.dylib` runners; inference needs neither `torch` nor `transformers`.
+- **Unsupported:** Windows, Linux, and Intel Macs (ANE runners and Apple Vision require macOS Apple Silicon frameworks). Xcode Command Line Tools are required to compile native ANE `.dylib` runners (`make -C packages/fast-bge-small native`, optional when passing `default_mode="gpu"`); inference needs neither `torch` nor `transformers`.
 
-## Quickstart (`fast-bge-small`, ~0.35 GB prebuilt download)
+## Quickstart (`fast-bge-small`, ~0.15-0.35 GB prebuilt download)
 
 ```bash
 git clone https://github.com/mikewolfd/fast-silicon
 cd fast-silicon
 uv sync --python 3.13 --package fast-bge-small --inexact
+make -C packages/fast-bge-small native
 .venv/bin/bge-small setup-weights
 ```
 
@@ -54,14 +55,14 @@ Pair that dual-accelerator scheduler with zero-padding sequence packing, shared 
 
 | Workload | Package | What you get | Prebuilt download |
 | --- | --- | --- | --- |
-| Search short English passages | [`fast-bge-small`](packages/fast-bge-small) | 384d vectors; **0.49 ms** warm query (M4 Pro), **200.6k tok/s** bulk (**11.3x** stock MLX). | ~0.35 GB |
-| Index 2K passages & page images | [`fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | Up to 2,048 tokens (128-768d); **48.8k tok/s** (**4.3-4.8x** MLX, **3.3x** Core ML), **19.0 img/s** lazy vision. | ~0.29 GB |
-| Contextual passage & 32K search | [`fast-pplx`](packages/fast-pplx) | `pplx-embed-v2-context-0.6b` + `MaxSim`; raises legal nDCG from 0.359 to 0.703 (**4.4x** faster than stock). | ~2.38 GB |
+| Search short English passages | [`fast-bge-small`](packages/fast-bge-small) | 384d vectors; **0.49 ms** warm query (M4 Pro), **200.6k tok/s** bulk (**11.3x** stock MLX). | ~0.15-0.35 GB |
+| Index 2K passages & page images | [`fast-embeddinggemma-2`](packages/fast-embeddinggemma-2) | Up to 2,048 tokens (128-768d); **48.8k tok/s** (**4.3-4.8x** MLX, **3.3x** Core ML), **19.0 img/s** lazy vision. | ~0.30-0.65 GB |
+| Contextual passage & 32K search | [`fast-pplx`](packages/fast-pplx) | `pplx-embed-v2-context-0.6b` + `MaxSim`; raises legal nDCG from 0.359 to 0.703 (**4.4x** faster than stock). | ~1.8-2.4 GB |
 | Score decisions & rerank choices | [`fast-decision-models`](packages/fast-decision-models) | 100% Pure-ANE 421M `Laya` (**5.1 ms** query, 1,400 items in **37.9 s** hetero) + `Kev-0.8B/4B` with prefix cache. | ~0.95-4.90 GB |
-| High-throughput JSON & tools (2B) | [`fast-gemma4`](packages/fast-gemma4) | Holds **128 rolling slots in 6.1 GB** MLX RAM at **10.5 valid docs/s** (**5.2x** `mlx-vlm` valid rate, **9.8x** CoreAI B=1). | ~10.40 GB |
-| Reasoning, tools & 16K JSON (4B/9B) | [`fast-qwen3`](packages/fast-qwen3) | Hybrid GatedDeltaNet + 4-bit QuaRot KV (**2.1x** faster at 16K); **300/300** valid on 300 JSON/tool tasks. | ~3.10 GB |
+| High-throughput JSON & tools (2B) | [`fast-gemma4`](packages/fast-gemma4) | Holds **128 rolling slots in 6.1 GB** MLX RAM at **10.5 valid docs/s** (**5.2x** `mlx-vlm` valid rate across B=128 vs B=64). | ~3-4 GB (~10.4 GB full extras) |
+| Reasoning, tools & 16K JSON (4B/9B) | [`fast-qwen3`](packages/fast-qwen3) | Hybrid GatedDeltaNet + 4-bit QuaRot KV (**2.1x** faster at 16K); **300/300** valid on 300 JSON/tool tasks. | ~2.6-3.1 GB |
 | Extract Markdown & tables from PDFs | [`fast-ocr`](packages/fast-ocr) | Clean PDF bypass (**139-220 pp/s**), parallel Apple Vision ANE (**9.6 pp/s**), and `OvisOCR2-8bit` VLM (**1.5-3.5x**). | ~2.60 GB |
-| Batch 20B MXFP4 MoE generation | [`fast-gpt-oss`](packages/fast-gpt-oss) | `gpt-oss-20b` auto-clamped across **16-48 GB+ Macs** (**103 tok/s** @ B=16 on 24 GB M5; **454 tok/s** @ B=128 on 48 GB). | ~12.10 GB |
+| Batch 20B MXFP4 MoE generation | [`fast-gpt-oss`](packages/fast-gpt-oss) | `gpt-oss-20b` verified across **24-48 GB+ Macs** (**103 tok/s** @ B=16 on 24 GB M5; **454 tok/s** @ B=128 on 48 GB; auto-clamps on 16 GB). | ~12.10 GB |
 | Shared runtime & compact index | [`fast-shared`](packages/fast-shared) | Dynamic chip dispatch, `CompactRetrievalIndex` (0.50 ms @ 100k vecs), `PrefixTree`, KV quant, and Parquet ETL. | - |
 
 ## Cross-silicon benchmarks (`M4 Pro 48 GB` vs. `Base M5 24 GB`)
@@ -72,15 +73,15 @@ All runs execute locally after warmup with deterministic accuracy verification o
 | --- | --- | --- | --- |
 | **BGE-small retrieval (`325` queries)** | **200.6k tok/s** (11.8 s, 1.54 GB) | **187.2k tok/s** (12.2 s, 1.55 GB) | **11.3x** (M5) / **9.6x** (M4 Pro) stock MLX |
 | **EmbeddingGemma-2 (`500` queries)** | **48.8k tok/s** (57.1 s, 3.43 GB) | **38.5k tok/s** (74.9 s, 2.49 GB) | **4.3-4.8x** MLX, **3.3x** Core ML, **6.2x** CoreAI |
-| **Contextual PPLX (`325` queries)** | **0.7244 score** (136.5 s, 1.97 GB) | **0.7241 score** (167.3 s, 1.97 GB) | **4.4x** (M5) / **4.3x** (M4 Pro) `pplx-context-mlx` |
+| **Contextual PPLX (`325` queries)** | **0.7244 score** (136.5 s, 2.34 GB) | **0.7241 score** (167.3 s, 1.97 GB) | **4.4x** (M5) / **4.3x** (M4 Pro) `pplx-context-mlx` |
 | **Laya-421M scoring (`1,400` items)** | **37.9 s** hetero / **76.7 s** ANE (1.59 GB) | **59.3 s** hetero / **133.1 s** ANE | **2.0x** MLX / **12-25x** CoreAI (`711/1400` ANE) |
-| **Gemma 4 E2B extraction (`B=128`)** | **10.5 valid docs/s** (`1,479 tok/s`, 6.1 GB) | **8.8 valid docs/s** (ANE+GPU) | **5.2x** stock `mlx-vlm` valid rate (OOMs @ B=64) |
+| **Gemma 4 E2B extraction (`B=128`)** | **10.5 valid docs/s** (`1,289 tok/s` monorepo, 6.1 GB) | **8.8 valid docs/s** (ANE+GPU) | **5.2x** stock `mlx-vlm` valid rate (10.5 @ B=128 vs 2.02 @ B=64) |
 | **Qwen 3.5 4B JSON + tools (`300` tasks)** | **0.8955** (`300/300` valid, 4.76 GB) | **0.8930** (`299/300` valid, 4.99 GB) | **1.4-1.5x** scored throughput vs unconstrained MLX |
 | **Document OCR (`96` pages, auto router)** | `0.613` olmOCR / `0.887` FinTab / `0.687` Omni | `0.616` olmOCR / `0.894` FinTab / `0.657` Omni | **1.5-2.0x** `OvisOCR2`; **3.5x** mixed PDF splice |
-| **GPT-OSS-20B (`MXFP4`, batched)** | **103.1 tok/s** @ B=16 (`13.4-14.3 GB`) | **454.1 tok/s** @ B=128 (`14.8-16.7 GB`) | Auto-clamped waves fit 16-48 GB+ Macs cleanly |
+| **GPT-OSS-20B (`MXFP4`, batched)** | **103.1 tok/s** @ B=16 (`13.4-14.3 GB`) | **454.1 tok/s** @ B=128 (`14.8-16.7 GB`) | Verified on 24-48 GB+ Macs (auto-clamps on 16 GB) |
 
 - **Sub-millisecond vector search:** `CompactRetrievalIndex` pairs 1-bit ARM64 NEON Hamming prefiltering with symmetric INT8 reranking (`4-6x` smaller than FP32) to search 100,000 vectors in **0.50-0.66 ms/query** (`3.0-4.4x` faster than FP32 BLAS) with zero ranking loss ([index details](docs/BENCHMARKS.md#122-model-aware-mrl--int8--arm64-neon-binary-rerank-fast-bge-small-fast-embeddinggemma-2-fast-pplx)).
-- **Local post-training:** Packed 8-bit `QLoRA` with shared system-prompt KV runs at `533-1,385 tok/s` on 24-48 GB Macs, and disaggregated `GRPO` runs `Gemma 4` rollouts on Metal GPU concurrently with `Laya` critic scoring on the ANE (`<0.4 ms` exposed critic time) ([training benchmarks](docs/BENCHMARKS.md#5-local-training--post-training-qlora-modernbert-grpo)).
+- **Local post-training:** Packed 8-bit `QLoRA` with shared system-prompt KV runs at `80.5-87.7 sup tok/s` on 24 GB M5 (`pack=1024`) and `546-1,385 tok/s` on 48 GB M4 Pro (`pack=2048`), and disaggregated `GRPO` runs `Gemma 4` rollouts on Metal GPU concurrently with `Laya` critic scoring on the ANE (`<0.4 ms` exposed critic time) ([training benchmarks](docs/BENCHMARKS.md#5-local-training--post-training-qlora-modernbert-grpo)).
 
 ## Prebuilt Hugging Face artifacts
 
