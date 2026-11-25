@@ -1391,6 +1391,66 @@ def test_lazy_neural_init_skipped_for_metal_default_mode_cpu(tmp_path: Path, mon
         FastEmbeddingGemma2(home=home, default_mode="ane", enable_ane=False, warmup=False)
 
 
+def test_emb2_local_files_only_forwarded_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `FastEmbeddingGemma2` exposes `local_files_only=False` by default and forwards it to `ensure_prebuilt_artifacts`."""
+    import inspect
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    import fast_embeddinggemma_2.engine as emb2_eng
+
+    sig = inspect.signature(FastEmbeddingGemma2.__init__)
+    assert sig.parameters["local_files_only"].default is False
+
+    home = tmp_path / "emb2_prebuilt_home"
+    (home / "artifacts" / "weights").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "weights" / "embeddinggemma_2_f16.npz").write_bytes(b"stub")
+    raw_tok = Tokenizer(WordLevel(vocab={"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3}, unk_token="<unk>"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", 2), ("<eos>", 1)],
+    )
+    raw_tok.save(str(home / "artifacts" / "tokenizer" / "tokenizer.json"))
+
+    seen_calls: list[dict[str, object]] = []
+    from dataclasses import replace
+
+    stub_paths = emb2_eng.resolve_paths(home)
+    missing_paths = replace(
+        stub_paths,
+        weights_npz=home / "artifacts" / "weights" / "missing.npz",
+        ane_models_dir=home / "artifacts" / "missing_ane",
+    )
+
+    monkeypatch.setattr(emb2_eng, "resolve_paths", lambda _h=None: missing_paths)
+    monkeypatch.setattr(emb2_eng, "require_runtime_paths", lambda *_a, **_kw: stub_paths)
+    monkeypatch.setattr(
+        emb2_eng,
+        "ensure_prebuilt_artifacts",
+        lambda h=None, *, include_ane=True, local_files_only=False, **_kw: (
+            seen_calls.append({"home": h, "include_ane": include_ane, "local_files_only": local_files_only})
+            or stub_paths
+        ),
+    )
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(emb2_eng, "load_or_mmap_token_table", lambda *_a, **_kw: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(emb2_eng, "set_mlx_cache_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng, "_apply_mlx_wired_limit", lambda: None)
+    monkeypatch.setattr(emb2_eng, "_restore_mlx_wired_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng, "_maybe_clear_mlx_arena", lambda *_a, **_kw: None)
+    monkeypatch.setattr(emb2_eng, "FastEmbeddingGemma2GPU", lambda *_a, **_kw: object())
+
+    with FastEmbeddingGemma2(default_mode="gpu", auto_prebuilt=True, local_files_only=True, warmup=False) as eng_off:
+        assert eng_off._local_files_only is True
+        assert seen_calls[-1] == {"home": None, "include_ane": False, "local_files_only": True}
+
+
 
 
 

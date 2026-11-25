@@ -890,7 +890,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_img = sub.add_parser("embed-images", help="Encode page/document images (or PDF pages) directly via ViT")
     _add_common_engine_args(p_img, include_ane_profile=False)
     p_img.add_argument("paths", nargs="+", help="Image or PDF file paths")
-    p_img.add_argument("--mode", choices=("auto", "gpu"), default="auto", help="Execution mode (default: auto)")
+    p_img.add_argument(
+        "--mode",
+        choices=("gpu", "auto"),
+        default="gpu",
+        help="Execution mode (default: gpu; avoids loading ANE text bundles on vision runs)",
+    )
     p_img.add_argument("--chunks", type=int, default=8, help="Horizontal contextual chunk bands per page (default: 8)")
     p_img.add_argument("--min-pixels", type=int, default=16384, help="Minimum resized pixel area (default: 16384)")
     p_img.add_argument("--max-pixels", type=int, default=786_432, help="Maximum resized pixel area (default: 786432)")

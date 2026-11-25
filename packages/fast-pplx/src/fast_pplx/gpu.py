@@ -2294,7 +2294,7 @@ class FastPplxGPU:
         quantize_weights: Literal["none", "w8"] = "none",
         use_mapped_embedding: bool = True,
         cache_limit_mb: int = 512,
-        local_files_only: bool = True,
+        local_files_only: bool = False,
         max_batch_size: int = 32,
         max_seq_len: int = 32768,
     ) -> None:

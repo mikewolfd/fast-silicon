@@ -1005,8 +1005,8 @@ class FastPplx:
         quantize_weights: Literal["none", "w8"] = "none",
         use_mapped_embedding: bool = True,
         cache_limit_mb: int = 512,
-        local_files_only: bool = True,
-        enable_ane: bool = True,
+        local_files_only: bool = False,
+        enable_ane: bool | None = None,
         ane_profile: str | None = None,
         deterministic: bool = False,
         dimensions: int | None = None,
@@ -1027,8 +1027,9 @@ class FastPplx:
         if eff_qw not in ("none", "w8"):
             raise ValueError(f"Unsupported quantize_weights {quantize_weights!r}; expected 'none' or 'w8'")
 
+        eff_enable_ane = (mode != "gpu") if enable_ane is None else bool(enable_ane)
         self.paths: RepoPaths = resolve_paths(home)
-        want_ane = enable_ane and (not bool(deterministic) or mode in ("ane", "hetero")) and mode in (
+        want_ane = eff_enable_ane and (not bool(deterministic) or mode in ("ane", "hetero")) and mode in (
             "auto",
             "ane",
             "hetero",
@@ -1093,7 +1094,7 @@ class FastPplx:
         # 2. Optional ANE staged runner
         self.ane: Any = _ane_backend
         self._ane_init_error: str | None = None
-        want_ane = enable_ane and (not self.deterministic or mode in ("ane", "hetero")) and mode in (
+        want_ane = eff_enable_ane and (not self.deterministic or mode in ("ane", "hetero")) and mode in (
             "auto",
             "ane",
             "hetero",

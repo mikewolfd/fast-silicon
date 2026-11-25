@@ -418,8 +418,10 @@ class FastEmbeddingGemma2:
         llm_coexec: bool = False,
         vision_model_dir: str | Path | None = None,
         auto_prebuilt: bool = True,
+        local_files_only: bool = False,
     ) -> None:
         self.dim = resolve_embedding_dim(dimensions, max_dim=EMBED_DIM)
+        self._local_files_only = bool(local_files_only)
         self._vision_model_dir: Path | None = (
             Path(vision_model_dir).expanduser().resolve() if vision_model_dir else None
         )
@@ -441,7 +443,11 @@ class FastEmbeddingGemma2:
                     want_ane and not cand.ane_models_dir.exists()
                 ):
                     try:
-                        ensure_prebuilt_artifacts(None, include_ane=want_ane)
+                        ensure_prebuilt_artifacts(
+                            None,
+                            include_ane=want_ane,
+                            local_files_only=local_files_only,
+                        )
                     except Exception:
                         pass
             self.paths = require_runtime_paths(home, require_ane=False)

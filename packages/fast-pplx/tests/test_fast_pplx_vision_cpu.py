@@ -677,3 +677,80 @@ def test_encode_images_async_prefetch_multiwave_order_and_parity(
         np.testing.assert_allclose(got_pils[i], ref_pils[i], atol=1e-5, rtol=1e-5)
         np.testing.assert_allclose(got_prebuilt[i], ref_paths[i], atol=1e-5, rtol=1e-5)
 
+
+def test_pplx_embed_images_cli_and_init_defaults_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `embed-images` defaults `--mode gpu`, `FastPplx`/`FastPplxGPU` default `local_files_only=False` + `enable_ane=None`, and `mode='gpu'` skips ANE."""
+    import inspect
+    from types import SimpleNamespace
+    import fast_pplx.cli as pplx_cli
+    import fast_pplx.engine as pplx_eng
+    from fast_pplx.gpu import FastPplxGPU
+
+    init_sig = inspect.signature(FastPplx.__init__)
+    assert init_sig.parameters["local_files_only"].default is False
+    assert init_sig.parameters["enable_ane"].default is None
+    assert inspect.signature(FastPplxGPU.__init__).parameters["local_files_only"].default is False
+
+    args = pplx_cli.build_parser().parse_args(["embed-images", "page.png"])
+    assert args.mode == "gpu"
+
+    prebuilt_calls: list[dict[str, object]] = []
+    ane_calls: list[dict[str, object]] = []
+    gpu_calls: list[dict[str, object]] = []
+
+    fake_home = tmp_path / "pplx_home"
+    (fake_home / "artifacts" / "weights").mkdir(parents=True)
+    (fake_home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (fake_home / "artifacts" / "ane_models").mkdir(parents=True)
+
+    from dataclasses import replace
+
+    real_resolve = pplx_eng.resolve_paths
+    stub_paths = real_resolve(fake_home)
+    missing_paths = replace(
+        stub_paths,
+        weights_npz=fake_home / "artifacts" / "weights" / "missing.npz",
+        ane_models_dir=fake_home / "artifacts" / "missing_ane",
+    )
+    monkeypatch.setattr(pplx_eng, "resolve_paths", lambda _h=None: missing_paths)
+
+    def _fake_prebuilt(home=None, *, include_ane=True, local_files_only=False, **_kw):
+        prebuilt_calls.append({"home": home, "include_ane": include_ane, "local_files_only": local_files_only})
+        return stub_paths
+
+    class _StubGPU:
+        def __init__(self, **kw: object) -> None:
+            gpu_calls.append(dict(kw))
+            self.config = pplx_eng.DEFAULT_PPLX_CONFIG
+            self.tokenizer = SimpleNamespace()
+            self.max_seq_len = 32768
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(pplx_eng, "ensure_prebuilt_artifacts", _fake_prebuilt)
+    monkeypatch.setattr(pplx_eng, "FastPplxGPU", _StubGPU)
+    monkeypatch.setattr(
+        FastPplx,
+        "_try_init_ane",
+        lambda self, **kw: ane_calls.append(dict(kw)) or SimpleNamespace(close=lambda: None, max_cap=512, manifest=None),
+    )
+
+    # 1. `mode="gpu"` with `enable_ane=None` skips ANE and does not request ANE in prebuilt download; `local_files_only=True` is forwarded.
+    with FastPplx(mode="gpu", auto_prebuilt=True, local_files_only=True) as eng_gpu:
+        assert eng_gpu.ane_available is False
+        assert ane_calls == []
+        assert prebuilt_calls[-1]["include_ane"] is False
+        assert prebuilt_calls[-1]["local_files_only"] is True
+        assert gpu_calls[-1]["local_files_only"] is True
+
+    # 2. Default `mode="auto"` forwards default `local_files_only=False` and enables ANE.
+    with FastPplx(auto_prebuilt=True) as eng_auto:
+        assert eng_auto.ane_available is True
+        assert len(ane_calls) == 1
+        assert prebuilt_calls[-1]["include_ane"] is True
+        assert prebuilt_calls[-1]["local_files_only"] is False
+        assert gpu_calls[-1]["local_files_only"] is False
+

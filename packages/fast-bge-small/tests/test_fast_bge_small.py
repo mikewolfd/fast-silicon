@@ -714,3 +714,57 @@ def test_lazy_neural_init_skipped_for_metal_default_mode_cpu(tmp_path: Path, mon
         FastBgeSmall(home=home, default_mode="ane", enable_ane=False, warmup=False)
 
 
+def test_bge_local_files_only_forwarded_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `FastBgeSmall` exposes `local_files_only=False` by default and forwards it to `ensure_prebuilt_artifacts`."""
+    import inspect
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    import fast_bge_small.engine as bge_eng
+
+    sig = inspect.signature(FastBgeSmall.__init__)
+    assert sig.parameters["local_files_only"].default is False
+
+    home = tmp_path / "bge_prebuilt_home"
+    (home / "artifacts" / "weights").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "weights" / "bge_small_f16.npz").write_bytes(b"stub")
+    raw_tok = Tokenizer(WordLevel(vocab={"[PAD]": 0, "[UNK]": 100, "[CLS]": 101, "[SEP]": 102}, unk_token="[UNK]"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        special_tokens=[("[CLS]", 101), ("[SEP]", 102)],
+    )
+    raw_tok.save(str(home / "artifacts" / "tokenizer" / "tokenizer.json"))
+
+    seen_calls: list[dict[str, object]] = []
+    from dataclasses import replace
+
+    stub_paths = bge_eng.resolve_paths(home)
+    missing_paths = replace(
+        stub_paths,
+        weights_npz=home / "artifacts" / "weights" / "missing.npz",
+        ane_models_dir=home / "artifacts" / "missing_ane",
+    )
+
+    monkeypatch.setattr(bge_eng, "resolve_paths", lambda _h=None: missing_paths)
+    monkeypatch.setattr(bge_eng, "require_runtime_paths", lambda *_a, **_kw: stub_paths)
+    monkeypatch.setattr(
+        bge_eng,
+        "ensure_prebuilt_artifacts",
+        lambda h=None, *, include_ane=True, local_files_only=False, **_kw: (
+            seen_calls.append({"home": h, "include_ane": include_ane, "local_files_only": local_files_only})
+            or stub_paths
+        ),
+    )
+    monkeypatch.setattr(bge_eng, "load_or_mmap_host_tables", lambda *_a, **_kw: (np.zeros((1, 384), dtype=np.float16), np.zeros((1, 384), dtype=np.float16)))
+    monkeypatch.setattr(bge_eng, "FastBgeSmallGPU", lambda *_a, **_kw: object())
+
+    with FastBgeSmall(default_mode="gpu", auto_prebuilt=True, local_files_only=True, warmup=False) as eng_off:
+        assert eng_off.default_mode == "gpu"
+        assert seen_calls[-1] == {"home": None, "include_ane": False, "local_files_only": True}
+
+

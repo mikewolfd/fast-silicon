@@ -179,6 +179,7 @@ class FastBgeSmall:
         mlx_cache_limit_mb: int | None = 512,
         set_wired_limit: bool = True,
         auto_prebuilt: bool = True,
+        local_files_only: bool = False,
     ) -> None:
         if auto_prebuilt and home is None:
             cand = resolve_paths(None)
@@ -187,7 +188,11 @@ class FastBgeSmall:
                 want_ane and not cand.ane_models_dir.exists()
             ):
                 try:
-                    ensure_prebuilt_artifacts(None, include_ane=want_ane)
+                    ensure_prebuilt_artifacts(
+                        None,
+                        include_ane=want_ane,
+                        local_files_only=local_files_only,
+                    )
                 except Exception:
                     pass
         self.paths = require_runtime_paths(home, require_ane=False)
