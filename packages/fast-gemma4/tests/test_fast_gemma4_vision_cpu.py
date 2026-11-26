@@ -599,3 +599,54 @@ def test_generate_multimodal_batch_rolling_and_delegation_cpu(monkeypatch: pytes
     assert r2.stats["valid_json_count"] == 2
     assert eng.model.prefill_slots_lazy_lg is not None
 
+
+def test_multimodal_skips_loop_guard_when_grammar_active_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `_generate_multimodal` passes `self.model` unwrapped when `grammar` is set and wraps otherwise."""
+    import threading
+    from types import SimpleNamespace
+    import mlx.core as mx
+    import fast_gemma4.engine as eng_mod
+    from fast_gemma4.engine import _MultimodalLoopGuardModel
+
+    eng = object.__new__(FastGemma4Engine)
+    eng._gpu_lock = threading.Lock()
+    eng.default_mode = "gpu"
+    eng.mtp_draft_k = None
+    eng.last_multimodal_stats = None
+    eng._engine_apple10_nax = lambda: True  # type: ignore[method-assign]
+    eng._maybe_ensure_mtp_drafter = lambda **_kw: None  # type: ignore[method-assign]
+    eng._prepare_multimodal_prefill = lambda *_a, **_kw: ([10, 11], mx.zeros((1, 2, 4), dtype=mx.bfloat16), 0.0, 1)  # type: ignore[method-assign]
+    eng.get_grammar = lambda *_a, **_kw: SimpleNamespace(  # type: ignore[method-assign]
+        upfront_ff=[],
+        validate_token_sequence=lambda _ids: True,
+    )
+    eng.tokenizer = SimpleNamespace(
+        stop_token_ids=frozenset({2}),
+        decode=lambda _ids, skip_special_tokens=True: '{"ok": true}',
+    )
+    base_model = SimpleNamespace(
+        window_size=512,
+        prefill_prefix=lambda _p: None,
+        make_batch_cache=lambda *_a, **_kw: {},
+        prefill_multimodal_b1=lambda *_a, **_kw: (mx.zeros((1, 1, 8)), mx.zeros((1, 1, 4))),
+    )
+    eng.model = base_model
+
+    seen_models: list[Any] = []
+
+    def _fake_decode_batch(model, *_a, **_kw):
+        seen_models.append(model)
+        return {"decode_sec": 0.01, "gen_toks": [[5]], "used_speculative": False}
+
+    monkeypatch.setattr(eng_mod, "run_decode_batch", _fake_decode_batch)
+    img = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    it_json = eng._generate_multimodal("extract", [img], json_schema='{"type": "object"}', max_tokens=32, temperature=0.0)
+    assert seen_models[-1] is base_model
+    assert it_json.valid_schema is True
+
+    _ = eng._generate_multimodal("ocr page", [img], json_schema=None, max_tokens=32, temperature=0.0)
+    assert isinstance(seen_models[-1], _MultimodalLoopGuardModel)
+    assert seen_models[-1]._inner is base_model
+
+

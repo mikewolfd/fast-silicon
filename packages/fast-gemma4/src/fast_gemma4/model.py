@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
+import tempfile
 from typing import Any, Sequence
 import warnings
 
@@ -144,6 +146,52 @@ def should_use_bf16_mpp_for_mlp(
     if mlp_bits is not None and int(mlp_bits) <= 4:
         return False
     return True
+
+
+def should_use_ple_mmap(
+    *,
+    ple_mmap: bool | str = "auto",
+    ple_dim: int,
+    has_sidecar: bool,
+    has_inline_ple_weight: bool,
+    host_ram_gib: float,
+    hidden_size: int = 1536,
+    num_layers: int = 35,
+    ple_nbytes: int = 0,
+    profile: str = "auto",
+) -> bool:
+    """Decide whether `embed_tokens_per_layer` uses an INT8 `np.memmap` sidecar.
+
+    Under `ple_mmap="auto"`, uses `np.memmap` only where empirical M5 telemetry shows net value:
+      1. Stripped checkpoints (`has_sidecar and not has_inline_ple_weight`): required.
+      2. Constrained unified-memory hosts (`0 < host_ram_gib <= 18.0`, e.g. 16 GB Macs).
+      3. Large-PLE checkpoints (`E4B+` or uncompressed BF16 PLE: `hidden_size >= 2560` or
+         `num_layers >= 42` or `ple_nbytes >= 1_800_000_000`) on `<= 28 GB` hosts.
+      4. Latency-focused `profile="interactive"` (`B=1`) on `<= 28 GB` hosts
+         (saves ~1.3 GB RAM and loads 1.36x faster while staying 1.012x on B=1 decode).
+
+    Keeps `embed_tokens_per_layer` in MLX RAM for `E2B` on `>= 24 GB` hosts under `auto`/`throughput`
+    to avoid `B=64` rolling (-24.2%) and batched prefill (0.575x) regressions.
+    """
+    if int(ple_dim) <= 0:
+        return False
+    if has_sidecar and not has_inline_ple_weight:
+        return True
+    if isinstance(ple_mmap, bool):
+        return bool(ple_mmap)
+    mode = str(ple_mmap or "auto").strip().lower()
+    if mode != "auto":
+        raise ValueError(f"Unsupported ple_mmap={ple_mmap!r}; expected bool or 'auto'")
+    ram = float(host_ram_gib)
+    if 0.0 < ram <= 18.0:
+        return True
+    is_large_ple = int(hidden_size) >= 2560 or int(num_layers) >= 42 or int(ple_nbytes) >= 1_800_000_000
+    if 0.0 < ram <= 28.0 and is_large_ple:
+        return True
+    prof = str(profile or "auto").strip().lower()
+    if prof == "interactive" and 0.0 < ram <= 28.0:
+        return True
+    return False
 
 
 def singleton_quantized_linear(linear: nn.Module, x: mx.array) -> mx.array | None:
@@ -910,6 +958,8 @@ class FastGemma4Model:
         lm_head_mode: str = "q4",
         local_files_only: bool = True,
         kv_i8: bool | str = "auto",
+        ple_mmap: bool | str = "auto",
+        ple_profile: str = "auto",
         vec4_reduce: bool = True,
         mpp_m32_cutoff: int = 96,
         use_fused_softcap_argmax: bool = True,
@@ -921,6 +971,11 @@ class FastGemma4Model:
             raise ValueError(f"Unsupported lm_head_mode={lm_head_mode!r}")
         if not isinstance(kv_i8, bool) and str(kv_i8).strip().lower() != "auto":
             raise ValueError(f"Unsupported kv_i8={kv_i8!r}; expected bool or 'auto'")
+        if not isinstance(ple_mmap, bool) and str(ple_mmap).strip().lower() != "auto":
+            raise ValueError(f"Unsupported ple_mmap={ple_mmap!r}; expected bool or 'auto'")
+        ple_profile_norm = str(ple_profile or "auto").strip().lower()
+        if ple_profile_norm not in ("auto", "interactive", "throughput"):
+            raise ValueError(f"Unsupported ple_profile={ple_profile!r}")
         if vocab_out is not None and int(vocab_out) <= 0:
             raise ValueError(f"vocab_out must be a positive integer (or None), got {vocab_out!r}")
 
@@ -949,6 +1004,9 @@ class FastGemma4Model:
         else:
             self.kv_i8_mode = "auto"
             self.kv_i8 = False
+        self.ple_mmap_requested: bool | str = ple_mmap if isinstance(ple_mmap, bool) else "auto"
+        self.ple_profile = ple_profile_norm
+        self.ple_mmap_enabled = False
         self.vec4_reduce = bool(vec4_reduce)
         self.mpp_m32_cutoff = int(mpp_m32_cutoff)
         self.use_fused_softcap_argmax = bool(use_fused_softcap_argmax)
@@ -1059,26 +1117,55 @@ class FastGemma4Model:
             )
 
             sidecar_name = cfg.get("ple_sidecar") or "embed_tokens_per_layer_i8.json"
-            sidecar_json = self.model_dir / str(sidecar_name)
-            if sidecar_json.is_file() and f"{base_p}.embed_tokens_per_layer.weight" not in raw:
+            ckpt_sidecar_json = self.model_dir / str(sidecar_name)
+            ple_prefix = f"{base_p}.embed_tokens_per_layer"
+            ple_w_key = f"{ple_prefix}.weight"
+            ple_s_key = f"{ple_prefix}.scales"
+            ple_b_key = f"{ple_prefix}.biases"
+            has_ckpt_sidecar = ckpt_sidecar_json.is_file()
+            has_inline_ple = ple_w_key in raw
+            ple_nbytes = sum(int(raw[k].nbytes) for k in (ple_w_key, ple_s_key, ple_b_key) if k in raw)
+            use_ple_mmap = should_use_ple_mmap(
+                ple_mmap=self.ple_mmap_requested,
+                ple_dim=self.ple_dim,
+                has_sidecar=has_ckpt_sidecar,
+                has_inline_ple_weight=has_inline_ple,
+                host_ram_gib=self._host_ram_gib,
+                hidden_size=self.hidden_size,
+                num_layers=self.num_layers,
+                ple_nbytes=ple_nbytes,
+                profile=self.ple_profile,
+            )
+            if use_ple_mmap:
+                sidecar_json = self._resolve_or_build_ple_sidecar_json(
+                    ckpt_sidecar_json=ckpt_sidecar_json,
+                    has_ckpt_sidecar=has_ckpt_sidecar,
+                    raw=raw,
+                    ple_prefix=ple_prefix,
+                    qcfg=qcfg,
+                )
+                for _pk in (ple_w_key, ple_s_key, ple_b_key):
+                    raw.pop(_pk, None)
+                sidecar_dir = sidecar_json.parent
                 sc_meta = json.loads(sidecar_json.read_text(encoding="utf-8"))
                 sc_shape = tuple(int(x) for x in sc_meta["shape"])
                 self._ple_mmap_i8 = np.memmap(
-                    self.model_dir / str(sc_meta["data_file"]),
+                    sidecar_dir / str(sc_meta["data_file"]),
                     dtype=np.int8,
                     mode="r",
                     shape=sc_shape,
                 )
                 self._ple_mmap_scales = np.memmap(
-                    self.model_dir / str(sc_meta["scales_file"]),
+                    sidecar_dir / str(sc_meta["scales_file"]),
                     dtype=np.float16,
                     mode="r",
                     shape=(sc_shape[0],),
                 )
+                self.ple_mmap_enabled = True
             else:
                 self.embed_tokens_per_layer = _load_qembedding(
                     raw,
-                    f"{base_p}.embed_tokens_per_layer",
+                    ple_prefix,
                     qcfg,
                     self.act_dtype,
                     expected_in_f=self.num_layers * self.ple_dim,
@@ -1479,6 +1566,122 @@ class FastGemma4Model:
 
         mx.eval(self._eval_targets())
         self.param_gb = sum(int(v.nbytes) for _, v in tree_flatten(self._eval_targets())) / (1024**3)
+
+    def _build_ple_sidecar_to_dir(
+        self,
+        dst_dir: Path,
+        *,
+        raw: dict[str, mx.array],
+        ple_prefix: str,
+        qcfg: dict[str, Any],
+        vocab_rows: int,
+        total_cols: int,
+        chunk_rows: int = 4096,
+    ) -> Path:
+        """Stream-dequantize and row-quantize `embed_tokens_per_layer` into an INT8 memmap sidecar."""
+        ple_w_key = f"{ple_prefix}.weight"
+        ple_s_key = f"{ple_prefix}.scales"
+        ple_b_key = f"{ple_prefix}.biases"
+        has_scales = ple_s_key in raw
+        bits, gs, mode = (
+            _resolve_quant_spec(raw, ple_prefix, qcfg, expected_in_f=total_cols)
+            if has_scales
+            else (0, 0, "")
+        )
+
+        data_name = "embed_tokens_per_layer_i8.bin"
+        scales_name = "embed_tokens_per_layer_scales.bin"
+        json_name = "embed_tokens_per_layer_i8.json"
+        mm_data = np.memmap(dst_dir / data_name, dtype=np.int8, mode="w+", shape=(vocab_rows, total_cols))
+        mm_scales = np.memmap(dst_dir / scales_name, dtype=np.float16, mode="w+", shape=(vocab_rows,))
+        try:
+            for r0 in range(0, vocab_rows, chunk_rows):
+                r1 = min(vocab_rows, r0 + chunk_rows)
+                if has_scales:
+                    sc_c = _cast_quant_scales(raw[ple_s_key][r0:r1], mode, self.act_dtype)
+                    bi_c = raw[ple_b_key][r0:r1].astype(self.act_dtype) if ple_b_key in raw else None
+                    f32_c = mx.dequantize(
+                        raw[ple_w_key][r0:r1], sc_c, bi_c, group_size=gs, bits=bits, mode=mode
+                    ).astype(mx.float32)
+                else:
+                    f32_c = raw[ple_w_key][r0:r1].astype(mx.float32)
+                row_max_c = mx.max(mx.abs(f32_c), axis=1)
+                sc_f16_c = mx.maximum(row_max_c / 127.0, 1e-6).astype(mx.float16)
+                q_i8_c = mx.clip(mx.round(f32_c / sc_f16_c.astype(mx.float32)[:, None]), -127.0, 127.0).astype(
+                    mx.int8
+                )
+                mm_data[r0:r1] = np.asarray(q_i8_c, dtype=np.int8)
+                mm_scales[r0:r1] = np.asarray(sc_f16_c, dtype=np.float16)
+            mm_data.flush()
+            mm_scales.flush()
+        finally:
+            del mm_data, mm_scales
+
+        meta = {
+            "shape": [vocab_rows, total_cols],
+            "dtype": "int8",
+            "data_file": data_name,
+            "scales_file": scales_name,
+            "scales_dtype": "float16",
+            "scale_mode": "per_row_fp16",
+        }
+        out_json = dst_dir / json_name
+        out_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return out_json
+
+    def _resolve_or_build_ple_sidecar_json(
+        self,
+        *,
+        ckpt_sidecar_json: Path,
+        has_ckpt_sidecar: bool,
+        raw: dict[str, mx.array],
+        ple_prefix: str,
+        qcfg: dict[str, Any],
+    ) -> Path:
+        """Return an on-disk INT8 PLE sidecar JSON, building and caching one in chunks if needed."""
+        if has_ckpt_sidecar:
+            return ckpt_sidecar_json
+
+        ple_w_key = f"{ple_prefix}.weight"
+        if ple_w_key not in raw:
+            raise KeyError(f"Missing {ple_w_key} and checkpoint sidecar {ckpt_sidecar_json}")
+
+        vocab_rows = int(raw[ple_w_key].shape[0])
+        total_cols = int(self.num_layers * self.ple_dim)
+        expected_shape = [vocab_rows, total_cols]
+        cache_dir = self.paths.home / "ple_sidecars" / self.paths.checkpoint_ane_key(self.model_dir)
+        cache_json = cache_dir / "embed_tokens_per_layer_i8.json"
+        if cache_json.is_file():
+            try:
+                sc_meta = json.loads(cache_json.read_text(encoding="utf-8"))
+                if (
+                    list(sc_meta.get("shape", [])) == expected_shape
+                    and (cache_dir / str(sc_meta["data_file"])).is_file()
+                    and (cache_dir / str(sc_meta["scales_file"])).is_file()
+                ):
+                    return cache_json
+            except Exception:
+                pass
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = Path(tempfile.mkdtemp(prefix=".ple_build.", dir=str(cache_dir)))
+        try:
+            built_json = self._build_ple_sidecar_to_dir(
+                tmp_dir,
+                raw=raw,
+                ple_prefix=ple_prefix,
+                qcfg=qcfg,
+                vocab_rows=vocab_rows,
+                total_cols=total_cols,
+            )
+            sc_meta = json.loads(built_json.read_text(encoding="utf-8"))
+            for fname in (str(sc_meta["data_file"]), str(sc_meta["scales_file"])):
+                os.replace(tmp_dir / fname, cache_dir / fname)
+            os.replace(built_json, cache_json)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            mx.clear_cache()
+        return cache_json
 
     def _eval_targets(self) -> list[Any]:
         arrs: list[Any] = [

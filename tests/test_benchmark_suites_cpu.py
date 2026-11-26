@@ -2744,6 +2744,50 @@ def test_wave2_root_runner_updates_cpu(
     assert "16" in mono._effective_bench_args(mono._SPEC_BY_NAME["fast-qwen3"], mono_args, host_mem_gb=24.0)
 
 
+def test_standalone_repeat_loop_gate_scoped_to_constrained_json() -> None:
+    """Verify standalone `_build_record` hard-FAILs loops only on schema-constrained runs while paired gates still catch regressions."""
+    out = _load_script("test_loop_gate_scope", "benchmark_outcomes.py")
+
+    def _make_rec(category: int, diag: dict[str, Any]):
+        return out._build_record(
+            package="fast-gemma4",
+            category=category,
+            config_label="test",
+            benchmark="test_suite",
+            valid_flags=[True, False],
+            item_scores=[1.0, 0.0],
+            wall_sec=1.0,
+            diagnostics=diag,
+            memory_4bucket_gb={"combined_with_model_mapped_gb": 4.0},
+            sub_benchmarks={},
+            host_mem_gb=24.0,
+        )
+
+    cat4_fail = _make_rec(4, {"repeat_loop_count": 1, "llguidance": True})
+    assert cat4_fail["gate_verdict"] == "FAIL"
+    assert "repeat_loop_count=1 > 0" in cat4_fail["gate_reasons"]
+
+    cat5_json_fail = _make_rec(5, {"repeat_loop_count": 1, "llguidance": True})
+    assert cat5_json_fail["gate_verdict"] == "FAIL"
+    assert "repeat_loop_count=1 > 0" in cat5_json_fail["gate_reasons"]
+
+    cat3_pass = _make_rec(3, {"repeat_loop_count": 2})
+    assert cat3_pass["gate_verdict"] == "PASS"
+    assert cat3_pass["diagnostics"]["repeat_loop_count"] == 2
+
+    cat5_ocr_pass = _make_rec(5, {"repeat_loop_count": 2})
+    assert cat5_ocr_pass["gate_verdict"] == "PASS"
+    assert cat5_ocr_pass["diagnostics"]["repeat_loop_count"] == 2
+
+    # Paired promotion gate still fails when candidate increases repeat_loop_count over baseline.
+    base_rec = _make_rec(3, {"repeat_loop_count": 2})
+    cand_reg = _make_rec(3, {"repeat_loop_count": 3})
+    gate = out.evaluate_promotion_gates(base_rec, cand_reg)
+    assert gate.verdict == "FAIL"
+    assert any("repeat_loop_count=3 > baseline=2" in r for r in gate.reasons)
+
+
+
 
 
 

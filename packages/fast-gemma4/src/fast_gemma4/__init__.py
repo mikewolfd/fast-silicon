@@ -43,6 +43,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "select_mtp_drafter_repo": (".mtp_drafter", "select_mtp_drafter_repo"),
     "should_use_bf16_mpp_for_mlp": (".model", "should_use_bf16_mpp_for_mlp"),
     "should_use_mtp_drafter": (".mtp_drafter", "should_use_mtp_drafter"),
+    "should_use_ple_mmap": (".model", "should_use_ple_mmap"),
     "singleton_quantized_linear": (".model", "singleton_quantized_linear"),
 }
 
@@ -50,7 +51,12 @@ try:
     from .ane_pipeline import AnePrefixRunner, AnePrefixWorker
     from .engine import FastGemma4Engine, GenerationBatchResult, GenerationItem
     from .grammar import GrammarHelper
-    from .model import FastGemma4Model, should_use_bf16_mpp_for_mlp, singleton_quantized_linear
+    from .model import (
+        FastGemma4Model,
+        should_use_bf16_mpp_for_mlp,
+        should_use_ple_mmap,
+        singleton_quantized_linear,
+    )
     from .paths import DEFAULT_HF_REPO, Gemma4Paths, resolve_paths
     from .pipeline import ParquetExtractSummary, extract_jsonl, extract_parquet
     from .server import FastGemma4OpenAIAdapter, FastGemma4Server, make_gemma4_handler
@@ -110,5 +116,6 @@ __all__ = [
     "select_mtp_drafter_repo",
     "should_use_bf16_mpp_for_mlp",
     "should_use_mtp_drafter",
+    "should_use_ple_mmap",
     "singleton_quantized_linear",
 ]

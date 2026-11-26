@@ -419,6 +419,7 @@ class FastGemma4Engine:
         mlp_dtype: str = "auto",
         use_mpp: bool = True,
         kv_i8: bool | str = "auto",
+        ple_mmap: bool | str = "auto",
         vec4_reduce: bool = True,
         mpp_m32_cutoff: int = 96,
         use_fused_softcap_argmax: bool = True,
@@ -442,9 +443,12 @@ class FastGemma4Engine:
             raise ValueError(f"Unsupported ane_ring_variant={ane_ring_variant!r}")
         if not isinstance(kv_i8, bool) and str(kv_i8).strip().lower() != "auto":
             raise ValueError(f"Unsupported kv_i8={kv_i8!r}; expected bool or 'auto'")
+        if not isinstance(ple_mmap, bool) and str(ple_mmap).strip().lower() != "auto":
+            raise ValueError(f"Unsupported ple_mmap={ple_mmap!r}; expected bool or 'auto'")
 
         self.profile = profile
         self._kv_i8_requested: bool | str = kv_i8
+        self._ple_mmap_requested: bool | str = ple_mmap
         self._host_ram_gib = _host_ram_gib()
         self._is_low_ram = 0.0 < self._host_ram_gib < 32.0
         self._allow_ane_on_low_ram = bool(allow_ane_on_low_ram)
@@ -486,6 +490,8 @@ class FastGemma4Engine:
                 "lm_head_mode": lm_head_mode,
                 "local_files_only": local_files_only,
                 "kv_i8": kv_i8,
+                "ple_mmap": ple_mmap,
+                "ple_profile": profile,
                 "vec4_reduce": vec4_reduce,
                 "mpp_m32_cutoff": mpp_m32_cutoff,
                 "use_fused_softcap_argmax": use_fused_softcap_argmax,
@@ -1254,10 +1260,11 @@ class FastGemma4Engine:
                 )
                 decode_fn = (
                     (lambda tids: self.tokenizer.decode(list(tids), skip_special_tokens=True))
-                    if callable(getattr(self.tokenizer, "decode", None))
+                    if grammar is None and callable(getattr(self.tokenizer, "decode", None))
                     else None
                 )
-                guarded_model = _MultimodalLoopGuardModel(self.model, decode_fn=decode_fn)
+                # Never abort schema-constrained JSON mid-object; valid long lists repeat keys legitimately.
+                guarded_model = self.model if grammar is not None else _MultimodalLoopGuardModel(self.model, decode_fn=decode_fn)
                 t_dec_guard0 = time.perf_counter()
                 try:
                     if mtp_drafter is not None and cache.get("_last_x_in") is not None:

@@ -500,7 +500,8 @@ def _build_record(
     if rec["n_valid"] <= 0:
         reasons.append("n_valid == 0 (all outputs failed validity checks)")
     rep_loops = int(diagnostics.get("repeat_loop_count", 0) or 0)
-    if rep_loops > 0:
+    is_schema_constrained = int(category) == 4 or bool(diagnostics.get("llguidance", False))
+    if rep_loops > 0 and is_schema_constrained:
         reasons.append(f"repeat_loop_count={rep_loops} > 0")
     verdict = "PASS" if (mem_ok and not reasons) else "FAIL"
     return {

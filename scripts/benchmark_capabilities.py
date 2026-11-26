@@ -1007,8 +1007,9 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     total_items = n_steps * items_per_step
     u_mlx: list[dict[str, Any]] = []
     p_mlx: list[dict[str, Any]] = []
+    step0_raw: tuple[list[np.ndarray], list[list[int]], np.ndarray, np.ndarray] | None = None
 
-    for _ in range(n_steps):
+    for step_idx in range(n_steps):
         lens = rng.integers(88, 212, size=items_per_step).tolist()
         seqs = [rng.integers(4, 50000, size=int(L), dtype=np.int32) for L in lens]
         markers: list[list[int]] = []
@@ -1018,13 +1019,15 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
             markers.append([1 + j * step_m for j in range(k_opts)])
         qtypes = rng.integers(0, 3, size=items_per_step, dtype=np.int32)
         labels = rng.integers(0, k_opts, size=items_per_step, dtype=np.int32)
+        if step_idx == 0:
+            step0_raw = (seqs, markers, qtypes, labels)
         u_step, p_step = _prepare_modernbert_step_pair(
             seqs, markers, qtypes, labels, pack_cap=pack_cap, local_attention=local_attn, dtype=mx.bfloat16
         )
         u_mlx.append(u_step)
         p_mlx.append(p_step)
 
-    def _init_mdl(*, fp32_head: bool) -> _ModernBertLargeValidator:
+    def _init_mdl(*, fp32_head: bool, model_dtype: Any = None) -> _ModernBertLargeValidator:
         mx.random.seed(7)
         m = _ModernBertLargeValidator(
             freeze_below=18,
@@ -1034,7 +1037,7 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
         )
         if raw_laya_w is not None:
             _maybe_load_laya_weights_into_validator(m, raw_laya_w)
-        m.set_dtype(mx.bfloat16)
+        m.set_dtype(mx.bfloat16 if model_dtype is None else model_dtype)
         if fp32_head:
             m.sc_norm.set_dtype(mx.float32)
             m.sc_l1.set_dtype(mx.float32)
@@ -1046,12 +1049,6 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
             m.layers[i].freeze()
         mx.eval(m.parameters())
         return m
-
-    mdl_bf16 = _init_mdl(fp32_head=False)
-    mdl_a = _init_mdl(fp32_head=True)
-    del raw_laya_w
-    gc.collect()
-    mx.clear_cache()
 
     def _loss_bf16(
         m: _ModernBertLargeValidator,
@@ -1079,27 +1076,67 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
         lg = m.forward_upper(hi, pos_i, mf_i, ml_i, qt_i, mk_i, fp32_head=True)
         return mx.mean(nn.losses.cross_entropy(lg, yi))
 
+    def _measure_step0_parity(
+        m_chk: _ModernBertLargeValidator,
+        u_chk: dict[str, Any],
+        p_chk: dict[str, Any],
+    ) -> tuple[float, float]:
+        vg_chk = nn.value_and_grad(m_chk, _loss_bf16)
+        hu_c = m_chk.forward_frozen(u_chk["input_ids"], u_chk["position_ids"], u_chk["mask_full"], u_chk["mask_local"])
+        hp_c = m_chk.forward_frozen(p_chk["input_ids"], p_chk["position_ids"], p_chk["mask_full"], p_chk["mask_local"])
+        lu_c, gu_c = vg_chk(
+            m_chk,
+            hu_c,
+            u_chk["position_ids"],
+            u_chk["mask_full"],
+            u_chk["mask_local"],
+            u_chk["qtypes"],
+            u_chk["marker_positions"],
+            u_chk["labels"],
+        )
+        lp_c, gp_c = vg_chk(
+            m_chk,
+            hp_c,
+            p_chk["position_ids"],
+            p_chk["mask_full"],
+            p_chk["mask_local"],
+            p_chk["qtypes"],
+            p_chk["marker_positions"],
+            p_chk["labels"],
+        )
+        mx.eval(lu_c, gu_c, lp_c, gp_c)
+        f1_c, f2_c = dict(tree_flatten(gu_c)), dict(tree_flatten(gp_c))
+        dot_c = sum(
+            float(mx.sum(f1_c[k].astype(mx.float32) * f2_c[k].astype(mx.float32)).item()) for k in f1_c if k in f2_c
+        )
+        n1_c = sum(float(mx.sum(f1_c[k].astype(mx.float32) ** 2).item()) for k in f1_c if k in f2_c)
+        n2_c = sum(float(mx.sum(f2_c[k].astype(mx.float32) ** 2).item()) for k in f1_c if k in f2_c)
+        gcos_c = dot_c / max(math.sqrt(n1_c * n2_c), 1e-12)
+        ldiff_c = abs(float(lu_c.item()) - float(lp_c.item()))
+        return ldiff_c, gcos_c
+
+    # Run and free the FP32 structural parity check before allocating BF16 timing models so peak RAM stays minimal.
+    assert step0_raw is not None
+    mdl_fp32 = _init_mdl(fp32_head=False, model_dtype=mx.float32)
+    u0_fp32, p0_fp32 = _prepare_modernbert_step_pair(
+        *step0_raw, pack_cap=pack_cap, local_attention=local_attn, dtype=mx.float32
+    )
+    loss_diff, grad_cos = _measure_step0_parity(mdl_fp32, u0_fp32, p0_fp32)
+    del mdl_fp32, u0_fp32, p0_fp32
+    gc.collect()
+    mx.clear_cache()
+
+    mdl_bf16 = _init_mdl(fp32_head=False)
+    mdl_a = _init_mdl(fp32_head=True)
+    del raw_laya_w
+    gc.collect()
+    mx.clear_cache()
+
     vg_bf16 = nn.value_and_grad(mdl_bf16, _loss_bf16)
     vg_a = nn.value_and_grad(mdl_a, _loss_a)
 
-    # Step-0 parity: unpacked vs Packed-512 with per-segment RoPE reset + local_attention=128
     b_u0, b_p0 = u_mlx[0], p_mlx[0]
-    hu0 = mdl_bf16.forward_frozen(b_u0["input_ids"], b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"])
-    hp0 = mdl_bf16.forward_frozen(b_p0["input_ids"], b_p0["position_ids"], b_p0["mask_full"], b_p0["mask_local"])
-    lu0, gu0 = vg_bf16(
-        mdl_bf16, hu0, b_u0["position_ids"], b_u0["mask_full"], b_u0["mask_local"], b_u0["qtypes"], b_u0["marker_positions"], b_u0["labels"]
-    )
-    lp0, gp0 = vg_bf16(
-        mdl_bf16, hp0, b_p0["position_ids"], b_p0["mask_full"], b_p0["mask_local"], b_p0["qtypes"], b_p0["marker_positions"], b_p0["labels"]
-    )
-    mx.eval(lu0, gu0, lp0, gp0)
-    f1, f2 = dict(tree_flatten(gu0)), dict(tree_flatten(gp0))
-    dot = sum(float(mx.sum(f1[k].astype(mx.float32) * f2[k].astype(mx.float32)).item()) for k in f1 if k in f2)
-    n1 = sum(float(mx.sum(f1[k].astype(mx.float32) ** 2).item()) for k in f1 if k in f2)
-    n2 = sum(float(mx.sum(f2[k].astype(mx.float32) ** 2).item()) for k in f1 if k in f2)
-    grad_cos = dot / max(math.sqrt(n1 * n2), 1e-12)
-    loss_diff = abs(float(lu0.item()) - float(lp0.item()))
-    del gu0, gp0, hu0, hp0
+    bf16_loss_diff, bf16_grad_cos = _measure_step0_parity(mdl_bf16, b_u0, b_p0)
     gc.collect()
     mx.clear_cache()
 
@@ -1217,7 +1254,12 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
     ep1_incl_ips = round(total_items / max(cold_cache_build_sec + cached_ep_sec, 1e-9), 2)
     amort_3ep_ips = round((3 * total_items) / max(cold_cache_build_sec + 3.0 * cached_ep_sec, 1e-9), 2)
     amort_5ep_ips = round((5 * total_items) / max(cold_cache_build_sec + 5.0 * cached_ep_sec, 1e-9), 2)
-    parity_ok = float(loss_diff) <= 1e-2 and float(grad_cos) >= 0.995
+    parity_ok = (
+        float(loss_diff) <= 1e-2
+        and float(grad_cos) >= 0.995
+        and float(bf16_loss_diff) <= 1e-2
+        and float(bf16_grad_cos) >= 0.95
+    )
     return {
         "suite": "encoder-finetune",
         "status": "ok" if parity_ok else "failed",
@@ -1236,7 +1278,12 @@ def _run_encoder_finetune(args: argparse.Namespace) -> dict[str, Any]:
         "amortized_5ep_items_s": amort_5ep_ips,
         "peak_gb": med["packed_512"]["peak_gb"],
         "stock_peak_gb": med["stock_unpacked_fp32_head"]["peak_gb"],
-        "parity": {"abs_loss_diff": round(loss_diff, 6), "grad_cosine": round(grad_cos, 6)},
+        "parity": {
+            "abs_loss_diff": round(loss_diff, 6),
+            "grad_cosine": round(grad_cos, 6),
+            "bf16_abs_loss_diff": round(bf16_loss_diff, 6),
+            "bf16_grad_cosine": round(bf16_grad_cos, 6),
+        },
         "regimes": med,
     }
 
