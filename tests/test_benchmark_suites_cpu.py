@@ -1388,11 +1388,13 @@ def test_capabilities_qlora_24gb_gate_and_authentic_modernbert_packed_rope_cpu()
 
     cap = _load_script("test_cap_hp04", "benchmark_capabilities.py")
 
-    # 1. QLoRA 24 GB vs 48 GB policy: ckpt_tokens == 512, BF16 baseline gated to >= 36.0 GB
+    # 1. QLoRA 16 GB / 24 GB / 48 GB policy: RAM-scaled ckpt_tokens matching recommended_packed_use_ckpt, BF16 >= 36.0 GB
+    pol_16 = cap.select_qlora_policy(16.0)
     pol_24 = cap.select_qlora_policy(24.0)
     pol_48 = cap.select_qlora_policy(48.0)
-    assert pol_24["ckpt_tokens"] == 512 and pol_24["run_bf16_baseline"] is False
-    assert pol_48["ckpt_tokens"] == 512 and pol_48["run_bf16_baseline"] is True
+    assert pol_16["ckpt_tokens"] <= 512 and pol_16["run_bf16_baseline"] is False
+    assert pol_24["ckpt_tokens"] == 1024 and pol_24["run_bf16_baseline"] is False
+    assert pol_48["ckpt_tokens"] == 2048 and pol_48["run_bf16_baseline"] is True
 
     # 2. Authentic ModernBERT-large architecture + per-segment RoPE reset on Packed-512 (CPU stream)
     with mx.stream(mx.cpu):

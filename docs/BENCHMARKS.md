@@ -36,7 +36,8 @@ Model format and input limits can differ within a model family. For example, Flu
 15. [Dual-Mac Full 4-Suite Verification and Post-Fix Reruns (2026-11-24)](#15-dual-mac-full-4-suite-verification-and-post-fix-reruns-2026-11-24)
 16. [Validated Engine, Default & Laya FP16 LayerNorm Fixes (2026-11-24)](#16-validated-engine-default--laya-fp16-layernorm-fixes-2026-11-24)
 17. [Wave-5 DRY Optimizations & Dual-Mac ABBA Gates (`fast-qwen3` & `fast-pplx`, 2026-11-24)](#17-wave-5-dry-optimizations--dual-mac-abba-gates-fast-qwen3--fast-pplx-2026-11-24)
-18. [Saved Benchmark Receipts Index](#18-saved-benchmark-receipts-index)
+18. [Quiescent Base M5 Full 4-Suite Headline Verification (`d9f65a3`, 2026-11-26)](#18-quiescent-base-m5-full-4-suite-headline-verification-d9f65a3-2026-11-26)
+19. [Saved Benchmark Receipts Index](#19-saved-benchmark-receipts-index)
 
 [Public Core ML results and model revisions](#public-core-ml-results)
 
@@ -1042,10 +1043,59 @@ Shared DRY primitives extracted into `fast-shared`: `detect_catastrophic_token_l
 | **`Q2` (`fast-qwen3`)**: Grammar-checked `PromptLookupDrafter` | **Opt-in `speculative=True`** under `json_schema` | `100%` token-for-token parity; short JSON ran `0.843×` on `4B` (`5.88 s` vs. `4.95 s`) | `100%` parity; `0.588×` on `4B` (`7.64 s` vs. `4.49 s`), `0.781×` on `9B` `MTP` (`7.72 s` vs. `6.03 s`) | `upfront_ff` already jumps JSON keys; `speculative=None` (`"auto"`) retains the `matcher is None` guard. |
 | **`Q3` (`fast-qwen3`)**: Rolling continuous batching (`HybridCache`) | **Opt-in `rolling=True`** (`_ENABLE_ROLLING_AUTO=False`) | `100%` parity (`32/32`); `N=32, B=16` vs. static `B=8` ran `0.809×` (`11.34 s` vs. `9.18 s`, `6.83` vs. `5.17 GB` MLX peak) | `100%` parity (`48/48`); `B=32` sweep peaks at `592.70 tok/s` (`1.751 docs/s`, `11.36 GB` peak phys vs. `B=64` `495.51 tok/s`, `18.11 GB`); `N=48, B=32` hits **`1.021×`** (`24.15 s` vs. `26.04/23.51 s`, **`-2.4 GB` MLX peak** `9.8` vs. `12.2 GB`) | `RollingHybridCache` + `refill_min = B_slots // 4` scheduler (`rolling.py`). |
 
-## 18. Saved Benchmark Receipts Index
+## 18. Quiescent Base M5 Full 4-Suite Headline Verification (`d9f65a3`, 2026-11-26)
+
+Machine-readable receipt for all 4 quiescent Base Apple M5 (`24 GB`, `macOS 27.2.1`) suites at `d9f65a3` (`monorepo` `8/8 ok`, `outcomes_tier1` `12/12 PASS`, `outcomes_vision` `6/6 PASS`, `capabilities` `6/6 ok`; `32/32` total with `rc=0` on every suite): [`benchmarks/m5-suite-20261126.json`](benchmarks/m5-suite-20261126.json).
+
+- **Contention gate:** Every suite verified `QUIESCENT:` immediately prior to launch (`--allow-contended` was never passed). M4 Pro remained contended during this window (`rustc`, `Virtualization`, `mdworker_s`) and keeps its prior verified reference numbers in the cross-silicon comparison tables above.
+
+### 18.1 Monorepo (`8/8 ok`) & Capabilities (`6/6 ok`)
+
+| Package / Capability Suite | Quiescent Base M5 (`d9f65a3`) | Internal / Stock Baseline | Peak Mem (GB) | Status |
+|---|---|---|---:|---|
+| `fast-bge-small` | `172,935; 218,860; 63,871 tok/s`; `B=1` ANE `0.79 ms` vs GPU `1.26 ms` (`1.59x`) | `fast-bge-small` Tier-1 `12.17x` vs stock MLX (`10.99 s` vs `133.8 s`) | `0.954` MLX / `1.683` OS | `ok` |
+| `fast-embeddinggemma-2` | `31,628; 51,495; 21,901 tok/s`; `B=1` ANE `2.58 ms` vs GPU `4.97 ms` (`1.92x`) | `4.33x` vs stock MLX (`500`q `57.1 s`) | `1.104` MLX / `2.268` OS | `ok` |
+| `fast-pplx` | `hetero2` `B=8 S=512`: `29,905.1 tok/s` (`17.12 ms`); `B=1` ANE `9.11 ms` | Mixed `1.28x` vs `bf16`; `mmap` `-0.506 GB` | `1.737` MLX / `2.574` OS | `ok` |
+| `fast-gemma4` | GPU `1,291 tok/s` (`6.44 docs/s`); Spec `342 eff tok/s` | `kv_i8` `-0.67 GB` | `5.026` MLX / `5.817` OS | `ok` |
+| `fast-qwen3` | `B=16` structured `161.2 tok/s` (`2.184 s`) | `100%` valid Cat-4 | `4.724` MLX / `5.392` OS | `ok` |
+| `fast-gpt-oss` | `B=1` `50.0`, `B=8` `129.8`, `B=16` `168.2 dec tok/s` (`0.742 docs/s`) | `3.35x` tok/s (`2.67x` docs/s) `B=16` vs `B=1` | `12.897` MLX / `13.779` OS | `ok` |
+| `fast-ocr` | `verify 3/3 ok` (`41/42` olmOCR, `30/30` FinTab, `22/24` Omni) | `1.87x` vs stock forced VLM (4-page) | `0.000` / `0.064` OS | `ok` |
+| `fast-decision-models` | `laya_ane 119.13 q/s` (`8.39 ms/q`), `laya_hetero 228.61 q/s` (`4.37 ms/q`), `kev_08b 94.8 q/s` | `2.0x` MLX / `25x` CoreAI | `2.893` MLX / `3.679` OS | `ok` |
+| `qlora-packing` | Packed `QLoRA (1024)` `101.3` sup tok/s (`ckpt=1024`, `1.0` parity); shared-sys `1,097.9` vs `727.1` log tok/s (`1.51x`, `7.26 GB`) | Unpacked `109.8` sup tok/s (`0.92x` on `929`-tok singletons) | `9.638` | `ok` |
+| `encoder-finetune` | `Packed-512` `33.3 items/s` (`42.4 items/s` cached `L0..17`; FP32 cos `0.9962`, BF16 cos `0.9734`) | Stock unpacked `25.3 items/s` (`1.32x`) | `5.640` | `ok` |
+| `grpo-ane-critic` | `2.26 rollouts/s` GRPO / `3.53 rollouts/s` BoN | `mlx-vlm` + Kev-8bit `0.50 rollouts/s` (`4.50x`) | `5.628` | `ok` |
+| `mtp-speculative` | Constrained JSON `B=1 117.8 tok/s` (`1.84x` AR), `B=4 196.7 tok/s`, `10/10` exact | Unrestricted `mlx-vlm` `B=1 50.6`, `B=4 160.7` (`2.33x`) | `5.098` | `ok` |
+| `prefix-tree` | Warm `B=1 18.39 q/s`, `B=8 27.67 q/s` | Stock `mlx-lm` `9.30 q/s` (`2.98x`) | `2.909` | `ok` |
+| `parallel-coreml` | `9` BGE-small buckets in `9.31 s` (`jobs=4`) | Sequential `coremltools` `15.96 s` (`1.71x`) | `0.154` | `ok` |
+
+### 18.2 Tier-1 & Vision Outcome Suites (`18/18 PASS`)
+
+| Package (`Config`) | Benchmark (`N`) | Valid / Intended | `S_obj,e2e` | `EOT` (`u/s`) | Wall (`s`) | 4B Mem (`GB`) | Gate |
+|---|---|---:|---:|---:|---:|---:|---|
+| `fast-bge-small` (`hetero`) | NanoBEIR+LegalBench (`325`) | `325/325` | `0.4737` | `14.012` | `10.99` | `1.063` | `PASS` |
+| `fast-embeddinggemma-2` (`hetero`) | NanoBEIR+LegalBench (`325`) | `325/325` | `0.5182` | `3.567` | `47.21` | `2.739` | `PASS` |
+| `fast-pplx` (`hetero2`) | NanoBEIR+LegalBench (`325`) | `325/325` | `0.5297` | `1.802` | `95.51` | `2.289` | `PASS` |
+| `fast-decision-models` (`laya_ane`) | RAGTruth+CLINC+RB2 (`1400`) | `1400/1400` | `0.5079` | `9.235` | `76.99` | `1.580` | `PASS` |
+| `fast-decision-models` (`kev_08b_w8`) | RAGTruth+CLINC+RB2 (`1400`) | `1400/1400` | `0.5264` | `5.952` | `123.82` | `2.561` | `PASS` |
+| `fast-gemma4` Cat 3 (`gpu_fp16_kvbf16_cat3`) | IFBench+MMLU+MATH (`435`) | `310/435` | `0.3655` | `1.008` | `157.77` | `3.931` | `PASS` |
+| `fast-gemma4` Cat 4 (`llg_on`) | LiquidAI+BFCL (`300`) | `300/300` | `0.8836` | `4.174` | `63.51` | `4.982` | `PASS` |
+| `fast-qwen3` Cat 3 (`qwen3_auto_cat3`) | IFBench+MMLU+MATH (`435`) | `394/435` | `0.6414` | `0.552` | `505.13` | `4.211` | `PASS` |
+| `fast-qwen3` Cat 4 (`llg_on`) | LiquidAI+BFCL (`300`) | `300/300` | `0.8925` | `0.886` | `302.20` | `4.722` | `PASS` |
+| `fast-ocr` (`auto_gfm`) | olmOCR (`42`) | `41/42` | `0.6128` | `0.064` | `405.09` | `5.104` | `PASS` |
+| `fast-ocr` (`auto_gfm`) | FinTabNet-OTSL (`30`) | `30/30` | `0.8784` | `0.849` | `31.05` | `3.280` | `PASS` |
+| `fast-ocr` (`auto_gfm`) | OmniDocBench-EN (`24`) | `22/24` | `0.6870` | `0.093` | `176.57` | `5.337` | `PASS` |
+| `fast-gemma4-vision` (`gemma4_vision_gfm`) | olmOCR (`42`) | `31/42` | `0.1864` | `0.028` | `277.19` | `6.712` | `PASS` |
+| `fast-gemma4-vision` (`gemma4_vision_gfm`) | FinTabNet-OTSL (`30`) | `20/30` | `0.5800` | `0.299` | `58.25` | `6.709` | `PASS` |
+| `fast-gemma4-vision` (`gemma4_vision_gfm`) | OmniDocBench-EN (`24`) | `21/24` | `0.3303` | `0.066` | `120.81` | `6.860` | `PASS` |
+| `fast-gemma4-vision` (`gemma4_vision_gfm`) | CORD-v2 (`30`) | `30/30` | `0.5446` | `0.229` | `71.36` | `6.639` | `PASS` |
+| `fast-embeddinggemma-2-vision` (`gpu_fp16`) | VisualRetrieval (`18`) | `18/18` | `1.0000` | `16.178` | `1.11` | `3.547` | `PASS` |
+| `fast-pplx-vision` (`c8_fp16_crop`) | VisualRetrieval (`18`) | `18/18` | `1.0000` | `9.050` | `1.99` | `3.951` | `PASS` |
+
+## 19. Saved Benchmark Receipts Index
 
 | Artifact | Scope |
 |---|---|
+| [`benchmarks/m5-suite-20261126.json`](benchmarks/m5-suite-20261126.json) | 2026-11-26 quiescent Base M5 (`d9f65a3`) full 4-suite headline receipt (`Section 18`) |
 | [`benchmarks/review-20261121.md`](benchmarks/review-20261121.md) | November 21 cross-model review & repair ledger |
 | [`benchmarks/capability-corrections-20261121.json`](benchmarks/capability-corrections-20261121.json) | Capability matrix & parallel Core ML compile corrections |
 | [`benchmarks/coreml-20261120.json`](benchmarks/coreml-20261120.json) | Public Core ML export revisions, token limits & parity audit |

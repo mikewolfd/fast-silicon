@@ -223,15 +223,18 @@ _PREQUANT_GEMMA4_REPOS: tuple[str, ...] = (
 
 
 def select_qlora_policy(mem_gb: float) -> dict[str, Any]:
-    """Select wired-safe QLoRA packing, checkpointing (`ckpt_tokens=512`), and `<36 GB` BF16 gating."""
+    """Select wired-safe QLoRA packing, RAM-scaled checkpointing (`<=1024`/`2048`), and `<36 GB` BF16 gating."""
     from fast_shared.runtime_lessons import recommend_silicon_budget
 
     eff_mem = max(16.0, float(mem_gb or 24.0))
     budget = recommend_silicon_budget(eff_mem, workload="qlora")
     raw_ckpt = int(budget.ckpt_tokens)
-    ckpt_tokens = 512 if raw_ckpt <= 0 else min(512, max(256, raw_ckpt))
-    if eff_mem >= 20.0:
-        ckpt_tokens = 512
+    if eff_mem >= 36.0:
+        ckpt_tokens = 2048
+    elif eff_mem >= 20.0:
+        ckpt_tokens = 1024
+    else:
+        ckpt_tokens = 512 if raw_ckpt <= 0 else min(512, max(256, raw_ckpt))
     return {
         "pack_tokens": int(budget.seq_pack_len),
         "grad_accum": int(budget.grad_accum),
@@ -437,7 +440,7 @@ def _run_qlora_packing(args: argparse.Namespace, host_mem_gb: float) -> dict[str
             acc_n = 0
             for idx_b, b in enumerate(b_list):
                 if pack_tokens > 0:
-                    pb = pack_examples_to_bin(b, pack_tokens=pack_tokens, pad_to_fixed=True, pad_multiple=pad_mult, loss_norm="token")
+                    pb = pack_examples_to_bin(b, pack_tokens=pack_tokens, pad_to_fixed=False, pad_multiple=pad_mult, loss_norm="token")
                     h1, m1, i1, p1, r1 = run_frozen_prefix_packed(mdl, pb, first_l)
                     loss, grads = vgp(
                         mdl, h1, m1, i1, p1, r1, pb.ans_indices, pb.y_flat, None, first_l,

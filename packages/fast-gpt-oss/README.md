@@ -1,6 +1,6 @@
 # fast-gpt-oss
 
-Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 24-48 GB+ Apple Silicon Macs (with `B=8` auto-clamp on 16 GB) for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **13.4-14.3 GB** peak RAM on a 24 GB M5 (`103.1 tok/s` at `B=16`) and scale to **444.1 tok/s** at `B=128` (`15.96 GB` MLX / `16.67 GB` peak) on a 48 GB M4 Pro.
+Run `openai/gpt-oss-20b` (`MXFP4` 32-expert MoE) locally on 24-48 GB+ Apple Silicon Macs (with `B=8` auto-clamp on 16 GB) for structured JSON extraction, tool calling, and batched generation. Shares system-prompt KV caches across batch slots (`Hydragen v2`) and uses hybrid Metal 4 matrix-matmul and quantized vector kernels to fit a 20.9B model into **12.9-13.8 GB** peak RAM on a 24 GB Base M5 (**168.2 tok/s** at `B=16`) and scale to **444.1 tok/s** at `B=128` (`15.96 GB` MLX / `16.67 GB` peak) on a 48 GB M4 Pro.
 
 Zero telemetry, no account, and runs 100% offline after weight download (~11-12 GB `MXFP4-Q8` default checkpoint). [Full cross-silicon benchmarks](../../docs/BENCHMARKS.md)
 
@@ -25,7 +25,7 @@ uv sync --python 3.13 --package fast-gpt-oss --inexact
 | Unified memory | Auto wave-batch cap | Measured footprint & expected usage |
 | --- | --- | --- |
 | **48 GB+ (`M4/M5 Pro/Max`)** | `B=64` default (up to `B=128`) | Verified `15.96 GB` MLX / `16.67 GB` peak @ `B=128` (**444.1 tok/s**, **1.568 docs/s** in the monorepo suite). |
-| **24 GB (`Base M5`)** | `B=16` (`<= 26 GiB` clamp) | Verified `13.42 GB` Metal / `14.27 GB` combined (**49.0 tok/s** `B=1`, **93.6 tok/s** `B=8`, **103.1 tok/s** `B=16`). |
+| **24 GB (`Base M5`)** | `B=16` (`<= 26 GiB` clamp) | Verified `12.90 GB` Metal / `13.78 GB` OS (**50.0 tok/s** `B=1`, **129.8 tok/s** `B=8`, **168.2 tok/s** `B=16`). |
 | **16 GB / 32 GB** | `B=8` (16 GB) / `B=32` (32 GB) | Automatically clamps batch waves from host RAM so ~11 GB resident weights stay out of swap (auto-clamp only; unverified on 16 GB hardware). |
 
 ## Benchmark highlights
@@ -49,7 +49,7 @@ Split on the 50 tasks: `24/25` valid extraction (`0.653` F1) vs. stock `17/25` (
 | **M4 Pro (48 GB)** | Batched `B=8` (8) | 8/8 | 2.82 s | 6.22 s decode | 184.2-190.7 | 0.883 | 10.92 GB MLX |
 | **M4 Pro (48 GB)** | Batched `B=64` (64) | 64/64 | 22.89 s | 24.40 s decode | 374.3-385.8 | 1.350 | 12.60 GB MLX |
 | **M4 Pro (48 GB)** | **Batched `B=128` (128)** | **128/128** | **46.14 s** | **39.87 s decode** | **444.1** | **1.568** | **15.96 GB MLX / 16.67 GB peak** |
-| **Base M5 (24 GB)** | `B=1` / `B=8` / **`B=16`** | - | - | - | `49.0 / 93.6` / **103.1** | **0.382** (`B=16`) | **13.42 GB Metal / 14.27 GB comb** |
+| **Base M5 (24 GB)** | `B=1` / `B=8` / **`B=16`** | - | - | - | `50.0 / 129.8` / **168.2** | **0.742** (`B=16`) | **12.90 GB Metal / 13.78 GB OS** |
 
 *Baseline note: An earlier capacity suite run reached `454.1 dec tok/s` @ `B=128` with a `23.98 GB` suite footprint. Separately, on a non-matching `128`-token summary prompt (without a 512-token extraction schema), stock `mlx-lm` (`B=8`) measured `156.1 tok/s` (`1.188 docs/s`, `11.24 GB`).*
 
