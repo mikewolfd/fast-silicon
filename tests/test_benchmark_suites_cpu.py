@@ -2789,6 +2789,189 @@ def test_standalone_repeat_loop_gate_scoped_to_constrained_json() -> None:
     assert any("repeat_loop_count=3 > baseline=2" in r for r in gate.reasons)
 
 
+def test_cat2_cascade_oof_flags_and_mmlu_budget_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `--backend laya-kev-cascade`, `--calibrate-oof`, and uniform `--mmlu-max-tokens` parsing + execution."""
+    out = _load_script("test_cat2_cascade_harness", "benchmark_outcomes.py")
+
+    ns_default = out._parse_extra_flags([])
+    assert ns_default.mmlu_max_tokens == 256
+    assert ns_default.calibrate_oof is False
+
+    ns_casc = out._parse_extra_flags(
+        [
+            "--backend",
+            "laya-kev-4b-cascade",
+            "--cascade-tau",
+            "0.45",
+            "--cascade-tertiary-tau",
+            "0.35",
+            "--calibrate-oof",
+            "--mmlu-max-tokens",
+            "512",
+        ]
+    )
+    assert ns_casc.backend == "laya-kev-4b-cascade"
+    assert ns_casc.cascade_tau == pytest.approx(0.45)
+    assert ns_casc.cascade_tertiary_tau == pytest.approx(0.35)
+    assert ns_casc.calibrate_oof is True
+    assert ns_casc.mmlu_max_tokens == 512
+
+    class _FakeProbe:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def snapshot(self) -> dict[str, Any]:
+            return {"mlx_peak_gb": 1.0, "phys_footprint_gb": 1.5, "peak_footprint_gb": 2.0}
+
+    class _FakeGuard:
+        def arm(self) -> None:
+            pass
+
+        def check(self) -> tuple[bool, Any]:
+            return True, None
+
+    monkeypatch.setattr(out, "FourBucketMemoryProbe", _FakeProbe)
+    monkeypatch.setattr(out, "DeviceMemoryGuard", _FakeGuard)
+    monkeypatch.setattr(out, "_memory_4bucket_dict", lambda _p: {"combined_with_model_mapped_gb": 2.0})
+    monkeypatch.setattr(
+        out,
+        "load_ragtruth",
+        lambda **_kw: [
+            {"id": f"rt{i}", "context": f"ctx{i % 2}", "query": "q", "response": f"r{i}", "is_faithful": bool(i % 2)}
+            for i in range(6)
+        ],
+    )
+    cl_doms = list(out.CLINC_STAGE1_DOMAINS)
+    monkeypatch.setattr(
+        out,
+        "load_clinc_oos",
+        lambda **_kw: {
+            "items": [
+                {
+                    "id": f"cl{i}",
+                    "text": f"utterance {i}",
+                    "domain": "out_of_scope" if i >= 5 else cl_doms[i % 2],
+                    "is_oos": i >= 5,
+                    "intent_label": "oos" if i >= 5 else "intent_a",
+                    "split": "test",
+                }
+                for i in range(10)
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        out,
+        "load_reward_bench_2",
+        lambda **_kw: [
+            {"id": "rb0", "prompt": "p0", "candidates": ["c0", "c1", "c2", "c3"], "gold_idx": 0, "subset": "Math"}
+        ],
+    )
+    monkeypatch.setattr(
+        out,
+        "evaluate_clinc_two_stage",
+        lambda items, s1, s2: {
+            "stage1_domain_acc": 0.6,
+            "end_to_end_151_acc": 0.5,
+            "end_to_end_151_acc_given_valid": 0.5,
+            "oos_auroc": 0.85,
+            "oos_f1": 0.65,
+            "stage1_nll": 1.4,
+            "per_item_valid": [True] * len(items),
+            "per_item_scores": [0.5] * len(items),
+        },
+    )
+
+    import fast_decision_models.calibration as cal_mod
+    import fast_decision_models.kev_mlx as kev_mod
+    import fast_decision_models.laya_hetero as laya_h_mod
+    import fast_decision_models.paths as paths_mod
+
+    monkeypatch.setattr(paths_mod, "resolve_laya_dir", lambda *_a, **_kw: tmp_path / "laya")
+    monkeypatch.setattr(paths_mod, "ensure_laya_dylib", lambda *_a, **_kw: tmp_path / "lib.dylib")
+    monkeypatch.setattr(paths_mod, "resolve_kev_dir", lambda *_a, **_kw: tmp_path / "kev")
+
+    closed = {"n": 0}
+
+    class _FakeLayaHetero:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            self.peak_gb = 1.25
+
+        def encode_item(self, state: Any, qdef: Any, on_truncate: str = "ignore") -> dict[str, Any]:
+            return {"ids": [1, 2, 3], "original_state_tokens": 2, "truncated": False, "state": state, "qdef": qdef}
+
+        def score_noul_batch(self, encs: list[Any]) -> list[float]:
+            return [0.2 if (i % 2 == 0) else 0.85 for i in range(len(encs))]
+
+        def score_choice_batch(self, encs: list[Any]) -> list[list[float]]:
+            out_p: list[list[float]] = []
+            for e in encs:
+                k = len(e["qdef"].get("criteria") or e["qdef"].get("options") or [])
+                if k == len(cl_doms):
+                    # Uncertain on first 4 items to force escalation to Kev.
+                    row = [1.0 / k] * k
+                    if "utterance 8" in str(e["state"]):
+                        oos_i = cl_doms.index("out_of_scope")
+                        row = [0.02] * k
+                        row[oos_i] = 1.0 - 0.02 * (k - 1)
+                    out_p.append(row)
+                else:
+                    row = [0.1 / max(1, k - 1)] * k
+                    if row:
+                        row[0] = 0.9
+                    out_p.append(row)
+            return out_p
+
+        def telemetry(self) -> dict[str, Any]:
+            return {"mode": "hetero"}
+
+        def close(self) -> float:
+            closed["n"] += 1
+            return 1.25
+
+    class _FakeKev:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def score_multi_states(self, pairs: list[Any], batch_docs: int = 8) -> list[list[tuple[list[float], list[float]]]]:
+            res = []
+            for _st, qdefs in pairs:
+                k = len(qdefs[0].get("criteria") or qdefs[0].get("options") or [1, 2])
+                row = [0.01] * k
+                row[0] = 1.0 - 0.01 * (k - 1)
+                res.append([(row, row)])
+            return res
+
+        def close(self) -> None:
+            closed["n"] += 1
+
+    monkeypatch.setattr(laya_h_mod, "LayaHeteroEngine", _FakeLayaHetero)
+    monkeypatch.setattr(kev_mod, "Kev08bMlxBackend", _FakeKev)
+    monkeypatch.setattr(kev_mod, "Kev4bMlxBackend", _FakeKev)
+    # Use a deterministic fast DecisionCascadeScorer wrapper via the real class.
+    assert hasattr(cal_mod, "DecisionCascadeScorer")
+
+    rec = out._run_cat2_single_backend(
+        "laya-kev-cascade",
+        tier="tier1",
+        config_label="",
+        extra=out._parse_extra_flags(["--backend", "laya-kev-cascade", "--cascade-tau", "0.40", "--calibrate-oof"]),
+        lock={},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=None,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    assert rec["config_label"] == "laya_kev_cascade"
+    assert rec["diagnostics"]["backend"] == "laya-kev-cascade"
+    assert rec["diagnostics"]["calibrate_oof"] is True
+    assert rec["diagnostics"]["cascade_esc_rate"] > 0.0
+    assert rec["diagnostics"]["cascade_tier_counts"]["escalation"] > 0
+    assert closed["n"] >= 2
+
+
+
 
 
 

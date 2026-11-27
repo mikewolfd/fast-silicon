@@ -30,8 +30,10 @@ from .preprocess import (
     RenderedPDFPage,
     extract_native_pdf_text,
     load_image,
+    normalize_faded_scan_image,
     render_pdf_pages,
     rotate_image_cw,
+    strip_running_headers_footers,
 )
 from .region_router import (
     REGION_CROP_MIN_PIXELS,
@@ -432,6 +434,9 @@ class AutoOCRPipeline:
         max_tokens: int = 8192,
         loop_breaker: bool = False,
         auto_loop_recover: bool = True,
+        strip_headers_footers: bool = True,
+        normalize_faded_scans: bool = True,
+        continue_on_truncation: bool = False,
         memory_limit_gb: float | None = None,
         cache_limit_gb: float | None = None,
         kv_i8: bool | str | None = None,
@@ -479,6 +484,9 @@ class AutoOCRPipeline:
         self.max_tokens: int = max(1, int(max_tokens))
         self.loop_breaker: bool = bool(loop_breaker)
         self.auto_loop_recover: bool = bool(auto_loop_recover)
+        self.strip_headers_footers: bool = bool(strip_headers_footers)
+        self.normalize_faded_scans: bool = bool(normalize_faded_scans)
+        self.continue_on_truncation: bool = bool(continue_on_truncation)
         self.memory_limit_gb: float | None = memory_limit_gb
         self.cache_limit_gb: float | None = cache_limit_gb
         self.kv_i8: bool | str | None = kv_i8
@@ -530,6 +538,9 @@ class AutoOCRPipeline:
                 "max_tokens": self.max_tokens,
                 "loop_breaker": self.loop_breaker,
                 "auto_loop_recover": self.auto_loop_recover,
+                "strip_headers_footers": self.strip_headers_footers,
+                "normalize_faded_scans": self.normalize_faded_scans,
+                "continue_on_truncation": self.continue_on_truncation,
                 "memory_limit_gb": self.memory_limit_gb,
                 "cache_limit_gb": self.cache_limit_gb,
                 "kv_i8": self.kv_i8,
@@ -564,6 +575,20 @@ class AutoOCRPipeline:
         except Exception:
             return (source, {"applied": False, "reason": "deskew_error"}) if self.deskew == "on" else (source, None)
 
+    def _maybe_normalize_faded_source(
+        self,
+        source: str | Path | Image.Image | np.ndarray,
+    ) -> tuple[str | Path | Image.Image | np.ndarray, dict[str, Any] | None]:
+        if not self.normalize_faded_scans:
+            return source, None
+        try:
+            norm_img, info = normalize_faded_scan_image(source)
+            if info is not None and info.get("applied"):
+                return norm_img, info
+            return source, None
+        except Exception:
+            return source, None
+
     def _run_vision_image(
         self,
         source: str | Path | Image.Image | np.ndarray,
@@ -573,6 +598,7 @@ class AutoOCRPipeline:
         apply_deskew: bool = True,
     ) -> OCRResult:
         eff_src, deskew_info = self._maybe_deskew_source(source) if apply_deskew else (source, None)
+        eff_src, norm_info = self._maybe_normalize_faded_source(eff_src)
         vision = self._get_vision_ocr()
         fn = getattr(vision, "recognize_image", None)
         if fn is None:
@@ -587,9 +613,12 @@ class AutoOCRPipeline:
             },
         )
         res = fn(eff_src, **kw)
-        if deskew_info is not None:
+        if deskew_info is not None or norm_info is not None:
             meta = dict(res.metadata)
-            meta["deskew"] = deskew_info
+            if deskew_info is not None:
+                meta["deskew"] = deskew_info
+            if norm_info is not None:
+                meta["faded_scan_normalized"] = norm_info
             res = replace(res, metadata=meta)
         return res
 
@@ -629,6 +658,9 @@ class AutoOCRPipeline:
             "speculative": self.speculative,
             "draft_k": self.draft_k,
             "max_tokens": self.max_tokens,
+            "strip_headers_footers": self.strip_headers_footers,
+            "normalize_faded_scans": self.normalize_faded_scans,
+            "continue_on_truncation": self.continue_on_truncation,
         }
         if pre_analysis is not None:
             candidates["pre_analysis"] = pre_analysis
@@ -723,6 +755,9 @@ class AutoOCRPipeline:
                 "speculative": self.speculative,
                 "draft_k": self.draft_k,
                 "max_tokens": self.max_tokens,
+                "strip_headers_footers": self.strip_headers_footers,
+                "normalize_faded_scans": self.normalize_faded_scans,
+                "continue_on_truncation": self.continue_on_truncation,
             }
             if self.confidence_escalate_dpi is not None:
                 candidates["collect_logprob_confidence"] = True
@@ -1104,6 +1139,7 @@ class AutoOCRPipeline:
             )
 
         eff_src, deskew_info = self._maybe_deskew_source(source) if pre_analysis is None else (source, None)
+        eff_src, norm_info = self._maybe_normalize_faded_source(eff_src)
         if pre_analysis is not None:
             vision_res = pre_analysis
         else:
@@ -1113,9 +1149,12 @@ class AutoOCRPipeline:
                 raise TypeError("Injected `vision_ocr` must provide `recognize_image` or `ocr_image`")
             kw = _filter_accepted_kwargs(fn, {"page_index": int(page_index), "output_format": fmt})
             vision_res = fn(eff_src, **kw)
-            if deskew_info is not None:
+            if deskew_info is not None or norm_info is not None:
                 meta = dict(vision_res.metadata)
-                meta["deskew"] = deskew_info
+                if deskew_info is not None:
+                    meta["deskew"] = deskew_info
+                if norm_info is not None:
+                    meta["faded_scan_normalized"] = norm_info
                 vision_res = replace(vision_res, metadata=meta)
 
         if vision_res.analysis is not None and vision_res.analysis.needs_vlm:
@@ -1179,6 +1218,8 @@ class AutoOCRPipeline:
         eff_sources: Sequence[Any] = (
             [self._maybe_deskew_source(src)[0] for src in sources] if deskew_active else sources
         )
+        if self.normalize_faded_scans:
+            eff_sources = [self._maybe_normalize_faded_source(src)[0] for src in eff_sources]
 
         # `auto` mode: pipeline ANE Vision pre-analysis of batch `k + 1` while VLM runs escalated pages of batch `k`
         batches: list[tuple[Sequence[Any], list[int]]] = [
@@ -1351,6 +1392,8 @@ class AutoOCRPipeline:
         validation = None
         if output_format == "markdown":
             rendered = _format_native_pdf_markdown(raw_text, table_mode=table_mode)
+            if self.strip_headers_footers and len([ln for ln in rendered.splitlines() if ln.strip()]) >= 3:
+                rendered = strip_running_headers_footers(rendered, vision_lines=page.lines)
             validation = validate_markdown(rendered, allow_html_tables=(table_mode == "html"))
         else:
             rendered = raw_text

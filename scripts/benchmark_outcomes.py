@@ -552,7 +552,15 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
     p.add_argument("--mtp-drafter", action="store_true")
     p.add_argument("--mtp-drafter-path", default=None)
-    p.add_argument("--backend", choices=("all", "laya-ane", "laya-hetero", "kev-0.8b"), default="all")
+    p.add_argument(
+        "--backend",
+        choices=("all", "laya-ane", "laya-hetero", "kev-0.8b", "laya-kev-cascade", "laya-kev-4b-cascade"),
+        default="all",
+    )
+    p.add_argument("--cascade-tau", type=float, default=0.40)
+    p.add_argument("--cascade-tertiary-tau", type=float, default=0.40)
+    p.add_argument("--calibrate-oof", action="store_true", default=False)
+    p.add_argument("--mmlu-max-tokens", type=int, default=256)
     p.add_argument("--kev-quant", choices=("auto", "w8", "bf16"), default="w8")
     p.add_argument("--batch-docs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=None)
@@ -1188,7 +1196,13 @@ def _run_cat2_single_backend(
     cl_s2_qdefs = {dom: build_clinc_stage2_qdef(dom) for dom in CLINC150_DOMAINS}
     rb_qdef = build_rewardbench2_score_qdef()
 
+    do_oof = bool(getattr(extra, "calibrate_oof", False))
+    cascade_tau = float(getattr(extra, "cascade_tau", 0.40))
+    cascade_tert_tau = float(getattr(extra, "cascade_tertiary_tau", 0.40))
+    is_cascade = backend_name in ("laya-kev-cascade", "laya-kev-4b-cascade")
     is_laya = backend_name in ("laya-ane", "laya-hetero", "public-laya", "coreai-laya", "coreml-laya")
+    uses_laya_primary = is_laya or is_cascade
+
     if backend_name == "laya-ane":
         laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
         eng: Any = LayaAneBackend(laya_dir, ensure_laya_dylib(), pipe_depth=4)
@@ -1199,6 +1213,49 @@ def _run_cat2_single_backend(
         laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
         eng = LayaHeteroEngine(laya_dir, ensure_laya_dylib(), mode="hetero", pipe_depth=4)
         eff_label = config_label or "laya_hetero"
+    elif is_cascade:
+        from fast_decision_models.calibration import DecisionCascadeScorer
+        from fast_decision_models.kev_mlx import Kev4bMlxBackend
+        from fast_decision_models.laya_hetero import LayaHeteroEngine
+
+        laya_dir = resolve_laya_dir(None, artifacts_dir=art_dir)
+        primary_laya = LayaHeteroEngine(
+            laya_dir,
+            ensure_laya_dylib(),
+            mode="hetero",
+            pipe_depth=4,
+            local_files_only=local_files_only,
+        )
+        kev_batch = min(8, int(extra.batch_docs))
+        tert_batch = min(4, int(extra.batch_docs))
+        esc_factory = lambda: Kev08bMlxBackend(
+            resolve_kev_dir(None, artifacts_dir=art_dir),
+            quant_mode=extra.kev_quant,
+            batch_docs=kev_batch,
+            local_files_only=local_files_only,
+        )
+        tert_factory = (
+            (
+                lambda: Kev4bMlxBackend(
+                    resolve_kev_dir(None, artifacts_dir=art_dir, variant="4b"),
+                    quant_mode=extra.kev_quant,
+                    batch_docs=tert_batch,
+                    local_files_only=local_files_only,
+                )
+            )
+            if backend_name == "laya-kev-4b-cascade"
+            else None
+        )
+        eng = DecisionCascadeScorer(
+            primary_laya,
+            escalation_factory=esc_factory,
+            tertiary_factory=tert_factory,
+            confidence_threshold=cascade_tau,
+            tertiary_threshold=cascade_tert_tau,
+            kev_batch_docs=kev_batch,
+            tertiary_batch_docs=tert_batch,
+        )
+        eff_label = config_label or backend_name.replace("-", "_")
     elif backend_name == "public-laya":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from _outcome_public_backends import PublicLayaMlxBackend
@@ -1235,12 +1292,14 @@ def _run_cat2_single_backend(
         eng = Kev08bMlxBackend(kev_dir, quant_mode=extra.kev_quant, batch_docs=int(extra.batch_docs))
         eff_label = config_label or f"kev_08b_{eng.quant_mode}"
 
+    primary_eng = eng.primary if is_cascade else eng
+
     try:
         guard.arm()
         # Untimed warmup
-        if is_laya:
-            w_enc = eng.encode_item("warmup", rt_qdef, on_truncate="ignore")
-            _ = eng.score_noul_batch([w_enc])
+        if uses_laya_primary:
+            w_enc = primary_eng.encode_item("warmup", rt_qdef, on_truncate="ignore")
+            _ = primary_eng.score_noul_batch([w_enc])
         else:
             _ = eng.score_multi_states_noul([("warmup", [rt_qdef])], batch_docs=1)
         _mx_sync()
@@ -1248,8 +1307,8 @@ def _run_cat2_single_backend(
 
         # Precompute exact real tokenizer token counts for RAGTruth length slices (untimed so Kev is not double-charged).
         rt_pairs = [(build_ragtruth_state(it), [rt_qdef]) for it in rt_items]
-        if is_laya:
-            rt_header_toks = len(eng.encode_item("", rt_qdef, on_truncate="ignore")["ids"])
+        if uses_laya_primary:
+            rt_header_toks = len(primary_eng.encode_item("", rt_qdef, on_truncate="ignore")["ids"])
             kev_rt_tok_counts: list[int] = []
         else:
             rt_header_toks = 0
@@ -1263,6 +1322,7 @@ def _run_cat2_single_backend(
         all_valid: list[bool] = []
         all_scores: list[float] = []
         laya_opt_truncations = 0
+        cascade_diag: dict[str, Any] = {}
 
         # 2A: RAGTruth (`noul`) — group <=6 sibling candidates per passage while preserving deterministic item order
         rt_p_true: list[float] = []
@@ -1274,10 +1334,13 @@ def _run_cat2_single_backend(
             length_fn=lambda it: len(str(it.get("context") or it.get("source") or "")) + len(str(it.get("query") or "")),
         )
         rt_pairs_grouped = [rt_pairs[idx] for idx in rt_order]
-        if is_laya:
-            rt_encs_g = [eng.encode_item(st, rt_qdef, on_truncate="ignore") for st, _ in rt_pairs_grouped]
+        if uses_laya_primary:
+            rt_encs_g = [primary_eng.encode_item(st, rt_qdef, on_truncate="ignore") for st, _ in rt_pairs_grouped]
             rt_tok_g = [rt_header_toks + int(e.get("original_state_tokens", 0)) for e in rt_encs_g]
-            rt_p_g = [float(p) for p in eng.score_noul_batch(rt_encs_g)]
+            if is_cascade:
+                rt_p_g = [float(p) for p in eng.score_binary_batch([st for st, _ in rt_pairs_grouped], rt_qdef, on_truncate="ignore")]
+            else:
+                rt_p_g = [float(p) for p in primary_eng.score_noul_batch(rt_encs_g)]
             rt_tok_counts = [rt_tok_g[rt_inv[i]] for i in range(len(rt_items))]
             rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
         else:
@@ -1285,6 +1348,21 @@ def _run_cat2_single_backend(
             out_rt_g = eng.score_multi_states_noul(rt_pairs_grouped, batch_docs=int(extra.batch_docs))
             rt_p_g = [float(r[0][0]) for r in out_rt_g]
             rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
+        if do_oof and len(rt_items) >= 5:
+            from fast_decision_models.calibration import fit_oof_calibrated_scores
+
+            y_rt = [int(bool(it["is_faithful"])) for it in rt_items]
+            if len(set(y_rt)) >= 2:
+                rt_oof = fit_oof_calibrated_scores(
+                    rt_p_true,
+                    y_rt,
+                    model_id=eff_label,
+                    task_key="ragtruth",
+                    method="platt",
+                    n_splits=5,
+                    seed=42,
+                )
+                rt_p_true = [float(p) for p in rt_oof["calibrated"].tolist()]
         _mx_sync()
         r_rt = evaluate_ragtruth_noul(rt_items, rt_p_true, token_counts=rt_tok_counts)
         sub_reports["ragtruth_noul"] = {k: v for k, v in r_rt.items() if not k.startswith("per_item_")}
@@ -1292,7 +1370,23 @@ def _run_cat2_single_backend(
         all_scores.extend(r_rt["per_item_scores"])
 
         # 2B: CLINC150 2-stage (`K=11 -> K=15`)
-        if is_laya:
+        if is_cascade:
+            casc_cl = eng.score_multiclass_cascade(
+                [it["text"] for it in cl_items],
+                cl_s1_qdef,
+                stage1_labels=CLINC_STAGE1_DOMAINS,
+                stage2_qdefs=cl_s2_qdefs,
+                align_oos_probs=True,
+            )
+            s1_probs = casc_cl["stage1_probs"]
+            s2_preds = list(casc_cl["stage2_preds"])
+            cascade_diag = {
+                "cascade_esc_rate": round(float(casc_cl["esc_rate"]), 6),
+                "cascade_tertiary_rate": round(float(casc_cl["tertiary_rate"]), 6),
+                "cascade_tier_counts": dict(casc_cl["tier_counts"]),
+                "cascade_tau": float(casc_cl["tau"]),
+            }
+        elif is_laya:
             s1_encs = [eng.encode_item(it["text"], cl_s1_qdef, on_truncate="ignore") for it in cl_items]
             laya_opt_truncations += sum(1 for e in s1_encs if e.get("truncated"))
             s1_probs = eng.score_choice_batch(s1_encs)
@@ -1334,6 +1428,52 @@ def _run_cat2_single_backend(
                 s2_raw = eng.score_multi_states(s2_pairs, batch_docs=int(extra.batch_docs))
                 for idx, dom, r2 in zip(s2_indices, s2_doms, s2_raw):
                     s2_preds[idx] = (dom, r2[0][0])
+
+        if do_oof and len(cl_items) >= 5:
+            from fast_decision_models.calibration import fit_oof_calibrated_scores
+
+            dom_to_idx = {d: i for i, d in enumerate(CLINC_STAGE1_DOMAINS)}
+            y_dom = [dom_to_idx[it["domain"]] for it in cl_items]
+            y_oos = [int(bool(it["is_oos"])) for it in cl_items]
+            oos_idx = CLINC_STAGE1_DOMAINS.index("out_of_scope")
+            cl_oof = fit_oof_calibrated_scores(
+                s1_probs,
+                y_dom,
+                model_id=eff_label,
+                task_key="clinc_s1",
+                method="temperature",
+                n_splits=5,
+                seed=42,
+                oos_labels=y_oos,
+                oos_index=oos_idx,
+                align_oos=True,
+            )
+            s1_probs = cl_oof["aligned"].tolist()
+            rescore_idxs: list[int] = []
+            rescore_doms: list[str] = []
+            for idx, p1 in enumerate(s1_probs):
+                pred_dom = CLINC_STAGE1_DOMAINS[int(np.argmax(np.asarray(p1, dtype=np.float64)))]
+                if pred_dom == "out_of_scope" or pred_dom not in cl_s2_qdefs:
+                    s2_preds[idx] = None
+                elif s2_preds[idx] is None or s2_preds[idx][0] != pred_dom:
+                    rescore_idxs.append(idx)
+                    rescore_doms.append(pred_dom)
+            if rescore_idxs:
+                if uses_laya_primary:
+                    r_encs = [
+                        primary_eng.encode_item(cl_items[idx]["text"], cl_s2_qdefs[dom], on_truncate="ignore")
+                        for idx, dom in zip(rescore_idxs, rescore_doms)
+                    ]
+                    for idx, dom, p2 in zip(rescore_idxs, rescore_doms, primary_eng.score_choice_batch(r_encs)):
+                        s2_preds[idx] = (dom, p2)
+                else:
+                    r_raw = eng.score_multi_states(
+                        [(cl_items[idx]["text"], [cl_s2_qdefs[dom]]) for idx, dom in zip(rescore_idxs, rescore_doms)],
+                        batch_docs=int(extra.batch_docs),
+                    )
+                    for idx, dom, r2 in zip(rescore_idxs, rescore_doms, r_raw):
+                        s2_preds[idx] = (dom, r2[0][0])
+
         _mx_sync()
         r_cl = evaluate_clinc_two_stage(cl_items, s1_probs, s2_preds)
         sub_reports["clinc150_2stage"] = {k: v for k, v in r_cl.items() if not k.startswith("per_item_")}
@@ -1355,9 +1495,9 @@ def _run_cat2_single_backend(
             length_fn=lambda ent: len(str(ent[1]["prompt"])),
         )
         grouped_rb_states = [flat_rb_entries[idx][1] for idx in rb_order]
-        if is_laya:
-            rb_encs_g = [eng.encode_item(st, rb_qdef, on_truncate="ignore") for st in grouped_rb_states]
-            flat_p_g = eng.score_choice_batch(rb_encs_g)
+        if uses_laya_primary:
+            rb_encs_g = [primary_eng.encode_item(st, rb_qdef, on_truncate="ignore") for st in grouped_rb_states]
+            flat_p_g = primary_eng.score_choice_batch(rb_encs_g)
             flat_p = [flat_p_g[rb_inv[i]] for i in range(len(flat_rb_entries))]
             for idx in range(len(rb_items)):
                 rb_cand_probs.append(flat_p[4 * idx : 4 * idx + 4])
@@ -1379,7 +1519,7 @@ def _run_cat2_single_backend(
         if b77_pack["items"]:
             b77_items = b77_pack["items"]
             b77_names = b77_pack["label_names"]
-            if not is_laya:
+            if not uses_laya_primary:
                 q_b77 = build_banking77_flat_qdef(b77_names)
                 raw_b77 = eng.score_multi_states([(it["text"], [q_b77]) for it in b77_items], batch_docs=int(extra.batch_docs))
                 probs_b77 = [r[0][0] for r in raw_b77]
@@ -1405,9 +1545,9 @@ def _run_cat2_single_backend(
                     }
                     for ci, cl in enumerate(clusters)
                 }
-                c_encs = [eng.encode_item(it["text"], c_qdef, on_truncate="ignore") for it in b77_items]
+                c_encs = [primary_eng.encode_item(it["text"], c_qdef, on_truncate="ignore") for it in b77_items]
                 laya_opt_truncations += sum(1 for e in c_encs if e.get("truncated"))
-                c_probs = eng.score_choice_batch(c_encs)
+                c_probs = primary_eng.score_choice_batch(c_encs)
                 b77_s1_valid = check_probability_validity(c_probs)
 
                 b77_s2_idxs: list[int] = []
@@ -1417,7 +1557,7 @@ def _run_cat2_single_backend(
                     if not b77_s1_valid[idx]:
                         continue
                     ci = int(np.argmax(np.asarray(c_probs[idx], dtype=np.float64)))
-                    enc2 = eng.encode_item(it["text"], c2_qdefs[ci], on_truncate="ignore")
+                    enc2 = primary_eng.encode_item(it["text"], c2_qdefs[ci], on_truncate="ignore")
                     if enc2.get("truncated"):
                         laya_opt_truncations += 1
                     b77_s2_idxs.append(idx)
@@ -1427,7 +1567,7 @@ def _run_cat2_single_backend(
                 b77_valid = [False] * len(b77_items)
                 b77_scores = [0.0] * len(b77_items)
                 if b77_s2_encs:
-                    s2_probs_batch = eng.score_choice_batch(b77_s2_encs)
+                    s2_probs_batch = primary_eng.score_choice_batch(b77_s2_encs)
                     s2_valid_batch = check_probability_validity(s2_probs_batch)
                     for idx, ci, p2, s2_ok in zip(b77_s2_idxs, b77_s2_cis, s2_probs_batch, s2_valid_batch):
                         is_ok = bool(b77_s1_valid[idx] and s2_ok)
@@ -1454,13 +1594,14 @@ def _run_cat2_single_backend(
         mem4 = _memory_4bucket_dict(probe)
         daemon_pk: float | None = None
         daemon_telem: dict[str, Any] | None = None
-        if hasattr(eng, "telemetry") or hasattr(eng, "peak_gb"):
+        if hasattr(primary_eng, "telemetry") or hasattr(primary_eng, "peak_gb") or is_cascade:
             pk_ret = eng.close()
-            daemon_pk = float(pk_ret) if isinstance(pk_ret, (int, float)) else float(getattr(eng, "peak_gb", 0.0))
-            if hasattr(eng, "telemetry"):
-                daemon_telem = eng.telemetry()
-        diag = {
+            daemon_pk = float(pk_ret) if isinstance(pk_ret, (int, float)) else float(getattr(primary_eng, "peak_gb", 0.0))
+            if hasattr(primary_eng, "telemetry"):
+                daemon_telem = primary_eng.telemetry()
+        diag: dict[str, Any] = {
             "backend": backend_name,
+            "calibrate_oof": do_oof,
             "composite_macro_score": round(headline_s, 6),
             "ragtruth_auroc": r_rt["auroc"],
             "ragtruth_macro_f1": r_rt["macro_f1"],
@@ -1468,11 +1609,14 @@ def _run_cat2_single_backend(
             "ragtruth_ece_15": r_rt["ece_15"],
             "clinc150_151_acc": r_cl["end_to_end_151_acc"],
             "clinc150_oos_auroc": r_cl["oos_auroc"],
+            "clinc150_oos_f1": r_cl["oos_f1"],
+            "clinc150_stage1_nll": r_cl["stage1_nll"],
             "rewardbench2_macro_bo4": r_rb["macro_best_of_4_acc"],
-            "laya_clinc_option_truncations": laya_opt_truncations if is_laya else 0,
+            "laya_clinc_option_truncations": laya_opt_truncations if uses_laya_primary else 0,
             "device_guard_tripped": guard_tripped,
             "repeat_loop_count": 0,
         }
+        diag.update(cascade_diag)
         _merge_daemon_telemetry(mem4, diag, daemon_telem, fallback_peak_gb=daemon_pk)
         return _build_record(
             package=pkg_name,
@@ -1882,10 +2026,10 @@ def _run_llm_worker(
                 tot_fin_len += sum(1 for fr in ife_fr if fr == "length")
                 if_scores_for_comp.append(float(r_ife["prompt_loose_acc"]))
 
-            # 3B: MMLU-Redux 2.0 (max_tokens=16, budgeted low reasoning for Harmony models)
+            # 3B: MMLU-Redux 2.0 (uniform max_tokens across all Cat 3 engines; default 256)
             mm_txt, mm_fr, mm_ids, mm_st = _generate_batch(
                 [_format_mmlu_prompt(it) for it in mm_items],
-                max_tokens=16,
+                max_tokens=int(getattr(extra, "mmlu_max_tokens", 256)),
                 reasoning_effort="low",
                 reasoning_budget=64,
             )

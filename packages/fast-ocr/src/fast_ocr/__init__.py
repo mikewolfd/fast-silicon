@@ -25,7 +25,16 @@ from .numeric_recovery import (
     extract_normalized_numbers,
     find_filtered_missing_numbers,
 )
+from .paths import (
+    DEFAULT_OVIS_GFM_REPO,
+    DEFAULT_OVIS_REPO,
+    OCR_MODEL_PRESETS,
+    OCR_PRESET_FALLBACKS,
+    resolve_ocr_model_dir,
+    resolve_v7final_local_dir,
+)
 from .pipeline import AutoOCRPipeline, FastOCR, ocr_parquet
+from .preprocess import normalize_faded_scan_image, strip_running_headers_footers
 from .region_router import (
     REGION_CROP_MIN_PIXELS,
     REGION_FORMULA_PROMPT,
@@ -55,6 +64,8 @@ __version__ = "0.1.0"
 __all__ = [
     "AppleVisionOCR",
     "AutoOCRPipeline",
+    "DEFAULT_OVIS_GFM_REPO",
+    "DEFAULT_OVIS_REPO",
     "DynamicTableRowGrammar",
     "FastOCR",
     "FastOvisOCREngine",
@@ -64,6 +75,8 @@ __all__ = [
     "OCRBackend",
     "OCRBox",
     "OCRLine",
+    "OCR_MODEL_PRESETS",
+    "OCR_PRESET_FALLBACKS",
     "OCRResult",
     "OCRTimings",
     "OutputFormat",
@@ -89,9 +102,13 @@ __all__ = [
     "is_likely_camera_photo",
     "merge_region_markdown",
     "normalize_deskew_mode",
+    "normalize_faded_scan_image",
     "ocr_parquet",
     "perspective_deskew_image",
     "resolve_ocr_mlx_limits",
+    "resolve_ocr_model_dir",
+    "resolve_v7final_local_dir",
+    "strip_running_headers_footers",
     "synthesize_markdown_from_lines",
     "validate_markdown",
 ]

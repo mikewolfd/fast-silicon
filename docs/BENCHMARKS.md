@@ -1091,11 +1091,25 @@ Machine-readable receipt for all 4 quiescent Base Apple M5 (`24 GB`, `macOS 27.2
 | `fast-embeddinggemma-2-vision` (`gpu_fp16`) | VisualRetrieval (`18`) | `18/18` | `1.0000` | `16.178` | `1.11` | `3.547` | `PASS` |
 | `fast-pplx-vision` (`c8_fp16_crop`) | VisualRetrieval (`18`) | `18/18` | `1.0000` | `9.050` | `1.99` | `3.951` | `PASS` |
 
+### 18.3 Quiescent Base M5 Accuracy Push (2026-11-26)
+
+Machine-readable receipt combining all follow-up quiescent Base M5 (`24 GB`, `macOS 27.2.1`) paired accuracy runs on top of `9ac1551`: [`benchmarks/m5-accuracy-20261126.json`](benchmarks/m5-accuracy-20261126.json).
+
+| Package / Track | Configuration | Measured Base M5 Accuracy Gain | Latency / Memory & Scope Notes |
+|---|---|---|---|
+| **`fast-decision-models`** | 5-fold OOF Platt/Temp + OOS threshold alignment + 2/3-tier `DecisionCascadeScorer` (`--backend laya-kev-cascade`, `--calibrate-oof`) | `RAGTruth` ECE `0.1188 ->` **`0.0701`** (`Brier 0.2251 -> 0.2121`); `CLINC150` Laya NLL `3.8444 ->` **`1.4229`** (`oos_f1 0.3151 -> 0.4437`); held-out `LayaHetero -> Kev-0.8B` (`tau=0.55`): **`oos_auroc 0.8370`**, **`oos_f1 0.6259`** (`+30.4 pp` vs raw Laya `0.322`) | `5.525 s` held-out cascade eval (`AbstractFramework/kev-0.8b-mlx-8bit`); `configs/outcome_benchmarks.lock.json` pins test splits only, so leakage-free calibration + cascade replaces fine-tuning. |
+| **`fast-shared`** (`HybridRetrievalPipeline`) | `CompactRetrievalIndex ->` ANE `LayaRerankFusion` (`dense_rerank`, top-20) & calibrated BM25 (`bm25_weight=0.25` + `ENGLISH_STOPWORDS`) | `LegalBench-RAG(175)` `dense_rerank` `span_nDCG@10` `0.2665 ->` **`0.3715`** (**`+0.1049`**, `CI95 [+0.0768, +0.1331]`), `char_recall@10` `0.5468 ->` **`0.5847`**; `NanoArguAna` `R@10` `0.98 ->` **`1.00`** (`0.6357` vs `0.6390`), `NanoHotpotQA` `0.8829 ->` **`0.8872`** | `2.403 GB` peak (`1.249 GB` phys), `486.8 ms/q` ANE rerank; equal-weight `bm25_weight=1.0` hurt dense retrieval, and ANE `Laya` rerank hurt `NanoSciFact` (`0.890 -> 0.700`), so `Laya` reranking stays scoped to structured/legal clauses. |
+| **`fast-ocr`** (`OvisOCR2-8bit` defaults) | Default Tier-2 `strip_running_headers_footers` + gated `normalize_faded_scan_image` | `olmOCR-bench(42)` `0.6128 ->` **`0.6402`** e2e / `0.6505 ->` **`0.6918`** macro (`headers_footers` `4/12 ->` **`7/12`**, `long_tiny_text` `64/77 ->` **`67/77`**); `OmniDocBench-EN(24)` `0.6870 ->` **`0.6910`**; `FinTabNet-OTSL(30)` exact parity (`0.8784` TEDS / `0.8775` NumF1) | `0.000` loops on `olmOCR`; remaining `old_scans` misses (`8/26`) are 1860s cursive handwriting. |
+| **`fast-ocr`** (opt-in `v7final` + `--ocr-max-tokens 8192`) | `FAST_OCR_GFM_MODEL_DIR` / `--ocr-model v7final` | `OmniDocBench-EN(24)` `0.6870 ->` **`0.7472`** (`24/24` valid, `0` truncations, `table_teds 0.6822 ->` **`0.7893`**); `FinTabNet-OTSL(30)` `NumF1 0.8775 ->` **`0.8923`**; `olmOCR-bench(42)` `0.6418` (`old_scans 9/26`, `multi_column 22/26`) | **`1.254x` faster** OmniDoc (`140.76 s`), **`1.508x` faster** FinTabNet (`20.59 s`), `1.077x` faster olmOCR (`376.06 s`), `11.89 GB` peak; kept **opt-in** because `olmOCR` `table_tests` dipped `37/41 -> 33/41` (`repeat_loop_count=1`). |
+| **`fast-qwen3`** (`Qwen3.5-9B-OptiQ-4bit`) | Full Tier-1 `Cat 3(435)` + `Cat 4(300)` on `24 GB` Base M5 | **Cat 3:** `0.6805` vs `4B 0.6414` (`+3.91 pp`; `IFBench 0.27` vs `0.20`, `MMLU 0.8211` vs `0.7895`, `MATH-500 0.70` vs `0.68`); **Cat 4:** `0.8915` (`BFCL 0.8400` vs `0.8333`, `abstention 0.9000` vs `0.8667`, `150/150` valid schemas) | Cat 3 `887.46 s` (`13.34 GB` peak, `8.17 GB` phys); Cat 4 `541.21 s` (`14.33 GB` peak, `8.68 GB` phys), `0` memory-guard trips under `19.2 GB` limit. |
+| **`fast-gemma4`** (`MMLU-Redux(285)` diagnostic) | `enable_thinking=False` at `max_tokens={16, 32, 64}` | Identical `209/285` valid (`0.4667`) across `16 / 32 / 64` tokens (`0/76` recovered; `0` engine bugs, matches stock `mlx-vlm`) | `32/76` items spontaneously emit `<\|channel>thought\n` and `44/76` write `> 64` prose tokens before answering; uniform `--mmlu-max-tokens` raised from `16` to `256` across Cat 3. |
+
 ## 19. Saved Benchmark Receipts Index
 
 | Artifact | Scope |
 |---|---|
-| [`benchmarks/m5-suite-20261126.json`](benchmarks/m5-suite-20261126.json) | 2026-11-26 quiescent Base M5 (`d9f65a3`) full 4-suite headline receipt (`Section 18`) |
+| [`benchmarks/m5-accuracy-20261126.json`](benchmarks/m5-accuracy-20261126.json) | 2026-11-26 quiescent Base M5 accuracy push receipt (`Section 18.3`) |
+| [`benchmarks/m5-suite-20261126.json`](benchmarks/m5-suite-20261126.json) | 2026-11-26 quiescent Base M5 (`d9f65a3`) full 4-suite headline receipt (`Section 18.1-18.2`) |
 | [`benchmarks/review-20261121.md`](benchmarks/review-20261121.md) | November 21 cross-model review & repair ledger |
 | [`benchmarks/capability-corrections-20261121.json`](benchmarks/capability-corrections-20261121.json) | Capability matrix & parallel Core ML compile corrections |
 | [`benchmarks/coreml-20261120.json`](benchmarks/coreml-20261120.json) | Public Core ML export revisions, token limits & parity audit |

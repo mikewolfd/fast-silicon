@@ -53,14 +53,25 @@ from .numeric_recovery import (
     find_filtered_missing_numbers,
     find_recovered_numbers,
 )
+from .paths import (
+    DEFAULT_OVIS_GFM_REPO,
+    DEFAULT_OVIS_REPO,
+    OCR_MODEL_PRESETS,
+    OCR_PRESET_FALLBACKS,
+    _find_local_hf_snapshot,
+    resolve_ocr_model_dir,
+    resolve_v7final_local_dir,
+)
 from .pld_drafter import OCRPLDDrafter
 from .preprocess import (
     build_qwen_vision_inputs,
     crop_to_ink,
     load_image,
+    normalize_faded_scan_image,
     render_pdf_pages,
     rotate_image_cw,
     smart_resize_qwen,
+    strip_running_headers_footers,
 )
 from .region_router import (
     REGION_CROP_MIN_PIXELS,
@@ -78,19 +89,6 @@ from .types import (
 )
 from .vision import FastQwen35VisionModel
 
-DEFAULT_OVIS_REPO: str = "mlx-community/OvisOCR2-8bit"
-OCR_MODEL_PRESETS: dict[str, str] = {
-    "ovis": DEFAULT_OVIS_REPO,
-    "ovisocr2": DEFAULT_OVIS_REPO,
-    "ovis2": DEFAULT_OVIS_REPO,
-    "nuextract": "numind/NuExtract3-mlx-4bits",
-    "nuextract3": "numind/NuExtract3-mlx-4bits",
-}
-OCR_PRESET_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "nuextract": ("mlx-community/NuExtract3-bf16",),
-    "nuextract3": ("mlx-community/NuExtract3-bf16",),
-}
-
 DEFAULT_OVIS_PROMPT: str = (
     "Extract all readable content from the image in natural human reading order and output the result as a "
     "single Markdown document. For charts or images, represent them using an HTML image tag: "
@@ -107,10 +105,10 @@ DEFAULT_GFM_STRICT_PROMPT: str = (
 )
 
 _OCR_EXTRA_CHARS: str = (
-    "—–“”‘’•§¶°±×÷€£¥¢½¼¾©®™✓✔✗☐☑"
-    "−→←↑↓≤≥≠≈∞√∑∫†‡‑"
-    "αβγδεζηθλμνξπρστφχψωΔΘΛΞΠΣΦΨΩ"
-    "₀₁₂₃₄₅₆₇₈₉"
+    "\u2014\u2013\u201c\u201d\u2018\u2019\u2022\u00a7\u00b6\u00b0\u00b1\u00d7\u00f7\u20ac\u00a3\u00a5\u00a2\u00bd\u00bc\u00be\u00a9\u00ae\u2122\u2713\u2714\u2717\u2610\u2611"
+    "\u2212\u2192\u2190\u2191\u2193\u2264\u2265\u2260\u2248\u221e\u221a\u2211\u222b\u2020\u2021\u2011"
+    "\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03bb\u03bc\u03bd\u03be\u03c0\u03c1\u03c3\u03c4\u03c6\u03c7\u03c8\u03c9\u0394\u0398\u039b\u039e\u03a0\u03a3\u03a6\u03a8\u03a9"
+    "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089"
 )
 
 _LATIN_LANG_CODES: frozenset[str] = frozenset({
@@ -219,59 +217,6 @@ def _resolve_ovis_min_pixels(
         if 50_000 <= area < 150_000 and min_side >= 100 and (float(max(w, h)) / float(min_side)) <= 4.0:
             return 262_144
     return 65_536
-
-
-def _find_local_hf_snapshot(repo_id: str) -> Path | None:
-    slug = "models--" + repo_id.replace("/", "--")
-    hub_snaps = Path.home() / ".cache" / "huggingface" / "hub" / slug / "snapshots"
-    if hub_snaps.is_dir():
-        for snap in reversed(sorted(s for s in hub_snaps.iterdir() if s.is_dir())):
-            if (snap / "config.json").is_file() and (snap / "tokenizer.json").is_file() and any(snap.glob("*.safetensors")):
-                return snap.resolve()
-    return None
-
-
-def resolve_ocr_model_dir(
-    model_path_or_repo: str | Path | None = None,
-    *,
-    local_files_only: bool = True,
-) -> Path:
-    """Resolve an OCR VLM snapshot path from local path, preset alias, or Hugging Face Hub cache."""
-    raw = str(model_path_or_repo).strip() if model_path_or_repo is not None else os.environ.get("FAST_OCR_MODEL_DIR", "")
-    preset_key = raw.lower() if raw else ""
-    if raw:
-        cand = Path(raw).expanduser()
-        if cand.is_dir() and (cand / "config.json").is_file():
-            return cand.resolve()
-        repo_id = OCR_MODEL_PRESETS.get(preset_key, raw)
-    else:
-        repo_id = DEFAULT_OVIS_REPO
-
-    as_dir = Path(repo_id).expanduser()
-    if as_dir.is_dir() and (as_dir / "config.json").is_file():
-        return as_dir.resolve()
-
-    local_snap = _find_local_hf_snapshot(repo_id)
-    if local_snap is not None:
-        return local_snap
-
-    for fb_repo in OCR_PRESET_FALLBACKS.get(preset_key, ()):
-        fb_snap = _find_local_hf_snapshot(fb_repo)
-        if fb_snap is not None:
-            return fb_snap
-
-    from huggingface_hub import snapshot_download
-
-    downloaded = Path(
-        snapshot_download(
-            repo_id=repo_id,
-            local_files_only=local_files_only,
-            allow_patterns=["*.json", "*.jinja", "*.txt", "*.model", "*.safetensors"],
-        )
-    ).resolve()
-    if not (downloaded / "config.json").is_file():
-        raise FileNotFoundError(f"Incomplete OCR model snapshot for {repo_id!r} at {downloaded}")
-    return downloaded
 
 
 def resolve_ocr_mlx_limits(
@@ -683,6 +628,9 @@ class FastOvisOCREngine:
         max_tokens: int = 8192,
         loop_breaker: bool = False,
         auto_loop_recover: bool = True,
+        strip_headers_footers: bool = True,
+        normalize_faded_scans: bool = True,
+        continue_on_truncation: bool = False,
         kv_i8: KVMode | bool | str = "auto",
         gdn_state_mode: str = "auto",
         drop_white_patches: bool = False,
@@ -730,6 +678,9 @@ class FastOvisOCREngine:
         self.max_tokens: int = max(1, int(max_tokens))
         self.loop_breaker: bool = bool(loop_breaker)
         self.auto_loop_recover: bool = bool(auto_loop_recover)
+        self.strip_headers_footers: bool = bool(strip_headers_footers)
+        self.normalize_faded_scans: bool = bool(normalize_faded_scans)
+        self.continue_on_truncation: bool = bool(continue_on_truncation)
         self.kv_i8: KVMode | bool | str = kv_i8
         self.gdn_state_mode: str = str(gdn_state_mode)
         self.drop_white_patches: bool = bool(drop_white_patches)
@@ -854,9 +805,13 @@ class FastOvisOCREngine:
         temperature: float = 0.0,
         pre_analysis: OCRResult | None = None,
         auto_loop_recover: bool | None = None,
+        strip_headers_footers: bool | None = None,
+        normalize_faded_scans: bool | None = None,
+        continue_on_truncation: bool | None = None,
         collect_logprob_confidence: bool | str | None = None,
         _force_loop_breaker: bool = False,
         _loop_retry_depth: int = 0,
+        _continuation_depth: int = 0,
     ) -> OCRResult:
         """Run end-to-end OCR on one image with Stage-0 crop/orient/adaptive-res, MRoPE VLM decode, PLD, and Markdown cleanup."""
         fmt: OutputFormat = output_format or self.output_format
@@ -866,6 +821,9 @@ class FastOvisOCREngine:
         do_crop = self.crop_margins if crop_margins is None else bool(crop_margins)
         do_orient = self.auto_orient if auto_orient is None else bool(auto_orient)
         do_adaptive = bool(getattr(self, "adaptive_resolution", True)) if adaptive_resolution is None else bool(adaptive_resolution)
+        do_strip_hf = bool(getattr(self, "strip_headers_footers", True)) if strip_headers_footers is None else bool(strip_headers_footers)
+        do_norm_scan = bool(getattr(self, "normalize_faded_scans", True)) if normalize_faded_scans is None else bool(normalize_faded_scans)
+        do_cont_trunc = bool(getattr(self, "continue_on_truncation", False)) if continue_on_truncation is None else bool(continue_on_truncation)
         eff_deskew = normalize_deskew_mode(getattr(self, "deskew", "off") if deskew is None else deskew)
         eff_drop_white = (
             bool(getattr(self, "drop_white_patches", False))
@@ -930,6 +888,9 @@ class FastOvisOCREngine:
         rot_cw = resolve_vision_rotation_cw(vision_res, auto_orient=do_orient)
         if rot_cw != 0:
             img = rotate_image_cw(img, rot_cw)
+        norm_scan_meta: dict[str, Any] | None = None
+        if do_norm_scan:
+            img, norm_scan_meta = normalize_faded_scan_image(img)
         oriented_img = img
 
         crop_box: tuple[int, int, int, int] | None = None
@@ -1637,11 +1598,62 @@ class FastOvisOCREngine:
         validation = None
         if fmt == "markdown" and schema is None:
             rendered = canonicalize_markdown(raw_text, table_mode=tmode)
+            if do_strip_hf:
+                hf_rot = ((int(rot_cw) - int(vision_res.rotation_applied_cw)) % 360) if vision_res is not None else 0
+                rendered = strip_running_headers_footers(
+                    rendered,
+                    vision_lines=(vision_res.lines if vision_res is not None else None),
+                    line_rotation_cw=hf_rot,
+                )
             validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
         else:
             rendered = raw_text
         conf_summary = conf_session.finish() if conf_session is not None else None
         post_ms = (time.perf_counter() - t_post0) * 1000.0
+
+        cont_meta: dict[str, Any] | None = None
+        if (
+            do_cont_trunc
+            and int(_continuation_depth) == 0
+            and hit_length
+            and (not hit_eos)
+            and aborted_loop is None
+            and tail_rep4 < 0.15
+            and tok_cap >= 1024
+            and fmt == "markdown"
+            and schema is None
+        ):
+            rendered, raw_text, c_res, cont_meta = self._continue_truncated_ocr_image(
+                oriented_img,
+                vision_res,
+                rot_cw=rot_cw,
+                rendered=rendered,
+                raw_text=raw_text,
+                page_index=page_index,
+                table_mode=tmode,
+                strict_markdown_grammar=strict_md,
+                do_strip_hf=do_strip_hf,
+                speculative=spec_req,
+                draft_k=k_draft,
+                max_tokens=tok_cap,
+                temperature=temperature,
+            )
+            if c_res is not None:
+                prep_ms += float(c_res.timings.preprocess_ms)
+                vit_ms += float(c_res.timings.vit_ms)
+                prefill_ms += float(c_res.timings.prefill_ms)
+                decode_ms += float(c_res.timings.decode_ms)
+                post_ms += float(c_res.timings.postprocess_ms)
+                total_gen += int(c_res.timings.generated_tokens)
+                drafted_tokens += int(c_res.timings.drafted_tokens)
+                accepted_draft_tokens += int(c_res.timings.accepted_draft_tokens)
+                verify_passes += int(c_res.timings.verify_passes)
+                peak_gb = max(peak_gb, float(c_res.timings.peak_memory_gb))
+                if decode_ms > 0.0:
+                    decode_tps = total_gen / (decode_ms / 1000.0)
+                if c_res.finish_reason == "stop":
+                    hit_eos = True
+                validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
 
         zoom_meta: dict[str, Any] | None = None
         if do_zoom and vision_res is not None and vision_res.lines:
@@ -1700,6 +1712,10 @@ class FastOvisOCREngine:
             )
         if zoom_meta is not None:
             metadata["zoom_recovery"] = zoom_meta
+        if norm_scan_meta is not None:
+            metadata["faded_scan_normalized"] = norm_scan_meta
+        if cont_meta is not None:
+            metadata["truncation_continuation"] = cont_meta
         if conf_summary is not None:
             metadata["logprob_confidence"] = conf_summary.to_dict()
 
@@ -1736,6 +1752,116 @@ class FastOvisOCREngine:
             finish_reason=finish_reason,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _stitch_continuation_markdown(
+        prefix_md: str,
+        suffix_md: str,
+        *,
+        table_mode: MarkdownTableMode = "gfm",
+    ) -> str:
+        """Stitch a truncated Markdown continuation onto `prefix_md` while removing repeated overlap."""
+        raw_tail = suffix_md.lstrip("\r\n")
+        head = prefix_md.rstrip()
+        tail = raw_tail.lstrip()
+        if not tail:
+            return head
+        if not head:
+            return tail
+
+        # Remove exact character suffix-prefix overlap (e.g. if VLM repeated the final 1-2 lines)
+        max_ov = min(280, len(head), len(raw_tail))
+        overlap_len = 0
+        for cand_len in range(max_ov, 15, -1):
+            if head[-cand_len:] == raw_tail[:cand_len]:
+                overlap_len = cand_len
+                break
+        if overlap_len > 0:
+            after_ov = raw_tail[overlap_len:]
+            if after_ov and not after_ov[0].isspace() and head[-1:] and not head[-1:].isspace():
+                return canonicalize_markdown(f"{head}{after_ov}", table_mode=table_mode)
+            if after_ov.startswith(" ") and not after_ov.startswith("\n"):
+                return canonicalize_markdown(f"{head}{after_ov}", table_mode=table_mode)
+            tail = after_ov.lstrip("\r\n")
+
+        # If inside an unclosed GFM table and continuation starts with a repeated header+separator, skip header+sep.
+        head_lines = [ln.rstrip() for ln in head.splitlines() if ln.strip()]
+        tail_lines = tail.splitlines()
+        if head_lines and head_lines[-1].strip().startswith("|") and len(tail_lines) >= 2:
+            t0 = tail_lines[0].strip()
+            t1 = tail_lines[1].strip()
+            if t0.startswith("|") and t1.startswith("|") and set(t1.replace("|", "").replace(":", "").replace("-", "").strip()) == set():
+                if len([c for c in t1.split("|") if c.strip()]) >= 2:
+                    tail = "\n".join(tail_lines[2:]).lstrip("\r\n")
+
+        if not tail:
+            return head
+        sep = "\n" if (head_lines and head_lines[-1].strip().startswith("|") and tail.lstrip().startswith("|")) else "\n\n"
+        return canonicalize_markdown(f"{head}{sep}{tail}", table_mode=table_mode)
+
+    def _continue_truncated_ocr_image(
+        self,
+        oriented_img: Image.Image,
+        vision_res: OCRResult | None,
+        *,
+        rot_cw: int,
+        rendered: str,
+        raw_text: str,
+        page_index: int,
+        table_mode: MarkdownTableMode,
+        strict_markdown_grammar: bool,
+        do_strip_hf: bool,
+        speculative: SpeculativeMode,
+        draft_k: int,
+        max_tokens: int,
+        temperature: float,
+    ) -> tuple[str, str, OCRResult | None, dict[str, Any]]:
+        """Run one bounded continuation pass after a non-looping `finish_reason='length'` truncation."""
+        tail_anchor = rendered[-320:].strip()
+        cont_prompt = (
+            "Continue transcribing ONLY the remaining untranscribed content from the image starting "
+            "immediately after the excerpt below. Do not repeat rows or lines already present in the excerpt. "
+            f"Keep the exact same table and Markdown formatting.\n\nExcerpt:\n{tail_anchor}"
+        )
+        cont_cap = min(2048, max(512, int(max_tokens)))
+        c_res = self.ocr_image(
+            oriented_img,
+            page_index=page_index,
+            prompt=cont_prompt,
+            output_format="markdown",
+            table_mode=table_mode,
+            strict_markdown_grammar=strict_markdown_grammar,
+            zoom_recover=False,
+            crop_margins=False,
+            auto_orient=False,
+            adaptive_resolution=True,
+            deskew=False,
+            normalize_faded_scans=False,
+            strip_headers_footers=False,
+            continue_on_truncation=False,
+            speculative=speculative,
+            draft_k=draft_k,
+            max_tokens=cont_cap,
+            temperature=temperature,
+            pre_analysis=vision_res,
+            auto_loop_recover=True,
+            _continuation_depth=1,
+        )
+        merged = self._stitch_continuation_markdown(rendered, c_res.text, table_mode=table_mode)
+        if do_strip_hf:
+            hf_rot = ((int(rot_cw) - int(vision_res.rotation_applied_cw)) % 360) if vision_res is not None else 0
+            merged = strip_running_headers_footers(
+                merged,
+                vision_lines=(vision_res.lines if vision_res is not None else None),
+                line_rotation_cw=hf_rot,
+            )
+        merged_raw = f"{raw_text}\n{c_res.raw_text}" if c_res.raw_text else raw_text
+        meta = {
+            "applied": True,
+            "continuation_tokens": int(c_res.timings.generated_tokens),
+            "continuation_finish_reason": str(c_res.finish_reason),
+        }
+        return merged, merged_raw, c_res, meta
 
     def _run_zoom_recovery(
         self,
@@ -1888,6 +2014,9 @@ class FastOvisOCREngine:
         max_pad_ratio: float | None = 1.8,
         max_wave_tokens: int | None = None,
         auto_loop_recover: bool | None = None,
+        strip_headers_footers: bool | None = None,
+        normalize_faded_scans: bool | None = None,
+        continue_on_truncation: bool | None = None,
         collect_logprob_confidence: bool | str | None = None,
     ) -> list[OCRResult]:
         """Process multiple images: true `B >= 2` batched VLM waves or double-buffered ANE+PLD when `B=1`."""
@@ -1942,6 +2071,9 @@ class FastOvisOCREngine:
         k_draft = self.draft_k if draft_k is None else max(1, int(draft_k))
         tok_cap = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         do_loop_recover = bool(getattr(self, "auto_loop_recover", True)) if auto_loop_recover is None else bool(auto_loop_recover)
+        do_strip_hf = bool(getattr(self, "strip_headers_footers", True)) if strip_headers_footers is None else bool(strip_headers_footers)
+        do_norm_scan = bool(getattr(self, "normalize_faded_scans", True)) if normalize_faded_scans is None else bool(normalize_faded_scans)
+        do_cont_trunc = bool(getattr(self, "continue_on_truncation", False)) if continue_on_truncation is None else bool(continue_on_truncation)
         eff_conf_mode = _normalize_confidence_mode(
             getattr(self, "collect_logprob_confidence", "auto")
             if collect_logprob_confidence is None
@@ -1990,6 +2122,9 @@ class FastOvisOCREngine:
                         temperature=temperature,
                         pre_analysis=pre,
                         auto_loop_recover=do_loop_recover,
+                        strip_headers_footers=do_strip_hf,
+                        normalize_faded_scans=do_norm_scan,
+                        continue_on_truncation=do_cont_trunc,
                         collect_logprob_confidence=collect_logprob_confidence,
                     )
                     for pos_i, (src, idx, pre, pr_i, sc_i, nat_i) in enumerate(
@@ -2035,6 +2170,9 @@ class FastOvisOCREngine:
                             temperature=temperature,
                             pre_analysis=cur_pre,
                             auto_loop_recover=do_loop_recover,
+                            strip_headers_footers=do_strip_hf,
+                            normalize_faded_scans=do_norm_scan,
+                            continue_on_truncation=do_cont_trunc,
                             collect_logprob_confidence=collect_logprob_confidence,
                         )
                     )
@@ -2117,6 +2255,7 @@ class FastOvisOCREngine:
         proc_imgs: list[Image.Image] = []
         rot_cws: list[int] = []
         crop_boxes: list[tuple[int, int, int, int] | None] = []
+        norm_scan_metas: list[dict[str, Any] | None] = []
         adaptive_caps: list[int | None] = []
         vision_ms_arr: list[float] = []
         prep_ms_arr: list[float] = []
@@ -2129,6 +2268,10 @@ class FastOvisOCREngine:
             rot_cw = resolve_vision_rotation_cw(pre_i, auto_orient=do_orient)
             if rot_cw != 0:
                 im = rotate_image_cw(im, rot_cw)
+            norm_meta_i: dict[str, Any] | None = None
+            if do_norm_scan:
+                im, norm_meta_i = normalize_faded_scan_image(im)
+            norm_scan_metas.append(norm_meta_i)
             oriented_imgs.append(im)
             crop_box: tuple[int, int, int, int] | None = None
             if do_crop:
@@ -2454,6 +2597,17 @@ class FastOvisOCREngine:
             validation = None
             if fmt == "markdown" and schema_seq[i] is None:
                 rendered = canonicalize_markdown(raw_text, table_mode=tmode)
+                if do_strip_hf:
+                    hf_rot = (
+                        ((int(rot_cws[i]) - int(vision_res.rotation_applied_cw)) % 360)
+                        if vision_res is not None
+                        else 0
+                    )
+                    rendered = strip_running_headers_footers(
+                        rendered,
+                        vision_lines=(vision_res.lines if vision_res is not None else None),
+                        line_rotation_cw=hf_rot,
+                    )
                 validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
             else:
                 rendered = raw_text
@@ -2469,6 +2623,54 @@ class FastOvisOCREngine:
             verify_passes = int(getattr(mm_res, "verify_passes", 0))
             peak_gb = batch_peak_gb
             decode_tps = (total_gen / (dec_ms / 1000.0)) if dec_ms > 0.0 else 0.0
+            eff_finish_reason = "length" if mm_res.hit_max_tokens else "stop"
+
+            cont_meta: dict[str, Any] | None = None
+            if (
+                do_cont_trunc
+                and hit_length
+                and (not mm_res.hit_eos)
+                and aborted_loop is None
+                and tok_cap >= 1024
+                and fmt == "markdown"
+                and schema_seq[i] is None
+            ):
+                tail_rep4_item = max(
+                    _token_tail_repeat_4gram_rate(gen_ids, tail_len=256),
+                    _token_tail_repeat_4gram_rate(gen_ids, tail_len=128),
+                )
+                if tail_rep4_item < 0.15:
+                    rendered, raw_text, c_res, cont_meta = self._continue_truncated_ocr_image(
+                        oriented_imgs[i],
+                        vision_res,
+                        rot_cw=rot_cws[i],
+                        rendered=rendered,
+                        raw_text=raw_text,
+                        page_index=indices[i],
+                        table_mode=tmode,
+                        strict_markdown_grammar=strict_md,
+                        do_strip_hf=do_strip_hf,
+                        speculative=spec_req,
+                        draft_k=k_draft,
+                        max_tokens=tok_cap,
+                        temperature=temperature,
+                    )
+                    if c_res is not None:
+                        prep_ms += float(c_res.timings.preprocess_ms)
+                        vit_ms += float(c_res.timings.vit_ms)
+                        prefill_ms += float(c_res.timings.prefill_ms)
+                        dec_ms += float(c_res.timings.decode_ms)
+                        post_ms += float(c_res.timings.postprocess_ms)
+                        total_gen += int(c_res.timings.generated_tokens)
+                        drafted_tokens += int(c_res.timings.drafted_tokens)
+                        accepted_draft_tokens += int(c_res.timings.accepted_draft_tokens)
+                        verify_passes += int(c_res.timings.verify_passes)
+                        peak_gb = max(peak_gb, float(c_res.timings.peak_memory_gb))
+                        if dec_ms > 0.0:
+                            decode_tps = total_gen / (dec_ms / 1000.0)
+                        if c_res.finish_reason == "stop":
+                            eff_finish_reason = "stop"
+                        validation = validate_markdown(rendered, allow_html_tables=(tmode == "html"))
 
             zoom_meta: dict[str, Any] | None = None
             if do_zoom_req and (schema_seq[i] is None) and vision_res is not None and vision_res.lines:
@@ -2529,6 +2731,10 @@ class FastOvisOCREngine:
                 )
             if zoom_meta is not None:
                 metadata["zoom_recovery"] = zoom_meta
+            if norm_scan_metas[i] is not None:
+                metadata["faded_scan_normalized"] = norm_scan_metas[i]
+            if cont_meta is not None:
+                metadata["truncation_continuation"] = cont_meta
             mm_tel = getattr(mm_res, "telemetry", None)
             if mm_tel:
                 metadata["logprob_confidence"] = summarize_logprob_confidence(
@@ -2568,7 +2774,7 @@ class FastOvisOCREngine:
                         verify_passes=int(verify_passes),
                         peak_memory_gb=round(peak_gb, 4),
                     ),
-                    finish_reason=("length" if mm_res.hit_max_tokens else "stop"),
+                    finish_reason=eff_finish_reason,
                     metadata=metadata,
                 )
             )
