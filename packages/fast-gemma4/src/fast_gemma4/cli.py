@@ -147,25 +147,25 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             temperature=args.temperature,
             mode=args.mode,
             speculative=spec,
+            enable_thinking=bool(getattr(args, "enable_thinking", False)),
+            thinking_budget_tokens=getattr(args, "thinking_budget_tokens", None),
+            answer_max_tokens=getattr(args, "answer_max_tokens", None),
             whitespace_flexible=args.whitespace_flexible,
             max_whitespace_run=getattr(args, "json_max_whitespace", None),
         )
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "text": item.text,
-                        "parsed": item.parsed,
-                        "prompt_tokens": item.prompt_tokens,
-                        "completion_tokens": item.completion_tokens,
-                        "valid_json": item.valid_json,
-                        "valid_schema": item.valid_schema,
-                        "finish_reason": item.finish_reason,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            payload: dict[str, object] = {
+                "text": item.text,
+                "parsed": item.parsed,
+                "prompt_tokens": item.prompt_tokens,
+                "completion_tokens": item.completion_tokens,
+                "valid_json": item.valid_json,
+                "valid_schema": item.valid_schema,
+                "finish_reason": item.finish_reason,
+            }
+            if getattr(item, "reasoning", None) is not None:
+                payload["reasoning"] = item.reasoning
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             print(item.text)
     finally:
@@ -554,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--ane-variant", choices=("auto", "fp16", "w8"), default="fp16", action=_ExplicitSetAction)
     gn.add_argument("--speculative", action="store_true")
     gn.add_argument("--no-speculative", action="store_true")
+    gn.add_argument("--enable-thinking", action="store_true", help="Enable Gemma-4 <|channel>thought reasoning output")
+    gn.add_argument("--thinking-budget-tokens", type=int, default=None, help="Two-pass Pass-1 thinking token budget")
+    gn.add_argument("--answer-max-tokens", type=int, default=None, help="Pass-2 post-channel answer token cap")
     _add_json_layout_args(gn)
     gn.add_argument(
         "--json-max-whitespace",

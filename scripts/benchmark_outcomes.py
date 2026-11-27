@@ -48,6 +48,7 @@ from fast_shared.outcome_eval import (
     DEFAULT_LOSSLESS_TOLERANCE,
     CLINC150_DOMAINS,
     CLINC_STAGE1_DOMAINS,
+    CLINC_STAGE1_LABELS,
     build_banking77_flat_qdef,
     build_bfcl_response_schema,
     build_clinc_stage1_qdef,
@@ -534,6 +535,13 @@ def _parse_ocr_batch_size(raw: str) -> int | str:
     return val
 
 
+def _resolve_ocr_max_tokens(pkg_name: str, extra: argparse.Namespace) -> int:
+    req = getattr(extra, "ocr_max_tokens", None)
+    if req is not None:
+        return int(req)
+    return 8192 if pkg_name == "fast-ocr" else 4096
+
+
 def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--mode", default=None)
@@ -547,6 +555,10 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
         choices=("single", "maxsim_1024", "maxsim_512", "top2_512"),
         default="single",
     )
+    p.add_argument("--sub-chunk-chars", type=int, default=None)
+    p.add_argument("--cat1-reranker", choices=("none", "genrm"), default="none")
+    p.add_argument("--cat1-margin-tau", type=float, default=0.065)
+    p.add_argument("--cat1-rerank-top-k", type=int, default=12)
     p.add_argument("--model-dir", default=None)
     p.add_argument("--lm-head-mode", choices=("q4", "bf16_mpp"), default="q4")
     p.add_argument("--mlp-dtype", choices=("auto", "bfloat16", "quantized"), default="auto")
@@ -554,7 +566,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--mtp-drafter-path", default=None)
     p.add_argument(
         "--backend",
-        choices=("all", "laya-ane", "laya-hetero", "kev-0.8b", "laya-kev-cascade", "laya-kev-4b-cascade"),
+        choices=("all", "laya-ane", "laya-hetero", "kev-0.8b", "genrm", "laya-kev-cascade", "laya-kev-4b-cascade"),
         default="all",
     )
     p.add_argument("--cascade-tau", type=float, default=0.40)
@@ -595,7 +607,7 @@ def _parse_extra_flags(extra_args: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--region-routing", action="store_true", default=False)
     p.add_argument("--zoom-recover", action="store_true", default=False)
     p.add_argument("--strict-markdown-grammar", action="store_true", default=False)
-    p.add_argument("--ocr-max-tokens", type=int, default=4096)
+    p.add_argument("--ocr-max-tokens", type=int, default=None)
     p.add_argument("--ocr-vocab-size", type=int, default=None)
     p.add_argument("--puredocbench-track", choices=("clean", "digital", "real"), default="clean")
     p.add_argument("--puredocbench-images-root", default=None)
@@ -1033,6 +1045,7 @@ def _run_cat1_worker(
 
         contextual_lift = None
         coarse_2k_lift = None
+        lb_ctx_vecs_ref: np.ndarray | None = None
         if r_iso is not None and lb_q_vecs is not None:
             if _enc_ctx is not None:
                 doc_chunk_texts = [[ch.text for ch in lb_chunks_by_doc[did]] for did in lb_doc_ids]
@@ -1041,6 +1054,7 @@ def _run_cat1_worker(
                 if [len(mat) for mat in ctx_mats] != [len(doc) for doc in doc_chunk_texts]:
                     raise ValueError("Contextual embedding count differs from the intended chunks per document")
                 lb_ctx_vecs = np.vstack(ctx_mats) if ctx_mats else np.zeros((0, lb_q_vecs.shape[1]), dtype=np.float32)
+                lb_ctx_vecs_ref = lb_ctx_vecs
                 r_ctx = evaluate_legalbench_spans(lb_queries, lb_flat_chunks, lb_q_vecs, lb_ctx_vecs, k=10)
                 contextual_lift = compute_contextual_lift(r_iso, r_ctx, k=10)
                 _, _, coverage = _retrieval_query_outcomes(lb_q_ids, r_ctx, "per_query_span_ndcg")
@@ -1071,6 +1085,90 @@ def _run_cat1_worker(
                     "coarse_2k_delta_ndcg@10": coarse_2k_lift["contextual_delta_ndcg@10"],
                     "se_paired": coarse_2k_lift["se_paired"],
                 }
+
+            sub_chars_req = getattr(extra, "sub_chunk_chars", None)
+            cat1_rr = str(getattr(extra, "cat1_reranker", "none") or "none")
+            if sub_chars_req is not None or cat1_rr == "genrm":
+                from fast_shared.hybrid_retrieval import (
+                    BM25Index,
+                    GenRMRerankFusion,
+                    HybridRetrievalPipeline,
+                    build_contextual_subchunk_index,
+                )
+                from fast_shared.outcome_eval.retrieval import evaluate_legalbench_rankings
+                from fast_shared.retrieval_index import CompactRetrievalIndex
+
+                eff_sub_chars = int(sub_chars_req) if sub_chars_req is not None else 256
+                chunk_texts = [ch.text for ch in lb_flat_chunks]
+                chunk_ids = [f"{ch.doc_id}#{i}" for i, ch in enumerate(lb_flat_chunks)]
+                chunk_titles = [ch.doc_id for ch in lb_flat_chunks]
+                sub_idx = build_contextual_subchunk_index(
+                    eng,
+                    chunk_texts,
+                    doc_ids=chunk_ids,
+                    doc_titles=chunk_titles,
+                    sub_chunk_chars=eff_sub_chars,
+                    context_tokens=4096,
+                    repeat_header_tokens=128,
+                    encode_mode=eff_mode,
+                )
+                dense_base = (
+                    CompactRetrievalIndex(np.asarray(lb_ctx_vecs_ref, dtype=np.float32), mode="fp32", use_neon=False)
+                    if lb_ctx_vecs_ref is not None
+                    else sub_idx
+                )
+                from fast_decision_models.genrm import GenRMScorer as _Cat1GenRMScorer
+
+                reranker_obj = (
+                    GenRMRerankFusion(
+                        scorer_factory=lambda: _Cat1GenRMScorer(local_files_only=local_files_only),
+                        max_rerank=int(getattr(extra, "cat1_rerank_top_k", 12)),
+                        prior_weight=0.35,
+                        deduplicate_labels=True,
+                    )
+                    if cat1_rr == "genrm"
+                    else None
+                )
+                pipe = HybridRetrievalPipeline(
+                    dense_index=dense_base,
+                    bm25_index=BM25Index(chunk_texts),
+                    maxsim_index=sub_idx,
+                    doc_texts=chunk_texts,
+                    doc_ids=chunk_ids,
+                    doc_titles=chunk_titles,
+                    reranker=reranker_obj,
+                    rerank_top_k=int(getattr(extra, "cat1_rerank_top_k", 12)),
+                    rerank_margin_threshold=float(getattr(extra, "cat1_margin_tau", 0.065)),
+                )
+                try:
+                    ms_top_idx, _ = pipe.search(lb_q_texts, query_vecs=lb_q_vecs, k=10, mode="maxsim")
+                    r_ms = evaluate_legalbench_rankings(lb_queries, lb_flat_chunks, ms_top_idx, k=10)
+                    _, _, ms_cov = _retrieval_query_outcomes(lb_q_ids, r_ms, "per_query_span_ndcg")
+                    sub_reports["legalbench_rag_subchunk_maxsim"] = {
+                        **ms_cov,
+                        "n_chunks": len(lb_flat_chunks),
+                        "sub_chunk_chars": eff_sub_chars,
+                        "span_ndcg@10": round(float(r_ms["span_ndcg@10"]), 6),
+                        "char_recall@10": round(float(r_ms["char_recall@10"]), 6),
+                    }
+                    if cat1_rr == "genrm":
+                        rr_top_idx, _ = pipe.search(
+                            lb_q_texts, query_vecs=lb_q_vecs, k=10, mode="margin_maxsim_rerank"
+                        )
+                        _mx_sync()
+                        r_rr = evaluate_legalbench_rankings(lb_queries, lb_flat_chunks, rr_top_idx, k=10)
+                        _, _, rr_cov = _retrieval_query_outcomes(lb_q_ids, r_rr, "per_query_span_ndcg")
+                        sub_reports["legalbench_rag_maxsim_genrm"] = {
+                            **rr_cov,
+                            "n_chunks": len(lb_flat_chunks),
+                            "sub_chunk_chars": eff_sub_chars,
+                            "margin_tau": float(getattr(extra, "cat1_margin_tau", 0.065)),
+                            "rerank_top_k": int(getattr(extra, "cat1_rerank_top_k", 12)),
+                            "span_ndcg@10": round(float(r_rr["span_ndcg@10"]), 6),
+                            "char_recall@10": round(float(r_rr["char_recall@10"]), 6),
+                        }
+                finally:
+                    pipe.close()
         _mx_sync()
         ablation_wall_sec = time.perf_counter() - t_abl0
 
@@ -1171,6 +1269,13 @@ def _run_cat2_single_backend(
 
     art_dir = home / "artifacts"
     cat2_model_dirs = [art_dir, *stock_decision_model_files(backend_name)]
+    if backend_name == "genrm":
+        try:
+            from fast_qwen3.paths import resolve_paths as _resolve_qwen_paths
+
+            cat2_model_dirs.append(_resolve_qwen_paths(local_files_only=local_files_only).model_dir)
+        except Exception:
+            pass
     if backend_name.startswith("coreai-") or pkg_name.startswith("coreai-"):
         cat2_model_dirs.append(_coreai_cache_dir())
     probe = FourBucketMemoryProbe(model_directories=cat2_model_dirs)
@@ -1201,6 +1306,7 @@ def _run_cat2_single_backend(
     cascade_tert_tau = float(getattr(extra, "cascade_tertiary_tau", 0.40))
     is_cascade = backend_name in ("laya-kev-cascade", "laya-kev-4b-cascade")
     is_laya = backend_name in ("laya-ane", "laya-hetero", "public-laya", "coreai-laya", "coreml-laya")
+    is_genrm = backend_name == "genrm"
     uses_laya_primary = is_laya or is_cascade
 
     if backend_name == "laya-ane":
@@ -1287,6 +1393,11 @@ def _run_cat2_single_backend(
 
         eng = CoreMlKev08bBackend()
         eff_label = config_label or "coreml_kev_08b_fp16_gpu"
+    elif is_genrm:
+        from fast_decision_models.genrm import GenRMScorer
+
+        eng = GenRMScorer(batch_size=int(extra.batch_docs), local_files_only=local_files_only)
+        eff_label = config_label or "genrm"
     else:
         kev_dir = resolve_kev_dir(None, artifacts_dir=art_dir)
         eng = Kev08bMlxBackend(kev_dir, quant_mode=extra.kev_quant, batch_docs=int(extra.batch_docs))
@@ -1300,6 +1411,8 @@ def _run_cat2_single_backend(
         if uses_laya_primary:
             w_enc = primary_eng.encode_item("warmup", rt_qdef, on_truncate="ignore")
             _ = primary_eng.score_noul_batch([w_enc])
+        elif is_genrm:
+            _ = eng.score_yes_no_logprob(["warmup context"], verdict_suffix="Answer (Yes or No):")
         else:
             _ = eng.score_multi_states_noul([("warmup", [rt_qdef])], batch_docs=1)
         _mx_sync()
@@ -1310,6 +1423,21 @@ def _run_cat2_single_backend(
         if uses_laya_primary:
             rt_header_toks = len(primary_eng.encode_item("", rt_qdef, on_truncate="ignore")["ids"])
             kev_rt_tok_counts: list[int] = []
+        elif is_genrm:
+            from fast_decision_models.genrm import format_ragtruth_prompt
+
+            rt_header_toks = 0
+            tok_genrm = getattr(getattr(eng, "_engine", None), "tokenizer", None)
+            if tok_genrm is not None and callable(getattr(tok_genrm, "encode", None)):
+                kev_rt_tok_counts = [
+                    len(tok_genrm.encode(format_ragtruth_prompt(it), add_special_tokens=False))
+                    for it in rt_items
+                ]
+            else:
+                kev_rt_tok_counts = [
+                    max(1, (len(str(it.get("context") or it.get("source") or "")) + len(str(it.get("output") or it.get("response") or ""))) // 4)
+                    for it in rt_items
+                ]
         else:
             rt_header_toks = 0
             kev_rt_tok_counts = []
@@ -1324,7 +1452,7 @@ def _run_cat2_single_backend(
         laya_opt_truncations = 0
         cascade_diag: dict[str, Any] = {}
 
-        # 2A: RAGTruth (`noul`) — group <=6 sibling candidates per passage while preserving deterministic item order
+        # 2A: RAGTruth (`noul`) -- group <=6 sibling candidates per passage while preserving deterministic item order
         rt_p_true: list[float] = []
         rt_tok_counts: list[int] = []
         rt_order, rt_inv = _group_shared_prefix_indices(
@@ -1342,6 +1470,11 @@ def _run_cat2_single_backend(
             else:
                 rt_p_g = [float(p) for p in primary_eng.score_noul_batch(rt_encs_g)]
             rt_tok_counts = [rt_tok_g[rt_inv[i]] for i in range(len(rt_items))]
+            rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
+        elif is_genrm:
+            rt_tok_counts = kev_rt_tok_counts
+            rt_grouped_items = [rt_items[idx] for idx in rt_order]
+            rt_p_g = [float(p) for p in eng.score_ragtruth_faithfulness(rt_grouped_items)]
             rt_p_true = [rt_p_g[rt_inv[i]] for i in range(len(rt_items))]
         else:
             rt_tok_counts = kev_rt_tok_counts
@@ -1409,6 +1542,33 @@ def _run_cat2_single_backend(
                 s2_probs_batch = eng.score_choice_batch(s2_encs)
                 for idx, dom, p2 in zip(s2_indices, s2_doms, s2_probs_batch):
                     s2_preds[idx] = (dom, p2)
+        elif is_genrm:
+            dom_labels = [chr(ord("A") + i) for i in range(len(CLINC_STAGE1_DOMAINS))]
+            dom_opts = "\n".join(
+                f"{lbl}. {dom.replace('_', ' ')} ({CLINC_STAGE1_LABELS[dom]})"
+                for lbl, dom in zip(dom_labels, CLINC_STAGE1_DOMAINS)
+            )
+            s1_prompts = [f"Utterance: {it['text']}\n\nSelect the intent domain:\n{dom_opts}" for it in cl_items]
+            s1_probs = eng.score_choice_logprob(s1_prompts, dom_labels, verdict_suffix="Domain label:")
+            s2_preds = [None] * len(cl_items)
+            by_dom_idxs: dict[str, list[int]] = {}
+            for idx, probs in enumerate(s1_probs):
+                if not probs:
+                    continue
+                pred_dom = CLINC_STAGE1_DOMAINS[int(np.argmax(np.asarray(probs, dtype=np.float64)))]
+                if pred_dom != "out_of_scope" and pred_dom in cl_s2_qdefs:
+                    by_dom_idxs.setdefault(pred_dom, []).append(idx)
+            for dom, idxs in by_dom_idxs.items():
+                crit2 = list(cl_s2_qdefs[dom]["criteria"])
+                lbl2 = [chr(ord("A") + i) for i in range(len(crit2))]
+                opt2 = "\n".join(f"{lbl}. {nm}" for lbl, nm in zip(lbl2, crit2))
+                p2_batch = eng.score_choice_logprob(
+                    [f"Utterance: {cl_items[idx]['text']}\n\nSelect the {dom.replace('_', ' ')} intent:\n{opt2}" for idx in idxs],
+                    lbl2,
+                    verdict_suffix="Intent label:",
+                )
+                for idx, p2 in zip(idxs, p2_batch):
+                    s2_preds[idx] = (dom, p2)
         else:
             s1_raw = eng.score_multi_states([(it["text"], [cl_s1_qdef]) for it in cl_items], batch_docs=int(extra.batch_docs))
             s1_probs = [r[0][0] for r in s1_raw]
@@ -1466,6 +1626,21 @@ def _run_cat2_single_backend(
                     ]
                     for idx, dom, p2 in zip(rescore_idxs, rescore_doms, primary_eng.score_choice_batch(r_encs)):
                         s2_preds[idx] = (dom, p2)
+                elif is_genrm:
+                    by_dom_rs: dict[str, list[int]] = {}
+                    for idx, dom in zip(rescore_idxs, rescore_doms):
+                        by_dom_rs.setdefault(dom, []).append(idx)
+                    for dom, idxs in by_dom_rs.items():
+                        crit2 = list(cl_s2_qdefs[dom]["criteria"])
+                        lbl2 = [chr(ord("A") + i) for i in range(len(crit2))]
+                        opt2 = "\n".join(f"{lbl}. {nm}" for lbl, nm in zip(lbl2, crit2))
+                        p2_batch = eng.score_choice_logprob(
+                            [f"Utterance: {cl_items[idx]['text']}\n\nSelect the {dom.replace('_', ' ')} intent:\n{opt2}" for idx in idxs],
+                            lbl2,
+                            verdict_suffix="Intent label:",
+                        )
+                        for idx, p2 in zip(idxs, p2_batch):
+                            s2_preds[idx] = (dom, p2)
                 else:
                     r_raw = eng.score_multi_states(
                         [(cl_items[idx]["text"], [cl_s2_qdefs[dom]]) for idx, dom in zip(rescore_idxs, rescore_doms)],
@@ -1502,6 +1677,10 @@ def _run_cat2_single_backend(
             for idx in range(len(rb_items)):
                 rb_cand_probs.append(flat_p[4 * idx : 4 * idx + 4])
                 rb_cand_logits.append(None)
+        elif is_genrm:
+            bo4_results = eng.score_best_of_k(rb_items, pairwise_margin_tau=0.0)
+            rb_cand_probs = [[[1.0 - float(p), float(p)] for p in res.probs] for res in bo4_results]
+            rb_cand_logits = [None for _ in bo4_results]
         else:
             rb_raw_g = eng.score_multi_states([(st, [rb_qdef]) for st in grouped_rb_states], batch_docs=int(extra.batch_docs))
             rb_raw = [rb_raw_g[rb_inv[i]] for i in range(len(flat_rb_entries))]
@@ -1519,7 +1698,7 @@ def _run_cat2_single_backend(
         if b77_pack["items"]:
             b77_items = b77_pack["items"]
             b77_names = b77_pack["label_names"]
-            if not uses_laya_primary:
+            if not uses_laya_primary and not is_genrm:
                 q_b77 = build_banking77_flat_qdef(b77_names)
                 raw_b77 = eng.score_multi_states([(it["text"], [q_b77]) for it in b77_items], batch_docs=int(extra.batch_docs))
                 probs_b77 = [r[0][0] for r in raw_b77]
@@ -1527,6 +1706,42 @@ def _run_cat2_single_backend(
                 sub_reports["banking77_k77"] = {k: v for k, v in r_b77.items() if not k.startswith("per_item_")}
                 all_valid.extend(r_b77["per_item_valid"])
                 all_scores.extend(r_b77["per_item_scores"])
+            elif is_genrm:
+                clusters = partition_banking77_clusters(b77_names, n_clusters=8)
+                c_lbls = [chr(ord("A") + ci) for ci in range(len(clusters))]
+                c_desc = "\n".join(
+                    f"{lbl}. {', '.join(nm.replace('_', ' ') for nm in cl[:4])}"
+                    for lbl, cl in zip(c_lbls, clusters)
+                )
+                c_probs = eng.score_choice_logprob(
+                    [f"Utterance: {it['text']}\n\nSelect banking cluster:\n{c_desc}" for it in b77_items],
+                    c_lbls,
+                    verdict_suffix="Cluster label:",
+                )
+                by_c: dict[int, list[int]] = {}
+                for idx, pv in enumerate(c_probs):
+                    by_c.setdefault(int(np.argmax(np.asarray(pv, dtype=np.float64))), []).append(idx)
+                b77_valid = [True] * len(b77_items)
+                b77_scores = [0.0] * len(b77_items)
+                for ci, idxs in by_c.items():
+                    cl_names = clusters[ci]
+                    i_lbls = [chr(ord("A") + j) for j in range(len(cl_names))]
+                    i_desc = "\n".join(f"{lbl}. {nm.replace('_', ' ')}" for lbl, nm in zip(i_lbls, cl_names))
+                    p2_batch = eng.score_choice_logprob(
+                        [f"Utterance: {b77_items[idx]['text']}\n\nSelect exact banking intent:\n{i_desc}" for idx in idxs],
+                        i_lbls,
+                        verdict_suffix="Intent label:",
+                    )
+                    for idx, p2 in zip(idxs, p2_batch):
+                        pred_name = cl_names[int(np.argmax(np.asarray(p2, dtype=np.float64)))]
+                        b77_scores[idx] = 1.0 if pred_name == b77_items[idx]["label_name"] else 0.0
+                sub_reports["banking77_2stage"] = {
+                    "n_items": len(b77_items),
+                    "n_valid": len(b77_items),
+                    "top1_accuracy": round(float(np.mean(b77_scores)) if b77_scores else 0.0, 6),
+                }
+                all_valid.extend(b77_valid)
+                all_scores.extend(b77_scores)
             else:
                 # Batched 2-stage 8-cluster hierarchy for Laya parity (0% option truncation).
                 clusters = partition_banking77_clusters(b77_names, n_clusters=8)
@@ -1860,6 +2075,8 @@ def _run_llm_worker(
         max_tokens: int = 256,
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
+        enable_thinking: bool = False,
+        thinking_budget: int | None = None,
     ) -> tuple[list[str], list[str], list[list[int]], dict[str, Any]]:
         if not prompts:
             return [], [], [], {"completion_tokens": 0, "mask_fallbacks": 0}
@@ -1937,7 +2154,12 @@ def _run_llm_worker(
                 kwargs["reasoning_effort"] = reasoning_effort
             if reasoning_budget is not None:
                 kwargs["reasoning_budget"] = int(reasoning_budget)
-        elif pkg_name in ("fast-gemma4", "fast-qwen3"):
+        elif pkg_name == "fast-gemma4":
+            kwargs["enable_thinking"] = bool(enable_thinking)
+            if enable_thinking and thinking_budget is not None and int(thinking_budget) > 0:
+                kwargs["thinking_budget_tokens"] = int(thinking_budget)
+            kwargs["speculative"] = True if use_mtp else False
+        elif pkg_name == "fast-qwen3":
             kwargs["enable_thinking"] = False
             kwargs["speculative"] = True if use_mtp else False
 
@@ -1997,7 +2219,7 @@ def _run_llm_worker(
             # 3A: IFBench (+ IFEval in Tier-2)
             ifb_txt, ifb_fr, ifb_ids, ifb_st = _generate_batch(
                 [it["prompt"] for it in ifb_items],
-                max_tokens=256 if smoke else 512,
+                max_tokens=256 if smoke else (1024 if pkg_name == "fast-qwen3" else 512),
                 reasoning_effort="low",
                 reasoning_budget=192,
             )
@@ -2013,7 +2235,7 @@ def _run_llm_worker(
             if ife_items:
                 ife_txt, ife_fr, ife_ids, ife_st = _generate_batch(
                     [it["prompt"] for it in ife_items],
-                    max_tokens=512,
+                    max_tokens=256 if smoke else (1024 if pkg_name == "fast-qwen3" else 512),
                     reasoning_effort="low",
                     reasoning_budget=192,
                 )
@@ -2027,11 +2249,14 @@ def _run_llm_worker(
                 if_scores_for_comp.append(float(r_ife["prompt_loose_acc"]))
 
             # 3B: MMLU-Redux 2.0 (uniform max_tokens across all Cat 3 engines; default 256)
+            mm_use_thinking = pkg_name == "fast-gemma4"
             mm_txt, mm_fr, mm_ids, mm_st = _generate_batch(
                 [_format_mmlu_prompt(it) for it in mm_items],
                 max_tokens=int(getattr(extra, "mmlu_max_tokens", 256)),
                 reasoning_effort="low",
                 reasoning_budget=64,
+                enable_thinking=mm_use_thinking,
+                thinking_budget=1024 if mm_use_thinking else None,
             )
             r_mm = evaluate_mmlu_redux(mm_items, mm_txt, finish_reasons=mm_fr, token_ids_list=mm_ids)
             sub3["mmlu_redux_2"] = {k: v for k, v in r_mm.items() if not k.startswith("per_item_")}
@@ -2741,6 +2966,7 @@ def _run_cat5_worker(
     eff_backend: str
     eff_label: str
     default_family: str
+    eff_ocr_max_tokens = _resolve_ocr_max_tokens(pkg_name, extra)
     allow_html_tables = (extra.table_mode == "html") or (extra.output_format != "markdown")
     if pkg_name == "fast-ocr":
         from fast_ocr import FastOCR
@@ -2762,7 +2988,7 @@ def _run_cat5_worker(
             "auto_orient": not bool(extra.no_auto_orient),
             "speculative": extra.speculative,
             "vocab_size": extra.ocr_vocab_size,
-            "max_tokens": int(extra.ocr_max_tokens),
+            "max_tokens": eff_ocr_max_tokens,
         }
         if bool(getattr(extra, "no_adaptive_resolution", False)):
             fast_kw["adaptive_resolution"] = False
@@ -2822,7 +3048,7 @@ def _run_cat5_worker(
             pkg_name,
             table_mode=extra.table_mode,
             output_format=extra.output_format,
-            max_tokens=int(extra.ocr_max_tokens),
+            max_tokens=eff_ocr_max_tokens,
         )
         eff_backend = pkg_name
         eff_label = config_label or pub_ad.default_label
@@ -2892,7 +3118,7 @@ def _run_cat5_worker(
                         schema=schema,
                         output_format="raw" if schema is not None else extra.output_format,
                         table_mode=extra.table_mode,
-                        max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                        max_tokens=max_tokens_override or eff_ocr_max_tokens,
                     )
             else:
                 res = fast_eng.ocr_image(pil_img)
@@ -2904,7 +3130,7 @@ def _run_cat5_worker(
                 eff_prompt,
                 images=[pil_img],
                 json_schema=eff_schema,
-                max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                max_tokens=max_tokens_override or eff_ocr_max_tokens,
                 temperature=0.0,
                 enable_thinking=False,
                 max_soft_tokens=getattr(extra, "max_soft_tokens", None),
@@ -2942,7 +3168,7 @@ def _run_cat5_worker(
                             schemas=list(schemas),
                             output_format="raw",
                             table_mode=extra.table_mode,
-                            max_tokens=max_tokens_override or int(extra.ocr_max_tokens),
+                            max_tokens=max_tokens_override or eff_ocr_max_tokens,
                             batch_size=suite_bs,
                         )
                         return (
@@ -3253,7 +3479,7 @@ def _run_cat5_worker(
                     suite_name=suite_name,
                     prompts=prompts,
                     schemas=schemas,
-                    max_tokens_override=min(1024, int(extra.ocr_max_tokens)),
+                    max_tokens_override=min(1024, eff_ocr_max_tokens),
                     task_kind="page",
                 )
                 del pils
@@ -3319,7 +3545,7 @@ def _run_cat5_worker(
                     suite_name=suite_name,
                     prompts=prompts,
                     schemas=schemas,
-                    max_tokens_override=min(1536, int(extra.ocr_max_tokens)),
+                    max_tokens_override=min(1536, eff_ocr_max_tokens),
                     task_kind="page",
                 )
                 del pils

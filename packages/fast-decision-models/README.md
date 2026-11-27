@@ -84,7 +84,7 @@ FluidInference Core ML clips combined inputs at 1,024 tokens (truncating 164 of 
 | --- | --- | --- |
 | **Laya-Typed-421M ANE & Hetero** | 6-bucket multifunction Core ML (`s64..s512`, `10,538` ANE ops, `0` GPU/CPU), FP16 LayerNorm scaling, split-head `einsum`, `lazy_load`, and `laya-hetero` makespan split | [`laya_ane.py`](src/fast_decision_models/laya_ane.py), [`laya_hetero.py`](src/fast_decision_models/laya_hetero.py), [`native/laya_ane_runner.mm`](native/laya_ane_runner.mm) |
 | **Kev-0.8B & Kev-4B MLX** | Lossless 8-bit (`g64`) with NAX `bf16` guard, mixed-bit linear projection fusion, `@mx.compile` forward, and hit-aware 256-tok `PrefixTree` (block-32 INT8 GDN state on `4B`) | [`kev_mlx.py`](src/fast_decision_models/kev_mlx.py), [`prefix_tree.py`](src/fast_decision_models/prefix_tree.py) |
-| **Calibration & Cascades** | Pure-NumPy Platt scaling, widened `fit_multiclass_temperature` (`0.25..40.0`), 5-fold OOF & OOS threshold alignment (`CalibrationProfile`), and 2/3-tier `DecisionCascadeScorer` (`LayaHetero -> Kev-0.8B -> optional Kev-4B`: `2.65x` faster than `Kev-0.8B`, `0.6259` `CLINC` OOS F1, `0.0701` `RAGTruth` ECE, `4.64 GB` peak) | [`calibration.py`](src/fast_decision_models/calibration.py), [`scorers.py`](src/fast_decision_models/scorers.py) |
+| **Calibration, Cascades & `GenRM`** | Pure-NumPy Platt scaling, widened `fit_multiclass_temperature` (`0.25..40.0`), 5-fold OOF & OOS threshold alignment (`CalibrationProfile`), 2/3-tier `DecisionCascadeScorer` (`2.65x` faster than `Kev-0.8B`, `0.6259` `CLINC` OOS F1, `0.0701` `RAGTruth` ECE), and 1-pass prefill `GenRMScorer` (`0.8993` `RAGTruth` AUROC, `0.5640` `RewardBench-2`, [M5 Wave-5 receipts](../../docs/benchmarks/m5-wave5-20261127.json)) | [`calibration.py`](src/fast_decision_models/calibration.py), [`scorers.py`](src/fast_decision_models/scorers.py), [`genrm.py`](src/fast_decision_models/genrm.py) |
 
 ## CLI & verification
 
@@ -92,6 +92,9 @@ FluidInference Core ML clips combined inputs at 1,024 tokens (truncating 164 of 
 .venv/bin/decision-models score --backend kev-0.8b --type choice \
   --question "Which subsystem caused the alert?" --criteria "network,storage,authentication" \
   --state "Primary DB volume reached 99% utilization and paused writes." --json
+.venv/bin/decision-models score --backend genrm --type noul \
+  --question "Is every claim in the summary grounded in the reference passage?" \
+  --state "Reference: Q3 revenue grew 12% year-over-year. Claim: Q3 revenue grew 12%." --json
 .venv/bin/decision-models setup-weights --quantize-existing-kev-w8   # Requires a local BF16 model.safetensors
 .venv/bin/decision-models setup-weights --build-laya-ane            # Compiles from source; requires --extra build
 .venv/bin/pytest -v packages/fast-decision-models/tests             # Requires --extra dev

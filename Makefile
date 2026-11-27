@@ -58,8 +58,11 @@ test-cpu: hw-check
 		packages/fast-shared/tests/test_v23_track_b_cpu.py \
 		packages/fast-shared/tests/test_rd_winners_cpu.py \
 		packages/fast-shared/tests/test_bench_memory.py \
+		packages/fast-shared/tests/test_hybrid_rerank_cpu.py \
+		packages/fast-shared/tests/test_maxsim_genrm_cpu.py \
 		packages/fast-shared/tests/test_metal_mpp_int8_cpu.py \
 		packages/fast-decision-models/tests/test_decision_models_cpu.py \
+		packages/fast-decision-models/tests/test_genrm_scorer_cpu.py \
 		packages/fast-decision-models/tests/test_prefix_tree_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_res_rms_cpu.py \
 		packages/fast-embeddinggemma-2/tests/test_emb2_vision_cpu.py \

@@ -124,6 +124,42 @@ def _cmd_score(args: argparse.Namespace) -> int:
                     payload["p_true"] = probs[1]
             finally:
                 kev4.close()
+        elif args.backend == "genrm":
+            from .genrm import GenRMScorer
+
+            with GenRMScorer(model_dir=getattr(args, "qwen_model_dir", None)) as genrm:
+                if args.type == "noul":
+                    prompt = f"Context:\n{args.state}\n\nQuestion: {args.question}"
+                    p_true = float(genrm.score_yes_no_logprob([prompt], verdict_suffix="Answer (Yes or No):")[0])
+                    probs = [1.0 - p_true, p_true]
+                    payload = {
+                        "backend": "genrm",
+                        "type": args.type,
+                        "probs": probs,
+                        "p_true": p_true,
+                    }
+                else:
+                    if isinstance(crit, dict):
+                        opt_items = list(crit.items())
+                        labels = [chr(ord("A") + i) for i in range(len(opt_items))]
+                        opts_txt = "\n".join(f"{lbl}. {k}: {v}" for lbl, (k, v) in zip(labels, opt_items))
+                    elif isinstance(crit, list) and crit:
+                        labels = [chr(ord("A") + i) for i in range(len(crit))]
+                        opts_txt = "\n".join(f"{lbl}. {v}" for lbl, v in zip(labels, crit))
+                    else:
+                        labels = ["A", "B"]
+                        opts_txt = "A. Option A\nB. Option B"
+                    prompt = (
+                        f"Context:\n{args.state}\n\nQuestion: {args.question}\n\n"
+                        f"Options:\n{opts_txt}"
+                    )
+                    probs = genrm.score_choice_logprob([prompt], labels)[0]
+                    payload = {
+                        "backend": "genrm",
+                        "type": args.type,
+                        "options": labels,
+                        "probs": probs,
+                    }
         else:
             kev = Kev08bMlxBackend(
                 resolve_kev_dir(args.kev_dir, artifacts_dir=args.artifacts_dir) if args.kev_dir else None,
@@ -289,7 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     sw.set_defaults(func=run_build_args)
 
     sc = sub.add_parser("score", help="Score one typed question (noul, choice, score) against a state")
-    sc.add_argument("--backend", choices=("laya-ane", "laya-gpu", "laya-hetero", "kev-0.8b", "kev-4b"), default="kev-0.8b")
+    sc.add_argument("--backend", choices=("laya-ane", "laya-gpu", "laya-hetero", "kev-0.8b", "kev-4b", "genrm"), default="kev-0.8b")
     sc.add_argument("--type", choices=("noul", "choice", "score"), default="noul")
     sc.add_argument("--question", required=True)
     sc.add_argument("--criteria", default=None, help="JSON object/array or comma-separated options")
@@ -297,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--artifacts-dir", default=None)
     sc.add_argument("--laya-dir", default=None)
     sc.add_argument("--kev-dir", default=None)
+    sc.add_argument("--qwen-model-dir", default=None, help="Optional local Qwen3.5 model dir for --backend genrm")
     sc.add_argument("--kev-quant", choices=("auto", "w8", "w4", "bf16"), default="auto")
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(func=_cmd_score)

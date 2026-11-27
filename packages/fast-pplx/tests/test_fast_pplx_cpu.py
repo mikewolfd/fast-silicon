@@ -2649,5 +2649,48 @@ def test_pplx_mpp_min_m_and_wrap_quantized_linears(monkeypatch: pytest.MonkeyPat
         mx.set_default_device(prev_dev)
 
 
+def test_fast_pplx_build_index_sub_chunk_chars_delegation_cpu() -> None:
+    from fast_pplx.engine import FastPplx
+    from fast_shared.retrieval_index import CompactRetrievalIndex
+
+    class _DummySubTok:
+        class _InnerTok:
+            def encode(self, text: str, add_special_tokens: bool = False):
+                _ = add_special_tokens
+                return SimpleNamespace(ids=[i + 1 for i, _ in enumerate(str(text).split())])
+
+        _tokenizer = _InnerTok()
+
+        def _pack_context_windows(self, chunks, *, context_tokens: int = 4096, repeat_header_tokens: int = 0):
+            _ = context_tokens, repeat_header_tokens
+            ch_list = list(chunks)
+            return [SimpleNamespace(chunks=ch_list, emit_start=0, spans=[(i, i + 1) for i in range(len(ch_list))])]
+
+    eng = FastPplx.__new__(FastPplx)
+    eng.max_dim = 8
+    eng.is_mrl_trained = False
+    eng.tokenizer = _DummySubTok()  # type: ignore[assignment]
+    ctx_calls: list[dict[str, object]] = []
+
+    def _fake_ctx(win_chunks, **kw):
+        ctx_calls.append({"win_chunks": [list(w) for w in win_chunks], **kw})
+        return [np.ones((len(w), 8), dtype=np.float32) / np.sqrt(8.0) for w in win_chunks]
+
+    eng.encode_contextual_chunks = _fake_ctx  # type: ignore[method-assign]
+    docs = [
+        "Clause one states notice period is thirty calendar days before termination.",
+        "Clause two defines confidential information and surviving obligations.",
+    ]
+    idx = eng.build_index(docs, sub_chunk_chars=36, doc_titles=["lease", "nda"], mode="fp32")
+    assert isinstance(idx, CompactRetrievalIndex)
+    assert idx.default_agg == "maxsim"
+    assert idx.num_docs == 2
+    assert idx.num_windows > 2
+    assert ctx_calls[0]["max_length"] == 4096
+
+    with pytest.raises(ValueError, match="At most|most one|multivector"):
+        eng.build_index(docs, multivector=True, sub_chunk_chars=36)
+
+
 
 

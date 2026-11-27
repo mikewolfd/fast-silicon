@@ -15,13 +15,22 @@ LATIN_EXTENDED_KEPT_VOCAB_SIZE = 162304
 FULL_VOCAB_SIZE = 262144
 GEMMA4_EOS_TOKEN_IDS: frozenset[int] = frozenset({1, 106, 50})
 
+_CHANNEL_THOUGHT_RE = re.compile(r"<\|channel>.*?<channel\|>", flags=re.DOTALL)
 _THOUGHT_RE = re.compile(r"<\|thought>.*?<thought\|>", flags=re.DOTALL)
+_LEADING_THOUGHT_HEADER_RE = re.compile(r"^\s*thought(?:\s+|$)", flags=re.IGNORECASE)
 
 
 def _strip_thinking(text: str) -> str:
-    stripped = _THOUGHT_RE.sub("", text)
+    stripped = _CHANNEL_THOUGHT_RE.sub("", text or "")
+    stripped = _THOUGHT_RE.sub("", stripped)
+    if "<channel|>" in stripped:
+        stripped = stripped.rsplit("<channel|>", 1)[-1]
     if "<thought|>" in stripped:
-        stripped = stripped.split("<thought|>", 1)[-1]
+        stripped = stripped.rsplit("<thought|>", 1)[-1]
+    if "<|channel>" in stripped:
+        stripped = stripped.split("<|channel>", 1)[0]
+    if "<|thought>" in stripped:
+        stripped = stripped.split("<|thought>", 1)[0]
     return stripped.strip()
 
 
@@ -307,6 +316,9 @@ class FastGemma4Tokenizer:
         self.bos_token_id = int(self._tok.token_to_id("<bos>") or 2)
         self.eot_token_id = int(self._tok.token_to_id("<turn|>") or 106)
         self.tool_response_token_id = int(self._tok.token_to_id("<|tool_response>") or 50)
+        self.channel_open_id: int | None = self._tok.token_to_id("<|channel>")
+        self.channel_close_id: int | None = self._tok.token_to_id("<channel|>")
+        self.think_token_id: int | None = self._tok.token_to_id("<|think|>")
         self.stop_token_ids = frozenset(
             {
                 *GEMMA4_EOS_TOKEN_IDS,
@@ -331,6 +343,88 @@ class FastGemma4Tokenizer:
 
     def decode(self, ids: Sequence[int], *, skip_special_tokens: bool = True) -> str:
         return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
+
+    def encode_channel_close_suffix(self) -> list[int]:
+        """Encode Gemma-4's channel closing delimiter `\\n<channel|>` for bounded thinking."""
+        return [int(t) for t in self.encode("\n<channel|>", add_special_tokens=False)]
+
+    def decode_answer_and_reasoning(self, token_ids: Sequence[int]) -> tuple[str, str | None, list[int]]:
+        """Strip `<|channel>...<channel|>` thinking blocks before `skip_special_tokens=True`."""
+        ids = [int(t) for t in token_ids]
+        open_id = getattr(self, "channel_open_id", None)
+        close_id = getattr(self, "channel_close_id", None)
+
+        if (open_id is not None and int(open_id) in ids) or (close_id is not None and int(close_id) in ids):
+            reasoning_blocks: list[list[int]] = []
+            cur_reasoning: list[int] = []
+            answer_ids: list[int] = []
+            in_channel = False
+            for tid in ids:
+                if open_id is not None and tid == int(open_id):
+                    if in_channel and cur_reasoning:
+                        reasoning_blocks.append(cur_reasoning)
+                        cur_reasoning = []
+                    in_channel = True
+                    continue
+                if close_id is not None and tid == int(close_id):
+                    if in_channel:
+                        if cur_reasoning:
+                            reasoning_blocks.append(cur_reasoning)
+                            cur_reasoning = []
+                    elif answer_ids:
+                        reasoning_blocks.append(answer_ids)
+                        answer_ids = []
+                    in_channel = False
+                    continue
+                if in_channel:
+                    cur_reasoning.append(tid)
+                else:
+                    answer_ids.append(tid)
+            if cur_reasoning:
+                reasoning_blocks.append(cur_reasoning)
+            reasoning_parts = [
+                _LEADING_THOUGHT_HEADER_RE.sub("", self.decode(blk, skip_special_tokens=True), count=1).strip()
+                for blk in reasoning_blocks
+            ]
+            cleaned_reasoning = "\n\n".join(p for p in reasoning_parts if p)
+            answer_text = _strip_thinking(self.decode(answer_ids, skip_special_tokens=True)) if answer_ids else ""
+            return answer_text, (cleaned_reasoning or None), answer_ids
+
+        decoded = self.decode(ids, skip_special_tokens=True)
+        if "<|channel>" in decoded or "<channel|>" in decoded or "<|thought>" in decoded or "<thought|>" in decoded:
+            reasoning_parts: list[str] = []
+            for m in _CHANNEL_THOUGHT_RE.finditer(decoded):
+                seg = _LEADING_THOUGHT_HEADER_RE.sub("", m.group(0)[len("<|channel>") : -len("<channel|>")], count=1).strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            for m in _THOUGHT_RE.finditer(decoded):
+                seg = m.group(0)[len("<|thought>") : -len("<thought|>")].strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            rem = _THOUGHT_RE.sub("", _CHANNEL_THOUGHT_RE.sub("", decoded))
+            if "<channel|>" in rem:
+                prefix, rem = rem.rsplit("<channel|>", 1)
+                seg = _LEADING_THOUGHT_HEADER_RE.sub("", prefix, count=1).strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            if "<thought|>" in rem:
+                prefix, rem = rem.rsplit("<thought|>", 1)
+                seg = prefix.strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            if "<|channel>" in rem:
+                _, tail = rem.split("<|channel>", 1)
+                seg = _LEADING_THOUGHT_HEADER_RE.sub("", tail, count=1).strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            elif "<|thought>" in rem:
+                _, tail = rem.split("<|thought>", 1)
+                seg = tail.strip()
+                if seg:
+                    reasoning_parts.append(seg)
+            reasoning_text = "\n\n".join(reasoning_parts) or None
+            return _strip_thinking(decoded), reasoning_text, ids
+        return decoded, None, ids
 
     def format_chat(
         self,

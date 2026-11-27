@@ -4,6 +4,16 @@ All notable changes to `fast-silicon` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - 2026-11-27
+
+### Added
+- **`fast-shared` contextual `MaxSim` & `GenRM` retrieval reranking (`hybrid_retrieval.py`, `__init__.py`, `outcome_eval`):** Added contextual 256-char sub-chunk `MaxSim` scoring (`split_subchunk_spans`, `build_contextual_subchunk_index`, `compute_margin_escalation_mask`, modes `"maxsim"` and `"margin_maxsim"`) plus optional context-preserving `GenRMRerankFusion` (`"maxsim_rerank"`, `"margin_maxsim_rerank"`), `sub_chunk_chars` support across `FastPplx.build_index`, `FastEmbeddingGemma2.build_index`, and `FastBgeSmall.build_index`, `evaluate_legalbench_rankings`, and Cat-1 `--sub-chunk-chars` / `--cat1-reranker genrm` flags. On quiescent Base M5 `fast-pplx` contextual `4K` (`repeat_header_tokens=128`), `maxsim_always` lifts `LegalBench-RAG(175)` `span_nDCG@10` from `0.6852` to **`0.7569` (`+7.17 pp`, `char_recall@10 0.9133`, `0.169 ms/q`, `0` extra encode time)** while improving `NanoSciFact(50)` (`0.8139 -> 0.8206`); adding margin-gated `Qwen3.5-4B` `GenRM` lifts `LegalBench-RAG` further to **`0.7803` (`+9.51 pp`)**.
+- **`fast-decision-models` 1-pass `GenRMScorer` (`genrm.py`, `__init__.py`, `cli.py`, `benchmark_outcomes.py`):** Added lazy-loaded generative verifier `GenRMScorer` (`score_yes_no_logprob`, `score_ragtruth_faithfulness`, `score_choice_logprob`, `score_best_of_k` with optional swap-invariant pairwise tiebreak), `decision-models score --backend genrm`, and Cat-2 `--backend genrm`, lifting quiescent Base M5 `RAGTruth(600)` AUROC from `0.6795` (`Laya`) to **`0.8993` (`+21.98 pp`, `macro_f1 0.8181`)** and `RewardBench-2(250)` from `0.3160` (`Laya`) to **`0.5640` (`+24.80 pp`)**.
+- **`fast-gemma4` `<|channel>...<channel|>` token-ID stripping & two-pass bounded thinking (`tokenizer.py`, `engine.py`, `cli.py`, `fast_shared.server`):** Fixed `FastGemma4Tokenizer.decode_answer_and_reasoning` to strip Gemma-4 `<|channel>...<channel|>` (`100..101`) spans at token-ID level before `skip_special_tokens=True`, added `GenerationItem.reasoning`, and wired two-pass bounded `thinking_budget_tokens` + `answer_max_tokens` across `FastGemma4Engine`, `gemma4 generate` (`--enable-thinking`, `--thinking-budget-tokens`, `--answer-max-tokens`), and `fast_shared.server` (`MMLU-Redux(285)` **`0.4807 -> 0.7404`**, **`+25.96 pp`** at `1024+256` tokens).
+
+### Changed
+- **`scripts/benchmark_outcomes.py` benchmark defaults (`_resolve_ocr_max_tokens`, Cat-3 routing):** Raised `fast-ocr` `--ocr-max-tokens` default from `4096` to `8192` while keeping `public_*` adapters at `4096` (recovering `OmniDocBench-EN(24)` `0.6910 -> 0.7437`, `24/24` valid, `1.147x` faster with `0` `table_tests` regressions), enabled bounded `1024+256` thinking on `fast-gemma4` `MMLU-Redux`, and raised `fast-qwen3` `IFBench` `max_tokens` to `1024` (`enable_thinking=False`, `0.22 -> 0.26`, `84/100` valid).
+
 ## [Unreleased] - 2026-11-26
 
 ### Added

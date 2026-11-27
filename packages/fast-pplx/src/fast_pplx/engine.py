@@ -2130,8 +2130,11 @@ class FastPplx:
         *,
         multivector: bool = False,
         window_tokens: int = 1024,
-        context_tokens: int = 2048,
+        context_tokens: int | None = None,
         repeat_header_tokens: int | None = 128,
+        sub_chunk_chars: int | None = None,
+        doc_ids: Sequence[str] | None = None,
+        doc_titles: Sequence[str | None] | None = None,
         doc_offsets: np.ndarray | Sequence[int] | None = None,
         mode: IndexMode = "auto",
         mrl_dim: int | None = None,
@@ -2141,7 +2144,36 @@ class FastPplx:
         batch_size: int = 16,
         encode_mode: str | None = None,
     ) -> CompactRetrievalIndex:
-        """Build a `CompactRetrievalIndex` (`1024d sym_int8` default, `binary_int8`, or `MaxSim` multivector)."""
+        """Build a `CompactRetrievalIndex` (`1024d sym_int8`, `MaxSim` multivector, or contextual sub-chunk index)."""
+        if multivector and sub_chunk_chars is not None:
+            raise ValueError("Pass at most one of `multivector=True` or `sub_chunk_chars`")
+        eff_context_tokens = (
+            int(context_tokens)
+            if context_tokens is not None
+            else (4096 if sub_chunk_chars is not None else 2048)
+        )
+        if sub_chunk_chars is not None and not isinstance(corpus, np.ndarray) and corpus:
+            if not isinstance(corpus[0], str):
+                raise TypeError("sub_chunk_chars requires a sequence of raw document strings")
+            from fast_shared.hybrid_retrieval import build_contextual_subchunk_index
+
+            return build_contextual_subchunk_index(
+                self,
+                corpus,  # type: ignore[arg-type]
+                doc_ids=doc_ids,
+                doc_titles=doc_titles,
+                sub_chunk_chars=int(sub_chunk_chars),
+                context_tokens=eff_context_tokens,
+                repeat_header_tokens=int(repeat_header_tokens or 0),
+                index_mode=mode,
+                mrl_dim=mrl_dim,
+                binary_bits=binary_bits,
+                agg=agg,
+                hybrid_alpha=hybrid_alpha,
+                encode_mode=encode_mode,
+                batch_size=min(4, max(1, int(batch_size))),
+            )
+
         eff_offsets: np.ndarray | list[int] | None = (
             list(doc_offsets) if doc_offsets is not None and not isinstance(doc_offsets, np.ndarray) else doc_offsets
         )
@@ -2155,7 +2187,7 @@ class FastPplx:
             vecs, eff_offsets = self.encode_documents_multivector(
                 corpus,  # type: ignore[arg-type]
                 window_tokens=window_tokens,
-                context_tokens=context_tokens,
+                context_tokens=eff_context_tokens,
                 repeat_header_tokens=repeat_header_tokens,
                 batch_size=batch_size,
                 dimensions=self.max_dim,

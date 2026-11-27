@@ -26,8 +26,11 @@ from .paths import (
 )
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "BEST_OF_K_GENRM_SYSTEM": (".genrm", "BEST_OF_K_GENRM_SYSTEM"),
     "CalibrationProfile": (".calibration", "CalibrationProfile"),
     "DecisionCascadeScorer": (".calibration", "DecisionCascadeScorer"),
+    "GenRMBestOfKResult": (".genrm", "GenRMBestOfKResult"),
+    "GenRMScorer": (".genrm", "GenRMScorer"),
     "KEV_SPECIAL_TOKENS": (".kev_mlx", "KEV_SPECIAL_TOKENS"),
     "Kev08bMlxBackend": (".kev_mlx", "Kev08bMlxBackend"),
     "Kev4bMlxBackend": (".kev_mlx", "Kev4bMlxBackend"),
@@ -38,6 +41,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "LayaTokenizerHelper": (".laya_ane", "LayaTokenizerHelper"),
     "PrefixMatch": (".prefix_tree", "PrefixMatch"),
     "PrefixTree": (".prefix_tree", "PrefixTree"),
+    "RAGTRUTH_GENRM_SYSTEM": (".genrm", "RAGTRUTH_GENRM_SYSTEM"),
     "acquire_hw_lock": ("._common", "acquire_hw_lock"),
     "align_oos_probabilities": (".calibration", "align_oos_probabilities"),
     "apply_multiclass_temperature": (".calibration", "apply_multiclass_temperature"),
@@ -71,6 +75,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "BEST_OF_K_GENRM_SYSTEM",
     "CalibrationProfile",
     "DEFAULT_KEV_08B_MLX_REPO",
     "DEFAULT_KEV_4B_ADAPTER_REPO",
@@ -83,6 +88,8 @@ __all__ = [
     "DEFAULT_LAYA_REPO",
     "DecisionCascadeScorer",
     "DecisionModelPaths",
+    "GenRMBestOfKResult",
+    "GenRMScorer",
     "KEV_SPECIAL_TOKENS",
     "Kev08bMlxBackend",
     "Kev4bMlxBackend",
@@ -93,6 +100,7 @@ __all__ = [
     "LayaTokenizerHelper",
     "PrefixMatch",
     "PrefixTree",
+    "RAGTRUTH_GENRM_SYSTEM",
     "acquire_hw_lock",
     "align_oos_probabilities",
     "apply_multiclass_temperature",

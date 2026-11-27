@@ -109,6 +109,8 @@ Why **`OvisOCR2-8bit` (`0.85B`)** and **`NuExtract3` (`4B`)** lead local Apple S
      - **`W8A8` (opt-in via `mpp_w8a8=True` / `FAST_SILICON_QWEN3_MPP_W8A8=1`, `M >= 128` for `OvisOCR2-8bit` `1024×7168` / `3584×1024`):** `1.29×–2.48×` micro (`cos >= 0.999974`), `1.14×–1.18×` `4B/9B` prefill (`+8.3%` EOT on `9B` Cat 4 within `-0.00153` SE parity), and reduced `OvisOCR2-8bit` `cord_v2 (n=6)` `LM sum_prefill` `909.8 -> 845.6 ms` (`w8_calls=594`).
 6. **Plain-Text Post-OCR Polish Guardrail:**
    - Never run unconstrained fine-tuned text-only Markdown rewriters blindly (they silently omit entities/names and fail flattened multi-column vote/financial grids). If polishing clean prose, gate `Qwen3-VL-4B-Instruct-4bit` (`70.7 tok/s`) with a deterministic token-diff check allowing only whitespace, de-hyphenation, and common OCR character repairs; keep tables on image/coordinate extraction.
+7. **Give Stock `OvisOCR2-8bit` Sufficient Output Token Headroom (`max_tokens=8192`) Before Training Table LoRAs:**
+   - On `OmniDocBench-EN(24)`, raising `fast-ocr` default `max_tokens` from `4096` (`22/24` valid, `0.6910`, `table_teds 0.6822`, `176.39 s`) to **`8192`** lifted stock `OvisOCR2-8bit` to **`24/24` valid (`0.7437`, `+5.27 pp`, `table_teds 0.7670`, `153.74 s` = `1.147x` faster)** with `0` `table_tests` regressions (`37/41`). Both tested table LoRAs (`v7final` `33/41` from irreducible `f5e5d540` separator merge weights and verifier-filtered `v8` `36/41`, `0.7400` OmniDoc, `0.8708` FinTabNet NumF1) missed promotion gates. Keep `max_tokens=8192` default on stock `OvisOCR2-8bit` while keeping `public_*` adapters at `4096`.
 
 ---
 

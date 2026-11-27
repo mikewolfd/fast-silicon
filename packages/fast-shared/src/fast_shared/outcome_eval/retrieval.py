@@ -463,32 +463,14 @@ def span_overlap_length(
     return ov
 
 
-def evaluate_legalbench_spans(
+def _score_legalbench_query_rows(
     queries: Sequence[Mapping[str, Any]],
     chunks: Sequence[CharSpanChunk],
-    query_vecs: np.ndarray,
-    chunk_vecs: np.ndarray,
+    orders: Sequence[Sequence[int]],
+    row_valid: Sequence[bool],
     *,
-    k: int = 10,
-    expect_unit_norm: bool = True,
+    k: int,
 ) -> dict[str, Any]:
-    """Compute LegalBench-RAG deterministic ``Span-nDCG@k`` and ``CharRecall@k`` with stable tie-breaking."""
-    q_arr = np.asarray(query_vecs)
-    c_arr = np.asarray(chunk_vecs)
-    if len(queries) != int(q_arr.shape[0]):
-        raise ValueError(f"queries len {len(queries)} != query_vecs rows {q_arr.shape[0]}")
-    if len(chunks) != int(c_arr.shape[0]):
-        raise ValueError(f"chunks len {len(chunks)} != chunk_vecs rows {c_arr.shape[0]}")
-
-    q_valid_all = check_embedding_validity(q_arr, expect_unit_norm=expect_unit_norm)
-    c_valid_all = check_embedding_validity(c_arr, expect_unit_norm=expect_unit_norm)
-    q_f64 = _l2_normalize_f64(q_arr)
-    c_f64 = _l2_normalize_f64(c_arr)
-    if not bool(np.all(c_valid_all)):
-        c_f64 = np.where(c_valid_all[:, None], c_f64, 0.0)
-
-    n_chunks = len(chunks)
-    eff_k = min(int(k), n_chunks)
     if not queries:
         return {
             "k": int(k),
@@ -507,8 +489,7 @@ def evaluate_legalbench_spans(
     for ci, ch in enumerate(chunks):
         doc_to_chunk_indices.setdefault(ch.doc_id, []).append(ci)
 
-    sims = q_f64 @ c_f64.T
-    all_chunks_valid = n_chunks > 0 and bool(np.all(c_valid_all))
+    n_chunks = len(chunks)
     per_ids: list[str] = []
     per_valid: list[bool] = []
     per_ndcg: list[float] = []
@@ -526,21 +507,22 @@ def evaluate_legalbench_spans(
             continue
 
         per_ids.append(str(q_item.get("id") or qi))
-        row_sim = sims[qi]
-        is_ok = bool(q_valid_all[qi]) and all_chunks_valid and bool(np.all(np.isfinite(row_sim)))
-        if not is_ok:
+        if not bool(row_valid[qi]):
             per_valid.append(False)
             per_ndcg.append(0.0)
             per_recall.append(0.0)
             continue
 
-        order = np.argsort(-row_sim, kind="mergesort")[:eff_k]
-
         # Compute exact graded overlap relevance in [0, 1] and exact merged CharRecall@k.
         rels: list[float] = []
         covered_by_doc: dict[str, list[tuple[int, int]]] = {}
-        for ci_raw in order:
-            ch = chunks[int(ci_raw)]
+        seen_chunks: set[int] = set()
+        for ci_raw in orders[qi]:
+            ci_int = int(ci_raw)
+            if ci_int < 0 or ci_int >= n_chunks or ci_int in seen_chunks:
+                continue
+            seen_chunks.add(ci_int)
+            ch = chunks[ci_int]
             ov = span_overlap_length(ch.doc_id, (ch.start_char, ch.end_char), gold_by_doc)
             rels.append(float(ov) / float(total_gold_chars))
             if ov > 0:
@@ -549,6 +531,8 @@ def evaluate_legalbench_spans(
                     hi = min(ch.end_char, gb)
                     if hi > lo:
                         covered_by_doc.setdefault(ch.doc_id, []).append((lo, hi))
+            if len(rels) >= k:
+                break
 
         covered_chars = sum(
             b - a for sp_list in covered_by_doc.values() for a, b in merge_char_spans(sp_list)
@@ -582,6 +566,66 @@ def evaluate_legalbench_spans(
         "per_query_span_ndcg": per_ndcg,
         "per_query_char_recall": per_recall,
     }
+
+
+def evaluate_legalbench_spans(
+    queries: Sequence[Mapping[str, Any]],
+    chunks: Sequence[CharSpanChunk],
+    query_vecs: np.ndarray,
+    chunk_vecs: np.ndarray,
+    *,
+    k: int = 10,
+    expect_unit_norm: bool = True,
+) -> dict[str, Any]:
+    """Compute LegalBench-RAG deterministic ``Span-nDCG@k`` and ``CharRecall@k`` with stable tie-breaking."""
+    q_arr = np.asarray(query_vecs)
+    c_arr = np.asarray(chunk_vecs)
+    if len(queries) != int(q_arr.shape[0]):
+        raise ValueError(f"queries len {len(queries)} != query_vecs rows {q_arr.shape[0]}")
+    if len(chunks) != int(c_arr.shape[0]):
+        raise ValueError(f"chunks len {len(chunks)} != chunk_vecs rows {c_arr.shape[0]}")
+
+    q_valid_all = check_embedding_validity(q_arr, expect_unit_norm=expect_unit_norm)
+    c_valid_all = check_embedding_validity(c_arr, expect_unit_norm=expect_unit_norm)
+    q_f64 = _l2_normalize_f64(q_arr)
+    c_f64 = _l2_normalize_f64(c_arr)
+    if not bool(np.all(c_valid_all)):
+        c_f64 = np.where(c_valid_all[:, None], c_f64, 0.0)
+
+    n_chunks = len(chunks)
+    eff_k = min(int(k), n_chunks)
+    sims = q_f64 @ c_f64.T
+    all_chunks_valid = n_chunks > 0 and bool(np.all(c_valid_all))
+    orders: list[list[int]] = []
+    row_valid: list[bool] = []
+    for qi in range(len(queries)):
+        row_sim = sims[qi]
+        is_ok = bool(q_valid_all[qi]) and all_chunks_valid and bool(np.all(np.isfinite(row_sim)))
+        row_valid.append(is_ok)
+        orders.append(np.argsort(-row_sim, kind="mergesort")[:eff_k].tolist() if is_ok else [])
+    return _score_legalbench_query_rows(queries, chunks, orders, row_valid, k=k)
+
+
+def evaluate_legalbench_rankings(
+    queries: Sequence[Mapping[str, Any]],
+    chunks: Sequence[CharSpanChunk],
+    top_indices: Sequence[Sequence[int]] | np.ndarray,
+    *,
+    k: int = 10,
+    valid_flags: Sequence[bool] | None = None,
+) -> dict[str, Any]:
+    """Compute LegalBench-RAG ``Span-nDCG@k`` and ``CharRecall@k`` from pre-ranked chunk indices."""
+    rows = [list(r) for r in top_indices]
+    if len(rows) != len(queries):
+        raise ValueError(f"queries len {len(queries)} != top_indices rows {len(rows)}")
+    if valid_flags is not None and len(valid_flags) != len(queries):
+        raise ValueError(f"queries len {len(queries)} != valid_flags len {len(valid_flags)}")
+    row_valid = (
+        [bool(v) for v in valid_flags]
+        if valid_flags is not None
+        else [any(0 <= int(ci) < len(chunks) for ci in row) for row in rows]
+    )
+    return _score_legalbench_query_rows(queries, chunks, rows, row_valid, k=k)
 
 
 def compute_contextual_lift(
@@ -618,6 +662,7 @@ __all__ = [
     "collect_pplx_window_vectors",
     "compute_contextual_lift",
     "dcg_at_k",
+    "evaluate_legalbench_rankings",
     "evaluate_legalbench_spans",
     "evaluate_mrl_dtype_grid",
     "evaluate_retrieval_rankings",

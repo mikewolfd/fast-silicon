@@ -36,7 +36,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | Capability | Module | What it provides |
 | --- | --- | --- |
 | **Dynamic silicon dispatch** | `fast_shared.runtime_lessons` | Routes workloads by chip (`Apple9` vs `Apple10+ NAX`), unified memory budget (`<= 80%` wired ceiling; auto batch/pack sizing), and batch size, alongside first-fit-decreasing sequence packing. |
-| **Compact & hybrid retrieval (`MaxSim` + ANE rerank)** | `fast_shared.retrieval_index`, `hybrid_retrieval` | `CompactRetrievalIndex` compresses embeddings 4-6x into symmetric INT8 and pairs an ARM64 NEON 1-bit Hamming prefilter to search 100,000 vectors in **0.50-0.66 ms/query** (`3.0-4.4x` faster than FP32 BLAS), plus multi-window `MaxSim`, pure-NumPy `BM25Index` + `rrf_fuse`, and `HybridRetrievalPipeline` (`+0.1049` `LegalBench-RAG` `span_nDCG@10` with ANE `LayaRerankFusion`). |
+| **Compact & hybrid retrieval (`MaxSim` + ANE/`GenRM` rerank)** | `fast_shared.retrieval_index`, `hybrid_retrieval` | `CompactRetrievalIndex` compresses embeddings 4-6x into symmetric INT8 and pairs an ARM64 NEON 1-bit Hamming prefilter to search 100,000 vectors in **0.50-0.66 ms/query** (`3.0-4.4x` faster than FP32 BLAS), plus contextual 256-char sub-chunk `MaxSim` (`0.7569` `LegalBench-RAG` `span_nDCG@10` at `0.169 ms/q`, `0.8206` `NanoSciFact`), `GenRMRerankFusion` (`0.7803` `LegalBench-RAG`), pure-NumPy `BM25Index` + `rrf_fuse`, and `HybridRetrievalPipeline`. |
 | **Quantized KV & mixed-bit fusion** | `fast_shared.kv_quant` | `QuantizedKVCache` runs attention over packed 8-bit (`q8`) and rotated 4-bit (`q4_quarot`, 3.56x smaller KV, 2.13x faster decode than 8-bit KV at 16K) caches, plus `SpecBucketedLinearGroup`. |
 | **Shared vision & OCR primitives** | `fast_shared.qwen35_vision`, `gemma4_vision`, `vision_preprocess` | Ported Qwen3.5 & Gemma-4 vision towers, 3D MRoPE helpers, ink cropping, lazy MLX imports, and public OCR evaluators (`outcome_eval.ocr`). |
 | **Hybrid `PrefixTree`, GPU argmax & PLD** | `fast_shared.prefix_tree`, `argmax`, `pld_drafter` | 256-token SHA-256 prefix cache for KV and block-32 INT8 GatedDeltaNet states (3.76x smaller), single-pass NaN/Inf-safe Metal `gpu_argmax_conf`/`gpu_argmax_nan` (2x less vocab DRAM traffic), and grammar-checked prompt-lookup drafting. |
@@ -58,9 +58,9 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.parquet_pipeline` | `embed_parquet`, `CorpusBackfillConfig`, `plan_header_anchored_windows` |
 | `fast_shared.grammar` / `pipeline_llm` / `extractconf` | `GrammarHelper`, `gather_topk_stats_mlx`, `try_sample_topk_row`, `detect_catastrophic_token_loop`, `extract_parquet`, `run_deferred_retries`, `normalize_extraction_telemetry`, `ExtractConfCalibrator` |
 | `fast_shared.self_consistency` | `generate_self_consistent`, `select_majority_answer`, `select_majority_json`, `extract_choice_letter`, `canonical_json_key` |
-| `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
+| `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` (forwards `reasoning`, `thinking_budget_tokens`, `answer_max_tokens`) |
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
-| `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates` |
+| `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates`, `evaluate_legalbench_rankings` |
 | `fast_shared.hw_check` / `ir_dtype_guard` / `roofline` | `fast-silicon-hw-check`, `supports_apple10_nax`, `detect_apple10_d256_force_fused`, `fast-ir-guard`, `fast-silicon-probe`, `fast-silicon-audit` |
 | `fast_shared.argmax` | `gpu_argmax_conf`, `gpu_argmax_nan`, `stats_to_logprob_margin` |
 | `fast_shared.metal_mpp` / `metal_mpp_int8` / `mpp_linear` / `ane_ffn` | `HEADER_MPP`, `mpp_linear_bf16`, `mpp_quantized_linear`, `MppQuantizedLinear`, `AneWave`, C++/ObjC++ headers |

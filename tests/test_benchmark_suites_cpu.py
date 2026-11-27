@@ -2971,6 +2971,331 @@ def test_cat2_cascade_oof_flags_and_mmlu_budget_cpu(tmp_path: Path, monkeypatch:
     assert closed["n"] >= 2
 
 
+def test_ocr_max_tokens_default_and_cat3_thinking_routing_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Gap 4 (`fast-ocr` 8192 vs `public_*` 4096) and Gap 2 (Gemma4 MMLU thinking / Qwen IFBench 1024)."""
+    out = _load_script("test_gap2_gap4_outcomes_mod", "benchmark_outcomes.py")
+
+    ns_default = out._parse_extra_flags([])
+    assert out._resolve_ocr_max_tokens("fast-ocr", ns_default) == 8192
+    assert out._resolve_ocr_max_tokens("public-ovis-mlx-vlm", ns_default) == 4096
+
+    ns_override = out._parse_extra_flags(["--ocr-max-tokens", "2048"])
+    assert out._resolve_ocr_max_tokens("fast-ocr", ns_override) == 2048
+    assert out._resolve_ocr_max_tokens("public-ovis-mlx-vlm", ns_override) == 2048
+
+    class _FakeProbe:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+    class _FakeGuard:
+        def arm(self) -> None:
+            pass
+
+        def check(self) -> tuple[bool, Any]:
+            return True, None
+
+    monkeypatch.setattr(out, "FourBucketMemoryProbe", _FakeProbe)
+    monkeypatch.setattr(out, "DeviceMemoryGuard", _FakeGuard)
+    monkeypatch.setattr(out, "_memory_4bucket_dict", lambda _p: {"combined_with_model_mapped_gb": 2.0})
+    monkeypatch.setattr(
+        out,
+        "load_ifbench_test",
+        lambda **_kw: [{"id": "if0", "prompt": "Say ok", "instruction_id_list": ["keywords:existence"], "kwargs": [{"keywords": ["ok"]}]}],
+    )
+    monkeypatch.setattr(
+        out,
+        "load_mmlu_redux",
+        lambda **_kw: [{"id": "mm0", "subject": "math", "question": "1+1?", "choices": ["1", "2", "3", "4"], "answer_idx": 1, "answer_letter": "B"}],
+    )
+    monkeypatch.setattr(
+        out,
+        "load_math_500",
+        lambda **_kw: [{"id": "m0", "problem": "1+1", "answer": "2", "subject": "algebra", "level": 1}],
+    )
+    monkeypatch.setattr(out, "evaluate_instruction_following", lambda items, txts, **_kw: {"n_items": len(items), "n_valid": len(items), "prompt_strict_acc": 1.0, "prompt_loose_acc": 1.0, "instruction_strict_acc": 1.0, "instruction_loose_acc": 1.0, "repeat_4gram_rate": 0.0, "repeat_loop_count": 0, "per_item_valid": [True] * len(items), "per_item_scores": [1.0] * len(items)})
+    monkeypatch.setattr(out, "evaluate_mmlu_redux", lambda items, txts, **_kw: {"n_items": len(items), "n_valid": len(items), "exact_accuracy": 1.0, "n_subjects": 1, "repeat_4gram_rate": 0.0, "repeat_loop_count": 0, "per_item_valid": [True] * len(items), "per_item_scores": [1.0] * len(items)})
+    monkeypatch.setattr(out, "evaluate_math_500", lambda items, txts, **_kw: {"n_items": len(items), "n_valid": len(items), "verified_accuracy": 1.0, "level_accuracy": {"1": 1.0}, "repeat_4gram_rate": 0.0, "repeat_loop_count": 0, "per_item_valid": [True] * len(items), "per_item_scores": [1.0] * len(items)})
+
+    recorded_calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeTok:
+        def llguidance_tokenizer(self) -> Any:
+            return None
+
+    class _FakeEng:
+        def __init__(self, pkg_tag: str) -> None:
+            self.pkg_tag = pkg_tag
+            self.tokenizer = _FakeTok()
+            self.model = SimpleNamespace(model_dir=tmp_path, vocab_size=1000)
+
+        def generate_batch(self, prompts: list[str], **kwargs: Any) -> Any:
+            recorded_calls.append((self.pkg_tag, dict(kwargs)))
+            items = [SimpleNamespace(text="Answer: B", finish_reason="stop", token_ids=[1, 2]) for _ in prompts]
+            return SimpleNamespace(items=items, stats={"completion_tokens": len(prompts) * 2})
+
+        def close(self) -> None:
+            pass
+
+    import fast_gemma4.engine as g4_eng_mod
+    import fast_qwen3.engine as q3_eng_mod
+
+    monkeypatch.setattr(g4_eng_mod, "FastGemma4Engine", lambda **_kw: _FakeEng("fast-gemma4"))
+    monkeypatch.setattr(q3_eng_mod, "FastQwen3Engine", lambda **_kw: _FakeEng("fast-qwen3"))
+
+    extra = out._parse_extra_flags(["--categories", "3"])
+    lock_stub = {"datasets": {"mmlu_redux_2": {"subjects": ["math"]}}}
+    out._run_llm_worker(
+        "fast-gemma4",
+        tier="tier1",
+        config_label="g4",
+        extra=extra,
+        lock=lock_stub,
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        include_unconstrained=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    out._run_llm_worker(
+        "fast-qwen3",
+        tier="tier1",
+        config_label="q3",
+        extra=extra,
+        lock=lock_stub,
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        include_unconstrained=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+
+    g4_calls = [kw for tag, kw in recorded_calls if tag == "fast-gemma4"]
+    q3_calls = [kw for tag, kw in recorded_calls if tag == "fast-qwen3"]
+    # Order per worker: [0]=warmup, [1]=IFBench, [2]=MMLU-Redux, [3]=MATH-500
+    assert g4_calls[1]["enable_thinking"] is False and g4_calls[1]["max_tokens"] == 512
+    assert g4_calls[2]["enable_thinking"] is True and g4_calls[2]["thinking_budget_tokens"] == 1024 and g4_calls[2]["max_tokens"] == 256
+    assert g4_calls[3]["enable_thinking"] is False and g4_calls[3]["max_tokens"] == 1536
+
+    assert q3_calls[1]["enable_thinking"] is False and q3_calls[1]["max_tokens"] == 1024
+    assert q3_calls[2]["enable_thinking"] is False and q3_calls[2]["max_tokens"] == 256
+    assert q3_calls[3]["enable_thinking"] is False and q3_calls[3]["max_tokens"] == 1536
+
+    # Tier-2 also includes IFEval and LiveBench-Reasoning: verify IFEval matches IFBench max_tokens policy.
+    recorded_calls.clear()
+    monkeypatch.setattr(
+        out,
+        "load_ifeval",
+        lambda **_kw: [{"id": "ife0", "prompt": "Say hi", "instruction_id_list": ["keywords:existence"], "kwargs": [{"keywords": ["hi"]}]}],
+    )
+    monkeypatch.setattr(
+        out,
+        "load_livebench_reasoning",
+        lambda **_kw: [{"id": "lb0", "prompt": "Solve x=1"}],
+    )
+    monkeypatch.setattr(
+        out,
+        "evaluate_livebench_reasoning",
+        lambda items, txts, **_kw: {
+            "n_items": len(items),
+            "n_valid": len(items),
+            "verified_accuracy": 1.0,
+            "repeat_4gram_rate": 0.0,
+            "repeat_loop_count": 0,
+            "per_item_valid": [True] * len(items),
+            "per_item_scores": [1.0] * len(items),
+        },
+    )
+    for pkg_n, cfg_l in (("fast-gemma4", "g4"), ("fast-qwen3", "q3")):
+        out._run_llm_worker(
+            pkg_n,
+            tier="tier2",
+            config_label=cfg_l,
+            extra=extra,
+            lock=lock_stub,
+            cache_dir=tmp_path,
+            local_files_only=True,
+            max_items=1,
+            smoke=False,
+            include_unconstrained=False,
+            home=tmp_path,
+            host_mem_gb=24.0,
+        )
+    g4_t2 = [kw for tag, kw in recorded_calls if tag == "fast-gemma4"]
+    q3_t2 = [kw for tag, kw in recorded_calls if tag == "fast-qwen3"]
+    # Order per Tier-2 worker: [0]=warmup, [1]=IFBench, [2]=IFEval, [3]=MMLU-Redux, [4]=MATH-500, [5]=LiveBench
+    assert g4_t2[2]["enable_thinking"] is False and g4_t2[2]["max_tokens"] == 512
+    assert q3_t2[2]["enable_thinking"] is False and q3_t2[2]["max_tokens"] == 1024
+
+
+def test_cat1_subchunk_maxsim_and_cat2_genrm_worker_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify --sub-chunk-chars + --cat1-reranker genrm in Cat 1 and --backend genrm in Cat 2."""
+    import numpy as np
+
+    out = _load_script("test_cat1_cat2_genrm_mod", "benchmark_outcomes.py")
+
+    class _FakeProbe:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+    class _FakeGuard:
+        def arm(self) -> None:
+            pass
+
+        def check(self) -> tuple[bool, Any]:
+            return True, None
+
+    monkeypatch.setattr(out, "FourBucketMemoryProbe", _FakeProbe)
+    monkeypatch.setattr(out, "DeviceMemoryGuard", _FakeGuard)
+    monkeypatch.setattr(out, "_memory_4bucket_dict", lambda _p: {"combined_with_model_mapped_gb": 1.5})
+
+    # Part A: Cat-1 --sub-chunk-chars 256 --cat1-reranker genrm
+    monkeypatch.setattr(
+        out,
+        "load_nanobeir_subset",
+        lambda *_a, **_kw: {
+            "queries": {"q0": "termination notice"},
+            "corpus": {"d0": "Lease termination notice.", "d1": "Unrelated parking addendum."},
+            "qrels": {"q0": {"d0": 1.0}},
+        },
+    )
+    monkeypatch.setattr(
+        out,
+        "load_legalbench_rag",
+        lambda **_kw: {
+            "subsets": ["cuad"],
+            "corpus_texts": {
+                "doc0": "Tenant shall give thirty days written notice prior to termination of the lease.",
+                "doc1": "Landlord shall maintain exterior structural roof components during lease term.",
+            },
+            "queries": [{"id": "lq0", "query": "written notice termination", "gold_spans": [("doc0", 0, 79)]}],
+        },
+    )
+    monkeypatch.setattr(
+        out,
+        "evaluate_retrieval_rankings",
+        lambda q_ids, *_a, **_kw: {
+            "n_docs": 2,
+            "ndcg@10": 1.0,
+            "mrr@10": 1.0,
+            "recall@10": 1.0,
+            "per_query_ids": list(q_ids),
+            "per_query_valid": [True] * len(q_ids),
+            "per_query_ndcg": [1.0] * len(q_ids),
+        },
+    )
+    monkeypatch.setattr(out, "evaluate_mrl_dtype_grid", lambda *_a, **_kw: {"mrl_128_int8_delta_ndcg@10": 0.0})
+
+    class _FakePplx:
+        def __init__(self, **_kw: Any) -> None:
+            class _Tok:
+                class _Raw:
+                    def encode(self, txt: str, add_special_tokens: bool = False):
+                        _ = add_special_tokens
+                        return SimpleNamespace(ids=[1] * max(1, len(txt.split())))
+
+                _tokenizer = _Raw()
+
+                def encode(self, txt: str):
+                    return [1] * max(1, len(txt.split()))
+
+                def _pack_context_windows(self, chunks, **_kw):
+                    ch_l = list(chunks)
+                    return [SimpleNamespace(chunks=ch_l, emit_start=0, spans=[(i, i + 1) for i in range(len(ch_l))])]
+
+            self.tokenizer = _Tok()
+
+        def encode_queries(self, txts, **_kw):
+            return np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (len(txts), 1))
+
+        def encode_documents(self, txts, **_kw):
+            return np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (len(txts), 1))
+
+        def encode_contextual_chunks(self, win_chunks, **_kw):
+            return [
+                np.vstack([np.array([1.0 if "notice" in c else 0.0, 0.0 if "notice" in c else 1.0, 0.0, 0.0], dtype=np.float32) for c in grp])
+                for grp in win_chunks
+            ]
+
+        def close(self) -> None:
+            pass
+
+    import fast_pplx.engine as pplx_eng_mod
+    from fast_decision_models.genrm import GenRMBestOfKResult
+    import fast_decision_models.genrm as genrm_mod
+
+    monkeypatch.setattr(pplx_eng_mod, "FastPplx", _FakePplx)
+
+    class _FakeGenRM:
+        def __init__(self, **_kw: Any) -> None:
+            self.closed = False
+
+        def score_yes_no_logprob(self, prompts, **_kw):
+            return [0.95 if "written notice" in p else 0.10 for p in prompts]
+
+        def score_ragtruth_faithfulness(self, items, **_kw):
+            return [0.9 if it.get("is_faithful") else 0.1 for it in items]
+
+        def score_choice_logprob(self, prompts, option_labels, **_kw):
+            k = len(option_labels)
+            return [[1.0 if i == 0 else 0.0 for i in range(k)] for _ in prompts]
+
+        def score_best_of_k(self, items, **_kw):
+            return [
+                GenRMBestOfKResult(best_idx=int(it["gold_idx"]), probs=(0.9, 0.05, 0.03, 0.02), margin_top1_top2=0.85, pairwise_refined=False)
+                for it in items
+            ]
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(genrm_mod, "GenRMScorer", _FakeGenRM)
+
+    extra1 = out._parse_extra_flags(["--sub-chunk-chars", "48", "--cat1-reranker", "genrm", "--cat1-margin-tau", "1.0"])
+    lock1 = {"datasets": {"nanobeir_en": {"tier1_subsets": ["scifact"], "tier2_subsets": ["scifact"]}}}
+    recs1 = out._run_cat1_worker(
+        "fast-pplx",
+        tier="tier1",
+        config_label="pplx_ms",
+        extra=extra1,
+        lock=lock1,
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=1,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    assert recs1[0]["sub_benchmarks"]["legalbench_rag_subchunk_maxsim"]["span_ndcg@10"] == 1.0
+    assert recs1[0]["sub_benchmarks"]["legalbench_rag_maxsim_genrm"]["span_ndcg@10"] == 1.0
+
+    # Part B: Cat-2 --backend genrm
+    monkeypatch.setattr(out, "load_ragtruth", lambda **_kw: [{"id": "r0", "context": "ctx", "query": "q", "output": "o", "is_faithful": True}, {"id": "r1", "context": "ctx2", "query": "q2", "output": "o2", "is_faithful": False}])
+    monkeypatch.setattr(out, "load_clinc_oos", lambda **_kw: {"items": [{"text": "my account is locked", "domain": "banking", "intent_name": "account_blocked", "is_oos": False}]})
+    monkeypatch.setattr(out, "load_reward_bench_2", lambda **_kw: [{"prompt": "p", "candidates": ["a", "b", "c", "d"], "gold_idx": 0, "subset": "Precise IF"}])
+    extra2 = out._parse_extra_flags(["--backend", "genrm"])
+    rec2 = out._run_cat2_single_backend(
+        "genrm",
+        tier="tier1",
+        config_label="genrm_test",
+        extra=extra2,
+        lock={},
+        cache_dir=tmp_path,
+        local_files_only=True,
+        max_items=2,
+        smoke=False,
+        home=tmp_path,
+        host_mem_gb=24.0,
+    )
+    assert rec2["diagnostics"]["backend"] == "genrm"
+    assert rec2["diagnostics"]["ragtruth_auroc"] == 1.0
+    assert rec2["diagnostics"]["clinc150_151_acc"] == 1.0
+    assert rec2["diagnostics"]["rewardbench2_macro_bo4"] == 1.0
+
+
 
 
 

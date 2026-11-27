@@ -51,7 +51,7 @@ When comparing against unconstrained stock `mlx-vlm` below, invalid JSON outputs
 | --- | --- | --- | --- |
 | **300-task JSON + tools (batched, strict)** | **4.179 score/s** (300/300 valid, 0.884 score, 4.98 GB) | **3.639 score/s** (300/300 valid, 0.880 score, 8.15 GB) | Batched rolling scheduler (`max_b_slots=128` on 24 GB) |
 | **300-task JSON + tools (`B=8` M5)** | **1.835 score/s** (150/150 extract 0.946 F1, 123/150 tools, 144.4 s) | - | Unconstrained `mlx-vlm`: `1.501` (146/150 extract 0.923 F1, 120/150 tools, 172.2 s) |
-| **Reasoning (`435` MMLU + MATH + IFBench)** | **0.843 score/s** (0.352 score, 181.5 s) | **0.892 score/s** (0.359 score, 174.8 s) | Stock `mlx-vlm`: `0.818` M5 / `0.951` M4 Pro (0.366 score) |
+| **Reasoning (`435` MMLU + MATH + IFBench; `MMLU(285)`)** | **0.843 score/s** (`0.352` no-think); **`MMLU(285)` bounded think `0.7404`** (`281/285` valid, `249.6 s`, `5.26 GB`, [M5 Wave-5 receipts](../../docs/benchmarks/m5-wave5-20261127.json)) | **0.892 score/s** (`0.359` no-think, `174.8 s`) | **`+25.96 pp`** on M5 `MMLU(285)` over `0.4807` baseline (`+10.53 pp` over `nothink_1024` `0.6351`) via `<\|channel>...<channel\|>` stripping |
 | **Batch-128 extraction (`kv_i8`)** | **10.46 valid docs/s** @ B=128 (monorepo: 1,289 tok/s / 6.42 docs/s, 4.76 GB MLX / 5.86 GB OS) | **8.78 valid docs/s** (ANE+GPU, 6.28 GB MLX) / **6.87** (GPU, 6.33 GB MLX) | **5.2x** `mlx-vlm` valid rate (`10.46 @ B=128` vs `2.02 @ B=64`) |
 
 ### 2. Speculative decoding (`MTP`), prefix reuse & local QLoRA
@@ -80,7 +80,7 @@ When comparing against unconstrained stock `mlx-vlm` below, invalid JSON outputs
 | Component | How it works | Source |
 | --- | --- | --- |
 | **Rolling Metal GPU + `kv_i8`** | Continuous 128-slot scheduler, INT8 KV compression, fused BF16 GeGLU, M5 (`Apple10 NAX`) inline XOR packing without duplicate weight buffers (`max_diff=0.0`), and FP32 logit softcap | [`model.py`](src/fast_gemma4/model.py), [`kernels.py`](src/fast_gemma4/kernels.py) |
-| **Schema grammar & loop guard** | Zero-allocation `llguidance` bitmasking, forced-prefix jumps, deferred length-truncation retries, and 4-gram loop breaking | [`grammar.py`](src/fast_gemma4/grammar.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
+| **Schema grammar & loop guard** | Zero-allocation `llguidance` bitmasking, forced-prefix jumps, deferred length-truncation retries, `<\|channel>...<channel\|>` token-ID reasoning extraction (`thinking_budget_tokens`), and 4-gram loop breaking | [`grammar.py`](src/fast_gemma4/grammar.py), [`tokenizer.py`](src/fast_gemma4/tokenizer.py), [`speculative.py`](src/fast_gemma4/speculative.py) |
 | **GPU top-k nucleus sampling** | `gather_topk_stats_mlx` + `try_sample_topk_row` in `run_decode_batch` and `run_decode_rolling` (`1.59x` sampled decode speedup on Base M5 `16x256` `T=0.6, top_p=0.95`: `10.65 s` vs `16.90 s`; exact fallback on flat/boundary-tie rows; [M5 receipts](../../docs/benchmarks/m5-sprint2-20261126.json)) | [`speculative.py`](src/fast_gemma4/speculative.py), [`grammar.py`](../fast-shared/src/fast_shared/grammar.py) |
 | **Pure-ANE `Early14` prefill ring** | Residual-scale folding keeps Layer 10-14 activations inside FP16 (`1,326` ANE ops, `0` GPU/CPU) with zero-copy `IOSurface` handoff | [`ane_pipeline.py`](src/fast_gemma4/ane_pipeline.py), [`native/gemma4_ane_prefix.mm`](native/gemma4_ane_prefix.mm) |
 | **Local `QLoRA` acceleration** | Single-mask FFD packed QLoRA (`run_frozen_prefix_single_mask`, `compute_packed_tail_single_mask`), chunked softcap cross-entropy, shared system-prompt KV backward passes, and safe non-compiled `CompiledOptimizerStep` defaults | [`lora_accel.py`](src/fast_gemma4/lora_accel.py), [`scripts/train_lora.py`](scripts/train_lora.py) |
@@ -89,6 +89,7 @@ When comparing against unconstrained stock `mlx-vlm` below, invalid JSON outputs
 
 ```bash
 .venv/bin/gemma4 generate --json 'Extract entity: Acme Cloud grew 12%.'
+.venv/bin/gemma4 generate --enable-thinking --thinking-budget-tokens 1024 --answer-max-tokens 256 --json 'Reason step by step.'
 .venv/bin/gemma4 parquet docs.parquet out_shards/ --schema schema.json --system-file sys.txt --drop-text-col --resume
 .venv/bin/gemma4 serve --host 127.0.0.1 --port 8080 --coalesce-ms 10
 .venv/bin/python packages/fast-gemma4/scripts/train_lora.py --pairs pairs.json --adapter-dir out_lora --out-model-dir out_ckpt --qlora-8bit --pack-tokens 2048 --shared-sys-kv

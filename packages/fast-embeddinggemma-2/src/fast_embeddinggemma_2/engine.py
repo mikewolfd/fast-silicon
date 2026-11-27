@@ -1545,6 +1545,8 @@ class FastEmbeddingGemma2:
         corpus: Sequence[str] | Sequence[Sequence[int]] | np.ndarray,
         *,
         titles: Sequence[str | None] | None = None,
+        sub_chunk_chars: int | None = None,
+        doc_ids: Sequence[str] | None = None,
         doc_offsets: np.ndarray | Sequence[int] | None = None,
         mode: IndexMode = "auto",
         mrl_dim: int | None = None,
@@ -1555,6 +1557,24 @@ class FastEmbeddingGemma2:
         add_document_prefix: bool = False,
     ) -> CompactRetrievalIndex:
         """Build a `CompactRetrievalIndex` (`512d mrl_int8` `6.0x` default, or `int8` / `binary_int8` / `MaxSim`)."""
+        if sub_chunk_chars is not None and not isinstance(corpus, np.ndarray) and corpus:
+            if not isinstance(corpus[0], str):
+                raise TypeError("sub_chunk_chars requires a sequence of raw document strings")
+            from fast_shared.hybrid_retrieval import build_contextual_subchunk_index
+
+            return build_contextual_subchunk_index(
+                self,
+                corpus,  # type: ignore[arg-type]
+                doc_ids=doc_ids,
+                doc_titles=titles,
+                sub_chunk_chars=int(sub_chunk_chars),
+                index_mode=mode,
+                mrl_dim=mrl_dim,
+                binary_bits=binary_bits,
+                agg=agg,
+                hybrid_alpha=hybrid_alpha,
+                encode_mode=encode_mode,
+            )
         if isinstance(corpus, np.ndarray):
             vecs = corpus
         elif not corpus:

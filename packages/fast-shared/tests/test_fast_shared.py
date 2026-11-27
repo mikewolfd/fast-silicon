@@ -3556,3 +3556,83 @@ def test_loop_detector_pld_drafter_and_mpp_linear_cpu() -> None:
     assert isinstance(state, MppPackState) and state.min_m_for(1024, 3584, 8) == 128
 
 
+def test_server_bounded_thinking_params_and_reasoning_response_cpu() -> None:
+    from types import SimpleNamespace
+
+    from fast_shared.server import ChatMicroBatcher, _gen_kwargs, build_chat_completion
+
+    kw = _gen_kwargs(
+        {
+            "max_tokens": 128,
+            "enable_thinking": True,
+            "thinking_budget_tokens": 1024,
+            "answer_max_tokens": 256,
+        }
+    )
+    assert kw["enable_thinking"] is True
+    assert kw["thinking_budget_tokens"] == 1024
+    assert kw["answer_max_tokens"] == 256
+
+    seen_calls: list[dict[str, Any]] = []
+
+    class _FakeThinkEngine:
+        def generate_batch(self, prompts, **kwargs):
+            seen_calls.append({"n": len(prompts), **kwargs})
+            return SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        text="Final answer",
+                        reasoning="Chain summary",
+                        prompt_tokens=10,
+                        completion_tokens=4,
+                        finish_reason="stop",
+                    )
+                    for _ in prompts
+                ],
+                stats={"completion_tokens": 4 * len(prompts)},
+            )
+
+    batcher = ChatMicroBatcher(_FakeThinkEngine(), coalesce_ms=0.0, max_batch_size=8)
+    item, _stats = batcher.submit(
+        [{"role": "user", "content": "hi"}],
+        json_schema=None,
+        max_tokens=kw["max_tokens"],
+        temperature=kw["temperature"],
+        top_p=kw["top_p"],
+        seed=kw["seed"],
+        enable_thinking=kw["enable_thinking"],
+        thinking_budget_tokens=kw["thinking_budget_tokens"],
+        answer_max_tokens=kw["answer_max_tokens"],
+    )
+    assert seen_calls[0]["thinking_budget_tokens"] == 1024
+    assert seen_calls[0]["answer_max_tokens"] == 256
+
+    entry_a = batcher._build_entry(
+        [[{"role": "user", "content": "a"}]],
+        kind="chat",
+        json_schema=None,
+        max_tokens=128,
+        temperature=0.0,
+        top_p=1.0,
+        seed=42,
+        enable_thinking=True,
+        thinking_budget_tokens=512,
+    )
+    entry_b = batcher._build_entry(
+        [[{"role": "user", "content": "b"}]],
+        kind="chat",
+        json_schema=None,
+        max_tokens=128,
+        temperature=0.0,
+        top_p=1.0,
+        seed=42,
+        enable_thinking=True,
+        thinking_budget_tokens=1024,
+    )
+    assert entry_a.key != entry_b.key
+
+    payload = build_chat_completion("google/gemma-4-E2B-it", item)
+    assert payload["choices"][0]["message"]["content"] == "Final answer"
+    assert payload["choices"][0]["message"]["reasoning"] == "Chain summary"
+
+

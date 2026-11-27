@@ -201,3 +201,347 @@ def test_fused_softcap_argmax_bf16_matches_fp32_softcap_near_boundary_gpu() -> N
         mx.eval(out_plain, out_telem, stats)
         assert int(out_plain[0]) == expected_idx
         assert int(out_telem[0]) == expected_idx
+
+
+def test_gemma4_channel_thought_stripping_and_token_id_extraction_cpu() -> None:
+    from fast_gemma4.tokenizer import FastGemma4Tokenizer, _strip_thinking
+
+    assert _strip_thinking("<|channel>thought\nstep 1\n<channel|>Answer: B") == "Answer: B"
+    assert _strip_thinking("<|thought>legacy\n<thought|>Answer: C") == "Answer: C"
+    assert _strip_thinking("<|channel>thought\nunclosed thought") == ""
+    assert _strip_thinking("prior<channel|>Final") == "Final"
+
+    class _FakeBackendTok:
+        def __init__(self) -> None:
+            self._special = {100: "<|channel>", 101: "<channel|>", 106: "<turn|>"}
+            self._words = {10: "thought\n", 11: "option A or ", 12: "B", 20: "Answer: ", 21: "B"}
+
+        def token_to_id(self, tok: str) -> int | None:
+            for k, v in self._special.items():
+                if v == tok:
+                    return k
+            return None
+
+        def get_vocab_size(self, with_added_tokens: bool = True) -> int:
+            return 256
+
+        def no_padding(self) -> None:
+            pass
+
+        def no_truncation(self) -> None:
+            pass
+
+        def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+            out: list[str] = []
+            for tid in ids:
+                if tid in self._special:
+                    if not skip_special_tokens:
+                        out.append(self._special[tid])
+                else:
+                    out.append(self._words.get(tid, f"<{tid}>"))
+            return "".join(out)
+
+    tok = FastGemma4Tokenizer.__new__(FastGemma4Tokenizer)
+    tok._tok = _FakeBackendTok()  # type: ignore[assignment]
+    tok.channel_open_id = 100
+    tok.channel_close_id = 101
+    tok.think_token_id = 98
+
+    # With skip_special_tokens=True directly, `<|channel>` and `<channel|>` disappear leaving `"thought..."`.
+    # `decode_answer_and_reasoning` strips `[100..101]` BEFORE `skip_special_tokens=True`.
+    ans, reasoning, ans_ids = tok.decode_answer_and_reasoning([100, 10, 11, 12, 101, 20, 21, 106])
+    assert ans == "Answer: B"
+    assert reasoning == "option A or B"
+    assert ans_ids == [20, 21, 106]
+
+    # Unclosed `<|channel>thought` returns empty answer and preserves reasoning.
+    ans_u, reas_u, ans_ids_u = tok.decode_answer_and_reasoning([100, 10, 11])
+    assert ans_u == ""
+    assert reas_u == "option A or"
+    assert ans_ids_u == []
+
+    # Backwards-compatible fast path when no channel tokens appear.
+    ans_p, reas_p, ans_ids_p = tok.decode_answer_and_reasoning([20, 21])
+    assert ans_p == "Answer: B"
+    assert reas_p is None
+    assert ans_ids_p == [20, 21]
+
+    # Stray `<channel|>` without `<|channel>` treats prior tokens as reasoning (matching `_strip_thinking`),
+    # and multi-block `<|channel>...<channel|>` strips per-block headers and joins cleanly.
+    ans_stray, reas_stray, ans_ids_stray = tok.decode_answer_and_reasoning([10, 11, 101, 20, 21])
+    assert ans_stray == "Answer: B"
+    assert reas_stray == "option A or"
+    assert ans_ids_stray == [20, 21]
+
+    ans_multi, reas_multi, ans_ids_multi = tok.decode_answer_and_reasoning(
+        [100, 10, 11, 101, 100, 10, 12, 101, 20, 21]
+    )
+    assert ans_multi == "Answer: B"
+    assert reas_multi == "option A or\n\nB"
+    assert ans_ids_multi == [20, 21]
+
+    # String-fallback path when channel token IDs are unset also extracts unclosed `<|channel>` / `<|thought>` tails.
+    class _StrTok:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def decode(self, _ids: list[int], skip_special_tokens: bool = True) -> str:
+            _ = skip_special_tokens
+            return self._text
+
+    tok_str = FastGemma4Tokenizer.__new__(FastGemma4Tokenizer)
+    tok_str.channel_open_id = None
+    tok_str.channel_close_id = None
+    tok_str.think_token_id = None
+    tok_str._tok = _StrTok("<|channel>thought\npartial trace")  # type: ignore[assignment]
+    ans_sc, reas_sc, _ = tok_str.decode_answer_and_reasoning([1, 2])
+    assert ans_sc == ""
+    assert reas_sc == "partial trace"
+
+    tok_str._tok = _StrTok("<|thought>inner trace")  # type: ignore[assignment]
+    ans_st, reas_st, _ = tok_str.decode_answer_and_reasoning([1, 2])
+    assert ans_st == ""
+    assert reas_st == "inner trace"
+
+
+def test_gemma4_bounded_two_pass_thinking_rolling_cpu() -> None:
+    from fast_gemma4.engine import FastGemma4Engine, GenerationBatchResult, GenerationItem
+
+    class _FakeTok:
+        channel_open_id = 100
+        channel_close_id = 101
+
+        def encode_channel_close_suffix(self) -> list[int]:
+            return [107, 101]
+
+        def decode_answer_and_reasoning(self, ids: list[int]) -> tuple[str, str | None, list[int]]:
+            if 100 in ids and 101 in ids:
+                return "Answer: C", "step by step", [30, 31]
+            return "Answer: A", None, list(ids)
+
+    eng = FastGemma4Engine.__new__(FastGemma4Engine)
+    eng.tokenizer = _FakeTok()  # type: ignore[assignment]
+    eng.default_mode = "gpu"
+    eng.profile = "auto"
+    eng.default_max_b_slots = 32
+
+    seen_encode: list[bool] = []
+    seen_roll: list[dict[str, object]] = []
+
+    def _encode_prompts(prompts, *, enable_thinking: bool = False, **_kw):
+        seen_encode.append(enable_thinking)
+        return [[2, 105, 50 + i] for i in range(len(prompts))]
+
+    def _gen_batch(prompts, **kwargs):
+        assert kwargs["enable_thinking"] is True
+        assert kwargs["max_tokens"] == 16
+        assert kwargs.get("thinking_budget_tokens") is None
+        return GenerationBatchResult(
+            items=[
+                # Item 0: finished inside Pass 1
+                GenerationItem("Answer: A", None, [100, 10, 101, 20], 3, 4, False, True, "stop", reasoning="quick"),
+                # Item 1: hit thinking_budget=16 with unclosed <|channel>
+                GenerationItem("", None, [100, 11, 12], 3, 3, False, True, "length", reasoning="partial"),
+            ],
+            stats={"completion_tokens": 7, "decode_sec": 0.1, "prefill_sec": 0.05},
+        )
+
+    def _run_rolling(*, sys_ids, suf_ids_list, max_tokens, B_slots, **_kw):
+        seen_roll.append({"sys_ids": sys_ids, "suf_ids_list": suf_ids_list, "max_tokens": max_tokens, "B_slots": B_slots})
+        return {"gen_toks": [[30, 31]], "prefill_sec": 0.02, "decode_sec": 0.03, "tot_out_tok": 2}
+
+    eng.encode_prompts = _encode_prompts  # type: ignore[method-assign]
+    eng.generate_batch = _gen_batch  # type: ignore[method-assign]
+    eng.run_rolling = _run_rolling  # type: ignore[method-assign]
+
+    res = FastGemma4Engine.generate_batch(
+        eng,
+        ["p0", "p1"],
+        enable_thinking=True,
+        thinking_budget_tokens=16,
+        max_tokens=8,
+        batch_size=32,
+    )
+    assert seen_encode == [True]
+    assert len(seen_roll) == 1
+    assert seen_roll[0]["max_tokens"] == 8
+    assert seen_roll[0]["B_slots"] == 1
+    # Item 1 prompt + [100, 11, 12] + injected [107, 101] (`\n<channel|>`)
+    full_p2 = list(seen_roll[0]["sys_ids"]) + list(seen_roll[0]["suf_ids_list"][0])  # type: ignore[index]
+    assert full_p2 == [2, 105, 51, 100, 11, 12, 107, 101]
+    assert res.items[0].text == "Answer: A" and res.items[0].finish_reason == "stop"
+    assert res.items[1].text == "Answer: C" and res.items[1].reasoning == "step by step"
+    assert res.items[1].finish_reason == "stop"
+    assert res.stats["two_pass_thinking"] is True
+    assert res.stats["pass1_done_count"] == 1
+    assert res.stats["pass2_count"] == 1
+    assert res.stats["pass2_forced_close"] == 1
+
+
+def test_gemma4_two_pass_review_fixes_and_legacy_reasoning_budget_cpu() -> None:
+    from fast_gemma4.engine import FastGemma4Engine, GenerationBatchResult, GenerationItem
+
+    class _EdgeTok:
+        bos_token_id = 2
+        channel_open_id = 100
+        channel_close_id = 101
+        stop_token_ids = frozenset({1})
+
+        def encode_channel_close_suffix(self) -> list[int]:
+            return [107, 101]
+
+        def decode_answer_and_reasoning(self, ids: list[int]) -> tuple[str, str | None, list[int]]:
+            if 30 in ids and 31 in ids:
+                return '{"ok": 1}', "done", [30, 31]
+            return "trunc", "still thinking", [40, 41]
+
+    eng = FastGemma4Engine.__new__(FastGemma4Engine)
+    eng.tokenizer = _EdgeTok()  # type: ignore[assignment]
+    eng.default_mode = "auto"
+    eng.profile = "auto"
+    eng.default_max_b_slots = 16
+
+    recorded_roll: list[dict[str, object]] = []
+
+    def _encode_empty(prompts, **_kw):
+        return [[] for _ in prompts]
+
+    def _gen_p1(prompts, **kwargs):
+        items = [
+            GenerationItem("", None, [100, 11, 12], 1, 3, False, True, "length", reasoning="t")
+            for _ in prompts
+        ]
+        return GenerationBatchResult(
+            items=items,
+            stats={"completion_tokens": 3 * len(prompts), "decode_sec": 0.1, "prefill_sec": 0.05, "mode_used": "gpu"},
+        )
+
+    def _roll2(*, sys_ids, suf_ids_list, max_tokens, B_slots, **kw):
+        recorded_roll.append({"sys_ids": sys_ids, "suf_ids_list": suf_ids_list, "max_tokens": max_tokens, "kw": kw})
+        if len(suf_ids_list) == 1:
+            # Exact budget length ending in stop_token_id=1 -> must finish as "stop".
+            return {"gen_toks": [[30, 31, 1]], "prefill_sec": 0.01, "decode_sec": 0.02, "tot_out_tok": 3}
+        # Doc 0 hits stop token on exact budget=2; doc 1 hits length without stop token.
+        return {"gen_toks": [[30, 1], [40, 41]], "prefill_sec": 0.01, "decode_sec": 0.02, "tot_out_tok": 4}
+
+    eng.encode_prompts = _encode_empty  # type: ignore[method-assign]
+    eng.generate_batch = _gen_p1  # type: ignore[method-assign]
+    eng.run_rolling = _roll2  # type: ignore[method-assign]
+
+    # Case 1: Empty raw prompt gets [bos_id], singleton Pass 2 forwards mode="gpu" + cache_prefix=False,
+    # exact stop token yields finish_reason="stop", valid_json_count recomputed, injected tokens separated.
+    res1 = FastGemma4Engine.generate_batch(
+        eng,
+        [""],
+        use_chat_template=False,
+        enable_thinking=True,
+        thinking_budget_tokens=8,
+        answer_max_tokens=3,
+        mode="gpu",
+    )
+    assert recorded_roll[0]["sys_ids"][0] == 2  # type: ignore[index]
+    assert recorded_roll[0]["kw"]["mode"] == "gpu"  # type: ignore[index]
+    assert recorded_roll[0]["kw"]["cache_prefix"] is False  # type: ignore[index]
+    assert res1.items[0].finish_reason == "stop"
+    assert res1.items[0].valid_json is True
+    assert res1.items[0].prompt_tokens == 1
+    assert res1.items[0].completion_tokens == 6  # 3 (Pass 1) + 3 (Pass 2), excluding 2 injected suffix tokens
+    assert res1.stats["valid_json_count"] == 1
+    assert res1.stats["injected_close_tokens"] == 2
+    assert res1.stats["completion_tokens"] == 6
+    assert res1.stats["mode_used"] == "gpu"
+
+    # Case 2: Boundary length without stop -> "length"; 2 docs -> cache_prefix=True.
+    res2 = FastGemma4Engine.generate_batch(
+        eng,
+        ["", "x"],
+        use_chat_template=False,
+        enable_thinking=True,
+        thinking_budget_tokens=8,
+        answer_max_tokens=2,
+        mode="gpu",
+    )
+    assert recorded_roll[1]["kw"]["cache_prefix"] is True  # type: ignore[index]
+    assert res2.items[0].finish_reason == "stop"
+    assert res2.items[1].finish_reason == "length"
+
+    # Case 3: answer_max_tokens=0 skips Pass 2 completely and reports pass1_done_count=0.
+    roll_before = len(recorded_roll)
+    res_zero = FastGemma4Engine.generate_batch(
+        eng,
+        ["a"],
+        enable_thinking=True,
+        thinking_budget_tokens=8,
+        answer_max_tokens=0,
+    )
+    assert len(recorded_roll) == roll_before
+    assert res_zero.stats["pass2_count"] == 0
+    assert res_zero.stats["pass1_done_count"] == 0
+
+    # Case 4: Legacy `reasoning_budget` without `thinking_budget_tokens` must NOT enter two-pass.
+    called_two_pass: list[bool] = []
+    eng._generate_two_pass_bounded_thinking = lambda *_a, **_kw: called_two_pass.append(True)  # type: ignore[method-assign]
+    eng.encode_prompts = lambda prompts, **kw: (  # type: ignore[method-assign]
+        [_ for _ in prompts],  # trigger single-pass path cleanly until _gpu_lock
+    )[0]
+    import contextlib
+
+    class _StopEarly(Exception):
+        pass
+
+    @contextlib.contextmanager
+    def _abort_lock():
+        raise _StopEarly()
+        yield
+
+    eng._gpu_lock = _abort_lock()  # type: ignore[assignment]
+    with pytest.raises(_StopEarly):
+        FastGemma4Engine.generate_batch(eng, ["hi"], reasoning_budget=64, max_tokens=128)
+    assert called_two_pass == []
+
+
+def test_gemma4_cli_bounded_thinking_forwarding_and_json_reasoning_cpu(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from fast_gemma4 import cli as g4_cli
+
+    seen_gen: list[dict[str, object]] = []
+
+    class _FakeCliEngine:
+        def generate(self, prompt, **kwargs):
+            seen_gen.append({"prompt": prompt, **kwargs})
+            return SimpleNamespace(
+                text="42",
+                parsed=None,
+                prompt_tokens=12,
+                completion_tokens=6,
+                valid_json=False,
+                valid_schema=True,
+                finish_reason="stop",
+                reasoning="computed cleanly",
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(g4_cli, "_make_engine", lambda _args: _FakeCliEngine())
+    rc = g4_cli.main(
+        [
+            "generate",
+            "--enable-thinking",
+            "--thinking-budget-tokens",
+            "1024",
+            "--answer-max-tokens",
+            "256",
+            "--json",
+            "What is 6 * 7?",
+        ]
+    )
+    assert rc == 0
+    assert seen_gen[0]["enable_thinking"] is True
+    assert seen_gen[0]["thinking_budget_tokens"] == 1024
+    assert seen_gen[0]["answer_max_tokens"] == 256
+    out_obj = json.loads(capsys.readouterr().out)
+    assert out_obj["text"] == "42"
+    assert out_obj["reasoning"] == "computed cleanly"

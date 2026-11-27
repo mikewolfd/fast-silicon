@@ -893,6 +893,12 @@ def _gen_kwargs(req: dict[str, Any], *, default_whitespace_flexible: Any = _UNSE
     reasoning_budget = extract_request_param(req, "reasoning_budget")
     if reasoning_budget is not None:
         kw["reasoning_budget"] = int(reasoning_budget)
+    thinking_budget_tokens = extract_request_param(req, "thinking_budget_tokens")
+    if thinking_budget_tokens is not None:
+        kw["thinking_budget_tokens"] = int(thinking_budget_tokens)
+    answer_max_tokens = extract_request_param(req, "answer_max_tokens")
+    if answer_max_tokens is not None:
+        kw["answer_max_tokens"] = int(answer_max_tokens)
     return kw
 
 

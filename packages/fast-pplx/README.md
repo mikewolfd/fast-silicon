@@ -32,6 +32,8 @@ with FastPplx(mode="auto", dimensions=512) as model:  # hetero2 if ANE stages ex
 
     # For 4K-32K documents, build a contextual multi-vector MaxSim index (1024d INT8):
     long_index = model.build_index(["Long 32K document text...", "Second long document..."], multivector=True)
+    # Or pack 4K contextual sub-chunks (sub_chunk_chars=256) for fine-grained clause MaxSim:
+    clause_index = model.build_index(["Long 4K contract text..."], sub_chunk_chars=256, doc_titles=["lease"])
     top_ids, top_scores = long_index.search(model.encode_queries(["ocean currents"])[0], k=5)
 ```
 
@@ -64,7 +66,7 @@ with FastPplx(mode="auto", dimensions=512) as model:  # hetero2 if ANE stages ex
 | `--ane-profile balanced` | `balanced` | Closes 73%+ of the ANE-vs-GPU cosine gap (`>=0.999` mean cosine) at negligible throughput cost vs. `fast`. |
 | `--context-tokens 2048` | `2048` | Encodes 256-tok chunks inside 2,048-tok windows with up to 128 repeated header tokens (`0.453 -> 0.735` LegalBench nDCG). |
 | `dimensions=1024` + `INT8` | `1024` / `int8` | Preserves all 1,024 dims in 4x-smaller INT8 (`1,026 B/vec`, lossless vs. FP32); truncating PPLX to 512d drops legal ranking 3.7 pts. |
-| `multivector=True` | `False` | Splits 4K-32K docs into 2,048-tok windows scored via `MaxSim` (`15.97 KiB/doc` in 1024d INT8). |
+| `multivector=True` | `False` | Splits 4K-32K docs into 2,048-tok windows scored via `MaxSim` (`15.97 KiB/doc` in 1024d INT8); or pass `sub_chunk_chars=256` to build a 4K-window contextual sub-chunk `MaxSim` index (`+7.17 pp` `LegalBench-RAG`). |
 
 ## Benchmark highlights
 

@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import math
 import re
+import threading
 from typing import Any, Literal, TypeVar
 
 import numpy as np
@@ -21,9 +22,31 @@ from .retrieval_index import (
     score_document_windows,
 )
 
-RetrievalMode = Literal["auto", "dense", "bm25", "hybrid", "dense_rerank", "hybrid_rerank"]
+RetrievalMode = Literal[
+    "auto",
+    "dense",
+    "bm25",
+    "hybrid",
+    "dense_rerank",
+    "hybrid_rerank",
+    "maxsim",
+    "margin_maxsim",
+    "maxsim_rerank",
+    "margin_maxsim_rerank",
+]
 VALID_RETRIEVAL_MODES: frozenset[str] = frozenset(
-    {"auto", "dense", "bm25", "hybrid", "dense_rerank", "hybrid_rerank"}
+    {
+        "auto",
+        "dense",
+        "bm25",
+        "hybrid",
+        "dense_rerank",
+        "hybrid_rerank",
+        "maxsim",
+        "margin_maxsim",
+        "maxsim_rerank",
+        "margin_maxsim_rerank",
+    }
 )
 
 # High-frequency function words only; deliberately retains negation and modal terms
@@ -565,24 +588,498 @@ class HybridSearchHit:
 
 
 def _is_laya_reranker_instance(obj: Any) -> bool:
-    return isinstance(obj, LayaRerankFusion) or (
+    return isinstance(obj, (LayaRerankFusion, GenRMRerankFusion)) or (
         callable(getattr(obj, "rerank", None))
         and not callable(getattr(obj, "score_noul_batch", None))
         and not callable(getattr(obj, "score_choice_batch", None))
     )
 
 
+def split_subchunk_spans(
+    doc_texts: Sequence[str],
+    *,
+    sub_chunk_chars: int = 256,
+) -> tuple[list[str], np.ndarray]:
+    """Split each document/chunk into whitespace-snapped sub-chunks and cumulative ``doc_offsets``."""
+    width = max(32, int(sub_chunk_chars))
+    sub_texts: list[str] = []
+    offsets: list[int] = [0]
+    for raw_text in doc_texts:
+        txt = str(raw_text or "")
+        n = len(txt)
+        if n == 0:
+            sub_texts.append("")
+            offsets.append(len(sub_texts))
+            continue
+        pos = 0
+        count_before = len(sub_texts)
+        while pos < n:
+            end = min(n, pos + width)
+            if end < n:
+                floor_snap = pos + int(width * 0.85)
+                ws = txt.rfind(" ", floor_snap, end)
+                nl = txt.rfind("\n", floor_snap, end)
+                snap = max(ws, nl)
+                if snap > pos:
+                    end = snap + 1
+            piece = txt[pos:end]
+            if piece.strip():
+                sub_texts.append(piece)
+            if end >= n:
+                break
+            pos = end
+        if len(sub_texts) == count_before:
+            sub_texts.append(txt)
+        offsets.append(len(sub_texts))
+    return sub_texts, np.asarray(offsets, dtype=np.int32)
+
+
+def _group_doc_indices_for_contextual(
+    n_docs: int,
+    doc_titles: Sequence[str] | None,
+    doc_ids: Sequence[str] | None,
+) -> list[list[int]]:
+    """Group parent chunks belonging to the same source document in contiguous order."""
+    if n_docs == 0:
+        return []
+    groups: list[list[int]] = []
+    cur_key: str | None = None
+    for idx in range(n_docs):
+        if doc_titles is not None:
+            key = str(doc_titles[idx])
+        elif doc_ids is not None:
+            raw_id = str(doc_ids[idx])
+            key = raw_id.split("#", 1)[0] if "#" in raw_id else raw_id
+        else:
+            key = str(idx)
+        if not groups or key != cur_key:
+            groups.append([idx])
+            cur_key = key
+        else:
+            groups[-1].append(idx)
+    return groups
+
+
+def build_contextual_subchunk_index(
+    encoder: Any,
+    doc_texts: Sequence[str],
+    *,
+    doc_ids: Sequence[str] | None = None,
+    doc_titles: Sequence[str] | None = None,
+    sub_chunk_chars: int = 256,
+    context_tokens: int = 4096,
+    repeat_header_tokens: int = 128,
+    index_mode: IndexMode = "int8",
+    mrl_dim: int | None = None,
+    binary_bits: int | None = None,
+    agg: WindowAgg = "maxsim",
+    hybrid_alpha: float = 0.7,
+    use_neon: bool = True,
+    encode_mode: str | None = None,
+    batch_size: int = 4,
+) -> CompactRetrievalIndex:
+    """Encode sub-chunks (`sub_chunk_chars=256`) into a multi-vector ``CompactRetrievalIndex``."""
+    n_docs = len(doc_texts)
+    sub_texts, parent_offsets = split_subchunk_spans(doc_texts, sub_chunk_chars=sub_chunk_chars)
+    if n_docs == 0:
+        dim = int(getattr(encoder, "dim", getattr(encoder, "max_dim", 1)))
+        return CompactRetrievalIndex(
+            np.empty((0, dim), dtype=np.float32),
+            doc_offsets=parent_offsets,
+            mode=index_mode,
+            is_mrl_trained=bool(getattr(encoder, "is_mrl_trained", False)),
+            mrl_dim=mrl_dim,
+            binary_bits=binary_bits,
+            agg=agg,
+            hybrid_alpha=hybrid_alpha,
+            use_neon=use_neon,
+        )
+
+    tok = getattr(encoder, "tokenizer", None)
+    has_contextual = (
+        tok is not None
+        and callable(getattr(tok, "_pack_context_windows", None))
+        and callable(getattr(encoder, "encode_contextual_chunks", None))
+    )
+    if has_contextual:
+        groups = _group_doc_indices_for_contextual(n_docs, doc_titles, doc_ids)
+        win_chunks: list[list[str]] = []
+        win_meta: list[tuple[int, int]] = []
+        for grp in groups:
+            grp_subs: list[str] = []
+            for p_idx in grp:
+                s0 = int(parent_offsets[p_idx])
+                s1 = int(parent_offsets[p_idx + 1])
+                grp_subs.extend(sub_texts[s0:s1])
+            rep_arg: int | list[int] = int(repeat_header_tokens)
+            raw_tok = getattr(tok, "_tokenizer", None)
+            if raw_tok is not None and int(repeat_header_tokens) > 0 and doc_texts[grp[0]]:
+                rep_arg = list(
+                    raw_tok.encode(str(doc_texts[grp[0]]), add_special_tokens=False).ids[
+                        : int(repeat_header_tokens)
+                    ]
+                )
+            packed = tok._pack_context_windows(
+                grp_subs,
+                context_tokens=int(context_tokens),
+                repeat_header_tokens=rep_arg,
+            )
+            for w in packed:
+                win_chunks.append(list(w.chunks))
+                win_meta.append((int(w.emit_start), len(w.spans)))
+
+        ctx_kw: dict[str, Any] = {
+            "batch_size": max(1, int(batch_size)),
+            "max_length": int(context_tokens),
+            "output_dtype": "float32",
+            "normalize": True,
+        }
+        if encode_mode is not None:
+            ctx_kw["mode"] = encode_mode
+        mats = encoder.encode_contextual_chunks(win_chunks, **ctx_kw)
+        parts: list[np.ndarray] = []
+        for mat, (emit_start, n_body) in zip(mats, win_meta, strict=True):
+            arr = np.asarray(mat, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            parts.append(arr[emit_start : emit_start + n_body])
+        vecs = np.vstack(parts)
+    else:
+        kw: dict[str, Any] = {}
+        if encode_mode is not None:
+            kw["mode"] = encode_mode
+        if callable(getattr(encoder, "encode_documents", None)):
+            vecs = encoder.encode_documents(sub_texts, **kw)
+        elif callable(getattr(encoder, "encode_corpus", None)):
+            vecs = encoder.encode_corpus(sub_texts, **kw)
+        elif callable(getattr(encoder, "encode_texts", None)):
+            vecs = encoder.encode_texts(sub_texts, **kw)
+        else:
+            raise TypeError(
+                f"Encoder {type(encoder).__name__!r} must implement encode_documents, encode_corpus, or encode_texts"
+            )
+
+    return CompactRetrievalIndex(
+        vecs,
+        doc_offsets=parent_offsets,
+        mode=index_mode,
+        is_mrl_trained=bool(getattr(encoder, "is_mrl_trained", False)),
+        mrl_dim=mrl_dim,
+        binary_bits=binary_bits,
+        agg=agg,
+        hybrid_alpha=hybrid_alpha,
+        use_neon=use_neon,
+    )
+
+
+def compute_margin_escalation_mask(
+    scores: np.ndarray,
+    *,
+    margin_threshold: float = 0.04,
+    margin_gap_rank: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(escalate_mask, margins)`` where ``margin = top1 - top(1 + margin_gap_rank)``."""
+    arr = np.asarray(scores, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    q_n = int(arr.shape[0])
+    if q_n == 0 or int(arr.shape[1]) <= 1:
+        zeros = np.zeros((q_n,), dtype=np.float64)
+        return np.zeros((q_n,), dtype=bool), zeros
+
+    thr = float(margin_threshold)
+    gap = max(1, int(margin_gap_rank))
+    valid_mask = np.isfinite(arr) & (arr > -1e20)
+    if np.all(valid_mask):
+        eff_gap = min(gap, int(arr.shape[1]) - 1)
+        desc = np.sort(arr, axis=1)[:, ::-1]
+        margins = desc[:, 0] - desc[:, eff_gap]
+        return margins <= thr, margins
+
+    margins = np.zeros((q_n,), dtype=np.float64)
+    mask = np.zeros((q_n,), dtype=bool)
+    for qi in range(q_n):
+        row = arr[qi]
+        if np.isnan(row).any():
+            margins[qi] = 0.0
+            mask[qi] = True
+            continue
+        valid = row[valid_mask[qi]]
+        if valid.size < 2:
+            margins[qi] = 0.0
+            mask[qi] = True
+            continue
+        desc_row = np.sort(valid)[::-1]
+        eff_r = min(gap, int(valid.size) - 1)
+        m_val = float(desc_row[0] - desc_row[eff_r])
+        margins[qi] = m_val
+        mask[qi] = m_val <= thr
+    return mask, margins
+
+
+DEFAULT_GENRM_RERANK_SYSTEM = (
+    "You are a precision legal and scientific evidence verifier. "
+    "Determine whether the TARGET PASSAGE (interpreted using its document header and surrounding context) "
+    "contains direct evidence, facts, rules, or clauses that answer, support, refute, or directly address the query."
+)
+
+
+class GenRMRerankFusion:
+    """Context-preserving Generative Reward Model candidate reranker via 1-pass calibrated logprobs.
+
+    Accepts a ``GenRMScorer`` (or compatible scorer implementing ``score_yes_no_logprob``),
+    a ``FastQwen3Engine`` (wrapped automatically in ``GenRMScorer``), a lazy ``scorer_factory``,
+    or a simple callable ``scorer(query, candidates) -> Sequence[float]``.
+
+    Unlike isolated snippet scorers, ``GenRMRerankFusion`` preserves each candidate's document
+    header anchor plus preceding and following context around ``[TARGET PASSAGE]``.
+    """
+
+    def __init__(
+        self,
+        scorer: Any | None = None,
+        *,
+        scorer_factory: Callable[[], Any] | None = None,
+        max_rerank: int = 12,
+        prior_weight: float = 0.35,
+        deduplicate_labels: bool = False,
+        attach_score: bool = True,
+        attach_confidence: bool = True,
+        max_passage_chars: int = 1600,
+        max_header_chars: int = 450,
+        max_neighbor_chars: int = 300,
+        high_confidence_threshold: float = 0.70,
+        low_confidence_threshold: float = 0.35,
+        system_prompt: str = DEFAULT_GENRM_RERANK_SYSTEM,
+        verdict_suffix: str = "Relevant (Yes or No):",
+        fallback_on_error: bool = False,
+    ) -> None:
+        if scorer is not None and scorer_factory is not None:
+            raise ValueError("Provide at most one of `scorer` or `scorer_factory`")
+        if scorer_factory is not None and not callable(scorer_factory):
+            raise TypeError("`scorer_factory` must be callable")
+        prior_w = _validate_finite_nonneg(prior_weight, "prior_weight")
+        if prior_w > 1.0:
+            raise ValueError(f"prior_weight must be in [0.0, 1.0], got {prior_weight!r}")
+        hi_thr = _validate_finite_nonneg(high_confidence_threshold, "high_confidence_threshold")
+        lo_thr = _validate_finite_nonneg(low_confidence_threshold, "low_confidence_threshold")
+        if lo_thr > hi_thr or hi_thr > 1.0:
+            raise ValueError(
+                f"thresholds must satisfy 0.0 <= low <= high <= 1.0, got ({lo_thr!r}, {hi_thr!r})"
+            )
+
+        self._scorer: Any | None = scorer
+        self._scorer_factory: Callable[[], Any] | None = scorer_factory
+        self._owns_scorer: bool = False
+        self._lock = threading.Lock()
+
+        self.max_rerank: int = _validate_positive_int(max_rerank, "max_rerank")
+        self.prior_weight: float = prior_w
+        self.deduplicate_labels: bool = bool(deduplicate_labels)
+        self.attach_score: bool = bool(attach_score)
+        self.attach_confidence: bool = bool(attach_confidence)
+        self.max_passage_chars: int = max(0, int(max_passage_chars))
+        self.max_header_chars: int = max(0, int(max_header_chars))
+        self.max_neighbor_chars: int = max(0, int(max_neighbor_chars))
+        self.high_confidence_threshold: float = hi_thr
+        self.low_confidence_threshold: float = lo_thr
+        self.system_prompt: str = str(system_prompt)
+        self.verdict_suffix: str = str(verdict_suffix)
+        self.fallback_on_error: bool = bool(fallback_on_error)
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._scorer is not None
+
+    def _get_scorer(self) -> Any:
+        sc = self._scorer
+        if sc is not None:
+            return sc
+        with self._lock:
+            sc = self._scorer
+            if sc is not None:
+                return sc
+            if self._scorer_factory is not None:
+                created = self._scorer_factory()
+                sc = self._wrap_if_engine(created)
+                self._scorer = sc
+                self._owns_scorer = True
+                return sc
+            from fast_decision_models.genrm import GenRMScorer
+
+            sc = GenRMScorer()
+            self._scorer = sc
+            self._owns_scorer = True
+            return sc
+
+    @staticmethod
+    def _wrap_if_engine(obj: Any) -> Any:
+        if callable(getattr(obj, "score_yes_no_logprob", None)) or (
+            callable(obj) and not hasattr(obj, "encode_chat")
+        ):
+            return obj
+        tok = getattr(obj, "tokenizer", None)
+        if tok is not None and hasattr(obj, "model") and callable(getattr(tok, "encode_chat", None)):
+            if "channel_open_id" in getattr(tok, "__dict__", {}) or type(tok).__name__.startswith("FastGemma4"):
+                raise TypeError(
+                    f"GenRMScorer requires a chat/logprob Qwen-compatible engine, got {type(obj).__name__!r}"
+                )
+            from fast_decision_models.genrm import GenRMScorer
+
+            return GenRMScorer(engine=obj)
+        if tok is not None and hasattr(obj, "model"):
+            raise TypeError(
+                f"GenRMRerankFusion engine wrapper requires tokenizer.encode_chat, got {type(obj).__name__!r}"
+            )
+        return obj
+
+    def _classify_decision(
+        self, score: float
+    ) -> Literal["high_confidence", "disambiguate", "low_confidence"]:
+        if score >= self.high_confidence_threshold:
+            return "high_confidence"
+        if score < self.low_confidence_threshold:
+            return "low_confidence"
+        return "disambiguate"
+
+    def format_candidate_prompt(self, query: str, cand: Mapping[str, Any]) -> str:
+        """Build a context-preserving verification prompt with document header and neighbors."""
+        doc_label = str(cand.get("label") or cand.get("id") or "document")
+        header = str(cand.get("header") or "").strip()
+        if self.max_header_chars > 0 and len(header) > self.max_header_chars:
+            header = header[: self.max_header_chars].strip()
+        prev_ctx = str(cand.get("prev_text") or "").strip()
+        if self.max_neighbor_chars > 0 and len(prev_ctx) > self.max_neighbor_chars:
+            prev_ctx = prev_ctx[-self.max_neighbor_chars :].strip()
+        next_ctx = str(cand.get("next_text") or "").strip()
+        if self.max_neighbor_chars > 0 and len(next_ctx) > self.max_neighbor_chars:
+            next_ctx = next_ctx[: self.max_neighbor_chars].strip()
+        passage = str(cand.get("definition") or cand.get("text") or "").strip()
+        if self.max_passage_chars > 0 and len(passage) > self.max_passage_chars:
+            passage = passage[: self.max_passage_chars].strip()
+
+        parts = [f"Query: {str(query or '').strip()}", f"Document: {doc_label}"]
+        if header and header != passage[: len(header)]:
+            parts.append(f"Document Header Anchor:\n{header}")
+        if prev_ctx:
+            parts.append(f"Context Immediately Before Target:\n{prev_ctx}")
+        parts.append(f"[TARGET PASSAGE]\n{passage}\n[/TARGET PASSAGE]")
+        if next_ctx:
+            parts.append(f"Context Immediately After Target:\n{next_ctx}")
+        parts.append(
+            "Question: Does [TARGET PASSAGE] directly answer, support, refute, or provide key evidence for the Query?"
+        )
+        return "\n\n".join(parts)
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        candidates: Sequence[Mapping[str, Any]],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Score up to ``max_rerank`` candidates with GenRM and return cards sorted descending."""
+        cand_list = [dict(c) for c in candidates]
+        if not cand_list:
+            return []
+        eff_limit = len(cand_list) if limit is None else max(0, min(int(limit), len(cand_list)))
+        if eff_limit == 0:
+            return []
+
+        rerank_n = min(self.max_rerank, len(cand_list))
+        head = cand_list[:rerank_n]
+        tail = cand_list[rerank_n:]
+
+        try:
+            scorer = self._wrap_if_engine(self._get_scorer())
+            prompt_head = head
+            if self.deduplicate_labels and len(head) > 1:
+                counts: dict[str, int] = {}
+                for c in head:
+                    lbl = str(c.get("label") or c.get("id") or "document")
+                    counts[lbl] = counts.get(lbl, 0) + 1
+                if any(cnt > 1 for cnt in counts.values()):
+                    prompt_head = []
+                    for pos, c in enumerate(head):
+                        lbl = str(c.get("label") or c.get("id") or "document")
+                        if counts[lbl] > 1:
+                            c_copy = dict(c)
+                            suffix = c.get("doc_idx", c.get("id", pos))
+                            c_copy["label"] = f"{lbl} [#{suffix}]"
+                            prompt_head.append(c_copy)
+                        else:
+                            prompt_head.append(c)
+            if callable(getattr(scorer, "score_yes_no_logprob", None)):
+                prompts = [self.format_candidate_prompt(query, c) for c in prompt_head]
+                raw_scores = scorer.score_yes_no_logprob(
+                    prompts,
+                    system_prompt=self.system_prompt,
+                    verdict_suffix=self.verdict_suffix,
+                )
+            elif callable(scorer):
+                raw_scores = scorer(query, prompt_head)
+            else:
+                raise TypeError(
+                    f"GenRMScorer / callable expected for GenRMRerankFusion, got {type(scorer).__name__!r}"
+                )
+            if len(raw_scores) != len(head):
+                raise ValueError(f"GenRM returned {len(raw_scores)} scores for {len(head)} candidates")
+            probs = [
+                float(min(1.0, max(0.0, s))) if math.isfinite(float(s)) else 0.5
+                for s in raw_scores
+            ]
+        except Exception:
+            if not self.fallback_on_error:
+                raise
+            return cand_list[:eff_limit]
+
+        w_g = 1.0 - self.prior_weight
+        scored_head: list[tuple[float, float, int, dict[str, Any]]] = []
+        for pos, (card, prob) in enumerate(zip(head, probs, strict=True)):
+            prior = 1.0 - (float(pos) / float(max(1, rerank_n)))
+            blended = w_g * prob + self.prior_weight * prior
+            if self.attach_score:
+                card["layaScore"] = prob
+                card["genrmScore"] = prob
+            if self.attach_confidence:
+                card["rerankConfidence"] = prob
+                card["rerankDecision"] = self._classify_decision(prob)
+            scored_head.append((blended, prob, -pos, card))
+
+        scored_head.sort(key=lambda tup: (-tup[0], -tup[1], -tup[2]))
+        ordered = [tup[3] for tup in scored_head] + tail
+        return ordered[:eff_limit]
+
+    def close(self) -> None:
+        sc = self._scorer
+        owns = self._owns_scorer
+        self._scorer = None
+        self._owns_scorer = False
+        if owns and sc is not None:
+            close_fn = getattr(sc, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    def __enter__(self) -> GenRMRerankFusion:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 class HybridRetrievalPipeline:
-    """Two/three-stage retrieval pipeline: Dense (``CompactRetrievalIndex``) + BM25 + RRF + Laya ANE rerank."""
+    """Multi-stage retrieval pipeline: Dense + BM25 + RRF + contextual MaxSim + Laya/GenRM rerank."""
 
     def __init__(
         self,
         *,
         dense_index: CompactRetrievalIndex,
         bm25_index: BM25Index,
+        maxsim_index: CompactRetrievalIndex | None = None,
         doc_texts: Sequence[str] | None = None,
         doc_ids: Sequence[str] | None = None,
         doc_titles: Sequence[str] | None = None,
+        doc_headers: Sequence[str] | None = None,
         reranker: Any | None = None,
         reranker_factory: Callable[[], Any] | None = None,
         rrf_k: float = 60.0,
@@ -597,10 +1094,18 @@ class HybridRetrievalPipeline:
         rerank_fallback_on_error: bool = False,
         agg: WindowAgg | None = None,
         hybrid_alpha: float | None = None,
+        margin_threshold: float = 0.04,
+        margin_gap_rank: int = 4,
+        rerank_margin_threshold: float | None = None,
+        neighbor_context_chars: int = 300,
     ) -> None:
         if bm25_index.num_docs != dense_index.num_docs:
             raise ValueError(
                 f"bm25_index.num_docs ({bm25_index.num_docs}) != dense_index.num_docs ({dense_index.num_docs})"
+            )
+        if maxsim_index is not None and maxsim_index.num_docs != dense_index.num_docs:
+            raise ValueError(
+                f"maxsim_index.num_docs ({maxsim_index.num_docs}) != dense_index.num_docs ({dense_index.num_docs})"
             )
         if reranker is not None and reranker_factory is not None:
             raise ValueError("Provide at most one of `reranker` or `reranker_factory`")
@@ -614,6 +1119,8 @@ class HybridRetrievalPipeline:
             raise ValueError(f"doc_ids length ({len(doc_ids)}) != num_docs ({n_docs})")
         if doc_titles is not None and len(doc_titles) != n_docs:
             raise ValueError(f"doc_titles length ({len(doc_titles)}) != num_docs ({n_docs})")
+        if doc_headers is not None and len(doc_headers) != n_docs:
+            raise ValueError(f"doc_headers length ({len(doc_headers)}) != num_docs ({n_docs})")
 
         eff_rrf_k = float(rrf_k)
         if not math.isfinite(eff_rrf_k) or eff_rrf_k <= 0.0:
@@ -627,6 +1134,7 @@ class HybridRetrievalPipeline:
             raise ValueError(f"agg must be one of {sorted(VALID_WINDOW_AGGS)}, got {agg!r}")
 
         self.dense_index: CompactRetrievalIndex = dense_index
+        self.maxsim_index: CompactRetrievalIndex | None = maxsim_index
         self.bm25_index: BM25Index = bm25_index
         self.doc_texts: tuple[str, ...] | None = (
             tuple(str(t) for t in doc_texts) if doc_texts is not None else None
@@ -638,6 +1146,9 @@ class HybridRetrievalPipeline:
         )
         self.doc_titles: tuple[str, ...] | None = (
             tuple(str(t) for t in doc_titles) if doc_titles is not None else None
+        )
+        self.doc_headers: tuple[str, ...] | None = (
+            tuple(str(h) for h in doc_headers) if doc_headers is not None else None
         )
 
         self.rrf_k: float = eff_rrf_k
@@ -654,6 +1165,12 @@ class HybridRetrievalPipeline:
         self.default_hybrid_alpha: float | None = (
             float(hybrid_alpha) if hybrid_alpha is not None else None
         )
+        self.margin_threshold: float = float(margin_threshold)
+        self.margin_gap_rank: int = _validate_positive_int(margin_gap_rank, "margin_gap_rank")
+        self.rerank_margin_threshold: float | None = (
+            float(rerank_margin_threshold) if rerank_margin_threshold is not None else None
+        )
+        self.neighbor_context_chars: int = max(0, int(neighbor_context_chars))
 
         self._reranker: Any | None = None
         self._reranker_factory: Callable[[], Any] | None = reranker_factory
@@ -705,8 +1222,13 @@ class HybridRetrievalPipeline:
         *,
         vectors: np.ndarray | CompactRetrievalIndex | None = None,
         encoder: Any | None = None,
+        maxsim_index: CompactRetrievalIndex | None = None,
+        sub_chunk_chars: int | None = None,
+        context_tokens: int = 4096,
+        repeat_header_tokens: int = 128,
         doc_ids: Sequence[str] | None = None,
         doc_titles: Sequence[str] | None = None,
+        doc_headers: Sequence[str] | None = None,
         doc_offsets: np.ndarray | Sequence[int] | None = None,
         window_texts: Sequence[str] | None = None,
         index_mode: IndexMode = "auto",
@@ -731,8 +1253,12 @@ class HybridRetrievalPipeline:
         rerank_prior_weight: float = 0.25,
         max_passage_chars: int = 600,
         rerank_fallback_on_error: bool = False,
+        margin_threshold: float = 0.04,
+        margin_gap_rank: int = 4,
+        rerank_margin_threshold: float | None = None,
+        neighbor_context_chars: int = 300,
     ) -> HybridRetrievalPipeline:
-        """Build dense ``CompactRetrievalIndex`` + ``BM25Index`` + optional Laya reranker from corpus texts."""
+        """Build dense ``CompactRetrievalIndex`` + ``BM25Index`` + optional MaxSim & Laya/GenRM reranker."""
         if isinstance(vectors, CompactRetrievalIndex):
             dense_idx = vectors
         elif vectors is not None:
@@ -762,6 +1288,22 @@ class HybridRetrievalPipeline:
         else:
             raise ValueError("Provide either `vectors` or `encoder` to HybridRetrievalPipeline.from_corpus")
 
+        eff_maxsim_idx = maxsim_index
+        if eff_maxsim_idx is None and sub_chunk_chars is not None and encoder is not None:
+            eff_maxsim_idx = build_contextual_subchunk_index(
+                encoder,
+                doc_texts,
+                doc_ids=doc_ids,
+                doc_titles=doc_titles,
+                sub_chunk_chars=int(sub_chunk_chars),
+                context_tokens=int(context_tokens),
+                repeat_header_tokens=int(repeat_header_tokens),
+                index_mode="int8" if index_mode == "auto" else index_mode,
+                agg=agg,
+                hybrid_alpha=hybrid_alpha,
+                use_neon=use_neon,
+            )
+
         bm25_texts = window_texts if (window_texts is not None and doc_offsets is not None) else doc_texts
         bm25_offsets = doc_offsets if (window_texts is not None and doc_offsets is not None) else None
         bm25_idx = BM25Index(
@@ -777,9 +1319,11 @@ class HybridRetrievalPipeline:
         return cls(
             dense_index=dense_idx,
             bm25_index=bm25_idx,
+            maxsim_index=eff_maxsim_idx,
             doc_texts=doc_texts,
             doc_ids=doc_ids,
             doc_titles=doc_titles,
+            doc_headers=doc_headers,
             reranker=reranker,
             reranker_factory=reranker_factory,
             rrf_k=rrf_k,
@@ -794,18 +1338,35 @@ class HybridRetrievalPipeline:
             rerank_fallback_on_error=rerank_fallback_on_error,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            margin_threshold=margin_threshold,
+            margin_gap_rank=margin_gap_rank,
+            rerank_margin_threshold=rerank_margin_threshold,
+            neighbor_context_chars=neighbor_context_chars,
         )
+
+    def _effective_maxsim_index(self) -> CompactRetrievalIndex:
+        return self.maxsim_index if self.maxsim_index is not None else self.dense_index
 
     def _resolve_mode(
         self, mode: RetrievalMode
-    ) -> Literal["dense", "bm25", "hybrid", "dense_rerank", "hybrid_rerank"]:
+    ) -> Literal[
+        "dense",
+        "bm25",
+        "hybrid",
+        "dense_rerank",
+        "hybrid_rerank",
+        "maxsim",
+        "margin_maxsim",
+        "maxsim_rerank",
+        "margin_maxsim_rerank",
+    ]:
         if mode not in VALID_RETRIEVAL_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_RETRIEVAL_MODES)}, got {mode!r}")
         if mode == "auto":
             if self.has_reranker and self.doc_texts is not None:
                 return "hybrid_rerank"
             return "hybrid"
-        if mode in ("hybrid_rerank", "dense_rerank"):
+        if mode in ("hybrid_rerank", "dense_rerank", "maxsim_rerank", "margin_maxsim_rerank"):
             if not self.has_reranker:
                 raise ValueError(f"mode={mode!r} requires `reranker` or `reranker_factory`")
             if self.doc_texts is None:
@@ -819,6 +1380,7 @@ class HybridRetrievalPipeline:
         deduplicate_labels: bool,
     ) -> list[dict[str, Any]]:
         assert self.doc_texts is not None
+        n_docs = len(self.doc_texts)
         candidates: list[dict[str, Any]] = []
         for doc_idx in doc_indices:
             doc_id = self.doc_ids[doc_idx]
@@ -827,14 +1389,32 @@ class HybridRetrievalPipeline:
                 label = f"{title} [#{doc_idx}]"
             else:
                 label = title
-            candidates.append(
-                {
-                    "id": doc_id,
-                    "doc_idx": int(doc_idx),
-                    "label": label,
-                    "definition": self.doc_texts[doc_idx],
-                }
-            )
+            card: dict[str, Any] = {
+                "id": doc_id,
+                "doc_idx": int(doc_idx),
+                "label": label,
+                "definition": self.doc_texts[doc_idx],
+            }
+            if self.doc_headers is not None:
+                card["header"] = self.doc_headers[doc_idx]
+            if self.neighbor_context_chars > 0:
+                if doc_idx > 0:
+                    prev_same = (
+                        self.doc_titles[doc_idx - 1] == self.doc_titles[doc_idx]
+                        if self.doc_titles is not None
+                        else (self.doc_ids[doc_idx - 1].split("#", 1)[0] == doc_id.split("#", 1)[0])
+                    )
+                    if prev_same:
+                        card["prev_text"] = self.doc_texts[doc_idx - 1][-self.neighbor_context_chars :]
+                if doc_idx + 1 < n_docs:
+                    next_same = (
+                        self.doc_titles[doc_idx + 1] == self.doc_titles[doc_idx]
+                        if self.doc_titles is not None
+                        else (self.doc_ids[doc_idx + 1].split("#", 1)[0] == doc_id.split("#", 1)[0])
+                    )
+                    if next_same:
+                        card["next_text"] = self.doc_texts[doc_idx + 1][: self.neighbor_context_chars]
+            candidates.append(card)
         return candidates
 
     def _rerank_candidates(
@@ -869,6 +1449,10 @@ class HybridRetrievalPipeline:
         reranked_head: list[tuple[int, float | None, str | None, float]] = []
         max_tail_sc = max((base_score_map[di] for di in tail_pool), default=0.0)
         head_offset = max_tail_sc + 1.0
+        is_genrm = isinstance(reranker, GenRMRerankFusion)
+        s1_vals = [float(sc) for _, sc in pool_scores[:eff_rr_k]]
+        s1_min = min(s1_vals, default=0.0)
+        s1_span = max(1e-6, max(s1_vals, default=0.0) - s1_min)
 
         for card in reranked_cards:
             di = int(card["doc_idx"])
@@ -882,12 +1466,17 @@ class HybridRetrievalPipeline:
                 mono_sc = head_offset + 2.0
             elif laya_sc is not None:
                 orig_pos = pos_by_doc.get(di, m)
-                prior = 1.0 - (float(orig_pos) / float(max(1, m)))
+                if is_genrm:
+                    prior = (base_score_map[di] - s1_min) / s1_span
+                else:
+                    prior = 1.0 - (float(orig_pos) / float(max(1, m)))
                 blended = w_laya * laya_sc + w_prior * prior
                 mono_sc = head_offset + blended
             else:
                 mono_sc = head_offset + (1.0 / float(1 + len(reranked_head)))
             reranked_head.append((di, laya_sc, str(decision) if decision is not None else None, mono_sc))
+        if is_genrm:
+            reranked_head.sort(key=lambda tup: (-tup[3], -(tup[1] if tup[1] is not None else -1.0)))
 
         for di in rerank_pool:
             if di not in seen_docs:
@@ -935,7 +1524,17 @@ class HybridRetrievalPipeline:
         q_list: list[str],
         query_vecs: np.ndarray | None,
         eff_k: int,
-        eff_mode: Literal["dense", "bm25", "hybrid", "dense_rerank", "hybrid_rerank"],
+        eff_mode: Literal[
+            "dense",
+            "bm25",
+            "hybrid",
+            "dense_rerank",
+            "hybrid_rerank",
+            "maxsim",
+            "margin_maxsim",
+            "maxsim_rerank",
+            "margin_maxsim_rerank",
+        ],
         *,
         dense_top_k: int | None,
         bm25_top_k: int | None,
@@ -955,7 +1554,16 @@ class HybridRetrievalPipeline:
         eff_agg = agg if agg is not None else self.default_agg
         eff_alpha = self.default_hybrid_alpha if hybrid_alpha is None else float(hybrid_alpha)
 
-        if eff_mode in ("dense", "hybrid", "dense_rerank", "hybrid_rerank"):
+        if eff_mode in (
+            "dense",
+            "hybrid",
+            "dense_rerank",
+            "hybrid_rerank",
+            "maxsim",
+            "margin_maxsim",
+            "maxsim_rerank",
+            "margin_maxsim_rerank",
+        ):
             if query_vecs is None:
                 raise ValueError(f"mode={eff_mode!r} requires `query_vecs`")
             q_arr = np.asarray(query_vecs)
@@ -996,6 +1604,68 @@ class HybridRetrievalPipeline:
                         )
             return d_idx, d_sc, details
 
+        if eff_mode in ("maxsim", "margin_maxsim"):
+            assert q_arr is not None
+            ms_idx_obj = self._effective_maxsim_index()
+            ms_agg: WindowAgg = agg if agg is not None else "maxsim"
+            if eff_mode == "maxsim":
+                m_idx, m_sc = ms_idx_obj.search(
+                    q_arr,
+                    k=eff_k,
+                    rerank_top_r=self.dense_rerank_top_r,
+                    agg=ms_agg,
+                    hybrid_alpha=eff_alpha,
+                )
+            else:
+                probe_k = min(self.num_docs, max(eff_k, self.margin_gap_rank + 1))
+                d_idx, d_sc = self.dense_index.search(
+                    q_arr,
+                    k=probe_k,
+                    rerank_top_r=self.dense_rerank_top_r,
+                    agg=eff_agg,
+                    hybrid_alpha=eff_alpha,
+                )
+                esc_mask, _ = compute_margin_escalation_mask(
+                    d_sc, margin_threshold=self.margin_threshold, margin_gap_rank=self.margin_gap_rank
+                )
+                m_idx = np.full((q_n, eff_k), -1, dtype=np.int32)
+                m_sc = np.full((q_n, eff_k), -1e30, dtype=np.float32)
+                take_d = min(eff_k, probe_k)
+                for qi in range(q_n):
+                    if not bool(esc_mask[qi]):
+                        m_idx[qi, :take_d] = d_idx[qi, :take_d]
+                        m_sc[qi, :take_d] = d_sc[qi, :take_d]
+                esc_rows = np.flatnonzero(esc_mask)
+                if esc_rows.size > 0:
+                    em_i, em_s = ms_idx_obj.search(
+                        q_arr[esc_rows],
+                        k=eff_k,
+                        rerank_top_r=self.dense_rerank_top_r,
+                        agg=ms_agg,
+                        hybrid_alpha=eff_alpha,
+                    )
+                    m_idx[esc_rows] = em_i
+                    m_sc[esc_rows] = em_s
+
+            if collect_details:
+                for qi in range(q_n):
+                    for r_pos in range(eff_k):
+                        di = int(m_idx[qi, r_pos])
+                        if di < 0:
+                            continue
+                        sc_v = float(m_sc[qi, r_pos])
+                        details[qi].append(
+                            HybridSearchHit(
+                                doc_idx=di,
+                                doc_id=self.doc_ids[di],
+                                score=sc_v,
+                                rrf_score=0.0,
+                                dense_score=sc_v,
+                                dense_rank=r_pos + 1,
+                            )
+                        )
+            return m_idx, m_sc, details
+
         if eff_mode == "bm25":
             b_idx, b_sc = self.bm25_index.search(
                 q_list,
@@ -1027,7 +1697,7 @@ class HybridRetrievalPipeline:
         eff_rr_k = _validate_positive_int(
             self.rerank_top_k if rerank_top_k is None else rerank_top_k, "rerank_top_k"
         )
-        uses_rerank = eff_mode in ("hybrid_rerank", "dense_rerank")
+        uses_rerank = eff_mode in ("hybrid_rerank", "dense_rerank", "maxsim_rerank", "margin_maxsim_rerank")
         base_pool = max(eff_k, eff_rr_k if uses_rerank else eff_k)
 
         reranker = self._get_reranker() if uses_rerank else None
@@ -1035,16 +1705,50 @@ class HybridRetrievalPipeline:
         w_prior = float(getattr(reranker, "prior_weight", self.rerank_prior_weight)) if reranker is not None else 0.0
         w_laya = 1.0 - w_prior
 
-        if eff_mode == "dense_rerank":
+        if eff_mode in ("dense_rerank", "maxsim_rerank", "margin_maxsim_rerank"):
             assert reranker is not None
-            eff_d_k = min(self.num_docs, base_pool)
-            d_idx, d_sc = self.dense_index.search(
-                q_arr,
-                k=eff_d_k,
-                rerank_top_r=max(self.dense_rerank_top_r, eff_d_k),
-                agg=eff_agg,
-                hybrid_alpha=eff_alpha,
+            need_margin = (eff_mode == "margin_maxsim_rerank") or (
+                eff_mode == "maxsim_rerank" and self.rerank_margin_threshold is not None
             )
+            eff_d_k = min(
+                self.num_docs,
+                max(base_pool, self.margin_gap_rank + 1) if need_margin else base_pool,
+            )
+            if eff_mode == "dense_rerank":
+                d_idx, d_sc = self.dense_index.search(
+                    q_arr,
+                    k=eff_d_k,
+                    rerank_top_r=max(self.dense_rerank_top_r, eff_d_k),
+                    agg=eff_agg,
+                    hybrid_alpha=eff_alpha,
+                )
+                esc_mask = np.ones((q_n,), dtype=bool)
+            else:
+                ms_idx_obj = self._effective_maxsim_index()
+                ms_agg: WindowAgg = agg if agg is not None else "maxsim"
+                d_idx, d_sc = ms_idx_obj.search(
+                    q_arr,
+                    k=eff_d_k,
+                    rerank_top_r=max(self.dense_rerank_top_r, eff_d_k),
+                    agg=ms_agg,
+                    hybrid_alpha=eff_alpha,
+                )
+                if eff_mode == "maxsim_rerank" and self.rerank_margin_threshold is None:
+                    esc_mask = np.ones((q_n,), dtype=bool)
+                else:
+                    rr_tau = (
+                        0.065 if self.rerank_margin_threshold is None else float(self.rerank_margin_threshold)
+                    )
+                    esc_mask, _ = compute_margin_escalation_mask(
+                        d_sc, margin_threshold=rr_tau, margin_gap_rank=self.margin_gap_rank
+                    )
+                    for qi in range(q_n):
+                        valid_cnt = int(
+                            np.sum((d_idx[qi] >= 0) & np.isfinite(d_sc[qi]) & (d_sc[qi] > -1e20))
+                        )
+                        if valid_cnt <= 1:
+                            esc_mask[qi] = True
+
             for qi in range(q_n):
                 pool_scores: list[tuple[int, float]] = []
                 d_rank_map: dict[int, tuple[int, float]] = {}
@@ -1055,6 +1759,24 @@ class HybridRetrievalPipeline:
                         d_rank_map[di_int] = (r_pos, sc_f)
                         pool_scores.append((di_int, sc_f))
                 if not pool_scores:
+                    continue
+                if not bool(esc_mask[qi]):
+                    take = min(eff_k, len(pool_scores))
+                    out_idx[qi, :take] = [di for di, _ in pool_scores[:take]]
+                    out_sc[qi, :take] = np.asarray([sc for _, sc in pool_scores[:take]], dtype=np.float32)
+                    if collect_details:
+                        details[qi] = [
+                            HybridSearchHit(
+                                doc_idx=di,
+                                doc_id=self.doc_ids[di],
+                                score=float(sc),
+                                rrf_score=0.0,
+                                dense_score=float(sc),
+                                dense_rank=pos + 1,
+                                rerank_decision="margin_bypass",
+                            )
+                            for pos, (di, sc) in enumerate(pool_scores[:take])
+                        ]
                     continue
                 r_ids, r_scs, r_hits = self._rerank_candidates(
                     query_text=q_list[qi],
@@ -1252,12 +1974,17 @@ class HybridRetrievalPipeline:
 
 __all__ = [
     "BM25Index",
+    "DEFAULT_GENRM_RERANK_SYSTEM",
     "ENGLISH_STOPWORDS",
+    "GenRMRerankFusion",
     "HybridRetrievalPipeline",
     "HybridSearchHit",
     "RetrievalMode",
     "VALID_RETRIEVAL_MODES",
+    "build_contextual_subchunk_index",
+    "compute_margin_escalation_mask",
     "rrf_fuse",
     "rrf_fuse_batch",
+    "split_subchunk_spans",
     "tokenize_lexical",
 ]

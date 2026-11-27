@@ -61,6 +61,34 @@ class GenerationItem:
     valid_schema: bool
     finish_reason: str
     telemetry: list[dict[str, float]] | None = None
+    reasoning: str | None = None
+
+
+def _decode_answer_and_reasoning(tokenizer: Any, full_out_ids: Sequence[int]) -> tuple[str, str | None, list[int]]:
+    dec_fn = getattr(tokenizer, "decode_answer_and_reasoning", None)
+    if callable(dec_fn):
+        return dec_fn(full_out_ids)
+    return str(tokenizer.decode(list(full_out_ids), skip_special_tokens=True)), None, list(full_out_ids)
+
+
+def _compute_lcp_and_suffixes(seqs: Sequence[Sequence[int]]) -> tuple[list[int], list[list[int]]]:
+    """Split token sequences into `(sys_ids, suf_ids_list)` leaving `>= 1` token per suffix."""
+    if not seqs:
+        return [], []
+    if len(seqs) == 1:
+        s0 = [int(t) for t in seqs[0]]
+        cut = max(0, len(s0) - 1)
+        return s0[:cut], [s0[cut:]]
+    lcp = min(len(x) for x in seqs)
+    for k in range(lcp):
+        t0_k = int(seqs[0][k])
+        if any(int(x[k]) != t0_k for x in seqs[1:]):
+            lcp = k
+            break
+    min_len = min(len(x) for x in seqs)
+    if lcp >= min_len:
+        lcp = max(0, min_len - 1)
+    return [int(t) for t in seqs[0][:lcp]], [[int(t) for t in x[lcp:]] for x in seqs]
 
 
 @dataclass
@@ -1320,7 +1348,7 @@ class FastGemma4Engine:
 
             g_toks = list(dec_res["gen_toks"][0])
             full_out_ids = upfront_ff + g_toks
-            txt = self.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+            txt, reasoning_text, _ = _decode_answer_and_reasoning(self.tokenizer, full_out_ids)
             parsed = None
             is_json = False
             is_schema = grammar is None
@@ -1368,6 +1396,7 @@ class FastGemma4Engine:
                 valid_schema=is_schema,
                 finish_reason=finish_reason,
                 telemetry=None,
+                reasoning=reasoning_text,
             )
 
     def generate_multimodal_batch(
@@ -1782,7 +1811,7 @@ class FastGemma4Engine:
                 g_d = list(gen_toks_all[d])
                 full_out_ids = upfront_lists[d] + g_d
                 doc_g = resolved_grammars[d] if resolved_grammars is not None else grammar
-                txt = self.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+                txt, reasoning_text, _ = _decode_answer_and_reasoning(self.tokenizer, full_out_ids)
                 parsed = None
                 is_json = False
                 is_schema = doc_g is None
@@ -1820,6 +1849,7 @@ class FastGemma4Engine:
                         valid_schema=is_schema,
                         finish_reason=finish_reason,
                         telemetry=telem_d,
+                        reasoning=reasoning_text,
                     )
                 )
 
@@ -1871,6 +1901,8 @@ class FastGemma4Engine:
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
+        thinking_budget_tokens: int | None = None,
+        answer_max_tokens: int | None = None,
         whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         kv_i8: bool | str | None = None,
@@ -1892,7 +1924,7 @@ class FastGemma4Engine:
                 use_chat_template=use_chat_template,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
-                reasoning_budget=reasoning_budget,
+                reasoning_budget=thinking_budget_tokens if thinking_budget_tokens is not None else reasoning_budget,
                 whitespace_flexible=whitespace_flexible,
                 max_whitespace_run=max_whitespace_run,
                 max_soft_tokens=max_soft_tokens,
@@ -1911,6 +1943,8 @@ class FastGemma4Engine:
             enable_thinking=enable_thinking,
             reasoning_effort=reasoning_effort,
             reasoning_budget=reasoning_budget,
+            thinking_budget_tokens=thinking_budget_tokens,
+            answer_max_tokens=answer_max_tokens,
             whitespace_flexible=whitespace_flexible,
             max_whitespace_run=max_whitespace_run,
             kv_i8=kv_i8,
@@ -1944,11 +1978,17 @@ class FastGemma4Engine:
         override_memory_cap: bool = False,
         collect_telemetry: bool = False,
         collect_valid_lse: bool = False,
+        mode: str | None = None,
+        cache_prefix: bool = True,
         **_compat_kwargs: Any,
     ) -> dict[str, Any]:
         """Thread-safe GPU (+ optional Hybrid ANE) rolling decode entrypoint."""
         with self._gpu_lock:
-            pkv = self.get_prefix_kv(sys_ids)
+            pkv = (
+                self.get_prefix_kv(sys_ids)
+                if cache_prefix
+                else self.model.prefill_prefix(tuple(int(x) for x in sys_ids))
+            )
             has_schema = (gh is not None) or (
                 per_doc_grammars is not None and any(g is not None for g in per_doc_grammars)
             )
@@ -1972,6 +2012,7 @@ class FastGemma4Engine:
                 use_ane_ring=use_ane_ring,
                 kv_i8=eff_kv_i8,
                 ane_cohort_size=ane_cohort_size,
+                mode=mode or "auto",
             )
             extra_kw: dict[str, Any] = {}
             if collect_telemetry or collect_valid_lse:
@@ -2003,6 +2044,200 @@ class FastGemma4Engine:
                 **extra_kw,
             )
 
+    def _generate_two_pass_bounded_thinking(
+        self,
+        prompts: Sequence[PromptInput],
+        *,
+        system_prompt: str | None,
+        thinking_budget: int,
+        answer_budget: int,
+        temperature: float,
+        top_p: float,
+        seed: int,
+        mode: str | None,
+        speculative: bool | None,
+        batch_size: int | None,
+        compact: bool,
+        use_chat_template: bool,
+        reasoning_effort: str | None,
+        use_ane_ring: bool | str,
+        ane_cohort_size: int,
+        enable_ff_jump: bool,
+        kv_i8: bool | str | None,
+        profile: str | None,
+    ) -> GenerationBatchResult:
+        """Run rolling Pass-1 thinking up to `thinking_budget`, then close unclosed `<|channel>` and decode `answer_budget`."""
+        t0 = time.perf_counter()
+        n_docs = len(prompts)
+        prompt1_ids = self.encode_prompts(
+            prompts,
+            system_prompt=system_prompt,
+            use_chat_template=use_chat_template,
+            enable_thinking=True,
+        )
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        if bos_id is not None:
+            prompt1_ids = [x if x else [int(bos_id)] for x in prompt1_ids]
+        res1 = self.generate_batch(
+            prompts,
+            system_prompt=system_prompt,
+            max_tokens=int(thinking_budget),
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            mode=mode,
+            speculative=speculative,
+            batch_size=batch_size,
+            compact=compact,
+            use_chat_template=use_chat_template,
+            enable_thinking=True,
+            reasoning_effort=reasoning_effort,
+            reasoning_budget=None,
+            thinking_budget_tokens=None,
+            use_ane_ring=use_ane_ring,
+            ane_cohort_size=ane_cohort_size,
+            enable_ff_jump=enable_ff_jump,
+            kv_i8=kv_i8,
+            profile=profile,
+        )
+
+        open_id = getattr(self.tokenizer, "channel_open_id", None)
+        close_id = getattr(self.tokenizer, "channel_close_id", None)
+        close_fn = getattr(self.tokenizer, "encode_channel_close_suffix", None)
+        close_suffix = (
+            list(close_fn())
+            if callable(close_fn)
+            else list(self.tokenizer.encode("\n<channel|>", add_special_tokens=False))
+        )
+        stop_ids = getattr(self.tokenizer, "stop_token_ids", frozenset())
+
+        items_out: list[GenerationItem | None] = [None] * n_docs
+        pass2_indices: list[int] = []
+        pass2_prompts: list[list[int]] = []
+        pass2_prefixes: list[list[int]] = []
+        pass2_injected_counts: list[int] = []
+        pass2_forced_close = 0
+
+        for d, it1 in enumerate(res1.items):
+            if it1.finish_reason != "length" or int(answer_budget) <= 0:
+                items_out[d] = it1
+                continue
+            g1 = list(it1.token_ids)
+            last_open = (
+                (len(g1) - 1 - g1[::-1].index(int(open_id)))
+                if (open_id is not None and int(open_id) in g1)
+                else -1
+            )
+            last_close = (
+                (len(g1) - 1 - g1[::-1].index(int(close_id)))
+                if (close_id is not None and int(close_id) in g1)
+                else -1
+            )
+            if last_open > last_close:
+                prefix = g1 + close_suffix
+                injected_n = len(close_suffix)
+                pass2_forced_close += 1
+            else:
+                prefix = g1
+                injected_n = 0
+            pass2_indices.append(d)
+            pass2_prompts.append(list(prompt1_ids[d]) + prefix)
+            pass2_prefixes.append(prefix)
+            pass2_injected_counts.append(injected_n)
+
+        pass2_dec_sec = 0.0
+        pass2_pre_sec = 0.0
+        pass2_out_tok = 0
+        pass2_ane = False
+        if pass2_indices and int(answer_budget) > 0:
+            if callable(getattr(mx, "clear_cache", None)):
+                mx.clear_cache()
+            sys_ids, suf_ids_list = _compute_lcp_and_suffixes(pass2_prompts)
+            cap_b = int(batch_size) if batch_size is not None else int(getattr(self, "default_max_b_slots", 256))
+            roll2 = self.run_rolling(
+                sys_ids=sys_ids,
+                suf_ids_list=suf_ids_list,
+                max_tokens=int(answer_budget),
+                B_slots=min(max(1, cap_b), len(pass2_indices)),
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                kv_i8=kv_i8,
+                use_ane_ring=use_ane_ring,
+                ane_cohort_size=ane_cohort_size,
+                enable_ff_jump=enable_ff_jump,
+                mode=mode,
+                cache_prefix=(len(pass2_indices) > 1),
+            )
+            pass2_pre_sec = float(roll2.get("prefill_sec", 0.0) or 0.0)
+            pass2_dec_sec = float(roll2.get("decode_sec", 0.0) or 0.0)
+            pass2_out_tok = int(roll2.get("tot_out_tok", 0) or 0)
+            pass2_ane = bool(roll2.get("used_ane_ring", False))
+            for j, d in enumerate(pass2_indices):
+                g2 = [int(t) for t in roll2["gen_toks"][j]]
+                full_out_ids = pass2_prefixes[j] + g2
+                txt, reasoning_text, _ = _decode_answer_and_reasoning(self.tokenizer, full_out_ids)
+                parsed = None
+                is_json = False
+                try:
+                    parsed = json.loads(txt)
+                    is_json = True
+                except Exception:
+                    pass
+                stopped = bool(g2) and (g2[-1] in stop_ids)
+                finish_reason = "length" if (len(g2) >= int(answer_budget) and not stopped) else "stop"
+                items_out[d] = GenerationItem(
+                    text=txt,
+                    parsed=parsed,
+                    token_ids=full_out_ids,
+                    prompt_tokens=len(prompt1_ids[d]),
+                    completion_tokens=len(full_out_ids) - pass2_injected_counts[j],
+                    valid_json=is_json,
+                    valid_schema=True,
+                    finish_reason=finish_reason,
+                    telemetry=None,
+                    reasoning=reasoning_text,
+                )
+
+        final_items = [it for it in items_out if it is not None]
+        elapsed = time.perf_counter() - t0
+        tot_prompt = sum(it.prompt_tokens for it in final_items)
+        tot_dec_sec = float(res1.stats.get("decode_sec", 0.0) or 0.0) + pass2_dec_sec
+        tot_pre_sec = float(res1.stats.get("prefill_sec", 0.0) or 0.0) + pass2_pre_sec
+        tot_out_tok = int(res1.stats.get("completion_tokens", 0) or 0) + pass2_out_tok
+        valid_json_cnt = sum(1 for it in final_items if it.valid_json)
+        valid_schema_cnt = sum(1 for it in final_items if it.valid_schema)
+        mode_used = (
+            "hetero_ane_gpu"
+            if (res1.stats.get("mode_used") == "hetero_ane_gpu" or pass2_ane)
+            else "gpu"
+        )
+        stats = dict(res1.stats)
+        stats.update(
+            {
+                "mode_used": mode_used,
+                "two_pass_thinking": True,
+                "thinking_budget": int(thinking_budget),
+                "answer_max_tokens": int(answer_budget),
+                "pass1_done_count": sum(1 for it in res1.items if it.finish_reason != "length"),
+                "pass2_count": len(pass2_indices),
+                "pass2_forced_close": pass2_forced_close,
+                "injected_close_tokens": sum(pass2_injected_counts),
+                "prompt_tokens": tot_prompt,
+                "completion_tokens": tot_out_tok,
+                "valid_json_count": valid_json_cnt,
+                "valid_schema_count": valid_schema_cnt,
+                "prefill_sec": tot_pre_sec,
+                "decode_sec": tot_dec_sec,
+                "elapsed_sec": elapsed,
+                "decode_tok_s": tot_out_tok / max(tot_dec_sec, 1e-9),
+                "total_tok_s": (tot_prompt + tot_out_tok) / max(elapsed, 1e-9),
+                "docs_per_sec": n_docs / max(elapsed, 1e-9),
+                "peak_gb": mx.get_peak_memory() / (1024**3),
+            }
+        )
+        return GenerationBatchResult(items=final_items, stats=stats)
+
     def generate_batch(
         self,
         prompts: Sequence[PromptInput],
@@ -2021,6 +2256,8 @@ class FastGemma4Engine:
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
+        thinking_budget_tokens: int | None = None,
+        answer_max_tokens: int | None = None,
         whitespace_flexible: bool | None = None,
         max_whitespace_run: int | None = None,
         per_doc_grammars: Sequence[str | dict[str, Any] | Any | None] | None = None,
@@ -2060,7 +2297,7 @@ class FastGemma4Engine:
                     use_chat_template=use_chat_template,
                     enable_thinking=enable_thinking,
                     reasoning_effort=reasoning_effort,
-                    reasoning_budget=reasoning_budget,
+                    reasoning_budget=thinking_budget_tokens if thinking_budget_tokens is not None else reasoning_budget,
                     whitespace_flexible=whitespace_flexible,
                     max_whitespace_run=max_whitespace_run,
                     max_soft_tokens=max_soft_tokens,
@@ -2082,12 +2319,46 @@ class FastGemma4Engine:
         else:
             eff_spec = speculative
 
+        raw_two_pass = thinking_budget_tokens
+        eff_two_pass_budget = (
+            int(raw_two_pass) if (raw_two_pass is not None and int(raw_two_pass) > 0) else None
+        )
         eff_thinking = bool(enable_thinking)
         if not eff_thinking and json_schema is None and per_doc_grammars is None:
             if reasoning_effort is not None and str(reasoning_effort).strip().lower() not in ("", "none", "skip", "off", "0"):
                 eff_thinking = True
-            elif reasoning_budget is not None and int(reasoning_budget) > 0:
+            elif eff_two_pass_budget is not None or (reasoning_budget is not None and int(reasoning_budget) > 0):
                 eff_thinking = True
+
+        if (
+            eff_thinking
+            and eff_two_pass_budget is not None
+            and json_schema is None
+            and per_doc_grammars is None
+            and not collect_telemetry
+            and not collect_valid_lse
+        ):
+            eff_answer_budget = int(answer_max_tokens) if answer_max_tokens is not None else int(max_tokens)
+            return self._generate_two_pass_bounded_thinking(
+                prompts,
+                system_prompt=system_prompt,
+                thinking_budget=eff_two_pass_budget,
+                answer_budget=eff_answer_budget,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                mode=mode,
+                speculative=eff_spec,
+                batch_size=batch_size,
+                compact=compact,
+                use_chat_template=use_chat_template,
+                reasoning_effort=reasoning_effort,
+                use_ane_ring=use_ane_ring,
+                ane_cohort_size=ane_cohort_size,
+                enable_ff_jump=enable_ff_jump,
+                kv_i8=kv_i8,
+                profile=profile,
+            )
 
         with self._gpu_lock:
             t_all0 = time.perf_counter()
@@ -2545,7 +2816,7 @@ class FastGemma4Engine:
                 g_toks = all_gen_toks[idx]
                 doc_g = resolved_grammars[idx] if resolved_grammars is not None else grammar
                 full_out_ids = upfront_by_doc[idx] + g_toks
-                txt = self.tokenizer.decode(full_out_ids, skip_special_tokens=True)
+                txt, reasoning_text, _ = _decode_answer_and_reasoning(self.tokenizer, full_out_ids)
                 parsed = None
                 is_json = False
                 is_schema = doc_g is None
@@ -2574,6 +2845,7 @@ class FastGemma4Engine:
                         valid_schema=is_schema,
                         finish_reason=finish_reason,
                         telemetry=all_telemetry[idx],
+                        reasoning=reasoning_text,
                     )
                 )
 
