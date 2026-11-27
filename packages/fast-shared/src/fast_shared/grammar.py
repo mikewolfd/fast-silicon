@@ -93,20 +93,55 @@ def _sample_from_logits(
     if temperature <= 0.0:
         best = safe_argmax_1d(logits_1d)
         return int(new_to_old[best]) if best >= 0 else -1
+    if bool(np.isnan(logits_1d).any()):
+        return -1
     gen = rng if rng is not None else np.random.default_rng()
-    scaled = logits_1d.astype(np.float64) / float(temperature)
-    scaled -= np.max(scaled)
+    eff_t = float(temperature)
+    max_logit = float(np.max(logits_1d))
+    if not np.isfinite(max_logit):
+        best = safe_argmax_1d(logits_1d)
+        return int(new_to_old[best]) if best >= 0 else -1
+
+    # Exact top-K argpartition fast path: when top_p < 1.0 and top-256 already covers
+    # strictly >= top_p mass (with zero boundary ties), sort only 256 items instead of 248K.
+    n_vocab = int(logits_1d.shape[0])
+    p_top = float(top_p)
+    if p_top < 1.0 and n_vocab > 256:
+        k_sub = 256
+        top_idx = np.argpartition(logits_1d, n_vocab - k_sub)[n_vocab - k_sub :]
+        top_scaled = (logits_1d[top_idx].astype(np.float64) - max_logit) / eff_t
+        top_exp = np.exp(top_scaled)
+        # Compute exact full-vocab partition sum Z in float32/float64 only when needed.
+        scaled_all = (logits_1d.astype(np.float32) - np.float32(max_logit)) / np.float32(eff_t)
+        total_sum = float(np.sum(np.exp(scaled_all), dtype=np.float64))
+        if np.isfinite(total_sum) and total_sum > 0.0:
+            sub_probs = top_exp / total_sum
+            sub_order = np.lexsort((top_idx, -sub_probs))
+            sorted_sub_p = sub_probs[sub_order]
+            # Exclude the entire boundary tie group so argpartition ties never bias selection.
+            strict_n = int(np.sum(sorted_sub_p > sorted_sub_p[-1]))
+            if strict_n >= 1 and float(np.sum(sorted_sub_p[:strict_n])) > p_top:
+                cdf = np.cumsum(sorted_sub_p[:strict_n])
+                cutoff = int(np.searchsorted(cdf, p_top, side="right")) + 1
+                keep_n = max(1, min(cutoff, strict_n))
+                keep = top_idx[sub_order[:keep_n]]
+                keep_p = sorted_sub_p[:keep_n]
+                keep_p = keep_p / float(keep_p.sum())
+                j = int(gen.choice(keep, p=keep_p))
+                return int(new_to_old[j])
+
+    scaled = (logits_1d.astype(np.float64) - max_logit) / eff_t
     probs = np.exp(scaled)
     s = float(probs.sum())
     if not np.isfinite(s) or s <= 0.0:
         best = safe_argmax_1d(logits_1d)
         return int(new_to_old[best]) if best >= 0 else -1
     probs /= s
-    if top_p < 1.0:
+    if p_top < 1.0:
         order = np.argsort(-probs)
         sorted_p = probs[order]
         cdf = np.cumsum(sorted_p)
-        cutoff = int(np.searchsorted(cdf, top_p, side="right")) + 1
+        cutoff = int(np.searchsorted(cdf, p_top, side="right")) + 1
         keep = order[: max(1, cutoff)]
         sub_p = probs[keep]
         sub_p /= sub_p.sum()
@@ -131,6 +166,89 @@ def sample_unconstrained(
         best = safe_argmax_1d(logits_1d)
         return int(new_to_old[best]) if best >= 0 else -1
     return _sample_from_logits(logits_1d, new_to_old, temperature=temperature, top_p=top_p, rng=rng)
+
+
+def try_sample_topk_row(
+    top_idx: np.ndarray,
+    top_vals: np.ndarray,
+    lse: float,
+    new_to_old: np.ndarray,
+    *,
+    temperature: float,
+    top_p: float = 1.0,
+    rng: np.random.Generator | None = None,
+) -> int | None:
+    """Exact top-K nucleus/categorical sample from GPU top-K stats; return None if fallback needed."""
+    eff_t = float(temperature)
+    if (
+        eff_t <= 0.0
+        or not np.isfinite(eff_t)
+        or not np.isfinite(lse)
+        or top_vals.size < 2
+        or bool(np.isnan(top_vals).any())
+        or not bool(np.all(np.isfinite(top_vals)))
+    ):
+        return None
+    probs = np.exp(top_vals.astype(np.float64) / eff_t - float(lse))
+    if not bool(np.all(np.isfinite(probs))):
+        return None
+    order = np.lexsort((top_idx, -probs))
+    sorted_p = probs[order]
+    sorted_idx = top_idx[order]
+    p_top = float(top_p)
+    # Exclude the entire boundary tie group so argpartition ties never bias nucleus selection.
+    strict_n = int(np.sum(sorted_p > sorted_p[-1]))
+    if p_top < 1.0:
+        if strict_n < 1 or float(np.sum(sorted_p[:strict_n])) <= p_top:
+            return None
+        cdf = np.cumsum(sorted_p[:strict_n])
+        cutoff = int(np.searchsorted(cdf, p_top, side="right")) + 1
+        keep_n = max(1, min(cutoff, strict_n))
+        keep = sorted_idx[:keep_n]
+        sub_p = sorted_p[:keep_n]
+        sub_sum = float(sub_p.sum())
+        if not np.isfinite(sub_sum) or sub_sum <= 0.0:
+            return None
+        sub_p = sub_p / sub_sum
+        gen = rng if rng is not None else np.random.default_rng()
+        j = int(gen.choice(keep, p=sub_p))
+        return int(new_to_old[j]) if 0 <= j < len(new_to_old) else None
+
+    # Unclipped categorical (top_p >= 1.0): accept only when tail mass outside top-K is negligible.
+    if float(np.sum(sorted_p[:-1])) < 0.9999:
+        return None
+    sub_sum = float(sorted_p.sum())
+    if not np.isfinite(sub_sum) or sub_sum <= 0.0:
+        return None
+    sub_p = sorted_p / sub_sum
+    gen = rng if rng is not None else np.random.default_rng()
+    j = int(gen.choice(sorted_idx, p=sub_p))
+    return int(new_to_old[j]) if 0 <= j < len(new_to_old) else None
+
+
+def gather_topk_stats_mlx(
+    logits_2d: Any,
+    *,
+    temperature: float,
+    top_k: int = 128,
+    sync_arrays: tuple[Any, ...] = (),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Gather compact `[M, top_k]` `(top_idx, top_vals, lse)` on GPU, avoiding full-vocab host copies."""
+    import mlx.core as mx
+
+    eff_t = float(temperature)
+    if not np.isfinite(eff_t) or eff_t <= 0.0 or not hasattr(mx, "argpartition") or not hasattr(mx, "logsumexp"):
+        return None
+    v_dim = int(logits_2d.shape[-1])
+    k_eff = min(max(2, int(top_k)), v_dim)
+    if v_dim <= k_eff:
+        return None
+    sl_f32 = logits_2d.astype(mx.float32)
+    lse_mx = mx.logsumexp(sl_f32 / eff_t, axis=-1)
+    top_idx_mx = mx.argpartition(-sl_f32, kth=k_eff - 1, axis=-1)[:, :k_eff]
+    top_vals_mx = mx.take_along_axis(sl_f32, top_idx_mx, axis=-1)
+    mx.eval(*sync_arrays, top_idx_mx, top_vals_mx, lse_mx)  # guard: allow-eval
+    return np.asarray(top_idx_mx), np.asarray(top_vals_mx), np.asarray(lse_mx)
 
 
 def _import_llguidance():
@@ -515,8 +633,10 @@ __all__ = [
     "apply_loop_breaker_penalties_1d",
     "compute_loop_breaker_penalties",
     "detect_catastrophic_token_loop",
+    "gather_topk_stats_mlx",
     "normalize_json_schema",
     "safe_argmax_1d",
     "sample_unconstrained",
+    "try_sample_topk_row",
     "validate_json_against_schema",
 ]

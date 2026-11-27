@@ -100,10 +100,21 @@ from .fault_injection import (
 )
 from .grammar import (
     detect_catastrophic_token_loop,
+    gather_topk_stats_mlx,
     normalize_json_schema,
     safe_argmax_1d,
     sample_unconstrained,
+    try_sample_topk_row,
     validate_json_against_schema,
+)
+from .self_consistency import (
+    SelfConsistencyBatchResult,
+    SelfConsistencySelection,
+    canonical_json_key,
+    extract_choice_letter,
+    generate_self_consistent,
+    select_majority_answer,
+    select_majority_json,
 )
 from .hf import DEFAULT_TOKENIZER_FILES, copy_tokenizer_files, resolve_hf_model_dir
 from .hybrid_retrieval import (
@@ -443,6 +454,8 @@ __all__ = [
     "RetrievalMode",
     "SUPPORTED_APPLE_SILICON_PROFILES",
     "ScoreMode",
+    "SelfConsistencyBatchResult",
+    "SelfConsistencySelection",
     "SiliconBudget",
     "SpecBucketedLinearGroup",
     "SpeculativePolicy",
@@ -475,6 +488,7 @@ __all__ = [
     "build_rerank_noul_qdef",
     "build_sylvester_hadamard",
     "build_text_completion",
+    "canonical_json_key",
     "check_coreml_mil_program",
     "check_coreml_model",
     "check_coreml_paths",
@@ -511,6 +525,7 @@ __all__ = [
     "eval_ffn_fp32_ref",
     "eval_ffn_w8a8",
     "export_pack_concept_texts",
+    "extract_choice_letter",
     "extract_coreml_compute_plan_ops",
     "extract_extractconf_features",
     "extract_json_schema",
@@ -524,6 +539,8 @@ __all__ = [
     "format_hardware_warning",
     "fused_geglu_split",
     "fused_quantized_sdpa",
+    "gather_topk_stats_mlx",
+    "generate_self_consistent",
     "get_engine_lock",
     "get_hadamard_bank",
     "get_or_pack_affine_module_weights",
@@ -593,6 +610,8 @@ __all__ = [
     "sample_unconstrained",
     "schema_cache_key",
     "score_document_windows",
+    "select_majority_answer",
+    "select_majority_json",
     "select_speculative_policy",
     "set_fd_nocache",
     "set_mlx_cache_limit",
@@ -611,6 +630,7 @@ __all__ = [
     "tile_aligned_slices",
     "tokenize_lexical",
     "truncate_and_normalize",
+    "try_sample_topk_row",
     "validate_export_quant_dtypes",
     "validate_grpo_ane_offload",
     "validate_json_against_schema",

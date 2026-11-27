@@ -24,6 +24,8 @@ from .ane_pipeline import (
     is_w8_bundle_calibrated,
     validate_slot_kv_scales_finite,
 )
+from fast_shared.grammar import gather_topk_stats_mlx, try_sample_topk_row
+
 from .grammar import GrammarHelper, sample_unconstrained
 from .model import FastGemma4Model, safe_argmax_with_nan_guard
 
@@ -397,6 +399,54 @@ def run_decode_batch(
             """Sample `row_indices` from `[len(active), V_eff]` logits, copying float32 rows only when needed."""
             last_x = cache.get("_last_x_in")
             if temperature > 0.0:
+                gathered = gather_topk_stats_mlx(logits_2d, temperature=temperature, top_k=128) if grammar is None else None
+                if gathered is not None:
+                    ti_arr, tv_arr, lse_arr = gathered
+                    fb_rows_k: list[tuple[int, dict[int, float]]] = []
+                    for r in row_indices:
+                        b = active[r]
+                        pen = _row_repeat_penalties(b, constrained=False)
+                        if not pen:
+                            sampled = try_sample_topk_row(
+                                ti_arr[r],
+                                tv_arr[r],
+                                float(lse_arr[r]),
+                                new_to_old,
+                                temperature=temperature,
+                                top_p=top_p,
+                                rng=rng,
+                            )
+                            if sampled is not None and sampled >= 0:
+                                if sampled in stop_token_ids:
+                                    done[b] = True
+                                    queues[b].clear()
+                                else:
+                                    gen_toks[b].append(sampled)
+                                    contexts[b].append(sampled)
+                                    if len(gen_toks[b]) >= max_tokens:
+                                        done[b] = True
+                                        queues[b].clear()
+                                    else:
+                                        queues[b].append(sampled)
+                                continue
+                        fb_rows_k.append((r, pen))
+                    if not fb_rows_k:
+                        return
+                    fb_mx = mx.array([r for r, _ in fb_rows_k], dtype=mx.int32)
+                    lg_fb = np.array(logits_2d[fb_mx, :].astype(mx.float32))
+                    for k_pos, (r, pen) in enumerate(fb_rows_k):
+                        b = active[r]
+                        row_lg = lg_fb[k_pos]
+                        if bool(np.isnan(row_lg).any()):
+                            raise FloatingPointError(f"NaN logits detected in run_decode_batch for rows {[b]}")
+                        if pen:
+                            row_lg, am_r = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
+                        else:
+                            am_r = int(np.argmax(row_lg))
+                        xr = last_x[r, -1] if last_x is not None else None
+                        consume_sampled(b, row_lg, am_r, x_row_mx=xr)
+                    return
+
                 lg_np = np.array(logits_2d.astype(mx.float32))
                 nan_rows = [active[r] for r in row_indices if bool(np.isnan(lg_np[r]).any())]
                 if nan_rows:
@@ -1284,8 +1334,49 @@ def run_decode_rolling(
             )
 
         if return_logits:
-            lg_np = np.asarray(x_or_lg[:, 0, :].astype(mx.float32))
             last_x = cache.get("_last_x_in")
+            all_unconstrained = all(slot_grammar[s] is None for s in target_slots)
+            lg_flat_mx = x_or_lg[:, 0, :]
+            gathered_roll = (
+                gather_topk_stats_mlx(lg_flat_mx, temperature=temperature, top_k=128)
+                if all_unconstrained
+                else None
+            )
+            if gathered_roll is not None:
+                ti_arr, tv_arr, lse_arr = gathered_roll
+                fb_roll_k: list[tuple[int, int, dict[int, float]]] = []
+                for r, s in enumerate(target_slots):
+                    pen = _slot_repeat_penalties(s, constrained=False)
+                    if not pen:
+                        oid = try_sample_topk_row(
+                            ti_arr[r],
+                            tv_arr[r],
+                            float(lse_arr[r]),
+                            new_to_old,
+                            temperature=temperature,
+                            top_p=top_p,
+                            rng=rng,
+                        )
+                        if oid is not None and oid >= 0:
+                            _process_sampled_token(s, oid)
+                            continue
+                    fb_roll_k.append((r, s, pen))
+                if not fb_roll_k:
+                    return
+                fb_idx_mx = mx.array([x[0] for x in fb_roll_k], dtype=mx.int32)
+                lg_sub = np.asarray(lg_flat_mx[fb_idx_mx, :].astype(mx.float32))
+                for k_pos, (r, s, pen) in enumerate(fb_roll_k):
+                    row_lg = lg_sub[k_pos]
+                    am_j = int(am_np[r])
+                    if pen:
+                        row_lg, am_j = _apply_repeat_penalties_row(row_lg, pen, old_to_new)
+                    oid = sample_unconstrained(
+                        row_lg, new_to_old, am_j, temperature=temperature, top_p=top_p, rng=rng
+                    )
+                    _process_sampled_token(s, oid)
+                return
+
+            lg_np = np.asarray(lg_flat_mx.astype(mx.float32))
             for r, s in enumerate(target_slots):
                 g_slot = slot_grammar[s]
                 row_lg = lg_np[r]

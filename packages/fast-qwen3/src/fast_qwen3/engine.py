@@ -21,9 +21,11 @@ from fast_shared.grammar import (
     apply_loop_breaker_penalties_1d,
     compute_loop_breaker_penalties,
     detect_catastrophic_token_loop,
+    gather_topk_stats_mlx,
     normalize_json_schema,
     safe_argmax_1d,
     sample_unconstrained,
+    try_sample_topk_row,
     validate_json_against_schema,
 )
 from fast_shared.kv_quant import KVMode, normalize_kv_mode
@@ -685,6 +687,69 @@ class FastQwen3Engine:
         am_list = [int(x) for x in am_mx.tolist()]
         return sl_eff, {r: am_list[pos] for pos, r in enumerate(need_rows)}, {}
 
+    def _project_needed_rows_topk(
+        self,
+        h_2d: mx.array,
+        need_rows: list[int],
+        row_count: int,
+        *,
+        temperature: float,
+        top_k: int = 128,
+    ) -> tuple[mx.array | None, dict[int, tuple[np.ndarray, np.ndarray, float]] | None]:
+        """Project active rows and gather compact `[M, top_k]` + `logsumexp` stats on GPU."""
+        if not need_rows:
+            getattr(mx, "async_eval", mx.eval)(h_2d)
+            return None, {}
+        if len(need_rows) == row_count:
+            sl_raw = self.model.project_logits(h_2d[:, None, :])[:, 0, :]
+        else:
+            idx_mx = mx.array(need_rows, dtype=mx.int32)
+            sub_h = mx.take(h_2d, idx_mx, axis=0)[:, None, :]
+            sl_raw = self.model.project_logits(sub_h)[:, 0, :]
+
+        v_limit = len(self._new_to_old)
+        sl_eff = (
+            sl_raw[:, :v_limit]
+            if (self.model.vocab_remap is None and int(sl_raw.shape[-1]) > v_limit)
+            else sl_raw
+        )
+        gathered = gather_topk_stats_mlx(
+            sl_eff,
+            temperature=float(temperature),
+            top_k=int(top_k),
+            sync_arrays=(h_2d,),
+        )
+        if gathered is None:
+            return sl_eff, None
+        ti_arr, tv_arr, lse_arr = gathered
+        topk_map = {
+            r: (ti_arr[pos], tv_arr[pos], float(lse_arr[pos]))
+            for pos, r in enumerate(need_rows)
+        }
+        return sl_eff, topk_map
+
+    @staticmethod
+    def _try_sample_topk_row(
+        top_idx: np.ndarray,
+        top_vals: np.ndarray,
+        lse: float,
+        new_to_old: np.ndarray,
+        *,
+        temperature: float,
+        top_p: float,
+        rng: np.random.Generator | None,
+    ) -> int | None:
+        """Delegate exact top-K nucleus/categorical sampling to shared `try_sample_topk_row`."""
+        return try_sample_topk_row(
+            top_idx,
+            top_vals,
+            lse,
+            new_to_old,
+            temperature=temperature,
+            top_p=top_p,
+            rng=rng,
+        )
+
     def _select_tokens_from_hidden(
         self,
         h_2d: mx.array,
@@ -700,14 +765,41 @@ class FastQwen3Engine:
         repeat_penalty: bool,
         collect_telemetry: bool,
     ) -> tuple[dict[int, int], dict[int, dict[str, float] | None], int]:
-        """Select next tokens via lazy GPU argmax, copying FP32 logits only for fallback rows."""
-        eager_fp32 = bool(float(temperature) > 0.0 or collect_telemetry)
-        sl_eff, greedy_map, logits_map = self._project_needed_rows(
-            h_2d,
-            need_rows,
-            row_count,
-            eager_fp32=eager_fp32,
+        """Select next tokens via lazy GPU argmax or exact GPU top-K sampling, copying FP32 logits only on fallback rows."""
+        unconstrained = all(matchers[r] is None for r in need_rows)
+        use_gpu_topk = bool(
+            float(temperature) > 0.0
+            and not collect_telemetry
+            and unconstrained
         )
+        eager_fp32 = bool((float(temperature) > 0.0 and not use_gpu_topk) or collect_telemetry)
+        sl_eff: mx.array | None = None
+        greedy_map: dict[int, int] = {}
+        logits_map: dict[int, np.ndarray] = {}
+        topk_map: dict[int, tuple[np.ndarray, np.ndarray, float]] | None = None
+        if use_gpu_topk:
+            sl_eff, topk_map = self._project_needed_rows_topk(
+                h_2d,
+                need_rows,
+                row_count,
+                temperature=float(temperature),
+            )
+            if topk_map is None and sl_eff is not None:
+                sl_f32 = sl_eff.astype(mx.float32)
+                mx.eval(sl_f32)  # guard: allow-eval
+                arr = np.asarray(sl_f32)
+                logits_map = {r: arr[pos] for pos, r in enumerate(need_rows)}
+                use_gpu_topk = False
+                eager_fp32 = True
+                del sl_eff
+                sl_eff = None
+        else:
+            sl_eff, greedy_map, logits_map = self._project_needed_rows(
+                h_2d,
+                need_rows,
+                row_count,
+                eager_fp32=eager_fp32,
+            )
         if not need_rows:
             return {}, {}, 0
 
@@ -715,7 +807,47 @@ class FastQwen3Engine:
         picked_tel: dict[int, dict[str, float] | None] = {}
         mask_fallbacks = 0
 
-        if not eager_fp32:
+        if use_gpu_topk:
+            assert topk_map is not None
+            fb_rows_k: list[tuple[int, int]] = []
+            for pos, r in enumerate(need_rows):
+                has_pen = False
+                if repeat_penalty:
+                    pen = compute_loop_breaker_penalties(
+                        recent_tokens_by_row[r],
+                        window=96,
+                        min_prior_hits=4,
+                        base_penalty=8.0,
+                        stop_token_ids=self.tokenizer.stop_token_ids,
+                    )
+                    has_pen = bool(pen)
+                if not has_pen:
+                    ti, tv, lse = topk_map[r]
+                    sampled = self._try_sample_topk_row(
+                        ti,
+                        tv,
+                        lse,
+                        self._new_to_old,
+                        temperature=temperature,
+                        top_p=top_p,
+                        rng=rngs[r],
+                    )
+                    if sampled is not None and sampled >= 0:
+                        picked_tid[r] = sampled
+                        picked_tel[r] = None
+                        continue
+                fb_rows_k.append((pos, r))
+
+            if fb_rows_k:
+                assert sl_eff is not None
+                fb_pos_mx = mx.array([pos for pos, _ in fb_rows_k], dtype=mx.int32)
+                fb_f32 = mx.take(sl_eff, fb_pos_mx, axis=0).astype(mx.float32)
+                mx.eval(fb_f32)  # guard: allow-eval
+                fb_arr = np.asarray(fb_f32)
+                for k_idx, (_, r) in enumerate(fb_rows_k):
+                    logits_map[r] = fb_arr[k_idx]
+            del sl_eff
+        elif not eager_fp32:
             n_vocab = len(self._new_to_old)
             fb_rows: list[tuple[int, int]] = []
             for pos, r in enumerate(need_rows):

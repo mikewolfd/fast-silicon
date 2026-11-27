@@ -41,6 +41,7 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | **Shared vision & OCR primitives** | `fast_shared.qwen35_vision`, `gemma4_vision`, `vision_preprocess` | Ported Qwen3.5 & Gemma-4 vision towers, 3D MRoPE helpers, ink cropping, lazy MLX imports, and public OCR evaluators (`outcome_eval.ocr`). |
 | **Hybrid `PrefixTree`, GPU argmax & PLD** | `fast_shared.prefix_tree`, `argmax`, `pld_drafter` | 256-token SHA-256 prefix cache for KV and block-32 INT8 GatedDeltaNet states (3.76x smaller), single-pass NaN/Inf-safe Metal `gpu_argmax_conf`/`gpu_argmax_nan` (2x less vocab DRAM traffic), and grammar-checked prompt-lookup drafting. |
 | **Schema grammars & resumable ETL** | `fast_shared.grammar`, `pipeline_llm`, `parquet_pipeline` | Per-document `llguidance` JSON Schema enforcement, 4-gram loop detection, deferred retries on truncated outputs, header-anchored Parquet chunking (+33-46% legal retrieval lift), and resumable shards. |
+| **GPU top-k sampling & self-consistency** | `fast_shared.grammar`, `self_consistency` | `gather_topk_stats_mlx` + `try_sample_topk_row` (`2.49x` on `Qwen3.5-4B` `MATH-500`, `1.59x` on `FastGemma4` sampled decode), CPU `argpartition` top-256 fast path, and engine-agnostic `generate_self_consistent` majority voting (`select_majority_answer`, `select_majority_json`, `extract_choice_letter`, auto-enabling `rolling=True` at `>= 4` samples, `adaptive=False` default). |
 | **Core ML / Core AI & Metal 4 MPP** | `fast_shared.coreai_pipeline`, `parallel_coreml`, `ir_dtype_guard`, `mpp_linear` | Parallel Core ML bucket compilation (2.0-2.1x faster), FP16 `.aimodel` ANE lowering on macOS 27.2.1, static AST/MIL dtype lints (`fast-ir-guard`), and inline-XOR Apple10 NAX linear wrappers. |
 | **4-bucket memory & outcome harness** | `fast_shared.bench`, `outcome_eval` | Tracks Metal allocator memory, process `phys_footprint`, `neural_footprint`, mapped model pages, and ANE daemon deltas (`aned`), paired with deterministic evaluators and interleaved regression gates. |
 
@@ -55,7 +56,8 @@ mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 | `fast_shared.prefix_tree` / `pld_drafter` | `PrefixTree`, `admit_prefix`, `quantize_gdn_state_block32`, `PromptLookupDrafter`, `filter_drafts_with_grammar` |
 | `fast_shared.embeddings` | `MappedEmbedding`, `truncate_and_normalize`, `tile_aligned_slices`, `set_mlx_cache_limit` |
 | `fast_shared.parquet_pipeline` | `embed_parquet`, `CorpusBackfillConfig`, `plan_header_anchored_windows` |
-| `fast_shared.grammar` / `pipeline_llm` / `extractconf` | `GrammarHelper`, `detect_catastrophic_token_loop`, `extract_parquet`, `run_deferred_retries`, `normalize_extraction_telemetry`, `ExtractConfCalibrator` |
+| `fast_shared.grammar` / `pipeline_llm` / `extractconf` | `GrammarHelper`, `gather_topk_stats_mlx`, `try_sample_topk_row`, `detect_catastrophic_token_loop`, `extract_parquet`, `run_deferred_retries`, `normalize_extraction_telemetry`, `ExtractConfCalibrator` |
+| `fast_shared.self_consistency` | `generate_self_consistent`, `select_majority_answer`, `select_majority_json`, `extract_choice_letter`, `canonical_json_key` |
 | `fast_shared.server` | `ManagedHTTPServer`, `UnifiedOpenAIServer`, `ChatMicroBatcher` |
 | `fast_shared.coreai_pipeline` / `parallel_coreml` | `build_coreai_opt_config`, `compile_buckets_parallel`, `inspect_coreml_bundle_placement` |
 | `fast_shared.bench` / `outcome_eval` | `fast-bench-check`, `FourBucketMemoryProbe`, `read_process_rusage_v6`, `evaluate_promotion_gates` |
