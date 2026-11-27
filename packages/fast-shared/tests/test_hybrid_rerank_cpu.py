@@ -414,3 +414,98 @@ def test_hybrid_retrieval_cpu_latency_budget() -> None:
     assert np.all(top_ids >= 0)
     assert build_sec < 2.0, f"Hybrid index build took {build_sec:.3f}s (> 2.0s budget)"
     assert search_sec < 0.75, f"50-query hybrid search took {search_sec:.3f}s (> 0.75s budget)"
+
+
+def test_bm25_cpp_sparse_and_gated_bmw_parity() -> None:
+    from fast_shared import detect_cpu_isa
+
+    isa = detect_cpu_isa()
+    if not isa.get("has_cxx", False):
+        pytest.skip("C++17 compiler required for C++ BM25 backend parity test")
+
+    rng = np.random.default_rng(4242)
+    n_docs = 2000
+    vocab = [f"term{i}" for i in range(600)]
+    probs = 1.0 / (np.arange(1, len(vocab) + 1, dtype=np.float64) ** 1.15)
+    probs /= probs.sum()
+    docs = [
+        " ".join(vocab[t] for t in rng.choice(len(vocab), size=18, p=probs))
+        for _ in range(n_docs - 4)
+    ]
+    docs.extend(["", "term0 term1 term2", "term0 term1 term2", "term250 term399"])
+
+    bm_np = BM25Index(docs, cpu_backend="numpy")
+    bm_port = BM25Index(docs, cpu_backend="portable_cpp", max_threads=2)
+    bm_auto = BM25Index(docs, cpu_backend="auto")
+    assert bm_port.resolved_cpu_backend == "portable_cpp"
+    assert bm_port._term_blk_offsets is not None
+    assert bm_auto._term_blk_offsets is not None
+
+    queries = [
+        "",
+        "nonexistent_oov_xyz",
+        "term399 term0 term1",           # selective anchor -> BMW path
+        "term0 term1 term2",             # high-DF only -> gated sparse path
+        "term5 term5 term250 term399",   # repeated terms
+        "term4",                         # single term
+    ]
+
+    def _bm25_lex_oracle(bm_obj: BM25Index, q_list: list[str], *, k_val: int, pos_only: bool, agg: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+        all_sc = bm_obj.score_all(q_list, agg=agg)  # type: ignore[arg-type]
+        qn = len(q_list)
+        oi = np.full((qn, k_val), -1, dtype=np.int32)
+        os_ = np.full((qn, k_val), -1e30, dtype=np.float32)
+        dids = np.arange(bm_obj.num_docs, dtype=np.int32)
+        for qi in range(qn):
+            row = all_sc[qi]
+            if pos_only:
+                m = row > np.float32(0.0)
+                sub_id, sub_sc = dids[m], row[m]
+            else:
+                sub_id, sub_sc = dids, row
+            if sub_id.size == 0:
+                continue
+            take = min(k_val, int(sub_id.size))
+            ord_i = np.lexsort((sub_id, -sub_sc))[:take]
+            oi[qi, :take] = sub_id[ord_i]
+            os_[qi, :take] = sub_sc[ord_i]
+        return oi, os_
+
+    for pos_only in (False, True):
+        for k_val in (1, 10, 2500):
+            ri, rs = _bm25_lex_oracle(bm_np, queries, k_val=k_val, pos_only=pos_only)
+            for bm_cand in (bm_port, bm_auto):
+                ci, cs = bm_cand.search(queries, k=k_val, positive_only=pos_only)
+                assert np.array_equal(ci, ri)
+                valid = ci >= 0
+                if np.any(valid):
+                    np.testing.assert_allclose(cs[valid], rs[valid], atol=2e-5)
+
+    # Skewed multi-window doc_offsets with an empty middle document across all 4 aggregations
+    offs = [0, 5, 5, 25, 180, 600, len(docs)]
+    bm_mv_np = BM25Index(docs, doc_offsets=offs, cpu_backend="numpy")
+    bm_mv_cpp = BM25Index(docs, doc_offsets=offs, cpu_backend="portable_cpp", max_threads=2)
+    for agg in ("maxsim", "hybrid", "top2_mean", "mean"):
+        for pos_only in (False, True):
+            ri, rs = _bm25_lex_oracle(bm_mv_np, queries, k_val=4, pos_only=pos_only, agg=agg)
+            ci, cs = bm_mv_cpp.search(queries, k=4, positive_only=pos_only, agg=agg)  # type: ignore[arg-type]
+            assert np.array_equal(ci, ri)
+            valid = ci >= 0
+            if np.any(valid):
+                np.testing.assert_allclose(cs[valid], rs[valid], atol=2e-5)
+
+    # HybridRetrievalPipeline.from_corpus forwards cpu_backend + max_threads cleanly
+    vecs = rng.standard_normal((len(docs), 32)).astype(np.float32)
+    q_vecs = rng.standard_normal((len(queries), 32)).astype(np.float32)
+    pipe_cpp = HybridRetrievalPipeline.from_corpus(
+        docs,
+        vectors=vecs,
+        index_mode="int8",
+        cpu_backend="portable_cpp",
+        max_threads=2,
+    )
+    assert pipe_cpp.dense_index.resolved_cpu_backend == "portable_cpp"
+    assert pipe_cpp.bm25_index.resolved_cpu_backend == "portable_cpp"
+    hi, hs = pipe_cpp.search(queries, q_vecs, k=5, mode="hybrid")
+    assert hi.shape == (len(queries), 5) and hs.shape == (len(queries), 5)
+    assert np.all(hi >= 0)

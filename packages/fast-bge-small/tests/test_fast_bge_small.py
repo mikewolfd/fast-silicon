@@ -768,3 +768,111 @@ def test_bge_local_files_only_forwarded_cpu(
         assert seen_calls[-1] == {"home": None, "include_ane": False, "local_files_only": True}
 
 
+def test_bge_query_batch_routing_and_table_bind_cache_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Q>=8 batched query routing (H4a) and ANE table-bind deduplication across calls and close()."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from tokenizers.processors import TemplateProcessing
+    import fast_bge_small.engine as bge_eng
+
+    home = tmp_path / "bge_batch_home"
+    (home / "artifacts" / "weights").mkdir(parents=True)
+    (home / "artifacts" / "tokenizer").mkdir(parents=True)
+    (home / "artifacts" / "ane_models").mkdir(parents=True)
+    (home / "build").mkdir(parents=True)
+    (home / "artifacts" / "weights" / "bge_small_f16.npz").write_bytes(b"stub")
+    (home / "build" / "libbge_ane_runner.dylib").write_bytes(b"stub")
+
+    raw_tok = Tokenizer(WordLevel(vocab={"[PAD]": 0, "[UNK]": 100, "[CLS]": 101, "[SEP]": 102, "query": 200}, unk_token="[UNK]"))
+    raw_tok.pre_tokenizer = WhitespaceSplit()
+    raw_tok.post_processor = TemplateProcessing(single="[CLS] $A [SEP]", special_tokens=[("[CLS]", 101), ("[SEP]", 102)])
+    raw_tok.save(str(home / "artifacts" / "tokenizer" / "tokenizer.json"))
+
+    class _StubGPU:
+        def __init__(self, weights_path: Path, *, wt0_f16: object = None, pos_f16: object = None) -> None:
+            del weights_path, wt0_f16, pos_f16
+
+    class _StubANE:
+        def __init__(self) -> None:
+            self.bind_calls = 0
+            self.clear_calls = 0
+
+        def bge_ane_init_tables_borrowed(self, *_args: object) -> int:
+            self.bind_calls += 1
+            return 0
+
+        def bge_ane_clear_borrowed_tables(self, *_args: object) -> None:
+            self.clear_calls += 1
+
+    stub_ane = _StubANE()
+    wt0 = np.zeros((4, 384), dtype=np.float16)
+    pos = np.zeros((4, 384), dtype=np.float16)
+
+    def _spy_init_ane(self: FastBgeSmall, *, verify_plan: bool = True) -> None:
+        del verify_plan
+        self._wt0_f16 = wt0
+        self._pos_f16 = pos
+        self.ane = stub_ane  # type: ignore[assignment]
+        self.ane_available = True
+        self._bind_ane_tables(stub_ane)
+
+    monkeypatch.setattr(bge_eng, "load_or_mmap_host_tables", lambda *_a, **_kw: (wt0, pos))
+    monkeypatch.setattr(bge_eng, "FastBgeSmallGPU", _StubGPU)
+    monkeypatch.setattr(bge_eng, "set_mlx_cache_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bge_eng, "_apply_mlx_wired_limit", lambda: None)
+    monkeypatch.setattr(bge_eng, "_restore_mlx_wired_limit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bge_eng, "_maybe_clear_mlx_arena", lambda *_a, **_kw: None)
+    monkeypatch.setattr(FastBgeSmall, "_init_ane", _spy_init_ane)
+
+    with FastBgeSmall(home=home, default_mode="hetero", enable_ane=True, warmup=False) as eng:
+        assert stub_ane.bind_calls == 1
+        # Repeated _bind_ane_tables with identical library and arrays skips redundant ctypes init
+        eng._bind_ane_tables()
+        eng._bind_ane_tables()
+        assert stub_ane.bind_calls == 1
+
+        eq_calls: list[bool] = []
+        ec_calls: list[tuple[int, str]] = []
+
+        def _fake_encode_query(_ids: object, *, prefer_ane: bool = True) -> np.ndarray:
+            eq_calls.append(prefer_ane)
+            return np.full((384,), 1.0 / np.sqrt(384.0), dtype=np.float32)
+
+        def _fake_encode_corpus(tok_lists: object, *, mode: str = "hetero", **_kw: object) -> np.ndarray:
+            n = len(tok_lists)  # type: ignore[arg-type]
+            ec_calls.append((n, mode))
+            return np.full((n, 384), 1.0 / np.sqrt(384.0), dtype=np.float32)
+
+        monkeypatch.setattr(eng, "encode_query", _fake_encode_query)
+        monkeypatch.setattr(eng, "encode_corpus", _fake_encode_corpus)
+
+        # Q=2 (< 8) with ANE available stays sequential on encode_query
+        out2 = eng.encode_texts(["query one", "query two"], is_query=True, mode="hetero")
+        assert out2.shape == (2, 384)
+        assert eq_calls == [True, True]
+        assert ec_calls == []
+
+        # Q=8 (>= 8) routes to batched encode_corpus
+        eq_calls.clear()
+        out8 = eng.encode_texts([f"query {i}" for i in range(8)], is_query=True, mode="hetero")
+        assert out8.shape == (8, 384)
+        assert eq_calls == []
+        assert ec_calls == [(8, "hetero")]
+
+        # Explicit gpu mode routes even small multi-query batch via encode_corpus
+        ec_calls.clear()
+        out_gpu = eng.encode_texts(["query one", "query two"], is_query=True, mode="gpu")
+        assert out_gpu.shape == (2, 384)
+        assert eq_calls == []
+        assert ec_calls == [(2, "gpu")]
+
+    assert stub_ane.clear_calls == 1
+    # Re-opening rebinds cleanly after close() cleared the cache key
+    with FastBgeSmall(home=home, default_mode="hetero", enable_ane=True, warmup=False) as eng2:
+        assert eng2.ane_available is True
+        assert stub_ane.bind_calls == 2
+
+

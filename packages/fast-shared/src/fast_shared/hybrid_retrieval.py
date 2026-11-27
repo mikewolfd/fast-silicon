@@ -12,6 +12,7 @@ from typing import Any, Literal, TypeVar
 
 import numpy as np
 
+from .cpu_kernels import CpuBackendMode, get_cpu_bm25_lib, resolve_cpu_backend
 from .refspec_bridge import LayaRerankFusion
 from .retrieval_index import (
     VALID_WINDOW_AGGS,
@@ -176,8 +177,16 @@ def _normalize_doc_key(raw: Any) -> Any:
     return raw
 
 
+_BM25_AGG_MODE_TO_ID: dict[str, int] = {
+    "maxsim": 0,
+    "hybrid": 1,
+    "top2_mean": 2,
+    "mean": 3,
+}
+
+
 class BM25Index:
-    """Fast CSR-packed NumPy Okapi/Lucene BM25 lexical index with optional multi-window aggregation."""
+    """Fast CSR-packed Okapi/Lucene BM25 lexical index with C++ sparse/Block-Max WAND and multi-window kernels."""
 
     def __init__(
         self,
@@ -192,6 +201,8 @@ class BM25Index:
         lowercase: bool = True,
         stopwords: Iterable[str] | None = None,
         min_token_len: int = 1,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
     ) -> None:
         eff_k1 = _validate_finite_nonneg(k1, "k1")
         eff_b = _validate_finite_nonneg(b, "b")
@@ -216,6 +227,15 @@ class BM25Index:
             else None
         )
         self._custom_tokenizer = tokenizer
+        self.cpu_backend: CpuBackendMode = cpu_backend
+        self.max_threads: int = int(max_threads)
+        self.resolved_cpu_backend: str = resolve_cpu_backend(cpu_backend)
+        self._block_size: int = 128
+        self._window_to_doc: np.ndarray | None = None
+        self._term_blk_offsets: np.ndarray | None = None
+        self._blk_max_doc: np.ndarray | None = None
+        self._blk_max_score: np.ndarray | None = None
+        self._term_max_score: np.ndarray | None = None
 
         n_windows = len(documents)
         self.num_windows: int = n_windows
@@ -233,6 +253,10 @@ class BM25Index:
                     f"doc_offsets must be 1D, non-decreasing, start at 0, and end at num_windows={n_windows}"
                 )
             self.doc_offsets: np.ndarray | None = off_arr
+            self._window_to_doc = np.ascontiguousarray(
+                np.repeat(np.arange(off_arr.size - 1, dtype=np.int32), np.diff(off_arr)),
+                dtype=np.int32,
+            )
             self.num_docs: int = int(off_arr.size) - 1
         else:
             self.doc_offsets = None
@@ -308,10 +332,38 @@ class BM25Index:
         ).astype(np.float32)
         term_ids_per_posting = np.repeat(np.arange(self.vocab_size, dtype=np.int32), dfs)
 
-        self._term_offsets = term_offsets
-        self._posting_doc_ids = flat_docs
-        self._posting_scores = (idf[term_ids_per_posting] * tf_norm).astype(np.float32)
+        self._term_offsets = np.ascontiguousarray(term_offsets, dtype=np.int64)
+        self._posting_doc_ids = np.ascontiguousarray(flat_docs, dtype=np.int32)
+        self._posting_scores = np.ascontiguousarray(
+            (idf[term_ids_per_posting] * tf_norm).astype(np.float32),
+            dtype=np.float32,
+        )
         self.idf = idf
+
+        if self.doc_offsets is None and self.vocab_size > 0 and n_windows > 0:
+            eff_be, lib = get_cpu_bm25_lib(cpu_backend=self.cpu_backend)
+            self.resolved_cpu_backend = eff_be
+            if lib is not None:
+                n_blocks = int(np.sum((dfs.astype(np.int64) + self._block_size - 1) // self._block_size))
+                term_blk_offsets = np.empty((self.vocab_size + 1,), dtype=np.int64)
+                blk_max_doc = np.empty((max(1, n_blocks),), dtype=np.int32)
+                blk_max_score = np.empty((max(1, n_blocks),), dtype=np.float32)
+                term_max_score = np.empty((self.vocab_size,), dtype=np.float32)
+                lib.fast_cpu_bm25_build_blocks(
+                    self._term_offsets.ctypes.data,
+                    self._posting_doc_ids.ctypes.data,
+                    self._posting_scores.ctypes.data,
+                    int(self.vocab_size),
+                    int(self._block_size),
+                    term_blk_offsets.ctypes.data,
+                    blk_max_doc.ctypes.data,
+                    blk_max_score.ctypes.data,
+                    term_max_score.ctypes.data,
+                )
+                self._term_blk_offsets = term_blk_offsets
+                self._blk_max_doc = blk_max_doc
+                self._blk_max_score = blk_max_score
+                self._term_max_score = term_max_score
 
     def tokenize(self, text: str) -> list[str]:
         """Tokenize a single string using the configured tokenizer and filters."""
@@ -410,6 +462,13 @@ class BM25Index:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(top_indices, top_scores)`` of shape ``[Q, k]`` (``[k]`` for single string)."""
         eff_k_req = _validate_positive_int(k, "k")
+        eff_agg = agg or self.default_agg
+        if eff_agg not in _BM25_AGG_MODE_TO_ID:
+            raise ValueError(f"agg must be one of {sorted(VALID_WINDOW_AGGS)}, got {eff_agg!r}")
+        eff_alpha = self.default_hybrid_alpha if hybrid_alpha is None else float(hybrid_alpha)
+        if not math.isfinite(eff_alpha):
+            raise ValueError(f"hybrid_alpha must be finite, got {eff_alpha!r}")
+
         was_single = isinstance(queries, str)
         q_list = [queries] if was_single else list(queries)
         q_n = len(q_list)
@@ -418,6 +477,71 @@ class BM25Index:
             empty_i = np.full((q_n, eff_k_req), -1, dtype=np.int32)
             empty_s = np.full((q_n, eff_k_req), -1e30, dtype=np.float32)
             return (empty_i[0], empty_s[0]) if was_single else (empty_i, empty_s)
+
+        if self.vocab_size > 0 and self.num_windows > 0:
+            eff_be, lib = get_cpu_bm25_lib(cpu_backend=self.cpu_backend)
+            self.resolved_cpu_backend = eff_be
+            if lib is not None:
+                q_offsets = np.zeros((q_n + 1,), dtype=np.int64)
+                tids_list: list[int] = []
+                tfs_list: list[float] = []
+                term_to_id = self._term_to_id
+                for qi, q_str in enumerate(q_list):
+                    tokens = self.tokenize(q_str)
+                    if tokens:
+                        counts = Counter(tokens)
+                        for term, tf in counts.items():
+                            tid = term_to_id.get(term)
+                            if tid is not None:
+                                tids_list.append(tid)
+                                tfs_list.append(float(tf))
+                    q_offsets[qi + 1] = len(tids_list)
+
+                q_tids = (
+                    np.asarray(tids_list, dtype=np.int32)
+                    if tids_list
+                    else np.empty((0,), dtype=np.int32)
+                )
+                q_tfs = (
+                    np.asarray(tfs_list, dtype=np.float32)
+                    if tfs_list
+                    else np.empty((0,), dtype=np.float32)
+                )
+                out_idx = np.empty((q_n, eff_k_req), dtype=np.int32)
+                out_sc = np.empty((q_n, eff_k_req), dtype=np.float32)
+                has_blocks = (
+                    self.doc_offsets is None
+                    and self._term_blk_offsets is not None
+                    and self._blk_max_doc is not None
+                    and self._blk_max_score is not None
+                    and self._term_max_score is not None
+                )
+                lib.fast_cpu_bm25_topk(
+                    self._term_offsets.ctypes.data,
+                    self._posting_doc_ids.ctypes.data,
+                    self._posting_scores.ctypes.data,
+                    self._term_blk_offsets.ctypes.data if has_blocks else 0,
+                    self._blk_max_doc.ctypes.data if has_blocks else 0,
+                    self._blk_max_score.ctypes.data if has_blocks else 0,
+                    self._term_max_score.ctypes.data if has_blocks else 0,
+                    self.doc_offsets.ctypes.data if self.doc_offsets is not None else 0,
+                    self._window_to_doc.ctypes.data if self._window_to_doc is not None else 0,
+                    int(self.num_windows),
+                    int(self.num_docs),
+                    int(self._block_size),
+                    int(_BM25_AGG_MODE_TO_ID[eff_agg]),
+                    float(eff_alpha),
+                    1 if positive_only else 0,
+                    int(q_n),
+                    q_offsets.ctypes.data,
+                    q_tids.ctypes.data if q_tids.size else 0,
+                    q_tfs.ctypes.data if q_tfs.size else 0,
+                    int(eff_k_req),
+                    int(self.max_threads),
+                    out_idx.ctypes.data,
+                    out_sc.ctypes.data,
+                )
+                return (out_idx[0], out_sc[0]) if was_single else (out_idx, out_sc)
 
         scores = self.score_all(q_list, agg=agg, hybrid_alpha=hybrid_alpha)
         out_idx = np.full((q_n, eff_k_req), -1, dtype=np.int32)
@@ -675,6 +799,8 @@ def build_contextual_subchunk_index(
     agg: WindowAgg = "maxsim",
     hybrid_alpha: float = 0.7,
     use_neon: bool = True,
+    cpu_backend: CpuBackendMode = "auto",
+    max_threads: int = 0,
     encode_mode: str | None = None,
     batch_size: int = 4,
 ) -> CompactRetrievalIndex:
@@ -693,6 +819,8 @@ def build_contextual_subchunk_index(
             agg=agg,
             hybrid_alpha=hybrid_alpha,
             use_neon=use_neon,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )
 
     tok = getattr(encoder, "tokenizer", None)
@@ -769,6 +897,8 @@ def build_contextual_subchunk_index(
         agg=agg,
         hybrid_alpha=hybrid_alpha,
         use_neon=use_neon,
+        cpu_backend=cpu_backend,
+        max_threads=max_threads,
     )
 
 
@@ -1237,6 +1367,8 @@ class HybridRetrievalPipeline:
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
         use_neon: bool = True,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
         k1: float = 1.5,
         b: float = 0.75,
         tokenizer: Callable[[str], Sequence[str]] | None = None,
@@ -1272,6 +1404,8 @@ class HybridRetrievalPipeline:
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
                 use_neon=use_neon,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
             )
         elif encoder is not None:
             src_texts = window_texts if window_texts is not None else doc_texts
@@ -1284,6 +1418,9 @@ class HybridRetrievalPipeline:
                 binary_bits=binary_bits,
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
+                use_neon=use_neon,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
             )
         else:
             raise ValueError("Provide either `vectors` or `encoder` to HybridRetrievalPipeline.from_corpus")
@@ -1302,10 +1439,13 @@ class HybridRetrievalPipeline:
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
                 use_neon=use_neon,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
             )
 
         bm25_texts = window_texts if (window_texts is not None and doc_offsets is not None) else doc_texts
         bm25_offsets = doc_offsets if (window_texts is not None and doc_offsets is not None) else None
+        bm25_cpu_backend: CpuBackendMode = "numpy" if (not use_neon and cpu_backend == "auto") else cpu_backend
         bm25_idx = BM25Index(
             bm25_texts,
             k1=k1,
@@ -1315,6 +1455,8 @@ class HybridRetrievalPipeline:
             hybrid_alpha=hybrid_alpha,
             tokenizer=tokenizer,
             stopwords=stopwords,
+            cpu_backend=bm25_cpu_backend,
+            max_threads=max_threads,
         )
         return cls(
             dense_index=dense_idx,

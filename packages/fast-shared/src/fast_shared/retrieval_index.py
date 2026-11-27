@@ -7,27 +7,21 @@ Implements the empirically validated retrieval winners across `fast-silicon` enc
   2. Model-aware `MRL` truncation (`512d int8` = `6.0x` compression, `+0.38 pp` `LegalBench-RAG`
      on MRL-trained `FastEmbeddingGemma2`, while protecting non-MRL `FastPplx` & `FastBgeSmall`
      from premature dimension truncation).
-  3. Two-stage `1-bit` packed binary Hamming pre-filter (`vcntq_u8` ARM NEON / `uint8` LUT)
-     followed by exact `INT8` dot-product rerank (`rerank_top_r=256` default; `0.43-0.54 ms` @ `top64` on `100K` chunks).
-  4. Multi-vector `MaxSim` / `Hybrid` / `Top-2` window aggregation over `[doc_offsets[d]:doc_offsets[d+1]]`,
-     lifting `32K` `LongEmbed` passkey `nDCG@10` from `0.047 -> 1.000` (`0.7510 -> 0.9923` combined).
+  3. Two-stage `1-bit` packed binary Hamming pre-filter + exact `INT8` dot-product rerank via
+     cross-platform C++17 SIMD kernels (`neon` `vdotq_s32`/`vcntq_u8`, `avx512` VNNI+VPOPCNTDQ,
+     `avx2`, `portable_cpp` multi-core scalar) with pure-NumPy fallback.
+  4. Fused C++ multi-vector `MaxSim` / `Hybrid` / `Top-2` / `Mean` document scoring over
+     `[doc_offsets[d]:doc_offsets[d+1]]`, lifting `32K` `LongEmbed` passkey `nDCG@10` from
+     `0.047 -> 1.000` (`0.7510 -> 0.9923` combined).
 """
 
 from __future__ import annotations
 
-import ctypes
-import hashlib
-import os
-from pathlib import Path
-import platform
-import shutil
-import subprocess
-import tempfile
-import threading
 from typing import Any, Literal
 
 import numpy as np
 
+from .cpu_kernels import CpuBackendMode, get_cpu_retrieval_lib, resolve_cpu_backend
 from .embeddings import truncate_and_normalize
 
 IndexMode = Literal["auto", "int8", "mrl_int8", "binary_int8", "fp16", "fp32"]
@@ -37,233 +31,15 @@ VALID_INDEX_MODES: frozenset[str] = frozenset(
     {"auto", "int8", "mrl_int8", "binary_int8", "fp16", "fp32"}
 )
 VALID_WINDOW_AGGS: frozenset[str] = frozenset({"maxsim", "hybrid", "top2_mean", "mean"})
+_AGG_MODE_TO_ID: dict[str, int] = {
+    "maxsim": 0,
+    "hybrid": 1,
+    "top2_mean": 2,
+    "mean": 3,
+}
 
 _POPCOUNT_LUT: np.ndarray = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 _BINARY_POPCOUNT_CHUNK_ROWS: int = 32_768
-
-_NEON_CPP_SOURCE = r"""
-#include <arm_neon.h>
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <utility>
-#include <vector>
-
-extern "C" {
-
-void fast_neon_int8_scores(
-    const int8_t* __restrict__ q_i8,
-    const _Float16* __restrict__ q_sc,
-    const int8_t* __restrict__ d_i8,
-    const _Float16* __restrict__ d_sc,
-    int Q,
-    int N,
-    int D,
-    float* __restrict__ out_scores
-) {
-    for (int qi = 0; qi < Q; ++qi) {
-        const int8_t* qr = q_i8 + static_cast<size_t>(qi) * D;
-        const float q_s = static_cast<float>(q_sc[qi]);
-        float* out_r = out_scores + static_cast<size_t>(qi) * N;
-        for (int di = 0; di < N; ++di) {
-            const int8_t* dr = d_i8 + static_cast<size_t>(di) * D;
-            int32x4_t acc0 = vdupq_n_s32(0);
-            int32x4_t acc1 = vdupq_n_s32(0);
-            int32x4_t acc2 = vdupq_n_s32(0);
-            int32x4_t acc3 = vdupq_n_s32(0);
-            int k = 0;
-            for (; k + 64 <= D; k += 64) {
-                acc0 = vdotq_s32(acc0, vld1q_s8(qr + k + 0), vld1q_s8(dr + k + 0));
-                acc1 = vdotq_s32(acc1, vld1q_s8(qr + k + 16), vld1q_s8(dr + k + 16));
-                acc2 = vdotq_s32(acc2, vld1q_s8(qr + k + 32), vld1q_s8(dr + k + 32));
-                acc3 = vdotq_s32(acc3, vld1q_s8(qr + k + 48), vld1q_s8(dr + k + 48));
-            }
-            for (; k + 16 <= D; k += 16) {
-                acc0 = vdotq_s32(acc0, vld1q_s8(qr + k), vld1q_s8(dr + k));
-            }
-            int32_t dot = vaddvq_s32(vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)));
-            for (; k < D; ++k) {
-                dot += static_cast<int32_t>(qr[k]) * static_cast<int32_t>(dr[k]);
-            }
-            out_r[di] = static_cast<float>(dot) * (q_s * static_cast<float>(d_sc[di]));
-        }
-    }
-}
-
-void fast_neon_binary_topr_rerank_int8(
-    const uint8_t* __restrict__ q_bits,
-    const int8_t* __restrict__ q_i8,
-    const _Float16* __restrict__ q_sc,
-    const uint8_t* __restrict__ d_bits,
-    const int8_t* __restrict__ d_i8,
-    const _Float16* __restrict__ d_sc,
-    int Q,
-    int N,
-    int n_bytes,
-    int D_rerank,
-    int top_r,
-    int top_k,
-    int32_t* __restrict__ out_indices,
-    float* __restrict__ out_scores
-) {
-    const int eff_r = std::min(top_r, N);
-    const int eff_k = std::min(top_k, eff_r);
-    std::vector<uint64_t> packed_cand(N);
-    std::vector<std::pair<float, int32_t>> reranked(eff_r);
-
-    for (int qi = 0; qi < Q; ++qi) {
-        const uint8_t* qb = q_bits + static_cast<size_t>(qi) * n_bytes;
-        for (int di = 0; di < N; ++di) {
-            const uint8_t* db = d_bits + static_cast<size_t>(di) * n_bytes;
-            uint32_t dist = 0;
-            int b = 0;
-            for (; b + 16 <= n_bytes; b += 16) {
-                uint8x16_t xr = veorq_u8(vld1q_u8(qb + b), vld1q_u8(db + b));
-                dist += vaddlvq_u8(vcntq_u8(xr));
-            }
-            for (; b < n_bytes; ++b) {
-                dist += static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(qb[b] ^ db[b])));
-            }
-            packed_cand[di] = (static_cast<uint64_t>(dist) << 32) | static_cast<uint32_t>(di);
-        }
-
-        if (eff_r < N) {
-            std::nth_element(packed_cand.begin(), packed_cand.begin() + eff_r, packed_cand.end());
-        }
-
-        const int8_t* qr = q_i8 + static_cast<size_t>(qi) * D_rerank;
-        const float q_s = static_cast<float>(q_sc[qi]);
-        for (int r = 0; r < eff_r; ++r) {
-            int32_t di = static_cast<int32_t>(packed_cand[r] & 0xFFFFFFFFull);
-            const int8_t* dr = d_i8 + static_cast<size_t>(di) * D_rerank;
-            int32x4_t acc0 = vdupq_n_s32(0);
-            int32x4_t acc1 = vdupq_n_s32(0);
-            int32x4_t acc2 = vdupq_n_s32(0);
-            int32x4_t acc3 = vdupq_n_s32(0);
-            int k = 0;
-            for (; k + 64 <= D_rerank; k += 64) {
-                acc0 = vdotq_s32(acc0, vld1q_s8(qr + k + 0), vld1q_s8(dr + k + 0));
-                acc1 = vdotq_s32(acc1, vld1q_s8(qr + k + 16), vld1q_s8(dr + k + 16));
-                acc2 = vdotq_s32(acc2, vld1q_s8(qr + k + 32), vld1q_s8(dr + k + 32));
-                acc3 = vdotq_s32(acc3, vld1q_s8(qr + k + 48), vld1q_s8(dr + k + 48));
-            }
-            for (; k + 16 <= D_rerank; k += 16) {
-                acc0 = vdotq_s32(acc0, vld1q_s8(qr + k), vld1q_s8(dr + k));
-            }
-            int32_t dot = vaddvq_s32(vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)));
-            for (; k < D_rerank; ++k) {
-                dot += static_cast<int32_t>(qr[k]) * static_cast<int32_t>(dr[k]);
-            }
-            float sc = static_cast<float>(dot) * (q_s * static_cast<float>(d_sc[di]));
-            reranked[r] = {-sc, di};
-        }
-
-        std::partial_sort(reranked.begin(), reranked.begin() + eff_k, reranked.end());
-        int32_t* out_idx_r = out_indices + static_cast<size_t>(qi) * top_k;
-        float* out_sc_r = out_scores + static_cast<size_t>(qi) * top_k;
-        for (int k = 0; k < eff_k; ++k) {
-            out_idx_r[k] = reranked[k].second;
-            out_sc_r[k] = -reranked[k].first;
-        }
-        for (int k = eff_k; k < top_k; ++k) {
-            out_idx_r[k] = -1;
-            out_sc_r[k] = -1e30f;
-        }
-    }
-}
-
-} // extern "C"
-"""
-
-_NEON_LOCK = threading.Lock()
-_NEON_LIB: ctypes.CDLL | None = None
-_NEON_TRIED: bool = False
-
-
-def _get_neon_lib() -> ctypes.CDLL | None:
-    """Lazily compile & load ARM64 NEON `vcntq_u8` + `vdotq_s32` helper on Apple Silicon (`None` fallback)."""
-    global _NEON_LIB, _NEON_TRIED
-    if _NEON_TRIED:
-        return _NEON_LIB
-    with _NEON_LOCK:
-        if _NEON_TRIED:
-            return _NEON_LIB
-        _NEON_TRIED = True
-        if os.environ.get("FAST_SILICON_DISABLE_NEON_INDEX") == "1":
-            return None
-        if platform.system() != "Darwin" or platform.machine() != "arm64":
-            return None
-        cxx = shutil.which("clang++")
-        if not cxx:
-            return None
-        try:
-            digest = hashlib.sha256(_NEON_CPP_SOURCE.encode("utf-8")).hexdigest()[:12]
-            cache_dir = Path(os.environ.get("FAST_SILICON_CACHE_DIR") or (Path.home() / ".cache" / "fast_silicon"))
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            dylib_path = cache_dir / f"libhamming_int8_neon_{digest}.dylib"
-            if not dylib_path.is_file():
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".cpp", dir=str(cache_dir), delete=False, encoding="utf-8"
-                ) as src_f:
-                    src_f.write(_NEON_CPP_SOURCE)
-                    src_path = Path(src_f.name)
-                tmp_dylib = cache_dir / f".tmp_{os.getpid()}_{digest}.dylib"
-                try:
-                    subprocess.run(
-                        [
-                            cxx,
-                            "-O3",
-                            "-std=c++17",
-                            "-arch",
-                            "arm64",
-                            "-march=armv8.4-a+dotprod+fp16",
-                            "-dynamiclib",
-                            str(src_path),
-                            "-o",
-                            str(tmp_dylib),
-                        ],
-                        check=True,
-                        capture_output=True,
-                        timeout=20,
-                    )
-                    os.replace(tmp_dylib, dylib_path)
-                finally:
-                    src_path.unlink(missing_ok=True)
-                    tmp_dylib.unlink(missing_ok=True)
-
-            lib = ctypes.CDLL(str(dylib_path))
-            lib.fast_neon_int8_scores.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_void_p,
-            ]
-            lib.fast_neon_int8_scores.restype = None
-            lib.fast_neon_binary_topr_rerank_int8.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-            ]
-            lib.fast_neon_binary_topr_rerank_int8.restype = None
-            _NEON_LIB = lib
-        except Exception:
-            _NEON_LIB = None
-        return _NEON_LIB
 
 
 def quantize_int8_symmetric(vecs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -323,26 +99,29 @@ def _int8_dot_scores(
     d_sc: np.ndarray,
     *,
     use_neon: bool = True,
+    cpu_backend: CpuBackendMode = "auto",
+    max_threads: int = 0,
 ) -> np.ndarray:
     q_n, dim = q_i8.shape
     d_n = d_i8.shape[0]
     if q_n == 0 or d_n == 0:
         return np.empty((q_n, d_n), dtype=np.float32)
-    lib = _get_neon_lib() if use_neon else None
+    _, lib = get_cpu_retrieval_lib(cpu_backend=cpu_backend, use_neon=use_neon)
     if lib is not None:
         qc = np.ascontiguousarray(q_i8, dtype=np.int8)
-        qs = np.ascontiguousarray(q_sc, dtype=np.float16)
+        qs_u16 = np.ascontiguousarray(q_sc, dtype=np.float16).view(np.uint16)
         dc = np.ascontiguousarray(d_i8, dtype=np.int8)
-        ds = np.ascontiguousarray(d_sc, dtype=np.float16)
+        ds_u16 = np.ascontiguousarray(d_sc, dtype=np.float16).view(np.uint16)
         out = np.empty((q_n, d_n), dtype=np.float32)
-        lib.fast_neon_int8_scores(
+        lib.fast_cpu_int8_scores(
             qc.ctypes.data,
-            qs.ctypes.data,
+            qs_u16.ctypes.data,
             dc.ctypes.data,
-            ds.ctypes.data,
+            ds_u16.ctypes.data,
             int(q_n),
             int(d_n),
             int(dim),
+            int(max_threads),
             out.ctypes.data,
         )
         return out
@@ -362,6 +141,8 @@ def _binary_topr_rerank_int8(
     top_r: int,
     top_k: int,
     use_neon: bool = True,
+    cpu_backend: CpuBackendMode = "auto",
+    max_threads: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     q_n = q_i8.shape[0]
     d_n, dim = d_i8.shape
@@ -373,29 +154,30 @@ def _binary_topr_rerank_int8(
     eff_r = min(max(top_k, int(top_r)), d_n)
     eff_k = min(int(top_k), eff_r)
 
-    lib = _get_neon_lib() if use_neon else None
+    _, lib = get_cpu_retrieval_lib(cpu_backend=cpu_backend, use_neon=use_neon)
     if lib is not None:
         qb = np.ascontiguousarray(q_bits, dtype=np.uint8)
         qc = np.ascontiguousarray(q_i8, dtype=np.int8)
-        qs = np.ascontiguousarray(q_sc, dtype=np.float16)
+        qs_u16 = np.ascontiguousarray(q_sc, dtype=np.float16).view(np.uint16)
         db = np.ascontiguousarray(d_bits, dtype=np.uint8)
         dc = np.ascontiguousarray(d_i8, dtype=np.int8)
-        ds = np.ascontiguousarray(d_sc, dtype=np.float16)
+        ds_u16 = np.ascontiguousarray(d_sc, dtype=np.float16).view(np.uint16)
         out_idx = np.empty((q_n, top_k), dtype=np.int32)
         out_sc = np.empty((q_n, top_k), dtype=np.float32)
-        lib.fast_neon_binary_topr_rerank_int8(
+        lib.fast_cpu_binary_topr_rerank_int8(
             qb.ctypes.data,
             qc.ctypes.data,
-            qs.ctypes.data,
+            qs_u16.ctypes.data,
             db.ctypes.data,
             dc.ctypes.data,
-            ds.ctypes.data,
+            ds_u16.ctypes.data,
             int(q_n),
             int(d_n),
             int(qb.shape[1]),
             int(dim),
             int(eff_r),
             int(top_k),
+            int(max_threads),
             out_idx.ctypes.data,
             out_sc.ctypes.data,
         )
@@ -552,12 +334,15 @@ class CompactRetrievalIndex:
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
         use_neon: bool = True,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
     ) -> None:
         arr = np.asarray(vectors)
         if arr.ndim != 2:
             raise ValueError(f"vectors must be a 2D array [N, D], got shape {arr.shape}")
         if agg not in VALID_WINDOW_AGGS:
             raise ValueError(f"agg must be one of {sorted(VALID_WINDOW_AGGS)}, got {agg!r}")
+        resolved_backend = resolve_cpu_backend(cpu_backend, use_neon=bool(use_neon))
 
         self.raw_dim: int = int(arr.shape[1])
         self.num_windows: int = int(arr.shape[0])
@@ -565,6 +350,9 @@ class CompactRetrievalIndex:
         self.default_agg: WindowAgg = agg
         self.default_hybrid_alpha: float = float(hybrid_alpha)
         self.use_neon: bool = bool(use_neon)
+        self.cpu_backend: CpuBackendMode = cpu_backend
+        self.max_threads: int = int(max_threads)
+        self.resolved_cpu_backend: str = resolved_backend
 
         if doc_offsets is not None:
             off_arr = np.ascontiguousarray(doc_offsets, dtype=np.int32)
@@ -637,12 +425,15 @@ class CompactRetrievalIndex:
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
         use_neon: bool = True,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
     ) -> "CompactRetrievalIndex":
         """Construct a ``CompactRetrievalIndex`` directly from pre-quantized arrays with zero copying.
 
         Arrays that are already C-contiguous with the expected dtype (including read-only ``mmap``
         views from ``np.frombuffer``) are bound directly with zero vector copying or re-quantization.
         """
+        resolved_backend = resolve_cpu_backend(cpu_backend, use_neon=bool(use_neon))
         valid_prequant_modes = ("binary_int8", "int8", "fp16", "fp32")
         if mode not in valid_prequant_modes:
             raise ValueError(f"mode must be one of {valid_prequant_modes}, got {mode!r}")
@@ -785,6 +576,9 @@ class CompactRetrievalIndex:
         obj.default_agg = agg
         obj.default_hybrid_alpha = alpha_f
         obj.use_neon = bool(use_neon)
+        obj.cpu_backend = cpu_backend
+        obj.max_threads = int(max_threads)
+        obj.resolved_cpu_backend = resolved_backend
         obj.doc_offsets = bound_doc_offsets
         obj.window_to_doc = bound_window_to_doc
         obj.num_docs = num_docs
@@ -836,7 +630,13 @@ class CompactRetrievalIndex:
         if self.codes_i8 is not None and self.scales_f16 is not None:
             q_i8, q_sc = quantize_int8_symmetric(q_trunc)
             win_scores = _int8_dot_scores(
-                q_i8, q_sc, self.codes_i8, self.scales_f16, use_neon=self.use_neon
+                q_i8,
+                q_sc,
+                self.codes_i8,
+                self.scales_f16,
+                use_neon=self.use_neon,
+                cpu_backend=self.cpu_backend,
+                max_threads=self.max_threads,
             )
         else:
             assert self.dense_vecs is not None
@@ -867,6 +667,11 @@ class CompactRetrievalIndex:
         """Return `(top_indices, top_scores)` of shape `[Q, k]` (`[k]` when `query_vecs` is 1D)."""
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
+        eff_agg = agg or self.default_agg
+        if eff_agg not in _AGG_MODE_TO_ID:
+            raise ValueError(f"agg must be one of {sorted(VALID_WINDOW_AGGS)}, got {eff_agg!r}")
+        eff_alpha = self.default_hybrid_alpha if hybrid_alpha is None else float(hybrid_alpha)
+
         raw_q, q_trunc, was_1d = self._prepare_queries(query_vecs)
         q_n = int(q_trunc.shape[0])
         eff_k = min(int(k), max(1, self.num_docs)) if self.num_docs > 0 else int(k)
@@ -878,6 +683,8 @@ class CompactRetrievalIndex:
 
         if self.mode == "binary_int8" and self.binary_u8 is not None and self.doc_offsets is None:
             assert self.codes_i8 is not None and self.scales_f16 is not None
+            eff_be, _ = get_cpu_retrieval_lib(cpu_backend=self.cpu_backend, use_neon=self.use_neon)
+            self.resolved_cpu_backend = eff_be
             q_i8, q_sc = quantize_int8_symmetric(q_trunc)
             src_q = raw_q if self.binary_bits > self.dim else q_trunc
             q_bits = pack_binary_bits(src_q, bits=self.binary_bits)
@@ -891,6 +698,8 @@ class CompactRetrievalIndex:
                 top_r=max(int(rerank_top_r), int(k)),
                 top_k=int(k),
                 use_neon=self.use_neon,
+                cpu_backend=self.cpu_backend,
+                max_threads=self.max_threads,
             )
             return (idx[0], sc[0]) if was_1d else (idx, sc)
 
@@ -906,6 +715,44 @@ class CompactRetrievalIndex:
             q_i8, q_sc = quantize_int8_symmetric(q_trunc)
             src_q = raw_q if self.binary_bits > self.dim else q_trunc
             q_bits = pack_binary_bits(src_q, bits=self.binary_bits)
+            if self.num_windows > 0:
+                eff_be, lib = get_cpu_retrieval_lib(cpu_backend=self.cpu_backend, use_neon=self.use_neon)
+                self.resolved_cpu_backend = eff_be
+                if lib is not None:
+                    qb = np.ascontiguousarray(q_bits, dtype=np.uint8)
+                    qc = np.ascontiguousarray(q_i8, dtype=np.int8)
+                    qs_u16 = np.ascontiguousarray(q_sc, dtype=np.float16).view(np.uint16)
+                    db = np.ascontiguousarray(self.binary_u8, dtype=np.uint8)
+                    dc = np.ascontiguousarray(self.codes_i8, dtype=np.int8)
+                    ds_u16 = np.ascontiguousarray(self.scales_f16, dtype=np.float16).view(np.uint16)
+                    doc_offs = np.ascontiguousarray(self.doc_offsets, dtype=np.int32)
+                    win_to_doc = np.ascontiguousarray(self.window_to_doc, dtype=np.int32)
+                    out_idx = np.empty((q_n, k), dtype=np.int32)
+                    out_sc = np.empty((q_n, k), dtype=np.float32)
+                    lib.fast_cpu_binary_doc_rerank_int8(
+                        qb.ctypes.data,
+                        qc.ctypes.data,
+                        qs_u16.ctypes.data,
+                        db.ctypes.data,
+                        dc.ctypes.data,
+                        ds_u16.ctypes.data,
+                        doc_offs.ctypes.data,
+                        win_to_doc.ctypes.data,
+                        int(q_n),
+                        int(self.num_docs),
+                        int(self.num_windows),
+                        int(qb.shape[1]),
+                        int(self.dim),
+                        int(win_top_r),
+                        int(_AGG_MODE_TO_ID[eff_agg]),
+                        float(eff_alpha),
+                        int(k),
+                        int(self.max_threads),
+                        out_idx.ctypes.data,
+                        out_sc.ctypes.data,
+                    )
+                    return (out_idx[0], out_sc[0]) if was_1d else (out_idx, out_sc)
+
             cand_win_idx, _ = _binary_topr_rerank_int8(
                 q_bits,
                 q_i8,
@@ -916,9 +763,9 @@ class CompactRetrievalIndex:
                 top_r=win_top_r,
                 top_k=win_top_r,
                 use_neon=self.use_neon,
+                cpu_backend=self.cpu_backend,
+                max_threads=self.max_threads,
             )
-            eff_agg = agg or self.default_agg
-            eff_alpha = self.default_hybrid_alpha if hybrid_alpha is None else float(hybrid_alpha)
             out_idx = np.full((q_n, k), -1, dtype=np.int32)
             out_sc = np.full((q_n, k), -1e30, dtype=np.float32)
             for qi in range(q_n):
@@ -937,6 +784,8 @@ class CompactRetrievalIndex:
                     self.codes_i8[flat_w],
                     self.scales_f16[flat_w],
                     use_neon=self.use_neon,
+                    cpu_backend=self.cpu_backend,
+                    max_threads=self.max_threads,
                 )
                 d_sc = score_document_windows(w_sc, sub_offsets, agg=eff_agg, hybrid_alpha=eff_alpha)[0]
                 take = min(int(k), cand_docs.size)
@@ -944,6 +793,51 @@ class CompactRetrievalIndex:
                 out_idx[qi, :take] = cand_docs[order]
                 out_sc[qi, :take] = d_sc[order]
             return (out_idx[0], out_sc[0]) if was_1d else (out_idx, out_sc)
+
+        if self.codes_i8 is not None and self.scales_f16 is not None and self.num_windows > 0:
+            eff_be, lib = get_cpu_retrieval_lib(cpu_backend=self.cpu_backend, use_neon=self.use_neon)
+            self.resolved_cpu_backend = eff_be
+            if lib is not None:
+                q_i8, q_sc = quantize_int8_symmetric(q_trunc)
+                qc = np.ascontiguousarray(q_i8, dtype=np.int8)
+                qs_u16 = np.ascontiguousarray(q_sc, dtype=np.float16).view(np.uint16)
+                dc = np.ascontiguousarray(self.codes_i8, dtype=np.int8)
+                ds_u16 = np.ascontiguousarray(self.scales_f16, dtype=np.float16).view(np.uint16)
+                out_idx = np.empty((q_n, k), dtype=np.int32)
+                out_sc = np.empty((q_n, k), dtype=np.float32)
+                if self.doc_offsets is None:
+                    lib.fast_cpu_int8_topk(
+                        qc.ctypes.data,
+                        qs_u16.ctypes.data,
+                        dc.ctypes.data,
+                        ds_u16.ctypes.data,
+                        int(q_n),
+                        int(self.num_docs),
+                        int(self.dim),
+                        int(k),
+                        int(self.max_threads),
+                        out_idx.ctypes.data,
+                        out_sc.ctypes.data,
+                    )
+                else:
+                    doc_offs = np.ascontiguousarray(self.doc_offsets, dtype=np.int32)
+                    lib.fast_cpu_int8_doc_topk(
+                        qc.ctypes.data,
+                        qs_u16.ctypes.data,
+                        dc.ctypes.data,
+                        ds_u16.ctypes.data,
+                        doc_offs.ctypes.data,
+                        int(q_n),
+                        int(self.num_docs),
+                        int(self.dim),
+                        int(_AGG_MODE_TO_ID[eff_agg]),
+                        float(eff_alpha),
+                        int(k),
+                        int(self.max_threads),
+                        out_idx.ctypes.data,
+                        out_sc.ctypes.data,
+                    )
+                return (out_idx[0], out_sc[0]) if was_1d else (out_idx, out_sc)
 
         scores = self.score_all(q_trunc, agg=agg, hybrid_alpha=hybrid_alpha)
         out_idx = np.full((q_n, k), -1, dtype=np.int32)
@@ -975,6 +869,9 @@ def build_engine_index(
     binary_bits: int | None = None,
     agg: WindowAgg = "maxsim",
     hybrid_alpha: float = 0.7,
+    use_neon: bool = True,
+    cpu_backend: CpuBackendMode = "auto",
+    max_threads: int = 0,
     encode_mode: str | None = None,
     **encode_kwargs: Any,
 ) -> CompactRetrievalIndex:
@@ -999,4 +896,7 @@ def build_engine_index(
         binary_bits=binary_bits,
         agg=agg,
         hybrid_alpha=hybrid_alpha,
+        use_neon=use_neon,
+        cpu_backend=cpu_backend,
+        max_threads=max_threads,
     )

@@ -43,6 +43,9 @@ _OPTIONAL_QUERY_BUCKETS: tuple[tuple[int, str, int, int], ...] = (
 
 _QUERY_CAPS: tuple[int, ...] = (24, 64, 128, 192, 256, 320, 384, 448, 512)
 _CORPUS_CAPS: tuple[int, ...] = (64, 128, 192, 256, 320, 384, 448, 512)
+_BGE_QUERY_BATCH_MIN_SIZE: int = 8
+_ANE_TABLE_BIND_LOCK = threading.Lock()
+_LAST_BOUND_ANE_TABLE_KEY: tuple[int, int, int, int, int] | None = None
 
 
 def _apply_mlx_wired_limit() -> int | None:
@@ -287,6 +290,14 @@ class FastBgeSmall:
                 wt0 = getattr(self, "_wt0_f16", None)
                 if wt0 is not None:
                     ane_lib.bge_ane_clear_borrowed_tables(wt0.ctypes.data)
+            wt0_ptr = int(getattr(self, "_wt0_f16", None).ctypes.data) if getattr(self, "_wt0_f16", None) is not None else 0
+            with _ANE_TABLE_BIND_LOCK:
+                global _LAST_BOUND_ANE_TABLE_KEY
+                if _LAST_BOUND_ANE_TABLE_KEY is not None and (
+                    _LAST_BOUND_ANE_TABLE_KEY[0] == id(ane_lib)
+                    or (wt0_ptr != 0 and _LAST_BOUND_ANE_TABLE_KEY[1] == wt0_ptr)
+                ):
+                    _LAST_BOUND_ANE_TABLE_KEY = None
             self._owned_bucket_ids.clear()
             self.buckets.clear()
             self.query_buckets.clear()
@@ -320,18 +331,30 @@ class FastBgeSmall:
             pass
 
     def _bind_ane_tables(self, ane: Any | None = None) -> None:
+        global _LAST_BOUND_ANE_TABLE_KEY
         lib = ane if ane is not None else self.ane
         if lib is None or self._wt0_f16 is None or self._pos_f16 is None:
             return
-        init_fn = getattr(lib, "bge_ane_init_tables_borrowed", lib.bge_ane_init_tables)
-        rc = init_fn(
-            self._wt0_f16.ctypes.data,
-            self._wt0_f16.shape[0],
-            self._pos_f16.ctypes.data,
-            self._pos_f16.shape[0],
+        key = (
+            id(lib),
+            int(self._wt0_f16.ctypes.data),
+            int(self._wt0_f16.shape[0]),
+            int(self._pos_f16.ctypes.data),
+            int(self._pos_f16.shape[0]),
         )
-        if rc != 0:
-            raise RuntimeError(f"bge_ane_init_tables failed with code {rc}")
+        with _ANE_TABLE_BIND_LOCK:
+            if _LAST_BOUND_ANE_TABLE_KEY == key:
+                return
+            init_fn = getattr(lib, "bge_ane_init_tables_borrowed", None) or getattr(lib, "bge_ane_init_tables")
+            rc = init_fn(
+                self._wt0_f16.ctypes.data,
+                self._wt0_f16.shape[0],
+                self._pos_f16.ctypes.data,
+                self._pos_f16.shape[0],
+            )
+            if rc != 0:
+                raise RuntimeError(f"bge_ane_init_tables failed with code {rc}")
+            _LAST_BOUND_ANE_TABLE_KEY = key
 
     def _init_ane(self, *, verify_plan: bool = True) -> None:
         self._wt0_f16, self._pos_f16 = load_or_mmap_host_tables(self.paths.weights_npz)
@@ -524,6 +547,8 @@ class FastBgeSmall:
             tok_lists = self.tokenizer.encode_batch(items, add_query_prefix=add_query_prefix, max_length=512)
             if len(tok_lists) == 1:
                 return self.encode_query(tok_lists[0], prefer_ane=prefer_ane)[None, :]
+            if len(tok_lists) >= _BGE_QUERY_BATCH_MIN_SIZE or eff_mode == "gpu" or not self.ane_available:
+                return self.encode_corpus(tok_lists, mode=eff_mode)
             return np.stack([self.encode_query(ids, prefer_ane=prefer_ane) for ids in tok_lists], axis=0)
 
         tok_lists = self.tokenizer.encode_batch(items, add_query_prefix=add_query_prefix, max_length=512)
