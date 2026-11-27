@@ -1451,6 +1451,130 @@ def test_emb2_local_files_only_forwarded_cpu(
         assert seen_calls[-1] == {"home": None, "include_ane": False, "local_files_only": True}
 
 
+def test_emb2_query_batch_routing_inline_ane_and_build_index_cpu() -> None:
+    """Verify multi-query batch routing, inline ANE small-batch path (zero GPU wake), and build_index cpu_backend."""
+    import threading
+    from fast_embeddinggemma_2.engine import CoreMLScratch
+
+    class _MockTok:
+        bos_id = 2
+        eos_id = 1
+
+        def encode(self, _text: str, **_kw: object) -> list[int]:
+            return [2, 10, 11, 1]
+
+        def encode_batch(self, texts: list[str], **_kw: object) -> list[list[int]]:
+            return [[2, 10 + i, 11, 1] for i, _ in enumerate(texts)]
+
+    # 1. encode_texts(..., is_query=True): Q=1 uses encode_query; Q>=2 routes through encode_corpus
+    eng = FastEmbeddingGemma2.__new__(FastEmbeddingGemma2)
+    eng.dim = 768
+    eng.default_mode = "hetero"
+    eng.ane_available = True
+    eng.cpu_sme_available = False
+    eng.tokenizer = _MockTok()  # type: ignore[assignment]
+    eng._gpu = None
+    eng.ane_query_max_len = 512
+
+    eq_calls: list[str] = []
+    ec_calls: list[tuple[int, str, int | None]] = []
+
+    def _spy_eq(tok_ids, *, prefer_ane=True, dimensions=None, strict_ane=False):
+        del prefer_ane, strict_ane
+        eq_calls.append("eq")
+        d = eng._resolve_dim(dimensions)
+        v = np.ones((d,), dtype=np.float32)
+        return v / np.linalg.norm(v)
+
+    def _spy_ec(tok_lists, *, mode=None, dimensions=None, allow_gpu_overflow=False):
+        del allow_gpu_overflow
+        ec_calls.append((len(tok_lists), str(mode), dimensions))
+        d = eng._resolve_dim(dimensions)
+        v = np.ones((len(tok_lists), d), dtype=np.float32)
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+        return v
+
+    eng.encode_query = _spy_eq  # type: ignore[method-assign]
+    eng.encode_corpus = _spy_ec  # type: ignore[method-assign]
+
+    out1 = eng.encode_texts(["one query"], is_query=True, mode="hetero")
+    assert out1.shape == (1, 768)
+    assert len(eq_calls) == 1 and ec_calls == []
+
+    eq_calls.clear()
+    out2 = eng.encode_texts(["q1", "q2"], is_query=True, mode="hetero")
+    assert out2.shape == (2, 768)
+    assert eq_calls == [] and ec_calls == [(2, "hetero", 768)]
+
+    ec_calls.clear()
+    out_gpu = eng.encode_texts(["q1", "q2", "q3"], is_query=True, mode="gpu")
+    assert out_gpu.shape == (3, 768)
+    assert eq_calls == [] and ec_calls == [(3, "gpu", 768)]
+
+    # 2. Inline ANE fast path inside real encode_corpus: S=32/64 downshift without waking GPU
+    class _PoisonGPU:
+        def exec_packed(self, *_a: object, **_kw: object) -> object:
+            raise AssertionError("GPU must not run for small <=512 query batches routed inline to ANE")
+
+    eng2 = FastEmbeddingGemma2.__new__(FastEmbeddingGemma2)
+    eng2.dim = 768
+    eng2.default_mode = "hetero"
+    eng2.ane_available = True
+    eng2.cpu_sme_available = False
+    eng2.tokenizer = _MockTok()  # type: ignore[assignment]
+    eng2.ane_handles = {32: 1, 64: 2, 128: 3}
+    eng2.cpu_handles = {}
+    eng2._oi_handles = {}
+    eng2._ane_scratch = CoreMLScratch(4, 128)
+    eng2._ane_scratch_b = None
+    eng2._cpu_scratch = None
+    eng2._gpu = _PoisonGPU()  # type: ignore[assignment]
+    eng2._gpu_lock = threading.Lock()
+    eng2._corpus_lock = threading.Lock()
+    eng2._mlx_cache_limit_mb = 512
+
+    inline_execs: list[tuple[int, int, int]] = []
+
+    def _spy_exec_lanes(kind, S, lanes, scratch, out_dest, *, eff_dim=768):
+        del scratch
+        assert kind == "ane"
+        inline_execs.append((S, len(lanes), eff_dim))
+        rt = 0
+        for ln in lanes:
+            for doc_i, tok in ln:
+                rt += len(tok)
+                out_dest[doc_i] = 1.0 / np.sqrt(eff_dim)
+        return rt, len(lanes) * S
+
+    eng2._exec_coreml_lanes = _spy_exec_lanes  # type: ignore[method-assign]
+
+    # Q=2 x 12 tok = 24 <= 32 -> inline S=32
+    r32 = eng2.encode_corpus([[2] + [10] * 10 + [1]] * 2, mode="hetero")
+    assert r32.shape == (2, 768)
+    assert inline_execs[-1] == (32, 1, 768)
+    assert eng2.last_stats is not None and eng2.last_stats["ane_docs"] == 2 and eng2.last_stats["gpu_docs"] == 0
+
+    # Q=2 x 25 tok = 50 <= 64 -> inline S=64
+    r64 = eng2.encode_corpus([[2] + [10] * 23 + [1]] * 2, mode="hetero")
+    assert r64.shape == (2, 768)
+    assert inline_execs[-1] == (64, 1, 768)
+    assert eng2.last_stats["ane_docs"] == 2 and eng2.last_stats["gpu_docs"] == 0
+
+    # Q=4 x 25 tok = 100 <= 128 -> inline S=128
+    r128 = eng2.encode_corpus([[2] + [10] * 23 + [1]] * 4, mode="hetero")
+    assert r128.shape == (4, 768)
+    assert inline_execs[-1] == (128, 1, 768)
+
+    # 3. build_index forwards cpu_backend + max_threads cleanly
+    idx_cpp = eng2.build_index(
+        np.ones((4, 768), dtype=np.float32),
+        cpu_backend="portable_cpp",
+        max_threads=2,
+    )
+    assert idx_cpp.resolved_cpu_backend == "portable_cpp"
+    assert idx_cpp.max_threads == 2
+
+
 
 
 

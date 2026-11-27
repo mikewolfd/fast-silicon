@@ -15,6 +15,7 @@ import warnings
 import mlx.core as mx
 import numpy as np
 from fast_shared.bench import clear_mlx_arena
+from fast_shared.cpu_kernels import CpuBackendMode
 from fast_shared.embeddings import resolve_embedding_dim, set_mlx_cache_limit, truncate_and_normalize
 from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
@@ -1154,13 +1155,34 @@ class FastEmbeddingGemma2:
             add_document_prefix=add_document_prefix,
             max_length=ml,
         )
-        if is_query or len(tok_lists) == 1:
-            if len(tok_lists) == 1:
-                return self.encode_query(tok_lists[0], prefer_ane=prefer_ane, dimensions=eff_dim, strict_ane=strict_ane)[None, :]
-            return np.stack(
-                [self.encode_query(ids, prefer_ane=prefer_ane, dimensions=eff_dim, strict_ane=strict_ane) for ids in tok_lists],
-                axis=0,
+        if len(tok_lists) == 1:
+            return self.encode_query(
+                tok_lists[0],
+                prefer_ane=prefer_ane,
+                dimensions=eff_dim,
+                strict_ane=strict_ane,
+            )[None, :]
+        if is_query:
+            can_batch = bool(
+                self.ane_available
+                or (eff_mode == "cpu" and self.cpu_sme_available)
+                or self._gpu is None
+                or hasattr(self._gpu, "exec_packed")
+                or callable(self.__dict__.get("encode_corpus"))
             )
+            if not can_batch:
+                return np.stack(
+                    [
+                        self.encode_query(
+                            ids,
+                            prefer_ane=prefer_ane,
+                            dimensions=eff_dim,
+                            strict_ane=strict_ane,
+                        )
+                        for ids in tok_lists
+                    ],
+                    axis=0,
+                )
 
         return self.encode_corpus(tok_lists, mode=eff_mode, dimensions=eff_dim)
 
@@ -1249,6 +1271,40 @@ class FastEmbeddingGemma2:
                     "ANE/CPU CoreML bundles cap at 512 tokens. Use mode='hetero'/'gpu', truncate to <=512, "
                     "or pass allow_gpu_overflow=True to explicitly route >512 overflow onto GPU."
                 )
+
+            if (
+                eff_mode in ("hetero", "hetero2", "ane")
+                and bool(self.ane_handles)
+                and not over_q
+                and self._ane_scratch is not None
+            ):
+                non_empty = [(b_s, list(dq)) for b_s, dq in by_b.items() if dq]
+                if len(non_empty) == 1:
+                    b_s, lanes = non_empty[0]
+                    cands = GPU_B_OPTS.get(b_s, (4,))
+                    min_gpu_b = min(cands[:-1] if len(cands) > 1 else cands)
+                    inline_ok = (len(lanes) <= 4) if eff_mode == "ane" else (len(lanes) < min_gpu_b)
+                    if inline_ok:
+                        tot_tok_max = max(sum(len(t) for _, t in ln) for ln in lanes)
+                        s_exec = b_s
+                        if b_s == 128:
+                            if 32 in self.ane_handles and len(lanes) == 1 and tot_tok_max <= 32:
+                                s_exec = 32
+                            elif 64 in self.ane_handles and tot_tok_max <= 64:
+                                s_exec = 64
+                        if s_exec in self.ane_handles:
+                            rt, _ = self._exec_coreml_lanes(
+                                "ane", s_exec, lanes, self._ane_scratch, outs, eff_dim=eff_dim
+                            )
+                            self.last_stats = {
+                                "gpu_toks": 0,
+                                "ane_toks": rt,
+                                "cpu_toks": 0,
+                                "gpu_docs": 0,
+                                "ane_docs": n,
+                                "cpu_docs": 0,
+                            }
+                            return outs
 
             qlock = threading.Lock()
             use_ane = eff_mode in ("hetero", "hetero2", "ane") and bool(self.ane_handles)
@@ -1553,6 +1609,8 @@ class FastEmbeddingGemma2:
         binary_bits: int | None = None,
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
         encode_mode: str | None = None,
         add_document_prefix: bool = False,
     ) -> CompactRetrievalIndex:
@@ -1573,6 +1631,8 @@ class FastEmbeddingGemma2:
                 binary_bits=binary_bits,
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
                 encode_mode=encode_mode,
             )
         if isinstance(corpus, np.ndarray):
@@ -1598,6 +1658,8 @@ class FastEmbeddingGemma2:
             binary_bits=binary_bits,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )
 
     def _resolve_vision_model_dir(self, vision_model_dir: str | Path | None = None) -> Path:
@@ -1812,6 +1874,8 @@ class FastEmbeddingGemma2:
         binary_bits: int | None = None,
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
         vision_model_dir: str | Path | None = None,
     ) -> CompactRetrievalIndex:
         """Build a `CompactRetrievalIndex` over visual embeddings of images (plus optional captions; defaults to `max_soft_tokens=140`)."""
@@ -1831,4 +1895,6 @@ class FastEmbeddingGemma2:
             binary_bits=binary_bits,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )

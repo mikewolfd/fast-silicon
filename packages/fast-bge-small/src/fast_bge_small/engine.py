@@ -12,6 +12,7 @@ import mlx.core as mx
 import numpy as np
 
 from fast_shared.bench import clear_mlx_arena
+from fast_shared.cpu_kernels import CpuBackendMode
 from fast_shared.embeddings import set_mlx_cache_limit
 from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
@@ -768,6 +769,8 @@ class FastBgeSmall:
         binary_bits: int | None = None,
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
         encode_mode: str | None = None,
     ) -> CompactRetrievalIndex:
         """Build a `CompactRetrievalIndex` (`384d int8` `4.0x` lossless default, or `binary_int8` / `MaxSim`)."""
@@ -787,6 +790,8 @@ class FastBgeSmall:
                 binary_bits=binary_bits,
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
                 encode_mode=encode_mode,
             )
         if isinstance(corpus, np.ndarray):
@@ -806,4 +811,6 @@ class FastBgeSmall:
             binary_bits=binary_bits,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )

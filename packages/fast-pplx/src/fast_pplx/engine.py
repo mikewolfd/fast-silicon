@@ -15,6 +15,7 @@ import time
 from typing import Any, Literal, Sequence
 
 import numpy as np
+from fast_shared.cpu_kernels import CpuBackendMode
 from fast_shared.embeddings import accepts_kwarg, resolve_embedding_dim, truncate_and_normalize
 from fast_shared.retrieval_index import CompactRetrievalIndex, IndexMode, WindowAgg
 
@@ -2143,6 +2144,8 @@ class FastPplx:
         hybrid_alpha: float = 0.7,
         batch_size: int = 16,
         encode_mode: str | None = None,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
     ) -> CompactRetrievalIndex:
         """Build a `CompactRetrievalIndex` (`1024d sym_int8`, `MaxSim` multivector, or contextual sub-chunk index)."""
         if multivector and sub_chunk_chars is not None:
@@ -2170,6 +2173,8 @@ class FastPplx:
                 binary_bits=binary_bits,
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
                 encode_mode=encode_mode,
                 batch_size=min(4, max(1, int(batch_size))),
             )
@@ -2213,6 +2218,8 @@ class FastPplx:
             binary_bits=binary_bits,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )
 
     def build_image_index(
@@ -2232,6 +2239,8 @@ class FastPplx:
         binary_bits: int | None = None,
         agg: WindowAgg = "maxsim",
         hybrid_alpha: float = 0.7,
+        cpu_backend: CpuBackendMode = "auto",
+        max_threads: int = 0,
     ) -> CompactRetrievalIndex:
         """Encode document/page images into contextual bands and build a CompactRetrievalIndex."""
         img_list = list(images)
@@ -2269,6 +2278,8 @@ class FastPplx:
                 binary_bits=binary_bits,
                 agg=agg,
                 hybrid_alpha=hybrid_alpha,
+                cpu_backend=cpu_backend,
+                max_threads=max_threads,
             )
 
         vec_dim = enc_dim
@@ -2299,6 +2310,8 @@ class FastPplx:
             binary_bits=binary_bits,
             agg=agg,
             hybrid_alpha=hybrid_alpha,
+            cpu_backend=cpu_backend,
+            max_threads=max_threads,
         )
 
     def close(self) -> None:
