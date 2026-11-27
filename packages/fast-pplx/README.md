@@ -84,9 +84,9 @@ The paired score difference vs. stock is `+0.0008` (95% CI `-0.0036` to `+0.0053
 | Indexing mode | Quality vs. FP32 whole-doc | Index size / peak Metal RAM | Speedup & query latency |
 | --- | --- | --- | --- |
 | Single-vector whole doc (up to 32K) | `0.047` on 32K passkey, `0.895` on `2wikimqa` | 4.00 KiB/doc / 4.27 GB Metal peak | 2,205.5 s GPU encode / 2.82 ms @ 100K docs |
-| **`build_index(..., multivector=True)` (`MaxSim`)** | **1.000** on 32K split (**0.674** pooled), **0.985** `2wikimqa`; optional `w512_ov64` lifts Base M5 `LongEmbed passkey R@1` `+8.33 pp` (`0.792 -> 0.875`) | 15.97 KiB/doc / **1.72 GB Metal peak** (2.48x lower) | **955.4 s GPU encode (2.31x faster)** |
-| `build_index(..., mode="int8")` (`<16K`) | `-0.0007` NanoBEIR, `-0.0012` LegalBench | 1,026 B/vec (3.99x smaller) | 2.11 ms/query @ 100K docs |
-| **`build_index(..., mode="binary_int8")` (`>=16K`)** | `+0.0006` NanoBEIR, `-0.0012` LegalBench @ Top-64 | 128 B binary + 1,026 B INT8 (3.55x smaller) | **0.66 ms/query @ 100K docs (4.28x faster)** |
+| **`build_index(..., multivector=True)` (`MaxSim`)** | **1.000** on 32K split (**0.674** pooled), **0.985** `2wikimqa`; optional `w512_ov64` lifts Base M5 `LongEmbed passkey R@1` `+8.33 pp` (`0.792 -> 0.875`) | 15.97 KiB/doc / **1.72 GB Metal peak** (2.48x lower) | **955.4 s GPU encode (2.31x faster)**; fused C++ `MaxSim` search up to **14.86x** (`int8`) / **11.12x** (`binary_int8`) faster on skewed `W=78K` docs |
+| `build_index(..., mode="int8")` (`<16K`) | `-0.0007` NanoBEIR, `-0.0012` LegalBench | 1,026 B/vec (3.99x smaller) | **0.75 ms/q** `Q=1` (`3.86x`), **16.43x** batched `Q=16` @ 100K docs (`cpu_backend="auto"`, [receipt](../../docs/benchmarks/m4-cpu-query-opt-20261127.json)) |
+| **`build_index(..., mode="binary_int8")` (`>=16K`)** | `+0.0006` NanoBEIR, `-0.0012` LegalBench @ Top-64 | 128 B binary + 1,026 B INT8 (3.55x smaller) | **0.30 ms/q** `Q=1` (`2.81x`), **7.02x** batched `Q=16` @ 100K docs (`cpu_backend`: NEON / AVX-512 / AVX2 / portable C++) |
 
 ### 3. Stock `pplx-context-mlx` GPU vs. `fast-pplx` (`gpu` / `ane` / `hetero2`)
 

@@ -6,7 +6,7 @@ Runs 100% locally with zero telemetry and zero runtime dependency on `torch` or 
 
 ## Requirements
 
-- Apple Silicon Mac (`M1-M5`), macOS 15+ for Core ML ANE and native modules (`macOS 14+` for GPU-only MLX), Python 3.12+, and `uv`. Linux, Windows, and Intel Macs are not supported for GPU/ANE modules.
+- Apple Silicon Mac (`M1-M5`), macOS 15+ for Core ML ANE and native modules (`macOS 14+` for GPU-only MLX), Python 3.12+, and `uv`. Metal GPU and Core ML ANE modules require Apple Silicon macOS, while CPU retrieval and BM25 (`fast_shared.cpu_kernels`, `CompactRetrievalIndex`, `BM25Index`, `HybridRetrievalPipeline`) run cross-platform on macOS and Linux (`x86_64` AVX-512/AVX2 and ARM64 NEON/portable C++17) via `cpu_backend` (`auto`, `avx512`, `avx2`, `neon`, `neon_i8mm`, `portable_cpp`, `numpy`) or `FAST_SILICON_CPU_BACKEND`.
 
 ## Quickstart
 
@@ -22,12 +22,14 @@ uv sync --python 3.13 --package fast-shared --inexact
 
 ```python
 import os
+from fast_shared import BM25Index, CompactRetrievalIndex, detect_cpu_isa
 from fast_shared.bench import check_system_quiescence, read_process_rusage_v6
 from fast_shared.runtime_lessons import DynamicSiliconPolicy
 
 warnings = check_system_quiescence()
 policy = DynamicSiliconPolicy()  # Probes Apple9 (M4) vs Apple10+ NAX (M5), RAM ceiling, and OS version
 plan = policy.resolve(workload="extraction", batch_size=8, seq_len=512)
+isa = detect_cpu_isa()           # Cross-platform backend selection: neon / avx512 / avx2 / portable_cpp / numpy
 mem = read_process_rusage_v6(os.getpid())  # Physical + Neural Engine footprint
 ```
 

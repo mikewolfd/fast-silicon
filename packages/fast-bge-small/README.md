@@ -57,7 +57,7 @@ Mean score averages ranking performance across 150 NanoBEIR queries and 175 Lega
 
 `fast-bge-small` runs 5.09x (M5) and 5.30x (M4 Pro) faster than the public `sidekickd` FP16 Core ML export at matching mean score (diff 0.0002, min cosine `>= 0.99996`), while `sidekickd` uses less unified memory (`0.54-0.74 GB` vs. `1.54-1.55 GB`). The alternative `michaeljelly/bge-small-en-coreml-v1.5` export returned non-finite first-token embeddings on CPU/GPU and low cosine similarity (`0.518-0.619`) on ANE. [Public Core ML details](../../docs/BENCHMARKS.md#public-core-ml-results)
 
-Prepending document headers during Parquet chunking raises 175-query legal passage ranking from `0.305` to `0.444` (`0.631` -> `0.710` recall). `eng.build_index(corpus)` compresses embeddings 4x into symmetric INT8 (`386 B/chunk`) and, at 16,000+ documents, adds a 48-byte binary Hamming prefilter that searches 100,000 vectors in **0.50 ms/query** vs. `1.46 ms` in FP32 BLAS (`2.95x` faster). Unlike Matryoshka-trained models, truncating BGE-small to 256d loses `0.0184` on NanoBEIR, so defaults keep all 384 dimensions. [Chunking and compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json)
+Prepending document headers during Parquet chunking raises 175-query legal passage ranking from `0.305` to `0.444` (`0.631` -> `0.710` recall). `eng.build_index(corpus)` compresses embeddings 4x into symmetric INT8 (`386 B/chunk`) and, at 16,000+ documents, adds a 48-byte binary Hamming prefilter backed by cross-platform multi-core C++17 `CompactRetrievalIndex` (`cpu_backend="auto"`, supporting Apple Silicon NEON plus non-Apple AVX-512/AVX2/portable C++; on `100K x 1024d`, `binary_int8` reaches **0.30 ms/q** and `int8` reaches **0.75 ms/q** single-query and **16.43x** batched `Q=16` speedup). Unlike Matryoshka-trained models, truncating BGE-small to 256d loses `0.0184` on NanoBEIR, so defaults keep all 384 dimensions. [Compact index receipts](../../docs/benchmarks/v25-rd-winners-20261122.json) · [CPU query optimization receipt](../../docs/benchmarks/m4-cpu-query-opt-20261127.json)
 
 ### 2. Stock `mlx-embeddings` vs. `fast-bge-small` (`gpu` / `ane` / `hetero`)
 
@@ -87,9 +87,9 @@ On the 64-doc verification fixture (`bge-small verify`), minimum cosine similari
 
 | Component | How it works | Source |
 | --- | --- | --- |
-| **16-core ANE runner** | Pure-ANE Core ML buckets with a 4-slot async ring, NEON FP16 transpose, and Layer-11 `[CLS]` slicing | [`native/bge_ane_runner.mm`](native/bge_ane_runner.mm) |
+| **16-core ANE runner & bind cache** | Pure-ANE Core ML buckets with a 4-slot async ring, cached `_bind_ane_tables` pointer reuse, NEON FP16 transpose, and Layer-11 `[CLS]` slicing | [`native/bge_ane_runner.mm`](native/bge_ane_runner.mm), [`src/fast_bge_small/engine.py`](src/fast_bge_small/engine.py) |
 | **Metal GPU** | Packed variable-length batching with zero attention padding, Apple10 NAX Metal 4 `MPP::matmul2d` `32x64` FlashAttention (`1.454x` attention / `213.5k tok/s` `hetero` / `173.2k tok/s` `gpu` on Base M5), and fused GELU + LayerNorm | [`src/fast_bge_small/gpu.py`](src/fast_bge_small/gpu.py) |
-| **Work-stealing scheduler** | GPU pulls longest sequences forward while ANE pulls shortest backward, with 4-batch Parquet prefetch (1.18-1.33x faster) | [`src/fast_bge_small/`](src/fast_bge_small/) |
+| **Work-stealing scheduler & `Q>=8` routing** | Routes `encode_texts(..., is_query=True)` batches at `Q>=8` cleanly through `encode_corpus` (`1.22x-3.83x` faster, `min_cos=1.0`) while keeping `Q<=4` on low-latency ANE `encode_query`; bulk runs split longest-GPU vs shortest-ANE with 4-batch Parquet prefetch | [`src/fast_bge_small/`](src/fast_bge_small/) |
 
 ## CLI, Parquet & HTTP server
 
