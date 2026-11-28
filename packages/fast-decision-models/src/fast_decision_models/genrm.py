@@ -30,6 +30,17 @@ DEFAULT_NO_VARIANTS: tuple[str, ...] = (" No", " no", "No", "no")
 
 
 @dataclass(frozen=True)
+class GenRMPairwiseResult:
+    """Result from :meth:`GenRMScorer.score_pairwise_swap_invariant`."""
+
+    p_a: float
+    p_b: float
+    p_fwd_a: float
+    p_rev_a: float
+    order_disagreement: float
+
+
+@dataclass(frozen=True)
 class GenRMBestOfKResult:
     """Result from :meth:`GenRMScorer.score_best_of_k`."""
 
@@ -38,6 +49,10 @@ class GenRMBestOfKResult:
     margin_top1_top2: float
     pairwise_refined: bool = False
     pairwise_probs: tuple[float, float] | None = None
+    decision_margin: float = 0.0
+    pairwise_order_disagreement: float | None = None
+    abstain: bool = False
+    abstain_reason: str | None = None
 
 
 def truncate_balanced(text: str, max_chars: int) -> str:
@@ -372,6 +387,80 @@ def _normalize_choice_probs(
     return [float(x / total) for x in clean.tolist()]
 
 
+def _validate_non_negative_threshold(name: str, value: float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite non-negative float, got {value!r}")
+    try:
+        val = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite non-negative float, got {value!r}") from exc
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0.0, got {value!r}")
+    return val
+
+
+def _parse_pairwise_item(
+    idx: int,
+    item: Mapping[str, Any] | tuple[str, str, str],
+) -> tuple[str, str, str]:
+    if isinstance(item, Mapping):
+        p_txt = "" if item.get("prompt") is None else str(item.get("prompt"))
+        has_pair_keys = "cand_a" in item or "cand_b" in item
+        has_cands_key = "candidates" in item and item.get("candidates") is not None
+        if has_pair_keys and (
+            item.get("cand_a") is not None or item.get("cand_b") is not None or not has_cands_key
+        ):
+            if "cand_a" not in item or "cand_b" not in item:
+                raise ValueError(f"Item {idx} mapping must provide both 'cand_a' and 'cand_b'")
+            cand_a = "" if item["cand_a"] is None else str(item["cand_a"])
+            cand_b = "" if item["cand_b"] is None else str(item["cand_b"])
+            return p_txt, cand_a, cand_b
+        if has_cands_key:
+            raw_cands = item["candidates"]
+            if isinstance(raw_cands, (str, bytes)) or not isinstance(raw_cands, Sequence):
+                raise ValueError(f"Item {idx} 'candidates' must be a 2-element sequence")
+            cands = ["" if c is None else str(c) for c in raw_cands]
+            if len(cands) != 2:
+                raise ValueError(f"Item {idx} pairwise 'candidates' must have length 2, got {len(cands)}")
+            return p_txt, cands[0], cands[1]
+        raise ValueError(
+            f"Item {idx} mapping must provide ('cand_a', 'cand_b') or 2-element 'candidates'"
+        )
+
+    if isinstance(item, (str, bytes)) or not isinstance(item, Sequence) or len(item) != 3:
+        raise ValueError(
+            f"Item {idx} must be a (prompt, cand_a, cand_b) tuple or mapping, got {type(item).__name__}"
+        )
+    return (
+        "" if item[0] is None else str(item[0]),
+        "" if item[1] is None else str(item[1]),
+        "" if item[2] is None else str(item[2]),
+    )
+
+
+def _compute_abstention(
+    decision_margin: float,
+    pairwise_order_disagreement: float | None,
+    abstain_margin_tau: float | None,
+    max_order_disagreement: float | None,
+) -> tuple[bool, str | None]:
+    low_margin = abstain_margin_tau is not None and decision_margin < abstain_margin_tau
+    high_flip = (
+        max_order_disagreement is not None
+        and pairwise_order_disagreement is not None
+        and pairwise_order_disagreement > max_order_disagreement
+    )
+    if low_margin and high_flip:
+        return True, "low_margin+order_disagreement"
+    if low_margin:
+        return True, "low_margin"
+    if high_flip:
+        return True, "order_disagreement"
+    return False, None
+
+
 class GenRMScorer:
     """Reusable 1-pass prefill logprob GenRM verifier for binary faithfulness and listwise Best-of-K judging.
 
@@ -542,16 +631,81 @@ class GenRMScorer:
             verdict_suffix=verdict_suffix,
         )
 
+    def score_pairwise_swap_invariant(
+        self,
+        items: Sequence[Mapping[str, Any] | tuple[str, str, str]],
+        *,
+        system_prompt: str = BEST_OF_K_GENRM_SYSTEM,
+        max_prompt_chars: int = 2400,
+        max_cand_chars: int = 2600,
+    ) -> list[GenRMPairwiseResult]:
+        """Score pairwise items in both ``(a, b)`` and ``(b, a)`` order in one batched call."""
+        if not items:
+            return []
+
+        norm_items = [_parse_pairwise_item(idx, it) for idx, it in enumerate(items)]
+        pair_prompts: list[str] = []
+        for p_txt, cand_a, cand_b in norm_items:
+            pair_prompts.append(
+                format_pairwise_prompt(
+                    p_txt,
+                    cand_a,
+                    cand_b,
+                    max_prompt_chars=max_prompt_chars,
+                    max_cand_chars=max_cand_chars,
+                )
+            )
+            pair_prompts.append(
+                format_pairwise_prompt(
+                    p_txt,
+                    cand_b,
+                    cand_a,
+                    max_prompt_chars=max_prompt_chars,
+                    max_cand_chars=max_cand_chars,
+                )
+            )
+
+        pair_probs = self.score_choice_logprob(
+            pair_prompts,
+            ("A", "B"),
+            system_prompt=system_prompt,
+            verdict_suffix="Better response (A or B):",
+        )
+
+        results: list[GenRMPairwiseResult] = []
+        for idx in range(len(norm_items)):
+            pr_fwd = pair_probs[2 * idx]
+            pr_rev = pair_probs[2 * idx + 1]
+            p_fwd_a = float(pr_fwd[0])
+            # Reversed prompt puts (cand_b, cand_a) as (A, B), so original A corresponds to B (index 1).
+            p_rev_a = float(pr_rev[1])
+            p_a = 0.5 * (p_fwd_a + p_rev_a)
+            p_b = 1.0 - p_a
+            results.append(
+                GenRMPairwiseResult(
+                    p_a=p_a,
+                    p_b=p_b,
+                    p_fwd_a=p_fwd_a,
+                    p_rev_a=p_rev_a,
+                    order_disagreement=abs(p_fwd_a - p_rev_a),
+                )
+            )
+        return results
+
     def score_best_of_k(
         self,
         items: Sequence[Mapping[str, Any] | tuple[str, Sequence[str]]],
         *,
         pairwise_margin_tau: float | None = None,
+        abstain_margin_tau: float | None = None,
+        max_order_disagreement: float | None = None,
         system_prompt: str = BEST_OF_K_GENRM_SYSTEM,
         max_prompt_chars: int = 2400,
         max_cand_chars: int = 2200,
     ) -> list[GenRMBestOfKResult]:
         """Score Best-of-K preference items via listwise logprob with optional swap-invariant pairwise tiebreak."""
+        eff_abstain_tau = _validate_non_negative_threshold("abstain_margin_tau", abstain_margin_tau)
+        eff_max_disagree = _validate_non_negative_threshold("max_order_disagreement", max_order_disagreement)
         if not items:
             return []
 
@@ -590,7 +744,7 @@ class GenRMScorer:
 
         top_pairs: list[tuple[int, int, float]] = []
         ambig_indices: list[int] = []
-        pair_prompts: list[str] = []
+        ambig_pairs: list[tuple[str, str, str]] = []
         for idx, row in enumerate(probs_batch):
             arr = np.asarray(row, dtype=np.float64)
             order = np.argsort(-arr, kind="mergesort")
@@ -600,52 +754,53 @@ class GenRMScorer:
             if pairwise_margin_tau is not None and margin < float(pairwise_margin_tau):
                 p_txt, cands = norm_items[idx]
                 ambig_indices.append(idx)
-                pair_prompts.append(
-                    format_pairwise_prompt(
-                        p_txt, cands[i1], cands[i2], max_prompt_chars=max_prompt_chars, max_cand_chars=max_cand_chars
-                    )
-                )
-                pair_prompts.append(
-                    format_pairwise_prompt(
-                        p_txt, cands[i2], cands[i1], max_prompt_chars=max_prompt_chars, max_cand_chars=max_cand_chars
-                    )
-                )
+                ambig_pairs.append((p_txt, cands[i1], cands[i2]))
 
-        refined_map: dict[int, tuple[float, float]] = {}
-        if pair_prompts:
-            pair_probs = self.score_choice_logprob(
-                pair_prompts,
-                ("A", "B"),
+        refined_map: dict[int, GenRMPairwiseResult] = {}
+        if ambig_pairs:
+            pw_results = self.score_pairwise_swap_invariant(
+                ambig_pairs,
                 system_prompt=system_prompt,
-                verdict_suffix="Better response (A or B):",
+                max_prompt_chars=max_prompt_chars,
+                max_cand_chars=max_cand_chars,
             )
-            for k_pos, orig_idx in enumerate(ambig_indices):
-                pr_fwd = pair_probs[2 * k_pos]
-                pr_rev = pair_probs[2 * k_pos + 1]
-                p_i1 = 0.5 * (float(pr_fwd[0]) + float(pr_rev[1]))
-                p_i2 = 1.0 - p_i1
-                refined_map[orig_idx] = (p_i1, p_i2)
+            refined_map = dict(zip(ambig_indices, pw_results))
 
         results: list[GenRMBestOfKResult] = []
         for idx, row in enumerate(probs_batch):
             i1, i2, margin = top_pairs[idx]
             cur_probs = list(row)
-            pw_pair = refined_map.get(idx)
-            if pw_pair is not None:
-                p_i1, p_i2 = pw_pair
+            pw_res = refined_map.get(idx)
+            pw_pair: tuple[float, float] | None = None
+            pw_disagree: float | None = None
+            if pw_res is not None:
+                pw_pair = (pw_res.p_a, pw_res.p_b)
+                pw_disagree = pw_res.order_disagreement
                 mass = max(1e-6, cur_probs[i1] + cur_probs[i2])
-                cur_probs[i1] = mass * p_i1
-                cur_probs[i2] = mass * p_i2
+                cur_probs[i1] = mass * pw_res.p_a
+                cur_probs[i2] = mass * pw_res.p_b
                 cur_probs = _normalize_choice_probs(cur_probs, k)
             arr = np.asarray(cur_probs, dtype=np.float64)
-            best_idx = int(np.argsort(-arr, kind="mergesort")[0])
+            final_order = np.argsort(-arr, kind="mergesort")
+            best_idx = int(final_order[0])
+            decision_margin = float(arr[final_order[0]] - arr[final_order[1]])
+            abstain, abstain_reason = _compute_abstention(
+                decision_margin,
+                pw_disagree,
+                eff_abstain_tau,
+                eff_max_disagree,
+            )
             results.append(
                 GenRMBestOfKResult(
                     best_idx=best_idx,
                     probs=tuple(cur_probs),
                     margin_top1_top2=margin,
-                    pairwise_refined=pw_pair is not None,
+                    pairwise_refined=pw_res is not None,
                     pairwise_probs=pw_pair,
+                    decision_margin=decision_margin,
+                    pairwise_order_disagreement=pw_disagree,
+                    abstain=abstain,
+                    abstain_reason=abstain_reason,
                 )
             )
         return results
@@ -672,6 +827,7 @@ __all__ = [
     "DEFAULT_NO_VARIANTS",
     "DEFAULT_YES_VARIANTS",
     "GenRMBestOfKResult",
+    "GenRMPairwiseResult",
     "GenRMScorer",
     "RAGTRUTH_GENRM_SYSTEM",
     "default_option_variants",

@@ -50,6 +50,7 @@ test-cpu: hw-check
 		packages/fast-shared/tests/test_fast_shared.py \
 		packages/fast-shared/tests/test_gemma4_vision_cpu.py \
 		packages/fast-shared/tests/test_outcome_eval_cpu.py \
+		packages/fast-shared/tests/test_ppi_metrics_cpu.py \
 		packages/fast-shared/tests/test_qwen35_vision_cpu.py \
 		packages/fast-shared/tests/test_runtime_lessons_cpu.py \
 		packages/fast-shared/tests/test_parquet_pipeline_v2_cpu.py \

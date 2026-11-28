@@ -15,6 +15,8 @@ from fast_decision_models import (
     GenRMScorer,
 )
 from fast_decision_models.genrm import (
+    GenRMPairwiseResult,
+    __all__ as genrm_all,
     default_option_variants,
     format_best_of_k_prompt,
     format_pairwise_prompt,
@@ -461,3 +463,212 @@ def test_decision_models_cli_genrm_score_cpu(monkeypatch: pytest.MonkeyPatch, ca
     out2 = json.loads(capsys.readouterr().out)
     assert out2["options"] == ["A", "B"]
     assert math.isclose(sum(out2["probs"]), 1.0, abs_tol=1e-9)
+
+
+def test_genrm_scorer_pairwise_swap_invariant_and_validation() -> None:
+    assert "GenRMPairwiseResult" in genrm_all
+
+    calls: list[tuple[str, list[str], str | None]] = []
+
+    def _mock_pairwise(prompts, system_prompt, verdict_suffix, option_variants):
+        _ = option_variants
+        calls.append((verdict_suffix, list(prompts), system_prompt))
+        assert len(prompts) == 6
+        return [
+            [0.80, 0.20],  # item 0 fwd: p_fwd_a = 0.80
+            [0.20, 0.80],  # item 0 rev: p_rev_a = 0.80 -> p_a=0.80, p_b=0.20, disagree=0.0
+            [0.85, 0.15],  # item 1 fwd: p_fwd_a = 0.85
+            [0.75, 0.25],  # item 1 rev: p_rev_a = 0.25 -> p_a=0.55, p_b=0.45, disagree=0.60
+            [0.35, 0.65],  # item 2 fwd: p_fwd_a = 0.35
+            [0.85, 0.15],  # item 2 rev: p_rev_a = 0.15 -> p_a=0.25, p_b=0.75, disagree=0.20
+        ]
+
+    scorer = GenRMScorer(logit_scorer=_mock_pairwise)
+    assert scorer.score_pairwise_swap_invariant([]) == []
+    assert calls == []
+
+    items = [
+        ("Prompt 0", "Alpha0", "Beta0"),
+        {"prompt": "Prompt 1", "cand_a": "Alpha1", "cand_b": "Beta1"},
+        {"prompt": "Prompt 2", "candidates": ["Alpha2", "Beta2"]},
+    ]
+    res = scorer.score_pairwise_swap_invariant(items)
+    assert len(calls) == 1
+    assert calls[0][0] == "Better response (A or B):"
+    assert calls[0][2] == BEST_OF_K_GENRM_SYSTEM
+
+    prompts_sent = calls[0][1]
+    assert "[Option A]\nAlpha0\n[/Option A]" in prompts_sent[0]
+    assert "[Option B]\nBeta0\n[/Option B]" in prompts_sent[0]
+    assert "[Option A]\nBeta0\n[/Option A]" in prompts_sent[1]
+    assert "[Option B]\nAlpha0\n[/Option B]" in prompts_sent[1]
+    assert "[Option A]\nAlpha2\n[/Option A]" in prompts_sent[4]
+    assert "[Option B]\nBeta2\n[/Option B]" in prompts_sent[4]
+    assert "[Option A]\nBeta2\n[/Option A]" in prompts_sent[5]
+    assert "[Option B]\nAlpha2\n[/Option B]" in prompts_sent[5]
+
+    expected = [
+        (0.80, 0.20, 0.80, 0.80, 0.0),
+        (0.55, 0.45, 0.85, 0.25, 0.60),
+        (0.25, 0.75, 0.35, 0.15, 0.20),
+    ]
+    assert len(res) == 3
+    for r, (p_a, p_b, p_fwd_a, p_rev_a, disagree) in zip(res, expected):
+        assert isinstance(r, GenRMPairwiseResult)
+        assert math.isclose(r.p_a, p_a, abs_tol=1e-12)
+        assert math.isclose(r.p_b, p_b, abs_tol=1e-12)
+        assert math.isclose(r.p_fwd_a, p_fwd_a, abs_tol=1e-12)
+        assert math.isclose(r.p_rev_a, p_rev_a, abs_tol=1e-12)
+        assert math.isclose(r.order_disagreement, disagree, abs_tol=1e-12)
+
+    with pytest.raises(ValueError, match="both 'cand_a' and 'cand_b'"):
+        scorer.score_pairwise_swap_invariant([{"prompt": "p", "cand_a": "a"}])
+    with pytest.raises(ValueError, match="length 2"):
+        scorer.score_pairwise_swap_invariant([{"prompt": "p", "candidates": ["a", "b", "c"]}])
+    with pytest.raises(ValueError, match=r"\(prompt, cand_a, cand_b\)"):
+        scorer.score_pairwise_swap_invariant([("p", "a")])  # type: ignore[list-item]
+
+
+def test_genrm_best_of_k_backward_compat_and_decision_margin() -> None:
+    pos_res = GenRMBestOfKResult(1, (0.2, 0.8), 0.6)
+    assert pos_res.pairwise_refined is False
+    assert pos_res.pairwise_probs is None
+    assert pos_res.decision_margin == 0.0
+    assert pos_res.pairwise_order_disagreement is None
+    assert pos_res.abstain is False
+    assert pos_res.abstain_reason is None
+
+    kw_res = GenRMBestOfKResult(best_idx=0, probs=(0.9, 0.1), margin_top1_top2=0.8, pairwise_refined=False)
+    assert kw_res.decision_margin == 0.0
+    assert kw_res.abstain is False
+    assert kw_res.abstain_reason is None
+
+    def _mock_bok(prompts, system_prompt, verdict_suffix, option_variants):
+        _ = system_prompt, option_variants
+        if verdict_suffix.startswith("Best option"):
+            return [
+                [0.10, 0.15, 0.70, 0.05],  # clear winner -> no tiebreak
+                [0.36, 0.34, 0.15, 0.15],  # tiebreak flips 0 -> 1
+                [0.36, 0.34, 0.28, 0.02],  # tiebreak sinks idx 1 below idx 2
+            ]
+        assert len(prompts) == 4
+        return [
+            [0.35, 0.65],  # item 1 fwd
+            [0.85, 0.15],  # item 1 rev -> p_a=0.25, p_b=0.75, disagree=0.20
+            [0.90, 0.10],  # item 2 fwd
+            [0.10, 0.90],  # item 2 rev -> p_a=0.90, p_b=0.10, disagree=0.0
+        ]
+
+    scorer = GenRMScorer(logit_scorer=_mock_bok)
+    items = [
+        ("p0", ["a", "b", "c", "d"]),
+        ("p1", ["a", "b", "c", "d"]),
+        ("p2", ["a", "b", "c", "d"]),
+    ]
+    res = scorer.score_best_of_k(items, pairwise_margin_tau=0.20)
+    assert len(res) == 3
+
+    # Item 0: unchanged listwise margin == decision_margin, no pairwise telemetry.
+    assert res[0].best_idx == 2
+    assert math.isclose(res[0].margin_top1_top2, 0.55, abs_tol=1e-12)
+    assert math.isclose(res[0].decision_margin, 0.55, abs_tol=1e-12)
+    assert res[0].pairwise_order_disagreement is None
+    assert res[0].abstain is False
+    assert res[0].abstain_reason is None
+
+    # Item 1: margin_top1_top2 preserves initial 0.02; decision_margin reflects final [0.175, 0.525, 0.15, 0.15].
+    assert res[1].best_idx == 1
+    assert math.isclose(res[1].margin_top1_top2, 0.02, abs_tol=1e-12)
+    assert math.isclose(res[1].decision_margin, 0.35, abs_tol=1e-12)
+    assert res[1].pairwise_order_disagreement is not None
+    assert math.isclose(res[1].pairwise_order_disagreement, 0.20, abs_tol=1e-12)
+    assert res[1].abstain is False
+    assert res[1].abstain_reason is None
+
+    # Item 2: final probs [0.63, 0.07, 0.28, 0.02] -> top2 is idx 2 (0.28), so decision_margin = 0.63 - 0.28 = 0.35.
+    assert res[2].best_idx == 0
+    assert math.isclose(res[2].margin_top1_top2, 0.02, abs_tol=1e-12)
+    assert math.isclose(res[2].decision_margin, 0.35, abs_tol=1e-12)
+    assert res[2].pairwise_order_disagreement is not None
+    assert math.isclose(res[2].pairwise_order_disagreement, 0.0, abs_tol=1e-12)
+    assert res[2].abstain is False
+    assert res[2].abstain_reason is None
+
+
+def test_genrm_best_of_k_selective_abstention_and_threshold_validation() -> None:
+    def _mock_abstain(prompts, system_prompt, verdict_suffix, option_variants):
+        _ = system_prompt, option_variants
+        if verdict_suffix.startswith("Best option"):
+            return [
+                [0.45, 0.25, 0.20, 0.10],  # item 0: margin=0.20 (not < 0.20), decision_margin=0.20 < 0.30 -> low_margin
+                [0.36, 0.34, 0.15, 0.15],  # item 1: refined -> low_margin only
+                [0.36, 0.34, 0.15, 0.15],  # item 2: refined -> order_disagreement only
+                [0.36, 0.34, 0.15, 0.15],  # item 3: refined -> low_margin+order_disagreement
+                [0.36, 0.34, 0.15, 0.15],  # item 4: refined -> passes both thresholds
+            ]
+        assert len(prompts) == 8
+        return [
+            [0.60, 0.40], [0.40, 0.60],  # item 1: p_a=0.60, disagree=0.0, final=[0.42, 0.28, 0.15, 0.15], dm=0.14
+            [0.95, 0.05], [0.35, 0.65],  # item 2: p_a=0.80, disagree=0.30, final=[0.56, 0.14, 0.15, 0.15], dm=0.41
+            [0.85, 0.15], [0.75, 0.25],  # item 3: p_a=0.55, disagree=0.60, final=[0.385, 0.315, 0.15, 0.15], dm=0.07
+            [0.90, 0.10], [0.20, 0.80],  # item 4: p_a=0.85, disagree=0.10, final=[0.595, 0.105, 0.15, 0.15], dm=0.445
+        ]
+
+    scorer = GenRMScorer(logit_scorer=_mock_abstain)
+    items = [(f"p{i}", ["a", "b", "c", "d"]) for i in range(5)]
+    res = scorer.score_best_of_k(
+        items,
+        pairwise_margin_tau=0.20,
+        abstain_margin_tau=0.30,
+        max_order_disagreement=0.25,
+    )
+    assert [(r.abstain, r.abstain_reason) for r in res] == [
+        (True, "low_margin"),
+        (True, "low_margin"),
+        (True, "order_disagreement"),
+        (True, "low_margin+order_disagreement"),
+        (False, None),
+    ]
+    assert res[0].pairwise_order_disagreement is None
+    assert math.isclose(res[1].decision_margin, 0.14, abs_tol=1e-12)
+    assert math.isclose(res[2].decision_margin, 0.41, abs_tol=1e-12)
+    assert math.isclose(res[3].decision_margin, 0.07, abs_tol=1e-12)
+    assert math.isclose(res[4].decision_margin, 0.445, abs_tol=1e-12)
+
+    # Boundary equality does not abstain (strict `<` for margin and strict `>` for disagreement).
+    def _mock_exact_boundary(prompts, system_prompt, verdict_suffix, option_variants):
+        _ = system_prompt, option_variants
+        if verdict_suffix.startswith("Best option"):
+            return [[0.50, 0.50]]
+        # fwd=[0.875, 0.125], rev=[0.375, 0.625] -> p_fwd_a=0.875, p_rev_a=0.625 -> p_a=0.75, p_b=0.25
+        # decision_margin = 0.75 - 0.25 = 0.50, order_disagreement = 0.25
+        return [[0.875, 0.125], [0.375, 0.625]]
+
+    boundary_scorer = GenRMScorer(logit_scorer=_mock_exact_boundary)
+    b_res = boundary_scorer.score_best_of_k(
+        [("p", ["a", "b"])],
+        pairwise_margin_tau=0.25,
+        abstain_margin_tau=0.50,
+        max_order_disagreement=0.25,
+    )[0]
+    assert b_res.decision_margin == 0.50
+    assert b_res.pairwise_order_disagreement == 0.25
+    assert b_res.abstain is False
+    assert b_res.abstain_reason is None
+
+    # 0.0 thresholds are valid non-negative numbers.
+    zero_res = boundary_scorer.score_best_of_k(
+        [("p", ["a", "b"])],
+        pairwise_margin_tau=0.25,
+        abstain_margin_tau=0.0,
+        max_order_disagreement=0.0,
+    )[0]
+    assert zero_res.abstain is True
+    assert zero_res.abstain_reason == "order_disagreement"
+
+    # Invalid negative, NaN, Inf, and bool thresholds raise ValueError even on empty items.
+    for bad in (-0.01, -1.0, float("nan"), float("inf"), float("-inf"), True):
+        with pytest.raises(ValueError, match="abstain_margin_tau"):
+            scorer.score_best_of_k([], abstain_margin_tau=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="max_order_disagreement"):
+            scorer.score_best_of_k(items[:1], max_order_disagreement=bad)  # type: ignore[arg-type]

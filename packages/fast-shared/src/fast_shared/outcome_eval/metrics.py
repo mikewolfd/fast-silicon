@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -503,14 +503,365 @@ def evaluate_promotion_gates(
     )
 
 
+_ACKLAM_A = (
+    -3.969683028665376e01,
+    2.209460984245205e02,
+    -2.759285104469687e02,
+    1.383577518672690e02,
+    -3.066479806614716e01,
+    2.506628277459239e00,
+)
+_ACKLAM_B = (
+    -5.447609879822406e01,
+    1.615858368580409e02,
+    -1.556989798598866e02,
+    6.680131188771972e01,
+    -1.328068155288572e01,
+)
+_ACKLAM_C = (
+    -7.784894002430293e-03,
+    -3.223964580411365e-01,
+    -2.400758277161838e00,
+    -2.549732539343734e00,
+    4.374664141464968e00,
+    2.938163982698783e00,
+)
+_ACKLAM_D = (
+    7.784695709041462e-03,
+    3.224671290700398e-01,
+    2.445134137142996e00,
+    3.754408661907416e00,
+)
+
+
+def _normal_ppf(p: float) -> float:
+    """Inverse standard normal CDF via Acklam's rational approximation (<1e-8 error, pure stdlib)."""
+    pf = float(p)
+    if not math.isfinite(pf) or pf <= 0.0 or pf >= 1.0:
+        raise ValueError(f"p must be finite and strictly in (0, 1), got {p!r}")
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+    if pf < p_low:
+        q = math.sqrt(-2.0 * math.log(pf))
+        num = (((((_ACKLAM_C[0] * q + _ACKLAM_C[1]) * q + _ACKLAM_C[2]) * q + _ACKLAM_C[3]) * q + _ACKLAM_C[4]) * q + _ACKLAM_C[5])
+        den = ((((_ACKLAM_D[0] * q + _ACKLAM_D[1]) * q + _ACKLAM_D[2]) * q + _ACKLAM_D[3]) * q + 1.0)
+        return num / den
+    if pf <= p_high:
+        q = pf - 0.5
+        r = q * q
+        num = (((((_ACKLAM_A[0] * r + _ACKLAM_A[1]) * r + _ACKLAM_A[2]) * r + _ACKLAM_A[3]) * r + _ACKLAM_A[4]) * r + _ACKLAM_A[5]) * q
+        den = (((((_ACKLAM_B[0] * r + _ACKLAM_B[1]) * r + _ACKLAM_B[2]) * r + _ACKLAM_B[3]) * r + _ACKLAM_B[4]) * r + 1.0)
+        return num / den
+    q = math.sqrt(-2.0 * math.log(1.0 - pf))
+    num = (((((_ACKLAM_C[0] * q + _ACKLAM_C[1]) * q + _ACKLAM_C[2]) * q + _ACKLAM_C[3]) * q + _ACKLAM_C[4]) * q + _ACKLAM_C[5])
+    den = ((((_ACKLAM_D[0] * q + _ACKLAM_D[1]) * q + _ACKLAM_D[2]) * q + _ACKLAM_D[3]) * q + 1.0)
+    return -(num / den)
+
+
+@dataclass(frozen=True)
+class PPIComparisonResult:
+    """Prediction-Powered Inference (PPI++, arXiv:2311.01453) comparison summary."""
+
+    theta_ppi: float
+    theta_classical: float
+    theta_judge_unlabeled: float
+    theta_judge_labeled: float
+    se_ppi: float
+    se_classical: float
+    ci_low: float
+    ci_high: float
+    classical_ci_low: float
+    classical_ci_high: float
+    lambda_hat: float
+    alpha: float
+    n_labeled: int
+    n_unlabeled: int
+    n_effective_multiplier: float
+    judge_bias_estimate: float
+    judge_misaligned: bool
+    ci_method: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "theta_ppi": float(self.theta_ppi),
+            "theta_classical": float(self.theta_classical),
+            "theta_judge_unlabeled": float(self.theta_judge_unlabeled),
+            "theta_judge_labeled": float(self.theta_judge_labeled),
+            "se_ppi": float(self.se_ppi),
+            "se_classical": float(self.se_classical),
+            "ci_low": float(self.ci_low),
+            "ci_high": float(self.ci_high),
+            "classical_ci_low": float(self.classical_ci_low),
+            "classical_ci_high": float(self.classical_ci_high),
+            "lambda_hat": float(self.lambda_hat),
+            "alpha": float(self.alpha),
+            "n_labeled": int(self.n_labeled),
+            "n_unlabeled": int(self.n_unlabeled),
+            "n_effective_multiplier": float(self.n_effective_multiplier),
+            "judge_bias_estimate": float(self.judge_bias_estimate),
+            "judge_misaligned": bool(self.judge_misaligned),
+            "ci_method": str(self.ci_method),
+        }
+
+
+def _row_var_ddof1(arr: np.ndarray) -> np.ndarray:
+    """Row-wise sample variance (``ddof=1``), guarding exact-constant rows against float noise."""
+    return np.where(np.ptp(arr, axis=1) == 0.0, 0.0, np.var(arr, axis=1, ddof=1))
+
+
+def _ppi_batch_stats(
+    f_u: np.ndarray,
+    f_l: np.ndarray,
+    y_l: np.ndarray,
+    *,
+    power_tune: bool,
+    lam_ov: float | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute vectorized ``(theta_ppi, se_ppi, lam, y_n, f_n, f_N)`` over ``(B, N)`` and ``(B, n)`` batches."""
+    b, n = y_l.shape
+    n_unlabeled = f_u.shape[1]
+    y_n = y_l.mean(axis=1)
+    f_n = f_l.mean(axis=1)
+    f_N = f_u.mean(axis=1)
+    var_f_l = _row_var_ddof1(f_l)
+
+    if lam_ov is not None:
+        lam = np.full(b, lam_ov, dtype=np.float64)
+    elif not power_tune:
+        lam = np.ones(b, dtype=np.float64)
+    else:
+        cov_yf = np.sum((y_l - y_n[:, None]) * (f_l - f_n[:, None]), axis=1) / float(n - 1)
+        cov_yf = np.where((np.ptp(y_l, axis=1) == 0.0) | (np.ptp(f_l, axis=1) == 0.0), 0.0, cov_yf)
+        f_all = np.concatenate([f_l, f_u], axis=1)
+        var_f_total = _row_var_ddof1(f_all)
+        denom = (1.0 + float(n) / float(n_unlabeled)) * var_f_total
+        pos = denom > 1e-15
+        lam = np.where(pos, np.clip(cov_yf / np.where(pos, denom, 1.0), 0.0, 1.0), 0.0)
+
+    theta = lam * f_N + (y_n - lam * f_n)
+    rectifier = y_l - lam[:, None] * f_l
+    var_rect = _row_var_ddof1(rectifier)
+    var_unlab = _row_var_ddof1(f_u) if n_unlabeled >= 2 else var_f_l
+    se = np.sqrt(np.maximum(0.0, var_rect / float(n) + (lam * lam) * var_unlab / float(n_unlabeled)))
+    return theta, se, lam, y_n, f_n, f_N
+
+
+def _validate_ppi_inputs(
+    judge_unlabeled: Sequence[float] | np.ndarray,
+    judge_labeled: Sequence[float] | np.ndarray,
+    human_labeled: Sequence[float] | np.ndarray,
+    *,
+    alpha: float,
+    lambda_override: float | None,
+    misaligned_lambda_threshold: float,
+    bootstrap_reps: int,
+    ci_method: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float | None, float, int]:
+    """Validate and normalize inputs for :func:`compute_ppi_comparison`."""
+    f_u = np.asarray(judge_unlabeled, dtype=np.float64)
+    f_l = np.asarray(judge_labeled, dtype=np.float64)
+    y_l = np.asarray(human_labeled, dtype=np.float64)
+
+    if f_l.ndim != 1 or y_l.ndim != 1 or f_l.shape != y_l.shape:
+        raise ValueError(
+            f"judge_labeled and human_labeled must be matching 1D arrays, got {f_l.shape} vs {y_l.shape}"
+        )
+    if f_u.ndim != 1:
+        raise ValueError(f"judge_unlabeled must be a 1D array, got shape {f_u.shape}")
+    if y_l.size < 2:
+        raise ValueError(f"At least 2 paired labeled samples are required, got n={y_l.size}")
+    if f_u.size < 1:
+        raise ValueError(f"At least 1 unlabeled judge score is required, got N={f_u.size}")
+    if not (np.all(np.isfinite(y_l)) and np.all(np.isfinite(f_l)) and np.all(np.isfinite(f_u))):
+        raise ValueError("All judge_unlabeled, judge_labeled, and human_labeled values must be finite")
+
+    alpha_f = float(alpha)
+    if not math.isfinite(alpha_f) or alpha_f <= 0.0 or alpha_f >= 1.0:
+        raise ValueError(f"alpha must be strictly in (0, 1), got {alpha!r}")
+
+    lam_ov: float | None = None
+    if lambda_override is not None:
+        lam_ov = float(lambda_override)
+        if not math.isfinite(lam_ov) or lam_ov < 0.0 or lam_ov > 1.0:
+            raise ValueError(f"lambda_override must be in [0, 1], got {lambda_override!r}")
+
+    thresh = float(misaligned_lambda_threshold)
+    if not math.isfinite(thresh) or thresh < 0.0 or thresh > 1.0:
+        raise ValueError(f"misaligned_lambda_threshold must be in [0, 1], got {misaligned_lambda_threshold!r}")
+
+    if ci_method not in ("asymptotic", "bootstrap_percentile", "bootstrap_t"):
+        raise ValueError(
+            f"Unsupported ci_method={ci_method!r}; expected 'asymptotic', 'bootstrap_percentile', or 'bootstrap_t'"
+        )
+
+    reps = int(bootstrap_reps)
+    if reps < 0:
+        raise ValueError(f"bootstrap_reps must be >= 0, got {bootstrap_reps!r}")
+    if ci_method != "asymptotic":
+        if reps == 0:
+            reps = 1000
+        elif reps < 50:
+            raise ValueError(f"bootstrap_reps must be 0 (default 1000) or >= 50, got {bootstrap_reps!r}")
+
+    return f_u, f_l, y_l, alpha_f, lam_ov, thresh, reps
+
+
+def _ppi_bootstrap_ci(
+    f_u: np.ndarray,
+    f_l: np.ndarray,
+    y_l: np.ndarray,
+    *,
+    theta_ppi: float,
+    se_ppi: float,
+    alpha: float,
+    power_tune: bool,
+    lam_ov: float | None,
+    n_reps: int,
+    ci_method: Literal["bootstrap_percentile", "bootstrap_t"],
+    seed: int,
+) -> tuple[float, float]:
+    """Compute percentile or studentized bootstrap confidence interval for PPI++."""
+    if ci_method == "bootstrap_t" and se_ppi <= 1e-15:
+        return theta_ppi, theta_ppi
+
+    n = int(y_l.size)
+    n_unlabeled = int(f_u.size)
+    rng = np.random.default_rng(int(seed))
+    # Cap per-chunk allocation (~16 MB) so large unlabeled pools remain memory-bounded.
+    chunk_size = max(1, min(n_reps, 2_000_000 // max(n, n_unlabeled)))
+    stats = np.empty(n_reps, dtype=np.float64)
+    deg_thresh = min(1e-12, 1e-8 * se_ppi) if ci_method == "bootstrap_t" else 0.0
+
+    offset = 0
+    while offset < n_reps:
+        cur = min(chunk_size, n_reps - offset)
+        idx_l = rng.integers(0, n, size=(cur, n))
+        idx_u = rng.integers(0, n_unlabeled, size=(cur, n_unlabeled))
+        theta_b, se_b, _, _, _, _ = _ppi_batch_stats(
+            f_u[idx_u], f_l[idx_l], y_l[idx_l], power_tune=power_tune, lam_ov=lam_ov,
+        )
+        if ci_method == "bootstrap_percentile":
+            stats[offset : offset + cur] = theta_b
+        else:
+            valid_se = se_b > deg_thresh
+            safe_se = np.where(valid_se, se_b, se_ppi)
+            t_b = (theta_b - theta_ppi) / safe_se
+            stats[offset : offset + cur] = np.where(valid_se, t_b, np.clip(t_b, -50.0, 50.0))
+        offset += cur
+
+    if ci_method == "bootstrap_percentile":
+        q_lo, q_hi = np.quantile(stats, [alpha / 2.0, 1.0 - alpha / 2.0])
+        return float(q_lo), float(q_hi)
+
+    q_hi, q_lo = np.quantile(stats, [1.0 - alpha / 2.0, alpha / 2.0])
+    return float(theta_ppi - q_hi * se_ppi), float(theta_ppi - q_lo * se_ppi)
+
+
+def compute_ppi_comparison(
+    judge_unlabeled: Sequence[float] | np.ndarray,
+    judge_labeled: Sequence[float] | np.ndarray,
+    human_labeled: Sequence[float] | np.ndarray,
+    *,
+    alpha: float = 0.05,
+    power_tune: bool = True,
+    lambda_override: float | None = None,
+    misaligned_lambda_threshold: float = 0.2,
+    bootstrap_reps: int = 0,
+    ci_method: Literal["asymptotic", "bootstrap_percentile", "bootstrap_t"] = "asymptotic",
+    seed: int = 0,
+) -> PPIComparisonResult:
+    """Compute Prediction-Powered Inference (PPI++) comparison from bulk judge + small human anchor scores.
+
+    Defaults to ``ci_method="asymptotic"`` (passes >=92% empirical 95% coverage for n=30-40); pass
+    ``ci_method="bootstrap_t"`` when exact >=95% finite-sample coverage is needed on small audits (n <= 40).
+    """
+    f_u, f_l, y_l, alpha_f, lam_ov, thresh, n_reps = _validate_ppi_inputs(
+        judge_unlabeled,
+        judge_labeled,
+        human_labeled,
+        alpha=alpha,
+        lambda_override=lambda_override,
+        misaligned_lambda_threshold=misaligned_lambda_threshold,
+        bootstrap_reps=bootstrap_reps,
+        ci_method=ci_method,
+    )
+    n = int(y_l.size)
+    n_unlabeled = int(f_u.size)
+
+    theta_arr, se_arr, lam_arr, y_n_arr, f_n_arr, f_N_arr = _ppi_batch_stats(
+        f_u[None, :], f_l[None, :], y_l[None, :], power_tune=power_tune, lam_ov=lam_ov,
+    )
+    theta_ppi = float(theta_arr[0])
+    se_ppi = float(se_arr[0])
+    lam = float(lam_arr[0])
+    y_n = float(y_n_arr[0])
+    f_n = float(f_n_arr[0])
+    f_N = float(f_N_arr[0])
+
+    var_y = float(_row_var_ddof1(y_l[None, :])[0])
+    se_classical = math.sqrt(max(0.0, var_y / float(n)))
+
+    if se_ppi > 1e-15:
+        n_effective_multiplier = (se_classical / se_ppi) ** 2
+    elif se_classical <= 1e-15:
+        n_effective_multiplier = 1.0
+    else:
+        n_effective_multiplier = float("inf")
+
+    z = _normal_ppf(1.0 - alpha_f / 2.0)
+    classical_ci_low = y_n - z * se_classical
+    classical_ci_high = y_n + z * se_classical
+
+    if ci_method == "asymptotic":
+        ci_low = theta_ppi - z * se_ppi
+        ci_high = theta_ppi + z * se_ppi
+    else:
+        ci_low, ci_high = _ppi_bootstrap_ci(
+            f_u,
+            f_l,
+            y_l,
+            theta_ppi=theta_ppi,
+            se_ppi=se_ppi,
+            alpha=alpha_f,
+            power_tune=power_tune,
+            lam_ov=lam_ov,
+            n_reps=n_reps,
+            ci_method=ci_method,
+            seed=seed,
+        )
+
+    return PPIComparisonResult(
+        theta_ppi=theta_ppi,
+        theta_classical=y_n,
+        theta_judge_unlabeled=f_N,
+        theta_judge_labeled=f_n,
+        se_ppi=se_ppi,
+        se_classical=se_classical,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        classical_ci_low=classical_ci_low,
+        classical_ci_high=classical_ci_high,
+        lambda_hat=lam,
+        alpha=alpha_f,
+        n_labeled=n,
+        n_unlabeled=n_unlabeled,
+        n_effective_multiplier=n_effective_multiplier,
+        judge_bias_estimate=f_n - y_n,
+        judge_misaligned=lam < thresh,
+        ci_method=ci_method,
+    )
+
+
 __all__ = [
     "DEFAULT_LOSSLESS_TOLERANCE",
     "GateEvaluation",
     "OutcomeSummary",
+    "PPIComparisonResult",
     "compute_corpus_outcome_metrics",
     "compute_effective_item_scores",
     "compute_outcome_metrics",
     "compute_paired_se",
+    "compute_ppi_comparison",
     "compute_unpaired_se",
     "evaluate_memory_gate",
     "evaluate_promotion_gates",
