@@ -2673,7 +2673,7 @@ class LiveMemoryGovernor:
 
     def _apply_mlx_limits(self, adaptation: MemoryAdaptation) -> None:
         changed_cache = self._last_applied_cache_mb != adaptation.cache_limit_mb
-        should_shed = bool(adaptation.should_clear_cache or adaptation.throttle_tier in ("warn", "critical"))
+        should_shed = adaptation.throttle_tier in ("warn", "critical")
         if not (changed_cache or should_shed):
             return
         if changed_cache:

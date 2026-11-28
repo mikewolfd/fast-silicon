@@ -634,9 +634,46 @@ def test_post_lcp_ragged_right_pad_conv_and_gdn_state_invariance() -> None:
                 assert np.max(np.abs(r_got - r_exp)) < 2.5e-2, f"rec_state mismatch slot={idx} layer={l_i}"
 
 
-def test_prefix_tree_chunk_reuse_kv_i8_and_a4_v2_loop_breaker(tmp_path: Path) -> None:
+def _stub_healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin host memory polls to a healthy snapshot so PrefixTree tests never flake on desktop pressure."""
+    import fast_shared.runtime_lessons as rl_mod
+
+    snap = rl_mod.HostMemorySnapshot(
+        platform="darwin",
+        page_size_bytes=16384,
+        host_mem_bytes=48 << 30,
+        available_bytes=24 << 30,
+        healthy_bytes=20 << 30,
+        phys_footprint_bytes=256 << 20,
+        compressed_bytes=0,
+        file_backed_bytes=8 << 30,
+        inactive_bytes=0,
+        file_cache_minimum_bytes=4 << 30,
+        free_pages=100,
+        speculative_pages=0,
+        external_pages=100,
+        purgeable_pages=0,
+        internal_pages=100,
+        compressor_pages=0,
+        compressed_pages=0,
+        compression_credit_bytes=0,
+        pressure_level="normal",
+        pressure_code=1,
+        uma_fraction=256.0 / 49152.0,
+        host_headroom_fraction=0.5,
+        source="test_stub",
+    )
+    monkeypatch.setattr(rl_mod, "sample_host_memory", lambda *_a, **_kw: snap)
+
+
+def test_prefix_tree_chunk_reuse_kv_i8_and_a4_v2_loop_breaker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify `256`-token `PrefixTree` reuse across distinct schemas, `kv_i8`, and `A4_v2` cycle breaker."""
     from fast_shared.grammar import compute_loop_breaker_penalties
+
+    _stub_healthy_host_memory(monkeypatch)
 
     # 1. `A4_v2` consecutive p=1..8 cycle detector + 4-gram repeat detector
     cyc = [42, 43] * 6  # p=2 cycle repeated 6x (>= min_prior_hits=5)
@@ -2225,6 +2262,8 @@ def test_q1_prefix_2hit_admission_async_eval_and_early_loop_abort_cpu(
     import types
     import fast_qwen3.engine as engine_mod
     from fast_shared.prefix_tree import PrefixTree
+
+    _stub_healthy_host_memory(monkeypatch)
 
     tok = _make_tiny_byte_tokenizer(tmp_path)
     cfg = _small_dense_cfg(vocab_size=tok.vocab_size, tie=True)

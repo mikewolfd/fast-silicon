@@ -921,10 +921,19 @@ def test_live_memory_governor_adaptation_hysteresis_and_mlx_hooks_cpu(
     shed_count = [0]
     gov = LiveMemoryGovernor(poll_interval_sec=0.0, clean_polls_to_relax=2)
     gov.register_shed_callback(lambda: shed_count.__setitem__(0, shed_count[0] + 1))
+
+    # Mild OS background warning trims cache only and preserves PrefixTree / shed callbacks
+    bg_warn_snap = _fake_snap(host_mem_gb=48.0, available_gb=9.0, healthy_gb=6.5, phys_gb=0.2, pressure="warning")
+    step_mild = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=bg_warn_snap)
+    assert step_mild.throttle_tier == "mild" and step_mild.b_slots == 128
+    assert cache_calls[-1] == 128 and clear_calls == [0]
+    assert shed_count[0] == 0 and gov.stats()["shed_callbacks_invoked"] == 0
+
+    # Warn/critical invoke shed callbacks
     ad_crit_snap = _fake_snap(phys_gb=19.5)
     step1 = gov.adapt(base_b_slots=128, base_cache_limit_mb=256, apply_mlx=True, snapshot=ad_crit_snap)
     assert step1.throttle_tier == "critical" and step1.b_slots == 32
-    assert cache_calls[-1] == 64 and clear_calls == [0]
+    assert cache_calls[-1] == 64 and clear_calls == [0, 0]
     assert shed_count[0] == 1 and gov.stats()["shed_callbacks_invoked"] == 1
 
     healthy_snap = _fake_snap(host_mem_gb=24.0, available_gb=14.0, healthy_gb=12.0, phys_gb=4.0)
